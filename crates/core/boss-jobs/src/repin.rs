@@ -27,6 +27,11 @@
 //! - LEAVES every completed (and skipped) step with the text it ran
 //!   under. Only its `sort_order` may move, so the list stays in the
 //!   target's order when a step is inserted ahead of it.
+//! - RE-DERIVES every skipped step under the target (backlog 4c6b4b74):
+//!   skipped is the readiness engine's verdict on the admission
+//!   version's predicate, not work anyone did, so a step the target can
+//!   still reach is written pending and re-projected like any live one,
+//!   and a step it cannot reach stays skipped as above.
 //!
 //! A PROJECTED KEY SOMEONE HAS SINCE WRITTEN IS KEPT, AND NAMED. The
 //! row's metadata is the projection PLUS whatever the executor wrote.
@@ -37,13 +42,18 @@
 //! see the one place the moved packet still reads its old text rather
 //! than discover it.
 //!
+//! A DECLARED WRITER IS NOT THE TARGET'S TO MOVE (backlog 6c9183de,
+//! review S1). On a live step, a re-pin that would change a field's
+//! declared writer, or write a key one reserves, is unplannable —
+//! [`crate::field_writer::repin_refusals`] holds the rule and its why.
+//!
 //! Whether the move is SAFE is not decided here —
 //! [`crate::protocol_conversion::convertibility_for_packet`] decides
 //! that, and the door asks it first. This decides only what the move
 //! writes. Everything here is pure; the handler does the I/O.
 
 use crate::registry::{WorkflowSpec, materialize_steps_at};
-use boss_core::job::{Job, Step, StepId, StepStatus};
+use boss_core::job::{Job, JobStatus, Step, StepId, StepStatus};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeSet, HashMap};
 
@@ -72,6 +82,11 @@ pub struct Reprojected {
     /// Projected keys the target changes that this row no longer holds
     /// at their admission value, and so were left as written.
     pub kept: Vec<String>,
+    /// The row was SKIPPED and the target's readiness re-derives it as
+    /// live, so the move writes it pending (backlog 4c6b4b74). The one
+    /// place a terminal row's status moves, and only through this flag:
+    /// both adapters otherwise freeze a skipped row as a completed one.
+    pub unskipped: bool,
 }
 
 /// Everything one re-pin writes to the step rows.
@@ -79,6 +94,27 @@ pub struct Reprojected {
 pub struct RepinPlan {
     pub reprojected: Vec<Reprojected>,
     pub inserted: Vec<Step>,
+}
+
+impl RepinPlan {
+    /// The slugs of the skipped steps this move writes back to pending,
+    /// in the target's order — named in the record on their own, so a
+    /// skip the move undoes is read off the entry, not diffed out of
+    /// `changed` lists (review of 28f3f28a).
+    pub fn unskipped(&self) -> Vec<String> {
+        self.reprojected
+            .iter()
+            .filter(|r| r.unskipped)
+            .filter_map(|r| r.step.spec_slug.clone())
+            .collect()
+    }
+
+    /// Does the move write a live row onto the packet — one it un-skips
+    /// or one it inserts? Such a move is only true of an OPEN packet, so
+    /// the adapters re-check that at the write.
+    pub fn opens_rows(&self) -> bool {
+        !self.inserted.is_empty() || self.reprojected.iter().any(|r| r.unskipped)
+    }
 }
 
 /// Why a packet cannot be planned at all.
@@ -148,7 +184,20 @@ pub fn plan(
             .collect()
     };
 
+    // Only an OPEN packet is walked again, so only an open packet's
+    // skipped steps are re-derived. A closed one keeps every skipped row
+    // as it stands and plans exactly as before (review of 28f3f28a: a
+    // terminal close skips what it leaves behind, and re-deriving that
+    // refused closed packets that had always planned). The adapters
+    // re-check `open` at the write, for a close landing in between.
+    let unskip = if job.status == JobStatus::Open {
+        rederived_live(to, job, steps, &target)
+    } else {
+        BTreeSet::new()
+    };
+
     let mut out = RepinPlan::default();
+    let mut refused: Vec<String> = Vec::new();
     for t in &target {
         let slug = t.spec_slug.as_deref().unwrap_or_default();
         let Some(row) = on_packet.get(slug) else {
@@ -162,7 +211,11 @@ pub fn plan(
         let mut next = (*row).clone();
         next.sort_order = t.sort_order;
         let mut kept = Vec::new();
-        let live = !matches!(row.status, StepStatus::Completed | StepStatus::Skipped);
+        let unskipped = row.status == StepStatus::Skipped && unskip.contains(slug);
+        if unskipped {
+            next.status = StepStatus::Pending;
+        }
+        let live = unskipped || !matches!(row.status, StepStatus::Completed | StepStatus::Skipped);
         if live && let Some(was) = admitted.get(slug) {
             next.kind = t.kind.clone();
             next.fields = t.fields.clone();
@@ -187,6 +240,19 @@ pub fn plan(
                 reproject_metadata(&row.metadata, &was.metadata, &t.metadata);
             next.metadata = metadata;
             kept.extend(kept_keys.into_iter().map(|k| format!("`{k}`")));
+            // A KEY WITH ONE DECLARED WRITER (backlog 6c9183de, review
+            // S1): the fields and metadata above came from the target,
+            // and the target is not that writer.
+            refused.extend(
+                crate::field_writer::repin_refusals(
+                    &row.fields,
+                    &next.fields,
+                    &row.metadata,
+                    &next.metadata,
+                )
+                .into_iter()
+                .map(|why| format!("step `{slug}`: {why}")),
+            );
         }
         let changed = differences(row, &next);
         if !changed.is_empty() || !kept.is_empty() {
@@ -194,10 +260,95 @@ pub fn plan(
                 step: next,
                 changed,
                 kept,
+                unskipped,
             });
         }
     }
+    if !refused.is_empty() {
+        return Err(Unplannable(refused.join("; ")));
+    }
     Ok(out)
+}
+
+/// The slugs of the packet's SKIPPED steps that the target's readiness
+/// does not skip again (backlog 4c6b4b74).
+///
+/// WHY A SKIP IS RE-JUDGED. On an open packet a skip is almost always
+/// [`crate::registry::reevaluate`]'s verdict: every step the predicate
+/// reads is terminal and it still does not hold. No actor, no evidence
+/// — a verdict of the ADMISSION version's predicate, so not a fact the
+/// move may carry across to a version whose predicate differs. Measured
+/// on backlog-item 70da1212 (v2, at `measure`): v2's branches read
+/// `triage` alone, so a `verify` route skipped all six; v14's read
+/// `measure` too, and a packet admitted at v14 would hold them pending.
+/// Moved without this, `measure` routing `build` would find `build`
+/// skipped and the packet stranded.
+///
+/// IT IS NOT THE ONLY WRITER OF SKIPPED, and this does not pretend it
+/// is (review of 28f3f28a). A terminal close skips the steps it leaves
+/// behind — excluded here, because only an open packet is re-derived.
+/// A hand skip also writes it: through the step door before its
+/// skip-guard landed (2026-09-25), and on a step no protocol step pairs
+/// with. Such a skip on an open packet, where the target's predicate
+/// can still hold, IS undone by the move. That is why the move names
+/// every step it un-skips in its record ([`RepinPlan::unskipped`], the
+/// `unskipped` list of the `repins` entry and the event): an undone
+/// hand skip is visible there, not discovered later.
+///
+/// So each skipped step the target still has is set pending and the
+/// target's readiness is run over the packet as the move leaves it (its
+/// rows, plus a pending row for each step the target inserts) — the
+/// same engine, pairing and context the live pass uses. A step it skips
+/// again stays skipped and is not written; one it leaves pending or
+/// opens is re-derived, and the door's readiness pass after the move
+/// opens it for real. A skipped step the target drops is not the
+/// target's to judge and is never un-skipped.
+fn rederived_live<'a>(
+    to: &WorkflowSpec,
+    job: &Job,
+    steps: &'a [Step],
+    target: &[Step],
+) -> BTreeSet<&'a str> {
+    let skipped: BTreeSet<&str> = steps
+        .iter()
+        .filter(|s| s.status == StepStatus::Skipped)
+        .filter_map(|s| s.spec_slug.as_deref())
+        .filter(|slug| to.steps.iter().any(|t| t.title == *slug))
+        .collect();
+    if skipped.is_empty() {
+        return skipped;
+    }
+    let carried: BTreeSet<&str> = steps
+        .iter()
+        .filter_map(|s| s.spec_slug.as_deref())
+        .collect();
+    let mut after: Vec<Step> = steps
+        .iter()
+        .map(|s| Step {
+            status: if s.status == StepStatus::Skipped {
+                StepStatus::Pending
+            } else {
+                s.status
+            },
+            ..s.clone()
+        })
+        .chain(
+            target
+                .iter()
+                .filter(|t| !t.spec_slug.as_deref().is_some_and(|s| carried.contains(s)))
+                .map(|t| Step {
+                    status: StepStatus::Pending,
+                    ..t.clone()
+                }),
+        )
+        .collect();
+    crate::registry::reevaluate(to, &mut after, &job.subject, &job.metadata);
+    after
+        .iter()
+        .filter(|s| s.status != StepStatus::Skipped)
+        .filter_map(|s| s.spec_slug.as_deref())
+        .filter_map(|slug| skipped.get(slug).copied())
+        .collect()
 }
 
 /// The row's metadata with every key the two projections disagree on
@@ -249,6 +400,7 @@ fn differences(before: &Step, after: &Step) -> Vec<String> {
         .filter(|k| b.get(*k) != a.get(*k))
         .map(|k| format!("`{k}`"));
     let columns = [
+        (before.status != after.status, "status"),
         (before.kind != after.kind, "kind"),
         (before.title != after.title, "title"),
         (before.fields != after.fields, "fields"),
@@ -291,6 +443,7 @@ pub fn record(
         "at": at.to_rfc3339(),
         "reprojected": reprojected,
         "inserted": inserted,
+        "unskipped": plan.unskipped(),
     })
 }
 
@@ -594,6 +747,168 @@ mod tests {
         assert_eq!(plan(&v1, &v2, &j, &rows), Ok(RepinPlan::default()));
     }
 
+    /// A step routed on `triage`'s disposition, and optionally on
+    /// `measure`'s too — the arm backlog-item v14 added (4c6b4b74).
+    fn routed(title: &str, route: &str, via_measure: bool) -> StepSpec {
+        let mut s = step(title);
+        s.ready_when =
+            format!("steps.triage.done AND steps.triage.metadata.disposition = \"{route}\"");
+        if via_measure {
+            s.ready_when = format!(
+                "({}) OR (steps.measure.done AND steps.measure.metadata.disposition = \"{route}\")",
+                s.ready_when
+            );
+        }
+        s
+    }
+
+    /// The 70da1212 shape, reduced: triage routed `verify`, so under
+    /// `from` the engine skipped `build`; `measure` stands at `measure`.
+    fn at_measure(from: &WorkflowSpec, j: &Job, measure: StepStatus) -> Vec<Step> {
+        let mut rows = admitted(from, j, &["triage"]);
+        for r in rows.iter_mut() {
+            match r.spec_slug.as_deref() {
+                Some("triage") => r.metadata["disposition"] = json!("verify"),
+                Some("measure") => r.status = measure,
+                Some("build") => r.status = StepStatus::Skipped,
+                _ => {}
+            }
+        }
+        rows
+    }
+
+    fn measure_after_triage() -> StepSpec {
+        routed("measure", "verify", false)
+    }
+
+    /// Backlog 4c6b4b74. Skipped is DERIVED — the readiness engine sets
+    /// it from a predicate, with no actor and no evidence — so a re-pin
+    /// re-derives it under the target. The target can still reach
+    /// `build` from `measure`, which is still to run: the row is
+    /// pending again, reads the target's text, and the record names
+    /// the status change.
+    #[test]
+    fn a_skipped_step_the_target_can_still_reach_is_pending_again() {
+        let j = job();
+        let v2 = wf(
+            2,
+            vec![
+                step("triage"),
+                measure_after_triage(),
+                routed("build", "build", false),
+            ],
+        );
+        let mut build = routed("build", "build", true);
+        build.metadata_defaults = json!({ "procedure": "Build it." });
+        let v14 = wf(14, vec![step("triage"), measure_after_triage(), build]);
+        let rows = at_measure(&v2, &j, StepStatus::Active);
+
+        let p = plan(&v2, &v14, &j, &rows).expect("planned");
+        let b = named(&p, "build");
+        assert_eq!(b.step.status, StepStatus::Pending);
+        assert!(b.unskipped, "{b:?}");
+        assert_eq!(
+            b.step.metadata["procedure"], "Build it.",
+            "the target's text"
+        );
+        assert!(b.changed.iter().any(|c| c == "status"), "{b:?}");
+        assert_eq!(b.step.id, rows[2].id, "the packet's own row");
+        let entry = record(
+            &p,
+            2,
+            14,
+            "emp-bootstrap-admin",
+            chrono::DateTime::<chrono::Utc>::MIN_UTC,
+        );
+        assert_eq!(
+            entry["unskipped"],
+            json!(["build"]),
+            "the un-skip is named in the record"
+        );
+    }
+
+    /// ...and one the target still cannot reach is skipped again in the
+    /// same pass: it is not written at all, and keeps what it ran under.
+    #[test]
+    fn a_skipped_step_the_target_still_cannot_reach_stays_skipped() {
+        let j = job();
+        let v2 = wf(
+            2,
+            vec![
+                step("triage"),
+                measure_after_triage(),
+                routed("build", "build", false),
+            ],
+        );
+        let mut build = routed("build", "build", true);
+        build.metadata_defaults = json!({ "procedure": "Build it." });
+        let v14 = wf(14, vec![step("triage"), measure_after_triage(), build]);
+        let mut rows = at_measure(&v2, &j, StepStatus::Completed);
+        rows[1].metadata["disposition"] = json!("stale");
+
+        let p = plan(&v2, &v14, &j, &rows).expect("planned");
+        assert!(
+            p.reprojected
+                .iter()
+                .all(|r| r.step.spec_slug.as_deref() != Some("build")),
+            "measure routed stale, so v14 cannot reach build either: {p:?}"
+        );
+    }
+
+    /// REVIEW PROBE A (4c6b4b74): a packet no longer open is not walked
+    /// again, so nothing on it is re-derived. A terminal close skipped
+    /// `measure`, whose predicate is `true`; the target changes only a
+    /// procedure. On main this planned (the skipped row simply frozen),
+    /// and it must still: re-deriving here refused it as "would re-open
+    /// its skipped measure".
+    #[test]
+    fn a_closed_packet_is_not_re_derived_and_plans_as_before() {
+        let mut j = job();
+        j.status = JobStatus::Closed;
+        let v1 = wf(
+            1,
+            vec![
+                with_procedure("triage", "a"),
+                with_procedure("measure", "m"),
+            ],
+        );
+        let v2 = wf(
+            2,
+            vec![
+                with_procedure("triage", "b"),
+                with_procedure("measure", "m2"),
+            ],
+        );
+        let mut rows = admitted(&v1, &j, &["triage"]);
+        rows[1].status = StepStatus::Skipped;
+
+        let p = plan(&v1, &v2, &j, &rows).expect("a closed packet still plans");
+        assert!(
+            p.reprojected
+                .iter()
+                .all(|r| r.step.spec_slug.as_deref() != Some("measure") && !r.unskipped),
+            "the skipped row keeps what it ran under: {p:?}"
+        );
+    }
+
+    /// REVIEW PROBE B: a skipped step the TARGET drops is not the
+    /// target's to re-derive, whatever the packet's status — it was
+    /// named in a refusal as a step v2 does not have.
+    #[test]
+    fn a_skipped_step_the_target_drops_is_never_unskipped() {
+        for status in [JobStatus::Open, JobStatus::Closed] {
+            let mut j = job();
+            j.status = status;
+            let v1 = wf(1, vec![step("triage"), after("gone", "triage")]);
+            let v2 = wf(2, vec![step("triage")]);
+            let mut rows = admitted(&v1, &j, &["triage"]);
+            rows[1].status = StepStatus::Skipped;
+
+            let p = plan(&v1, &v2, &j, &rows).expect("planned");
+            assert!(p.unskipped().is_empty(), "{status:?}: {p:?}");
+        }
+    }
+
     /// A packet whose rows predate `spec_slug` cannot be paired by name.
     #[test]
     fn a_packet_without_slugs_is_refused_rather_than_duplicated() {
@@ -628,6 +943,11 @@ mod tests {
         assert_eq!(entry["reprojected"][0]["step"], "file");
         assert_eq!(entry["reprojected"][0]["changed"][0], "`procedure`");
         assert_eq!(entry["inserted"][0]["step"], "archived");
+        assert_eq!(
+            entry["unskipped"],
+            json!([]),
+            "a move that un-skips nothing says so"
+        );
 
         let once = appended(&json!({"other": 1}), &entry);
         let twice = appended(&once, &entry);
@@ -638,5 +958,98 @@ mod tests {
             "abc",
             "the marker names its packet"
         );
+    }
+
+    fn reserved(title: &str, writer: Option<&str>) -> StepSpec {
+        let mut s = step(title);
+        s.fields = vec![StepField {
+            name: "plan".into(),
+            field_type: "string".into(),
+            required: true,
+            filled_by: boss_core::job::FilledBy::Executor,
+            item_keys: Vec::new(),
+            covers: None,
+            binds: None,
+            item_value_max_bytes: None,
+            item_one_of: Vec::new(),
+            writer: writer.map(str::to_string),
+        }];
+        s
+    }
+
+    /// THE CONVERT DOOR HONOURS A DECLARED WRITER (backlog 6c9183de,
+    /// review S1 of car 1e603cfd, 2026-09-26). A re-pin rewrote a live
+    /// step's `fields` from the target wholesale, so a version that
+    /// dropped or renamed a field's writer released the key on a packet
+    /// already carrying a value only that writer may put there — and one
+    /// that ADDED a writer would present a value anyone wrote as the
+    /// declared writer's. Each is refused, naming the step and both
+    /// writers, and the dry run shows it as an obstacle.
+    #[test]
+    fn a_live_steps_declared_writer_does_not_move_on_a_repin() {
+        let j = job();
+        let v1 = wf(1, vec![reserved("approve", Some("runner:ops"))]);
+        let mut rows = admitted(&v1, &j, &[]);
+        rows[0].metadata["plan"] = json!("PLAN a");
+        for (target, shown) in [
+            (reserved("approve", None), "none"),
+            (reserved("approve", Some("runner:other")), "runner:other"),
+            (step("approve"), "none"),
+        ] {
+            let why = plan(&v1, &wf(2, vec![target]), &j, &rows).expect_err("refused");
+            assert!(
+                why.0.contains("approve")
+                    && why.0.contains("`plan`")
+                    && why.0.contains("runner:ops")
+                    && why.0.contains(shown),
+                "{why:?}"
+            );
+        }
+        // Declaring a writer on a live key is the same move, the other
+        // way round.
+        let v1 = wf(1, vec![reserved("approve", None)]);
+        let rows = admitted(&v1, &j, &[]);
+        let v2 = wf(2, vec![reserved("approve", Some("runner:ops"))]);
+        assert!(plan(&v1, &v2, &j, &rows).is_err());
+        // A COMPLETED step keeps the fields it ran under, so its
+        // declaration is not the target's to move.
+        let done = admitted(&v1, &j, &["approve"]);
+        assert!(plan(&v1, &v2, &j, &done).is_ok());
+    }
+
+    /// A re-pin never writes a key its protocol reserves: a target that
+    /// projects a default into a declared writer's key is refused, not
+    /// applied — the re-projection is the protocol writing, and the
+    /// protocol is not the declared writer.
+    #[test]
+    fn a_repin_never_writes_a_reserved_key() {
+        let j = job();
+        let v1 = wf(1, vec![reserved("approve", Some("runner:ops"))]);
+        let rows = admitted(&v1, &j, &[]);
+        let mut target = reserved("approve", Some("runner:ops"));
+        target.metadata_defaults = json!({ "plan": "PLAN wipe" });
+        let why = plan(&v1, &wf(2, vec![target]), &j, &rows).expect_err("refused");
+        assert!(
+            why.0.contains("`plan`") && why.0.contains("runner:ops"),
+            "{why:?}"
+        );
+    }
+
+    /// CONTROL: a step that declares a writer still moves when the
+    /// target changes nothing about it — its procedure re-projects.
+    #[test]
+    fn a_step_with_a_declared_writer_still_takes_an_unrelated_change() {
+        let j = job();
+        let mut a = reserved("approve", Some("runner:ops"));
+        a.metadata_defaults = json!({ "procedure": "Read it." });
+        let mut b = reserved("approve", Some("runner:ops"));
+        b.metadata_defaults = json!({ "procedure": "Read all of it." });
+        let v1 = wf(1, vec![a]);
+        let mut rows = admitted(&v1, &j, &[]);
+        rows[0].metadata["plan"] = json!("PLAN a");
+        let p = plan(&v1, &wf(2, vec![b]), &j, &rows).expect("planned");
+        let approve = named(&p, "approve");
+        assert_eq!(approve.step.metadata["procedure"], "Read all of it.");
+        assert_eq!(approve.step.metadata["plan"], "PLAN a");
     }
 }

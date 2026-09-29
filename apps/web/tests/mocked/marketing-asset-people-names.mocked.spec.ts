@@ -18,7 +18,7 @@ const json = (r: Route, body: unknown, status = 200): Promise<void> =>
 
 const ASSET = {
   id: 'ma-owned', title: 'Autumn tap list', kind: null, description: null, file_url: null,
-  tags: [], linked_device_skus: [], linked_account_ids: [], linked_campaign_ids: [],
+  tags: [], linked_skus: [], linked_account_ids: [], linked_campaign_ids: [],
   owner_id: 'emp-mkt-1', brand_reviewed_by: 'emp-brand-2', brand_reviewed_at: null,
   supersedes_id: null, retired_at: null,
   created_at: '2026-09-01T00:00:00Z', updated_at: '2026-09-02T00:00:00Z',

@@ -481,7 +481,12 @@ fn the_census_is_one_document_read_through_the_postgres_container() {
         "LEFT JOIN jobs",
         "partition",
         "FROM event_outbox",
-        "delivered_at IS NULL",
+        // Pending is the relay's own predicate, and a dead letter is
+        // counted apart from it (backlog e22b692e): the relay has
+        // finished with a dead-lettered row, so it is not lag.
+        "delivered_at IS NULL AND dead_lettered_at IS NULL",
+        "dead_lettered_at IS NOT NULL AND dead_letter_resolved_at IS NULL",
+        "'dead_lettered'",
         "FROM event_facts",
     ] {
         assert!(log_sql.contains(want), "log query lacks {want}:\n{log_sql}");

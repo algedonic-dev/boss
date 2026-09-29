@@ -102,6 +102,39 @@ use super::spool::{PostFuture, Spool};
 /// as unknown rather than compared wrongly.
 pub(crate) const KNOWN_SCOPE: &str = "kubernetes-nodes";
 
+/// The field every comparison names the ids it JUDGED in, per findings
+/// field: `{"disk_tight": ["w-1", …], "not_ready": […], …}` (backlog
+/// c11bfb77). A finding's absence says the condition is gone only where
+/// the comparator looked; an id whose reading was unmeasured, unread or
+/// simply not in the observation is not listed, and `estate.recover`
+/// counts a comparison toward recovery only for a key listed here (or
+/// present). Without it an `ops_credentials_absent` alarm on a host
+/// whose credentials were never readable closed itself in three rows.
+pub(crate) const EVALUATED: &str = "evaluated";
+
+/// The ids of the observed nodes carrying both disk readings — the
+/// ones the floor was applied to. The rest are `disk_unmeasured`.
+fn disk_evaluated(observed: &[&Json]) -> Vec<Json> {
+    observed
+        .iter()
+        .filter(|n| {
+            n.get("disk_free_gb").and_then(Json::as_i64).is_some()
+                && n.get("disk_gb").and_then(Json::as_i64).is_some()
+        })
+        .filter_map(|n| n.get("id").cloned())
+        .collect()
+}
+
+/// The ids of the observed nodes carrying a `ready` reading — a node
+/// without one was not judged ready or not.
+fn ready_evaluated(observed: &[&Json]) -> Vec<Json> {
+    observed
+        .iter()
+        .filter(|n| n.get("ready").and_then(Json::as_bool).is_some())
+        .filter_map(|n| n.get("id").cloned())
+        .collect()
+}
+
 /// The per-host scope (`observe-host.sh`). A host observation carries
 /// ONE machine — the script reads its own /proc — so its comparison is
 /// SELF-SCOPED: declared-vs-observed for exactly the ids in the
@@ -133,6 +166,21 @@ pub(crate) const UNITS_SCOPE: &str = "host-units";
 /// series for the whole scope — every door rides one observation — so
 /// its comparisons carry no `host`, as the cluster's do not.
 pub(crate) const DOOR_SCOPE: &str = "door";
+
+/// The forge's reading of each cluster node's kubelet filesystem
+/// through the Talos API (`infra/estate/observe-nodefs.sh`, backlog
+/// eeac3d56). It exists because the in-cluster observer's own free-space
+/// read went through the kubelet as `get nodes/proxy`, which is exec into
+/// any pod; the reading moved outside the cluster and the grant went.
+///
+/// It is an INPUT, not a series judged here: the kubernetes-nodes
+/// observer carries the newest reading's figures onto its own
+/// observation, and the disk floor, `disk_unmeasured` and the blind-class
+/// alarm are all judged THERE, once. So [`compare_nodefs`] records what
+/// the reading held and names the nodes the forge could not read, and
+/// raises no class of its own — a second judgement would file every
+/// cluster disk alarm twice, under two series that recover separately.
+pub(crate) const NODEFS_SCOPE: &str = "talos-nodefs";
 
 /// The disk floor that turns a reading into a HARD finding (49a8d842:
 /// the forge host — 228G, 83% full, "THE TIGHT ONE" — could fill and
@@ -279,6 +327,11 @@ pub(crate) fn compare_host(declared: &[Json], observation: &Json) -> Json {
     let mut not_ready: Vec<Json> = Vec::new();
     let mut ops_absent: Vec<Json> = Vec::new();
     let mut ops_unmeasured: Vec<Json> = Vec::new();
+    // Every declared host whose credentials were JUDGED: absent, present,
+    // or owing none (a host that stopped declaring the role no longer
+    // carries the claim). Never an unmeasured one — the forge's rows were
+    // all unmeasured for a week (c11bfb77).
+    let mut ops_evaluated: Vec<Json> = Vec::new();
 
     for node in &observed {
         let Some(id) = node.get("id").and_then(Json::as_str) else {
@@ -303,9 +356,12 @@ pub(crate) fn compare_host(declared: &[Json], observation: &Json) -> Json {
             continue;
         };
         match ops_credentials_finding(dec, node) {
-            Some(Ok(finding)) => ops_absent.push(finding),
+            Some(Ok(finding)) => {
+                ops_absent.push(finding);
+                ops_evaluated.push(json!(id));
+            }
             Some(Err(unmeasured)) => ops_unmeasured.push(unmeasured),
-            None => {}
+            None => ops_evaluated.push(json!(id)),
         }
         let mut fields = serde_json::Map::new();
         for key in ["cpu", "memory_gb"] {
@@ -344,6 +400,11 @@ pub(crate) fn compare_host(declared: &[Json], observation: &Json) -> Json {
             "ops_credentials_absent": ops_absent,
             "ops_credentials_unmeasured": ops_unmeasured,
         },
+        EVALUATED: {
+            "not_ready": ready_evaluated(&observed),
+            "disk_tight": disk_evaluated(&observed),
+            "ops_credentials_absent": ops_evaluated,
+        },
     })
 }
 
@@ -351,25 +412,127 @@ pub(crate) fn compare_host(declared: &[Json], observation: &Json) -> Json {
 /// under its ops directory (`infra/estate/roles.toml`, design 1bc4b4ed).
 const CLUSTER_OPERATOR_ROLE: &str = "cluster-operator";
 
+/// The tree's estate declaration, compiled in for ONE part of it: the
+/// `[ops_credentials.<host>]` tables, which say which credentials each
+/// cluster-operator holds and who brings each into being (design
+/// 835c0c9c, decision 3; backlog f371c749). The shell check on the
+/// hosts reads the same tables from the same file; a test in
+/// boss-testing (a_host_declares_the_ops_credentials_it_holds) holds the
+/// two readings equal, because two parsers of one spelling can still
+/// disagree (CLAUDE.md §9a). The node rows themselves are the registry's
+/// (`declared`, read over HTTP) and are not read from here.
+const ESTATE_TOML: &str = include_str!("../../../../../infra/estate/estate.toml");
+
+/// Who brings a declared credential into being — the whole of what the
+/// alarm's act text turns on.
+#[derive(Debug, Clone, PartialEq)]
+enum Material {
+    /// Cannot be minted from anything the estate holds: placing it is
+    /// David's act.
+    Root,
+    /// Derivable, so the credential broker delivers it — never a hand
+    /// placement (CLAUDE.md §Doors, the credential broker). `delivery`
+    /// is the packet that builds or runs that delivery.
+    Scoped {
+        delivery: String,
+        delivery_title: String,
+    },
+}
+
+/// A talosconfig has no scoped form (design 835c0c9c, decision 3), so a
+/// declaration that calls one scoped is refused rather than believed —
+/// it would route Talos admin to a delivery that cannot narrow it.
+const UNSCOPABLE: &str = "talosconfig";
+
+/// Every host's declared credential set, by host id. A malformed
+/// declaration is refused whole, naming the entry — never read in part.
+fn ops_credential_sets(text: &str) -> Result<Vec<(String, Vec<(String, Material)>)>, String> {
+    let table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+    let Some(sets) = table.get("ops_credentials") else {
+        return Ok(Vec::new());
+    };
+    let sets = sets
+        .as_table()
+        .ok_or("[ops_credentials] is not a table of hosts")?;
+    sets.iter()
+        .map(|(host, creds)| {
+            let creds = creds
+                .as_table()
+                .ok_or(format!("[ops_credentials.{host}] is not a table"))?;
+            let parsed = creds
+                .iter()
+                .map(|(cred, spec)| {
+                    let field = |k: &str| spec.get(k).and_then(toml::Value::as_str);
+                    let material = match (field("material"), field("delivery"), field("delivery_title")) {
+                        (Some("root"), None, None) => Material::Root,
+                        (Some("scoped"), Some(d), Some(t)) if cred != UNSCOPABLE && !d.is_empty() => {
+                            Material::Scoped {
+                                delivery: d.to_string(),
+                                delivery_title: t.to_string(),
+                            }
+                        }
+                        _ => {
+                            return Err(format!(
+                                "ops_credentials.{host}.{cred}: want {{ material = \"root\" }} or \
+                                 {{ material = \"scoped\", delivery, delivery_title }} (a {UNSCOPABLE} \
+                                 is never scoped), got {spec}"
+                            ));
+                        }
+                    };
+                    Ok((cred.clone(), material))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok((host.clone(), parsed))
+        })
+        .collect()
+}
+
+/// The act that brings one declared credential into being, in words a
+/// reader acts on. Root material names David; a scoped credential names
+/// its broker delivery and never a person.
+fn ops_credential_act(dir: &str, id: &str, cred: &str, material: &Material) -> String {
+    match material {
+        Material::Root => format!(
+            "place {dir}/{cred} root:root 600 on {id} — root material, David's act \
+             (design 835c0c9c)"
+        ),
+        Material::Scoped {
+            delivery,
+            delivery_title,
+        } => format!(
+            "{dir}/{cred} on {id} is a scoped credential the credential broker delivers \
+             (backlog {delivery}: {delivery_title}) — never placed by hand"
+        ),
+    }
+}
+
 /// The declared credential set, judged (backlog 714bc71f). A host that
-/// DECLARES `cluster-operator` is expected to hold the admin kubeconfig
-/// and talosconfig David places (design 835c0c9c: root material "cannot
-/// be minted from anything the estate holds, so placing it stays
-/// David's act"). The converge records their absence as not-ready and
-/// must not fail over it — no converge can repair it — so this is where
-/// the absence becomes something a reader is interrupted by: a HARD
-/// finding `estate.alarm` raises as one urgent packet per host, whose
-/// entry names the act that clears it.
+/// DECLARES `cluster-operator` is expected to hold the set its
+/// `[ops_credentials.<id>]` table in estate.toml names ([`ESTATE_TOML`]):
+/// the forge its admin kubeconfig and talosconfig, root material only
+/// David can place; boss-gcp the scoped break-glass kubeconfig alone,
+/// which the credential broker delivers (backlog f371c749 — until
+/// 2026-09-29 every operator was judged against the forge's set, and the
+/// act told David to hand-place a talosconfig on the public edge). The
+/// converge records an absence as not-ready and must not fail over it —
+/// no converge can repair it — so this is where the absence becomes
+/// something a reader is interrupted by: a HARD finding `estate.alarm`
+/// raises as one urgent packet per host, whose entry names, credential
+/// by credential, the act that clears it.
 ///
 /// The observation carries `ops_credentials: {dir, state}`, where
 /// `state` is the one check's own words (`infra/estate/ops-credentials.sh`,
 /// read by the converge too): `present`, `not ready: <cred>:<why> …`,
-/// or `unmeasured: …`. Only `not ready` is hard — it covers a file that
-/// is there with the wrong owner or mode as well as one that is absent,
-/// and the entry quotes which. A reading that is missing or unmeasured
-/// on a declared operator is `Err` — informational, never hard (a guess
-/// is the crying-wolf class), but never silently clean either.
-/// `None` for a host that does not declare the role or holds its set.
+/// `unmeasured: …` or `undeclared: …`. Only `not ready` NAMING A
+/// DECLARED CREDENTIAL is hard — it covers a file that is there with the
+/// wrong owner or mode as well as one that is absent, and the entry
+/// quotes which; a credential the host is not declared to hold is no
+/// finding, whatever an older observer checked. A reading that is
+/// missing, unmeasured or undeclared on a declared operator, or an
+/// operator the tree declares no set for, is `Err` — informational,
+/// never hard (a guess is the crying-wolf class), but never silently
+/// clean either. `None` for a host that does not declare the role or
+/// holds its set.
 fn ops_credentials_finding(declared: &Json, node: &Json) -> Option<Result<Json, Json>> {
     let declares = declared
         .get("roles")
@@ -379,6 +542,27 @@ fn ops_credentials_finding(declared: &Json, node: &Json) -> Option<Result<Json, 
         return None;
     }
     let id = node.get("id").and_then(Json::as_str).unwrap_or("");
+    let set = match ops_credential_sets(ESTATE_TOML) {
+        Ok(sets) => sets
+            .into_iter()
+            .find(|(host, _)| host == id)
+            .map(|(_, s)| s),
+        Err(why) => {
+            return Some(Err(json!({
+                "id": id,
+                "state": format!("infra/estate/estate.toml's credential declaration does not parse: {why}"),
+            })));
+        }
+    };
+    let Some(set) = set.filter(|s| !s.is_empty()) else {
+        return Some(Err(json!({
+            "id": id,
+            "state": format!(
+                "{id} declares {CLUSTER_OPERATOR_ROLE}, but infra/estate/estate.toml declares no \
+                 [ops_credentials.{id}] set, so there is nothing to judge its reading against"
+            ),
+        })));
+    };
     let creds = node.get("ops_credentials");
     let state = creds
         .and_then(|c| c.get("state"))
@@ -399,14 +583,24 @@ fn ops_credentials_finding(declared: &Json, node: &Json) -> Option<Result<Json, 
         .and_then(|c| c.get("dir"))
         .and_then(Json::as_str)
         .unwrap_or("/etc/boss-ops");
+    // The check writes each shortfall as ` <cred>:<why>`, so a declared
+    // name preceded by a space and followed by a colon is one it named.
+    let short: Vec<&(String, Material)> = set
+        .iter()
+        .filter(|(cred, _)| state.contains(&format!(" {cred}:")))
+        .collect();
+    if short.is_empty() {
+        return None;
+    }
     Some(Ok(json!({
         "id": id,
         "state": state,
-        "act": format!(
-            "place {dir}/kubeconfig and {dir}/talosconfig root:root 600 on {id} — root \
-             material, David's act (design 835c0c9c); until then the broker's rotations \
-             cannot be delivered there"
-        ),
+        "credentials": short.iter().map(|(cred, _)| cred.as_str()).collect::<Vec<_>>(),
+        "act": short
+            .iter()
+            .map(|(cred, material)| ops_credential_act(dir, id, cred, material))
+            .collect::<Vec<_>>()
+            .join("; "),
     })))
 }
 
@@ -640,6 +834,19 @@ pub(crate) fn compare(declared: &[Json], observation: &Json) -> Json {
             "dead_letters_unrecorded": dead_letters_unrecorded,
             "dispatcher_unread": dispatcher_unread,
         },
+        EVALUATED: {
+            "not_ready": ready_evaluated(&observed),
+            // Every participating declared row is judged here: seen, or
+            // declared and not seen.
+            "declared_not_observed": participating
+                .iter()
+                .filter_map(|d| d.get("id").cloned())
+                .collect::<Vec<_>>(),
+            "disk_tight": disk_evaluated(&observed),
+            // Judged only when the counters were read: an unread
+            // dispatcher yields no finding AND no evaluation.
+            "dead_letters_unrecorded": if dispatcher_unread.is_none() { vec![DISPATCHER_ID] } else { vec![] },
+        },
     })
 }
 
@@ -688,6 +895,10 @@ pub(crate) fn compare_units(observation: &Json) -> Json {
 
     let mut units = 0usize;
     let mut units_unhealthy: Vec<Json> = Vec::new();
+    // `<host>/<unit>` for every unit this observation reported on — the
+    // id the raiser keys a unit by. A unit the observer stopped watching
+    // is no longer judged, so its alarm is not closed by its absence.
+    let mut units_evaluated: Vec<Json> = Vec::new();
 
     for node in &nodes {
         let host = node.get("id").and_then(Json::as_str).unwrap_or("");
@@ -699,6 +910,12 @@ pub(crate) fn compare_units(observation: &Json) -> Json {
             .flatten()
         {
             units += 1;
+            if let Some(name) = unit.get("unit").and_then(Json::as_str)
+                && !host.is_empty()
+                && !name.is_empty()
+            {
+                units_evaluated.push(json!(format!("{host}/{name}")));
+            }
             if unit.get("healthy").and_then(Json::as_bool) == Some(true) {
                 continue;
             }
@@ -738,6 +955,9 @@ pub(crate) fn compare_units(observation: &Json) -> Json {
         "findings": {
             "units_unhealthy": units_unhealthy,
         },
+        EVALUATED: {
+            "units_unhealthy": units_evaluated,
+        },
     })
 }
 
@@ -775,6 +995,8 @@ pub(crate) fn compare_door(observation: &Json) -> Json {
     let mut halves = 0usize;
     let mut door_dark: Vec<Json> = Vec::new();
     let mut door_dimming: Vec<Json> = Vec::new();
+    // `<door>/<half>` for every half probed, open or dark.
+    let mut halves_evaluated: Vec<Json> = Vec::new();
 
     for door in &doors {
         let id = door.get("id").and_then(Json::as_str).unwrap_or("");
@@ -787,10 +1009,11 @@ pub(crate) fn compare_door(observation: &Json) -> Json {
             .flatten()
         {
             halves += 1;
+            let name = half.get("half").and_then(Json::as_str).unwrap_or("");
+            halves_evaluated.push(json!(format!("{id}/{name}")));
             if half.get("open").and_then(Json::as_bool) == Some(true) {
                 continue;
             }
-            let name = half.get("half").and_then(Json::as_str).unwrap_or("");
             let dark_since = half.get("dark_since").and_then(Json::as_str);
             let dark_for_s = match (observed_at, dark_since) {
                 (Some(at), Some(since)) => chrono::DateTime::parse_from_rfc3339(since)
@@ -826,7 +1049,41 @@ pub(crate) fn compare_door(observation: &Json) -> Json {
             "door_dark": door_dark,
             "door_dimming": door_dimming,
         },
+        EVALUATED: {
+            "door_dark": halves_evaluated,
+        },
         "doors": doors,
+    })
+}
+
+/// The talos-nodefs record, pure (see [`NODEFS_SCOPE`]): how many nodes
+/// the reading held, and each one the forge could not read with the
+/// reason it gave. Informational only — the judgement is the
+/// kubernetes-nodes comparison's.
+pub(crate) fn compare_nodefs(observation: &Json) -> Json {
+    let nodes: Vec<&Json> = observation
+        .get("nodes")
+        .and_then(Json::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    let unread: Vec<Json> = nodes
+        .iter()
+        .filter(|n| n.get("disk_free_gb").and_then(Json::as_i64).is_none())
+        .map(|n| {
+            json!({
+                "id": n.get("id"),
+                "why": n.get("unread").cloned().unwrap_or_else(|| json!("no free figure")),
+            })
+        })
+        .collect();
+    json!({
+        "counts": {
+            "nodes": nodes.len(),
+            "unread": unread.len(),
+        },
+        "findings": {
+            "nodefs_unread": unread,
+        },
     })
 }
 
@@ -843,7 +1100,7 @@ const STAGE: &str = "estate.compare";
 /// failing is the same condition: the record cannot take this
 /// observation right now.
 async fn compare_and_record(
-    client: &reqwest::Client,
+    client: &boss_core::machine_token::Client,
     base: &str,
     rule: &str,
     observation: &Json,
@@ -899,6 +1156,10 @@ async fn compare_and_record(
         // was probed, when each half went dark, and the band it is
         // judged against (backlog e6406701).
         envelope(compare_door(observation))
+    } else if scope == NODEFS_SCOPE {
+        // An input to the kubernetes-nodes observation, recorded and
+        // never judged here (backlog eeac3d56).
+        envelope(compare_nodefs(observation))
     } else {
         // An observation from an instrument this comparator does
         // not understand. Guessing which declared rows it should
@@ -920,7 +1181,7 @@ async fn compare_and_record(
 }
 
 pub struct EstateCompare {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
     spool: Spool,
 }
@@ -1479,6 +1740,30 @@ mod tests {
         assert_eq!(blind["findings"]["disk_unmeasured"][0], "w-1");
         let seeing = compare(&declared, &cluster_obs("w-1", 929, Some(390)));
         assert_eq!(seeing["counts"]["disk_unmeasured"], 0);
+        // And the blind node was not JUDGED, so its silence cannot close
+        // a disk_tight alarm (c11bfb77); the seeing one was.
+        assert_eq!(blind[EVALUATED]["disk_tight"], json!([]), "{blind}");
+        assert_eq!(seeing[EVALUATED]["disk_tight"], json!(["w-1"]), "{seeing}");
+        assert_eq!(blind[EVALUATED]["not_ready"], json!(["w-1"]), "{blind}");
+    }
+
+    #[test]
+    fn a_vanished_node_is_judged_gone_and_nothing_else() {
+        // w-2 is declared and not observed: the comparison judged its
+        // absence, and could not have judged its disk or readiness — so
+        // a disk_tight:w-2 alarm is not closed by the node disappearing.
+        let out = compare(
+            &declared_fixture(),
+            &observed(json!([
+                {"id":"cp-1","cpu":8,"memory_gb":15,"address":"10.20.0.11","ready":true},
+            ])),
+        );
+        assert_eq!(
+            out[EVALUATED]["declared_not_observed"],
+            json!(["cp-1", "w-2"])
+        );
+        assert_eq!(out[EVALUATED]["not_ready"], json!(["cp-1"]));
+        assert_eq!(out[EVALUATED]["disk_tight"], json!([]), "no disk readings");
     }
 
     #[test]
@@ -1587,6 +1872,19 @@ mod tests {
         let out = compare(&[], &with_dispatcher(json!({"recorded": true})));
         assert!(out["findings"]["dispatcher_unread"].is_string(), "{out}");
         assert_eq!(out["counts"]["dead_letters_unrecorded"], 0, "{out}");
+        // Unread is not judged: `dead_letters_unrecorded: []` here must
+        // not read as a clean reading to recovery (c11bfb77).
+        assert_eq!(
+            out[EVALUATED]["dead_letters_unrecorded"],
+            json!([]),
+            "{out}"
+        );
+        let read = compare(&[], &with_dispatcher(dispatcher(0, 0)));
+        assert_eq!(
+            read[EVALUATED]["dead_letters_unrecorded"],
+            json!([DISPATCHER_ID]),
+            "{read}"
+        );
     }
 
     // ----- the self-scoped host comparison (49a8d842) -----
@@ -1732,7 +2030,198 @@ mod tests {
                 body["findings"]["ops_credentials_unmeasured"][0]["id"], "forge",
                 "{body}"
             );
+            // Not judged, so not evidence the files arrived (c11bfb77) —
+            // while disk and readiness on the same row still were.
+            assert_eq!(
+                body[EVALUATED]["ops_credentials_absent"],
+                json!([]),
+                "{body}"
+            );
+            assert_eq!(body[EVALUATED]["disk_tight"], json!(["forge"]), "{body}");
         }
+        // Present, and a declared host that owes none, ARE judged.
+        let present = host_obs_creds("forge", json!({"state": "present"}));
+        let body = compare_host(&[operator("forge")], &present);
+        assert_eq!(body[EVALUATED]["ops_credentials_absent"], json!(["forge"]));
+        let plain = json!({"id": "forge", "role": "forge", "roles": []});
+        let body = compare_host(&[plain], &host_obs("forge", 95, 228));
+        assert_eq!(body[EVALUATED]["ops_credentials_absent"], json!(["forge"]));
+    }
+
+    fn edge_operator() -> Json {
+        json!({"id": "boss-gcp", "role": "bastion", "roles": ["cluster-operator", "ops-runner"]})
+    }
+
+    /// boss-gcp's reading on 2026-09-27, -28 and -29, verbatim (backlog
+    /// f371c749): an observer that checked the forge's set on every host.
+    const EDGE_READING: &str = "not ready: talosconfig:absent kubeconfig:absent";
+
+    #[test]
+    fn a_scoped_credential_names_its_broker_delivery_and_never_a_talosconfig() {
+        // Design 835c0c9c decision (3): boss-gcp is declared to hold the
+        // SCOPED break-glass kubeconfig and nothing else — a talosconfig
+        // has no scoped form, and a full one on the public edge is the
+        // unbounded grant the scoping exists to avoid. The alarm this
+        // replaces told David to place both by hand; obeying it would
+        // have put Talos admin on the edge.
+        let obs = host_obs_creds(
+            "boss-gcp",
+            json!({"dir": "/etc/boss-ops", "state": EDGE_READING}),
+        );
+        let body = compare_host(&[edge_operator()], &obs);
+        let found = &body["findings"]["ops_credentials_absent"];
+        assert_eq!(found.as_array().map(Vec::len), Some(1), "{body}");
+        assert_eq!(found[0]["id"], "boss-gcp");
+        assert_eq!(
+            found[0]["state"], EDGE_READING,
+            "the observer's words, kept"
+        );
+        assert_eq!(found[0]["credentials"], json!(["kubeconfig"]), "{body}");
+        let act = found[0]["act"].as_str().unwrap_or("");
+        assert!(
+            act.contains("kubeconfig") && act.contains("broker") && act.contains("7336cb5f"),
+            "a scoped credential names its broker delivery: {act}"
+        );
+        assert!(
+            !act.contains("talosconfig"),
+            "never a talosconfig on the public edge: {act}"
+        );
+        assert!(
+            !act.contains("David") && !act.contains("root material"),
+            "a derivable credential is the broker's, never a hand placement: {act}"
+        );
+    }
+
+    #[test]
+    fn an_absence_the_host_is_not_declared_to_hold_is_no_finding() {
+        // What boss-gcp reads once its kubeconfig is delivered, from an
+        // observer that still checks the forge's set: judged, and clean.
+        let obs = host_obs_creds(
+            "boss-gcp",
+            json!({"dir": "/etc/boss-ops", "state": "not ready: talosconfig:absent"}),
+        );
+        let body = compare_host(&[edge_operator()], &obs);
+        assert_eq!(body["counts"]["ops_credentials_absent"], 0, "{body}");
+        assert_eq!(
+            body[EVALUATED]["ops_credentials_absent"],
+            json!(["boss-gcp"]),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn root_material_stays_davids_act_one_credential_at_a_time() {
+        let obs = host_obs_creds(
+            "forge",
+            json!({"dir": "/etc/boss-ops", "state": "not ready: kubeconfig:absent"}),
+        );
+        let body = compare_host(&[operator("forge")], &obs);
+        let found = &body["findings"]["ops_credentials_absent"][0];
+        assert_eq!(found["credentials"], json!(["kubeconfig"]), "{body}");
+        let act = found["act"].as_str().unwrap_or("");
+        assert!(
+            act.contains("/etc/boss-ops/kubeconfig")
+                && act.contains("root:root 600")
+                && act.contains("David"),
+            "{act}"
+        );
+        assert!(
+            !act.contains("talosconfig"),
+            "only what is missing is named: {act}"
+        );
+    }
+
+    #[test]
+    fn a_cluster_operator_with_no_declared_set_is_unmeasured_not_clean() {
+        // A host that takes the role in the live registry before the tree
+        // declares what it holds: nothing to judge against, so neither a
+        // guess at the forge's set nor silence.
+        let host = json!({"id": "w-new", "role": "talos-worker", "roles": ["cluster-operator"]});
+        let obs = host_obs_creds("w-new", json!({"state": EDGE_READING}));
+        let body = compare_host(&[host], &obs);
+        assert_eq!(body["counts"]["ops_credentials_absent"], 0, "{body}");
+        let why = body["findings"]["ops_credentials_unmeasured"][0]["state"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            why.contains("w-new") && why.contains("estate.toml"),
+            "names the missing declaration: {body}"
+        );
+        assert_eq!(body[EVALUATED]["ops_credentials_absent"], json!([]));
+    }
+
+    #[test]
+    fn every_cluster_operator_in_the_tree_declares_its_credential_set() {
+        // The tree's [[node]] rows that declare the role, against the
+        // tables the comparator judges by — a host in one and not the
+        // other would read unmeasured forever, or be judged by nothing.
+        let table: toml::Table = toml::from_str(ESTATE_TOML).expect("estate.toml parses");
+        let mut operators: Vec<String> = table["node"]
+            .as_array()
+            .expect("[[node]] rows")
+            .iter()
+            .filter(|n| {
+                n.get("roles")
+                    .and_then(toml::Value::as_array)
+                    .is_some_and(|r| r.iter().any(|x| x.as_str() == Some(CLUSTER_OPERATOR_ROLE)))
+            })
+            .filter_map(|n| {
+                n.get("id")
+                    .and_then(toml::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        operators.sort();
+        let sets = ops_credential_sets(ESTATE_TOML).expect("the declaration parses");
+        let mut declared: Vec<String> = sets.iter().map(|(h, _)| h.clone()).collect();
+        declared.sort();
+        assert_eq!(declared, operators);
+        assert!(sets.iter().all(|(_, s)| !s.is_empty()), "{sets:?}");
+
+        // Decision (3), pinned where the comparator reads it: the public
+        // edge holds the scoped kubeconfig alone, delivered by the broker.
+        let edge = &sets
+            .iter()
+            .find(|(h, _)| h == "boss-gcp")
+            .expect("boss-gcp")
+            .1;
+        assert_eq!(edge.len(), 1, "{edge:?}");
+        assert_eq!(edge[0].0, "kubeconfig");
+        assert!(
+            matches!(&edge[0].1, Material::Scoped { delivery, .. } if delivery == "7336cb5f"),
+            "{edge:?}"
+        );
+        let forge = &sets.iter().find(|(h, _)| h == "forge").expect("forge").1;
+        assert!(
+            forge.iter().all(|(_, m)| *m == Material::Root) && forge.len() == 2,
+            "{forge:?}"
+        );
+    }
+
+    #[test]
+    fn a_declaration_the_comparator_cannot_act_on_is_refused_by_name() {
+        for (bad, names) in [
+            (
+                "[ops_credentials.edge]\ntalosconfig = { material = \"scoped\", delivery = \"x\", delivery_title = \"y\" }\n",
+                "ops_credentials.edge.talosconfig",
+            ),
+            (
+                "[ops_credentials.edge]\nkubeconfig = { material = \"scoped\" }\n",
+                "ops_credentials.edge.kubeconfig",
+            ),
+            (
+                "[ops_credentials.edge]\nkubeconfig = { material = \"root\", delivery = \"x\" }\n",
+                "ops_credentials.edge.kubeconfig",
+            ),
+            (
+                "[ops_credentials.edge]\nkubeconfig = \"root\"\n",
+                "ops_credentials.edge.kubeconfig",
+            ),
+        ] {
+            let why = ops_credential_sets(bad).expect_err(bad);
+            assert!(why.contains(names), "{why}");
+        }
+        assert!(ops_credential_sets("sor_url = \"x\"\n").unwrap().is_empty());
     }
 
     // ----- the self-scoped unit comparison (729329c6) -----
@@ -1793,6 +2282,12 @@ mod tests {
                 .unwrap()
                 .len(),
             0
+        );
+        // Both were judged, the retired one included: its old alarm is
+        // closed by evidence, not left open by the suppression.
+        assert_eq!(
+            body[EVALUATED]["units_unhealthy"],
+            json!(["boss-gcp/boss-train.service", "boss-gcp/forgejo.service"])
         );
     }
 
@@ -1892,6 +2387,11 @@ mod tests {
         assert_eq!(body["counts"]["dark"], 0);
         assert_eq!(body["findings"]["door_dark"], json!([]));
         assert_eq!(body["findings"]["door_dimming"], json!([]));
+        // Both halves were probed, so both were judged (c11bfb77).
+        assert_eq!(
+            body[EVALUATED]["door_dark"],
+            json!(["dev-ssh/lan", "dev-ssh/public"])
+        );
         // The halves ride the comparison, so a reader of the judged
         // record (boss orient) prints the door without a second read.
         assert_eq!(body["doors"][0]["id"], "dev-ssh");
@@ -2067,6 +2567,7 @@ mod tests {
 
     fn firing(observation: Json) -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "estate-compare-on-observation".into(),
             triggering_event_id: "evt-test".into(),
             triggering_topic: "jobs.estate.observed".into(),
@@ -2188,5 +2689,76 @@ mod tests {
             let _ = handler.invoke(&[], &ctx).await;
         }
         assert_eq!(handler.spool.waiting(), 1);
+    }
+
+    // ----- the forge's talos-nodefs reading (backlog eeac3d56) -----
+
+    fn nodefs_observation() -> Json {
+        json!({
+            "scope": NODEFS_SCOPE,
+            "observed_at": "2026-09-29T12:00:00Z",
+            "observer": "boss-estate-observe-nodefs",
+            "mount": "/var",
+            "nodes": [
+                {"id":"w-1","address":"10.20.0.21","disk_gb":929,"disk_free_gb":390},
+                {"id":"cp-9","address":"10.20.0.19","disk_gb":null,"disk_free_gb":null,
+                 "unread":"talosctl -n 10.20.0.19 mounts failed: connection refused"},
+            ],
+        })
+    }
+
+    #[tokio::test]
+    async fn a_talos_nodefs_reading_is_recorded_as_an_input_not_an_unknown_scope() {
+        // The forge posts one every fifteen minutes. Read as an unknown
+        // scope, the comparison series would carry a shrug four times an
+        // hour for a reading this comparator knows exactly: the INPUT the
+        // kubernetes-nodes observer carries across, judged there.
+        let (record, base) = StubRecord::start().await;
+        let dir = SpoolDir::new("nodefs");
+        let handler = EstateCompare::with_spool(&base, Spool::at(&dir.0, 10));
+        handler
+            .invoke(&[], &firing(nodefs_observation()))
+            .await
+            .expect("the record takes the comparison");
+        let recorded = record.recorded.lock().expect("recorded lock").clone();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        let body = &recorded[0];
+        assert_eq!(body["scope"], NODEFS_SCOPE);
+        assert!(
+            body["findings"].get("unknown_scope").is_none(),
+            "a talos-nodefs reading was compared as an unknown scope: {body}"
+        );
+        assert_eq!(body["counts"]["nodes"], 2, "{body}");
+        assert_eq!(body["counts"]["unread"], 1, "{body}");
+        assert_eq!(body["findings"]["nodefs_unread"][0]["id"], "cp-9", "{body}");
+        assert!(
+            body["findings"]["nodefs_unread"][0]["why"]
+                .as_str()
+                .is_some_and(|w| w.contains("connection refused")),
+            "the unread node's reason did not ride the comparison: {body}"
+        );
+    }
+
+    #[test]
+    fn a_talos_nodefs_reading_raises_nothing_of_its_own() {
+        // The disk floor for a cluster node is judged ONCE, on the
+        // kubernetes-nodes comparison its figures are carried onto. A
+        // hard or blind class here as well would file every cluster disk
+        // alarm twice, under two series that recover separately.
+        let body = compare_nodefs(&nodefs_observation());
+        let findings = body["findings"].as_object().expect("findings object");
+        for (field, _) in super::super::estate_alarm::HARD_CLASSES
+            .iter()
+            .chain(super::super::estate_alarm::BLIND_CLASSES.iter())
+        {
+            assert!(
+                !findings.contains_key(*field),
+                "the talos-nodefs comparison carries `{field}`, which estate.alarm raises: {body}"
+            );
+        }
+        assert!(
+            body.get("host").is_none(),
+            "one series for the scope: {body}"
+        );
     }
 }

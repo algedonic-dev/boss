@@ -93,6 +93,7 @@
   import CodebaseTrendPage from './it/metrics/CodebaseTrendPage.svelte';
   import ProtocolDriftPage from './it/registry/ProtocolDriftPage.svelte';
   import AgentsPage from './it/agents/AgentsPage.svelte';
+  import CredentialsPage from './it/credentials/CredentialsPage.svelte';
   import IncidentsPage from './it/incidents/IncidentsPage.svelte';
   import LoginPage from './auth/LoginPage.svelte';
   import AuthAdminPage from './auth/AuthAdminPage.svelte';
@@ -462,6 +463,9 @@
     {:else if route.kind === 'systemAgents'}
       <ItTabs group="registry" active="/it/registry/agents" />
       <AgentsPage />
+    {:else if route.kind === 'systemCredentials'}
+      <ItTabs group="registry" active="/it/registry/credentials" />
+      <CredentialsPage />
     {:else if route.kind === 'inbox'}
       <InboxPage />
     {:else if route.kind === 'myCalendar'}

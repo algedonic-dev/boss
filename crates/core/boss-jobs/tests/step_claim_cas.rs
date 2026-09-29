@@ -317,3 +317,28 @@ async fn a_holder_the_claim_does_not_name_is_not_displaced() {
     assert_eq!(after.assignee_id.as_deref(), Some(EXECUTOR));
     assert_eq!(after.status, StepStatus::Ready);
 }
+
+/// A displaceable holder is compared by EXACT spelling: a registered id
+/// in the list does not displace a step its login holds, and the login
+/// listed does (backlog ce8b7d66, S1/S4 of the review of car 5d1c0b7a).
+/// So the route lists every spelling of a displaceable caller. The Pg
+/// half, where the alias table exists and could have been consulted, is
+/// `a_displaceable_holder_is_one_spelling_and_the_route_lists_each` in
+/// `a_claim_for_takes_a_ready_step_from_its_executor_pg.rs`.
+#[tokio::test]
+async fn a_displaceable_holder_is_compared_by_exact_spelling() {
+    let (jobs, step_id) = seeded_step(StepStatus::Ready, Some("claude@algedonic.dev")).await;
+    let by_id = jobs
+        .claim_step_displacing_at(&step_id, "emp-b", &["agent-claude".into()], &stamp(), &[])
+        .await;
+    assert!(
+        matches!(by_id, Err(JobsError::ClaimConflict { .. })),
+        "{by_id:?}"
+    );
+    let every_spelling = ["agent-claude".to_string(), "claude@algedonic.dev".into()];
+    let won = jobs
+        .claim_step_displacing_at(&step_id, "emp-b", &every_spelling, &stamp(), &[])
+        .await
+        .expect("the login, listed, is displaced");
+    assert_eq!(won.assignee_id.as_deref(), Some("emp-b"));
+}

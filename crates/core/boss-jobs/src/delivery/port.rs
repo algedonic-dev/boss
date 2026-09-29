@@ -73,8 +73,11 @@ pub trait DeliveryPolicyRegistry: Send + Sync {
     /// its declared version, active, stamped `now` — in that order,
     /// because `delivery_policy_one_active_per_name` is a plain partial
     /// unique index enforced per statement (the class
-    /// `registry-bump-retires-first` guards in migrations). A row
-    /// already at (name, version) is a conflict, not an overwrite.
+    /// `registry-bump-retires-first` guards in migrations). A version
+    /// not above the newest the name holds, in any status, is a
+    /// conflict — never an overwrite, and never a retirement of the
+    /// policy in force for a lower one (backlog df793bd7,
+    /// `crate::declared_version`).
     async fn publish_declared(
         &self,
         spec: DeliveryPolicySpec,

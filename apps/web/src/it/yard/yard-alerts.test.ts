@@ -199,6 +199,25 @@ describe('yardAlerts — what is wrong right now, each a button to its subject',
     );
   });
 
+  // A troubled packet must look troubled (CLAUDE.md §Diagnosis): the bay
+  // the gates region calls troubled — RUNNING past twice the median,
+  // never merely old in line (backlog 4d088a7e) — is an alert too.
+  test('a bay running past twice the median warns, with its two ages', () => {
+    const a = alertsOf(
+      yardOf(),
+      statusOf({
+        gates: { capacity: 3, active: [{
+          branch: 'feat/slow', packet_id: 'g1', since: '2026-09-08T01:00:00Z', stale: false,
+          launched_at: '2026-09-08T01:40:00Z', queued_seconds: 2400, running_seconds: 2460, troubled: true,
+        }], queued: [], typical_seconds: 1200 },
+      }),
+    );
+    expect(a[0]).toMatchObject({ subject: 'bay:0', sev: 'warn', since: '2026-09-08T01:40:00Z' });
+    expect(a[0]?.text).toBe(
+      'gate bay 1 · feat/slow TROUBLED — running past 2× the median (queued 40m · running 41m · median 20m)',
+    );
+  });
+
   test('each garaged car warns with the check that failed, selecting the garage', () => {
     const a = alertsOf(
       yardOf({ cars: [car('c1', 'fix/red')] }),

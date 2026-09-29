@@ -29,7 +29,8 @@ use boss_core::job::{Job, JobId, JobStatus, Priority, Step, StepId, StepStatus, 
 use boss_core::port::EventBus;
 use boss_core::publisher::DomainPublisher;
 use boss_jobs::cadence::{
-    CadenceError, CadenceRepository, CadenceRuleRow, InMemoryCadence, LastFiring, NewFiring,
+    CadenceError, CadenceRepository, CadenceRuleRow, FiringOutcome, InMemoryCadence, LastFiring,
+    NewFiring,
 };
 use boss_jobs::delivery::{
     DeliveryPolicyRepository, DeliveryPolicyRow, InMemoryDeliveryPolicy, StoredPolicy,
@@ -75,7 +76,6 @@ fn depth_rule() -> CadenceRuleRow {
         cadence: None,
         anchor_date: None,
         business_calendar: None,
-        regate_hold_minutes: None,
     }
 }
 
@@ -91,7 +91,6 @@ fn clock_rule() -> CadenceRuleRow {
         cadence: None,
         anchor_date: None,
         business_calendar: None,
-        regate_hold_minutes: None,
     }
 }
 
@@ -108,7 +107,6 @@ fn reconcile_rule() -> CadenceRuleRow {
         cadence: None,
         anchor_date: None,
         business_calendar: None,
-        regate_hold_minutes: None,
     }
 }
 
@@ -129,7 +127,17 @@ async fn fire(cadence: &InMemoryCadence, rule: &str, verb: &str, at: &str, rc: O
         .await
         .unwrap();
     if let Some(rc) = rc {
-        cadence.record_outcome(&firing_id, rc, 30).await.unwrap();
+        cadence
+            .record_outcome(
+                &firing_id,
+                &FiringOutcome {
+                    rc,
+                    runtime_secs: 30,
+                    board_decision: None,
+                },
+            )
+            .await
+            .unwrap();
     }
 }
 
@@ -869,8 +877,7 @@ impl CadenceRepository for FailingCadence {
     async fn record_outcome(
         &self,
         _firing_id: &str,
-        _rc: i32,
-        _runtime_secs: u64,
+        _outcome: &FiringOutcome,
     ) -> Result<(), CadenceError> {
         Err(CadenceError::Storage("read-only fake".into()))
     }
@@ -1366,9 +1373,14 @@ async fn no_cadence_or_policy_wired_degrades_gracefully() {
     );
     // No policy → thresholds null, never a fabricated default.
     assert!(body["policy"]["stall_hours"].is_null());
-    // No policy → gate capacity is the compiled fallback (3), the same
-    // bound a gate obeys against an unreachable registry.
-    assert_eq!(body["gates"]["capacity"], 3);
+    // No policy → gate capacity is the compiled fallback, the same
+    // bound a gate obeys against an unreachable registry — read off the
+    // constant, not retyped, because it moves with the policy (3 -> 4 on
+    // 2026-09-28, backlog 366c2ed5).
+    assert_eq!(
+        body["gates"]["capacity"],
+        boss_jobs::yard::COMPILED_GATE_MAX_CONCURRENT
+    );
 }
 
 /// A day of arrivals must not push the open train off the board.

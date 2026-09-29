@@ -80,17 +80,20 @@ jobs:
       # on device" — the mirror's previous workflow, 2026-08).
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      # There is no estate here, said out loud (backlog 3e63662c). Three
-      # roster lints read the live system (a-car-stays-under-the-edit-
-      # level, the-live-rules-are-the-authored-rules, the-live-protocols-
-      # are-the-authored-protocols); a GitHub runner has no route to it,
-      # so each could not answer and the gate REFUSED every publish PR
-      # from 2026-09-22 (#243-#245), saying nothing about the tree. This
-      # declaration makes those three run their tree half, print that the
-      # live comparison was not made, and pass that half; the receipt
-      # printed below names it under `estate`. Nowhere else sets it —
-      # infra/lint/lib/no-estate.sh, pinned by
-      # a_declared_no_estate_skips_only_the_live_half.rs.
+      # There is no estate here, said out loud (backlog 3e63662c). A
+      # GitHub runner has no route to the live system, so a lint that
+      # reads it could not answer, and the gate REFUSED every publish PR
+      # from 2026-09-22 (#243-#245), saying nothing about the tree. Three
+      # roster lints read it then; since design d349e0ba one does
+      # (a-car-stays-under-the-edit-level) — the-live-rules-are-the-
+      # authored-rules and the-live-protocols-are-the-authored-protocols
+      # left the roster (`# consist: skip`) and run against live in the
+      # cluster converge's last phase (infra/forge/registry-drift.sh),
+      # though both still honour this if run here. The declaration makes
+      # such a lint run its tree half, print that the live comparison was
+      # not made, and pass that half; the receipt printed below names it
+      # under `estate`. Nowhere else sets it — infra/lint/lib/no-estate.sh,
+      # pinned by a_declared_no_estate_skips_only_the_live_half.rs.
       BOSS_ESTATE: none
     services:
       postgres:

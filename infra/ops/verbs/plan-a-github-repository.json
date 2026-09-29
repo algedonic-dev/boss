@@ -1,0 +1,11 @@
+{
+  "about": "READ-ONLY: renders what `github-create-repository` WOULD create on GitHub, and changes nothing (infra/forge/github-act.sh create-repository --plan; design 76155676, backlog 6a8ff89f). It reads, as the GitHub App's installation on <owner> (the token slot /etc/boss-publish/github-app/<owner>.token the broker's installation token is rendered into), whether <owner> is an organisation (an installation token creates repositories only in one) and whether <owner>/<name> exists. Absent, the plan names the one act — POST /orgs/<owner>/repos, empty (auto_init false), at the requested visibility — and its proof. Standing exactly as declared (that visibility, not a fork, not archived), the plan names no act. A fork, the other visibility, an archived or moved repository, a non-organisation owner, or an unusable token slot is a refusal, exit 78, not a plan. No clock and no token in the bytes; its sha256 is printed on stderr as `plan-sha256:`, and that hash is what David's passkey signs (design 17835005 q1).",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/github-act.sh", "create-repository", "--plan", "{1}", "{2}", "{3}"],
+  "params": [
+    { "name": "owner", "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{0,38}$" },
+    { "name": "name", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$" },
+    { "name": "visibility", "one_of": ["private", "public"] }
+  ],
+  "timeout": 120
+}

@@ -308,7 +308,7 @@ impl Default for VerifyPoll {
 // ---------------------------------------------------------------------------
 
 pub struct CredentialRotateCloudflareTunnel {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
     cloudflare: Arc<dyn CloudflareTunnels>,
     secrets: Arc<dyn SecretStore>,
@@ -1977,6 +1977,7 @@ mod tests {
             metadata["old_token"] = json!(old);
         }
         InvocationContext {
+            event_timestamp: None,
             rule_name: "broker-rotates-the-cloudflare-tunnel".into(),
             triggering_event_id: "evt-rot-cf-1".into(),
             triggering_topic: "step.done.credential-rotation".into(),
@@ -2577,6 +2578,7 @@ mod tests {
     /// What a schedule firing carries: the day, and no packet.
     fn clock_ctx() -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: REFIRE_RULE.into(),
             triggering_event_id: "clock-2026-09-17".into(),
             triggering_topic: "schedule".into(),

@@ -8,10 +8,20 @@
 //! default insert-if-absent naming the fields that differ, UPDATES it
 //! under take on the declared fields that differ (a declared alias
 //! lands under the declared id, an undeclared alias is kept), and names
-//! each change in the outcome. The rate-card FK is NOT mirrored (the Pg
-//! test proves that refusal).
+//! each change in the outcome.
+//!
+//! And it refuses what the schema refuses, as Postgres does: a batch
+//! naming an id that is not `agent-<slug>` or a negative budget or run
+//! cap (the table's CHECKs, which run on every declared row, held or
+//! not), and — given a rate card (`with_rate_card`) — a model the card
+//! does not price on a row the batch would WRITE (the foreign key, which
+//! fires only on a written row), each refusing the whole batch before
+//! anything lands. Until backlog be459ab9's adapters-agree suite
+//! (2026-09-29) the double mirrored none of the three and landed every
+//! such batch, so a door test through it measured a registry Postgres
+//! would have refused.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -20,7 +30,7 @@ use boss_core::publish::PublishMode;
 use boss_core::publisher::EventStamp;
 
 use super::port::{AgentsError, AgentsRegistry, declared_event, updated_event};
-use super::types::{AgentInput, AgentRow, AgentsBatchOutcome, KeptRow, UpdatedRow};
+use super::types::{AgentInput, AgentRow, AgentsBatchOutcome, KeptRow, UpdatedRow, is_agent_id};
 
 #[derive(Default)]
 struct Rows {
@@ -54,11 +64,68 @@ impl Rows {
 pub struct InMemoryAgents {
     rows: Mutex<Rows>,
     events: Mutex<Vec<Event>>,
+    rate_card: Option<BTreeSet<String>>,
 }
 
 impl InMemoryAgents {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Price exactly `models`, as the `agent_rate_card` rows of a
+    /// Postgres registry do: a batch that would write any other
+    /// `default_model` is refused as `Unpriced`. Without one the double
+    /// prices every model — it holds no card of its own to consult.
+    pub fn with_rate_card<'a>(mut self, models: impl IntoIterator<Item = &'a str>) -> Self {
+        self.rate_card = Some(models.into_iter().map(str::to_string).collect());
+        self
+    }
+
+    /// The refusal Postgres makes of `declared`, row by row in the
+    /// batch's order and each row's CHECKs before its foreign key, as
+    /// the database meets them — or `Ok` when it makes none. Judged
+    /// before anything is written, so a refused batch lands nothing, as
+    /// its rolled-back transaction does there. The foreign key is
+    /// checked only where the model is WRITTEN: an inserted row, or a
+    /// take that changes a held row's model — a kept row, or a take that
+    /// leaves the model as it was, writes no model to check.
+    fn refusal(
+        &self,
+        held: &Rows,
+        declared: &[AgentInput],
+        mode: PublishMode,
+    ) -> Result<(), AgentsError> {
+        // Each id's model as the batch leaves it so far, over the held.
+        let mut model: BTreeMap<&str, &str> = BTreeMap::new();
+        for a in declared {
+            let negative = a.hourly_budget_usd_micros.is_some_and(|n| n < 0)
+                || a.max_concurrent_runs.is_some_and(|n| n < 0);
+            if !is_agent_id(&a.id) || negative {
+                return Err(AgentsError::Storage(format!(
+                    "agent {}: a CHECK on the agents table refuses the row",
+                    a.id
+                )));
+            }
+            let current = model
+                .get(a.id.as_str())
+                .copied()
+                .or_else(|| held.agents.get(&a.id).map(|h| h.default_model.as_str()));
+            let written = match current {
+                None => true,
+                Some(m) => mode.is_take() && m != a.default_model,
+            };
+            let priced = self
+                .rate_card
+                .as_ref()
+                .is_none_or(|card| card.contains(&a.default_model));
+            if written && !priced {
+                return Err(AgentsError::Unpriced(a.default_model.clone()));
+            }
+            if written {
+                model.insert(&a.id, &a.default_model);
+            }
+        }
+        Ok(())
     }
 
     /// Every event recorded through this adapter, in order — what a
@@ -115,6 +182,7 @@ impl AgentsRegistry for InMemoryAgents {
         stamp: &EventStamp,
     ) -> Result<AgentsBatchOutcome, AgentsError> {
         let mut rows = self.rows.lock().expect("agents lock");
+        self.refusal(&rows, declared, mode)?;
         let mut events = self.events.lock().expect("events lock");
         let mut inserted = 0usize;
         let mut updated = Vec::new();

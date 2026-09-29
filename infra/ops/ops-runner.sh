@@ -120,6 +120,11 @@
 #   every reader — `boss ops --wait`, the answered-ops-request judges,
 #   the yard — takes it from there (50fede8b; see the merge door below
 #   for the request-level copy this replaced).
+# - Judges an exit 0 against the verb's declared `effect` and records
+#   the verdict beside the exit — `effect`, `effect_unproven` or
+#   `effect_unread` — because an exit 0 is not a proof that the verb
+#   changed what it exists to change (backlog fdbb447e part 1; see the
+#   judgement below and infra/ops/verbs/README.md §Effect).
 # - Records how long the verb RAN, as `duration_ms` beside that exit
 #   (b7bfe821). The request's own stamps span this runner's poll
 #   latency — up to a minute — so they cannot cost a verb; this is
@@ -148,7 +153,11 @@
 #   OPS_TIMEOUT    (default 30) seconds before a verb is killed, unless
 #                  the verb's allowlist entry declares its own `timeout`
 #   OPS_OUTPUT_CAP (default 102400) bytes of output kept
-#   BOSS_MACHINE_TOKEN (optional) forwarded as x-boss-machine-token
+#   BOSS_MACHINE_TOKEN (optional) forwarded as x-boss-machine-token, in a
+#     0600 header file (infra/lib/secret-header.sh), never in argv
+#   BOSS_RUNNER_CREDENTIAL_FILE (default /etc/boss/ops-runner.credential)
+#     this host's runner credential, presented as x-boss-runner-credential
+#     the same way; absent, none is sent (design f623e425; see below)
 #
 # All JSON parsing is jq with payloads on stdin or via --arg/--argjson/
 # --rawfile, never spliced into the program text (the boss-step.sh /
@@ -273,6 +282,65 @@ fi
 # shellcheck source=infra/lib/step-shape.sh
 . "$SHAPE_LIB"
 
+# THE MACHINE TOKEN RIDES TO curl IN A 0600 FILE, never in its argv,
+# where every local user of the host reads it in ps and
+# /proc/<pid>/cmdline — seven of this runner's writes did until
+# 2026-09-28 (backlog 5f3ad356). Under the unit's RuntimeDirectory= the
+# file lives in tmpfs systemd removes when the run stops; elsewhere in a
+# private mktemp directory. Made once, here in the runner's own shell and
+# after the EXIT trap above (the helper chains its cleanup in front of
+# it), because the writes below run inside $(…). Checked before the `.`
+# for the reason SHAPE_LIB is.
+SECRET_LIB="$(dirname "$0")/../lib/secret-header.sh"
+if [ ! -r "$SECRET_LIB" ]; then
+    echo "ops-runner: $SECRET_LIB is missing — the machine token would have to ride in curl's command line; refusing to run" >&2
+    exit 78
+fi
+# shellcheck source=infra/lib/secret-header.sh
+. "$SECRET_LIB"
+if ! secret_header MT_HDR ${BOSS_MACHINE_TOKEN:+"x-boss-machine-token: $BOSS_MACHINE_TOKEN"}; then
+    echo "ops-runner: the machine token's header file could not be written — refusing to run" >&2
+    exit 78
+fi
+
+# THIS RUNNER'S OWN CREDENTIAL (design f623e425 Q1, option A, decided by
+# David 2026-09-25; backlog 6c9183de). The jobs API knows the runner by a
+# credential it PRESENTS in x-boss-runner-credential — resolved by the
+# server to runner:ops for THIS host — never by the id in x-boss-user,
+# which any holder of the machine token can type. It rides beside the
+# machine token on every request to the system of record, in its own
+# 0600 header file, never in argv. The value is read from a root-only
+# file the credential broker delivers (BOSS_RUNNER_CREDENTIAL_FILE); it
+# never reaches a log line, and the shell variable is emptied once the
+# header file holds it.
+#
+# IT NEVER STOPS AN ANSWER (DR rule 62dac114: no refusal on David's path).
+# No file is today's state on every host — the pass runs exactly as
+# before, sending none. A file that cannot be one header is said here and
+# the pass goes on without it: the credential adds identity, and until a
+# protocol declares a writer, identity is all it adds.
+RUNNER_CREDENTIAL_FILE="${BOSS_RUNNER_CREDENTIAL_FILE:-/etc/boss/ops-runner.credential}"
+RC_HDR=""
+if [ -e "$RUNNER_CREDENTIAL_FILE" ]; then
+    rc_value=""
+    rc_why=""
+    if [ ! -r "$RUNNER_CREDENTIAL_FILE" ]; then
+        rc_why="this runner cannot read it"
+    elif ! rc_value=$(cat "$RUNNER_CREDENTIAL_FILE" 2>"$workdir/rc-err"); then
+        rc_value=""
+        rc_why="reading it failed: $(cat "$workdir/rc-err")"
+    elif [ -z "$rc_value" ]; then
+        rc_why="it is empty"
+    fi
+    if [ -n "$rc_why" ]; then
+        echo "ops-runner: the runner credential at $RUNNER_CREDENTIAL_FILE is NOT presented ($rc_why); this pass answers without it" >&2
+    elif ! secret_header RC_HDR "x-boss-runner-credential: $rc_value" 2>"$workdir/rc-err"; then
+        RC_HDR=""
+        echo "ops-runner: the runner credential at $RUNNER_CREDENTIAL_FILE is NOT presented ($(cat "$workdir/rc-err")); this pass answers without it" >&2
+    fi
+    rc_value=""
+fi
+
 # THE CLAIMANT A PASS SIGNS ITS CLAIM AS, and the test for one — side by
 # side, so the shape is written once. The claim door is idempotent for
 # its holder, so each pass is a different claimant: this runner's
@@ -355,7 +423,9 @@ decide() {
                                    | $vals[($ph | ltrimstr("{") | rtrimstr("}") | tonumber) - 1]
                                    | if has("omit") then empty else .ok end
                               else . end ],
-                    timeout: ($spec.timeout // null)}
+                    timeout: ($spec.timeout // null),
+                    effect: ($spec.effect // null),
+                    effect_unread: ($spec.effect_unread // null)}
               end
           end' "$VERBS_FILE"
 }
@@ -474,7 +544,7 @@ step_write() {
         sw_code=$(curl -sS --max-time "$OPS_WRITE_MAX_TIME" -o "$3" -w '%{http_code}' -X "$1" \
             -H "content-type: application/json" \
             -H "x-boss-user: $BOSS_USER" \
-            ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+            ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
             --data-binary @"$2" \
             "$4" 2>"$workdir/put-err") || sw_code=""
         case "${sw_code:-000}" in
@@ -572,7 +642,7 @@ record_refused_completion() {
             verb_ran: ($ran == "true")}}' > "$workdir/refused"
     if ! rr_err=$(curl -fsS -X PATCH -H "content-type: application/json" \
             -H "x-boss-user: $BOSS_USER" \
-            ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+            ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
             --data-binary @"$workdir/refused" \
             "$BASE/api/jobs/$job_id/metadata" 2>&1 >/dev/null); then
         echo "ops-runner: could not record the refusal on $short — $rr_err" >&2
@@ -683,7 +753,7 @@ render_plan() {
     fi
     if ! rp_err=$(curl -fsS -X PATCH -H "content-type: application/json" \
             -H "x-boss-user: $BOSS_USER" \
-            ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+            ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
             --data-binary @"$workdir/plan-patch" \
             "$BASE/api/jobs/$rp_id/steps/$rp_sid/metadata" 2>&1 >/dev/null); then
         echo "ops-runner: could not write the plan onto $rp_short's approve step — $rp_err" >&2
@@ -728,8 +798,13 @@ verify_approval() {
         (.metadata // {}) as $jm
         | ($verbs[0].verbs[$v].params | length) as $np
         | ((.steps // []) | map(select(.spec_slug == "approve")) | .[0]) as $a
-        | if ($jm.args | type) != "array" or ($jm.args | length) != ($np - 1) then
-            no("this request carries \(($jm.args // []) | length) arg(s) where it takes \($np - 1) before plan_sha256: the hash is appended by this runner from the SIGNED plan, never supplied by the filer")
+        # A MISSING args is named as missing (backlog 3df309bf review): for
+        # a verb whose only param is the hash this used to read "carries 0
+        # arg(s) where it takes 0", a refusal that names no defect.
+        | if ($jm.args | type) != "array" then
+            no("this request carries no args list (args is \($jm.args | type)): it must carry an array of exactly \($np - 1) arg(s) before plan_sha256 — an empty list when the verb takes none — and the hash is appended by this runner from the SIGNED plan, never supplied by the filer")
+          elif ($jm.args | length) != ($np - 1) then
+            no("this request carries \($jm.args | length) arg(s) where it takes \($np - 1) before plan_sha256: the hash is appended by this runner from the SIGNED plan, never supplied by the filer")
           elif $a == null then
             no("this request has no approve step to carry one (filed before ops-request v2); file it again with boss ops")
           elif $a.status != "completed" then
@@ -1157,7 +1232,7 @@ while [ "$i" -lt "$n" ]; do
             > "$workdir/unknown"
         if ! patch_err=$(curl -fsS -X PATCH -H "content-type: application/json" \
                 -H "x-boss-user: $BOSS_USER" \
-                ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+                ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
                 --data-binary @"$workdir/unknown" \
                 "$BASE/api/jobs/$job_id/metadata" 2>&1 >/dev/null); then
             echo "ops-runner: could not record claimed, outcome unknown on $short — $patch_err" >&2
@@ -1240,6 +1315,7 @@ while [ "$i" -lt "$n" ]; do
 
     outf="$workdir/out"
     disp=""; rc_str=""; script=""; dur_ms=""
+    eff_line=""; eff_unproven=""; eff_unread=""
     reason=$(printf '%s' "$decision" | jq -r '.refuse // empty')
     if [ -n "$reason" ]; then
         disp="refused"; rc_str=""
@@ -1300,7 +1376,7 @@ ARGV
     if [ "$disp" != "refused" ] && [ "$approved" = true ]; then
         fresh=""
         if ! fresh=$(curl -fsS -H "x-boss-user: $BOSS_USER" \
-                ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+                ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
                 "$BASE/api/jobs/$job_id" 2>&1); then
             echo "ops-runner: could not re-read $short before claiming its execute — $fresh — $verb NOT run" >&2
             failed=$((failed + 1))
@@ -1337,7 +1413,7 @@ ARGV
         : > "$workdir/claim-body"
         claim_code=$(curl -sS -o "$workdir/claim-body" -w '%{http_code}' -X POST \
                 -H "x-boss-user: $claim_user" \
-                ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+                ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
                 "$BASE/api/jobs/$job_id/steps/$step_id/claim" 2>"$workdir/claim-err") || claim_code=""
         case "${claim_code:-000}" in
             2??) ;;
@@ -1383,6 +1459,23 @@ ARGV
         # because a probe is seconds. A `date` without GNU's %N leaves
         # a non-digit in the stamp; the guard below then records no
         # duration rather than a nonsense one.
+        #
+        # WHAT IS RUNNING, SAID WHEN IT STARTS (backlog b81ff4ca). This
+        # runner is serial, and until 2026-09-28 it named a request only
+        # when it ENDED: the forge journal read `answered
+        # publish-github-pr` at 02:28:59 and then nothing for thirteen
+        # minutes while eight requests queued, so the item was filed as
+        # a silent runner with three wrong hypotheses — and the runner
+        # had been running read-publish-checks 444d0f22 the whole time,
+        # which only its 02:42:28 `answered` line said. This line makes
+        # the silence attributable from the journal as it happens: the
+        # verb, the request, how long it queued and how long it may hold
+        # the runner.
+        case ${wait_s:-empty} in
+            empty|*[!0-9]*) queued="queued unknown" ;;
+            *) queued="queued ${wait_s}s" ;;
+        esac
+        echo "ops-runner: running $verb on $short ($queued, timeout ${verb_timeout:-$OPS_TIMEOUT}s)"
         t0=$(date -u +%s%3N 2>/dev/null)
         OPS_REQUEST_ID="$job_id" BOSS_ACTOR="${BOSS_ACTOR:-$ACTOR}" \
             timeout "${verb_timeout:-$OPS_TIMEOUT}" "$@" > "$rawf" 2>&1 < /dev/null
@@ -1408,6 +1501,61 @@ ARGV
             printf '\n[ops-runner: command killed at %ss timeout]\n' "${verb_timeout:-$OPS_TIMEOUT}" >> "$outf"
         fi
         disp="answered"; rc_str="$rc"
+
+        # AN EXIT 0 IS NOT AN EFFECT (backlog fdbb447e part 1, design
+        # 3036296f mechanism B, David 2026-09-27). `answered` says the
+        # verb ran and `exit_code` says it did not fail; neither says it
+        # changed what it exists to change. The daily prune's proof read
+        # the outcome alone and counted a REFUSED run as proof; the data
+        # move's proof could not tell the old copy from the new. So a
+        # verb file declares its EFFECT: the regex of the line its script
+        # prints only after it has read back what it changed (a re-list,
+        # a re-stat, a re-query) — or, for a dry run, the line saying it
+        # changed nothing. The judgement is made ONCE, here, where the
+        # verb file and the whole output are both in hand, and recorded
+        # on the step beside the exit, so every reader — `boss ops
+        # --wait`, `verb_failure` (the answered-ops-request judges), a
+        # car's recorded probe — reads one verdict instead of re-deriving
+        # it:
+        #   effect           the last line matching the declared regex;
+        #   effect_unproven  exit 0 and NO line matched (or the regex
+        #                    could not be judged) — the run did not show
+        #                    its effect, and every reader fails it;
+        #   effect_unread    the verb declares no read-back yet — its
+        #                    file's own `effect_unread` reason, copied so
+        #                    the run says out loud that exit 0 is all it
+        #                    proves.
+        # Only an exit 0 is judged: a failed run is already a failure,
+        # and a not-yet (75) or a kill (124) claims no effect at all.
+        # Nothing is refused here — the verb has already run; this is the
+        # record of what the run showed (DR rule 62dac114: no new
+        # refusal on a human path).
+        #
+        # The WHOLE output is judged ("$rawf"), never the recorded copy:
+        # "$outf" is cut at OPS_OUTPUT_CAP, and a verb says its result
+        # LAST — the adversarial review of this car found every
+        # prune-registry-versions run and sweep-archive-branches 54547b33
+        # (184 KB) past the cap, so judging the cut copy would have written
+        # a false EFFECT NOT SHOWN into the record for exactly the verbs
+        # that did the most. Only the one line kept is capped (2,000 bytes).
+        if [ "$rc" -eq 0 ]; then
+            eff_re=$(printf '%s' "$decision" | jq -r '.effect // empty')
+            if [ -n "$eff_re" ]; then
+                if eff_found=$(jq -nRr --arg re "$eff_re" \
+                        '[inputs | select(test($re))] | last // empty | .[0:2000]' \
+                        < "$rawf" 2> "$workdir/effect-err"); then
+                    if [ -n "$eff_found" ]; then
+                        eff_line="$eff_found"
+                    else
+                        eff_unproven="exit 0, and no line of the output matches the effect this verb declares (${eff_re}) — the run did not show that it changed what it exists to change"
+                    fi
+                else
+                    eff_unproven="exit 0, and the effect this verb declares (${eff_re}) could not be judged: $(head -c 500 "$workdir/effect-err")"
+                fi
+            else
+                eff_unread=$(printf '%s' "$decision" | jq -r '.effect_unread // empty')
+            fi
+        fi
     fi
 
     # Only the keys this answer records (see header): they go through the
@@ -1428,12 +1576,16 @@ ARGV
     payloadf="$workdir/payload"
     jq -cn --rawfile out "$outf" \
         --arg d "$disp" --arg rc "$rc_str" --arg h "$HOST_ID" --arg ms "${dur_ms:-}" \
-        --arg ps "$plan_sha" --arg sa "$signed_at" --arg ap "$approved" --arg ca "$claimant" '
+        --arg ps "$plan_sha" --arg sa "$signed_at" --arg ap "$approved" --arg ca "$claimant" \
+        --arg el "$eff_line" --arg eu "$eff_unproven" --arg er "$eff_unread" '
         {disposition: $d, output: $out, runner_host: $h,
          exit_code: (if $rc == "" then null else $rc end),
          duration_ms: (if $ms == "" then null else ($ms | tonumber) end),
          reason: (if $d == "refused" then $out else null end),
-         claimed_as: (if $ca == "" then null else $ca end)}
+         claimed_as: (if $ca == "" then null else $ca end),
+         effect: (if $el == "" then null else $el end),
+         effect_unproven: (if $eu == "" then null else $eu end),
+         effect_unread: (if $er == "" then null else $er end)}
         + (if $ap == "true" and $d == "answered"
            then {approved_plan_sha256: $ps, approval_signed_at: $sa}
            else {approved_plan_sha256: null, approval_signed_at: null} end)' \
@@ -1474,7 +1626,7 @@ ARGV
             + (if $w == "-" then {} else {queued_s: ($w | tonumber)} end)' > "$exitf"
         if ! patch_err=$(curl -fsS -X PATCH -H "content-type: application/json" \
                 -H "x-boss-user: $BOSS_USER" \
-                ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+                ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
                 --data-binary @"$exitf" \
                 "$BASE/api/jobs/$job_id/metadata" 2>&1 >/dev/null); then
             echo "ops-runner: PATCH queue_depth=$depth failed on $short — $patch_err" >&2

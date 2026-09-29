@@ -57,19 +57,31 @@ use crate::session::{self, Session};
 /// nonce makes it single-step regardless.
 const TICKET_TTL_SECONDS: u64 = 120;
 
+/// The tier a self-service enrolment stores, as the enrolment event
+/// records it. People's `webauthn_credentials.access_tier` is `user` or
+/// `operator`; only an `operator` key elevates a session
+/// (`crate::elevation`). The gateway no longer SENDS it: people's
+/// credential POST binds `user` for every body and refuses a body naming
+/// a tier (backlog 1d9970d1), so this names what that door stores.
+pub const ENROLLED_TIER: &str = "user";
+
 pub struct PasskeyState {
     pub session_key: Vec<u8>,
-    pub http: reqwest::Client,
+    pub http: crate::machine_client::MachineClient,
     pub people_base: String,
     pub jobs_base: String,
     pub webauthn: Webauthn,
+    /// Where an enrolment is put on the record (`auth.passkey.enrolled`,
+    /// review of car 0bde9b99): enrolling a key is an auth act, and it
+    /// left no trace before.
+    pub audit: crate::audit::AuthAudit,
 }
 
 impl PasskeyState {
     /// rp_id / origin derive from BOSS_PUBLIC_URL — the one host
     /// browsers actually see (the OIDC callback constraint already
     /// pins this URL; see boss-project memory on playground origins).
-    pub fn from_env(session_key: Vec<u8>) -> anyhow::Result<Self> {
+    pub fn from_env(session_key: Vec<u8>, audit: crate::audit::AuthAudit) -> anyhow::Result<Self> {
         let public_url = std::env::var("BOSS_PUBLIC_URL")
             .unwrap_or_else(|_| "http://localhost:8000".to_string());
         let origin = Url::parse(&public_url)?;
@@ -82,12 +94,13 @@ impl PasskeyState {
             .build()?;
         Ok(Self {
             session_key,
-            http: reqwest::Client::new(),
+            http: crate::machine_client::MachineClient::build(reqwest::Client::builder())?,
             people_base: std::env::var("BOSS_PEOPLE_UPSTREAM")
                 .unwrap_or_else(|_| boss_ports::url("people")),
             jobs_base: std::env::var("BOSS_JOBS_UPSTREAM")
                 .unwrap_or_else(|_| boss_ports::url("jobs")),
             webauthn,
+            audit,
         })
     }
 }
@@ -152,6 +165,9 @@ pub async fn credentials_list(
                 "label": r["label"],
                 "registered_at": r["registered_at"],
                 "last_used_at": r["last_used_at"],
+                // `user` or `operator`: /me offers "Make this my operator
+                // key" on a user-tier key only (design 2cb6256f).
+                "access_tier": r["access_tier"],
             })
         })
         .collect();
@@ -314,7 +330,10 @@ fn session_of(headers: &HeaderMap, key: &[u8]) -> Option<Session> {
 
 /// Employee-bearing session or 401 — guests and unresolved logins
 /// cannot hold credentials.
-fn employee_session(headers: &HeaderMap, key: &[u8]) -> Result<(Session, String), ErrResp> {
+pub(crate) fn employee_session(
+    headers: &HeaderMap,
+    key: &[u8],
+) -> Result<(Session, String), ErrResp> {
     let sess = session_of(headers, key).ok_or_else(|| (StatusCode::UNAUTHORIZED, String::new()))?;
     let emp = sess.employee_id.clone().ok_or_else(|| {
         err(
@@ -328,9 +347,9 @@ fn employee_session(headers: &HeaderMap, key: &[u8]) -> Result<(Session, String)
 /// Small error value for helper Results — converted to a Response at
 /// the handler boundary (clippy::result_large_err: Response is a
 /// 128-byte-plus payload and these are cold refusal paths).
-type ErrResp = (StatusCode, String);
+pub(crate) type ErrResp = (StatusCode, String);
 
-fn err(status: StatusCode, msg: impl Into<String>) -> ErrResp {
+pub(crate) fn err(status: StatusCode, msg: impl Into<String>) -> ErrResp {
     (status, msg.into())
 }
 
@@ -362,7 +381,7 @@ const JOBS_UNREACHABLE: &str = "jobs unreachable";
 /// consume URL carries the challenge id. Nothing here logs a challenge
 /// id, a credential id or any credential material; the employee id is
 /// the only identifier.
-fn presence_refused(
+pub(crate) fn presence_refused(
     ceremony: &'static str,
     employee_id: Option<&str>,
     reason: &str,
@@ -379,20 +398,28 @@ fn presence_refused(
 }
 
 /// The gateway's own service identity: the actor its server-side
-/// calls sign as, and the `owner_id` of what those calls open.
-pub const GATEWAY_ACTOR: &str = "automation:gateway";
+/// calls sign as, and the `owner_id` of what those calls open. Defined
+/// in boss-core, because boss-people's passkey promote judges its caller
+/// by this exact id (design 2cb6256f D5) and a second spelling could
+/// drift from the one the gateway signs with.
+pub const GATEWAY_ACTOR: &str = boss_core::actor::GATEWAY_ACTOR_ID;
 
-/// A server-side call signed as the gateway's own internal actor,
-/// plus the machine token when the process has one. boss-people's
-/// webauthn storage requires a `platform-admin` caller (its paths
-/// are also browser-reachable through the /api/people proxy, so it
-/// cannot trust callers by position) — this identity is how the
-/// ceremony passes that gate while ordinary proxied sessions are
-/// refused. The site's inquiry door (inquiries.rs) signs its
+/// A server-side call signed as the gateway's own internal actor.
+/// The machine token is the CLIENT's to stamp, not this function's:
+/// build `rb` from a [`crate::machine_client::MachineClient`], which
+/// stamps every request and never follows a redirect (review of
+/// 6fbc7fc7, 2026-09-28, finding 1 — this stamped any builder it was
+/// handed, including ones from clients on reqwest's follow-ten-hops
+/// default). boss-people's webauthn storage admits exactly this
+/// caller id and refuses every other, whatever its role (its paths
+/// are also browser-reachable through the /api/people proxy, which
+/// forwards the session's own role, so it cannot trust callers by
+/// position or role; backlog e199c02d). The site's inquiry door
+/// (inquiries.rs) signs its
 /// accounts and jobs writes the same way; one spelling, here, so the
 /// two cannot drift (backlog 68126ec9).
 pub fn sign_as_gateway(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    let rb = rb.header(
+    rb.header(
         "x-boss-user",
         json!({
             "id": GATEWAY_ACTOR,
@@ -400,15 +427,12 @@ pub fn sign_as_gateway(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
             "access_tier": "operator",
         })
         .to_string(),
-    );
-    match boss_core::machine_token::current() {
-        Some(token) => rb.header(boss_core::machine_token::HEADER, token),
-        None => rb,
-    }
+    )
 }
 
 /// A server-side call made FOR a signed-in session, carrying ONE
-/// identity — the session's — plus the machine token, exactly what the
+/// identity — the session's — on the machine client's stamped
+/// builder, exactly what the
 /// role_headers middleware stamps on that session's own proxied
 /// traffic. The downstream policy extractor reads the first
 /// `x-boss-user`, and reqwest's `header` appends, so a request built
@@ -417,22 +441,18 @@ pub fn sign_as_gateway(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
 /// read did exactly that until backlog 18b9e09d (2026-09-24). A read
 /// made on an employee's behalf is that employee's read.
 fn sign_as_session(rb: reqwest::RequestBuilder, user_json: String) -> reqwest::RequestBuilder {
-    let rb = rb.header("x-boss-user", user_json);
-    match boss_core::machine_token::current() {
-        Some(token) => rb.header(boss_core::machine_token::HEADER, token),
-        None => rb,
-    }
+    rb.header("x-boss-user", user_json)
 }
 
 impl PasskeyState {
     /// Machine-token-stamped server-side call as the gateway — see
     /// [`sign_as_gateway`]. Only for the ceremony's OWN storage calls;
     /// a read on the session's behalf goes through [`sign_as_session`].
-    fn request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
+    pub(crate) fn request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
         sign_as_gateway(self.http.request(method, url))
     }
 
-    async fn stored_passkeys(&self, employee_id: &str) -> Result<Vec<Value>, ErrResp> {
+    pub(crate) async fn stored_passkeys(&self, employee_id: &str) -> Result<Vec<Value>, ErrResp> {
         let employee_id = people_segment(employee_id, "employee id")?;
         let url = format!(
             "{}/api/people/{}/webauthn-credentials",
@@ -575,7 +595,7 @@ pub async fn register_finish(
     headers: HeaderMap,
     Json(body): Json<RegisterFinishBody>,
 ) -> Response {
-    let (_sess, employee_id) = match employee_session(&headers, &state.session_key) {
+    let (sess, employee_id) = match employee_session(&headers, &state.session_key) {
         Ok(v) => v,
         Err(r) => return presence_refused("register_finish", None, "session", r),
     };
@@ -635,6 +655,7 @@ pub async fn register_finish(
         }
     };
     let cred_id_b64 = URL_SAFE_NO_PAD.encode(passkey.cred_id().as_ref());
+    let label = body.label.unwrap_or_else(|| "passkey".to_string());
     let passkey_b64 =
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&passkey).expect("serialize Passkey"));
     let store = state
@@ -648,16 +669,27 @@ pub async fn register_finish(
         .json(&json!({
             "credential_id": cred_id_b64,
             "public_key": passkey_b64,
-            "label": body.label.unwrap_or_else(|| "passkey".to_string()),
+            "label": label,
+            // No tier here: people's credential POST stores `user` for every
+            // body and REFUSES one that names a tier (backlog 1d9970d1), so
+            // the key this used to send would now fail every enrolment. A
+            // self-service key signs presence stamps and never elevates a
+            // session — that takes an operator-tier key, and promoting one
+            // is a separate recorded act (review of car 0bde9b99, H1).
         }))
         .send()
         .await;
     match store {
-        Ok(r) if r.status().is_success() => (
-            StatusCode::CREATED,
-            Json(json!({ "credential_id": cred_id_b64 })),
-        )
-            .into_response(),
+        Ok(r) if r.status().is_success() => {
+            state
+                .audit
+                .passkey_enrolled(&sess.username, &employee_id, &label, ENROLLED_TIER);
+            (
+                StatusCode::CREATED,
+                Json(json!({ "credential_id": cred_id_b64 })),
+            )
+                .into_response()
+        }
         Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => refused(
             "credential already registered",
             err(StatusCode::CONFLICT, "credential already registered"),
@@ -753,7 +785,7 @@ pub async fn assert_begin(
             // widest (design 2830b6b7) — the Session's one fallback,
             // shared with role_headers and the proxy's refusal.
             "role": sess.effective_role(),
-            "access_tier": sess.access_tier,
+            "access_tier": sess.access_tier(),
             "territory_account_ids": sess.territory_account_ids,
             "direct_report_ids": sess.direct_report_ids,
             "department": sess.department,
@@ -923,68 +955,11 @@ pub async fn assert_finish(
         );
     };
 
-    let rows = match state.stored_passkeys(&employee_id).await {
-        Ok(v) => v,
-        Err(r) => return refused("stored passkeys", r),
-    };
-    let passkeys = match PasskeyState::passkey_jsons(&rows) {
-        Ok(v) => v,
-        Err(r) => return refused("stored passkey rows", r),
-    };
-    // Build the crate's own AuthenticationState through serde — the
-    // documented experts-only seam for a server-supplied challenge.
-    // Every verification step (origin, rpIdHash, UV, signature,
-    // counter) stays inside webauthn-rs.
-    let creds: Vec<Value> = passkeys.iter().map(|p| p["cred"].clone()).collect();
-    let auth_state: webauthn_rs::prelude::PasskeyAuthentication =
-        match serde_json::from_value(json!({
-            "ast": {
-                "credentials": creds,
-                "policy": "required",
-                "challenge": challenge_b64,
-                "appid": null,
-                "allow_backup_eligible_upgrade": false,
-            }
-        })) {
-            Ok(v) => v,
-            // The serde error can quote the value it choked on, and
-            // that value is credential material — the log gets the
-            // stage only, and since backlog 56126dc7 (2026-09-23) so
-            // does the browser, which rendered it.
-            Err(_) => {
-                return refused(
-                    "authentication state rebuild failed",
-                    err(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "authentication state rebuild failed",
-                    ),
-                );
-            }
-        };
-    let result = match state
-        .webauthn
-        .finish_passkey_authentication(&body.credential, &auth_state)
+    if let Err((reason, r)) =
+        verify_assertion(&state, &employee_id, challenge_b64, &body.credential, None).await
     {
-        Ok(v) => v,
-        Err(e) => {
-            let reason = format!("assertion rejected: {e}");
-            return refused(&reason, err(StatusCode::UNAUTHORIZED, reason.clone()));
-        }
-    };
-
-    // Advance the sign counter — clone detection lives in the crate,
-    // the durable count lives with the credential row.
-    let _ = state
-        .request(
-            reqwest::Method::POST,
-            format!("{}/api/people/webauthn-credentials/used", state.people_base),
-        )
-        .json(&json!({
-            "credential_id": URL_SAFE_NO_PAD.encode(result.cred_id().as_ref()),
-            "sign_count": result.counter(),
-        }))
-        .send()
-        .await;
+        return refused(&reason, r);
+    }
 
     let Some(ticket) = (PresenceTicket {
         i: employee_id.clone(),
@@ -1005,8 +980,104 @@ pub async fn assert_finish(
     .into_response()
 }
 
+/// VERIFY ONE ASSERTION against the employee's stored passkeys and the
+/// challenge the consumed row carried, then advance the sign counter.
+/// The one verifier for both assertion ceremonies — presence (a step
+/// sign-off) and elevation (the platform owner's session, backlog
+/// 3c92c5b8) — so a hardening of one is a hardening of both. `Err`
+/// carries the log reason (built only from fixed text and webauthn-rs's
+/// own fixed error strings, per [`presence_refused`]) and the refusal.
+///
+/// `only_tier` narrows the credentials the assertion may come from to
+/// the rows of that `access_tier` BEFORE verification, so a key outside
+/// it is not in the set webauthn-rs checks at all (an assertion from it
+/// fails as an unknown credential). The elevation passes `operator`;
+/// presence passes `None` and checks every key the employee holds. `Ok`
+/// is the stored row the assertion verified against.
+pub(crate) async fn verify_assertion(
+    state: &PasskeyState,
+    employee_id: &str,
+    challenge_b64: &str,
+    credential: &PublicKeyCredential,
+    only_tier: Option<&str>,
+) -> Result<Value, (String, ErrResp)> {
+    fn staged(reason: &'static str) -> impl Fn(ErrResp) -> (String, ErrResp) {
+        move |r| (reason.to_string(), r)
+    }
+    let rows: Vec<Value> = state
+        .stored_passkeys(employee_id)
+        .await
+        .map_err(staged("stored passkeys"))?
+        .into_iter()
+        .filter(|r| only_tier.is_none_or(|t| r["access_tier"] == t))
+        .collect();
+    if only_tier.is_some() && rows.is_empty() {
+        let reason = "no passkey of the required tier";
+        return Err((reason.to_string(), err(StatusCode::CONFLICT, reason)));
+    }
+    let passkeys = PasskeyState::passkey_jsons(&rows).map_err(staged("stored passkey rows"))?;
+    // Build the crate's own AuthenticationState through serde — the
+    // documented experts-only seam for a server-supplied challenge.
+    // Every verification step (origin, rpIdHash, UV, signature,
+    // counter) stays inside webauthn-rs.
+    let creds: Vec<Value> = passkeys.iter().map(|p| p["cred"].clone()).collect();
+    let auth_state: webauthn_rs::prelude::PasskeyAuthentication = serde_json::from_value(json!({
+        "ast": {
+            "credentials": creds,
+            "policy": "required",
+            "challenge": challenge_b64,
+            "appid": null,
+            "allow_backup_eligible_upgrade": false,
+        }
+    }))
+    // The serde error can quote the value it choked on, and that
+    // value is credential material — the log gets the stage only,
+    // and since backlog 56126dc7 (2026-09-23) so does the browser,
+    // which rendered it.
+    .map_err(|_| {
+        let reason = "authentication state rebuild failed";
+        (
+            reason.to_string(),
+            err(StatusCode::INTERNAL_SERVER_ERROR, reason),
+        )
+    })?;
+    let result = state
+        .webauthn
+        .finish_passkey_authentication(credential, &auth_state)
+        .map_err(|e| {
+            let reason = format!("assertion rejected: {e}");
+            (reason.clone(), err(StatusCode::UNAUTHORIZED, reason))
+        })?;
+
+    // Advance the sign counter — clone detection lives in the crate,
+    // the durable count lives with the credential row.
+    let _ = state
+        .request(
+            reqwest::Method::POST,
+            format!("{}/api/people/webauthn-credentials/used", state.people_base),
+        )
+        .json(&json!({
+            "credential_id": URL_SAFE_NO_PAD.encode(result.cred_id().as_ref()),
+            "sign_count": result.counter(),
+        }))
+        .send()
+        .await;
+    let used = URL_SAFE_NO_PAD.encode(result.cred_id().as_ref());
+    rows.into_iter()
+        .find(|r| r["credential_id"] == used.as_str())
+        .ok_or_else(|| {
+            // Unreachable in practice — webauthn-rs verified against one
+            // of exactly these rows — and refused rather than assumed.
+            let reason = "verified credential not among the stored rows";
+            (
+                reason.to_string(),
+                err(StatusCode::INTERNAL_SERVER_ERROR, reason),
+            )
+        })
+}
+
 /// Consume a challenge row: 410 → replay/too-slow, 404 → never minted.
-async fn consume_challenge(state: &PasskeyState, id: &str) -> Result<Value, ErrResp> {
+pub(crate) async fn consume_challenge(state: &PasskeyState, id: &str) -> Result<Value, ErrResp> {
     // The id comes back from the caller's finish body: an id, or a
     // refusal before any request (a0dd9387, `people_segment`).
     let id = people_segment(id, "challenge id")?;

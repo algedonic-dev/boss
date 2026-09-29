@@ -237,7 +237,7 @@ async fn a_published_design_fires_the_completion_over_its_answers_edge() {
             }
         }
     }
-    let results = dispatch(&matched, &hreg, "evt-1", "jobs.job.closed", &payload)
+    let results = dispatch(&matched, &hreg, "evt-1", "jobs.job.closed", &payload, None)
         .await
         .expect("every named handler is registered");
     assert!(

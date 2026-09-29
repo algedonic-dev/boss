@@ -1,0 +1,60 @@
+# ---------------------------------------------------------------------
+# The credential broker keeps the disaster-recovery push token alive
+# (design 76155676; backlog 81eb6d4d). A GitHub App installation token
+# dies ONE HOUR after its mint and GitHub offers no longer one, so the
+# value in Secret boss/github-dr-push-token must be replaced before it
+# expires, or the next push to algedonic-dev/boss-dr reads a dead
+# credential.
+#
+# WHAT FIRES, AND WHAT IT DOES. Every fifteen minutes the handler runs
+# with `phase = "refresh"`: it reads the expiry it recorded beside the
+# token (`token.expires-at`) and, when fewer than
+# `refresh_within_minutes` remain — or the Secret holds nothing yet — it
+# mints a fresh installation token, verifies it can read
+# algedonic-dev/boss-dr, and writes token, expiry and provenance
+# (`token.minted-for = refresh`) as one merge-patch, recording one
+# `credential.installed` event (which stamps the registry row's
+# `rotated_at`). A token outside the window is left alone, so a
+# redelivered tick does nothing. It revokes NOTHING: the value it
+# replaced is what the forge host's file holds until the next converge
+# pass, and it dies on its own within the window.
+#
+# THE NUMBERS, and why. The Secret's value always has at least
+# 40 - 15 = 25 minutes left (re-minted once under 40, looked at every
+# 15); the host's file lags the Secret by at most one forge converge
+# pass (ten minutes), so the token a push reads has at least fifteen.
+# That is roughly 48 mints a day — against GitHub's 5,000 requests an
+# hour for an App, nothing. A finer cadence buys no margin the window
+# does not already give; a coarser one (hourly) cannot keep an
+# hour-long token alive at all.
+#
+# WHY A CADENCE AND NOT A PACKET. A packet is the record of a decision
+# someone made; "an hour passed" is not one. The routine lives on the
+# clock and on the credential's own events, and a rotate-a-credential
+# packet stays the exposure path (`broker-rotates-the-github-dr-push-
+# token`, whose args these are, pinned equal by
+# crates/core/boss-dispatcher/tests/github_app_installation_token_rules.rs).
+#
+# BEFORE THE ROOT IS PLACED every firing refuses, naming the
+# boss-credential-broker-root keys it lacks, and the refusal is on the
+# dispatcher's firing record (GET /api/dispatcher/schedule) — the loud
+# form of "not yet". Before algedonic-dev/boss-dr exists the exchange is
+# refused (a repository the installation cannot see) and nothing is
+# written.
+[[rule]]
+name = "broker-refreshes-the-github-dr-push-token"
+why = """
+A TIMER, the standing exemption, and EXTERNAL GLUE at once: the
+condition it watches is an installation token's expiry, a fact GitHub
+sets at mint and nothing in the system emits an event for; its effect is
+a GitHub API exchange and a k8s Secret write, which no Workflow
+definition can address. It adds no routing and spawns nothing: it
+refreshes one Secret's value and records credential.installed. Design
+76155676 (2026-09-27): installation tokens live one hour, so a
+credential minted from the App root exists only if something re-mints
+it.
+"""
+schedule = { cadence = "every-15-minutes", anchor_date = "2026-09-27" }
+[[rule.do]]
+handler = "credential.rotate.github-app-installation"
+args = { phase = "\"refresh\"", refresh_within_minutes = "\"40\"", secret_namespace = "\"boss\"", secret_name = "\"github-dr-push-token\"", secret_key = "\"token\"", credential_id = "\"github-dr-push-token\"", verify_repo = "\"algedonic-dev/boss-dr\"", repositories = "\"boss-dr\"", permissions = "\"contents:write,metadata:read\"" }

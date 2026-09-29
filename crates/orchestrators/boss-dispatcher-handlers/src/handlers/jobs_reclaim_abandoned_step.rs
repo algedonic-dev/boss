@@ -108,7 +108,7 @@ const CLAIMED: &str = "active";
 const WAITING: &str = "ready";
 
 pub struct JobsReclaimAbandonedStep {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
 }
 
@@ -122,7 +122,10 @@ impl JobsReclaimAbandonedStep {
 
     /// Construct with a custom reqwest client (tests point it at a
     /// local stand-in for jobs-api).
-    pub fn with_client(client: reqwest::Client, jobs_base: impl Into<String>) -> Arc<Self> {
+    pub fn with_client(
+        client: boss_core::machine_token::Client,
+        jobs_base: impl Into<String>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client,
             jobs_base: jobs_base.into(),
@@ -468,6 +471,7 @@ mod tests {
 
     fn ctx(payload: serde_json::Value) -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "an-abandoned-step-is-reclaimed-when-its-run-died".into(),
             triggering_event_id: "tick-1".into(),
             triggering_topic: "schedule".into(),
@@ -730,7 +734,7 @@ mod tests {
             running(LIVE_RUN),
         ])
         .await;
-        let h = JobsReclaimAbandonedStep::with_client(reqwest::Client::new(), &base);
+        let h = JobsReclaimAbandonedStep::with_client(crate::handlers::common::api_client(), &base);
         h.invoke(&args(), &ctx(tick("2026-09-19T15:00:00Z")))
             .await
             .expect("the tick runs");
@@ -812,7 +816,7 @@ mod tests {
             run(DEAD_RUN, "died", Some("2026-09-19T12:00:00Z")),
         ])
         .await;
-        let h = JobsReclaimAbandonedStep::with_client(reqwest::Client::new(), &base);
+        let h = JobsReclaimAbandonedStep::with_client(crate::handlers::common::api_client(), &base);
         h.invoke(&args(), &ctx(tick("2026-09-19T15:00:00Z")))
             .await
             .expect("the tick runs");
@@ -872,7 +876,7 @@ mod tests {
             run(DEAD_RUN, "died", Some("2026-09-19T14:00:00Z")),
         ])
         .await;
-        let h = JobsReclaimAbandonedStep::with_client(reqwest::Client::new(), &base);
+        let h = JobsReclaimAbandonedStep::with_client(crate::handlers::common::api_client(), &base);
         h.invoke(&args(), &ctx(tick("2026-09-19T15:00:00Z")))
             .await
             .expect("the tick runs");
@@ -894,7 +898,7 @@ mod tests {
             .unwrap()
             .remove("agent_model");
         let (base, puts) = mock_jobs(vec![human]).await;
-        let h = JobsReclaimAbandonedStep::with_client(reqwest::Client::new(), &base);
+        let h = JobsReclaimAbandonedStep::with_client(crate::handlers::common::api_client(), &base);
         h.invoke(&args(), &ctx(tick("2026-09-19T15:00:00Z")))
             .await
             .expect("the tick runs");
@@ -912,7 +916,7 @@ mod tests {
             run(DEAD_RUN, "died", Some("2026-09-19T10:00:00Z")),
         ])
         .await;
-        let h = JobsReclaimAbandonedStep::with_client(reqwest::Client::new(), &base);
+        let h = JobsReclaimAbandonedStep::with_client(crate::handlers::common::api_client(), &base);
         h.invoke(&args(), &ctx(tick("2026-09-19T15:00:00Z")))
             .await
             .expect("the tick runs");
@@ -930,7 +934,8 @@ mod tests {
                 run(DEAD_RUN, ending, Some("2026-09-19T10:00:00Z")),
             ])
             .await;
-            let h = JobsReclaimAbandonedStep::with_client(reqwest::Client::new(), &base);
+            let h =
+                JobsReclaimAbandonedStep::with_client(crate::handlers::common::api_client(), &base);
             h.invoke(&args(), &ctx(tick("2026-09-19T15:00:00Z")))
                 .await
                 .expect("the tick runs");
@@ -951,7 +956,7 @@ mod tests {
             running(LIVE_RUN),
         ])
         .await;
-        let h = JobsReclaimAbandonedStep::with_client(reqwest::Client::new(), &base);
+        let h = JobsReclaimAbandonedStep::with_client(crate::handlers::common::api_client(), &base);
         h.invoke(&args(), &ctx(tick("2026-09-19T15:00:00Z")))
             .await
             .expect("the tick runs");
@@ -1016,7 +1021,7 @@ mod tests {
             run(DEAD_RUN, "died", Some("2026-09-19T10:00:00Z")),
         ])
         .await;
-        let h = JobsReclaimAbandonedStep::with_client(reqwest::Client::new(), &base);
+        let h = JobsReclaimAbandonedStep::with_client(crate::handlers::common::api_client(), &base);
         let err = h
             .invoke(&args(), &ctx(json!({ "_day": "2026-09-19" })))
             .await
@@ -1117,7 +1122,10 @@ mod tests {
 
     #[test]
     fn the_handler_is_registered_under_its_name() {
-        let h = JobsReclaimAbandonedStep::with_client(reqwest::Client::new(), "http://unused");
+        let h = JobsReclaimAbandonedStep::with_client(
+            crate::handlers::common::api_client(),
+            "http://unused",
+        );
         assert_eq!(h.name(), "jobs.reclaim_abandoned_step");
         assert_eq!(
             crate::cascade::handler_emits()

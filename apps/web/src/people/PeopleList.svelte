@@ -1,6 +1,7 @@
 <script lang="ts">
   // Roster list — port of apps/web/src/people/PeopleList.tsx.
 
+  import ClassesReadFailed from '@boss/web-kit/ui/ClassesReadFailed.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
   import FilterGroup from '@boss/web-kit/ui/FilterGroup.svelte';
@@ -11,7 +12,7 @@
   import SortHeader from '@boss/web-kit/ui/SortHeader.svelte';
   import { createSortState } from '@boss/web-kit/ui/sort-state.svelte';
   import OrgTreeNode from './OrgTreeNode.svelte';
-  import { classLabel, employmentTone, type Employee } from './types';
+  import { classLabel, departmentNames, employmentTone, type Employee } from './types';
   import {
     departmentBuckets,
     expiringCerts,
@@ -20,8 +21,11 @@
     type CodeFilter,
   } from './utils';
   import { headcount, rosterHeader } from './roster-counts';
-  import { countLabel, readStateOfLoad } from '../data/readState';
+  import { countLabel, emptyState, readStateOfLoad } from '../data/readState';
+  import { readList } from '../data/shape';
+  import ListEmpty from '../data/ListEmpty.svelte';
   import { classesFor } from '@boss/web-kit/session/classes.svelte';
+  import { departments } from '@boss/web-kit/session/departments.svelte';
   import { rowLink } from '@boss/web-kit/ui/RowLink';
   import { href, navigate } from '../router';
 
@@ -31,6 +35,7 @@
   type StatusFilter = CodeFilter;
   type DeptFilter = CodeFilter;
 
+  const PEOPLE_URL = '/api/people';
   let roster = $state<Employee[]>([]);
   /// Non-null when the roster load failed — rendered instead of the
   /// empty state, so an outage never reads as "no employees" (packet
@@ -46,9 +51,11 @@
     loading = true;
     (async () => {
       try {
-        const r = await fetch('/api/people');
-        if (!r.ok) throw new Error(`people HTTP ${r.status}`);
-        const body = (await r.json()) as Employee[];
+        const r = await fetch(PEOPLE_URL);
+        if (!r.ok) throw new Error(`${PEOPLE_URL}: HTTP ${r.status}`);
+        // A 200 that is not a list is a failed read, not an empty roster
+        // (backlog 0ef5e008): the cast let `{}` through as the roster.
+        const body = readList(PEOPLE_URL, await r.json()) as Employee[];
         if (!cancelled) {
           roster = body;
           loadFailed = null;
@@ -89,8 +96,10 @@
   // display_name — backlog 8a331c9b: every code went through
   // humanizeClassCode, so `operations` printed Operations where its
   // Class says Operations / IT. classLabel humanizes only a code the
-  // registry lacks, or every code while it is still loading.
-  let departmentClasses = $derived(classesFor('employee', 'department'));
+  // registry lacks, or every code while it is still loading. A
+  // department's registry is the departments registry since c87e3d6d —
+  // the `(employee, department)` Classes were a second, drifted list.
+  let departmentClasses = $derived(departmentNames(departments()));
   let roleClasses = $derived(classesFor('employee', 'role'));
 
   // The rows the Status selection admits. The Department buttons count
@@ -114,6 +123,11 @@
       }
       return true;
     }),
+  );
+
+  // Read failed, no employees, or the filters hid them (backlog 0ef5e008).
+  let listState = $derived(
+    emptyState([{ source: PEOPLE_URL, state: read }], roster.length, visible.length),
   );
 
   // Every column clickable (CAR-4). The department accessor keeps the
@@ -184,6 +198,7 @@
     title={header.title}
     subtitle={header.subtitle}
   />
+  <ClassesReadFailed subjectKind="employee" what="roles and statuses" fallback="Roles and statuses show by code, and the headcount includes every role." />
 
   <div class="catalog-layout">
     <aside class="catalog-filters">
@@ -230,14 +245,8 @@
     </aside>
 
     <section class="list-section">
-      {#if loading}
-        <p class="empty">Loading…</p>
-      {:else if loadFailed}
-        <p class="empty load-failed" role="alert">
-          Couldn't load the roster — {loadFailed}
-        </p>
-      {:else if visible.length === 0}
-        <p class="empty">No employees match those filters.</p>
+      {#if listState.kind !== 'rows'}
+        <ListEmpty view={listState} words={{ what: 'the roster', noun: 'employees' }} />
       {:else if viewMode === 'tree'}
         {#if treeRoots.length === 0}
           <p class="empty">No leadership rooted org chart yet.</p>

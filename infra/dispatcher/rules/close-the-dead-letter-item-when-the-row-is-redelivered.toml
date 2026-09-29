@@ -1,0 +1,44 @@
+# An operator put a dead letter back on the relay's queue, and the item
+# filed for it closes on that act (backlog ac0a0abd, the follow-up to
+# e22b692e).
+#
+# `open-a-packet-when-an-event-is-dead-lettered` files one backlog-item
+# per dead letter, carrying the row as `metadata.outbox_id`. `boss
+# events redeliver <outbox id>` answers the dead letter and records
+# `events.outbox.redelivered` naming the same row — and until this rule
+# nothing read that fact back onto the item, so the item sat open at
+# triage while the row was already pending again, and the item's record
+# and the act that answered it were two disconnected records.
+#
+# `jobs.retract_matching` finds every OPEN backlog-item whose
+# `outbox_id` is the row's, writes the act onto it as `answered_by`
+# (act, actor, the event, and `overtaken_by` — how many later events
+# subscribers saw first), and withdraws it at the step it is waiting on:
+# `triage` while open, a READY build or measure a person routed it to,
+# each completed `stale` — the terminal titled "the claim no longer
+# holds"; an ACTIVE step belongs to its executor and is told instead.
+# The same close the machine alarms use (`common::retraction`, a2d8bad3,
+# e61093a1), never a PATCH on a finished step.
+#
+# A REDELIVERY THAT FAILS IS NEWS, NOT A REOPEN. If the cause was not
+# fixed, the relay dead-letters the row again and the filing rule files a
+# SECOND item naming the same row. This rule closes only the items open
+# when the act was recorded, so the new item stands.
+[[rule]]
+name = "close-the-dead-letter-item-when-the-row-is-redelivered"
+why = """
+EXTERNAL INGRESS, and a CROSS-PROTOCOL REACTOR. The cause is an
+operator's act on the event outbox (boss-events), not a step of any
+packet: no Workflow `on` consequence can see an events-service fact, and
+the backlog-item protocol cannot know which outbox row was redelivered.
+Measured 2026-09-28 on origin/main (backlog ac0a0abd): the redeliver
+door recorded `events.outbox.redelivered` naming the outbox_id and no
+rule read it, so the item filed for that row stayed open at triage
+after the row was pending again. No authority widened: the only writes
+are to the backlog-item the dead-letter rule filed, through that item's
+own stale terminal, stamped with the rule.
+"""
+on_event = "events.outbox.redelivered"
+[[rule.do]]
+handler = "jobs.retract_matching"
+args = { kind = "\"backlog-item\"", match_key = "\"outbox_id\"", value = "outbox_id", act = "\"redelivered\"", "note.overtaken_by" = "overtaken_by", because = "\"An operator redelivered the dead-lettered row (boss events redeliver): it is pending on the relay's queue again, so it is no longer an open dead letter. It reaches subscribers after the later events already delivered (answered_by.overtaken_by). If the bus refuses it again, the relay dead-letters it again and a new item names the same row.\"" }

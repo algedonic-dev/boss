@@ -7,5 +7,6 @@
     "infra/forge/converge-hold.sh",
     "release"
   ],
-  "params": []
+  "params": [],
+  "effect": "^converge-hold: (released [(]was: |no hold was standing$)"
 }

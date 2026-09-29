@@ -31,6 +31,62 @@
     return el;
   }
 
+  // The step's own declaration of who runs it, read the way boss-jobs
+  // reads it: `human_only` in either spelling the registry carries
+  // (human_only.rs `declaration`), and the agent block as the
+  // projection's four keys, all or none (agent_spec.rs `projected`).
+  function humanOnly(m) {
+    const v = m.human_only;
+    return v === true || (typeof v === 'string' && v.trim().toLowerCase() === 'true');
+  }
+  function agentProfile(m) {
+    const text = (k) => typeof m[k] === 'string';
+    const whole =
+      text('agent_profile') &&
+      text('agent_model') &&
+      typeof m.agent_budget_usd === 'number' &&
+      text('agent_effort');
+    return whole && !humanOnly(m) ? m.agent_profile : null;
+  }
+
+  // An empty list is not an answer (backlog 82cd3da2, David 2026-09-27):
+  // the publish review step of 246d597a was ready, its agent run had not
+  // started, and this bundle drew an empty list, a 0/0 and a Save
+  // button — on the full step page, which mounts the plugin without the
+  // procedure panel StepSurface draws. So it says that nothing has run,
+  // who writes the items, and what the procedure says will appear.
+  function emptyState(step) {
+    const m = (step.metadata && typeof step.metadata === 'object' && step.metadata) || {};
+    let who;
+    if (step.status === 'completed') {
+      who = 'This step completed with no items recorded.';
+    } else {
+      const profile = agentProfile(m);
+      const writer = profile
+        ? `an agent run (profile ${profile}) writes them when it is dispatched`
+        : step.assignee_id
+          ? `${step.assignee_id}, who holds this step, writes them`
+          : 'whoever takes this step writes them';
+      who = `No items yet: ${writer} — nothing has run.`;
+    }
+    const procedure =
+      step.status !== 'completed' && typeof m.procedure === 'string' && m.procedure.trim()
+        ? m.procedure
+        : null;
+    return h(
+      'div',
+      { className: 'step-checklist-empty', 'data-testid': 'checklist-empty' },
+      h('p', null, who),
+      procedure &&
+        h(
+          'div',
+          { 'data-testid': 'checklist-procedure' },
+          h('strong', null, 'The procedure that writes them:'),
+          h('p', { style: 'white-space: pre-wrap' }, procedure),
+        ),
+    );
+  }
+
   function mount(container, { step, jobId, onUpdate }) {
     const items = Array.isArray(step.metadata && step.metadata.items)
       ? step.metadata.items.map((i) => ({
@@ -63,6 +119,10 @@
 
     function renderItems() {
       itemsDiv.replaceChildren();
+      if (items.length === 0) {
+        itemsDiv.appendChild(emptyState(step));
+        return;
+      }
       items.forEach((item, idx) => {
         const row = h(
           'label',
@@ -83,7 +143,8 @@
 
     function renderActions() {
       actionsDiv.replaceChildren();
-      if (isDone) return;
+      // Nothing to tick is nothing to save.
+      if (isDone || items.length === 0) return;
       saveBtn.disabled = saving;
       actionsDiv.appendChild(saveBtn);
       if (allChecked()) {
@@ -93,7 +154,7 @@
     }
 
     function renderProgress() {
-      progressSpan.textContent = `${checkedCount()}/${items.length}`;
+      progressSpan.textContent = items.length === 0 ? '' : `${checkedCount()}/${items.length}`;
     }
 
     function toggle(idx) {
@@ -127,23 +188,17 @@
         // shows server truth — exactly what it showed before.
         if (pr.ok) {
           if (completing) {
-            // The PATCH answers 204 with no body, and the completion
-            // PUT replaces metadata wholesale — read the post-merge
-            // row back and complete with the true final shape, never
-            // the snapshot. (No single-step GET exists; the job's
-            // steps list is the read the API offers.)
-            const lr = await fetch(`/api/jobs/${jobId}/steps`);
-            const stepsNow = lr.ok ? await lr.json() : null;
-            const fresh = Array.isArray(stepsNow)
-              ? stepsNow.find((s) => s.id === step.id)
-              : null;
-            if (fresh) {
-              await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ...fresh, job_id: jobId, status: 'completed' }),
-              });
-            }
+            // The status alone (backlog e39a9d2a, design 93d2bddb).
+            // This read the merged row back and PUT it whole with the
+            // new status — correct, but a metadata body on the step
+            // PUT, and that PUT is closing to any metadata body. The
+            // PUT keeps every field a body omits, so the merge above
+            // is what the step completes with.
+            await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ status: 'completed' }),
+            });
           }
           // A save no longer flips a pending step active (design
           // 611fbffd, clause b of backlog 6ef4a36b): a step becomes

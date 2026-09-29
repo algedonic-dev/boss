@@ -15,8 +15,23 @@
 //! ids: everything at or below the mark is already projected, and
 //! nothing below it will change. If that ever stops being true, the
 //! full rebuild is still the fallback that fixes it.
+//!
+//! Both modes hold [`REBUILD_LOCK_KEY`] for their WHOLE run, so a full
+//! rebuild and the five-minute catch-up (`boss-views-catchup`) never
+//! interleave, and neither do two of either. It is a SESSION lock on a
+//! connection of its own, not the transaction lock every other
+//! `boss-rebuild-all` step takes: the projection is windowed by design
+//! ([`BATCH`]), and a window is its own statement. That connection is
+//! detached from the pool and closed at the end, so a run that fails or
+//! is cancelled ends its session and with it the lock — a session lock
+//! left on a pooled connection would outlive the run. Until backlog
+//! 8d5ac7c5 neither mode took any lock (both write `ON CONFLICT
+//! (audit_id) DO NOTHING`, so the interleaving was benign, but the
+//! rebuild-all header's "every step" was false of this one). It does
+//! NOT make a fact still sitting in `event_outbox` visible to either
+//! mode; that is backlog d6656496.
 
-use sqlx::{PgPool, Row};
+use sqlx::{Connection, PgConnection, PgPool, Row};
 
 use crate::error::ViewsError;
 
@@ -24,6 +39,10 @@ use crate::error::ViewsError;
 /// holds a lock for a bounded time and shows progress rather than
 /// running as one opaque statement.
 const BATCH: i64 = 50_000;
+
+/// The projection's advisory lock, taken by both the full rebuild and
+/// the catch-up for the whole of their run.
+const REBUILD_LOCK_KEY: i64 = boss_core::rebuild::lock_key("event-facts");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RebuildEventFactsReport {
@@ -95,7 +114,7 @@ fn storage(e: sqlx::Error) -> ViewsError {
 /// cast and take down the whole batch, where this simply does not
 /// match.
 async fn project_window(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     from_exclusive: i64,
     to_inclusive: i64,
 ) -> Result<u64, ViewsError> {
@@ -131,45 +150,85 @@ async fn project_window(
     )
     .bind(from_exclusive)
     .bind(to_inclusive)
-    .execute(pool)
+    .execute(conn)
     .await
     .map_err(storage)?;
     Ok(res.rows_affected())
 }
 
-async fn max_audit_id(pool: &PgPool, table: &str) -> Result<i64, ViewsError> {
+async fn max_audit_id(conn: &mut PgConnection, table: &str) -> Result<i64, ViewsError> {
     let col = if table == "audit_log" {
         "id"
     } else {
         "audit_id"
     };
     let sql = format!("SELECT COALESCE(MAX({col}), 0) AS m FROM {table}");
-    let row = sqlx::query(&sql).fetch_one(pool).await.map_err(storage)?;
+    let row = sqlx::query(&sql).fetch_one(conn).await.map_err(storage)?;
     row.try_get::<i64, _>("m").map_err(storage)
 }
 
-/// Full rebuild — TRUNCATE, then replay the whole log.
-pub async fn rebuild_event_facts(pool: &PgPool) -> Result<RebuildEventFactsReport, ViewsError> {
-    sqlx::query("TRUNCATE event_facts")
-        .execute(pool)
+/// A connection of its own, detached from the pool, holding the
+/// projection's session lock. Waits while another run holds it.
+async fn locked_session(pool: &PgPool) -> Result<PgConnection, ViewsError> {
+    let mut conn = pool.acquire().await.map_err(storage)?.detach();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(REBUILD_LOCK_KEY)
+        .execute(&mut conn)
         .await
         .map_err(storage)?;
-    catch_up_event_facts(pool).await
+    Ok(conn)
 }
 
-/// Project everything the log has that the projection does not.
+/// End the locked session, which releases the lock with it, and hand
+/// back what the run answered. A failed close is reported rather than
+/// swallowed: the socket is dropped either way, so the server ends the
+/// session, but the run should not claim a clean finish it did not see.
+async fn end_session<T>(conn: PgConnection, run: Result<T, ViewsError>) -> Result<T, ViewsError> {
+    let closed = conn.close().await.map_err(storage);
+    let answer = run?;
+    closed?;
+    Ok(answer)
+}
+
+/// Full rebuild — TRUNCATE, then replay the whole log, under the lock.
+pub async fn rebuild_event_facts(pool: &PgPool) -> Result<RebuildEventFactsReport, ViewsError> {
+    let mut conn = locked_session(pool).await?;
+    let run = async {
+        // No log-complete check (design b046f510): event_facts has no
+        // live writer, and the catch-up replays past this run's
+        // audit_log watermark, so a fact the relay copies later lands
+        // on the next catch-up — late, never lost.
+        sqlx::query("TRUNCATE event_facts")
+            .execute(&mut conn)
+            .await
+            .map_err(storage)?;
+        catch_up_on(&mut conn).await
+    }
+    .await;
+    end_session(conn, run).await
+}
+
+/// Project everything the log has that the projection does not, under
+/// the lock.
+pub async fn catch_up_event_facts(pool: &PgPool) -> Result<RebuildEventFactsReport, ViewsError> {
+    let mut conn = locked_session(pool).await?;
+    let run = catch_up_on(&mut conn).await;
+    end_session(conn, run).await
+}
+
+/// The catch-up itself, on a session already holding the lock.
 ///
 /// Also the tail of a full rebuild: after the TRUNCATE the watermark is
 /// 0, so this replays everything. One code path, so the incremental
 /// case cannot drift from the authoritative one.
-pub async fn catch_up_event_facts(pool: &PgPool) -> Result<RebuildEventFactsReport, ViewsError> {
-    let target = max_audit_id(pool, "audit_log").await?;
-    let mut cursor = max_audit_id(pool, "event_facts").await?;
+async fn catch_up_on(conn: &mut PgConnection) -> Result<RebuildEventFactsReport, ViewsError> {
+    let target = max_audit_id(conn, "audit_log").await?;
+    let mut cursor = max_audit_id(conn, "event_facts").await?;
     let mut rows_projected = 0u64;
 
     while cursor < target {
         let window_end = (cursor + BATCH).min(target);
-        rows_projected += project_window(pool, cursor, window_end).await?;
+        rows_projected += project_window(conn, cursor, window_end).await?;
         cursor = window_end;
     }
 

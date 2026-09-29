@@ -57,7 +57,7 @@ pub trait DispatcherSchedule: Send + Sync {
 /// `GET {base}/api/dispatcher/schedule`, the viewer in `x-boss-user`.
 pub struct ReqwestDispatcherSchedule {
     base_url: String,
-    http: reqwest::Client,
+    http: boss_core::machine_token::Client,
 }
 
 impl ReqwestDispatcherSchedule {

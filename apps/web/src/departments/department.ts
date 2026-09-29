@@ -5,7 +5,7 @@
 // in, jobs getting worked within the department, and jobs flowing
 // out." IT built its three first (Receiving Yard / Crew Board / Train
 // Yard), each IT-shaped. This is the department-shaped instance: one
-// read, three thirds, for every department the Class registry declares
+// read, three thirds, for every department the departments registry declares
 // — the tab a surface-less department used to land on All jobs from
 // (backlog cc76f755, 2026-09-18).
 //

@@ -83,6 +83,9 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF_DIR/lint/lib/git-answer.sh"
 # shellcheck source=infra/lib/jq.sh
 . "$SELF_DIR/lib/jq.sh"
+# shellcheck source=infra/lib/secret-header.sh
+. "$SELF_DIR/lib/secret-header.sh" \
+    || { echo "$(basename "$0"): $SELF_DIR/lib/secret-header.sh is missing — without it the machine token could only ride in curl's command line; nothing filed" >&2; exit 78; }
 
 NAME="protocol-drift"
 KIND="maintenance-protocol-drift"
@@ -206,8 +209,8 @@ head_json() {
 
 method_json() {
     jq -n '{
-      comparator: "infra/lint/the-live-protocols-are-the-authored-protocols.sh --require-live --report-json — the same comparison every gate runs, in the mode for a caller with somewhere to put the answer. This script re-derives nothing; the self-test of the lint proves its JSON report carries the same kind, field, live version, excerpt, counts and verdict as its text.",
-      fields: "label, description, category — the scalar strings an operator reads — and, since 2026-09-15, four step facets: steps.count, steps.titles (ordered), steps.<title>.required (the sorted required-field names) and steps.<title>.title_template; each compared between infra/platform/workflows/<kind>.toml and the ACTIVE live row of that kind. Steps were left out until the live ship-a-change v31 carried a settled step and a required proof field its file lacked while the measurement read one description adrift (0ccf23ec). Predicates, kinds, field types, subject_kinds, metadata_schema and entitlements are still not compared: they need the normalisation the publish path applies first.",
+      comparator: "infra/lint/the-live-protocols-are-the-authored-protocols.sh --require-live --report-json — the same comparison the gate ran until design d349e0ba moved its live run out of the gate, in the mode for a caller with somewhere to put the answer. This script re-derives nothing; the self-test of the lint proves its JSON report carries the same kind, field, live version, excerpt, counts and verdict as its text.",
+      fields: "label, description, category — the scalar strings an operator reads — and, since 2026-09-15, four step facets: steps.count, steps.titles (ordered), steps.<title>.required (the sorted required-field names) and steps.<title>.title_template; each compared between infra/platform/workflows/<kind>.toml and the ACTIVE live row of that kind. Steps were left out until the live ship-a-change v31 carried a settled step and a required proof field its file lacked while the measurement read one description adrift (0ccf23ec). Since 2026-09-28 every other key is compared too, under its own name — workflow keys (metadata, subject_kinds, metadata_schema, entitlements) and every step key (steps.<title>.optional, .ready_when, .kind, .metadata_defaults, …) — because incident and publish-request carried metadata revisions their live rows never took while this row read 56 agreeing (462cdfe3). Absent, null, false and empty read as one claim, numbers as floats, and a step authority_role is compared only when the file names one: the publish path fills it from the owner role.",
       direction: "`unauthored` is what is live that the tree does not say — a kind the registry admits and no file, tenant seed, Rust literal or migration authors; the lint FAILS on it (exit 1) and this row records it. `pending` is what the tree says that is not live — a bundle kind with no live row, the expected window between the merge of a protocol car and the seed behind it; reported, never failed on. `fields` is the third state: both exist and disagree.",
       windows: "tree_window and live_window are 90-character excerpts around the first differing character. Both full copies stay readable at their homes — the file in the tree at `head`, the row at GET /api/workflows — so the excerpt discards no only-copy.",
       head: "The checkout the bundle was read from. The lint reads its own working tree, which on boss-gcp is /opt/boss, fast-forwarded to forge main by boss-gcp-converge every half hour; a stale checkout therefore shows as a stale head, not as drift. Null when git could not read the checkout, with head_why saying so — the comparison still happened.",
@@ -247,6 +250,11 @@ row_json() {
 API_CURL="$SELF_DIR/boss-api-curl.sh"
 [ -x "$API_CURL" ] || API_CURL=boss-api-curl.sh
 BOSS_USER='{"id":"automation:protocol-drift","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
+# The machine token rides to curl in a 0600 file, never in its argv
+# (infra/lib/secret-header.sh; backlog 5f3ad356). Made here, in the
+# script's own shell, because api() runs inside $(…).
+secret_header MT_HDR ${BOSS_MACHINE_TOKEN:+"x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+    || { echo "$(basename "$0"): the machine token's header file could not be written — nothing filed, never an unsigned write" >&2; exit 78; }
 
 api() { # <method> <path> [body]
     local method="$1" path="$2" body="${3:-}"
@@ -260,7 +268,7 @@ api() { # <method> <path> [body]
         printf '%s' "$body" > "$bodyfile"
         "$API_CURL" -fsS -X "$method" -H "x-boss-user: $BOSS_USER" \
             -H "content-type: application/json" \
-            ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+            ${MT_HDR:+-H "$MT_HDR"} \
             --data-binary "@$bodyfile" "$BOSS_JOBS_URL$path"
         local rc=$?
         rm -f "$bodyfile"

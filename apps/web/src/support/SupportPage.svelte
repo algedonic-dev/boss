@@ -15,12 +15,14 @@
   // set is EMPTY — Support has no protocols yet — and an empty answer
   // is now the true one rather than an artefact of the filter.
 
+  import ClassesReadFailed from '@boss/web-kit/ui/ClassesReadFailed.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { appNow } from '@boss/web-kit/sim-clock';
   import Link from '@boss/web-kit/ui/Link.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import OverflowBanner from '@boss/web-kit/ui/OverflowBanner.svelte';
-  import type { Job } from '../jobs/types';
+  // A row off an unflagged list read: slim steps (backlog ea80b5fd).
+  import type { ListedJob as Job } from '../jobs/types';
   import type { Account as AccountRow } from '../accounts/types';
   import TierChip from '../accounts/TierChip.svelte';
   import { shortId } from '../data/ids';
@@ -405,6 +407,7 @@
       {:else if healthView.kind === 'empty'}
         <p class="empty">No account data.</p>
       {:else}
+        <ClassesReadFailed subjectKind="account" what="account tiers" fallback="Tiers show by code, not by their registry names." />
         <table class="data-table data-table-striped">
           <thead>
             <tr>

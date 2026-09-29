@@ -22,6 +22,9 @@ postgres = ["dep:sqlx", "boss-events/postgres"]
 [dependencies]
 boss-core = { path = "../boss-core" }
 boss-policy-client = { path = "../boss-policy-client" }
+# The write doors' policy URL fallback, as every policy-asking service
+# reads it (backlog 553cf479).
+boss-ports = { path = "../boss-ports" }
 boss-events = { path = "../boss-events" }
 async-trait = { workspace = true }
 chrono = { workspace = true }
@@ -48,4 +51,8 @@ workspace = true
 
 [[test]]
 name = "classes_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_class_adapters_agree_pg"
 required-features = ["postgres"]

@@ -2,9 +2,13 @@
 //! (department-flow-dashboards Q1, decided 2026-08-09: registry).
 //!
 //! Contracts pinned:
-//! 1. **The registry seeds the four real edges** (backlog_item,
-//!    train, boarded_jobs, and the every-kind '*' waiting_on) — instruments derive topology from rows,
-//!    never from hardcoded key names.
+//! 1. **The registry seeds exactly the declared edges** — instruments
+//!    derive topology from rows, never from hardcoded key names. The
+//!    roster, every field of every row including the `abort` dial, is
+//!    stated once for BOTH adapters in
+//!    `the_adapters_agree_on_the_job_edges_registry_pg.rs`, which
+//!    replaced the Postgres-only roster test that lived here (backlog
+//!    be459ab9).
 //! 2. **Resolution is prefix-aware**: an exact Job id resolves; an
 //!    unambiguous prefix of length >= 8 resolves (the folklore's
 //!    dominant shape, measured live); a garbage value does not.
@@ -54,124 +58,6 @@ async fn set_meta(
         .execute(conn)
         .await
         .map(|_| ())
-}
-
-/// The roster of declared edges, pinned exactly — INCLUDING the dial.
-///
-/// The count is deliberately NOT in the name any more. It read
-/// `registry_seeds_the_four_real_edges`, so adding a fifth edge failed
-/// a test whose name then also had to be corrected — the name was a
-/// second copy of the assertion, and it drifted the moment the
-/// assertion did.
-///
-/// `on_missing` is asserted because leaving it out let a real defect
-/// ship the same day: the fifth edge landed as `warn` while every other
-/// row said `abort` and `InMemoryJobEdges` hardcoded `abort` for all of
-/// them. When that happened the column DEFAULT was `warn` and 105 was a
-/// one-time UPDATE of the three rows existing then, so "edges abort" was
-/// a property of those rows and not of the table. 202608291630 has since
-/// done `ALTER COLUMN on_missing SET DEFAULT 'abort'`, so a new row now
-/// inherits the strong dial by default — but this assertion is still the
-/// only thing that would catch that default being weakened again, which
-/// is why it stays.
-#[tokio::test]
-async fn registry_seeds_exactly_the_declared_edges() {
-    let db = TestDb::new().await;
-    let dials: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT source_kind, field_path, on_missing FROM job_edges \
-         WHERE on_missing <> 'abort' ORDER BY source_kind, field_path",
-    )
-    .fetch_all(&db.pool)
-    .await
-    .expect("dial rows");
-    assert!(
-        dials.is_empty(),
-        "every declared edge must abort on an unresolvable ref; these do not: {dials:?}"
-    );
-
-    let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT source_kind, field_path, field_kind FROM job_edges ORDER BY source_kind, field_path",
-    )
-    .fetch_all(&db.pool)
-    .await
-    .expect("registry rows");
-    assert_eq!(
-        rows,
-        vec![
-            // '*' applies to every kind (migration 110, waiting_on).
-            //
-            // The three RELATION edges (design c0d2787a) carry no
-            // behaviour: they record that two packets are related, so
-            // the fact is resolvable and queryable instead of living
-            // in whatever metadata key the author reached for. They
-            // are '*' because a relationship is not a property of a
-            // kind. `waiting_on` stays the BLOCKING one — a wait the
-            // dispatcher clears on close — and is deliberately not
-            // duplicated by a "prerequisite" relation.
-            ("*".into(), "duplicate_of".into(), "job_id".into()),
-            ("*".into(), "occasioned_by".into(), "job_id".into()),
-            ("*".into(), "supersedes".into(), "job_id".into()),
-            ("*".into(), "waiting_on".into(), "job_id".into()),
-            // The feedback (or backlog item) a design decides
-            // (5f0b2661) — followed on publish by
-            // complete-feedback-design-review-on-design-doc-published.
-            ("design-doc".into(), "answers".into(), "job_id".into()),
-            // A design doc's revision chain (87f5bc84 Q5).
-            (
-                "design-doc".into(),
-                "translated_from".into(),
-                "job_id".into()
-            ),
-            // The gate's own park intent (89faab68). The gate writes
-            // it onto every gate-run it stamps, and it was undeclared
-            // until the census COUNTED it — nobody reading the code
-            // found it. Declared on `gate-run` rather than `'*'`
-            // because one verb writes it onto one kind; the relation
-            // edges above are wildcards for the opposite reason.
-            (
-                "gate-run".into(),
-                "park_backlog_item".into(),
-                "job_id".into()
-            ),
-            (
-                "pr-train".into(),
-                "boarded_jobs".into(),
-                "job_id_list".into()
-            ),
-            // Every OTHER item a car answers (a994f533) — a list, each
-            // element ref-checked, followed on merge by the same rule
-            // as backlog_item through its `also_link`.
-            (
-                "ship-a-change".into(),
-                "also_answers".into(),
-                "job_id_list".into()
-            ),
-            (
-                "ship-a-change".into(),
-                "backlog_item".into(),
-                "job_id".into()
-            ),
-            // The car this car must land BEHIND (d3320278). Sorts here
-            // by field_path. on_missing is the table DEFAULT, which is
-            // `abort` since 202608291630 — the dials assertion above is
-            // what keeps that true if the default is ever weakened.
-            (
-                "ship-a-change".into(),
-                "boards_after".into(),
-                "job_id".into()
-            ),
-            // An item a car is ONE PIECE of — declared so the value is
-            // ref-checked and normalised, and deliberately followed by
-            // no rule, so it records provenance without closing the
-            // item (e1325456).
-            (
-                "ship-a-change".into(),
-                "partial_item".into(),
-                "job_id".into()
-            ),
-            ("ship-a-change".into(), "train".into(), "job_id".into()),
-        ]
-    );
 }
 
 #[tokio::test]

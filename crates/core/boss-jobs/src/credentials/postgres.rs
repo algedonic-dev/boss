@@ -52,10 +52,16 @@ fn row_of(row: &sqlx::postgres::PgRow) -> Result<CredentialRow, CredentialsError
 #[async_trait]
 impl CredentialsRegistry for PgCredentials {
     async fn list(&self) -> Result<Vec<CredentialRow>, CredentialsError> {
-        let rows = sqlx::query(&format!("SELECT {COLUMNS} FROM credentials ORDER BY id"))
-            .fetch_all(&self.pool)
-            .await
-            .map_err(storage)?;
+        // BYTE order, `COLLATE "C"`: a bare `ORDER BY id` sorts by the
+        // database's locale, which ignores `-` at first level, so
+        // `suite-ab` listed before `suite-a-z` here and after it in
+        // memory (backlog be459ab9, found by the adapters-agree suite).
+        let rows = sqlx::query(&format!(
+            "SELECT {COLUMNS} FROM credentials ORDER BY id COLLATE \"C\""
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)?;
         rows.iter().map(row_of).collect()
     }
 

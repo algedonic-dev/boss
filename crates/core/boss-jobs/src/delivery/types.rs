@@ -49,6 +49,48 @@ pub struct DeliveryPolicyRow {
     pub gate_max_concurrent: i32,
 }
 
+impl DeliveryPolicyRow {
+    /// Every budget, named as its column is — the nine values the table
+    /// CHECKs above 0.
+    pub fn budgets(&self) -> [(&'static str, i32); 9] {
+        [
+            ("max_red_trains", self.max_red_trains),
+            ("stall_hours", self.stall_hours),
+            ("consist_budget_secs", self.consist_budget_secs),
+            ("consist_output_budget", self.consist_output_budget),
+            ("consist_files_named", self.consist_files_named),
+            ("skip_reason_file_budget", self.skip_reason_file_budget),
+            ("blip_cause_budget", self.blip_cause_budget),
+            ("ci_host_floor_gb", self.ci_host_floor_gb),
+            ("gate_max_concurrent", self.gate_max_concurrent),
+        ]
+    }
+}
+
+/// Would `delivery_policy` admit this row? The table's CHECKs — every
+/// budget above 0 — as one Rust check, so a declaration is refused the
+/// same way over either adapter.
+///
+/// WHY IT EXISTS (backlog be459ab9, found by the adapters-agree suite,
+/// 2026-09-29). Postgres enforced the CHECKs and `InMemoryDeliveryPolicy`
+/// enforced none, so a declaration the database refused as a storage
+/// error naming a constraint landed in the double, retired the policy in
+/// force, and was served to the conductor. Both adapters now run this
+/// before writing and answer `DeliveryPolicyError::BadRequest` naming
+/// the policy and the column. `the_policy_check_is_the_tables_check` (in
+/// `the_adapters_agree_on_the_delivery_policy_registry_pg.rs`) holds it
+/// to the live table BOTH ways. This is the registry's judgement only:
+/// the conductor still parses what it reads (the module's `types` doc).
+pub fn check_policy(row: &DeliveryPolicyRow) -> Result<(), String> {
+    match row.budgets().into_iter().find(|(_, v)| *v <= 0) {
+        Some((column, v)) => Err(format!(
+            "delivery policy {}@{}: {column} must be above 0, got {v}",
+            row.name, row.version
+        )),
+        None => Ok(()),
+    }
+}
+
 /// One row of `delivery_policy` as DECLARED — the wire row (which
 /// already carries `name` and `version`) plus the column the conductor
 /// never reads (`status`) and the one the seed stamps (`created_at`).

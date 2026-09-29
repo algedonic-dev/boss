@@ -189,3 +189,86 @@ fn an_ordinary_host_read_is_unaffected() {
         "and on the approval itself: {refs:?}"
     );
 }
+
+/// EVERY KEY THE RUNNER RENDERS ONTO THE APPROVE STEP IS A DECLARED
+/// FIELD (backlog 6c9183de, review S4 of car 1e603cfd, 2026-09-26). A
+/// writer is declared on a field (`StepField::writer`), so a key that is
+/// not a field cannot be reserved to the runner at all: with only `plan`
+/// declared, the declaration car could guard the plan and leave `verb`,
+/// `host`, `args` and `rendered_plan_sha256` — the request the passkey
+/// signs beside it — writable by anyone with Update on the step. The
+/// shapes are the runner's own write (infra/ops/ops-runner.sh
+/// render_plan: `{plan: $p, verb: $v, host: $h, args: $a,
+/// rendered_plan_sha256: $s}`, `args` a JSON array built with
+/// `--argjson`), each required at done because the runner writes all
+/// five in one patch or none.
+#[test]
+fn every_key_the_runner_renders_is_a_declared_field_of_the_approval() {
+    let wf = ops_request();
+    let approve = step(&wf, "approve");
+    for (name, field_type) in [
+        ("plan", "string"),
+        ("verb", "string"),
+        ("host", "string"),
+        ("args", "array"),
+        ("rendered_plan_sha256", "string"),
+    ] {
+        let f = approve
+            .fields
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the approve step must declare `{name}` — the passkey signs it, and only a \
+                     declared field can name its one writer; fields are {:?}",
+                    approve.fields.iter().map(|f| &f.name).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(f.field_type, field_type, "`{name}` is the runner's shape");
+        assert!(f.required, "`{name}` is required at done");
+    }
+}
+
+/// THE MACHINE-FILED REQUEST STAYS VALID. The dispatcher rule that files
+/// `reclaim-gcp-root` (whose one param is the plan hash the runner
+/// appends, so the filer's `args` is `[]`) and every `boss ops` request
+/// reach completion through the runner's rendered patch alone: an empty
+/// `args` is present, and an array, so the approval completes. The
+/// approve step BEFORE the runner renders fails naming every key, which
+/// is what keeps a signature over nothing from completing.
+#[test]
+fn a_zero_arg_request_as_the_runner_renders_it_completes_its_approval() {
+    let wf = ops_request();
+    let approve = step(&wf, "approve");
+    let rendered = serde_json::json!({
+        "plan": "PLAN reclaim-gcp-root on boss-gcp\n",
+        "verb": "reclaim-gcp-root",
+        "host": "boss-gcp",
+        "args": [],
+        "rendered_plan_sha256": "ab".repeat(32),
+        "decision": "approved",
+    });
+    if let Err(errs) =
+        boss_jobs::step_registry::StepRegistry::validate_authored_fields(&approve.fields, &rendered)
+    {
+        panic!(
+            "the runner's own patch for a zero-arg verb must satisfy the approval's fields: \
+             {errs:?}"
+        );
+    }
+    let unrendered = serde_json::json!({ "decision": "approved" });
+    let missing: Vec<String> = boss_jobs::step_registry::StepRegistry::validate_authored_fields(
+        &approve.fields,
+        &unrendered,
+    )
+    .expect_err("an approval the runner never rendered cannot complete")
+    .into_iter()
+    .map(|e| e.field)
+    .collect();
+    for key in ["plan", "verb", "host", "args", "rendered_plan_sha256"] {
+        assert!(
+            missing.iter().any(|m| m == key),
+            "`{key}` missing is named: {missing:?}"
+        );
+    }
+}

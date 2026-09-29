@@ -101,16 +101,23 @@
 # already-fresh cars' dock time growing by more than a gate while trains
 # do not grow (the hold costs more than it batches).
 #
+# VERSION 10 DROPS `regate_hold_minutes` (backlog d1d4275d). The board
+# stopped waiting on re-gates in backlog 96f02540 (train #768), so the
+# v9 hold was declared and read by nothing; the row type lost the column
+# with it, and the loader refuses a file that still declares one. Live
+# lineage read before the bump, 2026-09-28: v1..v9, v9 active at depth
+# 1 / cooldown 30 / hold 15 — so v10 is above it. Depth and cooldown are
+# unchanged. The v9 value stays on record in its cadence publish event.
+#
 # To change this rule, bump `version` — and check the LIVE lineage
 # first (`GET /api/cadence/rules/<name>/versions`), not just this file.
 # ---------------------------------------------------------------------------
 
 [[cadence_rule]]
 name = "train-board-on-dock-depth"
-version = 9
+version = 10
 status = "active"
 verb = "board"
 basis = "queue-depth"
 min_dock_depth = 1
 cooldown_minutes = 30
-regate_hold_minutes = 15

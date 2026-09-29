@@ -8,6 +8,7 @@
   import Section from '@boss/web-kit/ui/Section.svelte';
   import { type MarketingAsset } from './types';
   import { loadClasses, classesFor } from '@boss/web-kit/session/classes.svelte';
+  import ClassesReadFailed from '@boss/web-kit/ui/ClassesReadFailed.svelte';
   import { href } from '../router';
   import { loadOwnerNames, personIdsOf } from '../data/ownerNames';
   import { failedRead, loadingRead, okRead, readStateOfResponse, type ReadState } from '../data/readState';
@@ -33,6 +34,8 @@
   let decoded = $derived(decodeURIComponent(assetId));
 
   // Kind label from the Class registry (subject_kind='marketing-asset').
+  // `ClassesReadFailed` says when that read failed and the kind is a raw code
+  // (backlog e520c794).
   $effect(() => {
     void loadClasses('marketing-asset');
   });
@@ -157,6 +160,7 @@
             <span class="chip chip-warn" style="margin-left:8px">SUPERSEDED</span>
           {/if}
         </div>
+        <ClassesReadFailed subjectKind="marketing-asset" what="asset kinds" fallback="Kinds show as codes." />
         <h1 class="detail-title">{a.title}</h1>
         {#if a.description}
           <div class="detail-tagline">{a.description}</div>
@@ -164,7 +168,7 @@
         <div class="detail-meta">
           <Meta label="Tags">{a.tags.length}</Meta>
           <Meta label="Links">
-              {a.linked_device_skus.length + a.linked_account_ids.length + a.linked_campaign_ids.length}
+              {a.linked_skus.length + a.linked_account_ids.length + a.linked_campaign_ids.length}
           </Meta>
           <Meta label="Versions">{historyRead.kind === 'ok' ? history.length || 1 : '?'}</Meta>
           <Meta label="Updated">{formatDate(a.updated_at)}</Meta>
@@ -247,18 +251,20 @@
 
       <Section title="Linked entities" wide>
           <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px">
-            <div>
+            <div class="linked-skus">
+              <!-- Every linked SKU is a product (f925b58b): the field was
+                   linked_device_skus and routed by an FP- prefix, the
+                   retired device shop's /ux/catalog on the other arm. -->
               <h4 style="font-size:12px; color:var(--static); margin-bottom:6px">
-                Device SKUs ({a.linked_device_skus.length})
+                SKUs ({a.linked_skus.length})
               </h4>
-              {#if a.linked_device_skus.length === 0}
+              {#if a.linked_skus.length === 0}
                 <p class="empty" style="margin:0">None.</p>
               {:else}
                 <ul style="list-style:none; padding:0; margin:0; font-size:13px">
-                  {#each a.linked_device_skus as id (id)}
-                    {@const path = id.startsWith('FP-') ? `/ux/products/${encodeURIComponent(id)}` : `/ux/catalog/${encodeURIComponent(id)}`}
+                  {#each a.linked_skus as id (id)}
                     <li style="margin-bottom:4px">
-                      <a href={safeLinkHref(href(path))}>{id}</a>
+                      <EntityLink kind="product" id={id} />
                     </li>
                   {/each}
                 </ul>

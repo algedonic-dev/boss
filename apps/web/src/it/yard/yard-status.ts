@@ -255,6 +255,18 @@ export type ActiveGate = Readonly<{
    *  absent or null for a car's gate. The floor draws such a bay as the
    *  train under test, not as a PR car (2026-09-14). */
   train?: string | null;
+  /** When the run's Job was created (`launched_at`) — null on a run
+   *  filed before 2026-09-28, or from an older server. */
+  launched_at?: string | null;
+  /** Seconds it waited in line before its Job existed; null when the
+   *  record cannot say — an unknown wait, never a zero one. */
+  queued_seconds?: number | null;
+  /** Seconds its Job has run, as the server read it. */
+  running_seconds?: number | null;
+  /** The server's word that this run has RUNNING past twice the median
+   *  running time — the bay worth a look (backlog 4d088a7e). Absent on
+   *  an older server → false: no fabricated alarm. */
+  troubled?: boolean;
 }>;
 
 /** One gate-run WAITING for a slot — filed and ordered, but not running.
@@ -597,6 +609,10 @@ function parseActiveGate(raw: unknown): ActiveGate {
     packet_id: String(o.packet_id ?? ''),
     since: String(o.since ?? ''),
     stale: o.stale === true,
+    launched_at: typeof o.launched_at === 'string' ? o.launched_at : null,
+    queued_seconds: typeof o.queued_seconds === 'number' ? o.queued_seconds : null,
+    running_seconds: typeof o.running_seconds === 'number' ? o.running_seconds : null,
+    troubled: o.troubled === true,
   };
 }
 
@@ -846,6 +862,46 @@ export function queueLabel(q: QueuedGate): string {
     );
   }
   return parts.join(' · ');
+}
+
+/** A bay's two ages and the median beside them — queued for, running
+ *  for, and the measured median running time (backlog 4d088a7e: a gate
+ *  queued 46 minutes and running 14 read "going for an hour" on every
+ *  surface). What the record cannot say is said as unknown, never as a
+ *  number the page invented. */
+export function bayTimes(g: ActiveGate, typicalSeconds: number | null): string {
+  const waited = g.queued_seconds ?? null;
+  const queued = waited !== null ? `queued ${journeyText(waited)}` : 'wait unrecorded';
+  const running = `running ${journeyText(g.running_seconds ?? null)}`;
+  const median = typicalSeconds !== null ? `median ${journeyText(typicalSeconds)}` : 'no median measured';
+  return `${queued} · ${running} · ${median}`;
+}
+
+/** Where a packet stands at the gates, for its own page: in a bay (its
+ *  two ages and the median, and the server's troubled word), in the line
+ *  (its place and wait), or nowhere — null, and the page draws nothing. */
+export type GateStanding = Readonly<{ kind: 'running' | 'queued'; text: string; troubled: boolean }>;
+
+export function gateStanding(gates: Gates, packetId: string): GateStanding | null {
+  const bay = gates.active.find(g => g.packet_id === packetId);
+  if (bay) return { kind: 'running', text: bayTimes(bay, gates.typical_seconds), troubled: bay.troubled === true };
+  const q = gates.queued.find(g => g.packet_id === packetId);
+  if (q) return { kind: 'queued', text: queueLabel(q), troubled: false };
+  return null;
+}
+
+/** A SETTLED run's two ages, read off its own stamps: `launched_at` less
+ *  `opened_at` in line, `closed_at` less `launched_at` running. Null
+ *  unless all three parse — a run filed before the launch stamp has one
+ *  age, and the page does not split it by guessing. */
+export function settledGateTimes(metadata: Readonly<Record<string, unknown>> | undefined): string | null {
+  const at = (k: string): number => {
+    const v = metadata?.[k];
+    return typeof v === 'string' ? Date.parse(v) : Number.NaN;
+  };
+  const [opened, launched, closed] = [at('opened_at'), at('launched_at'), at('closed_at')];
+  if ([opened, launched, closed].some(Number.isNaN)) return null;
+  return `queued ${journeyText(Math.max(launched - opened, 0) / 1000)} · ran ${journeyText(Math.max(closed - launched, 0) / 1000)}`;
 }
 
 export function gateSlots(gates: Pick<Gates, 'capacity' | 'active'>): readonly GateSlot[] {

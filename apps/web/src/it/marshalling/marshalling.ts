@@ -34,7 +34,12 @@ import { partitionOf, type Partition } from '@boss/web-kit/ui/packet-card';
 
 export type StationLoadRow = Readonly<{
   station: string;
+  /** The STATION kind — batch, constraint, actor — not a Workflow kind. */
   kind: string;
+  /** The Workflow kind the station's predicate holds; `null` when the
+   *  predicate spans kinds, or from a server that predates it. What a
+   *  siding links to the per-kind Bottlenecks drill-down (c7c5c1de). */
+  workflowKind: string | null;
   depth: number;
   wipLimit: number | null;
   overLimit: boolean;
@@ -92,6 +97,7 @@ export function parseStationLoad(raw: unknown): ReadonlyArray<StationLoadRow> {
     .map((r) => ({
       station: str(r.station) ?? '',
       kind: str(r.kind) ?? '',
+      workflowKind: str(r.workflow_kind),
       depth: num(r.depth) ?? 0,
       wipLimit: num(r.wip_limit),
       overLimit: r.over_limit === true,
@@ -177,6 +183,7 @@ export type SidingFlow =
 export type Siding = Readonly<{
   station: string;
   kind: string;
+  workflowKind: string | null;
   depth: number;
   wipLimit: number | null;
   overLimit: boolean;
@@ -210,6 +217,7 @@ export function joinSidings(
     return {
       station: l.station,
       kind: l.kind,
+      workflowKind: l.workflowKind,
       depth: l.depth,
       wipLimit: l.wipLimit,
       overLimit: l.overLimit,
@@ -254,6 +262,24 @@ export function drainHours(depth: number, served: number, windowHours: number): 
   if (depth <= 0) return 0;
   if (served <= 0 || windowHours <= 0) return null;
   return (depth * windowHours) / served;
+}
+
+/**
+ * The window a flow answer was COUNTED over — the envelope's own
+ * `window_hours`, which the server clamps — and only when it does not
+ * say, the hours the read asked for. Every figure judged per window
+ * (clears-in, the constraint, why-not-moving) is judged in this, never
+ * in the button pressed (backlog 371aa184: the envelope was parsed and
+ * then ignored, so a 72 h count read as "served in the last 168h").
+ */
+export function answeredHours(flow: StationFlowEnvelope, asked: number): number {
+  return flow.windowHours !== null && flow.windowHours > 0 ? flow.windowHours : asked;
+}
+
+/** What the board says beside the window buttons when the count it
+ *  shows is not over the window pressed; nothing when it is. */
+export function windowLine(answered: number, pressed: number): string | null {
+  return answered === pressed ? null : `counted over ${answered}h, not the ${pressed}h pressed`;
 }
 
 export type Constraint =

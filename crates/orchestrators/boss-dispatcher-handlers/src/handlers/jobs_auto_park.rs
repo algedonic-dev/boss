@@ -34,15 +34,8 @@ use super::common::{
 };
 
 pub struct JobsAutoPark {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
-    /// A precise `now` for the car's step stamps — the gate step's
-    /// `completed_at` is one end of the dock-queue-time measurement
-    /// (`review − gate`), so it must be the real park instant, not a
-    /// day-granular fallback. The dispatcher is not on the no-wallclock
-    /// allowlist, so this comes from the clock service like every other
-    /// record stamp.
-    clock: Arc<dyn boss_clock_client::ClockClient>,
     /// Who the car this handler files is owned by — the platform owner
     /// through the port (backlog 3c23662d), resolved once per filing by
     /// `common::owner_for_filing`; never a literal.
@@ -52,13 +45,11 @@ pub struct JobsAutoPark {
 impl JobsAutoPark {
     pub fn new(
         jobs_base: impl Into<String>,
-        clock_url: impl Into<String>,
         owner: Arc<dyn boss_core::platform_owner::PlatformOwner>,
     ) -> Arc<Self> {
         Arc::new(Self {
             client: api_client(),
             jobs_base: jobs_base.into(),
-            clock: Arc::new(boss_clock_client::ReqwestClockClient::new(clock_url)),
             owner,
         })
     }
@@ -238,6 +229,10 @@ struct AutoParkInputs {
     /// the marker (`stranded::hold_reason`). `Some` = the car is filed
     /// already held — see [`hold_write`].
     hold: Option<String>,
+    /// Whether that hold is a REVIEW hold, bound to the head it judged:
+    /// false only when the gate-run says its hold is an unread diff
+    /// alone (`car::HOLD_UNBOUND`, backlog b7b02024 review F1).
+    hold_bound: bool,
 }
 
 /// PURE: the review-step merge write that puts a gate's `--hold` onto
@@ -276,9 +271,18 @@ fn hold_write(car: &Value, inputs: &AutoParkInputs) -> Result<Option<(String, Va
              carry it — refusing to park the car unheld; nothing further was written to it"
         ));
     };
+    // THE HEAD THE HOLD WAS JUDGED AT rides in the same write (design
+    // 7cedfa29 D2, backlog b7b02024): the receipt's head, which is the
+    // head the gate's hold was stamped on. The conductor then boards
+    // this car only on a release recorded at its current head, so a
+    // release given before a repair is no release of the repair.
+    let mut body = json!({ "hold": reason });
+    if inputs.hold_bound && !inputs.receipt.head.trim().is_empty() {
+        body[car::HOLD_SHA] = json!(inputs.receipt.head.trim());
+    }
     Ok(Some((
         format!("/api/jobs/{car_id}/steps/{step_id}/metadata"),
-        json!({ "hold": reason }),
+        body,
     )))
 }
 
@@ -468,11 +472,7 @@ fn auto_park_inputs(
             .filter(|s| !s.is_empty())
             .map(str::to_string),
         receipt,
-        proof: car::proof_intent(
-            md.get(car::PARK_PROBE).and_then(Value::as_str),
-            md.get(car::PARK_EXPECT).and_then(Value::as_str),
-            md.get(car::PARK_PROOF_EVENT).and_then(Value::as_str),
-        ),
+        proof: car::proof_intent_of_park(md),
         // The verdict is green by the guard at the top of this function.
         flake: flake_stamp(gate_run, verdict_meta)
             .and_then(|v| v.as_object().cloned())
@@ -486,6 +486,10 @@ fn auto_park_inputs(
         hold: gate_run
             .get("metadata")
             .and_then(boss_jobs::stranded::hold_reason),
+        hold_bound: gate_run
+            .pointer(&format!("/metadata/{}", car::HOLD_UNBOUND))
+            .and_then(Value::as_bool)
+            != Some(true),
     })
 }
 
@@ -924,7 +928,7 @@ fn car_body_with_proof(inputs: &AutoParkInputs, owner: &str) -> Value {
 /// car's id back, which `common::post_json` (fire-and-forget) discards.
 /// Same header + 422-is-permanent contract as the shared helpers.
 async fn post_json_return(
-    client: &reqwest::Client,
+    client: &boss_core::machine_token::Client,
     url: &str,
     body: &Value,
     rule_name: &str,
@@ -1171,7 +1175,13 @@ impl Handler for JobsAutoPark {
             return Ok(());
         }
 
-        let now = boss_clock_client::now_from(&self.clock).await;
+        // THE CAR'S STAMPS ARE THE GREEN'S INSTANT (backlog 2b03a2df).
+        // The gate step's `completed_at` is one end of the dock-queue-time
+        // measurement (`review − gate`), so it is the instant the gate
+        // went green — the verdict event's own timestamp — not the moment
+        // this handler consumed it, which a redelivery or a replay moves.
+        // A firing with no instant is refused before anything is filed.
+        let now = ctx.firing_instant()?;
 
         // ONE CAR, TWO WAYS IN. Either the builder opened it when the
         // build started and this green FINISHES it, or no car exists and
@@ -2394,7 +2404,6 @@ mod park_routes_its_item_tests {
         let (base, puts) = mock_item(Some(untriaged_item()), axum::http::StatusCode::OK).await;
         let h = JobsAutoPark::new(
             base,
-            "http://unused",
             Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
         );
         h.triage_linked_item(ITEM, CAR_ID, "fix/x", "jobs.auto-park")
@@ -2429,7 +2438,6 @@ mod park_routes_its_item_tests {
         let (base, puts) = mock_item(Some(decided), axum::http::StatusCode::OK).await;
         let h = JobsAutoPark::new(
             base,
-            "http://unused",
             Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
         );
         h.triage_linked_item(ITEM, CAR_ID, "fix/x", "jobs.auto-park")
@@ -2451,7 +2459,6 @@ mod park_routes_its_item_tests {
         let (base, puts) = mock_item(None, axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
         let h = JobsAutoPark::new(
             base.clone(),
-            "http://unused",
             Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
         );
         // Returns () — there is no error for the park to propagate.
@@ -2461,7 +2468,6 @@ mod park_routes_its_item_tests {
 
         let h = JobsAutoPark::new(
             base,
-            "http://unused",
             Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
         );
         h.triage_linked_item("5942f205", CAR_ID, "fix/x", "jobs.auto-park")
@@ -2560,6 +2566,7 @@ mod building_car_tests {
             tiers: serde_json::Map::new(),
             waits_on: None,
             hold: None,
+            hold_bound: true,
         };
         let now = chrono::DateTime::parse_from_rfc3339("2026-09-10T18:30:00Z")
             .unwrap()
@@ -2622,6 +2629,7 @@ mod building_car_tests {
             tiers: serde_json::Map::new(),
             waits_on: None,
             hold: None,
+            hold_bound: true,
         };
         let patch = adopt_patch(&building(), &inputs);
         assert_eq!(
@@ -2679,6 +2687,7 @@ mod building_car_tests {
             tiers: serde_json::Map::new(),
             waits_on: None,
             hold: None,
+            hold_bound: true,
         };
         let patch = adopt_patch(&opened, &inputs);
         assert_explicit_null!(
@@ -2750,6 +2759,7 @@ mod building_car_tests {
             tiers: serde_json::Map::new(),
             waits_on: None,
             hold: None,
+            hold_bound: true,
         };
 
         // ONE PIECE, stated at open and confirmed at the gate.
@@ -2826,6 +2836,7 @@ mod building_car_tests {
                 tiers: serde_json::Map::new(),
                 waits_on: None,
                 hold: None,
+                hold_bound: true,
             }
         };
         let opened = |key: &str, value: &str| {
@@ -2902,6 +2913,7 @@ mod building_car_tests {
                 tiers: serde_json::Map::new(),
                 waits_on: None,
                 hold: None,
+                hold_bound: true,
             }
         };
         // The gate names the closing edge too: agreement, not conflict.
@@ -2956,6 +2968,7 @@ mod building_car_tests {
             tiers: serde_json::Map::new(),
             waits_on: None,
             hold: None,
+            hold_bound: true,
         };
         let patch = adopt_patch(&building(), &inputs);
         assert!(
@@ -3060,6 +3073,7 @@ mod no_data_array_tests {
 
     fn green_verdict() -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "jobs.auto-park".into(),
             triggering_event_id: "evt-green-1".into(),
             triggering_topic: "step.done.gate-verdict".into(),
@@ -3078,7 +3092,6 @@ mod no_data_array_tests {
     fn handler(base: String) -> Arc<JobsAutoPark> {
         JobsAutoPark::new(
             base,
-            "http://unused",
             Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
         )
     }
@@ -3209,11 +3222,36 @@ mod held_park_tests {
             boss_jobs::stranded::hold_reason(&body).as_deref(),
             Some(REASON)
         );
-        assert_eq!(body, json!({ "hold": REASON }));
+        assert_eq!(
+            body,
+            json!({ "hold": REASON, car::HOLD_SHA: inputs.receipt.head }),
+            "the head the hold was judged at rides in the same write (b7b02024)"
+        );
+        assert!(
+            !inputs.receipt.head.is_empty(),
+            "the fixture's receipt names a head"
+        );
         // A car already at the dock (review ready) is held the same way.
         let mut parked = fresh_car();
         parked["steps"][3]["status"] = json!("ready");
         assert!(hold_write(&parked, &inputs).unwrap().is_some());
+    }
+
+    /// A gate whose hold is only an UNREAD diff (no --hold, the judge
+    /// could not read it) files its car held but not bound to a head, so
+    /// a cleared hold is judged again rather than sent to a reviewer
+    /// (backlog b7b02024, review F1).
+    #[test]
+    fn an_unread_diff_hold_is_filed_without_the_head() {
+        let mut gr = held_gate_run();
+        gr["metadata"][car::HOLD_UNBOUND] = json!(true);
+        let inputs = auto_park_inputs(&gr, &green_meta()).unwrap();
+        assert!(!inputs.hold_bound);
+        let (_, body) = hold_write(&fresh_car(), &inputs).unwrap().unwrap();
+        assert_eq!(body, json!({ "hold": REASON }));
+        // The mark absent, or false: a review hold, bound.
+        gr["metadata"][car::HOLD_UNBOUND] = json!(false);
+        assert!(auto_park_inputs(&gr, &green_meta()).unwrap().hold_bound);
     }
 
     #[test]
@@ -3267,6 +3305,7 @@ mod held_park_tests {
         ])
         .await;
         let ctx = InvocationContext {
+            event_timestamp: Some(chrono::Utc::now()),
             rule_name: "jobs.auto-park".into(),
             triggering_event_id: "evt-green-held".into(),
             triggering_topic: "step.done.gate-verdict".into(),
@@ -3279,7 +3318,6 @@ mod held_park_tests {
         };
         JobsAutoPark::new(
             stub.base.clone(),
-            "http://unused",
             Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
         )
         .invoke(&[], &ctx)
@@ -3290,12 +3328,101 @@ mod held_park_tests {
         assert!(at("POST /api/jobs").is_some(), "the car is filed: {sent:?}");
         let hold = at("PATCH /api/jobs/stub-created/steps/s-review/metadata")
             .expect("the hold is written onto the review step");
-        assert_eq!(sent[hold].1, json!({ "hold": REASON }));
+        assert_eq!(
+            sent[hold].1,
+            json!({ "hold": REASON, car::HOLD_SHA: "deadbeef" }),
+            "the hold and the receipt head it was judged at, in one write (b7b02024)"
+        );
         let gate_done = at("PUT /api/jobs/stub-created/steps/s-gate")
             .expect("the gate step still completes: every receipt field rides");
         assert!(
             hold < gate_done,
             "held BEFORE the gate step completes: {sent:?}"
+        );
+    }
+
+    /// THE CAR'S STEP STAMPS ARE THE GREEN'S INSTANT (backlog 2b03a2df).
+    /// `completed_at` on scope, build and gate was read off the clock
+    /// service when this handler got round to the event, so a redelivery
+    /// or a replay stamped a different time onto the same act. It is the
+    /// green verdict event's own timestamp now — and a firing with none
+    /// is refused rather than stamped with the consumer's clock.
+    #[tokio::test]
+    async fn the_cars_steps_are_stamped_with_the_greens_instant() {
+        let stub = serve(vec![
+            (
+                "/api/jobs/5e1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f",
+                held_gate_run(),
+            ),
+            ("/api/jobs/stub-created", fresh_car()),
+            ("/api/jobs?status=open", empty_listing()),
+            ("/api/jobs?status=closed", empty_listing()),
+        ])
+        .await;
+        let green_at = chrono::DateTime::parse_from_rfc3339("2026-09-10T18:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let ctx = InvocationContext {
+            event_timestamp: Some(green_at),
+            rule_name: "jobs.auto-park".into(),
+            triggering_event_id: "evt-green-at".into(),
+            triggering_topic: "step.done.gate-verdict".into(),
+            event_payload: json!({
+                "job_id": GATE_RUN,
+                "step_id": "s-verdict",
+                "kind": "gate-verdict",
+                "metadata": green_meta(),
+            }),
+        };
+        let park = JobsAutoPark::new(
+            stub.base.clone(),
+            Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
+        );
+        park.invoke(&[], &ctx).await.expect("a green parks");
+        let sent = stub.sent();
+        for step in ["s-scope", "s-build", "s-gate"] {
+            let path = format!("PATCH /api/jobs/stub-created/steps/{step}/metadata");
+            let (_, body) = sent
+                .iter()
+                .find(|(w, _)| *w == path)
+                .unwrap_or_else(|| panic!("{step} is filled: {sent:?}"));
+            assert_eq!(
+                body["completed_at"],
+                json!("2026-09-10T18:30:00Z"),
+                "{step} carries the green's instant"
+            );
+        }
+
+        // No instant on the firing: refused by name, and no car is filed
+        // for a green whose stamps would have to be invented.
+        let dark = serve(vec![
+            (
+                "/api/jobs/5e1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f",
+                held_gate_run(),
+            ),
+            ("/api/jobs/stub-created", fresh_car()),
+            ("/api/jobs?status=open", empty_listing()),
+            ("/api/jobs?status=closed", empty_listing()),
+        ])
+        .await;
+        let err = JobsAutoPark::new(
+            dark.base.clone(),
+            Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
+        )
+        .invoke(
+            &[],
+            &InvocationContext {
+                event_timestamp: None,
+                ..ctx
+            },
+        )
+        .await
+        .expect_err("no instant to stamp");
+        assert!(err.is_permanent(), "{err}");
+        assert!(
+            !dark.writes().iter().any(|w| w.starts_with("POST ")),
+            "nothing filed: {:?}",
+            dark.writes()
         );
     }
 }

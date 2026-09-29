@@ -4,6 +4,7 @@
   // /api/assets). The full page has a warranty-expiring + KB
   // panel that we're deferring to phase 2.
 
+  import ClassesReadFailed from '@boss/web-kit/ui/ClassesReadFailed.svelte';
   import { navigate, href } from '../router';
   import Link from '@boss/web-kit/ui/Link.svelte';
   import { rowLink } from '@boss/web-kit/ui/RowLink';
@@ -90,6 +91,7 @@
     title={header.title}
     subtitle={header.subtitle}
   />
+  <ClassesReadFailed subjectKind="asset" what="asset phases" fallback="Phases show by code, not by their registry names." />
 
   {#if isCapped(devicesPage)}
     <OverflowBanner

@@ -36,6 +36,18 @@
 //! - **the N are consecutive.** The newest N same-series rows after
 //!   the raise must ALL lack the key — a finding that flaps
 //!   present/absent is still a condition, not a recovery.
+//! - **the clean readings must have LOOKED** (backlog c11bfb77). A key
+//!   absent from a comparison that never evaluated its class is
+//!   silence, not recovery — *no evidence is not a pass*, read in
+//!   reverse. The forge's host series carried an unmeasured
+//!   credentials reading on every row for a week, so an
+//!   `ops_credentials_absent:forge` alarm would have been closed by its
+//!   next three rows with the words "the condition has recovered". So
+//!   a row counts only where it bears on the key
+//!   (`estate_alarm::evaluated`): it carries the finding, or it lists
+//!   the key in the comparator's `evaluated` record, or the key is
+//!   `unobserved:<series>`, whose evidence is a row arriving at all. A
+//!   row that did not look is skipped — neither clean nor present.
 //!
 //! WHY A SIBLING HANDLER AND NOT A THIRD HALF OF `estate.alarm`.
 //! The raiser reads the series only when the triggering comparison
@@ -89,7 +101,7 @@ use super::common::{
     RECOVERED_AT, Retraction, api_client, complete_step, get_json, recovery_note, relapse_patch,
     retraction, rows_or_refuse, write_json,
 };
-use super::estate_alarm::{DEDUP_PAGE, PERSIST_N, query_safe, unrecovered_keys};
+use super::estate_alarm::{DEDUP_PAGE, PERSIST_N, evaluated, query_safe, unrecovered_keys};
 
 /// Stamped on the triage completion this handler writes, so
 /// `estate_alarm::settled_recently` can tell a machine clear from a
@@ -98,7 +110,7 @@ use super::estate_alarm::{DEDUP_PAGE, PERSIST_N, query_safe, unrecovered_keys};
 pub(super) const CLEARED_BY: &str = "estate.recover";
 
 pub struct EstateRecover {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
 }
 
@@ -179,8 +191,9 @@ fn instant(row: &Value) -> Option<DateTime<Utc>> {
 /// recovered — the decision, pure. `rows` is the recorded comparison
 /// series newest-first (the API's order), every scope's rows; for each
 /// open alarm on `(scope, host)` the newest `n` same-series rows
-/// observed after the alarm's `opened_at` must exist and must ALL lack
-/// the alarm's key. Fewer than `n` such rows is not enough evidence;
+/// observed after the alarm's `opened_at` that evaluated its key
+/// (`estate_alarm::evaluated`) must exist and must ALL lack the key.
+/// Fewer than `n` such rows is not enough evidence;
 /// an alarm without `opened_at` or without a `triage` step cannot be
 /// judged and is left alone. An alarm the machine may only ANNOTATE,
 /// and already has, is left alone too: this fires on every comparison,
@@ -203,8 +216,10 @@ pub(super) fn recovered(
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())?
                 .with_timezone(&Utc);
             // The newest `n` rows of THIS series observed after the
-            // raise, in record order — the raiser's window, floored
-            // at the raise.
+            // raise that EVALUATED the key, in record order — the
+            // raiser's window, floored at the raise. A row that could
+            // not see the finding is skipped, neither clean nor present
+            // (c11bfb77).
             let since: Vec<(&Value, DateTime<Utc>)> = rows
                 .iter()
                 .filter(|r| {
@@ -214,6 +229,7 @@ pub(super) fn recovered(
                 })
                 .filter_map(|r| instant(r).map(|t| (r, t)))
                 .filter(|(_, t)| *t > opened_at)
+                .filter(|(r, _)| evaluated(payload(r), key))
                 .take(n)
                 .collect();
             if since.len() < n {
@@ -284,8 +300,10 @@ fn evidence(r: &Recovery, n: usize) -> String {
     format!(
         "estate.recover read the recorded `{scope}` series back: the finding \
          `{key}` on `{host}` has been absent from {n} consecutive comparisons \
-         observed after this alarm was raised, at {instants}. The condition \
-         has recovered, so the claim this alarm carried no longer holds. \
+         that evaluated it, observed after this alarm was raised, at {instants} \
+         (a comparison whose reading of it was unmeasured or unread is not \
+         counted). The condition has recovered, so the claim this alarm \
+         carried no longer holds. \
          Closed by machine from the record, not by judgement (backlog \
          ef421cd3: three of these were read off the record and typed in by \
          hand). The series rides /api/estate/comparisons?scope={scope}.",
@@ -565,7 +583,8 @@ mod tests {
 
     /// One recorded `host-units` comparison row as the API returns
     /// it: an event envelope whose payload is the comparison
-    /// `estate.compare` recorded — scope + host stamp + findings.
+    /// `estate.compare` recorded — scope + host stamp + findings, and
+    /// the units it evaluated: every one in [`WATCHED`].
     fn units_row(host: &str, unhealthy: &[&str], observed: DateTime<Utc>) -> Value {
         json!({
             "event_id": "e", "timestamp": observed.to_rfc3339(), "source": "jobs",
@@ -580,11 +599,15 @@ mod tests {
                         "load_state": "loaded", "active_state": "failed",
                         "sub_state": "failed", "result": "exit-code",
                     })).collect::<Vec<_>>(),
-                }
+                },
+                "evaluated": {
+                    "units_unhealthy": WATCHED.iter().map(|u| format!("{host}/{u}")).collect::<Vec<_>>(),
+                },
             }
         })
     }
 
+    /// One recorded `kubernetes-nodes` row observing cp-2.
     fn cluster_row(not_ready: &[&str], observed: DateTime<Utc>) -> Value {
         json!({
             "event_id": "e", "timestamp": observed.to_rfc3339(), "source": "jobs",
@@ -593,12 +616,15 @@ mod tests {
                 "scope": "kubernetes-nodes",
                 "observed_at": observed.to_rfc3339(),
                 "findings": {"not_ready": not_ready, "declared_not_observed": []},
+                "evaluated": {"not_ready": ["cp-2"], "declared_not_observed": ["cp-2"]},
             }
         })
     }
 
     const KEY: &str = "unit_unhealthy:boss-gcp/boss-codebase-metrics.service";
     const UNIT: &str = "boss-codebase-metrics.service";
+    /// The units every `units_row` reports on.
+    const WATCHED: [&str; 2] = [UNIT, "boss-train.service"];
 
     /// One recorded `door` comparison row (backlog e6406701): host-less,
     /// the halves dark past their band under `door_dark`, the ones
@@ -615,6 +641,7 @@ mod tests {
                     "door_dark": dark.iter().map(entry).collect::<Vec<_>>(),
                     "door_dimming": dimming.iter().map(entry).collect::<Vec<_>>(),
                 },
+                "evaluated": {"door_dark": ["dev-ssh/lan"]},
             }
         })
     }
@@ -900,6 +927,268 @@ mod tests {
         assert!(series_alarms(&open, "host", Some("boss-gcp")).is_empty());
     }
 
+    // ----- a comparison that never looked is not a clean one (c11bfb77) -----
+
+    /// One recorded row wrapping a comparison `estate.compare` itself
+    /// computed — the shape the series really has, not a hand copy of
+    /// it, so these tests move when the comparator does.
+    fn recorded(mut comparison: Value, scope: &str, observed: DateTime<Utc>) -> Value {
+        comparison["scope"] = json!(scope);
+        comparison["observed_at"] = json!(observed.to_rfc3339());
+        json!({
+            "event_id": "e", "timestamp": observed.to_rfc3339(), "source": "jobs",
+            "kind": "jobs.estate.compared", "payload": comparison,
+        })
+    }
+
+    /// The forge's host comparison with its credentials reading in
+    /// `state` — the observer's own words (`present`, `not ready: …`,
+    /// `unmeasured: …`).
+    fn forge_row(state: &str, observed: DateTime<Utc>) -> Value {
+        use crate::handlers::estate_compare::compare_host;
+        let declared = [json!({"id": "forge", "role": "forge", "roles": ["cluster-operator"]})];
+        let obs = json!({"scope": "host", "nodes": [{
+            "id": "forge", "cpu": 16, "memory_gb": 30, "disk_gb": 437, "disk_free_gb": 300,
+            "ready": true, "ops_credentials": {"dir": "/etc/boss-ops", "state": state}}]});
+        recorded(compare_host(&declared, &obs), "host", observed)
+    }
+
+    const UNSEARCHABLE: &str = "unmeasured: /etc/boss-ops is not searchable by david";
+
+    /// The live forge series as triage measured it, 2026-09-28: 667
+    /// comparisons in a week and every one that carried a credentials
+    /// reading carried THIS one, so `ops_credentials_absent` was
+    /// evaluated on none of them. Three such rows lack the key only
+    /// because nothing looked; read as recovery they would machine-close
+    /// a hard alarm with the evidence "the condition has recovered".
+    #[test]
+    fn three_rows_that_could_not_read_the_finding_do_not_close_its_alarm() {
+        let open = [alarm(
+            "forge-ops",
+            "ops_credentials_absent:forge",
+            "host",
+            Some("forge"),
+            "open",
+        )];
+        let blind = [
+            forge_row(UNSEARCHABLE, at(45)),
+            forge_row(UNSEARCHABLE, at(30)),
+            forge_row(UNSEARCHABLE, at(15)),
+        ];
+        assert!(
+            recovered(&open, &blind, "host", Some("forge"), 3).is_empty(),
+            "no evidence is not a pass: three unmeasured readings are not three clean ones"
+        );
+        // Three readings that LOOKED and found the files present are the
+        // recovery, exactly as before.
+        let seeing = [
+            forge_row("present", at(45)),
+            forge_row("present", at(30)),
+            forge_row("present", at(15)),
+        ];
+        assert_eq!(recovered(&open, &seeing, "host", Some("forge"), 3).len(), 1);
+    }
+
+    /// A blind reading between seeing ones is no evidence either way: it
+    /// neither breaks the run nor counts toward it, and the close names
+    /// only the instants of the comparisons that looked.
+    #[test]
+    fn a_blind_reading_is_skipped_not_counted() {
+        let open = [alarm(
+            "forge-ops",
+            "ops_credentials_absent:forge",
+            "host",
+            Some("forge"),
+            "open",
+        )];
+        let rows = [
+            forge_row("present", at(60)),
+            forge_row(UNSEARCHABLE, at(50)),
+            forge_row("present", at(40)),
+            forge_row(UNSEARCHABLE, at(35)),
+            forge_row("present", at(30)),
+        ];
+        let out = recovered(&open, &rows, "host", Some("forge"), 3);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].clean_at, vec![at(60), at(40), at(30)]);
+        // And a reading that looked and still found it is a presence,
+        // whatever blind rows surround it.
+        let still = [
+            forge_row("present", at(60)),
+            forge_row(UNSEARCHABLE, at(50)),
+            forge_row("not ready: kubeconfig:absent", at(40)),
+            forge_row("present", at(30)),
+        ];
+        assert!(recovered(&open, &still, "host", Some("forge"), 3).is_empty());
+    }
+
+    /// A `blind:` alarm (a276f7c2) closes on the evidence c11bfb77
+    /// recorded for it: N rows after the raise that LIST the host as
+    /// evaluated for the class — whatever they found, since the alarm
+    /// is about not looking; an absence found is its own hard alarm.
+    #[test]
+    fn a_blind_alarm_closes_when_n_rows_list_the_host_evaluated() {
+        let key = "blind:ops_credentials_absent/forge";
+        let open = [alarm("forge-blind", key, "host", Some("forge"), "open")];
+        let still_blind = [
+            forge_row(UNSEARCHABLE, at(45)),
+            forge_row(UNSEARCHABLE, at(30)),
+            forge_row(UNSEARCHABLE, at(15)),
+        ];
+        assert!(recovered(&open, &still_blind, "host", Some("forge"), 3).is_empty());
+        let two = [
+            forge_row("present", at(45)),
+            forge_row("present", at(30)),
+            forge_row(UNSEARCHABLE, at(15)),
+        ];
+        assert!(recovered(&open, &two, "host", Some("forge"), 3).is_empty());
+        for state in ["present", "not ready: kubeconfig:absent"] {
+            let seeing = [
+                forge_row(state, at(45)),
+                forge_row(state, at(30)),
+                forge_row(state, at(15)),
+            ];
+            let out = recovered(&open, &seeing, "host", Some("forge"), 3);
+            assert_eq!(out.len(), 1, "{state}");
+            assert_eq!(out[0].key, key);
+        }
+    }
+
+    /// The cluster series' own blind spot: a dispatcher the observer
+    /// could not read yields `dead_letters_unrecorded: []`, which read
+    /// exactly like a dispatcher with nothing unrecorded (4 of 673 rows
+    /// in the triage's week).
+    #[test]
+    fn an_unread_dispatcher_is_not_a_clean_dead_letter_reading() {
+        use crate::handlers::estate_compare::compare;
+        let row = |dispatcher: Option<Value>, observed: DateTime<Utc>| {
+            let mut obs = json!({"scope": "kubernetes-nodes", "nodes": []});
+            match dispatcher {
+                Some(d) => obs["dispatcher"] = d,
+                None => obs["dispatcher_unread"] = json!("curl: (7) Failed to connect"),
+            }
+            recorded(compare(&[], &obs), "kubernetes-nodes", observed)
+        };
+        let open = [alarm(
+            "c6c797cd",
+            "dead_letters_unrecorded:boss-dispatcher",
+            "kubernetes-nodes",
+            None,
+            "open",
+        )];
+        let unread = [row(None, at(45)), row(None, at(30)), row(None, at(15))];
+        assert!(recovered(&open, &unread, "kubernetes-nodes", None, 3).is_empty());
+        let read = json!({"dead_letters": 3, "dead_letters_unrecorded": 0});
+        let clean = [
+            row(Some(read.clone()), at(45)),
+            row(Some(read.clone()), at(30)),
+            row(Some(read), at(15)),
+        ];
+        assert_eq!(
+            recovered(&open, &clean, "kubernetes-nodes", None, 3).len(),
+            1
+        );
+    }
+
+    /// A row recorded before comparisons listed what they evaluated
+    /// carries no `evaluated` record, so its silence is no evidence: an
+    /// alarm open when this lands waits for three rows that looked.
+    #[test]
+    fn a_row_that_records_no_evaluation_is_no_evidence_of_absence() {
+        let open = [alarm("a", KEY, "host-units", Some("boss-gcp"), "open")];
+        let bare = |t| {
+            let mut r = units_row("boss-gcp", &[], t);
+            r["payload"].as_object_mut().unwrap().remove("evaluated");
+            r
+        };
+        let rows = [bare(at(45)), bare(at(40)), bare(at(35))];
+        assert!(recovered(&open, &rows, "host-units", Some("boss-gcp"), 3).is_empty());
+    }
+
+    /// One SICK comparison per comparator, computed by the comparator
+    /// itself — between them they raise every hard class there is.
+    fn every_comparators_sick_comparison() -> Vec<(&'static str, Value)> {
+        use crate::handlers::estate_compare::{compare, compare_door, compare_host, compare_units};
+        vec![
+            (
+                "kubernetes-nodes",
+                compare(
+                    &[
+                        json!({"id": "cp-2", "role": "talos-worker"}),
+                        json!({"id": "w-2", "role": "talos-worker"}),
+                    ],
+                    &json!({"scope": "kubernetes-nodes",
+                        "nodes": [{"id": "cp-2", "ready": false, "disk_gb": 929, "disk_free_gb": 10}],
+                        "dispatcher": {"dead_letters": 5, "dead_letters_unrecorded": 2,
+                                       "last_unrecorded_dead_letter_unix": 0}}),
+                ),
+            ),
+            (
+                "host",
+                compare_host(
+                    &[json!({"id": "forge", "role": "forge", "roles": ["cluster-operator"]})],
+                    &json!({"scope": "host", "nodes": [{"id": "forge", "ready": false,
+                        "disk_gb": 437, "disk_free_gb": 10,
+                        "ops_credentials": {"state": "not ready: kubeconfig:absent"}}]}),
+                ),
+            ),
+            (
+                "host-units",
+                compare_units(&json!({"scope": "host-units", "nodes": [{"id": "boss-gcp",
+                    "units": [{"unit": "boss-jobs-api.service", "healthy": false}]}]})),
+            ),
+            (
+                "door",
+                compare_door(
+                    &json!({"scope": "door", "nodes": [{"id": "dev-ssh", "band_s": 900,
+                    "halves": [{"half": "lan", "open": false}]}]}),
+                ),
+            ),
+        ]
+    }
+
+    /// THE PIN (c11bfb77): every class the raiser can key is raised by
+    /// some comparator. A class added to `HARD_CLASSES` — the boot's
+    /// `break_glass_unbound` was the one in flight — fails here, by
+    /// name, until a comparator produces it AND records evaluating it,
+    /// so no class can be raised that recovery has no evidence for.
+    #[test]
+    fn every_hard_class_is_raised_by_a_comparator() {
+        use super::super::estate_alarm::{HARD_CLASSES, hard_finding_keys};
+        let raised: std::collections::BTreeSet<String> = every_comparators_sick_comparison()
+            .iter()
+            .flat_map(|(_, c)| hard_finding_keys(c))
+            .filter_map(|k| k.split_once(':').map(|(p, _)| p.to_string()))
+            .collect();
+        for (field, prefix) in HARD_CLASSES {
+            assert!(
+                raised.contains(prefix),
+                "no comparator raises `{prefix}` (findings field `{field}`): a class \
+                 the raiser keys needs a comparator that produces it and lists what \
+                 it evaluated, or its alarm can only close on silence"
+            );
+        }
+    }
+
+    /// And every finding a comparator records is one it LISTS as
+    /// evaluated — read through `lists_as_evaluated`, not the
+    /// present-is-observed shortcut, so a comparator that raises a class
+    /// without recording its evaluation fails here, naming the key.
+    #[test]
+    fn every_finding_a_comparator_records_is_one_it_evaluated() {
+        use super::super::estate_alarm::{hard_finding_keys, lists_as_evaluated};
+        for (scope, c) in every_comparators_sick_comparison() {
+            let keys = hard_finding_keys(&c);
+            assert!(!keys.is_empty(), "the {scope} fixture is sick: {c}");
+            for key in keys {
+                assert!(
+                    lists_as_evaluated(&c, &key),
+                    "the {scope} comparator raised `{key}` without listing it evaluated: {c}"
+                );
+            }
+        }
+    }
+
     fn a_recovery() -> Recovery {
         Recovery {
             job_id: "fdd10ec8".into(),
@@ -926,6 +1215,10 @@ mod tests {
         assert!(evidence.contains(KEY), "names the finding");
         assert!(evidence.contains("boss-gcp"), "names the host");
         assert!(evidence.contains("3 consecutive"), "names N");
+        assert!(
+            evidence.contains("that evaluated it"),
+            "says the N are readings that looked (c11bfb77)"
+        );
         for t in [at(45), at(40), at(35)] {
             assert!(
                 evidence.contains(&t.to_rfc3339()),
@@ -1075,6 +1368,7 @@ mod tests {
 
     fn firing(comparison: Value) -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "estate-recover-on-comparison".into(),
             triggering_event_id: "evt-test".into(),
             triggering_topic: "jobs.estate.compared".into(),
@@ -1355,7 +1649,8 @@ mod tests {
                 "event_id": "e", "timestamp": observed.to_rfc3339(), "source": "jobs",
                 "kind": "jobs.estate.compared",
                 "payload": {"scope": "host", "host": host, "observed_at": observed.to_rfc3339(),
-                            "findings": {"disk_tight": [], "not_ready": []}},
+                            "findings": {"disk_tight": [], "not_ready": []},
+                            "evaluated": {"disk_tight": [host], "not_ready": [host]}},
             })
         };
         // Three clean days of boss-gcp after the raise, newest first,

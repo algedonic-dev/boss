@@ -693,7 +693,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dark = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
-        let app = app_with(Arc::new(boss_policy_client::ReqwestPolicyClient::new(dark)));
+        let app = app_with(Arc::new(boss_policy_client::ReqwestPolicyClient::new(
+            "content", dark,
+        )));
         let resp = app
             .oneshot(
                 Request::get("/api/files?target_kind=job&target_id=job-1")

@@ -1,0 +1,60 @@
+# ---------------------------------------------------------------------
+# The credential broker re-mints the org-admin token the GitHub verbs
+# act with on algedonic-dev, WHEN A REQUEST'S PLAN IS APPROVED, if the
+# token minted at filing is running out (design 76c46869 Q2, David
+# 2026-09-28; backlog bf8726c9). The filing half, and the credential's
+# whole declaration, is
+# `broker-mints-the-algedonic-dev-admin-token-when-a-github-request-is-filed`;
+# this rule hands the handler those same args with its own window,
+# pinned equal by
+# crates/core/boss-dispatcher/tests/github_app_installation_token_rules.rs
+# (CLAUDE.md §9a).
+#
+# WHY A SECOND MINT. A GitHub write waits for David's passkey on the
+# request's approve step, and that can come later than the hour an
+# installation token lives. So when the approve step completes with
+# `decision = "approved"`, the handler's refresh path mints again if
+# fewer than forty minutes remain on the token the Secret holds — the
+# runner re-renders the plan and runs the write within a pass or two of
+# the approval (about a minute each), so forty leaves the act the whole
+# of its window — and leaves a younger token alone. A rejected plan, or
+# any decision but `approved`, opens no act and mints nothing.
+#
+# WHICH APPROVALS. `step.done.sign-off` carries the approve step's
+# metadata, and the ops runner writes the WRITE verb the plan was
+# rendered for into it beside the plan (render_plan in
+# infra/ops/ops-runner.sh), so `metadata.verb` is the act being approved.
+# The list is every verb that runs infra/forge/github-act.sh AND declares
+# requires_approval — the three writes — pinned to infra/ops/verbs/ by
+# the same test. The runner writes the request's `args` beside the verb,
+# so `metadata.args.0` is the owner the approved act names, and only an
+# act on algedonic-dev re-mints algedonic-dev's admin token (the twin's
+# WHICH ORGANISATION).
+#
+# WHOSE TOKEN. `request_id = job_id`: the approve step's packet is the
+# request itself, so the re-mint reads and writes the key the filing
+# minted into, `token-<request id>` — never another request's (the twin's
+# ONE TOKEN PER REQUEST; backlog 4ce4ec55). A sibling request's fresh
+# token no longer stands in for this one's, which is what stranded the
+# second of two approved writes.
+[[rule]]
+name = "broker-re-mints-the-algedonic-dev-admin-token-when-a-github-request-is-approved"
+why = """
+EXTERNAL GLUE, the census class for reactions whose effect lives outside
+the system: the broker speaks to GITHUB's App API (the installation-token
+exchange) and the k8s Secret store, neither of which a Workflow
+definition can address. The approval is the ops-request protocol's own
+step; this rule only keeps the token its approved act will read alive
+long enough to be read. It adds no routing and spawns nothing: it fills
+one Secret and records credential.installed. Design 76c46869
+(2026-09-28): a token minted per act, never kept alive.
+"""
+# v2 (backlog 732c3cf9, 2026-09-29): the org filter (#808) and
+# `request_id` (#819) were edited in at v1, so the seed kept the v1 row
+# and neither was live. A content edit is a version bump.
+version = 2
+on_event = "step.done.sign-off"
+when = 'workflow_kind = "ops-request" AND spec_slug = "approve" AND metadata.decision = "approved" AND metadata.args.0 = "algedonic-dev" AND (metadata.verb = "github-create-repository" OR metadata.verb = "github-delete-refs" OR metadata.verb = "github-set-branch-protection")'
+[[rule.do]]
+handler = "credential.rotate.github-app-installation"
+args = { phase = "\"refresh\"", refresh_within_minutes = "\"40\"", secret_namespace = "\"boss\"", secret_name = "\"github-app-algedonic-dev\"", secret_key = "\"token\"", credential_id = "\"github-app-algedonic-dev\"", verify_repo = "\"algedonic-dev/boss\"", permissions = "\"administration:write,contents:write,metadata:read\"", request_id = "job_id" }

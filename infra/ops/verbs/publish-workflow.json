@@ -22,5 +22,6 @@
       "optional": true
     }
   ],
-  "timeout": 300
+  "timeout": 300,
+  "effect": "^publish-workflow: (.+ live at .+ — confirmed by reading the active row back|--check ok: would publish )"
 }

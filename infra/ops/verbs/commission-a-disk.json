@@ -10,5 +10,6 @@
     { "name": "mount_path", "pattern": "^/srv/[A-Za-z0-9][A-Za-z0-9._-]{0,40}$" },
     { "name": "plan_sha256", "pattern": "^[0-9a-f]{64}$" }
   ],
-  "timeout": 600
+  "timeout": 600,
+  "effect": "^commission-a-disk: /srv/[^ ]+ is live on UUID=[^ ]+$"
 }

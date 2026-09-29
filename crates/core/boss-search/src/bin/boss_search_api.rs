@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
     // by the inner client (backlog 85e7f10f).
     let policy: std::sync::Arc<dyn boss_policy_client::PolicyClient> =
         boss_policy_client::SimBypassPolicyClient::from_env(std::sync::Arc::new(
-            boss_policy_client::ReqwestPolicyClient::new(cli.policy_url),
+            boss_policy_client::ReqwestPolicyClient::new("search", cli.policy_url),
         ));
 
     let app = boss_search::http::router(boss_search::http::SearchApiState { pool, policy });

@@ -111,7 +111,28 @@ sign_offs_required = ["platform-admin"]
 title_template = "Approve the plan: {metadata.verb} on {metadata.host}"
 authority_role = "platform-admin"
 metadata_defaults = { procedure = "READ THE PLAN ON THIS STEP AND NOTHING ELSE. `plan` holds the document rendered on the host itself: the target named by-id, the kernel name it resolved to AT PLAN TIME, what was observed about it, and the argv that would run. The kernel name is shown because it is the thing that moves — it is evidence about when the plan was made, never the target.\n\nYOUR PASSKEY SIGNS THESE EXACT BYTES. If anything about the plan changes after you sign, the signature stops matching and the runner refuses. If the plan looks wrong, do not approve it and say why — a plan that needs an operator to eyeball which thing is meant is a verb that should not be on this path at all (q3)." }
-fields = [{ name = "plan", field_type = "string", required = true }]
+# EVERY KEY THE RUNNER RENDERS HERE IS A FIELD (backlog 6c9183de, review
+# S4 of car 1e603cfd, 2026-09-26). The runner writes the plan with the
+# request it was rendered for, in one patch (ops-runner.sh render_plan),
+# and the passkey signs all five. A key's one writer is declared on its
+# FIELD, so a key that is not a field can never be reserved to the
+# runner: with only `plan` here, the writer declaration would guard the
+# plan and leave the signed request beside it open. Each is required at
+# done because the runner writes all five or none. `args` is the JSON
+# array the runner writes with --argjson, empty for a verb whose only
+# param is the plan hash the runner appends (reclaim-gcp-root, filed by
+# machine with `args = []`) — present, and an array, so it completes.
+# No `writer` yet: `runner:ops` is declared in the car that delivers
+# the runner credential (design f623e425), because a writer no door
+# resolves locks its key against everyone and the publish lint refuses
+# it (workflow_lint phase 9).
+fields = [
+    { name = "plan", field_type = "string", required = true },
+    { name = "verb", field_type = "string", required = true },
+    { name = "host", field_type = "string", required = true },
+    { name = "args", field_type = "array", required = true },
+    { name = "rendered_plan_sha256", field_type = "string", required = true },
+]
 
 [[workflow.step]]
 title = "execute"

@@ -230,6 +230,7 @@ const SECTION_FOR_KIND: Readonly<Record<Route['kind'], string>> = {
   systemSubjects: 'system-subjects',
   systemRegistryDrift: 'system-registry-drift',
   systemAgents: 'system-agents',
+  systemCredentials: 'system-credentials',
   // The Department Map (design e765b3fc, car N1): the landing and every
   // selection on it light its one row. The floors, the crew board, yard
   // status, the conductor's feed and the feedback and backlog boards

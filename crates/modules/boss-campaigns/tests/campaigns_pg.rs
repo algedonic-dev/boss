@@ -108,3 +108,83 @@ async fn rebuild_reproduces_campaigns_from_the_log_alone() {
         .unwrap();
     assert_eq!(name, "Alpha Renamed", "newest event wins");
 }
+
+/// Design b046f510 (backlog d6656496): a campaign created live stages
+/// its `campaigns.campaign.created` in event_outbox, and the relay
+/// copies it into audit_log later. A rebuild between the two used to
+/// TRUNCATE the row and replay a log without its fact — and `created`
+/// is the only kind this projection replays, so nothing brought it
+/// back. The rebuild now refuses, naming the count, and the row stays;
+/// once the relay drains, the same rebuild replays it back.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_rebuild_refuses_while_a_live_campaign_is_undrained() {
+    let db = TestDb::new().await;
+    let repo = PgCampaigns::new(db.pool.clone());
+    let now = Utc.with_ymd_and_hms(2026, 9, 28, 12, 0, 0).unwrap();
+    repo.create_campaign_at(&campaign("cmp-live", "Live Launch"), now)
+        .await
+        .unwrap();
+
+    let refusal = boss_campaigns::rebuild::rebuild_campaigns(&db.pool)
+        .await
+        .expect_err("the log is missing a committed write");
+    assert!(
+        refusal.contains("1 committed write(s) have not reached audit_log"),
+        "the refusal names the count: {refusal}"
+    );
+    let survived: i64 = sqlx::query_scalar("SELECT count(*) FROM campaigns WHERE id = 'cmp-live'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(survived, 1, "the refused rebuild wiped nothing");
+
+    let bus = boss_testing::RecordingEventBus::new();
+    boss_events::outbox::drain_outbox_once(
+        &db.pool,
+        &(bus as std::sync::Arc<dyn boss_core::port::EventBus>),
+        100,
+    )
+    .await
+    .unwrap();
+    let n = boss_campaigns::rebuild::rebuild_campaigns(&db.pool)
+        .await
+        .expect("a drained log replays");
+    assert_eq!(n, 1);
+    let name: String = sqlx::query_scalar("SELECT name FROM campaigns WHERE id = 'cmp-live'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(name, "Live Launch", "replayed from the log");
+}
+
+/// `boss-rebuild-all` says every step holds its projection's
+/// `pg_advisory_xact_lock` under `lock_key(<step>)`; `campaigns` took
+/// none (backlog 8d5ac7c5). Holding `lock_key("campaigns")` on another
+/// session must hold the TRUNCATE-and-reproject back until it is
+/// released.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_rebuild_waits_on_the_campaigns_rebuild_lock() {
+    let db = TestDb::new().await;
+    let mut holder = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(boss_core::rebuild::lock_key("campaigns"))
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let pool = db.pool.clone();
+    let rebuild =
+        tokio::spawn(async move { boss_campaigns::rebuild::rebuild_campaigns(&pool).await });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !rebuild.is_finished(),
+        "the rebuild ran while another session held the campaigns rebuild lock"
+    );
+
+    holder.rollback().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(30), rebuild)
+        .await
+        .expect("the rebuild finishes once the lock is released")
+        .unwrap()
+        .expect("rebuild");
+}

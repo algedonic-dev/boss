@@ -1324,6 +1324,87 @@ describe('sign-off — a presence step shows the signed document as it is', () =
     expect(patch.decision).toBe('rejected');
     expect('plan' in patch).toBe(false);
   });
+
+  // EVERY RUNNER KEY IS A DECLARED FIELD (backlog 6c9183de, review S4,
+  // 2026-09-26): ops-request's approve step declares plan, verb, host,
+  // args (an ARRAY) and rendered_plan_sha256, each required. A value that
+  // is not a string was seeded with String(), so a zero-arg request's
+  // `args: []` read as '' — an empty REQUIRED text input that kept
+  // Approve shut forever, on exactly the request the reclaim rule files
+  // by machine. A value that is present is the signed document, whatever
+  // its JSON type.
+  const runnerStep = (args: unknown[]) => {
+    const step = planStep();
+    step.fields = [
+      { name: 'plan', field_type: 'string', required: true },
+      { name: 'verb', field_type: 'string', required: true },
+      { name: 'host', field_type: 'string', required: true },
+      { name: 'args', field_type: 'array', required: true },
+      { name: 'rendered_plan_sha256', field_type: 'string', required: true },
+    ];
+    Object.assign(step.metadata as Record<string, unknown>, {
+      verb: 'reclaim-gcp-root',
+      host: 'boss-gcp',
+      args,
+      rendered_plan_sha256: 'ab'.repeat(32),
+    });
+    return step;
+  };
+
+  test('a zero-arg request: args [] is shown as signed, never offered for edit, and Approve is open', () => {
+    const { mount } = loadBundle(() => undefined);
+    const c = new FakeNode();
+    mount(c, { step: runnerStep([]), jobId: 'job-1', onUpdate() {} });
+    expect(byClass(c, 'step-signoff-input').length).toBe(0);
+    expect(signedBlock(c).get('args')).toBe(signedText([]));
+    expect(buttonNamed(c, 'Approve')?.disabled).toBe(false);
+  });
+
+  // THE READ-ONLY BOX AFTER DONE (review of car f3365343, 2026-09-28,
+  // follow-up b). Once the step is done the signed block is down and each
+  // signed field is drawn in its own box — from `fieldValues`, the INPUT
+  // copy, where an array is seeded as its JSON text. So `args: []` read as
+  // the quoted string "[]" rather than the empty list the passkey signed.
+  // The box draws the step's own value, as the signed block does.
+  test('after done, a signed array field is drawn as the value it holds, not as its JSON text', () => {
+    for (const args of [[], ['target-a']]) {
+      const { mount } = loadBundle(() => undefined);
+      const c = new FakeNode();
+      const step = runnerStep(args);
+      step.status = 'completed';
+      mount(c, { step, jobId: 'job-1', onUpdate() {} });
+      const textOf = (n: FakeNode) =>
+        walk(n)
+          .map((x) => x.textContent)
+          .join('');
+      const field = byClass(c, 'step-field').find(
+        (n) => textOf(n).startsWith('args — what your passkey signs'),
+      );
+      expect(field).toBeDefined();
+      const box = byClass(field!, 'step-signoff-signed')[0];
+      expect(box).toBeDefined();
+      expect(textOf(box!)).toBe(signedText(args));
+      expect(textOf(box!)).not.toBe(signedText(JSON.stringify(args)));
+    }
+  });
+
+  test('the decision patch re-writes none of the runner keys, arrays included', async () => {
+    const step = runnerStep(['target-a']);
+    const srv = signingServer(step);
+    const { mount, calls } = loadBundle(srv.routes);
+    const c = new FakeNode();
+    mount(c, { step, jobId: 'job-1', onUpdate() {} });
+    buttonNamed(c, 'Reject')!.fire('click');
+    await settled();
+    const patch = calls.find((x) => x.url === META && x.method === 'PATCH')?.body as Record<
+      string,
+      unknown
+    >;
+    expect(patch.decision).toBe('rejected');
+    for (const k of ['plan', 'verb', 'host', 'args', 'rendered_plan_sha256']) {
+      expect(k in patch).toBe(false);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------

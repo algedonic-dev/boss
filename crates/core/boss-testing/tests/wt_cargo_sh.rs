@@ -22,7 +22,11 @@
 //!     otherwise the per-worktree dir starts cold, and says so;
 //!   * the seed lands in a sibling `.seeding` dir and is renamed into
 //!     place only once whole (backlog 08782b71): a copy that dies
-//!     part-way leaves no half target for the next run to believe warm.
+//!     part-way leaves no half target for the next run to believe warm;
+//!   * every seeded file is backdated to the epoch before that rename
+//!     (backlog 1150c518), so a seed built after this tree's checkout,
+//!     from other sources, is rebuilt rather than trusted — pinned with
+//!     real cargo on a two-crate workspace, not the stub.
 
 use boss_testing::{repo_root, scratch_dir, write_exec};
 use std::path::{Path, PathBuf};
@@ -802,4 +806,525 @@ fn a_build_waits_out_a_free_in_progress_and_says_so() {
         out.contains("argv=build -p boss-cli"),
         "then it builds: {out}"
     );
+}
+
+/// A seed whose files could not all be backdated is a seed cargo may
+/// trust over this tree's sources (1150c518), so it is cleared and the
+/// target starts cold, naming why — never renamed into place.
+#[test]
+fn a_seed_that_cannot_be_backdated_starts_cold_saying_why() {
+    let f = Fixture::new("backdate-fails");
+    write_exec(
+        &f.bin.join("touch"),
+        "#!/usr/bin/env bash\n\
+         case \" $* \" in *' @1 '*) exit 4 ;; esac\n\
+         for c in /usr/bin/touch /bin/touch; do [ -x \"$c\" ] && exec \"$c\" \"$@\"; done\n\
+         exit 127\n",
+    );
+    let wt = f.worktree("agent-nobackdate");
+    let seed = f.root.join("seed");
+    boss_testing::create_dir(&seed);
+
+    let (rc, out) = f.run(&wt, &seed, &[]);
+    assert_eq!(rc, 0, "a seed that fails is not a failed build: {out}");
+    assert!(
+        out.contains("backdating exit") && out.contains("starts cold"),
+        "the message must say the backdate failed and the target is cold: {out}"
+    );
+    assert!(
+        !f.targets().join("target-agent-nobackdate.seeding").exists(),
+        "the un-backdated copy must be removed: {out}"
+    );
+    assert!(
+        !out.contains("seeded"),
+        "an un-backdated copy must never be reported as a seed: {out}"
+    );
+}
+
+/// Run `git` in `dir` with an identity of its own, and require success.
+fn git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?} in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// THE SEED IS OLDER THAN ANY CHECKOUT (backlog 1150c518, 2026-09-28).
+/// `cp -a` keeps every mtime, and cargo trusts a path crate's artifact
+/// whose dep-info is NEWER than its sources — while the artifact's
+/// identity (the `-C metadata` hash) leaves the workspace path out. So
+/// a seed built AFTER a worktree was checked out, from a revision where
+/// a path crate reads differently, is trusted as this tree's own build:
+/// measured by analyst run d666c988, the first build printed `value=1`
+/// from a tree whose source says 2, with no Compiling line, and the
+/// second did too. A false green that nothing reports.
+///
+/// Real cargo, a real two-crate workspace, the hazardous order: the
+/// worktree at B (value 2) exists first, the seed is built from A
+/// (value 1) after it. The worktree's sources are also dated an hour
+/// back, so the order holds on a filesystem with coarse mtimes. `cp`
+/// is a shim that drops `--reflink=always` and runs the real `cp -a`:
+/// reflink is where the bytes live, `-a` is what keeps the mtimes, and
+/// the test must not depend on the filesystem it runs on being XFS.
+#[test]
+fn a_seed_built_after_the_checkout_from_other_sources_is_rebuilt_not_trusted() {
+    let root = scratch_dir("wt-cargo-late-seed");
+    let bin = root.join("bin");
+    boss_testing::create_dir(&bin);
+    write_exec(
+        &bin.join("cp"),
+        "#!/usr/bin/env bash\n\
+         args=()\n\
+         for a in \"$@\"; do [ \"$a\" = --reflink=always ] || args+=(\"$a\"); done\n\
+         for c in /usr/bin/cp /bin/cp; do [ -x \"$c\" ] && exec \"$c\" \"${args[@]}\"; done\n\
+         echo 'cp shim: no real cp' >&2; exit 127\n",
+    );
+
+    // The main checkout: commit A says 1, commit B says 2, and the
+    // checkout is left at A — the tree the seed is built from.
+    let repo = root.join("repo");
+    boss_testing::create_dir(&repo.join("dep/src"));
+    boss_testing::create_dir(&repo.join("app/src"));
+    boss_testing::write_file(
+        &repo.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"dep\", \"app\"]\nresolver = \"2\"\n",
+    );
+    boss_testing::write_file(
+        &repo.join("dep/Cargo.toml"),
+        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    boss_testing::write_file(
+        &repo.join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\ndep = { path = \"../dep\" }\n",
+    );
+    boss_testing::write_file(
+        &repo.join("app/src/main.rs"),
+        "fn main() { println!(\"value={}\", dep::value()); }\n",
+    );
+    boss_testing::write_file(
+        &repo.join("dep/src/lib.rs"),
+        "pub fn value() -> u32 { 1 }\n",
+    );
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "A"]);
+    boss_testing::write_file(
+        &repo.join("dep/src/lib.rs"),
+        "pub fn value() -> u32 { 2 }\n",
+    );
+    git(&repo, &["commit", "-qam", "B"]);
+    git(&repo, &["tag", "B"]);
+    git(&repo, &["checkout", "-q", "HEAD~1"]);
+
+    // The worktree at B, checked out FIRST, its sources an hour old.
+    let wt = root.join("trees").join("late-seed");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            wt.to_str().expect("utf8"),
+            "B",
+        ],
+    );
+    let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    for f in [
+        "Cargo.toml",
+        "dep/Cargo.toml",
+        "dep/src/lib.rs",
+        "app/Cargo.toml",
+        "app/src/main.rs",
+    ] {
+        std::fs::File::options()
+            .write(true)
+            .open(wt.join(f))
+            .and_then(|h| h.set_modified(an_hour_ago))
+            .unwrap_or_else(|e| panic!("date {f} back: {e}"));
+    }
+    assert!(
+        std::fs::read_to_string(wt.join("dep/src/lib.rs"))
+            .expect("worktree dep")
+            .contains("{ 2 }"),
+        "the worktree must be at B"
+    );
+
+    // The seed, built from A AFTER the worktree exists — the order a
+    // seed re-built by a sidecar pass lands in (da1d903f).
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let seed = root.join("seed");
+    let built = Command::new(&cargo)
+        .args(["build", "-q", "--offline", "-p", "app"])
+        .current_dir(&repo)
+        .env("CARGO_TARGET_DIR", &seed)
+        .output()
+        .expect("cargo builds the seed");
+    assert!(
+        built.status.success(),
+        "the seed build: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let out = Command::new(repo_root().join(SCRIPT))
+        .args(["run", "-q", "--offline", "-p", "app"])
+        .current_dir(&wt)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("WT_SEED", &seed)
+        .env("WT_TARGET_ROOT", root.join("targets"))
+        .env("WT_RECLAIM", root.join("no-floor-pass"))
+        .env_remove("WT_JOBS")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_JOBS")
+        .output()
+        .expect("run wt-cargo");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "wt-cargo run: {stdout}{stderr}");
+    assert!(
+        stderr.contains("seeded") && stderr.contains("by reflink"),
+        "the seed must have been used, or a cold target passes this for nothing: {stderr}"
+    );
+    assert_eq!(
+        stdout.trim(),
+        "value=2",
+        "the first build from the seed must run THIS tree's source, not the seed's: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// `wt-cargo suite <crate>` (backlog ede6245a, 2026-09-28).
+// ---------------------------------------------------------------------
+// MEASURED by triage run ed6ad65a over twenty builder logs that day:
+// `wt-cargo test -p boss-testing --all-features` spent 410-782 s in test
+// execution alone and 411-1128 s with its compile — median 11.2 min, and
+// 12 of 20 past the ten-minute window a builder's tool call gets, after
+// which the harness moves the call to the background by itself. Rule 4
+// asks for the whole suite before the push and rule 9 forbids background
+// tasks, so every boss-testing car broke one of them; and the suite grew
+// from 169 to 206 binaries in two days, so no split typed into the rules
+// stays under the window for long.
+//
+// So no single call can run the whole suite, however it is chunked. The
+// verb runs the crate's test targets — listed from cargo at run time,
+// never typed — in chunks sized by each target's MEASURED duration, and
+// stops before its call's budget; the next call resumes on the same
+// tree, and only a call that finds every target passed on that tree
+// exits 0. These tests drive it with REAL cargo on a small fixture
+// crate: the target list, the `--test` selectors and libtest's output
+// are cargo's own, not a stub's idea of them.
+
+/// A standalone crate with a library (one unit test, one doctest) and
+/// three integration tests. `beta` fails while `FX_FAIL` is set, so a
+/// test can make one binary red without editing the tree.
+struct Suite {
+    root: PathBuf,
+    wt: PathBuf,
+}
+
+impl Suite {
+    fn new(name: &str) -> Self {
+        let root = scratch_dir(&format!("wt-cargo-suite-{name}"));
+        let wt = root.join("trees").join(format!("agent-suite-{name}"));
+        boss_testing::create_dir(&wt.join("src"));
+        boss_testing::create_dir(&wt.join("tests"));
+        boss_testing::write_file(
+            &wt.join("Cargo.toml"),
+            "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        );
+        boss_testing::write_file(
+            &wt.join("src/lib.rs"),
+            "/// ```\n/// assert_eq!(fx::one(), 1);\n/// ```\npub fn one() -> u32 { 1 }\n\n\
+             #[cfg(test)]\nmod tests {\n    #[test]\n    fn unit() { assert_eq!(super::one(), 1); }\n}\n",
+        );
+        boss_testing::write_file(
+            &wt.join("tests/alpha.rs"),
+            "#[test]\nfn alpha() { assert_eq!(fx::one(), 1); }\n",
+        );
+        boss_testing::write_file(
+            &wt.join("tests/beta.rs"),
+            "#[test]\nfn beta() { assert!(std::env::var(\"FX_FAIL\").is_err(), \"FX_FAIL is set\"); }\n",
+        );
+        boss_testing::write_file(
+            &wt.join("tests/gamma.rs"),
+            "#[test]\nfn gamma() { assert_eq!(fx::one(), 1); }\n",
+        );
+        git(&wt, &["init", "-q"]);
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "fixture"]);
+        Self { root, wt }
+    }
+
+    fn targets(&self) -> PathBuf {
+        self.root.join("targets")
+    }
+
+    /// The measured-duration history the verb keeps beside the targets.
+    fn times(&self) -> PathBuf {
+        self.targets().join("wt-cargo-suite-times").join("fx.tsv")
+    }
+
+    /// `wt-cargo suite fx` with a chunk cap of 20 s and an unmeasured
+    /// target estimated at 10 s, so two unmeasured targets fill a chunk.
+    fn run(&self, env: &[(&str, &str)]) -> (i32, String) {
+        let mut cmd = Command::new(repo_root().join(SCRIPT));
+        cmd.args(["suite", "fx"])
+            .current_dir(&self.wt)
+            .env("WT_SEED", self.root.join("no-such-seed"))
+            .env("WT_TARGET_ROOT", self.targets())
+            .env("WT_RECLAIM", self.root.join("no-floor-pass"))
+            .env("WT_SUITE_CHUNK_SECS", "20")
+            .env("WT_SUITE_DEFAULT_SECS", "10")
+            .env("WT_SUITE_BUDGET_SECS", "3600")
+            .env_remove("FX_FAIL")
+            .env_remove("WT_JOBS")
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_BUILD_JOBS");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("run wt-cargo suite");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.code().unwrap_or(-1), text)
+    }
+}
+
+/// The one-line result each chunk prints, in order.
+fn chunk_lines(out: &str) -> Vec<&str> {
+    out.lines()
+        .filter(|l| l.starts_with("wt-cargo suite: chunk "))
+        .collect()
+}
+
+/// Every target cargo lists is run exactly once, in chunks no larger
+/// than the cap (two unmeasured targets at 10 s under a 20 s cap), the
+/// doctests in a chunk of their own because cargo refuses to mix
+/// `--doc` with other targets, and the call ends on a tally.
+#[test]
+fn the_suite_runs_every_target_in_bounded_chunks_and_ends_on_a_tally() {
+    let s = Suite::new("chunks");
+    let (rc, out) = s.run(&[]);
+    assert_eq!(rc, 0, "a green suite exits 0: {out}");
+    let chunks = chunk_lines(&out);
+    assert_eq!(chunks.len(), 3, "three chunks: {out}");
+    assert!(
+        chunks[0].contains("ok") && chunks[0].ends_with("lib test:alpha"),
+        "chunk 1 is the library and alpha: {out}"
+    );
+    assert!(
+        chunks[1].contains("ok") && chunks[1].ends_with("test:beta test:gamma"),
+        "chunk 2 is beta and gamma: {out}"
+    );
+    assert!(
+        chunks[2].contains("ok") && chunks[2].ends_with("doc"),
+        "the doctests run alone: {out}"
+    );
+    assert!(
+        out.contains("suite result: ok. 5 of 5 test targets passed"),
+        "the tally names every target: {out}"
+    );
+}
+
+/// A target an earlier run MEASURED as heavy gets a chunk to itself,
+/// whatever its neighbours weigh — the chunks follow the durations, not
+/// the count — and each run records what it measured for the next.
+#[test]
+fn a_target_measured_heavy_on_an_earlier_run_gets_a_chunk_of_its_own() {
+    let s = Suite::new("heavy");
+    boss_testing::create_dir(s.times().parent().expect("times dir"));
+    boss_testing::write_file(&s.times(), "test:beta\t100\n");
+    let (rc, out) = s.run(&[]);
+    assert_eq!(rc, 0, "{out}");
+    let chunks = chunk_lines(&out);
+    let names: Vec<&str> = chunks
+        .iter()
+        .map(|l| l.rsplit(": ").next().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        names,
+        ["lib test:alpha", "test:beta", "test:gamma", "doc"],
+        "beta, measured at 100 s against a 20 s cap, runs alone: {out}"
+    );
+    let times = std::fs::read_to_string(s.times()).expect("the history is written");
+    for target in ["lib", "test:alpha", "test:beta", "test:gamma", "doc"] {
+        assert!(
+            times.lines().any(|l| l.starts_with(&format!("{target}\t"))),
+            "{target}'s measured duration is recorded for the next run: {times}"
+        );
+    }
+    assert!(
+        !times.contains("test:beta\t100"),
+        "beta's new measurement replaces the old one: {times}"
+    );
+}
+
+/// A call stops at its budget — after at least one chunk, so every call
+/// makes progress — and says the suite is NOT green; the next call on
+/// the same tree resumes where it stopped, and only the call that runs
+/// the last target exits 0 with the tally over all of them.
+#[test]
+fn a_call_that_reaches_its_budget_stops_and_the_next_call_resumes() {
+    let s = Suite::new("resume");
+    let budget = [("WT_SUITE_BUDGET_SECS", "1")];
+
+    let (rc, out) = s.run(&budget);
+    assert_eq!(rc, 75, "a call that stops early is not a pass: {out}");
+    assert_eq!(chunk_lines(&out).len(), 1, "one chunk per call here: {out}");
+    assert!(
+        out.contains("3 of 5 test targets remain") && out.contains("NOT GREEN"),
+        "it says what remains and that the suite is not green: {out}"
+    );
+    assert!(
+        out.contains("wt-cargo suite fx"),
+        "it names the command that continues: {out}"
+    );
+
+    let (rc, out) = s.run(&budget);
+    assert_eq!(rc, 75, "{out}");
+    let chunks = chunk_lines(&out);
+    assert_eq!(chunks.len(), 1, "{out}");
+    assert!(
+        chunks[0].ends_with("test:beta test:gamma"),
+        "the second call resumes after what passed: {out}"
+    );
+
+    let (rc, out) = s.run(&budget);
+    assert_eq!(rc, 0, "the call that finishes the suite exits 0: {out}");
+    assert!(chunk_lines(&out)[0].ends_with("doc"), "{out}");
+    assert!(
+        out.contains("suite result: ok. 5 of 5 test targets passed"),
+        "the tally counts the targets every call ran: {out}"
+    );
+
+    let (rc, out) = s.run(&budget);
+    assert_eq!(rc, 0, "{out}");
+    assert!(
+        chunk_lines(&out).is_empty(),
+        "an unchanged tree whose suite passed runs nothing again: {out}"
+    );
+    assert!(out.contains("suite result: ok. 5 of 5"), "{out}");
+}
+
+/// A pass belongs to the tree it ran on. Any change — here an untracked
+/// file — and the next call starts the suite over.
+#[test]
+fn a_changed_tree_starts_the_suite_over() {
+    let s = Suite::new("changed");
+    let (rc, out) = s.run(&[]);
+    assert_eq!(rc, 0, "{out}");
+    boss_testing::write_file(&s.wt.join("NOTES"), "a change\n");
+    let (rc, out) = s.run(&[]);
+    assert_eq!(rc, 0, "{out}");
+    // The chunking differs now (the first run measured every target),
+    // so read which targets ran, not how they were grouped.
+    let mut ran: Vec<&str> = chunk_lines(&out)
+        .iter()
+        .flat_map(|l| l.rsplit(": ").next().unwrap_or("").split(' '))
+        .collect();
+    ran.sort_unstable();
+    assert_eq!(
+        ran,
+        ["doc", "lib", "test:alpha", "test:beta", "test:gamma"],
+        "every target runs again on the changed tree: {out}"
+    );
+}
+
+/// A failing binary is named on its chunk's line and in the tally, the
+/// chunk's own log is printed rather than lost, the other chunks still
+/// run, and the call exits nonzero. A later call on the same tree runs
+/// only what has not passed.
+#[test]
+fn a_failing_target_is_named_its_log_is_shown_and_only_it_runs_again() {
+    let s = Suite::new("failing");
+    let (rc, out) = s.run(&[("FX_FAIL", "1")]);
+    assert_eq!(rc, 101, "a red suite exits 101: {out}");
+    let chunks = chunk_lines(&out);
+    assert_eq!(
+        chunks.len(),
+        3,
+        "a red chunk does not stop the others: {out}"
+    );
+    assert!(
+        chunks[1].contains("FAILED") && chunks[1].contains("test:beta"),
+        "the red chunk says so: {out}"
+    );
+    assert!(
+        out.contains("FX_FAIL is set"),
+        "the failing chunk's log is printed: {out}"
+    );
+    assert!(
+        out.contains("suite result: FAILED. 4 of 5 test targets passed; failed: test:beta"),
+        "the tally names the failure: {out}"
+    );
+
+    let (rc, out) = s.run(&[]);
+    assert_eq!(rc, 0, "{out}");
+    let chunks = chunk_lines(&out);
+    assert_eq!(chunks.len(), 1, "{out}");
+    assert!(
+        chunks[0].ends_with(": test:beta"),
+        "only the target that had not passed runs again: {out}"
+    );
+    assert!(out.contains("suite result: ok. 5 of 5"), "{out}");
+}
+
+/// Rule 4 of the builder rules is where a builder learns to run a whole
+/// suite; it must name this verb, and the verb it names must be the one
+/// the door answers to — a rule pointing at a verb that does not exist
+/// is the drift CLAUDE.md 9a pins.
+#[test]
+fn the_builder_rules_send_a_whole_suite_to_this_verb() {
+    let rules =
+        std::fs::read_to_string(repo_root().join("infra/platform/documents/builder-rules.md"))
+            .expect("the builder rules");
+    assert!(
+        rules.contains("`wt-cargo suite <crate>`"),
+        "rule 4 names `wt-cargo suite <crate>` as the way to run a whole suite"
+    );
+    let door = std::fs::read_to_string(repo_root().join(SCRIPT)).expect("wt-cargo");
+    assert!(
+        door.contains("\"${1:-}\" = suite") && door.contains("wt-cargo-suite.sh"),
+        "wt-cargo answers to `suite` through wt-cargo-suite.sh"
+    );
+}
+
+/// `suite` takes exactly one crate; anything else is a usage error that
+/// runs nothing.
+#[test]
+fn the_suite_verb_takes_exactly_one_crate() {
+    let s = Suite::new("usage");
+    for args in [&["suite"][..], &["suite", "fx", "--lib"][..]] {
+        let out = Command::new(repo_root().join(SCRIPT))
+            .args(args)
+            .current_dir(&s.wt)
+            .env("WT_SEED", s.root.join("no-such-seed"))
+            .env("WT_TARGET_ROOT", s.targets())
+            .env("WT_RECLAIM", s.root.join("no-floor-pass"))
+            .env_remove("CARGO_TARGET_DIR")
+            .output()
+            .expect("run wt-cargo");
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {text}");
+        assert!(text.contains("usage: wt-cargo suite <crate>"), "{text}");
+    }
 }

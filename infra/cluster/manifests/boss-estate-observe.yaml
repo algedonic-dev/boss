@@ -31,48 +31,46 @@ metadata:
   namespace: boss
 ---
 # Node listing is cluster-scoped, so this is the one ClusterRole in the
-# tree — and it is READ-ONLY. An observer that could change anything
-# would be a different kind of thing, and `get` is the only verb here:
-# the kubelet's write paths (/exec, /run, /attach, /portForward) are all
-# POST, so none of them is reachable with this rule set.
+# tree — and it is READ-ONLY: the node objects themselves, and NO
+# subresource of them.
 #
-# WHY nodes/proxy, added 2026-09-10 (a520737f). FREE SPACE IS NOT ON THE
-# NODE OBJECT. `status.capacity.ephemeral-storage` is a total;
-# `status.allocatable.ephemeral-storage` is that total minus kube-reserved
-# and the eviction threshold — a static figure, not a measurement, and
-# reading it as "free" would produce a number that never moves. The
-# kubelet's own statfs is published at /stats/summary, reached through the
-# API server at /api/v1/nodes/<name>/proxy/..., which the API server
-# authorizes as `get` on the `nodes/proxy` subresource.
+# NO nodes/proxy, AND WHY IT IS NAMED HERE (backlog eeac3d56,
+# 2026-09-29). From a520737f (2026-09-10) this role also granted
+# `nodes/proxy`, to read the kubelet's /stats/summary for each node's
+# free space, and this header said the kubelet's write paths (/exec,
+# /run, /attach, /portForward) were all POST and so out of reach of a
+# `get`-only rule. That was FALSE: a WebSocket upgrade is a GET, and the
+# kubelet authorizes an exec, attach or port-forward opened that way as
+# `get nodes/proxy` (publicly disclosed in 2026; upstream calls it
+# intended). So the grant was exec into any pod on any node — the boss
+# pod, whose environment carries the credential broker's root tokens,
+# included. RBAC cannot scope a proxy grant by path, so there was no
+# narrower form of it to keep.
 #
-# Two alternatives were weighed and rejected:
-# - The `DiskPressure` condition is free with the rule above and needs no
-#   arithmetic, but kubelet raises it at its eviction threshold — 10% of
-#   nodefs by default. estate_compare's floor is deliberately 35%
-#   BECAUSE 8% arrived hours after CI had already gone red (2026-09-05);
-#   adopting a 10% signal as the only cluster-node disk alarm would
-#   reintroduce exactly what that change fixed. It fires when the node is
-#   already evicting, which on w-1 means gate pods dying.
-# - A DaemonSet reading `df` off a hostPath needs no cluster-wide RBAC,
-#   but mounting the kubelet's filesystem into a pod is a LARGER
-#   privilege than reading stats through the API server, and it replaces
-#   one CronJob with a per-node workload.
+# WHERE THE FREE FIGURE COMES FROM NOW. Not through the kubelet at all:
+# the forge reads each node's /var — the kubelet's root filesystem on
+# Talos, "nodefs" — through the Talos API with the talosconfig it
+# already holds (infra/estate/observe-nodefs.sh), and records it as a
+# `talos-nodefs` observation. The script below reads the newest one and
+# carries each node's figure on this observation, where estate.compare
+# and the estate page already read it. The two in-cluster alternatives
+# were worse: `nodes/stats` straight to the kubelet on :10250 is the
+# narrow grant, but Talos kubelet serving certs are self-signed per node,
+# so it would send this SA's token to each node with verification off;
+# and metrics-server is not installed and carries no filesystem figure.
 #
-# State plainly what this widens: `get nodes/proxy` reaches the kubelet's
-# whole read surface (/pods, /runningpods, /metrics, /containerLogs), so
-# the observer can now read pod logs cluster-wide. RBAC cannot scope a
-# proxy grant by path. The narrower grant — talking to port 10250
-# directly, where the kubelet's own check is `nodes/stats` and nothing
-# else — was not taken because it needs a TLS trust decision and a
-# per-node network path of its own, to save a read the API server already
-# audits. Revisit if the observer ever needs a second kubelet endpoint.
+# The pin that keeps it gone: infra/lint/a-cluster-node-reports-its-headroom.sh
+# refuses nodes/proxy in this file, and
+# crates/core/boss-testing/tests/no_service_account_reaches_the_kubelet_proxy.rs
+# refuses it — or any wildcard that covers it — in every role the
+# converge renders.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: estate-observer
 rules:
   - apiGroups: [""]
-    resources: [nodes, nodes/proxy]
+    resources: [nodes]
     verbs: [get, list]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -273,9 +271,8 @@ spec:
                   # In-cluster credentials: the ServiceAccount token is
                   # mounted, so kubectl needs no kubeconfig.
                   kubectl get nodes -o json > "$WORK/nodes.json"
-                  # FREE SPACE, per node, from the kubelet's own statfs
-                  # (a520737f). Until this loop existed the observation
-                  # carried capacity and nothing else, so
+                  # FREE SPACE, per node (a520737f). Until this existed
+                  # the observation carried capacity and nothing else, so
                   # estate_compare's disk floor — free below 16 GiB or
                   # below 35% of capacity — had no numerator and could
                   # never fire for cp-1, cp-2, cp-3 or w-1. w-1 is THE
@@ -284,49 +281,99 @@ spec:
                   # the one machine whose disk stops the pipeline was the
                   # one machine nothing watched.
                   #
-                  # WHICH FILESYSTEM. `.node.fs` of /stats/summary is the
-                  # kubelet root filesystem — "nodefs" — which holds the
-                  # image store, emptyDirs and the gate's warm target. It
-                  # is the same filesystem the kubelet measures to publish
-                  # status.capacity.ephemeral-storage, so the free figure
-                  # below and the disk_gb further down are one volume's
+                  # WHERE IT IS READ — NOT HERE (backlog eeac3d56). This
+                  # loop read each kubelet's /stats/summary through the API
+                  # server, which needed `get nodes/proxy`, and that grant
+                  # is exec into any pod (the ClusterRole's header says
+                  # why it is gone). The forge now reads each node's /var
+                  # through the Talos API (infra/estate/observe-nodefs.sh)
+                  # and records a `talos-nodefs` observation; this pass
+                  # carries the NEWEST one's figures across, and names the
+                  # reading it used as `disk_free_source` — the receipt,
+                  # so a figure on this observation says where it came
+                  # from and when it was taken.
+                  #
+                  # WHICH FILESYSTEM. On Talos the kubelet's root
+                  # filesystem — "nodefs", which holds the image store,
+                  # emptyDirs and the gate's warm target — is the
+                  # EPHEMERAL partition at /var, and it is the filesystem
+                  # the kubelet measures to publish
+                  # status.capacity.ephemeral-storage. The free figure and
+                  # the disk_gb further down must be one volume's
                   # available and total, exactly as `df -k /` gives the
-                  # host observer its pair. A cluster node's own `/` is a
-                  # read-only Talos squashfs and is not what fills; a
-                  # volume as seen from inside a pod is a third thing
-                  # again, and reading one of those as a node-level
-                  # figure is how this gap stayed hidden.
+                  # host observer its pair — so that is CHECKED here, not
+                  # assumed: a Talos total more than 1 GiB from this
+                  # node's ephemeral-storage capacity is a different
+                  # filesystem, and its free figure is refused. A cluster
+                  # node's own `/` is a read-only Talos squashfs and is
+                  # not what fills; a volume as seen from inside a pod is
+                  # a third thing again.
+                  #
+                  # HOW OLD IS TOO OLD. NODEFS_MAX_AGE_S, default 1800:
+                  # the forge reads every fifteen minutes, so this allows
+                  # one missed tick. Older, and the node is unread — a
+                  # forge reader that went quiet must look blind here, not
+                  # healthy on a figure from yesterday. And the guard is
+                  # two-sided: a reading dated more than five minutes in
+                  # the FUTURE sorts newest and would otherwise win over
+                  # every genuine one until it fell off the page (~75
+                  # minutes), so a skewed clock or a forged post reads
+                  # blind too (review of 4327d1a3, finding 1).
                   #
                   # BEST-EFFORT, AND LOUD ABOUT IT. The same POST carries
                   # the readings declared_not_observed, not_ready and the
-                  # alarm's silence sweep all depend on, so a denied or
-                  # unreachable kubelet must cost the free figure for one
+                  # alarm's silence sweep all depend on, so an unreadable,
+                  # stale or refused figure costs the free figure for that
                   # node and nothing else — never the observation. The
                   # node and the reason are printed; estate_compare turns
-                  # the null into `disk_unmeasured` so going blind stays
-                  # distinguishable from having plenty of room.
-                  mkdir -p "$WORK/fs" && rm -f "$WORK"/fs/*.json
-                  for n in $(jq -r '(.items // [])[] | .metadata.name' "$WORK/nodes.json"); do
-                    if kubectl get --raw "/api/v1/nodes/$n/proxy/stats/summary" >"$WORK/fs/$n.raw" 2>"$WORK/fs/$n.err"; then
-                      jq --arg id "$n" '{ id: $id, disk_free_gb:
-                        (if (.node.fs.availableBytes | type) == "number"
-                         then ((.node.fs.availableBytes + 536870912) / 1073741824 | floor)
-                         else null end) }' "$WORK/fs/$n.raw" > "$WORK/fs/$n.json"
-                    else
-                      echo "no free-space reading for $n: $(cat "$WORK/fs/$n.err")"
-                      jq -n --arg id "$n" '{ id: $id, disk_free_gb: null }' > "$WORK/fs/$n.json"
-                    fi
-                  done
-                  if ls "$WORK"/fs/*.json >/dev/null 2>&1; then
-                    jq -s 'map({ key: .id, value: .disk_free_gb }) | from_entries' \
-                      "$WORK"/fs/*.json > "$WORK/free.json"
-                  else
-                    # No nodes listed at all. The door refuses an
-                    # observation that saw nothing, and that refusal is
-                    # the report we want — not a jq error on an unmatched
-                    # glob three lines earlier.
-                    echo '{}' > "$WORK/free.json"
+                  # the null into `disk_unmeasured`, and three of those in
+                  # a row raise `blind:disk_tight/<node>`, so going blind
+                  # stays distinguishable from having plenty of room.
+                  NODEFS_MAX_AGE_S="${NODEFS_MAX_AGE_S:-1800}"
+                  nodefs_unread=""
+                  if ! api_curl -sf -H "x-boss-user: {\"id\":\"automation:estate-observer\",\"role\":\"platform-admin\",\"access_tier\":\"operator\"}" \
+                      "$JOBS_API/api/estate/observations?scope=talos-nodefs&limit=5" >"$WORK/nodefs-page.json" 2>"$WORK/nodefs-page.err"; then
+                    nodefs_unread="the talos-nodefs series could not be read: $(cat "$WORK/nodefs-page.err")"
                   fi
+                  # The newest reading by its own observed_at, or null.
+                  jq -cs '[ .[] | objects | (.data // [])[]? | (.payload? // empty) | objects
+                            | select(.scope == "talos-nodefs" and (.observed_at | type) == "string") ]
+                          | sort_by(.observed_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) | last' \
+                    "$WORK/nodefs-page.json" >"$WORK/nodefs.json" 2>/dev/null \
+                    || { [ -n "$nodefs_unread" ] || nodefs_unread="the talos-nodefs series answered something that is not a page of observations: $(head -c 200 "$WORK/nodefs-page.json")"; echo null >"$WORK/nodefs.json"; }
+                  jq -r --slurpfile nodes "$WORK/nodes.json" --argjson max "$NODEFS_MAX_AGE_S" --arg unread "$nodefs_unread" '
+                    def gib:
+                      if . == null then null
+                      elif endswith("Ki") then (((rtrimstr("Ki") | tonumber) + 524288) / 1048576 | floor)
+                      elif endswith("Mi") then (((rtrimstr("Mi") | tonumber) + 512) / 1024 | floor)
+                      else null end;
+                    def abs: if . < 0 then -. else . end;
+                    . as $r
+                    | (($r.nodes // []) | map({ key: (.id // ""), value: . }) | from_entries) as $by
+                    | (if $r == null then null
+                       else (now - ($r.observed_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) | floor) end) as $age
+                    | ($nodes[0].items // [])[]
+                    | .metadata.name as $n
+                    | ((.status.capacity // {})["ephemeral-storage"] | gib) as $cap
+                    | $by[$n] as $t
+                    | if $unread != "" then [$n, "null", $unread]
+                      elif $r == null then [$n, "null", "no talos-nodefs reading is recorded (the forge runs infra/estate/observe-nodefs.sh)"]
+                      elif $age > $max then [$n, "null", "the newest talos-nodefs reading (\($r.observed_at)) is \($age)s old, past NODEFS_MAX_AGE_S=\($max)"]
+                      elif $age < -300 then [$n, "null", "the newest talos-nodefs reading (\($r.observed_at)) is dated \(0 - $age)s in the future — a skewed clock or a forged reading, not headroom"]
+                      elif $t == null then [$n, "null", "the talos-nodefs reading of \($r.observed_at) has no row for this node"]
+                      elif ($t.disk_free_gb | type) != "number" then [$n, "null", "the forge could not read it at \($r.observed_at): \($t.unread // "no free figure")"]
+                      elif $cap == null or ($t.disk_gb | type) != "number" or (($t.disk_gb - $cap) | abs) > 1
+                        then [$n, "null", "Talos \($r.mount // "/var") is \($t.disk_gb)G but the kubelet ephemeral-storage is \($cap)G — not the kubelet filesystem, so its free figure is refused"]
+                      else [$n, ($t.disk_free_gb | tostring), "-"] end
+                    | @tsv' "$WORK/nodefs.json" >"$WORK/free.tsv" \
+                    || { echo "no free-space reading for any node: the talos-nodefs reading did not parse"; : >"$WORK/free.tsv"; }
+                  while IFS="$(printf '\t')" read -r n free why; do
+                    [ "$why" = "-" ] || echo "no free-space reading for $n: $why"
+                  done <"$WORK/free.tsv"
+                  jq -Rs 'split("\n") | map(select(length > 0) | split("\t") | { key: .[0], value: (.[1] | fromjson) }) | from_entries' \
+                    "$WORK/free.tsv" >"$WORK/free.json"
+                  disk_free_source=$(jq -c 'if type == "object" then { scope, observer, observed_at } else null end' "$WORK/nodefs.json")
+                  [ -n "$disk_free_source" ] || disk_free_source=null
                   # THE DISPATCHER'S DEAD-LETTER COUNTERS (8834804a). A
                   # handler failure past its budget annotates the subject
                   # packet — except when there is no packet (six topics
@@ -352,7 +399,7 @@ spec:
                   # which also RUNS this block under stubs.
                   #
                   # BEST-EFFORT, AND LOUD ABOUT IT — the same contract as
-                  # the kubelet read above. A plain curl with a short
+                  # the free-space read above. A plain curl with a short
                   # deadline, not api_curl: the dispatcher shares the
                   # boss pod with the jobs API, so a roll takes both away
                   # together and the POST below already waits it out; a
@@ -392,7 +439,7 @@ spec:
                   # python this replaces used round-half-even, so an
                   # exact .5-GiB tie now rounds up instead of to the
                   # nearest even integer.
-                  jq --slurpfile free "$WORK/free.json" \
+                  jq --slurpfile free "$WORK/free.json" --argjson disk_free_source "$disk_free_source" \
                      --argjson dispatcher "$dispatcher" --arg dispatcher_unread "$dispatcher_unread" '
                     def gib:
                       if . == null then null
@@ -405,6 +452,7 @@ spec:
                       observed_at: (now | todate),
                       observer: "boss-estate-observe",
                       scope: "kubernetes-nodes",
+                      disk_free_source: $disk_free_source,
                       dispatcher: $dispatcher,
                       nodes: ([ (.items // [])[]
                         | (.metadata // {}) as $md
@@ -488,7 +536,7 @@ spec:
                   # BEST-EFFORT, after the observation has landed: the
                   # node observation is this pod's first duty, and a
                   # refused or failed read here costs one spoken line,
-                  # never the run — the same contract as a lost kubelet
+                  # never the run — the same contract as a lost free-space
                   # read above.
                   #
                   # A CORPSE DOES NOT SETTLE A PACKET SOMEONE ELSE IS

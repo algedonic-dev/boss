@@ -103,16 +103,16 @@ pub trait PublishedStamps: Send + Sync {
 /// in the instance that was published.
 pub struct HttpStamps {
     base: String,
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
 }
 
 impl HttpStamps {
     pub fn new(base: &str) -> Result<Self> {
         Ok(Self {
             base: base.trim_end_matches('/').to_string(),
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()?,
+            client: crate::gate::machine_client_with(
+                reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)),
+            )?,
         })
     }
 }

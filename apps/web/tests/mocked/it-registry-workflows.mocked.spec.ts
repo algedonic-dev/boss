@@ -61,7 +61,7 @@ const CATALOG = [
   workflow('hire', 'Hire someone', 'people'),
 ] as const;
 
-const REGISTRY_TABS = ['Workflows', 'Dispatcher', 'Rules', 'Step plugins', 'Policy', 'Subjects', 'Drift', 'Agents'];
+const REGISTRY_TABS = ['Workflows', 'Dispatcher', 'Rules', 'Step plugins', 'Policy', 'Subjects', 'Drift', 'Agents', 'Credentials'];
 
 async function openRegistry(
   page: Page,

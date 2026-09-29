@@ -848,7 +848,7 @@ pub(crate) async fn retire(
     accept_net_diff: bool,
     dry_run: bool,
 ) -> Result<()> {
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     // The actor FIRST: a write nobody names is refused, and the refusal
     // costs a line rather than a half-retired car (5083d6f5).
     let actor = if dry_run {
@@ -948,7 +948,7 @@ fn evidence_of(r: &Retirement) -> &str {
     }
 }
 
-pub(crate) async fn read(http: &reqwest::Client, id: &str) -> Result<Value> {
+pub(crate) async fn read(http: &boss_core::machine_token::Client, id: &str) -> Result<Value> {
     read_via(&Http(http), id).await
 }
 
@@ -970,7 +970,7 @@ pub(crate) trait Door: Send + Sync {
 
 /// The operator's door: `crate::gate::api`, signed as the actor running
 /// the verb.
-pub(crate) struct Http<'a>(pub(crate) &'a reqwest::Client);
+pub(crate) struct Http<'a>(pub(crate) &'a boss_core::machine_token::Client);
 
 #[async_trait::async_trait]
 impl Door for Http<'_> {
@@ -1010,7 +1010,7 @@ pub(crate) async fn read_via(door: &dyn Door, id: &str) -> Result<Value> {
 /// Shared with `boss prove --disproved` (08664157), whose writes are the
 /// same three in the same order; `verb` is who prints the confirmation.
 pub(crate) async fn apply(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     id: &str,
     car_json: &Value,
     w: &car_retire::RetireWrites,

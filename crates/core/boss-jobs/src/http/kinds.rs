@@ -365,13 +365,18 @@ pub(super) async fn publish_kind<R: JobsRepository + 'static, B: EventBus + 'sta
 ///
 /// A draft a packet is pinned to is NOT pre-history — an experiment
 /// admits packets to its draft candidate, and `boss job convert --to
-/// vN` can move one onto a draft — so the route refuses 409, naming
+/// vN` could move one onto a draft until it refused draft targets — so
+/// the route refuses 409, naming
 /// how many packets and one of them (backlog ce8b7d66). The registry
 /// never reuses the discarded number either way, so this refusal
-/// protects the packet's text, not only its number. The check reads
-/// before the delete rather than in its transaction: a packet admitted
-/// to the draft between the two is the draft-pinning question the
-/// experiments design owns (d8771dec).
+/// protects the packet's text, not only its number. This read answers
+/// for every adapter; the Pg registry asks the same question again
+/// INSIDE the discard's transaction, under a lock on the draft row, and
+/// that answer is the one that decides — a packet committed between
+/// this read and the delete is counted there, not orphaned. What it
+/// cannot see is an admission that read the draft before the discard
+/// and commits after it; the job insert takes no lock on the row it
+/// pins to (recorded on backlog ce8b7d66).
 pub(super) async fn discard_kind_version<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     CurrentUser(user): CurrentUser,
@@ -386,24 +391,7 @@ pub(super) async fn discard_kind_version<R: JobsRepository + 'static, B: EventBu
     }
     match state.jobs.jobs_pinned_to_workflow(&kind, version).await {
         Ok(pinned) if pinned.count > 0 => {
-            let named = pinned
-                .first
-                .map(|id| format!(" (e.g. {id})"))
-                .unwrap_or_default();
-            let noun = if pinned.count == 1 {
-                "packet is"
-            } else {
-                "packets are"
-            };
-            return (
-                StatusCode::CONFLICT,
-                format!(
-                    "{kind} v{version} cannot be discarded: {} {noun} pinned to it{named}, \
-                     and a pinned packet runs the text it was admitted under",
-                    pinned.count
-                ),
-            )
-                .into_response();
+            return (StatusCode::CONFLICT, pinned.discard_refusal(&kind, version)).into_response();
         }
         Ok(_) => {}
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),

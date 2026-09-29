@@ -18,8 +18,10 @@
 # null value DELETES its key; every other value replaces that key
 # wholesale; status and the other step fields are untouchable through
 # it). A plugin sends ONLY the keys it owns and the server preserves
-# the rest. A completion PUT that must attest the step's final shape
-# reads the row back fresh first — never the snapshot.
+# the rest. A completion PUT carries the status alone — no metadata at
+# all, fresh or snapshot — since backlog e39a9d2a moved every bundle to
+# the two doors; apps/web/src/steps/a-step-plugin-put-carries-no-metadata.test.ts
+# holds that half.
 #
 # WHAT IT CHECKS. Greps infra/step-plugins/*.js for the snapshot-write
 # idioms, each taken verbatim from the pre-migration code so this lint
@@ -72,8 +74,8 @@ for entry in "${PATTERNS[@]}"; do
         echo "  reverted server-side step metadata on 2026-09-02 (review-design" >&2
         echo "  title/markdown). Send ONLY the keys the plugin owns through" >&2
         echo "  PATCH /api/jobs/{id}/steps/{step_id}/metadata (the server merges;" >&2
-        echo "  null deletes a key), and build a completion PUT from a freshly" >&2
-        echo "  fetched row, never from the mount-prop \`step\`." >&2
+        echo "  null deletes a key), then PUT the status alone — { status }," >&2
+        echo "  never a row, fresh or the mount-prop \`step\`." >&2
     fi
     echo "  [$name]" >&2
     printf '%s\n' "$hits" | sed 's/^/    /' >&2

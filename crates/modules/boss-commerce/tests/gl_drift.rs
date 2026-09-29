@@ -38,7 +38,10 @@ async fn manual_revenue_credit_flows_into_commerce_summary() {
     let posted_on = Utc::now().date_naive();
     let amount_cents: i64 = 777_000;
 
+    // Signed: a ledger write names its caller, and an unsigned one is
+    // refused 401 (backlog 34f0a954).
     TestRequest::post("/api/ledger/journal-entries")
+        .as_user("emp-controller", "controller")
         .json(&json!({
             "posted_on": posted_on.format("%Y-%m-%d").to_string(),
             "memo": "drift test: manual revenue credit",

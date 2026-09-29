@@ -12,7 +12,7 @@
   // close a packet without saying why. Two aborted terminals: it lists
   // both and asks which. The page decides whether to mount it at all
   // (none → no control), so this component never sees an empty list.
-  import { putStep } from '../steps/stepWrite';
+  import { saveStep } from '../steps/stepWrite';
   import { abortBody, reasonIsSentence, type AbortTerminal } from './abort';
 
   type Props = Readonly<{
@@ -41,20 +41,20 @@
   async function submit(): Promise<void> {
     const t = chosen;
     if (!t) return;
-    // The terminal carries the step's materialised metadata; the body
-    // merges the reason over it, because a step PUT replaces metadata
-    // wholesale and `outcome_kind` lives in that same object.
-    const body = abortBody({ metadata: t.metadata }, reason);
+    // The reason alone, through the step merge door, then the status
+    // (backlog e39a9d2a, Stage 2): `outcome_kind` stays on the row as
+    // it stands rather than being re-sent from the page's copy.
+    const body = abortBody(reason);
     if (!body) {
       error = 'A reason is required — at least one sentence.';
       return;
     }
     busy = true;
     error = null;
-    // putStep can only come back as a discriminated result: a refused
+    // saveStep can only come back as a discriminated result: a refused
     // write (a 409 from the blocker gate, a 403 from policy) renders
     // the server's own words here and leaves the modal open.
-    const result = await putStep(jobId, t.id, body);
+    const result = await saveStep(jobId, t.id, body);
     busy = false;
     if (result.kind === 'failed') {
       error = result.error;

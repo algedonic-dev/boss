@@ -837,6 +837,18 @@ if [ "$1" = "repo" ] && [ "$2" = "fork" ]; then
 fi
 if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
     if [ -f '{api}/_pr_create_refuses' ]; then cat '{api}/_pr_create_refuses' >&2; exit 1; fi
+    # The PR it opens is then on the open listing, as on GitHub — unless
+    # a case plants `_pr_create_unlisted` to stand in for a listing that
+    # does not show it.
+    head=; prev=
+    for a in "$@"; do [ "$prev" = "--head" ] && head="$a"; prev="$a"; done
+    if [ ! -f '{api}/_pr_create_unlisted' ]; then
+        [ -f '{api}/_open_prs.json' ] || echo '[]' > '{api}/_open_prs.json'
+        jq --arg o "${{head%%:*}}" --arg b "${{head#*:}}" \
+            '. + [{{number: 1, url: "https://github.invalid/{mirror_slug}/pull/1", headRefName: $b,
+                   headRepositoryOwner: {{login: $o}}, headRepository: {{id: "R_1", name: "{fork_name}"}}}}]' \
+            '{api}/_open_prs.json' > '{api}/_open_prs.next' && mv '{api}/_open_prs.next' '{api}/_open_prs.json'
+    fi
     echo 'https://github.invalid/{mirror_slug}/pull/1'
     exit 0
 fi
@@ -851,11 +863,17 @@ if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
     exit 0
 fi
 # `pr close <n>` brings GitHub's answer for pulls/<n> into being — a
-# closed PR, unless `on_close` planted a different answer.
+# closed PR, unless `on_close` planted a different answer — and takes it
+# off the open listing, as GitHub does, unless that answer still reads
+# open.
 if [ "$1" = "pr" ] && [ "$2" = "close" ]; then
     f='{api}/'"$(echo "{mirror_slug}/pulls/$3" | tr / _)".json
     if [ -f '{api}/_on_close.json' ]; then cp '{api}/_on_close.json' "$f"
     else printf '{{"number":%s,"state":"closed","merged":false,"closed_at":"2026-01-02T00:00:00Z"}}\n' "$3" > "$f"; fi
+    if [ -f '{api}/_open_prs.json' ] && [ "$(jq -r '.state // ""' "$f")" = closed ]; then
+        jq --argjson n "$3" 'map(select(.number != $n))' '{api}/_open_prs.json' > '{api}/_open_prs.next' \
+            && mv '{api}/_open_prs.next' '{api}/_open_prs.json'
+    fi
     exit 0
 fi
 exit 0
@@ -863,6 +881,7 @@ exit 0
                 log = root.join("gh.log").display(),
                 api = gh_api.display(),
                 fork_file = fork_file,
+                fork_name = FORK_SLUG.split('/').nth(1).unwrap(),
                 mirror_slug = MIRROR_SLUG,
             ),
         );
@@ -1877,19 +1896,42 @@ impl Run {
 
 const OLDER_PACKET: &str = "00000000-0000-0000-0000-0000000000c5";
 
-/// The open packet the run publishes for, plus a CLOSED older packet
-/// whose open-pr recorded pull/5 — the shape d2967a9c had on 2026-09-24.
-fn jobs_with_an_older_publish(run: &Run) {
-    let older: serde_json::Value = serde_json::from_str(&format!(
-        r#"{{"id":"{OLDER_PACKET}","title":"publish to github","status":"closed","metadata":{{}},
-    "steps":[{{"id":"00000000-0000-0000-0000-0000000000c6","spec_slug":"open-pr","status":"completed",
-               "metadata":{{"pr_url":"https://github.com/{MIRROR_SLUG}/pull/5"}}}}]}}"#
-    ))
-    .unwrap();
+/// A CLOSED publish packet whose open-pr recorded `pr_url` on the fork's
+/// `branch`, published from forge commit `source` — the shape every
+/// packet since 254177e2 carries (d2967a9c on 2026-09-24 among them).
+fn recorded_publish(id: &str, pr_url: &str, branch: &str, source: &str) -> serde_json::Value {
+    let owner = FORK_SLUG.split('/').next().unwrap();
+    serde_json::json!({
+        "id": id, "title": "publish to github", "status": "closed", "metadata": {},
+        "steps": [{"id": format!("{id}-open-pr"), "spec_slug": "open-pr", "status": "completed",
+                   "metadata": {"pr_url": pr_url, "head": format!("{owner}:{branch}"),
+                                "source_sha": source}}],
+    })
+}
+
+/// Serve `packet` as the one open publish packet, beside `others`.
+fn jobs_with(run: &Run, packet: &Packet, others: Vec<serde_json::Value>) {
+    let data: Vec<serde_json::Value> = std::iter::once(packet.json()).chain(others).collect();
     boss_testing::write_file(
         &run.root.join("jobs.json"),
-        &serde_json::json!({ "data": [Packet::signed(&run.forge_main()).json(), older] })
-            .to_string(),
+        &serde_json::json!({ "data": data }).to_string(),
+    );
+}
+
+/// The open packet the run publishes for, plus the older packet whose
+/// open-pr recorded pull/5 on `branch`, from the same forge main the run
+/// publishes — so the run's snapshot contains everything in it.
+fn jobs_with_an_older_publish(run: &Run, branch: &str) {
+    let main = run.forge_main();
+    jobs_with(
+        run,
+        &Packet::signed(&main),
+        vec![recorded_publish(
+            OLDER_PACKET,
+            &format!("https://github.com/{MIRROR_SLUG}/pull/5"),
+            branch,
+            &main,
+        )],
     );
 }
 
@@ -2396,9 +2438,17 @@ fn the_snapshot_carries_the_signed_tree_even_after_forge_main_moves() {
     );
 }
 
+/// One row of `gh pr list --json number,url,headRefName,headRepositoryOwner,
+/// headRepository`, from a repository named like the fork.
 fn pr_row(n: u32, url: &str, head: &str, owner: &str) -> String {
+    pr_row_from(n, url, head, owner, FORK_SLUG.split('/').nth(1).unwrap())
+}
+
+/// `pr_row`, from a repository called `repo` — gh answers `headRepository`
+/// as `{id, name}`, the owner being a separate field.
+fn pr_row_from(n: u32, url: &str, head: &str, owner: &str, repo: &str) -> String {
     format!(
-        r#"{{"number":{n},"url":"{url}","headRefName":"{head}","headRepositoryOwner":{{"login":"{owner}"}}}}"#
+        r#"{{"number":{n},"url":"{url}","headRefName":"{head}","headRepositoryOwner":{{"login":"{owner}"}},"headRepository":{{"id":"R_{n}","name":"{repo}"}}}}"#
     )
 }
 
@@ -2411,21 +2461,45 @@ fn a_new_publish_pr_closes_each_older_publish_pr_as_superseded() {
     let run = Run::new("supersede-older");
     run.a_real_fork();
     run.echoing_curl();
-    jobs_with_an_older_publish(&run);
+    // The older packet published forge main as it stood; a train lands;
+    // this run publishes the newer main, which contains it.
+    let older_source = run.forge_main();
+    let newer_source = run.forge_moves_on();
     let owner = FORK_SLUG.split('/').next().unwrap();
     let url = |n: u32| format!("https://github.com/{MIRROR_SLUG}/pull/{n}");
     let new_pr = format!("https://github.invalid/{MIRROR_SLUG}/pull/1");
+    jobs_with(
+        &run,
+        &Packet::signed(&newer_source),
+        vec![
+            recorded_publish(OLDER_PACKET, &url(5), "publish/2026-01-01", &older_source),
+            // A packet recorded #12's url and branch, but #12 comes from
+            // ANOTHER repository of the same owner: the record is of the
+            // fork's branch, and this is not it (1a2bcf11, finding 3).
+            recorded_publish(
+                "00000000-0000-0000-0000-0000000000c7",
+                &url(12),
+                "publish/2025-12-29",
+                &older_source,
+            ),
+        ],
+    );
     run.open_prs(&format!(
         "[{}]",
         [
-            // Older publishes from our fork: both superseded.
+            // An older publish from our fork, recorded by its packet: superseded.
             pr_row(5, &url(5), "publish/2026-01-01", owner),
+            // Ours by owner and name, but NO packet recorded it — a PR a
+            // person opened by hand on a publish-shaped branch is theirs,
+            // not the sweep's (1a2bcf11, finding 3). Kept, and said.
             pr_row(4, &url(4), "publish/2025-12-31", owner),
             // Somebody else's branch that happens to be named publish/:
             // not ours to close.
             pr_row(6, &url(6), "publish/2025-12-30", "someone-else"),
             // Ours, but not a publish.
             pr_row(9, &url(9), "fix-a-typo", owner),
+            // Same owner, another repository, recorded above: kept.
+            pr_row_from(12, &url(12), "publish/2025-12-29", owner, "another-repo"),
             // Today's own PR, and a NEWER one: never closed by today's.
             pr_row(1, &new_pr, &format!("publish/{PUBLISH_DATE}"), owner),
             pr_row(10, &url(10), "publish/2026-01-03", owner),
@@ -2440,9 +2514,14 @@ fn a_new_publish_pr_closes_each_older_publish_pr_as_superseded() {
     closed.sort();
     assert_eq!(
         closed,
-        vec!["4".to_string(), "5".to_string()],
-        "exactly the OLDER publish PRs from our fork are closed: {}",
+        vec!["5".to_string()],
+        "exactly the publish PR a packet recorded on the fork's branch, from a tree this \
+         run's contains, is closed: {}",
         run.gh_log()
+    );
+    assert!(
+        out.contains(&url(12)) && out.contains("another-repo"),
+        "a PR from another repository of the same owner must be named as kept: {out}"
     );
     // The comment names the PR that supersedes it, and the new PR exists
     // BEFORE anything older is closed.
@@ -2473,16 +2552,32 @@ fn a_new_publish_pr_closes_each_older_publish_pr_as_superseded() {
         .unwrap_or_else(|| panic!("no pr_superseded annotation: {patches:?}"));
     assert_eq!(sup["pr_url"], url(5).as_str(), "{sup}");
     assert_eq!(sup["by_pr_url"], new_pr.as_str(), "{sup}");
-    let st = patches
+    let effect = patches
         .iter()
-        .find_map(|p| p.get("pr_state"))
+        .find(|p| p.get("pr_state").is_some())
         .unwrap_or_else(|| panic!("no pr_state read back: {patches:?}"));
+    let st = &effect["pr_state"];
     assert_eq!(st["pr_url"], url(5).as_str(), "{st}");
     assert_eq!(st["state"], "closed", "{st}");
-    // #4 was recorded by no packet: said, not skipped in silence.
+    // THE KEYS THE TERMINAL READS, beside the effect (backlog 78f2fbda):
+    // the `superseded` outcome is ready on `job.metadata.superseded_by`
+    // and `job.metadata.supersession_translation`, so a publisher that
+    // wrote only `pr_superseded` left publish 8d7a3507 open 95 minutes.
+    assert_eq!(
+        effect["superseded_by"], OPEN_PACKET,
+        "the older packet must name the packet that superseded it: {effect}"
+    );
+    let words = effect["supersession_translation"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no supersession_translation: {effect}"));
+    assert!(
+        words.contains(&url(5)) && words.contains(&new_pr),
+        "the translation names both pull requests: {words}"
+    );
+    // #4 was recorded by no packet: KEPT, and said, not skipped in silence.
     assert!(
         out.contains(&url(4)) && out.contains("no publish packet recorded"),
-        "a closed PR no packet recorded must be named: {out}"
+        "an open PR no packet recorded must be named as kept: {out}"
     );
 
     // Today's packet carries what it superseded.
@@ -2494,9 +2589,131 @@ fn a_new_publish_pr_closes_each_older_publish_pr_as_superseded() {
     let superseded = done["metadata"]["superseded_prs"]
         .as_array()
         .unwrap_or_else(|| panic!("no superseded_prs on open-pr: {done}"));
-    let mut urls: Vec<&str> = superseded.iter().filter_map(|v| v.as_str()).collect();
-    urls.sort_unstable();
-    assert_eq!(urls, vec![url(4).as_str(), url(5).as_str()], "{done}");
+    let urls: Vec<&str> = superseded.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(urls, vec![url(5).as_str()], "{done}");
+}
+
+/// THE OVERLAP (1a2bcf11, finding 2). Two publish packets can be open at
+/// once — a superseding packet is filed while the older one waits — and
+/// nothing orders their runs. A run for the OLDER tree that comes second
+/// must not close the PR carrying the newer one: a PR is superseded only
+/// when its recorded source is contained in this run's source, which is
+/// the claim the close comment makes.
+#[test]
+fn a_run_for_an_older_tree_never_closes_the_pr_of_a_newer_one() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the run path needs a real jq");
+        return;
+    }
+    let run = Run::new("supersede-never-newer");
+    run.a_real_fork();
+    run.echoing_curl();
+    let owner = FORK_SLUG.split('/').next().unwrap();
+    // This packet signed forge main as it stood; a train landed and a
+    // second packet published the newer main as PR #7.
+    let older_source = run.forge_main();
+    let newer_source = run.forge_moves_on();
+    let newer = format!("https://github.com/{MIRROR_SLUG}/pull/7");
+    jobs_with(
+        &run,
+        &Packet::signed(&older_source),
+        vec![recorded_publish(
+            OLDER_PACKET,
+            &newer,
+            &format!("publish/{PUBLISH_DATE}-0123456789ab"),
+            &newer_source,
+        )],
+    );
+    run.open_prs(&format!(
+        "[{}]",
+        pr_row(
+            7,
+            &newer,
+            &format!("publish/{PUBLISH_DATE}-0123456789ab"),
+            owner
+        )
+    ));
+
+    let (ok, out) = run.go();
+    assert!(ok, "{out}");
+    assert!(
+        run.closed_prs().is_empty(),
+        "the older tree's run closed the newer tree's PR: {}",
+        run.gh_log()
+    );
+    assert!(
+        out.contains(&newer) && out.contains(&newer_source[..12]),
+        "the kept PR must be named with the source that is not in this run's: {out}"
+    );
+    assert!(
+        !run.curl_log()
+            .contains(&format!("api/jobs/{OLDER_PACKET}/metadata")),
+        "nothing may be written onto the newer packet: {}",
+        run.curl_log()
+    );
+}
+
+/// ONE RUN AT A TIME (1a2bcf11, finding 2). The one-open-packet guard is
+/// the daily rule's, and a superseding packet is filed beside the one it
+/// supersedes, so two runs can overlap; they share one private clone and
+/// both read the open-PR listing before either closes anything. A run
+/// that cannot take the state dir's lock within its wait refuses, naming
+/// the lock, before it reads or pushes anything.
+#[test]
+fn a_second_run_waits_for_the_first_and_refuses_when_it_does_not_finish() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the run path needs a real jq");
+        return;
+    }
+    let run = Run::new("one-run-at-a-time");
+    run.a_real_fork();
+    run.echoing_curl();
+    let state = run.root.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let lock = state.join("publish.lock");
+    // The first run, standing in: flock(1) holding the same file. `-o`
+    // keeps the lock out of the sleep it runs, so killing flock releases
+    // it rather than leaving an orphaned sleep holding it.
+    let mut holder = Command::new("flock")
+        .arg("-o")
+        .arg(&lock)
+        .args(["sleep", "30"])
+        .spawn()
+        .expect("flock runs");
+    // Wait until it holds the lock, not merely until it started.
+    let held = (0..100).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        !Command::new("flock")
+            .args(["-n"])
+            .arg(&lock)
+            .arg("true")
+            .status()
+            .is_ok_and(|s| s.success())
+    });
+    assert!(held, "the stand-in first run never took {}", lock.display());
+
+    let (ok, out) = run.go_with(&[("BOSS_PUBLISH_LOCK_WAIT", "1".to_string())]);
+    let _ = holder.kill();
+    let _ = holder.wait();
+    assert!(
+        !ok,
+        "a second run went ahead while the first held the lock: {out}"
+    );
+    assert!(
+        out.contains("REFUSED") && out.contains(&lock.display().to_string()),
+        "the refusal must name the lock it could not take: {out}"
+    );
+    run.assert_nothing_published(&out);
+    assert!(
+        !run.curl_log().contains("api/jobs"),
+        "the second run read the system of record before it held the lock: {}",
+        run.curl_log()
+    );
+
+    // Released, the same run goes ahead.
+    let (ok, out) = run.go_with(&[("BOSS_PUBLISH_LOCK_WAIT", "1".to_string())]);
+    assert!(ok, "the run after the lock was released: {out}");
+    assert!(run.pushed(), "{out}");
 }
 
 /// A close is a claim until GitHub is read back saying so: a PR that
@@ -2511,7 +2728,7 @@ fn a_close_github_does_not_confirm_fails_the_run_before_open_pr_completes() {
     let run = Run::new("supersede-unconfirmed");
     run.a_real_fork();
     run.echoing_curl();
-    jobs_with_an_older_publish(&run);
+    jobs_with_an_older_publish(&run, "publish/2026-01-01");
     let owner = FORK_SLUG.split('/').next().unwrap();
     let old = format!("https://github.com/{MIRROR_SLUG}/pull/5");
     run.open_prs(&format!(
@@ -2582,7 +2799,7 @@ fn a_second_publish_on_the_same_day_opens_its_own_branch_and_moves_no_open_pr() 
     let run = Run::new("second-publish-same-day");
     run.a_real_fork();
     run.echoing_curl();
-    jobs_with_an_older_publish(&run);
+    jobs_with_an_older_publish(&run, &format!("publish/{PUBLISH_DATE}"));
     let owner = FORK_SLUG.split('/').next().unwrap();
     let older = format!("https://github.com/{MIRROR_SLUG}/pull/5");
     let fork_before = a_date_only_branch(&run.fork);
@@ -2783,5 +3000,391 @@ fn a_re_run_after_forge_main_moves_rebuilds_the_same_snapshot() {
         !run.gh_log().contains("pr create"),
         "one approval, one PR: a second was opened after a train: {}",
         run.gh_log()
+    );
+}
+
+// ---------------------------------------------------------------------
+// THE BRANCHES A PUBLISH LEAVES BEHIND (backlog 1a2bcf11, finding 1;
+// measured 2026-09-27). Since 1f0aa60d every publish pushes a branch of
+// its own to the forge and the fork, and nothing removed one: that
+// evening both held seven publish/* heads whose PRs (#239-#245) GitHub
+// read closed, #239-#241 merged. `boss orient` promised "stays until
+// GitHub reports the PR merged or closed", and nothing kept the promise.
+//
+// So each run, after its own PR is open and the older ones closed, takes
+// every publish branch a publish packet recorded, asks GitHub about that
+// PR, and deletes the branch — forge first (the order the off-site push's
+// old publish/* carry needed; backlog a2b58aab ended the carry), then the
+// fork — only when the PR reads closed, no open
+// PR stands on the branch, and the branch still holds the head GitHub
+// names for the PR. Each delete is leased to that head and read back.
+// ---------------------------------------------------------------------
+
+/// A parentless commit in `repo` holding `content` — a publish snapshot
+/// stand-in that is on nobody's main.
+fn a_commit(repo: &Path, content: &str) -> String {
+    let blob = git_stdin(
+        repo,
+        &["hash-object", "-t", "blob", "-w", "--stdin"],
+        content,
+    );
+    let tree = git_stdin(repo, &["mktree"], &format!("100644 blob {blob}\tfile\n"));
+    git_in(repo, &["commit-tree", &tree, "-m", content])
+}
+
+/// `branch` at `sha` in `repo`, which must already hold the commit.
+fn plant(repo: &Path, branch: &str, sha: &str) {
+    git_in(repo, &["update-ref", &format!("refs/heads/{branch}"), sha]);
+}
+
+/// `branch`'s head in `repo`, or `None`.
+fn head_of(repo: &Path, branch: &str) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("refs/heads/{branch}"),
+        ])
+        .output()
+        .expect("git runs");
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// What GitHub's pulls API answers for PR `n` on the fork's `branch`.
+fn a_pull(n: u32, state: &str, merged: bool, branch: &str, sha: &str) -> String {
+    format!(
+        r#"{{"number":{n},"state":"{state}","merged":{merged},
+            "head":{{"ref":"{branch}","sha":"{sha}","repo":{{"full_name":"{FORK_SLUG}"}}}}}}"#
+    )
+}
+
+#[test]
+fn a_publish_prunes_the_branches_of_its_closed_prs_on_the_forge_and_the_fork() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the run path needs a real jq");
+        return;
+    }
+    let run = Run::new("prune-closed");
+    run.a_real_fork();
+    run.echoing_curl();
+    let owner = FORK_SLUG.split('/').next().unwrap();
+    let url = |n: u32| format!("https://github.com/{MIRROR_SLUG}/pull/{n}");
+    let pull = |n: u32| format!("{MIRROR_SLUG}/pulls/{n}");
+    let main = run.forge_main();
+    // Two snapshots on nobody's main, on the forge and the fork alike.
+    let snap = a_commit(&run.forge, "an old snapshot\n");
+    let other = a_commit(&run.forge, "a different snapshot\n");
+    for sha in [&snap, &other] {
+        git_in(
+            &run.forge,
+            &[
+                "push",
+                "-q",
+                &run.fork.display().to_string(),
+                &format!("{sha}:refs/heads/seed-{}", &sha[..8]),
+            ],
+        );
+    }
+    let merged = "publish/2025-12-30";
+    let open = "publish/2025-12-29";
+    let moved = "publish/2025-12-31";
+    let by_hand = "publish/2025-12-28";
+    let fork_moved = "publish/2025-12-27";
+    for b in [merged, open, moved, by_hand, fork_moved] {
+        plant(&run.forge, b, &snap);
+        plant(&run.fork, b, &snap);
+    }
+    // The forge's copy moved on since its PR closed: the head GitHub
+    // names is no longer what the forge holds.
+    plant(&run.forge, moved, &other);
+    // The FORK's copy moved on instead: the forge's copy goes, the fork's
+    // stays and is named.
+    plant(&run.fork, fork_moved, &other);
+    // The fork's main, which a record naming `<owner>:main` must never
+    // reach, however closed the PR it names.
+    plant(&run.fork, "main", &snap);
+
+    jobs_with(
+        &run,
+        &Packet::signed(&main),
+        vec![
+            recorded_publish(
+                "00000000-0000-0000-0000-0000000000d3",
+                &url(3),
+                merged,
+                &snap,
+            ),
+            // #2 is open, and its tree is not in this run's: never closed,
+            // so its branch is never pruned.
+            recorded_publish("00000000-0000-0000-0000-0000000000d2", &url(2), open, &snap),
+            recorded_publish(
+                "00000000-0000-0000-0000-0000000000d4",
+                &url(4),
+                moved,
+                &snap,
+            ),
+            recorded_publish(
+                "00000000-0000-0000-0000-0000000000d7",
+                &url(7),
+                fork_moved,
+                &snap,
+            ),
+            recorded_publish(
+                "00000000-0000-0000-0000-0000000000d8",
+                &url(8),
+                "main",
+                &snap,
+            ),
+        ],
+    );
+    run.gh_repo(&pull(3), &a_pull(3, "closed", true, merged, &snap));
+    run.gh_repo(&pull(2), &a_pull(2, "open", false, open, &snap));
+    run.gh_repo(&pull(4), &a_pull(4, "closed", false, moved, &snap));
+    run.gh_repo(&pull(7), &a_pull(7, "closed", false, fork_moved, &snap));
+    run.gh_repo(&pull(8), &a_pull(8, "closed", true, "main", &snap));
+    run.open_prs(&format!("[{}]", pr_row(2, &url(2), open, owner)));
+
+    let (ok, out) = run.go();
+    assert!(ok, "{out}");
+
+    // Merged: gone from both, and read back gone.
+    assert_eq!(
+        head_of(&run.forge, merged),
+        None,
+        "the merged PR's branch is still on the forge: {out}"
+    );
+    assert_eq!(
+        head_of(&run.fork, merged),
+        None,
+        "the merged PR's branch is still on the fork: {out}"
+    );
+    // Open: untouched on both.
+    assert_eq!(
+        head_of(&run.forge, open).as_deref(),
+        Some(snap.as_str()),
+        "{out}"
+    );
+    assert_eq!(
+        head_of(&run.fork, open).as_deref(),
+        Some(snap.as_str()),
+        "{out}"
+    );
+    // Moved on the forge: kept there, and so kept on the fork — deleting
+    // only the fork's copy would leave the forge to push it back.
+    assert_eq!(
+        head_of(&run.forge, moved).as_deref(),
+        Some(other.as_str()),
+        "{out}"
+    );
+    assert_eq!(
+        head_of(&run.fork, moved).as_deref(),
+        Some(snap.as_str()),
+        "{out}"
+    );
+    // No packet recorded it: never a candidate.
+    assert_eq!(
+        head_of(&run.forge, by_hand).as_deref(),
+        Some(snap.as_str()),
+        "{out}"
+    );
+    assert_eq!(
+        head_of(&run.fork, by_hand).as_deref(),
+        Some(snap.as_str()),
+        "{out}"
+    );
+    // Moved on the fork: gone from the forge (it held the PR's head), kept
+    // on the fork, which holds something else.
+    assert_eq!(head_of(&run.forge, fork_moved), None, "{out}");
+    assert_eq!(
+        head_of(&run.fork, fork_moved).as_deref(),
+        Some(other.as_str()),
+        "{out}"
+    );
+    // Main, on both sides, and the run's own branch, untouched — even with
+    // a record naming `<owner>:main` over a PR GitHub reads merged.
+    assert_eq!(
+        head_of(&run.forge, "main").as_deref(),
+        Some(main.as_str()),
+        "{out}"
+    );
+    assert_eq!(
+        head_of(&run.fork, "main").as_deref(),
+        Some(snap.as_str()),
+        "{out}"
+    );
+    assert!(run.pushed() && run.forge_has_branch().is_some(), "{out}");
+
+    // Said, and on the record: what went, and what stayed and why.
+    let puts = run.puts();
+    let done = puts
+        .iter()
+        .find(|p| p["status"] == "completed")
+        .unwrap_or_else(|| panic!("open-pr was never completed: {puts:?}"));
+    assert_eq!(
+        done["metadata"]["pruned_branches"],
+        serde_json::json!([merged]),
+        "{done}"
+    );
+    let kept: Vec<String> = done["metadata"]["prune_kept"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no prune_kept on open-pr: {done}"))
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    let names = |b: &str| kept.iter().any(|k| k.starts_with(&format!("{b}: ")));
+    assert!(
+        names(open) && names(moved) && !names(by_hand) && !names("main"),
+        "prune_kept names the open and the moved branch, and neither a branch no packet \
+         recorded nor main: {kept:?}"
+    );
+    assert!(
+        kept.iter().any(|k| k.starts_with(&format!(
+            "{fork_moved}: deleted from the forge, but the fork holds"
+        ))),
+        "the fork-moved half is named, saying the forge's copy went: {kept:?}"
+    );
+    assert!(
+        out.contains(&format!("pruned {merged}")),
+        "the run says what it pruned: {out}"
+    );
+}
+
+/// A GUARD NEEDS A KNOWN POSITIVE (adversarial review of 8ec86b42). The
+/// open-PR guard counts PRs from the fork on each branch; if gh's listing
+/// changed shape so `from_fork` matched nothing, every count would read 0
+/// and the guard would be blind. This run's OWN PR is open by then — it
+/// was just opened or reused — so a fresh listing that does not show it
+/// cannot be trusted to show any other, and nothing is pruned.
+#[test]
+fn a_listing_that_does_not_show_the_runs_own_pr_prunes_nothing() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the run path needs a real jq");
+        return;
+    }
+    let run = Run::new("prune-blind-listing");
+    run.a_real_fork();
+    run.echoing_curl();
+    let url3 = format!("https://github.com/{MIRROR_SLUG}/pull/3");
+    let main = run.forge_main();
+    let snap = a_commit(&run.forge, "an old snapshot\n");
+    git_in(
+        &run.forge,
+        &[
+            "push",
+            "-q",
+            &run.fork.display().to_string(),
+            &format!("{snap}:refs/heads/seed"),
+        ],
+    );
+    let merged = "publish/2025-12-30";
+    plant(&run.forge, merged, &snap);
+    plant(&run.fork, merged, &snap);
+    jobs_with(
+        &run,
+        &Packet::signed(&main),
+        vec![recorded_publish(
+            "00000000-0000-0000-0000-0000000000d3",
+            &url3,
+            merged,
+            &snap,
+        )],
+    );
+    run.gh_repo(
+        &format!("{MIRROR_SLUG}/pulls/3"),
+        &a_pull(3, "closed", true, merged, &snap),
+    );
+    boss_testing::write_file(&run.gh_api.join("_pr_create_unlisted"), "");
+
+    let (ok, out) = run.go();
+    assert!(
+        ok,
+        "a blind listing keeps branches; it does not fail the publish: {out}"
+    );
+    assert_eq!(
+        head_of(&run.forge, merged).as_deref(),
+        Some(snap.as_str()),
+        "{out}"
+    );
+    assert_eq!(
+        head_of(&run.fork, merged).as_deref(),
+        Some(snap.as_str()),
+        "{out}"
+    );
+    let puts = run.puts();
+    let done = puts
+        .iter()
+        .find(|p| p["status"] == "completed")
+        .unwrap_or_else(|| panic!("open-pr was never completed: {puts:?}"));
+    assert_eq!(
+        done["metadata"]["pruned_branches"],
+        serde_json::json!([]),
+        "{done}"
+    );
+    let kept = done["metadata"]["prune_kept"].to_string();
+    assert!(
+        kept.contains("does not show this run's own open PR"),
+        "prune_kept says why nothing was pruned: {kept}"
+    );
+}
+
+/// A MEASURE YIELDS TO A PUBLISH (adversarial review of 8ec86b42). The
+/// daily refresh re-fires on its own cadence; a passkey-approved publish
+/// that refuses has to be re-filed by a person. So a --measure that finds
+/// the lock held waits briefly and answers not yet (75) — with its
+/// DEFAULT wait, well inside the publish's — and reads nothing.
+#[test]
+fn a_measure_finding_the_lock_held_answers_not_yet_quickly() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the measure path needs a real jq");
+        return;
+    }
+    let run = Run::new("measure-yields");
+    let state = run.root.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let lock = state.join("publish.lock");
+    let mut holder = Command::new("flock")
+        .arg("-o")
+        .arg(&lock)
+        .args(["sleep", "120"])
+        .spawn()
+        .expect("flock runs");
+    let held = (0..100).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        !Command::new("flock")
+            .args(["-n"])
+            .arg(&lock)
+            .arg("true")
+            .status()
+            .is_ok_and(|s| s.success())
+    });
+    assert!(held, "the stand-in publish never took {}", lock.display());
+
+    let started = std::time::Instant::now();
+    let (ok, out) = run.measure(&[]);
+    let took = started.elapsed();
+    let _ = holder.kill();
+    let _ = holder.wait();
+    assert!(
+        !ok,
+        "a measure went ahead while a publish held the lock: {out}"
+    );
+    assert!(
+        out.contains("not yet") && out.contains(&lock.display().to_string()),
+        "the measure answers not yet, naming the lock: {out}"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(90),
+        "the measure's default wait must be short — it re-fires on its own, the publish \
+         does not: took {took:?}"
+    );
+    assert!(
+        !run.curl_log().contains("api/jobs"),
+        "the measure read the system of record before it held the lock: {}",
+        run.curl_log()
     );
 }

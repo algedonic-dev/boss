@@ -19,7 +19,9 @@ use boss_core::job::Subject;
 
 use boss_core::publish::PublishMode;
 
-use crate::port::{BusinessCalendarsOutcome, CalendarClient, CalendarError, account_for};
+use crate::port::{
+    BusinessCalendarsOutcome, CalendarClient, CalendarError, account_for, published_fact,
+};
 
 pub struct PgCalendar {
     pool: PgPool,
@@ -417,24 +419,48 @@ impl CalendarClient for PgCalendar {
         &self,
         calendars: &[BusinessCalendar],
         mode: PublishMode,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<BusinessCalendarsOutcome, CalendarError> {
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| CalendarError::Storage(e.to_string()))?;
+        // Each code is locked for this transaction BEFORE it is read, so
+        // concurrent publishes of one code queue rather than both read
+        // the same held row (adversarial review of car d768217e, F1,
+        // 2026-09-28). Unlocked under READ COMMITTED, two takes both read
+        // A and the log held A→B and A→C, never naming the B the second
+        // overwrote; two publishes of an absent code both recorded
+        // `declared`. A row lock (the class doors' FOR UPDATE) cannot
+        // hold a code that does not exist yet, so the lock is a
+        // transaction-scoped advisory lock on the code, taken for the
+        // whole batch in sorted order so two batches naming the same
+        // codes in different orders cannot deadlock.
+        let codes: BTreeSet<&str> = calendars.iter().map(|c| c.code.as_str()).collect();
+        for code in codes {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtext('business-calendar:' || $1))")
+                .bind(code)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| CalendarError::Storage(e.to_string()))?;
+        }
         let mut out = BusinessCalendarsOutcome {
             received: calendars.len(),
             ..Default::default()
         };
         for cal in calendars {
             // What the table holds for this code, read inside the
-            // transaction so the outcome names the row the write saw.
+            // transaction — after its lock — so the outcome and the fact
+            // name the row the write replaces.
             let held = held_in_tx(&mut tx, &cal.code).await?;
             // Insert-if-absent leaves a held row untouched — the
             // instance is the truth (design e187198f); take replaces
-            // the header and the closed-day set wholesale.
-            if held.is_none() || mode.is_take() {
+            // the header and the closed-day set wholesale. A publish
+            // writes only when it changes the row, and every write
+            // stages its fact, signed by the caller the door resolved,
+            // in this transaction (backlog 05f61acf).
+            if let Some(fact) = published_fact(stamp, held.as_ref(), cal, mode)? {
                 let weekend: Vec<i16> = cal.weekend.iter().map(|&w| w as i16).collect();
                 sqlx::query(
                     "INSERT INTO business_calendars (code, name, weekend)
@@ -465,6 +491,9 @@ impl CalendarClient for PgCalendar {
                     .await
                     .map_err(|e| CalendarError::Storage(e.to_string()))?;
                 }
+                boss_events::outbox::record_event_in_tx(&mut tx, &fact)
+                    .await
+                    .map_err(CalendarError::Storage)?;
             }
             account_for(&mut out, held.as_ref(), cal, mode);
         }

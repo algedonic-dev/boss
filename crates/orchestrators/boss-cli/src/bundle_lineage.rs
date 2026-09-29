@@ -152,7 +152,7 @@ pub(crate) fn section_lines(
 /// A name's whole live lineage, read from its registry's versions
 /// route and decoded as the bundle's own type.
 async fn live_lineage<S: serde::de::DeserializeOwned>(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     route: &str,
 ) -> anyhow::Result<Vec<S>> {
     let rows =
@@ -223,7 +223,7 @@ pub(crate) struct CarJudgement {
 /// One registry's changed rows, judged against their live lineage.
 #[allow(clippy::too_many_arguments)]
 async fn judge_registry<S: Declared + serde::de::DeserializeOwned>(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     registry: &str,
     bundle: &str,
     parse: fn(&str, &str) -> Result<Vec<S>, SeedLoaderError>,
@@ -262,7 +262,7 @@ async fn judge_registry<S: Declared + serde::de::DeserializeOwned>(
 /// Never fails: what git or the system of record cannot answer comes
 /// back in `unread`, and the caller proceeds on it.
 pub(crate) async fn judge_car(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     repo: &Path,
     base: &str,
     tip: &str,
@@ -349,7 +349,7 @@ pub(crate) async fn judge_car(
 /// the lineage the system of record answers now. Never fatal — a tree
 /// or a read that fails prints why, and the approach still prints.
 async fn registry_section<S: Declared + serde::de::DeserializeOwned>(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     registry: &str,
     bundle: &str,
     load: fn(&std::path::Path) -> Result<Vec<S>, boss_jobs::seed_loader::SeedLoaderError>,
@@ -480,7 +480,7 @@ pub(crate) fn step_plugin_live_lines(
 /// this checkout's bundle authors and the bundles it would mount, put
 /// through [`step_plugin_live_lines`]. Never fatal — what cannot be
 /// read prints why, and the approach still prints.
-async fn step_plugin_live_section(http: &reqwest::Client) -> Vec<String> {
+async fn step_plugin_live_section(http: &boss_core::machine_token::Client) -> Vec<String> {
     let skipped = |why: String| vec![format!("\n  BUNDLES — step-plugins live: skipped: {why}")];
     let root = match crate::brief::repo_root() {
         Ok(root) => root,
@@ -515,7 +515,7 @@ async fn step_plugin_live_section(http: &reqwest::Client) -> Vec<String> {
 /// than being judged from half the facts. Step plugins are then read
 /// once more from the LIVE end — unauthored rows and bundles the tree
 /// would not mount (230f7156), see [`step_plugin_live_lines`].
-pub(crate) async fn bundles_section(http: &reqwest::Client) -> Vec<String> {
+pub(crate) async fn bundles_section(http: &boss_core::machine_token::Client) -> Vec<String> {
     use boss_jobs::seed_loader::{load_cadence_rules, load_stations, load_step_plugins};
     let mut out = registry_section(
         http,

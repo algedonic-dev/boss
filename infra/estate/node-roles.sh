@@ -7,7 +7,10 @@
 #
 # read_node_roles <node-id>
 #   Sets and exports BOSS_NODE_ROLES (comma-separated) from
-#   /api/estate/nodes, with a short ceiling, and REMEMBERS a successful
+#   /api/estate/nodes — SIGNED as automation:<BOSS_CONVERGE_NAME> at the
+#   read role (sor_reader_header, infra/lib/sor.sh; the registry refuses
+#   a caller with no name since backlog e5f7b51e) — with a short
+#   ceiling, and REMEMBERS a successful
 #   read in BOSS_NODE_ROLES_CACHE (default /var/lib/boss/node-roles.<id>,
 #   beside the host's other state). A system of record that cannot be
 #   reached then installs THE LAST DECLARATION THIS HOST HAS EVIDENCE
@@ -49,10 +52,15 @@ read_node_roles() { # <node-id>
     # path's own definition, and the converge that renders the file is
     # the one caller here — on a host that has no file yet, "no address"
     # is a dark registry (cache, else [always]), never a refusal.
+    #
+    # Sourced on both branches since backlog e5f7b51e: the READ IS
+    # SIGNED (sor_reader_header, below), because the registry refuses a
+    # caller with no name — and a refusal here would install the cache
+    # while saying the registry "did not answer".
+    # shellcheck source=infra/lib/sor.sh
+    . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/sor.sh"
     local nodes_url="${BOSS_ESTATE_NODES_URL:-}"
     if [ -z "$nodes_url" ]; then
-        # shellcheck source=infra/lib/sor.sh
-        . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/sor.sh"
         if [ -n "${BOSS_JOBS_URL:-}" ]; then
             nodes_url="$BOSS_JOBS_URL/api/estate/nodes"
         else
@@ -63,24 +71,49 @@ read_node_roles() { # <node-id>
     fi
     BOSS_NODE_ROLES_SOURCE="preset"
     if [ -z "${BOSS_NODE_ROLES+set}" ]; then
-        local roles_json=""
+        local roles_json="" roles_out="" roles_code="" why="did not answer"
+        # THE HTTP CODE IS KEPT, not folded into curl -f's silence
+        # (review of car 4e9e75e3). The registry REFUSES a caller policy
+        # does not grant, and a lasting refusal — a mis-signed header, a
+        # revoked audit-readonly grant — read as "did not answer" would
+        # freeze this host on its cached roles with nothing saying why.
+        # So a 401/403 still falls back to the cache (a refusal must
+        # never widen what a host runs), but says REFUSED, with the code
+        # and who signed, in the log AND the run's packet. `000` is a
+        # non-HTTP URL (a file:// fixture), which answers with a body.
         if [ -n "${BOSS_JOBS_URL:-}${BOSS_ESTATE_NODES_URL:-}" ]; then
-            roles_json="$(curl -fsS --max-time 10 "$nodes_url" 2>/dev/null)" || roles_json=""
+            if roles_out="$(curl -sS --max-time 10 \
+                -H "x-boss-user: $(sor_reader_header "automation:$prefix")" \
+                -w '\n%{http_code}' "$nodes_url" 2>/dev/null)"; then
+                roles_code="${roles_out##*$'\n'}"
+                roles_json="${roles_out%$'\n'*}"
+                case "$roles_code" in
+                    2?? | 000) ;;
+                    401 | 403)
+                        why="REFUSED (HTTP $roles_code, signed automation:$prefix/audit-readonly)"
+                        roles_json=""
+                        ;;
+                    *)
+                        why="did not answer (HTTP $roles_code)"
+                        roles_json=""
+                        ;;
+                esac
+            fi
         fi
         if [ -z "$roles_json" ]; then
             if [ -s "$cache" ]; then
                 BOSS_NODE_ROLES="$(tr -d '[:space:]' < "$cache")"
                 BOSS_NODE_ROLES_SOURCE="cache"
-                echo "$prefix: $nodes_url did not answer — installing the cached declaration read $(date -u -r "$cache" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo earlier): $BOSS_NODE_ROLES"
+                echo "$prefix: $nodes_url $why — installing the cached declaration read $(date -u -r "$cache" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo earlier): $BOSS_NODE_ROLES"
                 if declare -F run_summary_note >/dev/null; then
-                    run_summary_note "roles: $nodes_url did not answer — cached declaration installed ($BOSS_NODE_ROLES)"
+                    run_summary_note "roles: $nodes_url $why — cached declaration installed ($BOSS_NODE_ROLES)"
                 fi
             else
                 BOSS_NODE_ROLES="registry-unread"
                 BOSS_NODE_ROLES_SOURCE="none"
-                echo "$prefix: $nodes_url did not answer and there is no cached declaration at $cache — installing [always] only, never every row"
+                echo "$prefix: $nodes_url $why and there is no cached declaration at $cache — installing [always] only, never every row"
                 if declare -F run_summary_note >/dev/null; then
-                    run_summary_note "roles: $nodes_url did not answer, no cache — [always] only installed"
+                    run_summary_note "roles: $nodes_url $why, no cache — [always] only installed"
                 fi
             fi
         else

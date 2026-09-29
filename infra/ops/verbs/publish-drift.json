@@ -17,5 +17,6 @@
       "default": "--check"
     }
   ],
-  "timeout": 1800
+  "timeout": 1800,
+  "effect": "^publish-drift: (published|would publish) [0-9]+, skipped [0-9]+ equal, refused [0-9]+"
 }

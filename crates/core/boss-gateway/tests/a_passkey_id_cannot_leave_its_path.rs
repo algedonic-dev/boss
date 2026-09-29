@@ -51,13 +51,15 @@ fn router(people_base: String) -> Router {
     let origin = Url::parse("https://boss.test").unwrap();
     passkey_router(Arc::new(PasskeyState {
         session_key: KEY.to_vec(),
-        http: reqwest::Client::new(),
+        http: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+            .unwrap(),
         people_base: people_base.clone(),
         jobs_base: people_base,
         webauthn: WebauthnBuilder::new("boss.test", &origin)
             .unwrap()
             .build()
             .unwrap(),
+        audit: boss_gateway::audit::AuthAudit::disabled(),
     }))
 }
 

@@ -31,7 +31,7 @@ struct HireFields {
 }
 
 pub struct PeopleHire {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     people_base: String,
 }
 
@@ -64,12 +64,27 @@ impl Handler for PeopleHire {
         let completed_on = step.completed_on.ok_or_else(|| {
             HandlerError::Downstream("step.done payload missing completed_on".into())
         })?;
+        // No default department (backlog 4096e63e). This used to fill
+        // the literal `operations`, an employee department Class the
+        // collapse onto the departments registry retired (c87e3d6d) —
+        // so the people door refused the handler's own invention. Which
+        // department a hire joins is the tenant's fact, declared in its
+        // seeds/departments.toml; a hire step that names none is a
+        // data error that fails identically on every redelivery, so it
+        // is Permanent (the runner's 422) rather than a retry.
+        let department = h.department.filter(|d| !d.is_empty()).ok_or_else(|| {
+            HandlerError::Permanent(format!(
+                "hire {}: the hire block names no department — set `department` to a code \
+                 of the departments registry (GET /api/departments)",
+                h.id
+            ))
+        })?;
 
         let body = json!({
             "id": h.id,
             "name": h.name,
             "role": h.role,
-            "department": h.department.unwrap_or_else(|| "operations".to_string()),
+            "department": department,
             "location": h.location.unwrap_or_else(|| "loc-brewery-brewhouse".to_string()),
             "email": h.email.unwrap_or_else(|| format!("{}@example.brewery", h.id)),
             "hire_date": h.hire_date.unwrap_or_else(|| completed_on.to_string()),
@@ -111,5 +126,71 @@ impl Handler for PeopleHire {
         Err(HandlerError::Downstream(format!(
             "POST {url} returned {status}: {resp_body}"
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A people base nothing listens on: a hire that reaches the POST
+    /// fails `Downstream`, so a `Permanent` answer proves the refusal
+    /// came BEFORE any write was attempted.
+    fn handler() -> Arc<PeopleHire> {
+        PeopleHire::new("http://127.0.0.1:9")
+    }
+
+    fn ctx(hire: serde_json::Value) -> InvocationContext {
+        InvocationContext {
+            event_timestamp: None,
+            rule_name: "people-hire-on-hr-hire-step-done".into(),
+            triggering_event_id: "evt-1".into(),
+            triggering_topic: "step.done.hr-hire".into(),
+            event_payload: json!({
+                "job_id": "job-1",
+                "step_id": "step-1",
+                "kind": "hr-hire",
+                "completed_on": "2026-09-28",
+                "metadata": { "hire": hire },
+            }),
+        }
+    }
+
+    /// Backlog 4096e63e: a hire naming no department was written into
+    /// `operations`, an employee department Class the collapse onto the
+    /// departments registry retired (c87e3d6d) — so the people door
+    /// refused the default this handler invented. No literal can be
+    /// right for every tenant; the refusal names where departments live.
+    #[tokio::test]
+    async fn a_hire_naming_no_department_is_refused_naming_the_registry() {
+        for hire in [
+            json!({ "id": "emp-x", "name": "X", "role": "analyst" }),
+            json!({ "id": "emp-x", "name": "X", "role": "analyst", "department": "" }),
+        ] {
+            match handler().invoke(&[], &ctx(hire.clone())).await {
+                Err(HandlerError::Permanent(msg)) => assert!(
+                    msg.contains("emp-x")
+                        && msg.contains("department")
+                        && msg.contains("departments registry"),
+                    "the refusal names the hire and the registry: {msg}"
+                ),
+                other => panic!("{hire}: a hire with no department must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// The department the step names is the one sent — only the
+    /// missing case is refused.
+    #[tokio::test]
+    async fn a_hire_naming_a_department_reaches_the_people_door() {
+        let hire =
+            json!({ "id": "emp-x", "name": "X", "role": "analyst", "department": "production" });
+        assert!(
+            matches!(
+                handler().invoke(&[], &ctx(hire)).await,
+                Err(HandlerError::Downstream(m)) if m.contains("/api/people")
+            ),
+            "a named department goes to the POST (which fails here: nothing listens)"
+        );
     }
 }

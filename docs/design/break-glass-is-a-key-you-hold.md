@@ -43,7 +43,7 @@ which outages*:
 |---|---|---|
 | rollout undo | kube-apiserver | BOSS stack down, IdP down |
 | emergency merge to forge main | Forgejo | BOSS stack down, IdP down |
-| break-glass web session | boss-gateway | IdP down (not stack down) |
+| break-glass web session | boss-gateway | IdP down — but not stack down, and only while Cloudflare's edge, the Access mail and the tunnel are up (see "What this door does not cover") |
 
 The design principle that falls out: **each lever gets
 hardware-key-gated at its own verifier**, not at a central authority
@@ -113,6 +113,84 @@ shared secrets.
   (see Q4 for whether it should be).
 - The refusal posture: a break-glass attempt that fails verification
   fails loudly, like every other refusal in the system.
+
+## What this door does not cover
+
+Decided on design `c5ce1aeb` (David, 2026-09-29, all three questions
+accepted as proposed; backlog `a15a1cd2`). Until then this document
+said the web session survives "IdP down" and never named what else it
+routes through, so a reader would have believed the key opens BOSS when
+the edge or the mailbox is what broke — the fiction the principle above
+refuses.
+
+**The key reaches the gateway by exactly one road**, and every hop on
+it must be standing. Each fact is read from the file that decides it:
+
+| hop | why the door needs it | read from |
+|---|---|---|
+| Cloudflare's edge | the only certificate for boss.algedonic.dev is the edge's; the gateway's one LAN address is 10.20.0.30, port 80, plain http, and the Caddy TLS front with its DNS-01 certificate was deleted 2026-09-17 (`21c17ebc`) | `infra/cluster/manifests/boss.yaml` |
+| the Access one-time code mailed to the operator | one Access application covers the WHOLE host with one allow policy; the only bypass in the file is playground's `/auth` | `infra/cluster/dns/access.toml` |
+| the in-cluster tunnel connector | the edge reaches the gateway only through it | `infra/cluster/manifests/cloudflared-config.yaml` |
+| the gateway | it is the relying party: one rp_id and one origin, https://boss.algedonic.dev | `break_glass_webauthn` in `crates/core/boss-gateway/src/break_glass.rs` |
+
+A browser on http://10.20.0.30 is no way round: it is not a secure
+context and will not run the ceremony, and its origin is not the one
+both records are bound to. Nor is an Access bypass on `/break-glass`
+alone: the ceremony POSTs to `/api/auth/break-glass/assert/*`, and the
+session it opens is an HttpOnly cookie used on every other path, all
+still behind Access — the key would be touched and the next page
+refused. Only a bypass of the whole host removes the mailbox, and that
+exposes every gateway route to the internet while keeping the edge and
+the tunnel on the road; it was rejected.
+
+**So this is the door for a lockout inside BOSS** — policy, the roster,
+the IdP — while those four hops stand. Both enrolled keys were proven
+through it on 2026-09-29 (two `auth.login.succeeded` events with
+`method = break-glass`, 01:36Z and 01:37Z). It is **not** the door for
+a dark edge, a dark mailbox or a dark cluster; those have roads that
+owe nothing to Cloudflare:
+
+| failure | road | read from |
+|---|---|---|
+| the edge or Access dark, or the one-time code not arriving | the dev workspace's ssh door on the LAN, `dev-ssh` at 10.20.0.35:22, which keeps a mounted `authorized_keys` as the fallback for a day the edge is down | `infra/estate/doors.toml`, `infra/cluster/manifests/boss-dev.yaml` |
+| the same, from off the LAN | the WireGuard hub on boss-gcp (overlay 10.99.0.0/24), then the LAN road | `infra/cluster/wireguard/setup-hub.sh` |
+| the gateway or the stack down | roll to the last known-good build at kube-apiserver, as operator (§Below the gateway) | `infra/cluster/manifests/boss-break-glass-operator.yaml` |
+| a fix must land while the system of record is down | the emergency merge lane on the forge | `infra/platform/workflows/emergency-merge.toml` |
+
+What that leaves, said plainly: a lockout inside BOSS at the same time
+as a dark edge or mailbox has **no web road**; the repair comes from the
+cluster side. And a road on this list is only as good as its last use —
+the re-entry sheet's design (`125d405d`) derives this door's
+"THIS ROAD NEEDS" line from the same three files, and prints NOT
+EXERCISED ON RECORD for a road nobody has walked. The sheet owns that
+line; this section is not restated there.
+
+**The Apple Passkey Delegate** — the role that holds a phone passkey
+for a one-person company (DR readiness `62dac114`, item 4), named as a
+role and never as a person (David, 2026-09-29, backlog `41c5ddaf`) —
+takes the ordinary edge road, never this one. A phone passkey is the
+kind of authenticator this door's enrolment refuses (synced, or not
+hardware-attested), so the Apple Passkey Delegate's credential is never
+a break-glass record. And the edge road is not yet theirs either: the
+Access policy admits only the operator's address, so the Apple Passkey
+Delegate has no road in until item 4's design decides what they may do
+and how it is revoked — including which of the roads above they may
+walk. The re-entry sheet carries the role as its own road
+(`apple-passkey-delegate` in `infra/recovery/re-entry.toml`), which
+reads who the edge admits rather than stating it.
+
+**A second road to this same door is decided and not built**: a LAN
+TLS listener serving the gateway under the SAME origin,
+https://boss.algedonic.dev, with its certificate from a local CA whose
+root never enters the cluster or the forge. It needs the cluster and
+the gateway pod, and not Cloudflare, the mailbox or the tunnel; the
+enrolled keys work on it unchanged. The decision — where the root
+lives, which devices trust it, and why it waits behind DR readiness
+`62dac114` — is in
+[docs/architecture-decisions.md](../architecture-decisions.md)
+§Policy & auth, "The break-glass key is the door for a lockout inside
+BOSS". Until that road is built and walked, the table above is the
+whole list.
 
 ## Costs, said out loud
 

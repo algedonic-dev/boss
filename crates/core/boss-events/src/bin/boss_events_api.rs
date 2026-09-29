@@ -12,12 +12,17 @@
 //! Auth: same as the original router — operator/auditor tier or
 //! has_global_read role for tail/stream/export; public-tail is
 //! unauth (curated topic allowlist).
+//!
+//! Also the one write it serves: `POST /api/events/outbox/{id}/redeliver`
+//! and `/resolve`, the dead-letter door `boss events redeliver` speaks
+//! to (`boss_events::outbox_http`, Operator tier only).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use boss_events::events_api_config::EventsApiConfig;
+use boss_events::outbox_http::outbox_router;
 use boss_events::tail_http::audit_tail_router;
 use clap::Parser;
 use sqlx::postgres::PgPoolOptions;
@@ -57,7 +62,10 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| "connecting to Postgres for audit_log reads")?;
 
-    let app = audit_tail_router(pool);
+    // The dead-letter door (backlog e22b692e): this service owns
+    // event_outbox, so the act on one of its rows happens here, behind
+    // the signed caller and the Operator tier — `outbox_http`'s header.
+    let app = audit_tail_router(pool.clone()).merge(outbox_router(pool));
     // Sim-origin middleware: extract x-sim-origin header and set the
     // per-request task-local so the publisher inherits the sim
     // marker. Closes the gap where a sim chain could trigger a

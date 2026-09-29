@@ -7,6 +7,9 @@
 //! - `RecordingEventBus` that captures published events for verification
 //! - Custom assertion functions designed for agent-friendly failure messages
 //! - `scratch_dir` for a fixture root this process and uid own outright
+//! - `git_config_isolated`, the one way a test closes every channel git
+//!   reads `safe.directory` from, so a host's `[safe] directory = *`
+//!   cannot switch off an ownership refusal the test depends on
 //! - `announce`, the one definition of a stub server stating its port
 //!   to the test that spawned it, written whole or not at all
 //! - `leaked_policy`, the AST pass behind `boss-leaked-policy`: it counts
@@ -23,8 +26,12 @@ pub mod adapter_suite;
 pub mod announce;
 pub mod assertions;
 pub mod feed;
+pub mod git;
+pub mod kubectl_secret_stub;
 pub mod leaked_policy;
 pub mod ops_runner_stub;
+pub mod production_source;
+pub mod rbac;
 pub mod recording_bus;
 pub mod request;
 pub mod scratch;
@@ -34,6 +41,7 @@ pub mod tree;
 
 pub use assertions::*;
 pub use feed::feed_stdin;
+pub use git::git_config_isolated;
 pub use recording_bus::RecordingEventBus;
 pub use request::{TestRequest, TestResponse};
 pub use scratch::{copy_exec, create_dir, scratch_dir, scratch_path, write_exec, write_file};

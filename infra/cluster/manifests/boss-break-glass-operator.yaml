@@ -21,8 +21,22 @@
 # WHAT IT DELIBERATELY WITHHOLDS, in the shape boss-dev-access.yaml
 # uses for the same reason: no `delete` on anything, no secrets, no
 # create/update on workloads, no exec. A holder can SEE the cluster and
-# can UNDO a bad rollout. It cannot deploy, cannot read a credential,
-# and cannot remove anything.
+# can UNDO a bad rollout. It cannot create a workload and cannot remove
+# anything.
+#
+# IT CAN READ A CREDENTIAL, and this header said otherwise until
+# 2026-09-29 (review 978b; backlog cbb56130). RBAC scopes `patch` to an
+# object, never to a field: the patch on deployments/statefulsets below
+# can rewrite a pod TEMPLATE — its command, its env, its
+# serviceAccountName — and the controller, not the holder, starts the
+# pod, so every Secret the namespace holds (the broker's root tokens
+# deploy/boss already names in its env, the `boss` account's token) is
+# one patch and one `pods/log` read (cluster-wide, above) away. The
+# same grant was removed from the dev session for exactly this
+# (978bbd7d). It stays here on purpose, for now: narrowing this Role
+# waits on the one-person DR proof (62dac114; item 4e1c33b4), because
+# this credential is the road back when the forge is down. This comment
+# changes no grant.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -110,7 +124,9 @@ subjects:
 # a break-glass credential that has quietly expired is not a credential.
 #
 # The blast radius of the non-expiry is exactly the grant above: read
-# the cluster, patch two workload kinds in one namespace, no secrets.
+# the cluster, patch two workload kinds in one namespace, no direct
+# Secret read — and, through that patch, every Secret the namespace
+# holds (see the header: the patch is a credential read).
 # That is what makes a long-lived token acceptable here and would not
 # make an admin one acceptable.
 apiVersion: v1

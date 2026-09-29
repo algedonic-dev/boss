@@ -20,7 +20,7 @@
 // soften.
 
 import { prNumber } from './yard-floor';
-import { failedChecks, stampAt, type JobLite, type StepLite } from './yard';
+import { exitFailed, failedChecks, NOT_YET_EXIT, stampAt, type JobLite, type StepLite } from './yard';
 
 /** How many signals the panel shows. */
 export const SIGNALS_SHOWN = 10;
@@ -177,11 +177,15 @@ function opsSignals(j: JobLite): Signal[] {
     const code = str(em.exit_code);
     const output = (str(em.output) ?? '').split('\n')[0]?.trim() ?? '';
     const refused = disposition === 'refused';
-    const failed = refused || (code !== null && code !== '0');
+    const failed = refused || exitFailed(code);
+    // Exit 75 is "not yet", not a failure (backlog 1058e686): the warn
+    // tone, and the words say so.
+    const notYet = !refused && code === String(NOT_YET_EXIT);
     const what = refused
       ? `${verb} refused on ${runnerHost}${output !== '' ? ` — ${output}` : ' — outside the allowlist'}`
-      : `${verb} ${disposition} on ${runnerHost}${code !== null ? ` · exit ${code}` : ''}`;
-    out.push({ id: `${j.id}:execute`, at: answeredAt, who: 'ops-runner', what, sev: failed ? 'err' : 'ok', hand: false, packetId: j.id });
+      : `${verb} ${disposition} on ${runnerHost}${code !== null ? ` · exit ${code}` : ''}${notYet ? ' (not yet)' : ''}`;
+    const sev: Signal['sev'] = failed ? 'err' : notYet ? 'warn' : 'ok';
+    out.push({ id: `${j.id}:execute`, at: answeredAt, who: 'ops-runner', what, sev, hand: false, packetId: j.id });
   }
   return out;
 }

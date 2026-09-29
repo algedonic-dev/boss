@@ -8,7 +8,7 @@
 # parens-requiring regex into a projection rebuilder.
 #
 # Why this exists — updated for the sim-stamp retirement (David,
-# 2026-08-22, packet a7a4cae5). Two rules now share this gate:
+# 2026-08-22, packet a7a4cae5). Three rules now share this gate:
 #
 #   1. RECORD STAMPS ARE WALL TIME, minted centrally. `EventStamp`
 #      (crates/core/boss-core/src/publisher.rs) and
@@ -25,6 +25,12 @@
 #      business timeline the same way it always did (the class that
 #      surfaced 116k mis-dated rows in regen 18, closed by v1.0.5
 #      #68). This lint keeps that leak class from recurring.
+#   3. A DISPATCHER HANDLER STAMPS ITS FIRING, NOT ITS CLOCK (backlog
+#      2b03a2df). In the handlers crate even the sanctioned
+#      `wall_now()` / `now_from()` are refused outside a short
+#      allowlist: what a handler writes is about the event, tick or
+#      day that fired it. The third pass, "Dispatcher-handler clock
+#      pass", below.
 #
 # Allowlist: only these paths may call Utc::now()
 #   * crates/core/boss-clock/         (the clock-api itself —
@@ -316,6 +322,83 @@ in_cfg_test_item() {
   ' "$1" 2>/dev/null || echo "prod"
 }
 
+# ============================================================
+# Dispatcher-handler clock pass (backlog 2b03a2df)
+# ============================================================
+#
+# A dispatcher handler acts on a FIRING — an event, a clock tick, a
+# clock day — and what it writes is about that firing. So the instant it
+# stamps or measures against is the firing's own: `ctx.firing_instant()`
+# (the tick's `_at`, else the event's `timestamp`), `ctx.firing_day()`
+# (a clock day's `_day`), or `ctx.firing_instant_or_day_start()` (a
+# day-fired measurement, anchored at the midnight the day fell due). A
+# clock read at the moment the dispatcher CONSUMED the firing makes the
+# record say when it was read, and a redelivery or a replay says
+# something different each time.
+#
+# The Rust pass above cannot see this. `wall_now()` and `now_from()` are
+# the sanctioned spellings everywhere else, so the handlers that used them
+# passed it clean: on 2026-09-28 four handlers stamped the consumer's
+# clock onto what they filed — auto-park's car step `completed_at`, the
+# cadence sweep's `silent_for_minutes`, the estate alarm's series ages
+# and the retro opener's week (eabc5943 had fixed three others, and its
+# `wall_now` fallback). This pass refuses either call in a handlers-crate
+# production module, word-bounded so `now_from_foo` is not one.
+#
+# Allowlist: a real-time use that is correct, with its reason, one file
+# per entry — held to lib/allowlist.sh's two rules like the lists above.
+HANDLERS_SRC="crates/orchestrators/boss-dispatcher-handlers/src"
+HANDLER_CLOCK_ALLOWED=(
+  # A GitHub App JWT's `iat`/`exp` (`self.root.jwt(wall_now())`): GitHub
+  # judges it against real time, and it is sent, never written to a
+  # packet. Any instant but now is a token GitHub refuses.
+  "$HANDLERS_SRC/handlers/credential_issuer.rs"
+  # Two real-time uses, neither a packet stamp: `plan_refresh` compares an
+  # installed token's expiry against the refresh window NOW (a rotation
+  # judged at a replayed instant would keep a dead token), and a revoked
+  # token's Secret gets a wall-time expiry key so every consumer reads it
+  # as not-live from that moment.
+  "$HANDLERS_SRC/handlers/credential_rotate_github_app.rs"
+)
+handler_allow_used=""
+
+is_handler_clock_allowed() {
+  local file="$1" allowed
+  for allowed in "${HANDLER_CLOCK_ALLOWED[@]}"; do
+    if [[ "$file" == "$allowed" ]]; then
+      handler_allow_used="$handler_allow_used"$'\n'"$allowed"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# handler_clock_violations <src-root>: sets `handler_hits` to every
+# production `wall_now` / `now_from` under <src-root> that no allowlist
+# entry excuses, one `file:line:code` per element. Comment lines,
+# whole-file test modules and `#[cfg(test)]` item bodies are not
+# production. It sets globals rather than printing, because a
+# `$(...)` capture runs it in a subshell and would lose the
+# `handler_allow_used` record the stale-entry check reads.
+handler_hits=()
+handler_clock_violations() {
+  local raw line file rest lineno code
+  handler_hits=()
+  raw=$(grep -rnE --include='*.rs' '\b(wall_now|now_from)\b' "$1" || true)
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    file="${line%%:*}"
+    rest="${line#*:}"
+    lineno="${rest%%:*}"
+    code="${rest#*:}"
+    [[ "$code" =~ ^[[:space:]]*// ]] && continue
+    is_test_file "$file" && continue
+    [ "$(in_cfg_test_item "$file" "$lineno")" = "test" ] && continue
+    is_handler_clock_allowed "$file" && continue
+    handler_hits+=("$line")
+  done <<<"$raw"
+}
+
 # --self-test: the classifier against a fixture carrying both shapes
 # that used to swallow a file. Runs without touching the tree.
 if [ "${1:-}" = "--self-test" ]; then
@@ -379,8 +462,32 @@ FIXTURE
     echo "self-test FAIL: a tests.rs no parent declares under #[cfg(test)] classified as a test file"
     st_fail=1
   fi
+  # The handler pass (backlog 2b03a2df): a production `now_from` and
+  # `wall_now` are named; the same calls in a comment, in a
+  # `#[cfg(test)]` item, and a longer identifier are not.
+  mkdir -p "$whole/handlers"
+  printf '%s\n' \
+    'async fn invoke(&self) {' \
+    '    let now = boss_clock_client::now_from(&self.clock).await;' \
+    '    // a comment naming wall_now() is prose' \
+    '    let at = boss_clock_client::wall_now();' \
+    '    let x = now_from_payload(ctx);' \
+    '}' \
+    '#[cfg(test)]' \
+    'mod tests {' \
+    '    fn t() { let _ = boss_clock_client::wall_now(); }' \
+    '}' >"$whole/handlers/fixture.rs"
+  handler_clock_violations "$whole/handlers"
+  want=("$whole/handlers/fixture.rs:2:    let now = boss_clock_client::now_from(&self.clock).await;"
+        "$whole/handlers/fixture.rs:4:    let at = boss_clock_client::wall_now();")
+  if [ "${handler_hits[*]}" != "${want[*]}" ]; then
+    echo "self-test FAIL: the handler pass named ${#handler_hits[@]} line(s):"
+    printf '    %s\n' "${handler_hits[@]}"
+    echo "  where it should name exactly lines 2 and 4 of the fixture"
+    st_fail=1
+  fi
   if [ "$st_fail" -eq 0 ]; then
-    echo "no-wallclock --self-test: ok (cfg(test) exemption is bounded to the item; a whole-file test module is exempt by its parent's declaration)"
+    echo "no-wallclock --self-test: ok (cfg(test) exemption is bounded to the item; a whole-file test module is exempt by its parent's declaration; the handler pass names a production wall_now/now_from and nothing else)"
     exit 0
   fi
   echo "no-wallclock --self-test: FAILED — the cfg(test) exemption is leaking past the item it applies to, or misreads a whole-file test module."
@@ -418,9 +525,10 @@ while IFS= read -r line; do
   fi
 done <<<"$hits"
 
-# Both passes walk every Rust file under crates/; zero means the tree
+# The Rust and SQL passes walk every Rust file under crates/, the handler
+# pass one crate of them (and refuses its own zero below); zero means the tree
 # moved, not that nothing stamps wallclock.
-lint_scanned "$LINT" "$(find crates -type f -name '*.rs' | wc -l | tr -d ' ')" "Rust file(s) under crates/ (both passes)"
+lint_scanned "$LINT" "$(find crates -type f -name '*.rs' | wc -l | tr -d ' ')" "Rust file(s) under crates/ (all three passes)"
 
 if [ "$violations" -eq 0 ]; then
   echo "no-wallclock (Rust): clean"
@@ -615,9 +723,36 @@ else
   echo "v1.0.7 commit c70455e5 (boss-commerce AR aging) and a39bec22 (boss-ml)."
 fi
 
-total=$((violations + sql_violations))
+# The handler pass (see its definition above). A crate with no Rust
+# files under its src/ has moved, and a pass that read nothing certifies
+# nothing (lib/scanned.sh's rule; the one `scanned` line above covers
+# every file this pass reads, so it refuses here rather than print a
+# second).
+allowlist_paths_exist "$LINT" "${HANDLER_CLOCK_ALLOWED[@]}"
+handler_files=$(find "$HANDLERS_SRC" -type f -name '*.rs' | wc -l | tr -d ' ')
+if [ "${handler_files:-0}" -eq 0 ]; then
+  echo "no-wallclock (dispatcher handlers): scanned 0 Rust files under $HANDLERS_SRC — refusing; the crate has moved, fix HANDLERS_SRC." >&2
+  exit 1
+fi
+handler_clock_violations "$HANDLERS_SRC"
+handler_violations=${#handler_hits[@]}
+if [ "$handler_violations" -gt 0 ]; then
+  echo "no-wallclock (dispatcher handlers): $handler_violations violation(s) — a handler reads a clock where the firing's own instant belongs:"
+  echo
+  printf '  %s\n' "${handler_hits[@]}"
+  echo
+  echo "Fix: stamp or measure with \`ctx.firing_instant()?\` (a fact or a tick),"
+  echo "\`ctx.firing_day()?\` (a clock day), or \`ctx.firing_instant_or_day_start()?\`"
+  echo "(a day-fired measurement). A real-time use that is correct goes on"
+  echo "HANDLER_CLOCK_ALLOWED with its reason. Why: backlog 2b03a2df, eabc5943."
+else
+  echo "no-wallclock (dispatcher handlers): clean"
+fi
+
+total=$((violations + sql_violations + handler_violations))
 if [ "$total" -gt 0 ]; then
   exit 1
 fi
 allowlist_entries_used "$LINT" "$allow_used" "${ALLOWED_PREFIXES[@]}" "${ALLOWED_FILES[@]}"
+allowlist_entries_used "$LINT" "$handler_allow_used" "${HANDLER_CLOCK_ALLOWED[@]}"
 exit 0

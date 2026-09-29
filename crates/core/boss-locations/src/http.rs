@@ -1,9 +1,9 @@
 //! HTTP API for the Locations registry. Reads are open; the one
 //! write — `POST /api/locations/batch` — seeds the registry from a
 //! tenant's `seeds/locations.toml` (backlog 1ec8312a, 2026-09-17)
-//! and is gated to operator-tier callers (with the `x-sim-origin`
-//! bypass), the classes batch's shape. Authoring (edit / retire)
-//! lands when the admin UI does.
+//! and asks policy for Create on `location` (backlog 59deda40), the
+//! classes batch's shape. Authoring (edit / retire) lands when the
+//! admin UI does.
 
 use std::sync::Arc;
 
@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use boss_core::primitives::Location;
-use boss_policy_client::{AccessTier, CurrentUser};
+use boss_policy_client::{Action, CurrentUser, PolicyClient, Resource};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -22,6 +22,9 @@ use crate::port::LocationRepository;
 #[derive(Clone)]
 pub struct LocationsApiState {
     pub locations: Arc<dyn LocationRepository>,
+    /// Asked by the batch door for Create on `location` (backlog
+    /// 59deda40). Reads ask no one.
+    pub policy: Arc<dyn PolicyClient>,
 }
 
 pub fn router(state: LocationsApiState) -> Router {
@@ -161,30 +164,43 @@ impl From<LocationInput> for Location {
 /// write surface, the door a tenant's `seeds/locations.toml` goes
 /// through. Before it (backlog 1ec8312a, measured 2026-09-16) the
 /// only rows were the schema's, so the people door refused an
-/// employee at any site a tenant declared. Gated like the classes
-/// batch: operator tier, or a sim caller on a sim instance
-/// (`boss_policy_client::sim_bypass_allowed` — never the header alone,
-/// backlog 85e7f10f). Reads stay open.
+/// employee at any site a tenant declared. Reads stay open.
+///
+/// WHY POLICY (backlog 59deda40, 2026-09-28). The door checked the
+/// caller's access tier (`Operator`, or a sim caller on a sim instance)
+/// and never asked policy, so no rule could widen or narrow who declares
+/// a site, and an unsigned sim-chain caller was stamped as this
+/// service's own automation. It now asks Create on `location` —
+/// platform-admin's alone in the core defaults, which is what `boss
+/// tenant publish` signs as — through the registry-write ladder
+/// ([`boss_policy_client::writes::require_registry_write`], the classes
+/// doors' since 553cf479): no caller 401, a deny or a grant narrower
+/// than `all` 403, a policy service that cannot answer 503. The sim is
+/// admitted the way every policy-asking service admits it: the binary
+/// wraps its client in `SimBypassPolicyClient::from_env` (85e7f10f).
 async fn batch_upsert(
     State(state): State<LocationsApiState>,
     CurrentUser(user): CurrentUser,
     Json(rows): Json<Vec<LocationInput>>,
 ) -> Response {
-    let sim = boss_policy_client::sim_bypass_allowed(&user);
-    let tier_ok = matches!(user.access_tier, AccessTier::Operator);
-    if !(sim || tier_ok) {
-        return (StatusCode::FORBIDDEN, "operator tier required").into_response();
-    }
+    let actor = match boss_policy_client::writes::require_registry_write(
+        state.policy.as_ref(),
+        &user,
+        Action::Create,
+        Resource::location(),
+    )
+    .await
+    {
+        Ok(actor) => actor,
+        Err(refusal) => return refusal,
+    };
     let locations: Vec<Location> = rows.into_iter().map(Into::into).collect();
     // The fact each inserted row leaves is stamped with the actor the
-    // request signed with; a sim-chain caller with no identity is
-    // this service's own automation, never anonymous. Publisher-less
-    // stamp (the classes door's shape): the adapter stages the event
-    // on the outbox inside the insert's transaction and the relay
-    // moves it on, so this service needs no bus of its own.
-    let actor = user
-        .ambient_actor()
-        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("locations".into()));
+    // ladder resolved — the signed caller, never a fallback.
+    // Publisher-less stamp (the classes door's shape): the adapter
+    // stages the event on the outbox inside the insert's transaction
+    // and the relay moves it on, so this service needs no bus of its
+    // own.
     let stamp = boss_core::publisher::EventStamp::new("locations", actor);
     match state.locations.batch_upsert(&locations, &stamp).await {
         Ok(inserted) => Json(serde_json::json!({
@@ -223,10 +239,63 @@ mod tests {
     }
 
     fn build_app(rows: Vec<Location>) -> Router {
-        let state = LocationsApiState {
-            locations: Arc::new(InMemoryLocations::new(rows)),
-        };
-        router(state)
+        door(Arc::new(InMemoryLocations::new(rows)), default_policy())
+    }
+
+    /// The router over `repo`, asking `policy`.
+    fn door(repo: Arc<InMemoryLocations>, policy: Arc<dyn PolicyClient>) -> Router {
+        router(LocationsApiState {
+            locations: repo,
+            policy,
+        })
+    }
+
+    /// The core default rules, as the live policy service seeds them —
+    /// so these tests judge the door against the grant that ships.
+    fn default_policy() -> Arc<dyn PolicyClient> {
+        Arc::new(
+            boss_policy_client::FakePolicyClient::builder()
+                .with_default_rules()
+                .build(),
+        )
+    }
+
+    /// A policy service that cannot be asked.
+    struct DarkPolicy;
+
+    #[async_trait::async_trait]
+    impl PolicyClient for DarkPolicy {
+        async fn check(
+            &self,
+            _: &boss_policy_client::User,
+            _: Action,
+            _: Resource,
+        ) -> Result<boss_policy_client::Decision, boss_policy_client::PolicyClientError> {
+            Err(boss_policy_client::PolicyClientError::Unreachable(
+                "dark".into(),
+            ))
+        }
+        async fn scope_predicate(
+            &self,
+            _: &boss_policy_client::User,
+            _: Resource,
+        ) -> Result<boss_policy_client::Predicate, boss_policy_client::PolicyClientError> {
+            Err(boss_policy_client::PolicyClientError::Unreachable(
+                "dark".into(),
+            ))
+        }
+    }
+
+    /// `x-boss-user` JSON for a caller of the given role and tier.
+    fn signed(id: &str, role: &str, tier: &str) -> String {
+        json!({
+            "id": id,
+            "role": role,
+            "access_tier": tier,
+            "territory_account_ids": [],
+            "direct_report_ids": [],
+        })
+        .to_string()
     }
 
     #[tokio::test]
@@ -368,9 +437,7 @@ mod tests {
     #[tokio::test]
     async fn batch_inserts_rows_for_operator_and_a_minimal_row_needs_four_fields() {
         let repo = Arc::new(InMemoryLocations::new(vec![]));
-        let app = router(LocationsApiState {
-            locations: repo.clone(),
-        });
+        let app = door(repo.clone(), default_policy());
         let resp = app
             .oneshot(batch_request(Some(&operator_header()), hq_rows()))
             .await
@@ -397,9 +464,7 @@ mod tests {
         let repo = Arc::new(InMemoryLocations::new(vec![loc(
             "loc-t-hq", "HQ", "office", None,
         )]));
-        let app = router(LocationsApiState {
-            locations: repo.clone(),
-        });
+        let app = door(repo.clone(), default_policy());
         let resp = app
             .oneshot(batch_request(Some(&operator_header()), hq_rows()))
             .await
@@ -422,9 +487,7 @@ mod tests {
         let repo = Arc::new(InMemoryLocations::new(vec![loc(
             "loc-t-hq", "HQ", "office", None,
         )]));
-        let app = router(LocationsApiState {
-            locations: repo.clone(),
-        });
+        let app = door(repo.clone(), default_policy());
         let mut rows = hq_rows();
         rows.as_array_mut().unwrap().push(json!(
             {"id": "loc-t-yard", "name": "Yard", "kind": "office", "timezone": "UTC"}
@@ -467,33 +530,140 @@ mod tests {
         );
     }
 
+    // ---- the policy question (backlog 59deda40) -------------------------
+
+    /// A caller the tier check refused — USER tier, a role the core
+    /// defaults grant nothing — declares Locations once a policy rule
+    /// grants it Create on `location`, and each fact names it.
     #[tokio::test]
-    async fn batch_is_forbidden_for_non_operator() {
-        // No header → anonymous, AccessTier::User. Reads stay open;
-        // the write is the one privileged door.
-        let app = build_app(vec![]);
-        let resp = app.oneshot(batch_request(None, hq_rows())).await.unwrap();
+    async fn a_granting_rule_lets_a_non_admin_declare_and_signs_the_fact_as_it() {
+        let policy: Arc<dyn PolicyClient> = Arc::new(
+            boss_policy_client::FakePolicyClient::builder()
+                .with_default_rules()
+                .allow(
+                    "site-planner",
+                    Action::Create,
+                    Resource::location(),
+                    boss_policy_client::Scope::All,
+                )
+                .build(),
+        );
+        let repo = Arc::new(InMemoryLocations::new(vec![]));
+        let planner = signed("emp-planner", "site-planner", "user");
+        let resp = door(repo.clone(), policy)
+            .oneshot(batch_request(Some(&planner), hq_rows()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(repo.exists_active("loc-t-hq").await.unwrap());
+        let events = repo.recorded_events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(
+            events
+                .iter()
+                .all(|e| e.payload["_actor"] == json!("emp-planner")
+                    && e.payload["declared_by"] == json!("emp-planner")),
+            "every fact is signed by the caller: {events:?}"
+        );
+    }
+
+    /// A platform-admin at operator tier — everything the tier check
+    /// admitted — is refused 403 by a user override that denies it, with
+    /// policy's reason, and nothing is written.
+    #[tokio::test]
+    async fn a_denying_override_refuses_a_platform_admin() {
+        let admin_id = "claude@algedonic.dev";
+        let policy: Arc<dyn PolicyClient> = Arc::new(
+            boss_policy_client::FakePolicyClient::builder()
+                .with_default_rules()
+                .with_override(boss_policy_client::UserOverride {
+                    id: "deny-locations".into(),
+                    user_id: admin_id.into(),
+                    resource: Resource::location(),
+                    action: Action::Create,
+                    scope: boss_policy_client::Scope::None,
+                    reason: "sites frozen for the move".into(),
+                    expires_at: None,
+                })
+                .build(),
+        );
+        let repo = Arc::new(InMemoryLocations::new(vec![]));
+        let resp = door(repo.clone(), policy)
+            .oneshot(batch_request(
+                Some(&signed(admin_id, "platform-admin", "operator")),
+                hq_rows(),
+            ))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("sites frozen"));
+        assert!(!repo.exists_active("loc-t-hq").await.unwrap());
+        assert!(repo.recorded_events().is_empty());
+    }
+
+    /// The rest of the ladder, and each refusal writes nothing: no
+    /// identity is 401 — and so is a header claiming the anonymous id
+    /// with a platform role, or a blank id — a role the defaults grant
+    /// nothing is 403, a policy service that cannot answer is its own
+    /// 503, never an allow.
+    #[tokio::test]
+    async fn the_door_refuses_before_it_writes() {
+        let cases: [(Option<String>, Arc<dyn PolicyClient>, StatusCode); 5] = [
+            (None, default_policy(), StatusCode::UNAUTHORIZED),
+            (
+                Some(signed(
+                    boss_policy_client::User::ANONYMOUS_ID,
+                    "platform-admin",
+                    "operator",
+                )),
+                default_policy(),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Some(signed("", "platform-admin", "operator")),
+                default_policy(),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Some(signed("emp-audit", "audit-readonly", "operator")),
+                default_policy(),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Some(operator_header()),
+                Arc::new(DarkPolicy),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ];
+        for (user, policy, want) in cases {
+            let repo = Arc::new(InMemoryLocations::new(vec![]));
+            let resp = door(repo.clone(), policy)
+                .oneshot(batch_request(user.as_deref(), hq_rows()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), want, "{user:?}");
+            assert!(!repo.exists_active("loc-t-hq").await.unwrap(), "{user:?}");
+            assert!(repo.recorded_events().is_empty(), "{user:?}");
+        }
     }
 
     #[tokio::test]
-    async fn a_sim_chain_alone_is_not_operator_tier() {
+    async fn a_sim_chain_alone_is_not_a_caller() {
         // Backlog 85e7f10f (2026-09-25): a sim chain is not an identity.
         // Anonymous on a chain (the task-local set directly — the router
-        // under test omits the middleware) is refused, and no row lands:
-        // only a sim caller on a sim instance takes the bypass
-        // (boss_policy_client::sim_bypass_allowed).
+        // under test omits the middleware) is refused 401, and no row
+        // lands: only a sim caller on a sim instance takes the bypass,
+        // which the binary's `SimBypassPolicyClient::from_env` installs.
         let repo = Arc::new(InMemoryLocations::new(vec![]));
-        let app = router(LocationsApiState {
-            locations: repo.clone(),
-        });
+        let app = door(repo.clone(), default_policy());
         let resp = boss_core::sim_origin::with_sim_chain(
             true,
             app.oneshot(batch_request(None, hq_rows())),
         )
         .await
         .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert!(!repo.exists_active("loc-t-hq").await.unwrap());
     }
 

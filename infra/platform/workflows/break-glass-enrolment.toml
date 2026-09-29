@@ -1,0 +1,180 @@
+# break-glass-enrolment — presence authorises ONE break-glass key
+# enrolment (design 03451237, David 2026-09-22, all four questions
+# accepted as proposed; built for backlog 1c4c100a).
+#
+# WHY THIS EXISTS. The emergency door (crates/core/boss-gateway
+# src/break_glass.rs, "a hardware key you hold") enrolled keys two ways:
+# under a break-glass session, or with a bootstrap token while ZERO
+# records were committed. On 2026-09-16 the door moved from
+# playground.algedonic.dev to boss.algedonic.dev, and a WebAuthn
+# credential is bound to its relying party BY THE AUTHENTICATOR — so both
+# enrolled keys stopped opening the door, and the only way back in was
+# to empty the store, arm the token, re-enrol, disarm: eight steps, five
+# of them pasted kubectl, with no emergency door at all in between.
+#
+# THE ANSWER: independence is a property of the ASSERT path (hardware
+# key plus touch opens the door whatever else is down); enrolment is an
+# administrative act done while things work. So an employee's passkey
+# may AUTHORISE an enrolment — and may never BE the emergency
+# credential: the gateway's refusal of synced and unattested
+# authenticators is unchanged. The token and its zero-credentials
+# window retired with this protocol (Q4).
+#
+# ONE PACKET PER KEY (Q1). The filer names the key (`label`), the
+# relying party it is for (`rp_id`, the host of BOSS_PUBLIC_URL) and the
+# deployment (`origin`); they are bound into the `authorise` step's
+# metadata, so the passkey signs them — step_shape_hash covers every
+# key — and an edit after signing leaves no live stamp. The gateway
+# reads this packet at the enrolment, re-judges the stamp against the
+# step's CURRENT content with the one rule (Step::live_stamps), and
+# enrols only when: the decision is `approved`; a live PRESENCE stamp is
+# by an employee on the gateway's named list, BOSS_BREAK_GLASS_
+# AUTHORISERS (Q2 — a list in the manifest, changed by a car someone
+# reviews; never a role); the ceremony is run from that same employee's
+# session; and `rp_id`/`origin` are that door's own.
+#
+# SINGLE-USE BY RECORD (Q3). The gateway completes `enrol` carrying the
+# WHOLE record it enrolled (credential_id, public_key, sign_count,
+# label, rp_id, aaguid, enrolled_at — every field public, Q5 of
+# e9703d8f) in ONE write, BEFORE it hands the record out, and a refused
+# write issues no record; a completed step refuses every later metadata
+# write, so the spend cannot be undone to re-arm the packet. An `enrol`
+# step already carrying a credential, or a packet no longer open, is
+# refused, naming it.
+#
+# THE STEP IS THE DURABLE COPY. The record is committed to
+# infra/cluster/manifests/boss-break-glass-credentials.yaml by a car, as
+# every break-glass record always was, and that car reads it off this
+# packet's `enrol` step. Until 2026-09-28 the step kept five keys and
+# left out `public_key` and `sign_count`, so the only complete copy was
+# the page's 201 body and one log line in a pod the next converge
+# replaces — both records enrolled that day were copied by hand from
+# `kubectl logs` (backlog 4a173252).
+#
+# FILING: `boss job file --kind break-glass-enrolment --subject
+# custom/break-glass-<label> --meta label=<primary|backup> --meta
+# rp_id=<host> --meta origin=<https://host>` (one per key). Then the
+# authoriser approves `authorise` with a passkey, opens /break-glass on
+# that deployment signed in as themselves, pastes the packet id, and
+# touches the key.
+
+[[workflow]]
+kind = "break-glass-enrolment"
+label = "Break-glass enrolment"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "Authorise enrolling ONE break-glass hardware key, with a passkey (design 03451237). The filer names the key's label (primary or backup), the relying party it is for and the deployment's origin; an authoriser on the gateway's named list approves `authorise` with a presence stamp over exactly that; the gateway, asked from that authoriser's own session at /break-glass, re-judges the stamp against the step's current content, verifies the key's attestation, records the credential it enrolled on `enrol` BEFORE it hands the record out, and refuses any second use naming the credential it was spent on. The record is then committed to the in-tree credential manifest. `declined` is an authorisation the approver did not approve."
+metadata = { owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "filed"
+kind = "trigger"
+ready_when = "true"
+title_template = "Break-glass key enrolment requested: {metadata.label} for {metadata.rp_id}"
+metadata_defaults = { trigger_kind = "operator", trigger_name = "operator-requests-a-break-glass-enrolment" }
+
+[[workflow.step]]
+title = "authorise"
+kind = "sign-off"
+ready_when = "steps.filed.done"
+assurance_required = "presence"
+sign_offs_required = ["platform-admin"]
+title_template = "Authorise enrolling the {metadata.label} break-glass key for {metadata.rp_id}"
+authority_role = "platform-admin"
+metadata_defaults = { label = "{metadata.label}", rp_id = "{metadata.rp_id}", origin = "{metadata.origin}", procedure = "YOUR PASSKEY SIGNS THIS STEP'S CONTENT, and the gateway enrols exactly what it names: the `label` (which physical key: primary or backup), the `rp_id` (the relying party the key will be bound to - it must be the host of the deployment you will enrol on, or the key will never open that door) and the `origin`. Approve only a request you made, for a key you hold. After approving, open `<origin>/break-glass` SIGNED IN AS YOURSELF, expand Enrollment, paste this packet's id, and touch the key: the enrolment is refused from anyone else's session. The page prints the record to commit to infra/cluster/manifests/boss-break-glass-credentials.yaml." }
+
+[[workflow.step.fields]]
+name = "label"
+field_type = "primary|backup"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "rp_id"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "origin"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "decision"
+field_type = "approved|rejected"
+required = true
+
+# Written by the gateway, never by hand: the credential this
+# authorisation was spent on. A role queue (`claimable`), so the
+# dispatcher nominates it to no agent — the only executor is the
+# gateway's enrolment finish, as `automation:gateway`.
+[[workflow.step]]
+title = "enrol"
+kind = "task"
+ready_when = "steps.authorise.done AND steps.authorise.metadata.decision = \"approved\""
+title_template = "Enrol the {metadata.label} key at {metadata.origin}/break-glass"
+authority_role = "platform-admin"
+claimable = true
+metadata_defaults = { procedure = "Completed by the gateway when the authoriser touches the key at /break-glass: it records the credential enrolled under this authorisation, which is what refuses a second use. Do not complete this step by hand - a hand-written credential_id spends the authorisation on nothing." }
+
+[[workflow.step.fields]]
+name = "credential_id"
+field_type = "string"
+required = true
+
+[[workflow.step.fields]]
+name = "enrolled_at"
+field_type = "string"
+required = true
+
+# The rest of the record, so this step holds everything the committed
+# manifest entry holds and the commit car copies it from here (backlog
+# 4a173252). `public_key` is the serialized webauthn-rs SecurityKey —
+# public key, verified attestation, flags; nothing in it is secret.
+[[workflow.step.fields]]
+name = "public_key"
+field_type = "string"
+required = true
+
+[[workflow.step.fields]]
+name = "sign_count"
+field_type = "integer"
+required = true
+
+[[workflow.step.fields]]
+name = "label"
+field_type = "primary|backup"
+required = true
+
+[[workflow.step.fields]]
+name = "rp_id"
+field_type = "string"
+required = true
+
+[[workflow.step.fields]]
+name = "aaguid"
+field_type = "string"
+required = true
+
+[[workflow.step]]
+title = "enrolled"
+kind = "outcome"
+ready_when = "steps.enrol.done"
+title_template = "Enrolled — commit the record"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "enrolled" }
+
+# Led by `steps.authorise.done`, so it is false on a fresh packet and
+# the dispatcher's complete-on-ready rule cannot close one at open;
+# `NOT (… = "approved")` so an absent decision reads as not approved
+# (the ops-request `refused` shape).
+[[workflow.step]]
+title = "declined"
+kind = "outcome"
+ready_when = "steps.authorise.done AND NOT (steps.authorise.metadata.decision = \"approved\")"
+title_template = "Declined — nothing enrolled"
+metadata_defaults = { outcome_kind = "aborted" }
+terminal = { outcome = "declined" }

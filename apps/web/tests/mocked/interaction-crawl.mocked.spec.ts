@@ -118,9 +118,12 @@
 //   CRAWL_VERBOSE=1              print every click's outcome
 
 import { test, expect, type Page, type Request } from './_test';
-import { DISPATCHER_RULES, OBJECT_ENDPOINTS, SHELL_ENDPOINTS, VIEW_RESULTS, installSmokeMocks } from './_smokeMocks';
+import {
+  DISPATCHER_RULES, EMPTY_PAGE, OBJECT_ENDPOINTS, PAGED_ENDPOINTS, SHELL_ENDPOINTS, VIEW_RESULTS, installSmokeMocks,
+} from './_smokeMocks';
 import { FAILURE_MARKER, NOT_FOUND_ROW, ROUTES } from './_routes';
 import { parseRoute, routable } from '../../src/router';
+import { scaled } from '../../src/dev-load';
 import { pageRequests, readsSettled, recordPageRequests } from './_helpers';
 
 // ---------------------------------------------------------------------------
@@ -237,7 +240,7 @@ type Scope = 'page' | 'chrome' | 'dialog';
 /// head in a day (backlog ac3270c7). A control that is genuinely not
 /// clickable still fails, just later; a control that is merely waiting
 /// on a starved renderer no longer reds a train.
-const CLICK_TIMEOUT_MS = 15_000;
+const CLICK_TIMEOUT_MS = scaled(15_000);
 
 /// How long a click that navigates nowhere gets to answer before the
 /// page is read. It is the TIMEOUT of a wait for the click's
@@ -320,7 +323,7 @@ async function open(page: Page, route: string): Promise<boolean> {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       await page.goto(route, { waitUntil: 'commit' });
-      await expect(page.locator('.app-shell')).toBeVisible({ timeout: 20_000 });
+      await expect(page.locator('.app-shell')).toBeVisible({ timeout: scaled(20_000) });
       // The route's own reads answered and painted — not 400 ms, which
       // was a bet that they would be (backlog 840c5a76). A route whose
       // reads outlast the budget is crawled as it stands, as before.
@@ -380,6 +383,8 @@ type Force = Readonly<{ requestEventLateMs?: number }>;
 const EMPTIED: ReadonlyArray<readonly [RegExp, unknown]> = [
   [DISPATCHER_RULES, { rules: [], handler_emits: {}, system_edges: [] }],
   [VIEW_RESULTS, { view_id: 'view-1', source: 'jobs', layout: 'table', rows: [], matched: 0, truncated: false, scope: 'all' }],
+  // A paged read's empty is the empty page, not `[]` (backlog 0ef5e008).
+  ...PAGED_ENDPOINTS.map((re): readonly [RegExp, unknown] => [re, EMPTY_PAGE]),
 ];
 
 /// window.print() opens the browser's print dialog — a native dialog the
@@ -848,7 +853,7 @@ test.describe('the interaction crawl — every rendered link lands, every contro
       // the route's open throws, and the crawl must name it as the
       // route's own finding — `page (load)` — not silence, and not a
       // control's.
-      test.setTimeout(120_000);
+      test.setTimeout(scaled(120_000));
       const mode: Mode = { refuse: false, empty: false };
       await installLegs(page, mode);
       await page.addInitScript(([route, text]) => {
@@ -877,7 +882,7 @@ test.describe('the interaction crawl — every rendered link lands, every contro
     // and the answer that would repaint the page was later still. So
     // the pin forces both halves: the POST's answer is held back, and
     // its request event reaches the crawl after the click has returned.
-    test.setTimeout(120_000);
+    test.setTimeout(scaled(120_000));
     const mode: Mode = { refuse: false, empty: false };
     await installLegs(page, mode);
     await page.route(RACE_WRITE, async (r) => {
@@ -900,7 +905,7 @@ test.describe('the interaction crawl — every rendered link lands, every contro
     // and the old judge counted any. Planted: one inert button in the
     // page's content slot, on a page that polls every SILENT_POLL_MS from
     // a timer of its own, scheduled at load and not by any click.
-    test.setTimeout(120_000);
+    test.setTimeout(scaled(120_000));
     const mode: Mode = { refuse: false, empty: false };
     await installLegs(page, mode);
     await page.addInitScript(([route, label, pollMs]) => {
@@ -935,7 +940,7 @@ test.describe('the interaction crawl — every rendered link lands, every contro
     // anchor to /# and a bare #, which must red, beside a "← Home"
     // anchor to / (the KB breadcrumb's shape), which must not; and a
     // button that navigates to / without naming Home, for the click leg.
-    test.setTimeout(120_000);
+    test.setTimeout(scaled(120_000));
     const mode: Mode = { refuse: false, empty: false };
     await installLegs(page, mode);
     await page.addInitScript(([route, label]) => {

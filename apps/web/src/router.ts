@@ -135,6 +135,10 @@ export type Route =
   /// (backlog 62988516; David 2026-09-26: agents get a page in IT,
   /// never the People roster).
   | { kind: 'systemAgents' }
+  /// The Credentials tab on Registry — the credentials registry drawn,
+  /// its lifecycle filed as packets (backlog 851259b9; design 76155676
+  /// step 3). It holds no value and reads none.
+  | { kind: 'systemCredentials' }
   | { kind: 'experiments' }
   | { kind: 'dispatcherRules' }
   | { kind: 'dispatcherRulesList' }
@@ -269,6 +273,7 @@ export function parseRoute(pathname: string, search = ''): Route {
     if (p === '/registry/subjects') return { kind: 'systemSubjects' };
     if (p === '/registry/drift') return { kind: 'systemRegistryDrift' };
     if (p === '/registry/agents') return { kind: 'systemAgents' };
+    if (p === '/registry/credentials') return { kind: 'systemCredentials' };
     // 4. Design — reviews lead; the experiments tab.
     if (p === '/design') return { kind: 'systemDesign' };
     if (p === '/design/experiments') return { kind: 'experiments' };

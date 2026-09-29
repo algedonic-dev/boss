@@ -128,6 +128,7 @@ fn stub(path: &Path, who: &str, built_from: &str) {
              echo \"boss 0.1.0 built from {sha}\"\n\
              echo \"ran={who}\"\n\
              echo \"jobs_url=${{BOSS_JOBS_URL:-unset}}\"\n\
+             echo \"tree=${{BOSS_TREE:-unset}}\"\n\
              for a in \"$@\"; do echo \"arg=$a\"; done\n"
         ),
     );
@@ -268,6 +269,7 @@ impl Fixture {
             .env("BOSS_SHIM_CLI_WAIT", "0")
             .env_remove("BOSS_SHIM_CLI_POLL")
             .env_remove("BOSS_JOBS_URL")
+            .env_remove("BOSS_TREE")
             .env_remove("BOSS_SHIM_BUILT")
             .env_remove("BOSS_SHIM_VERBOSE");
         cmd
@@ -978,6 +980,35 @@ fn the_jobs_url_defaults_to_the_sor_only_when_unset() {
     assert!(
         out.contains(&format!("jobs_url={second_stack}")),
         "a caller's jobs URL is kept, not overridden: {out}"
+    );
+}
+
+/// THE CHECKOUT THE DOOR BELONGS TO (backlog a693cf9d). The trust
+/// verbs read infra/platform/trust-areas.toml from the worktree they
+/// are run in, else from `BOSS_TREE`; an analyst runs them from its
+/// scratchpad, which is no worktree, and the image CLI's own build path
+/// is not on the pod. So the shim names the checkout it lives in — the
+/// operator's, through the /work/tools/bin symlink — unless the caller
+/// already named one.
+#[test]
+fn the_shim_names_its_own_checkout_as_the_tree_only_when_unset() {
+    let f = Fixture::new("tree");
+    f.build("debug", &main_sha());
+
+    let (rc, out) = f.run(&["orient"], &[]);
+    assert_eq!(rc, 0, "the shim failed: {out}");
+    let checkout = repo_root().canonicalize().expect("canonical");
+    assert!(
+        out.contains(&format!("tree={}\n", checkout.display())),
+        "unset, the tree is the checkout the shim lives in ({}): {out}",
+        checkout.display()
+    );
+
+    let (rc, out) = f.run(&["orient"], &[("BOSS_TREE", "/some/other/checkout")]);
+    assert_eq!(rc, 0, "the shim failed: {out}");
+    assert!(
+        out.contains("tree=/some/other/checkout\n"),
+        "a caller's tree is kept, not overridden: {out}"
     );
 }
 

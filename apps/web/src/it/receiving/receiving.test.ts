@@ -139,6 +139,10 @@ describe('the page is parsed once', () => {
   // as `failed` with the alert it filed. Publish 254177e2's open-pr sat
   // ready for five hours on 2026-09-19 and this yard drew it like any
   // ready step — the packet was troubled and did not look it.
+  //
+  // The note is the SERVER's reading since backlog ea80b5fd: the board
+  // reads slim rows and asks `failed_verbs=true`, which lifts the note's
+  // four keys onto the step as `failed_verb` — no step metadata rides.
   test('a ready step a failed verb annotated carries the FAILED line and its alert', () => {
     const line = 'publish-github-pr: FAILED — pushing publish/2026-09-18: dubious ownership';
     const page = parseJobsPage({
@@ -146,13 +150,13 @@ describe('the page is parsed once', () => {
         job({
           kind: 'publish-to-github',
           steps: [
-            { kind: 'approval', status: 'completed', assignee_id: 'emp-david' },
+            { kind: 'approval', status: 'completed', assignee_id: 'emp-david', slim: true },
             {
               kind: 'task',
               status: 'ready',
               assignee_id: null,
-              metadata: {
-                ops_verb: 'publish-github-pr',
+              slim: true,
+              failed_verb: {
                 failed: line,
                 failed_exit: '1',
                 failed_source: 'c98a782f-0000-4000-8000-000000000000',

@@ -163,6 +163,10 @@ export type NeedLine = Readonly<{
   /** Shown only when it is not `standard`. */
   priority: string | null;
   age: string;
+  /** The step's own agent block hands it to an agent (the row's
+   *  `agent_takes`, backlog 1dd6d7ad) — it is on your role, and the
+   *  line says an agent takes it rather than reading as yours. */
+  agentTakes: boolean;
 }>;
 
 const PRIORITY_RANK: Readonly<Record<string, number>> = { emergency: 0, urgent: 1, standard: 2, scheduled: 3 };
@@ -206,6 +210,7 @@ export function needsYouBoard(
       stepTitle: r.step.title,
       priority: r.priority === 'standard' ? null : r.priority,
       age: days === null ? '?' : days === 0 ? 'today' : `${days}d`,
+      agentTakes: r.step.agent_takes === true,
     };
   });
   return { kind: 'rows', count: count(yours.length, false), lines, more: yours.length - lines.length, whom: named };

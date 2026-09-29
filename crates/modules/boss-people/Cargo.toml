@@ -69,6 +69,10 @@ name = "a_guest_is_refused_the_roster_by_email"
 required-features = ["postgres"]
 
 [[test]]
+name = "an_employee_sits_in_a_registry_department"
+required-features = ["postgres"]
+
+[[test]]
 name = "a_requisition_asks_policy_for_create"
 required-features = ["postgres"]
 

@@ -200,6 +200,17 @@ pub async fn rebuild_facts(pool: &PgPool) -> Result<RebuildFactsReport, LedgerEr
         .await
         .map_err(|e| LedgerError::Storage(e.to_string()))?;
 
+    // The truncate below may run only against a log that holds every
+    // committed write (design b046f510). Taken here, not in
+    // `rebuild_facts_in_tx`: its other caller, the deep replay check,
+    // truncates session-private shadows no writer can reach.
+    boss_events::outbox::lock_and_assert_log_complete(
+        &mut tx,
+        &["financial_facts", "gl_account_daily"],
+    )
+    .await
+    .map_err(LedgerError::Storage)?;
+
     let report = rebuild_facts_in_tx(&mut tx).await?;
 
     tx.commit()

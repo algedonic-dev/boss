@@ -16,11 +16,24 @@
 # running). A company declares its own roster in its own
 # seeds/departments.toml; a code it declares is never a candidate.
 #
-# Every row is exactly as the migration seeds it — code, display name,
-# function and sort order — so on an instance that ran the migration
-# the publish finds each one already as declared.
+# Every row the migration seeds is here exactly as it seeds it — code,
+# display name, function and sort order — so on an instance that ran
+# the migration the publish finds each one already as declared.
 # crates/core/boss-testing/tests/a_department_is_a_subject_sql.rs holds
-# the two equal (CLAUDE.md §9a).
+# the two equal (CLAUDE.md §9a). Two exceptions, both since backlog
+# c87e3d6d (2026-09-27), when an employee's `department` stopped being
+# an `employee` Class and became a row of this registry:
+#
+#   * `it` is NOT here. It is the platform's department — the operator
+#     baseline hires its own people into it and the IT surfaces are
+#     core — so it must never be an eviction candidate, exactly as the
+#     `it` department Class never was. The migration seeds it on every
+#     instance.
+#   * `packaging` and `taproom` ARE here though no migration seeds
+#     them: 64 and 36 of this tenant's employees sit in them
+#     (seeds/employees.json) and its policy rules scope to them, and
+#     with the department Classes retired this file is the only place
+#     a brewery department is declared.
 #
 # Each [[department]] is one row. Schema (docs/tenant-contract.md):
 #   code          — a lowercase slug: the department's URL root segment
@@ -34,12 +47,6 @@
 #   sort_order    — tab order (default 0)
 #   retired       — true withdraws the row on this instance (default
 #                   false)
-
-[[department]]
-code = "it"
-display_name = "IT"
-function = "operations"
-sort_order = 1
 
 [[department]]
 code = "executive"
@@ -72,6 +79,12 @@ function = "revenue"
 sort_order = 50
 
 [[department]]
+code = "taproom"
+display_name = "Taproom"
+function = "revenue"
+sort_order = 55
+
+[[department]]
 code = "support"
 display_name = "Support"
 function = "support"
@@ -94,6 +107,12 @@ code = "production"
 display_name = "Production"
 function = "operations"
 sort_order = 90
+
+[[department]]
+code = "packaging"
+display_name = "Packaging"
+function = "operations"
+sort_order = 95
 
 [[department]]
 code = "warehouse"

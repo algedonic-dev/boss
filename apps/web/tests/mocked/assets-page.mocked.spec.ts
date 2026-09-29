@@ -202,12 +202,12 @@ test.describe('/ux/assets — State A, the equipment module off (the live instan
       await expect(notice.locator('strong')).toHaveText(ROUTE_CATALOG.assets.label);
       await expect(notice.locator('strong')).toHaveText('Assets');
       await expect(notice).toContainText(
-        "The Assets module is turned off in this tenant's tenant.toml. The page exists in the platform — the active tenant just doesn't surface it.",
+        "The Assets module is turned off in this tenant's manifest. The page exists in the platform — the active tenant just doesn't surface it.",
       );
-      // Gap 2 (27ff23fa): the one instruction names a seed file under
-      // examples/<tenant>, on an instance whose registries are the truth.
+      // Gap 2 (27ff23fa; fixed with fa838818): the instruction names the
+      // manifest by what it is, not a seed file under examples/<tenant>.
       await expect(notice).toContainText(
-        'To enable: set equipment = true in examples/<tenant>/seeds/tenant.toml under [modules], redeploy, and the page comes back.',
+        "To enable: set equipment = true in the [modules] section of the tenant's manifest, redeploy, and the page comes back.",
       );
       await expect(notice.getByRole('button')).toHaveCount(1);
       await expect(notice.locator('a')).toHaveCount(0);

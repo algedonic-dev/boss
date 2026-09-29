@@ -57,6 +57,7 @@ async fn step_ready_delegate_subjob_fires_spawn_with_resolved_args() {
         "evt-ready-1",
         "step.ready.delegate-subjob",
         &payload,
+        None,
     )
     .await
     .unwrap();
@@ -109,9 +110,16 @@ async fn job_closed_for_delegated_child_fires_subjob_resolve() {
     let mut hreg = HandlerRegistry::new();
     hreg.register(resolve.clone());
 
-    let results = dispatch(&matched, &hreg, "evt-close-1", "jobs.job.closed", &payload)
-        .await
-        .unwrap();
+    let results = dispatch(
+        &matched,
+        &hreg,
+        "evt-close-1",
+        "jobs.job.closed",
+        &payload,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(results.len(), 1);
     assert!(results[0].outcome.is_ok());
 

@@ -28,6 +28,12 @@ export type AssignmentStep = Readonly<{
    *  null-when-unknown contract as `completion`)? {@link isVerdict}
    *  falls back to the kind roster when absent. */
   decision_shaped?: boolean | null;
+  /** Does the STEP'S OWN agent block hand it to an agent — a block,
+   *  and no `human_only` requiring a person (boss-jobs
+   *  `agent_spec::agent_takes`, backlog 1dd6d7ad)? The one fact on the
+   *  row read off the step rather than its kind. Optional so a server
+   *  that predates it still parses; absent reads as a person's. */
+  agent_takes?: boolean | null;
 }>;
 
 export type AssignmentRow = Readonly<{
@@ -124,7 +130,16 @@ export type MyDayQueues = Readonly<{
 /// front of somebody rather than filing it under "an agent will get
 /// to it", and being wrong in that direction costs a glance instead
 /// of a stalled packet.
+///
+/// THE STEP CAN SAY MORE THAN ITS KIND (backlog 1dd6d7ad). A kind's
+/// contract is one answer for every step of it, so a `checklist` —
+/// human by kind — that carries its own agent block read to David as
+/// his ("I thought you were ready for me because it was in my
+/// backlog"). The server reads the step's declaration into
+/// `agent_takes`; `true` files it with the automation, where a step
+/// nothing picked up is still seen.
 export function needsAPerson(row: AssignmentRow): boolean {
+  if (row.step.agent_takes === true) return false;
   const c = row.step.completion;
   return c === undefined || c === null || c === 'human';
 }

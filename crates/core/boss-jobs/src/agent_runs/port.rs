@@ -100,6 +100,11 @@ pub trait AgentRunLog: Send + Sync {
     /// Matching runs, newest finish first.
     async fn list_runs(&self, filter: &RunFilter) -> Result<Vec<AgentRun>, AgentRunError>;
 
+    /// How many runs match `filter`, its `limit` aside — the listing's
+    /// `total`, so a reader can tell a page from the whole answer
+    /// (backlog 11a0998a). A limit is not a filter.
+    async fn count_runs(&self, filter: &RunFilter) -> Result<u64, AgentRunError>;
+
     /// The rate card, model-ordered. Read-only on purpose — see
     /// `super::mod`'s doc comment for why a price is a tree change.
     async fn rate_card(&self) -> Result<Vec<RateCardRow>, AgentRunError>;

@@ -88,7 +88,7 @@ mod boarding;
 mod cars;
 mod conductor;
 mod consist;
-mod dock_regate;
+pub(crate) mod dock_regate;
 mod entry;
 mod forge;
 mod jobs_api;
@@ -575,6 +575,17 @@ mod test_support {
         git_ok(&clone, &["config", "user.email", "t@example.com"]);
         git_ok(&clone, &["config", "user.name", "t"]);
         std::fs::write(clone.join("README"), name).expect("write");
+        // The ops verb registry the conductor's re-judge reads on every
+        // parked car (backlog b7b02024): a main with no verb at all reads
+        // as the registry moved, which holds every car, so the fixture
+        // carries one read-only verb that names no script.
+        let verbs = clone.join(crate::mutating_verb::VERBS_DIR);
+        std::fs::create_dir_all(&verbs).expect("mkdir verbs");
+        std::fs::write(
+            verbs.join("df.json"),
+            r#"{"about":"READ-ONLY — df","hosts":["forge"],"argv":["df","-h"]}"#,
+        )
+        .expect("write verb");
         git_ok(&clone, &["add", "-A"]);
         git_ok(&clone, &["commit", "-qm", "base"]);
         git_ok(

@@ -28,6 +28,26 @@ async function mountFeedback(page: Page): Promise<void> {
 
 const MANIFEST = { display_name: 'Algedonic Ales', modules: {}, labels: {} };
 
+/// Every write the board sends a step, in order. The keys go through the
+/// step merge door (PATCH …/steps/{id}/metadata) and the status alone
+/// through the PUT (backlog e39a9d2a, Stage 2) — so a route is two
+/// writes, and a finding or a hand-off, which decide nothing, is one.
+type StepWrite = { method: string; url: string; body: Record<string, unknown> };
+async function captureStepWrites(page: Page): Promise<StepWrite[]> {
+  const writes: StepWrite[] = [];
+  await page.route(/\/api\/jobs\/[^/]+\/steps\/[^/]+(\/metadata)?$/, async (route) => {
+    const method = route.request().method();
+    if (method !== 'PUT' && method !== 'PATCH') return route.fallback();
+    writes.push({
+      method,
+      url: route.request().url(),
+      body: route.request().postDataJSON() as Record<string, unknown>,
+    });
+    return route.fulfill({ json: {} });
+  });
+  return writes;
+}
+
 const DISPOSITIONS = 'reproduce|design|build|duplicate|needs-info|decline';
 
 /// Mirrors `user_feedback_spec()`. The board reads the fork out of
@@ -192,45 +212,38 @@ test.describe('feedback triage board', () => {
   });
 
   test('routing an item completes the fork step with that disposition', async ({ page }) => {
-    let body: Record<string, unknown> | null = null;
-    await page.route(/\/api\/jobs\/[^/]+\/steps\/[^/]+$/, async (route) => {
-      if (route.request().method() !== 'PUT') return route.fallback();
-      body = route.request().postDataJSON() as Record<string, unknown>;
-      return route.fulfill({ json: {} });
-    });
+    const writes = await captureStepWrites(page);
 
     await mountFeedback(page);
     const card = page.locator('article', { hasText: 'Column picker forgets my choice' });
     await card.getByLabel('Route this item').selectOption('build');
     await card.getByRole('button', { name: /^route$/i }).click();
 
-    await expect.poll(() => body !== null).toBe(true);
-    const sent = body as unknown as { status: string; metadata: Record<string, unknown> };
-    // Routing IS triaging: one write that both records the decision
-    // and completes the step, so the next step opens.
-    expect(sent.status).toBe('completed');
-    expect(sent.metadata['disposition']).toBe('build');
-    // The merge that keeps the step findable must survive.
-    expect(sent.metadata['authority_role']).toBe('platform-admin');
+    await expect.poll(() => writes.length).toBe(2);
+    // Routing IS triaging: the decision recorded, then the step
+    // completed, so the next step opens — the decision FIRST, because
+    // the completion is judged on it.
+    expect(writes.map((w) => w.method)).toEqual(['PATCH', 'PUT']);
+    expect(writes[0]?.url).toMatch(/\/steps\/fb-waiting-a\/metadata$/);
+    // The disposition alone: authority_role, which keeps the step
+    // findable, stays on the row because the merge door touches only
+    // what it is sent — it is never re-sent from the board's copy.
+    expect(writes[0]?.body).toEqual({ disposition: 'build' });
+    expect(writes[1]?.body).toEqual({ status: 'completed' });
   });
 
   test('dragging onto a route does exactly what picking it does', async ({ page }) => {
-    let body: Record<string, unknown> | null = null;
-    await page.route(/\/api\/jobs\/[^/]+\/steps\/[^/]+$/, async (route) => {
-      if (route.request().method() !== 'PUT') return route.fallback();
-      body = route.request().postDataJSON() as Record<string, unknown>;
-      return route.fulfill({ json: {} });
-    });
+    const writes = await captureStepWrites(page);
 
     await mountFeedback(page);
     await page
       .locator('article', { hasText: 'Column picker forgets my choice' })
       .dragTo(page.locator('section[aria-label="Reproduce and investigate"]'));
 
-    await expect.poll(() => body !== null).toBe(true);
-    const sent = body as unknown as { status: string; metadata: Record<string, unknown> };
-    expect(sent.status).toBe('completed');
-    expect(sent.metadata['disposition']).toBe('reproduce');
+    await expect.poll(() => writes.length).toBe(2);
+    expect(writes.map((w) => w.method)).toEqual(['PATCH', 'PUT']);
+    expect(writes[0]?.body).toEqual({ disposition: 'reproduce' });
+    expect(writes[1]?.body).toEqual({ status: 'completed' });
   });
 
   test('lifting a card offers every route as a drop target', async ({ page }) => {
@@ -299,14 +312,7 @@ test.describe('feedback triage board', () => {
       r.fulfill({ json: { data: [legacy], total: 1 } }),
     );
 
-    let body: Record<string, unknown> | null = null;
-    let url = '';
-    await page.route(/\/api\/jobs\/[^/]+\/steps\/[^/]+$/, async (route) => {
-      if (route.request().method() !== 'PUT') return route.fallback();
-      url = route.request().url();
-      body = route.request().postDataJSON() as Record<string, unknown>;
-      return route.fulfill({ json: {} });
-    });
+    const writes = await captureStepWrites(page);
 
     await mountFeedback(page);
 
@@ -317,13 +323,12 @@ test.describe('feedback triage board', () => {
     await card.getByLabel('Route this item').selectOption('decline');
     await card.getByRole('button', { name: /^route$/i }).click();
 
-    await expect.poll(() => body !== null).toBe(true);
+    await expect.poll(() => writes.length).toBe(2);
     // It targets the gated step it does have, and still records the
     // decision rather than closing anonymously.
-    expect(url).toContain('fb-legacy-a');
-    const sent = body as unknown as { status: string; metadata: Record<string, unknown> };
-    expect(sent.status).toBe('completed');
-    expect(sent.metadata['disposition']).toBe('decline');
+    expect(writes.every((w) => w.url.includes('fb-legacy-a'))).toBe(true);
+    expect(writes[0]?.body).toEqual({ disposition: 'decline' });
+    expect(writes[1]?.body).toEqual({ status: 'completed' });
   });
 
   // A card whose cause is known must not look like an untouched one.
@@ -354,12 +359,7 @@ test.describe('feedback triage board', () => {
   test('recording a finding writes it with provenance, and decides nothing', async ({
     page,
   }) => {
-    let body: Record<string, unknown> | null = null;
-    await page.route(/\/api\/jobs\/[^/]+\/steps\/[^/]+$/, async (route) => {
-      if (route.request().method() !== 'PUT') return route.fallback();
-      body = route.request().postDataJSON() as Record<string, unknown>;
-      return route.fulfill({ json: {} });
-    });
+    const writes = await captureStepWrites(page);
 
     await mountFeedback(page);
     const card = page.locator('article', { hasText: 'Column picker forgets my choice' });
@@ -367,16 +367,17 @@ test.describe('feedback triage board', () => {
     await card.getByLabel(/what did you find/i).fill('Root cause: the picker never persists.');
     await card.getByRole('button', { name: /save finding/i }).click();
 
-    await expect.poll(() => body !== null).toBe(true);
-    const sent = body as unknown as { metadata: Record<string, unknown> };
-    expect(sent.metadata['finding']).toContain('never persists');
-    expect(sent.metadata['finding_by']).toBeTruthy();
+    await expect.poll(() => writes.length).toBe(1);
     // Finding something is not deciding what to do about it — the item
-    // stays in triage until somebody routes it.
-    expect(body).not.toHaveProperty('status');
-    expect(sent.metadata['disposition']).toBeUndefined();
-    // The gate that keeps the step findable must survive.
-    expect(sent.metadata['authority_role']).toBe('platform-admin');
+    // stays in triage until somebody routes it: one merge, no status PUT.
+    expect(writes[0]?.method).toBe('PATCH');
+    const sent = writes[0]?.body ?? {};
+    expect(sent['finding']).toContain('never persists');
+    expect(sent['finding_by']).toBeTruthy();
+    expect(sent['disposition']).toBeUndefined();
+    // The gate that keeps the step findable is left on the row, not
+    // re-sent: the merge door touches only the keys it is sent.
+    expect(sent['authority_role']).toBeUndefined();
   });
 
   // The finding is evidence for the routing decision, so it has to
@@ -405,23 +406,18 @@ test.describe('feedback triage board', () => {
   });
 
   test('handing to an agent records a durable request without deciding', async ({ page }) => {
-    let body: Record<string, unknown> | null = null;
-    await page.route(/\/api\/jobs\/[^/]+\/steps\/[^/]+$/, async (route) => {
-      if (route.request().method() !== 'PUT') return route.fallback();
-      body = route.request().postDataJSON() as Record<string, unknown>;
-      return route.fulfill({ json: {} });
-    });
+    const writes = await captureStepWrites(page);
 
     await mountFeedback(page);
     const card = page.locator('article', { hasText: 'Column picker forgets my choice' });
     await card.getByRole('button', { name: /hand to agent/i }).click();
 
-    await expect.poll(() => body !== null).toBe(true);
-    const sent = body as unknown as { metadata: Record<string, unknown> };
-    expect(sent.metadata['agent_requested_at']).toBeTruthy();
-    // An agent looking is not a decision — no status, no disposition.
-    expect(body).not.toHaveProperty('status');
-    expect(sent.metadata['disposition']).toBeUndefined();
+    await expect.poll(() => writes.length).toBe(1);
+    // An agent looking is not a decision — one merge, no status PUT, no
+    // disposition.
+    expect(writes[0]?.method).toBe('PATCH');
+    expect(writes[0]?.body['agent_requested_at']).toBeTruthy();
+    expect(writes[0]?.body['disposition']).toBeUndefined();
   });
 
   // Backlog 1e73bd93. The board read the WHOLE roster to name the few

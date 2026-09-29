@@ -124,17 +124,20 @@ fn actor_header() -> String {
 /// The router's HTTP client: its identity rides as a DEFAULT header, so
 /// no call it makes can go out unsigned (the assignment dispatcher's
 /// shape, `boss_dispatcher::Dispatcher::new`).
-fn client(timeout: Duration) -> Result<reqwest::Client, String> {
+/// The machine token is stamped per request by the machine client, from
+/// the process's watched source, so a rotation reaches a router built at
+/// boot (design 6805c764 car 2, review S1).
+fn client(timeout: Duration) -> Result<boss_core::machine_token::Client, String> {
     let mut headers = reqwest::header::HeaderMap::new();
     let value = reqwest::header::HeaderValue::from_str(&actor_header())
         .map_err(|e| format!("x-boss-user header value: {e}"))?;
     headers.insert("x-boss-user", value);
-    boss_core::machine_token::attach(&mut headers);
-    reqwest::Client::builder()
-        .timeout(timeout)
-        .default_headers(headers)
-        .build()
-        .map_err(|e| e.to_string())
+    boss_core::machine_token::Client::build(
+        reqwest::Client::builder()
+            .timeout(timeout)
+            .default_headers(headers),
+    )
+    .map_err(|e| e.to_string())
 }
 
 pub fn spawn_router(
@@ -235,7 +238,7 @@ pub fn spawn_router(
 }
 
 async fn handle_event(
-    client: &reqwest::Client,
+    client: &boss_core::machine_token::Client,
     config: &EscalationConfig,
     event: &Event,
 ) -> Result<(), String> {
@@ -351,7 +354,7 @@ fn priority_label(p: Priority) -> &'static str {
 }
 
 async fn fetch_account(
-    client: &reqwest::Client,
+    client: &boss_core::machine_token::Client,
     accounts_url: &str,
     account_id: &str,
 ) -> Result<AccountSummary, String> {
@@ -370,7 +373,7 @@ async fn fetch_account(
 }
 
 async fn fetch_employees(
-    client: &reqwest::Client,
+    client: &boss_core::machine_token::Client,
     people_url: &str,
 ) -> Result<Vec<Employee>, String> {
     let url = format!("{people_url}/api/people");
@@ -413,7 +416,7 @@ fn signal_payload(
 }
 
 async fn send_signal(
-    client: &reqwest::Client,
+    client: &boss_core::machine_token::Client,
     messages_url: &str,
     recipient_id: &str,
     subject: &str,

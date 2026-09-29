@@ -9,7 +9,8 @@
   // GET /api/jobs/live is only the in-flight counts. A failed counts
   // read keeps the catalog and says so on its own line — it used to be
   // dropped in silence, which painted zero in flight on every kind
-  // (page audit 9da74410, backlog 398913af).
+  // (page audit 9da74410, backlog 398913af). A third, GET /api/jobs/kinds,
+  // is each kind's packet history and is judged apart too (112c0535).
 
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
@@ -18,6 +19,23 @@
   import { formatDate } from '@boss/web-kit/ui/date';
   import type { WorkflowSpec } from '../../workflows/workflowTypes';
   import { href } from '../../router';
+  import KindLedgerLine from './KindLedgerLine.svelte';
+  import { historyOf, loadKindLedger, type KindLedger } from './kindLedger';
+  import type { Remote } from '../../data/remote';
+
+  // Each kind's packet history — version lag, packets ever, newest
+  // terminal — is its own read, judged apart from the catalog and the
+  // in-flight counts (backlogs 112c0535, 5eacf6db).
+  let ledger = $state<Remote<KindLedger>>({ kind: 'loading' });
+  $effect(() => {
+    let cancelled = false;
+    void loadKindLedger().then((r) => {
+      if (!cancelled) ledger = r;
+    });
+    return () => {
+      cancelled = true;
+    };
+  });
 
   let kinds = $state<ReadonlyArray<WorkflowSpec>>([]);
   let liveCounts = $state<Readonly<Record<string, number>>>({});
@@ -128,6 +146,12 @@
          missing chips are said to be missing rather than zero (398913af). -->
     <p class="empty load-failed" role="alert" style="margin:0 24px 12px">{liveError}</p>
   {/if}
+  {#if ledger.kind === 'failed'}
+    <!-- Unknown, so no kind is drawn as never run (112c0535, 5eacf6db). -->
+    <p class="empty load-failed" role="alert" style="margin:0 24px 12px">
+      Packet history unavailable — {ledger.error}. Version lag and never-run kinds are not shown.
+    </p>
+  {/if}
 
   <div class="wf-toolbar">
     <input
@@ -178,6 +202,7 @@
                     · <Link to={href(`/ux/jobs/${encodeURIComponent(k.authoring_job_id)}`)}>authoring packet</Link>
                   {/if}
                 </div>
+                <KindLedgerLine history={ledger.kind === 'ready' ? historyOf(ledger.data, k.kind, k.version) : null} />
                 {#if describe(k)}
                   <p class="kb-workflow-desc">{describe(k)}</p>
                 {/if}

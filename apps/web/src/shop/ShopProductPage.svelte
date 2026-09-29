@@ -1,5 +1,6 @@
 <script lang="ts">
   import { surfaceOf } from '../steps/surfaceRegistry.svelte';
+  import { saveStep } from '../steps/stepWrite';
   // Brewery beer detail page — direct-to-consumer purchase flow.
   //
   // Reads catalog metadata from brewery-products.ts (static), live
@@ -175,11 +176,7 @@
         try {
           const stepsResp = await fetch(`/api/jobs/${submittedJobId}/steps`);
           if (stepsResp.ok) {
-            const steps = (await stepsResp.json()) as Array<{
-              id: string;
-              kind: string;
-              metadata?: Record<string, unknown>;
-            }>;
+            const steps = (await stepsResp.json()) as Array<{ id: string; kind: string }>;
             const shipmentStep = steps.find((s) => surfaceOf(s.kind) === 'shipment');
             const billingStep = steps.find((s) => surfaceOf(s.kind) === 'billing');
             const lineItems = body.metadata.line_items;
@@ -188,30 +185,17 @@
               qty: li.qty,
               location_id: 'loc-brewery-brewhouse',
             }));
+            // Only these keys, through the step merge door (backlog
+            // e39a9d2a, Stage 2): the PUT of a spread of the step's
+            // metadata re-wrote whatever this page had read of it.
             if (shipmentStep) {
-              await fetch(`/api/jobs/${submittedJobId}/steps/${shipmentStep.id}`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  metadata: {
-                    ...(shipmentStep.metadata ?? {}),
-                    line_items: lineItems,
-                    consumes_products: consumesProducts,
-                  },
-                }),
+              await saveStep(submittedJobId, shipmentStep.id, {
+                metadata: { line_items: lineItems, consumes_products: consumesProducts },
               });
             }
             if (billingStep) {
-              await fetch(`/api/jobs/${submittedJobId}/steps/${billingStep.id}`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  metadata: {
-                    ...(billingStep.metadata ?? {}),
-                    line_items: lineItems,
-                    amount_cents: totalCents,
-                  },
-                }),
+              await saveStep(submittedJobId, billingStep.id, {
+                metadata: { line_items: lineItems, amount_cents: totalCents },
               });
             }
           }

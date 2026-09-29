@@ -16,5 +16,6 @@
       ]
     }
   ],
-  "timeout": 300
+  "timeout": 300,
+  "effect": "^retire-cloudflared: (OK — stopped[+]disabled[+]removed [0-9]+ unit[(]s[)]|DRY RUN — would stop[+]disable[+]remove )"
 }

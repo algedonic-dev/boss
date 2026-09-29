@@ -635,6 +635,8 @@ JSON
 run_converge() { # <dir> <installer> -> output; returns the script's status
     BOSS_GCP_REPO_DIR="$1" BOSS_GCP_CONVERGE_INSTALLER="$2" \
         BOSS_GCP_CONVERGE_SOR_ENV="$tmp/sor.env.converge" \
+        BOSS_JOURNALD_CONF_DIR="$tmp/journald.conf.d" BOSS_JOURNALD_SYSTEMCTL="$tmp/bin/systemctl" \
+        STUB_LOG="$tmp/journald-systemctl.log" \
         BOSS_GCP_CONVERGE_CLI_INSTALLER="$tmp/bin/cli-installer-ok" \
         BOSS_NODE_ID="${CONVERGE_NODE_ID:-boss-gcp}" \
         BOSS_ESTATE_NODES_URL="${CONVERGE_NODES_URL:-file://$nodes_json}" \
@@ -698,6 +700,14 @@ $out"
 grep -q "14 timer unit pair" <<<"$out" \
     || fail "the installer's own summary is not in the converge's output — print what it did:
 $out"
+# The journal bound (backlog d3c7eada): journald's default ceiling held
+# 3.9G of this host's 48 GB root and kept it under its estate floor, so
+# the converge puts the tree's drop-in down on every tick.
+cmp -s "$repo/infra/gcp/journald-cap.conf" "$tmp/journald.conf.d/boss-gcp-journal-cap.conf" \
+    || fail "the converge did not install infra/gcp/journald-cap.conf as the journald drop-in:
+$out"
+grep -q "restart systemd-journald" "$tmp/journald-systemctl.log" \
+    || fail "the converge installed the journal cap but did not restart journald to apply it"
 
 # Idempotent: a second pass moves nothing, still installs, still says so.
 : >"$tmp/calls.log"
@@ -790,6 +800,8 @@ sum_conv="$tmp/summary-converge.json"
 run_converge_sum() { # <dir> <installer>
     BOSS_GCP_REPO_DIR="$1" BOSS_GCP_CONVERGE_INSTALLER="$2" \
         BOSS_GCP_CONVERGE_SOR_ENV="$tmp/sor.env.converge" \
+        BOSS_JOURNALD_CONF_DIR="$tmp/journald.conf.d" BOSS_JOURNALD_SYSTEMCTL="$tmp/bin/systemctl" \
+        STUB_LOG="$tmp/journald-systemctl.log" \
         BOSS_GCP_CONVERGE_CLI_INSTALLER="$tmp/bin/cli-installer-ok" \
         BOSS_RUN_SUMMARY_FILE="$sum_conv" \
         BOSS_NODE_ID=boss-gcp BOSS_ESTATE_NODES_URL="file://$nodes_json" \

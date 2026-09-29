@@ -1,0 +1,135 @@
+# reprint-recovery-sheet — ONE print job for the paper way back in
+# (design 125d405d §6-7, car 3; backlog fd6d6c08, David 2026-09-28: "we
+# are going to maintain the fidelity of those instructions or generate
+# a new print job. The print job can simply be a PDF download to print").
+#
+# THE PRINTED VERSION IS THIS PACKET'S SIGNATURE, AND NOTHING ELSE. What
+# is on paper is the `fact_hash` on the `print` step of the newest
+# packet of this kind whose `print` step completed `approved` with a
+# live presence stamp. There is no other record of it: not a file, not
+# a setting, not a memory of having printed it. A sheet nobody signed
+# for is a sheet the record does not know exists.
+#
+# WHO FILES IT. The daily chore (infra/cluster/manifests/
+# boss-recovery-sheet.yaml, `boss recovery reprint`) renders the sheet
+# from origin/main and compares the tree's fact hash with the signed
+# one. Different, and no packet of this kind open: it files one, with
+# the PDF attached to the `print` step through file_refs. Different,
+# and one already open and unsigned: it REFRESHES that one in place —
+# the new PDF attached, the signed keys of `print` rewritten, the
+# replaced render appended to `superseded_renders` on the packet — so
+# the queue holds one print job, never a pile (decision 7 of the
+# design). An edit to `print`'s keys voids any stamp already on it,
+# which is the point: a signature covers exactly one render. The first
+# run on a record with no signed packet files the first print job by
+# itself; bootstrap is the normal path.
+#
+# DAVID'S ACT, AND WHAT HE TYPES: nothing. Open the packet, download
+# the PDF on the `print` step (its file name carries the version),
+# print it, put it where the paper is kept, destroy the copy it
+# replaces, then Approve with your passkey. The machine filled every
+# key the passkey signs — the version, the PDF's sha256 and file id,
+# the tree it was rendered from, and the statement "printed version X,
+# destroyed version Y" — and step_shape_hash covers every one, so the
+# signature is on the rendered bytes, never on a transcription (the
+# rule the decision record states for this design). Reject when the
+# copy could not be printed or the old one could not be found; that is
+# worth knowing, and the next daily run files the print job again.
+#
+# THE KEYS ARE A CONTRACT with crates/orchestrators/boss-cli/src/
+# recovery/reprint.rs (REPRINT_KIND, PRINT_STEP and the key names it
+# reads and writes), pinned by crates/core/boss-jobs/tests/
+# platform_bundle_reprint_recovery_sheet.rs.
+
+[[workflow]]
+kind = "reprint-recovery-sheet"
+label = "Reprint the recovery sheet"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "Print the recovery sheet again, because the tree now says something the signed paper copy does not (design 125d405d). Filed and kept current by the daily recovery-sheet check: the PDF rendered from origin/main is attached to the `print` step with the fact-level diff on the packet. The platform owner prints it, destroys the copy it replaces and approves `print` with a passkey over the machine-filled statement; the version on that step is then the printed version. `declined` records a print that did not happen."
+metadata = { owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "render"
+kind = "trigger"
+ready_when = "true"
+title_template = "Recovery sheet rendered from the tree"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "recovery-sheet-daily-check" }
+
+[[workflow.step]]
+title = "print"
+kind = "sign-off"
+ready_when = "steps.render.done"
+assurance_required = "presence"
+sign_offs_required = ["platform-admin"]
+title_template = "Print the recovery sheet and sign for the copy it replaces"
+authority_role = "platform-admin"
+metadata_defaults = { fact_hash = "{metadata.fact_hash}", version = "{metadata.version}", pdf_sha256 = "{metadata.pdf_sha256}", origin_sha = "{metadata.origin_sha}", rendered_at = "{metadata.rendered_at}", replaces_version = "{metadata.replaces_version}", statement = "{metadata.statement}", procedure = "YOUR PASSKEY SIGNS THIS STEP'S CONTENT, and you type nothing: every key was filled by the daily check. Download the PDF attached to this step - its file name carries the version, and `pdf_file_ref` and `pdf_sha256` name the one to print. Print it, put it where the paper copy is kept, and destroy the copy it replaces. Then Approve: the `statement` is what you are signing. Reject if the copy was not printed or the old one could not be found; the next daily check files the print job again. The packet's `diff` says what changed since the version on paper." }
+
+[[workflow.step.fields]]
+name = "fact_hash"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "version"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "pdf_sha256"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "origin_sha"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "rendered_at"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "replaces_version"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "statement"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "decision"
+field_type = "approved|rejected"
+required = true
+
+[[workflow.step]]
+title = "printed"
+kind = "outcome"
+ready_when = "steps.print.done AND steps.print.metadata.decision = \"approved\""
+title_template = "Printed — this version is the paper copy"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "printed" }
+
+# Led by `steps.print.done`, so it is false on a fresh packet and the
+# dispatcher's complete-on-ready rule cannot close one at open; `NOT
+# (… = "approved")` so an absent decision reads as not approved (the
+# break-glass-enrolment shape).
+[[workflow.step]]
+title = "declined"
+kind = "outcome"
+ready_when = "steps.print.done AND NOT (steps.print.metadata.decision = \"approved\")"
+title_template = "Not printed — the next daily check files it again"
+metadata_defaults = { outcome_kind = "aborted" }
+terminal = { outcome = "declined" }

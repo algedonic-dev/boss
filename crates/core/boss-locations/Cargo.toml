@@ -19,6 +19,9 @@ postgres = ["dep:sqlx", "boss-events/postgres"]
 [dependencies]
 boss-core = { path = "../boss-core" }
 boss-policy-client = { path = "../boss-policy-client" }
+# The batch door's policy URL fallback, as every policy-asking service
+# reads it (backlog 59deda40).
+boss-ports = { path = "../boss-ports" }
 boss-events = { path = "../boss-events" }
 async-trait = { workspace = true }
 chrono = { workspace = true }

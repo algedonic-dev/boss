@@ -56,8 +56,26 @@ export function readEnvelope(path: string, raw: unknown): Envelope {
       return { body, data: body.data as ReadonlyArray<Readonly<Record<string, unknown>>> };
     }
   }
-  const what = raw !== null && typeof raw === 'object' && !Array.isArray(raw)
+  throw new Error(`${path}: HTTP 200, but the body is ${describedObject(raw)}, not a {data: [...]} envelope`);
+}
+
+function describedObject(raw: unknown): string {
+  return raw !== null && typeof raw === 'object' && !Array.isArray(raw)
     ? 'an object with no data list'
     : described(raw);
-  throw new Error(`${path}: HTTP 200, but the body is ${what}, not a {data: [...]} envelope`);
+}
+
+/// A read of `path` whose body may be EITHER list shape — a bare list or
+/// the envelope — as the catalog, inventory and vendor reads have
+/// answered both. Each page coerced any other body to no rows
+/// (`Array.isArray(b) ? b : (b.data ?? [])`), which its empty state then
+/// called an empty source (backlog 0ef5e008).
+export function readRows(path: string, raw: unknown): ReadonlyArray<unknown> {
+  if (Array.isArray(raw)) return raw;
+  if (raw !== null && typeof raw === 'object' && Array.isArray((raw as { data?: unknown }).data)) {
+    return (raw as { data: ReadonlyArray<unknown> }).data;
+  }
+  throw new Error(
+    `${path}: HTTP 200, but the body is ${describedObject(raw)}, not a list or a {data: [...]} envelope`,
+  );
 }

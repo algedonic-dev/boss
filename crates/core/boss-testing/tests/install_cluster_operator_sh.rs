@@ -89,7 +89,11 @@ fn absent_credentials_are_named_and_nothing_is_written() {
     // A path that must NOT exist: the per-name root, which nothing here
     // creates.
     let dir = boss_testing::scratch_path("boss-co-absent");
-    let (rc, out) = sh("install_cluster_operator", dir.to_str().expect("utf8"));
+    // The forge: it declares both root credentials (estate.toml).
+    let (rc, out) = sh(
+        "install_cluster_operator forge",
+        dir.to_str().expect("utf8"),
+    );
     assert_eq!(
         rc, 0,
         "a missing credential reports; it does not fail the converge"
@@ -114,7 +118,10 @@ fn a_credential_with_the_wrong_ownership_is_reported_with_what_it_actually_is() 
     for cred in ["talosconfig", "kubeconfig"] {
         std::fs::write(dir.join(cred), "placeholder").expect("write");
     }
-    let (rc, out) = sh("install_cluster_operator", dir.to_str().expect("utf8"));
+    let (rc, out) = sh(
+        "install_cluster_operator forge",
+        dir.to_str().expect("utf8"),
+    );
     std::fs::remove_dir_all(&dir).ok();
     assert_eq!(rc, 0);
     assert!(

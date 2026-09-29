@@ -1,7 +1,10 @@
 <script lang="ts">
   // The Surfaces section of /it/codebase (backlog 628f182b): the last
   // seven days of surface opens, per actor — opens per route sorted,
-  // distinct routes — and the catalogued surfaces nobody opened.
+  // distinct routes — and the catalogued surfaces nobody opened, with
+  // that list's scope stated (the nav catalog, not every route the
+  // router serves) and the opened routes outside it listed on their own
+  // (13ded76c part a, page audit f82b05a9).
   //
   // David, 2026-09-16: "let's measure which surfaces I open for a
   // week." The measurement's mechanism is documented once, at the top
@@ -12,7 +15,7 @@
   // itself. No chart: counts per route per actor are the whole product.
   import { onMount } from 'svelte';
   import type { Remote } from '../../data/remote';
-  import { catalogPaths, loadSurfaceRollup, neverOpened, perActor, type Rollup } from './surfaces';
+  import { catalogPaths, loadSurfaceRollup, neverOpened, perActor, uncatalogued, type Rollup } from './surfaces';
 
   /** The reading's window. Seven days: the week David asked for. */
   const DAYS = 7;
@@ -28,6 +31,9 @@
   const actors = $derived(ready ? perActor(ready.rows) : []);
   const roster = catalogPaths();
   const unopened = $derived(ready ? neverOpened(ready.rows, roster) : []);
+  /** Opened routes outside the roster (13ded76c part a): the candidate
+   *  list cannot see them, so they are listed on their own. */
+  const outside = $derived(ready ? uncatalogued(ready.rows, roster) : []);
   const opens = $derived(actors.reduce((s, a) => s + a.opens, 0));
   const when = (iso: string): string => (iso ? `${iso.slice(0, 10)} ${iso.slice(11, 16)}Z` : '—');
   const n = (v: number): string => v.toLocaleString('en-US');
@@ -95,11 +101,26 @@
   </div>
   <div class="ct-panel">
     <div class="h">Never opened in {DAYS} days · {unopened.length} of {roster.length} catalogued surfaces — the deletion candidates</div>
+    <p class="su-scope">
+      The roster is the nav catalog — its {roster.length} paths. A route the router serves that the catalog
+      does not list can never appear here, however unused; the ones opened in these {DAYS} days are listed
+      below. Comparing against every route the router serves is not measured here yet.
+    </p>
     {#if unopened.length === 0}
       <p class="ct-quiet">Every catalogued surface was opened at least once.</p>
     {:else}
       <ul class="su-list mono">
         {#each unopened as p (p)}<li>{p}</li>{/each}
+      </ul>
+    {/if}
+  </div>
+  <div class="ct-panel su-uncatalogued">
+    <div class="h">Opened but not in the catalog · {outside.length} — outside the roster above, so never a candidate</div>
+    {#if outside.length === 0}
+      <p class="ct-quiet">Every route opened in these {DAYS} days is catalogued.</p>
+    {:else}
+      <ul class="su-list mono">
+        {#each outside as p (p)}<li>{p}</li>{/each}
       </ul>
     {/if}
   </div>
@@ -151,5 +172,7 @@
   .ct-table td { padding: 4px 8px; border-bottom: 1px solid var(--hairline); vertical-align: top; white-space: nowrap; }
   .ct-table .num { text-align: right; }
   .su-list { margin: 0; padding-left: 16px; font-size: 12px; columns: 3; column-gap: 24px; }
+  .su-scope { color: var(--static); font-size: 12px; max-width: 90ch; margin: 0 0 8px; }
+  .su-uncatalogued { margin-top: 10px; }
   .ct-footnote { color: var(--text-faint); font-size: 12px; max-width: 90ch; margin-top: 20px; }
 </style>

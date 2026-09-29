@@ -223,9 +223,11 @@ How it lands.
   7edf0e97). `classes`: each differing row is PUT through
   `PUT /api/classes/{kind}/{code}`. `policy`: each rule whose `scope`
   or `active` differs is re-POSTed. `workflows`: each kind whose file
-  differs on a facet the drift lint compares (label, description,
-  category, step count, titles, required fields, title templates) is
-  published as a new version that supersedes the live one.
+  differs on a facet the drift lint compares (`label`, `description`,
+  `category` and every other workflow key; the step count and titles;
+  per step its `required` and `optional` fields, `title_template`,
+  `agent` block and every other key) is published as a new version
+  that supersedes the live one.
 - **The launcher publishes once per database.** A successful publish
   records itself in `tenant_publishes`, with a `tenant.published` event
   in the same write, through the jobs API on every route (backlog
@@ -354,9 +356,12 @@ pub const CONTRACT: &[Entry] = &[
                 segment, never one of crates/core/boss-jobs/src/department/reserved-root-\
                 segments.txt), display_name, function (a Class code under (department, \
                 function)), sort_order? (0), retired? (false) — validated by \
-                `boss_jobs::department::declare::load_departments_toml`",
+                `boss_jobs::department::declare::load_departments_toml`. The ONE list of \
+                departments: an employee's and an agent's `department` must name one of \
+                these rows (or the platform's `it`), and no `(employee, department)` Class \
+                is read any longer (backlog c87e3d6d)",
         parse: parse_departments,
-        scaffold: None,
+        scaffold: Some(scaffold_departments),
     },
     Entry {
         paths: &["seeds/chart_of_accounts.toml"],
@@ -407,7 +412,9 @@ pub const CONTRACT: &[Entry] = &[
         shape: "JSON array of Employee rows: id, name, email, role, department, hire_date, \
                 location, manager_id, employment_type, status, skills[], certifications[], \
                 annual_salary_cents; role/department/location are validated against the \
-                registries at write time, not here",
+                registries at write time, not here — role against the (employee, role) \
+                Classes, department against the departments registry (seeds/departments.toml; \
+                backlog c87e3d6d), location against the locations registry",
         parse: parse_employees,
         scaffold: Some(scaffold_employees),
     },
@@ -484,9 +491,9 @@ pub const CONTRACT: &[Entry] = &[
                   names each change from → to (design e187198f); the jobs API's login door \
                   resolves each alias to the id (design 6fda05ae; backlog f56155f0)",
         shape: "`[[agent]]` rows: id (`agent-<slug>`), display_name, default_model (a rate-card \
-                model, e.g. `opus-5[1m]`), aliases? (the logins that sign as it), role? and \
-                department? (Class codes under (employee, role) / (employee, department), \
-                checked against the registry at the batch door like an employee's — a role \
+                model, e.g. `opus-5[1m]`), aliases? (the logins that sign as it), role? (a \
+                Class code under (employee, role)) and department? (a departments-registry \
+                code, backlog c87e3d6d), checked at the batch door like an employee's — a role \
                 audience resolves to every holder, agents included; backlog ab192a9f), \
                 hourly_budget_usd_micros?, max_concurrent_runs? — the `agents` table's columns \
                 and nothing else; validated by `boss_jobs::agents::load_agents_toml`",
@@ -1650,17 +1657,41 @@ scope = \"all\"\n",
 }
 
 /// JSON has no comments; the README and the contract doc say what this
-/// file is — the tenant's Class registry rows (departments, roles,
-/// account types), POSTed to /api/classes/batch by the tenant prepare.
+/// file is — the tenant's Class registry rows (roles, account types),
+/// POSTed to /api/classes/batch by the tenant prepare. No department:
+/// a department is a row of seeds/departments.toml since backlog
+/// c87e3d6d, and a department Class would be the second list that
+/// retired.
 fn scaffold_classes(_: &Scaffold) -> String {
     concat!(
         "[\n",
-        "  {\"subject_kind\": \"employee\", \"code\": \"operations\", \"display_name\": \"Operations\", \"member_attribute\": \"department\", \"sort_order\": 10},\n",
         "  {\"subject_kind\": \"employee\", \"code\": \"owner\", \"display_name\": \"Owner\", \"member_attribute\": \"role\", \"sort_order\": 1},\n",
         "  {\"subject_kind\": \"account\", \"code\": \"customer\", \"display_name\": \"Customer\", \"member_attribute\": \"account_type\", \"sort_order\": 10}\n",
         "]\n"
     )
     .to_string()
+}
+
+fn scaffold_departments(s: &Scaffold) -> String {
+    format!(
+        "# {display} — the departments this company runs.\n\
+#\n\
+# One [[department]] per row of the departments registry — the org\n\
+# chart's tabs (/<code>), the retro roster, and the list an employee's\n\
+# or an agent's `department` must name (backlog c87e3d6d). Published\n\
+# by `boss tenant publish` (POST /api/departments/batch,\n\
+# insert-if-absent by code) BEFORE the roster. The platform's own `it`\n\
+# department is on every instance already; declare it too if you run\n\
+# one. `function` is a Class code under (department, function):\n\
+# operations | revenue | support | governance.\n\
+\n\
+[[department]]\n\
+code = \"executive\"\n\
+display_name = \"Executive\"\n\
+function = \"governance\"\n\
+sort_order = 10\n",
+        display = s.display_name,
+    )
 }
 
 fn scaffold_chart_of_accounts(s: &Scaffold) -> String {
@@ -1741,7 +1772,7 @@ fn scaffold_employees(s: &Scaffold) -> String {
     "name": "{display} owner",
     "email": "owner@{name}.example",
     "role": "owner",
-    "department": "operations",
+    "department": "executive",
     "skill_level": null,
     "hire_date": "2026-01-01",
     "location": null,
@@ -1892,9 +1923,10 @@ fn scaffold_agents(s: &Scaffold) -> String {
 # spells it (opus-5[1m], never claude-…); the caps are the budget the\n\
 # jobs API admits each run against, and are unset until measured.\n\
 # `role` and `department` place it in the org exactly as an\n\
-# employee's do — Class codes from seeds/classes.json under\n\
-# (employee, role) and (employee, department) — and a step whose\n\
-# audience is that role reaches the agent through them.\n\
+# employee's do — a role Class from seeds/classes.json under\n\
+# (employee, role), and a department from seeds/departments.toml —\n\
+# and a step whose audience is that role reaches the agent through\n\
+# them.\n\
 # Published to the agents registry by `boss tenant publish`: a row\n\
 # the platform already registered is updated on the declared fields\n\
 # that differ, and the publish names each change.\n\
@@ -2334,6 +2366,46 @@ mod tests {
             .filter(|row| row.status == Status::Unknown)
             .collect();
         assert!(unknown.is_empty(), "{unknown:#?}");
+    }
+
+    /// A scaffold carries no second department list (backlog c87e3d6d,
+    /// 2026-09-27): its classes declare no `(employee, department)`
+    /// Class — those retired onto the departments registry — and the
+    /// department its founder sits in is a row its own
+    /// seeds/departments.toml declares, because on a company's instance
+    /// the people door admits only a registry department, and a fresh
+    /// instance holds none of a new tenant's.
+    #[test]
+    fn a_fresh_init_declares_its_founders_department_and_no_department_class() {
+        let dir = scratch_dir("boss-cli-tenant-init-departments").join("acme");
+        init("acme", Some(&dir)).unwrap();
+        let classes: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("seeds/classes.json")).unwrap())
+                .unwrap();
+        let department_classes: Vec<&serde_json::Value> = classes
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["subject_kind"] == "employee" && c["member_attribute"] == "department")
+            .collect();
+        assert!(
+            department_classes.is_empty(),
+            "the scaffold declares a department Class: {department_classes:?}"
+        );
+        let employees: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("seeds/employees.json")).unwrap(),
+        )
+        .unwrap();
+        let sat_in = employees[0]["department"].as_str().unwrap().to_string();
+        let declared = boss_jobs::department::declare::load_departments_toml(
+            &dir.join("seeds/departments.toml"),
+        )
+        .unwrap();
+        assert!(
+            declared.iter().any(|d| d.code == sat_in),
+            "the founder sits in `{sat_in}`, which seeds/departments.toml does not declare: \
+             {declared:?}"
+        );
     }
 
     #[test]
@@ -3490,6 +3562,44 @@ terminal = { outcome = "sponsored" }
         assert!(
             INSTANCE_IS_THE_TRUTH.contains("--take")
                 && INSTANCE_IS_THE_TRUTH.contains("insert-if-absent by default")
+        );
+    }
+
+    /// The publish rule's `workflows` sentence names the facets a
+    /// differing kind is found on, and it is the third copy of that
+    /// list (backlog e5dc276d): until 2026-09-28 it said "label,
+    /// description, category, step count, titles, required fields,
+    /// title templates" while the drift lint had also compared the
+    /// agent block for nine days and every other key for one. The doc
+    /// follows this constant by the test above; this holds the
+    /// constant to `boss_jobs::bootstrap`'s lists, which
+    /// `boss-testing/tests/the_drift_facets_are_one_list.rs` holds to
+    /// the lint's.
+    #[test]
+    fn the_publish_rule_names_every_facet_a_workflow_is_compared_on() {
+        let text = INSTANCE_IS_THE_TRUTH
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let start = text
+            .find("differs on a facet the drift lint compares")
+            .expect("the publish rule says what a workflow is compared on");
+        let rest = &text[start..];
+        let sentence = &rest[..rest.find("is published").expect("…and what then happens")];
+        let missing: Vec<&str> = boss_jobs::bootstrap::COMPARED_FIELDS
+            .iter()
+            .chain(&boss_jobs::bootstrap::NAMED_STEP_FACETS)
+            .filter(|f| !sentence.contains(&format!("`{f}`")))
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "INSTANCE_IS_THE_TRUTH's workflows sentence does not name {missing:?}, which \
+             boss_jobs::bootstrap compares: {sentence}"
+        );
+        assert!(
+            sentence.contains("every other workflow key") && sentence.contains("every other key"),
+            "the sentence must say the unnamed keys are compared too: {sentence}"
         );
     }
 

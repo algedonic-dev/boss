@@ -35,4 +35,4 @@ pub use in_memory::{InMemoryDeliveryPolicy, StoredPolicy};
 pub use port::{DeliveryPolicyError, DeliveryPolicyRegistry, DeliveryPolicyRepository};
 #[cfg(feature = "postgres")]
 pub use postgres::PgDeliveryPolicy;
-pub use types::{DeliveryPolicyRow, DeliveryPolicySpec};
+pub use types::{DeliveryPolicyRow, DeliveryPolicySpec, check_policy};

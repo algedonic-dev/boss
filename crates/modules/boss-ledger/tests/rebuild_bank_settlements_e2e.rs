@@ -273,13 +273,17 @@ fn build_router(db: &TestDb) -> Router {
     })
 }
 
+/// Signed: a ledger write names its caller, and an unsigned one is
+/// refused 401 (backlog 34f0a954).
 async fn post(app: Router, path: &str, body: Value) -> (StatusCode, String) {
+    let signer = r#"{"id":"emp-controller","role":"controller","access_tier":"user","territory_account_ids":[],"direct_report_ids":[],"department":"finance"}"#;
     let resp = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri(path)
                 .header("content-type", "application/json")
+                .header("x-boss-user", signer)
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )

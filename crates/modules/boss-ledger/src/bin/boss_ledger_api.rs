@@ -107,6 +107,7 @@ async fn main() -> Result<()> {
         // the surface has no open configuration.
         policy: boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
             boss_policy_client::ReqwestPolicyClient::new(
+                "ledger",
                 std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
             ),
         )),

@@ -27,6 +27,141 @@ pub fn departs_a_train(verb: &str) -> bool {
     matches!(verb, "board" | "run")
 }
 
+/// The `boss train` verbs a rule may fire — the conductor's allowlist
+/// (`boss-cli`'s cadence loop spawns nothing else) and the literal half
+/// of the table's `cadence_rules_verb_check` (20260925200737), spelled
+/// once. The other half is [`OPEN_VERB_PREFIX`].
+pub const CONDUCTOR_VERBS: [&str; 5] = ["preflight", "reconcile", "board", "run", "refresh"];
+
+/// A rule may instead open a packet of a workflow kind: `open:<kind>`,
+/// the kind in kebab-case — the table's `verb ~ '^open:[a-z0-9-]+$'`.
+pub const OPEN_VERB_PREFIX: &str = "open:";
+
+/// Every basis, the columns it REQUIRES, and the columns it MAY carry
+/// beyond those — `cadence_rules_basis_check` and
+/// `cadence_rules_params_check` (202608282135) spelled once. A column in
+/// neither list must be absent for that basis; an INT column present
+/// must be above 0; and a calendar rule's `at_times` holds exactly one
+/// time-of-day (the cadence chooses the days, the time when on them).
+pub const BASIS_COLUMNS: [(&str, &[&str], &[&str]); 4] = [
+    ("wall", &["every_minutes"], &[]),
+    ("clock", &["at_times"], &[]),
+    ("queue-depth", &["min_dock_depth", "cooldown_minutes"], &[]),
+    (
+        "calendar",
+        &["cadence", "anchor_date", "at_times"],
+        &["business_calendar"],
+    ),
+];
+
+/// Would `cadence_rules` admit this row? The table's CHECKs on the verb,
+/// the basis and each basis's parameter group, as one Rust check, so a
+/// declaration is refused the same way over either adapter.
+///
+/// WHY IT EXISTS (backlog be459ab9, found by the adapters-agree suite,
+/// 2026-09-29). Postgres enforced the CHECKs and `InMemoryCadence`
+/// enforced none, so a publish the database refused as a 500 naming a
+/// constraint landed in the double and answered 200 — every door test
+/// of `POST /api/cadence/rules/{name}/publish` runs on the double. Both
+/// adapters now run this before writing and answer
+/// `CadenceError::BadRequest` naming the rule and the column.
+/// `the_rule_check_is_the_tables_check` (in
+/// `the_adapters_agree_on_the_cadence_registry_pg.rs`) holds it to the
+/// live table BOTH ways: the verb and basis lists equal the constraint's
+/// own, and a corpus of rows gets the same verdict from each.
+///
+/// `cadence_rules_regate_hold_check` has no half here: the row lost
+/// `regate_hold_minutes` in backlog d1d4275d, so no adapter writes it.
+/// The conductor's parse (`boss-cli` `rule_from_row`) is stricter still
+/// — it reads the times and refuses a business calendar it cannot
+/// resolve — and is the conductor's own judgement, not the registry's.
+pub fn check_rule(row: &CadenceRuleRow) -> Result<(), String> {
+    let name = &row.name;
+    let verb = row.verb.as_str();
+    let is_kind = |k: &str| {
+        !k.is_empty()
+            && k.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    };
+    let verb_ok =
+        CONDUCTOR_VERBS.contains(&verb) || verb.strip_prefix(OPEN_VERB_PREFIX).is_some_and(is_kind);
+    if !verb_ok {
+        return Err(format!(
+            "cadence rule {name}: verb `{verb}` is neither a conductor verb ({}) nor \
+             {OPEN_VERB_PREFIX}<kind> with the kind in kebab-case",
+            CONDUCTOR_VERBS.join(" | ")
+        ));
+    }
+    let basis = row.basis.as_str();
+    let Some((_, required, may)) = BASIS_COLUMNS.iter().find(|(b, _, _)| *b == basis) else {
+        let bases: Vec<&str> = BASIS_COLUMNS.iter().map(|(b, _, _)| *b).collect();
+        return Err(format!(
+            "cadence rule {name}: basis `{basis}` is not one of {}",
+            bases.join(" | ")
+        ));
+    };
+    let int = |v: Option<i32>| (v.is_some(), v);
+    let columns: [(&str, (bool, Option<i32>)); 7] = [
+        ("every_minutes", int(row.every_minutes)),
+        ("at_times", (row.at_times.is_some(), None)),
+        ("min_dock_depth", int(row.min_dock_depth)),
+        ("cooldown_minutes", int(row.cooldown_minutes)),
+        ("cadence", (row.cadence.is_some(), None)),
+        ("anchor_date", (row.anchor_date.is_some(), None)),
+        ("business_calendar", (row.business_calendar.is_some(), None)),
+    ];
+    for (column, (present, value)) in columns {
+        if required.contains(&column) && !present {
+            return Err(format!(
+                "cadence rule {name}: {column} is required for basis `{basis}`"
+            ));
+        }
+        if present && !required.contains(&column) && !may.contains(&column) {
+            return Err(format!(
+                "cadence rule {name}: {column} is not a column of basis `{basis}` — leave it absent"
+            ));
+        }
+        if let Some(v) = value.filter(|v| *v <= 0) {
+            return Err(format!(
+                "cadence rule {name}: {column} must be above 0, got {v}"
+            ));
+        }
+    }
+    let one_time = row
+        .at_times
+        .as_ref()
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|a| a.len() == 1);
+    if basis == "calendar" && !one_time {
+        return Err(format!(
+            "cadence rule {name}: at_times holds exactly one time-of-day for basis `calendar` \
+             — the cadence chooses the days, at_times when on them"
+        ));
+    }
+    Ok(())
+}
+
+/// The `detail` a claim lands with: an object as sent, JSON null as `{}`,
+/// and anything else refused — one rule for both adapters.
+///
+/// WHY (backlog be459ab9, found by the adapters-agree suite,
+/// 2026-09-29). `NewFiring::detail` defaults to null on the wire, and
+/// Postgres stored that null: `record_outcome`'s `detail || $2` then
+/// built `[null, {"rc": 0, …}]`, so the rc just recorded read back as
+/// "no outcome yet" for ever — the state evaluation must NOT mistake for
+/// a finished run — while the double replaced the null and read it. An
+/// outcome merges into an object, and an array or a scalar has no merge
+/// both adapters share, so a claim carrying one is a bad request.
+pub fn claim_detail(detail: &serde_json::Value) -> Result<serde_json::Value, String> {
+    match detail {
+        serde_json::Value::Null => Ok(serde_json::json!({})),
+        serde_json::Value::Object(_) => Ok(detail.clone()),
+        other => Err(format!(
+            "a firing's detail is a JSON object (or absent), got {other}"
+        )),
+    }
+}
+
 /// One row of `cadence_rules`, unparsed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CadenceRuleRow {
@@ -53,12 +188,6 @@ pub struct CadenceRuleRow {
     /// every day is a business day.
     #[serde(default)]
     pub business_calendar: Option<String>,
-    /// A departing rule (`board`, `run`): how many minutes a departure
-    /// waits for the dock's re-gate round on the current main, counted
-    /// from the oldest re-gate in it (design 42279fb2). Absent means no
-    /// hold; the table refuses it on any verb that departs no train.
-    #[serde(default)]
-    pub regate_hold_minutes: Option<i32>,
 }
 
 /// One row of `cadence_rules` as DECLARED — the wire row plus the
@@ -106,6 +235,13 @@ pub struct LastFiring {
     /// whole cooldown (2026-09-04, two hours of a threshold-met dock).
     #[serde(default)]
     pub rc: Option<i32>,
+    /// What a BOARD firing decided (backlog 96f02540) — merged into its
+    /// `detail` with the outcome, `None` for every other verb, for a
+    /// firing with no outcome yet, and for one recorded before the field
+    /// existed. The yard's boarding hold states it rather than re-deriving
+    /// the board's decision from the cadence rows (`yard::boarding_hold`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_decision: Option<crate::board_decision::BoardDecision>,
 }
 
 /// A claim request. `fired_at` is supplied BY THE CALLER and bound as
@@ -137,4 +273,21 @@ pub struct ClaimResult {
 pub struct FiringOutcome {
     pub rc: i32,
     pub runtime_secs: u64,
+    /// A board's decision (backlog 96f02540), read by the cadence loop off
+    /// the verb it ran. Absent for every other verb.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_decision: Option<crate::board_decision::BoardDecision>,
+}
+
+impl FiringOutcome {
+    /// The object an adapter merges into the firing's `detail` — the one
+    /// shape both adapters write, so the decision rides under the key the
+    /// readers look for (`board_decision::FIRING_KEY`).
+    pub fn detail_patch(&self) -> serde_json::Value {
+        let mut patch = serde_json::json!({"rc": self.rc, "runtime_secs": self.runtime_secs});
+        if let Some(d) = &self.board_decision {
+            patch[crate::board_decision::FIRING_KEY] = serde_json::json!(d);
+        }
+        patch
+    }
 }

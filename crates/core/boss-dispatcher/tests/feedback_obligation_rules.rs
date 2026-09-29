@@ -172,7 +172,7 @@ async fn a_merged_car_fires_the_completion_with_its_edge_and_branches() {
             }
         }
     }
-    let results = dispatch(&matched, &hreg, "evt-1", "jobs.job.closed", &payload)
+    let results = dispatch(&matched, &hreg, "evt-1", "jobs.job.closed", &payload, None)
         .await
         .expect("every named handler is registered");
     assert!(

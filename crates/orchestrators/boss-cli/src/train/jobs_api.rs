@@ -933,6 +933,19 @@ pub(crate) fn orphan_receipt(o: &OrphanCandidate, branch: &str, namespace: &str)
     )
 }
 
+/// The receipt a gate-run the conductor FILED and could not start is
+/// settled with (backlog 7919fdcc, item 11): the cause verbatim — the
+/// only copy of it — and what the run does not say.
+pub(crate) fn unstarted_receipt(branch: &str, cause: &anyhow::Error) -> String {
+    format!(
+        "NO VERDICT WAS PRODUCED. The conductor filed this gate-run for {branch} and then could \
+         not start its runner Job: {cause:#}. No runner ever existed, so no check ran. Settled \
+         as LOST by the conductor at once, rather than left open for the orphan window with \
+         nothing referencing it: this run says nothing about {branch}, and an infrastructure \
+         failure is not a consist failure."
+    )
+}
+
 /// Should this closed gate-run's verdict be buried if its sha landed?
 /// Returns the (sha, verdict) to check when the run is closed with a
 /// `failed` or `lost` verdict, names a sha, is not already superseded,

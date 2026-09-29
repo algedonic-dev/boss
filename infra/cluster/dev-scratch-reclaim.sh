@@ -287,6 +287,7 @@ WT_KEPT_UNREFERENCED=0; WT_KEPT_UNREFERENCED_NAMES=""
 WT_KEPT_LIVE=0; WT_KEPT_RECENT=0; WT_KEPT_LOCKED=0; WT_KEPT_REFUSED=0
 WT_STALE_LOCKS=0; WT_STALE_LOCK_NAMES=""
 WT_PRUNED=0
+WT_KEPT_UNSEEN=0; WT_KEPT_UNSEEN_NAMES=""
 WT_TARGETS_REMOVED=0; WT_TARGETS_MIB=0
 FLOOR_WORKTREES_REMOVED=0; FLOOR_WORKTREES_KEPT_UNREFERENCED_NAMES=""
 STALE_TARGETS_RECLAIMED=0
@@ -966,6 +967,82 @@ remove_worktree_target() {
     done
 }
 
+# THE PRUNE IS JUDGED HERE, NOT HANDED TO GIT (backlog 52fefc45,
+# 2026-09-28). A bare `git worktree prune` drops every admin entry
+# whose worktree it cannot find — and this sidecar mounts only /work
+# and /scratch (boss-dev.yaml), so a worktree under the dev container's
+# /tmp, where every session scratchpad and so every reviewer's detached
+# tree lives, is one it can NEVER find. Measured by run ff5ff31c: the
+# sidecar logged "pruned: Removing worktrees/rv", "wt", "rr", "wt" at
+# 16:58, 17:59 and 18:59Z, inside the window in which three live
+# reviewers each lost their tree's metadata mid-run and recreated it.
+# Absent from here is not gone. So an entry is dropped only when its
+# worktree lies under a mount this process can see — WORKTREES_DIR,
+# WORK_MOUNT, SCRATCH_MOUNT, each only when it is there to look in —
+# AND that directory is absent. An entry pointing anywhere else is
+# kept, logged and counted (worktrees_kept_unseen on the packet); so is
+# one whose path cannot be judged (no gitdir, or a path with . or ..
+# segments, which a prefix cannot place). A locked entry is untouched,
+# as git's own prune leaves it. Removing the admin directory is what
+# git's prune itself does (prune_worktree in builtin/worktree.c).
+# Widening the sidecar's mounts instead would roll the dev pod and end
+# the operator's session, and would still leave the next unseen path
+# exposed.
+prune_gone_worktrees() {
+    local common entry name gitdir wt m visible pruned=0 unseen=0 unseen_names=""
+    local -a roots=()
+    if ! common=$(git -C "$REPO_DIR" rev-parse --git-common-dir 2>&1) || [ -z "$common" ]; then
+        log "could not read $REPO_DIR's git directory (${common:-empty answer}) — no worktree entry pruned" >&2
+        problems=$((problems + 1))
+        return 0
+    fi
+    case "$common" in /*) ;; *) common="$REPO_DIR/$common" ;; esac
+    [ -d "$common/worktrees" ] || return 0
+    # A mount that is not there is not a place to look: were /work
+    # unmounted, every entry under it would read as gone.
+    for m in "$WORKTREES_DIR" "$WORK_MOUNT" "$SCRATCH_MOUNT"; do
+        [ -n "$m" ] && [ -d "$m" ] || continue
+        [ -n "${m%/}" ] && roots+=("${m%/}")
+        if m=$(readlink -f "$m") && [ -n "${m%/}" ]; then
+            roots+=("${m%/}")
+        fi
+    done
+    for entry in "$common"/worktrees/*; do
+        [ -d "$entry" ] || continue
+        name=$(basename "$entry")
+        [ -e "$entry/locked" ] && continue
+        wt=""
+        if gitdir=$(head -n1 "$entry/gitdir" 2>/dev/null) && [ -n "$gitdir" ]; then
+            case "$gitdir" in /*) ;; *) gitdir="$entry/$gitdir" ;; esac
+            wt=$(dirname "$gitdir")
+        fi
+        visible=0
+        for m in ${roots[@]+"${roots[@]}"}; do
+            case "$wt" in "$m"/*) visible=1; break ;; esac
+        done
+        case "$wt" in */./*|*/../*|*/.|*/..) visible=0 ;; esac
+        if [ "$visible" = 0 ]; then
+            log "  kept worktrees/$name: its worktree ${wt:-(no gitdir recorded)} lies outside every mount this pass can see (${roots[*]:-none}) — absent from here is not gone"
+            unseen=$((unseen + 1))
+            unseen_names="${unseen_names:+$unseen_names, }$name"
+            continue
+        fi
+        [ -e "$wt" ] && continue
+        if rm -rf "$entry"; then
+            log "  pruned: Removing worktrees/$name: its worktree $wt is gone"
+            pruned=$((pruned + 1))
+        else
+            log "could not remove the admin entry worktrees/$name" >&2
+            problems=$((problems + 1))
+        fi
+    done
+    WT_PRUNED=$((WT_PRUNED + pruned))
+    # A reading of what is there now, not a tally: one pass may prune
+    # three times (the floor pass twice), and an entry kept three times
+    # is still one entry.
+    WT_KEPT_UNSEEN=$unseen; WT_KEPT_UNSEEN_NAMES=$unseen_names
+}
+
 reclaim_gone_worktrees() {
     if [ ! -d "$REPO_DIR/.git" ] && [ ! -f "$REPO_DIR/.git" ]; then
         log "$REPO_DIR is not a git checkout — worktree pass skipped"
@@ -995,12 +1072,7 @@ reclaim_gone_worktrees() {
 
     # Admin entries whose directory is already gone — a worktree an
     # operator rm -rf'd — hold the branch checked out and nothing else.
-    local pruned
-    pruned=$(git -C "$REPO_DIR" worktree prune -v 2>&1 || true)
-    if [ -n "$pruned" ]; then
-        printf '%s\n' "$pruned" | sed 's/^/dev-scratch-reclaim:   pruned: /'
-        WT_PRUNED=$(printf '%s\n' "$pruned" | grep -c . || true)
-    fi
+    prune_gone_worktrees
 
     local self now judge_locks=1
     self="$(pwd -P 2>/dev/null || echo /nonexistent)"
@@ -1180,7 +1252,7 @@ reclaim_gone_worktrees() {
         '
     )
 
-    log "worktree pass: removed $WT_REMOVED worktree(s) (${WT_REMOVED_MIB}MiB; $WT_REMOVED_BY_CONTENT of them landed by content, not by sha, and $WT_REMOVED_BY_RECORD landed on record) and $WT_TARGETS_REMOVED target(s) (${WT_TARGETS_MIB}MiB); kept $WT_KEPT_LIVE with an origin/ ref still in the checkout, $WT_KEPT_RECENT with git activity inside the window, $WT_KEPT_NO_LANDING unpushed with no landing on record, $WT_KEPT_SOR_UNREAD unpushed because the record could not be read, $WT_KEPT_DIRTY dirty, $WT_KEPT_UNREFERENCED with a head no ref holds, $WT_KEPT_LOCKED locked, $WT_KEPT_REFUSED refused by git; pruned $WT_PRUNED entries whose directory was gone; judged $WT_STALE_LOCKS with a stale lock"
+    log "worktree pass: removed $WT_REMOVED worktree(s) (${WT_REMOVED_MIB}MiB; $WT_REMOVED_BY_CONTENT of them landed by content, not by sha, and $WT_REMOVED_BY_RECORD landed on record) and $WT_TARGETS_REMOVED target(s) (${WT_TARGETS_MIB}MiB); kept $WT_KEPT_LIVE with an origin/ ref still in the checkout, $WT_KEPT_RECENT with git activity inside the window, $WT_KEPT_NO_LANDING unpushed with no landing on record, $WT_KEPT_SOR_UNREAD unpushed because the record could not be read, $WT_KEPT_DIRTY dirty, $WT_KEPT_UNREFERENCED with a head no ref holds, $WT_KEPT_LOCKED locked, $WT_KEPT_REFUSED refused by git; pruned $WT_PRUNED entries whose directory was gone; kept $WT_KEPT_UNSEEN entries outside the mounts this pass can see${WT_KEPT_UNSEEN_NAMES:+ ($WT_KEPT_UNSEEN_NAMES)}; judged $WT_STALE_LOCKS with a stale lock"
 }
 
 # ---------------------------------------------------------------------
@@ -1205,8 +1277,9 @@ reclaim_work() {
     log "$WORK_MOUNT ${gb}GB free < ${WORK_FLOOR_GB}GB floor (the gate's ${GATE_MIN_FREE_GB} + ${WORK_RECLAIM_MARGIN_GB} margin, infra/build-floor.env) — pruning stale git worktrees"
 
     # Metadata first: drop admin entries for worktree dirs that are
-    # already gone. Cheap and always safe.
-    git -C "$REPO_DIR" worktree prune -v 2>&1 | sed 's/^/dev-scratch-reclaim:   /' || true
+    # already gone — gone where this process can SEE, which a bare
+    # `git worktree prune` never asked (backlog 52fefc45).
+    prune_gone_worktrees
 
     # This run's own worktree is off limits — never saw the axe fall on
     # the branch it is standing on.
@@ -1270,7 +1343,7 @@ reclaim_work() {
         '
     )
 
-    git -C "$REPO_DIR" worktree prune 2>/dev/null || true
+    prune_gone_worktrees
     FLOOR_WORKTREES_REMOVED=$removed
 
     kb=$(free_kb "$WORK_MOUNT")
@@ -1592,6 +1665,7 @@ record_pass() {
             "worktrees_kept_locked=$WT_KEPT_LOCKED" "worktrees_kept_refused=$WT_KEPT_REFUSED" \
             "worktrees_stale_locks=$WT_STALE_LOCKS" "worktrees_stale_lock_names=$WT_STALE_LOCK_NAMES" \
             "worktrees_pruned=$WT_PRUNED" \
+            "worktrees_kept_unseen=$WT_KEPT_UNSEEN" "worktrees_kept_unseen_names=$WT_KEPT_UNSEEN_NAMES" \
             "targets_removed=$WT_TARGETS_REMOVED" "targets_removed_mib=$WT_TARGETS_MIB" \
             "floor_worktrees_removed=$FLOOR_WORKTREES_REMOVED" "floor_worktrees_kept_unreferenced_names=$FLOOR_WORKTREES_KEPT_UNREFERENCED_NAMES" \
             "stale_targets_reclaimed=$STALE_TARGETS_RECLAIMED" \

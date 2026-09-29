@@ -327,6 +327,59 @@ async fn an_unwired_record_or_underivable_routes_read_null_and_judge_nothing() {
     }
 }
 
+/// A CALLER WHOSE SCOPE READS NO PACKETS READS NO MOVES (backlog
+/// e5f7b51e, the note of 2026-09-27). The regions read asked policy for
+/// its map and answered such a caller the empty map — then read the
+/// moves record and the derived routes anyway and hung every undeclared
+/// crossing on it, with its count and its last instant: the partial
+/// scoping the machine-firings car closed on the borders and the rule
+/// firings. The reading is now not made for that caller, so it is null
+/// — "not read", as for an unwired record — and judges nothing. A
+/// request with no identity is one such caller; a role with no grant on
+/// `job` is the other.
+#[tokio::test]
+async fn a_caller_who_reads_no_packets_reads_no_undeclared_moves() {
+    let anonymous = app(true)
+        .await
+        .oneshot(
+            Request::builder()
+                .uri("/api/yard/regions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::OK);
+    let bytes = anonymous.into_body().collect().await.unwrap().to_bytes();
+    let anonymous: Value = serde_json::from_slice(&bytes).unwrap();
+    let (status, stranger) = get(app(true).await, "/api/yard/regions", "stranger").await;
+    assert_eq!(status, StatusCode::OK, "{stranger}");
+    for (who, body) in [("no identity", &anonymous), ("no job grant", &stranger)] {
+        let regions = body["regions"].as_array().expect("the empty map's regions");
+        assert!(!regions.is_empty(), "{who}: {body}");
+        for r in regions {
+            assert_eq!(
+                r["undeclared"],
+                Value::Null,
+                "{who}: {} carried the moves record to a caller that reads no packets",
+                r["name"]
+            );
+            assert_ne!(r["band"]["id"], "moves-undeclared", "{who}: {r}");
+        }
+    }
+    // The control: the same record and routes, read by a caller who
+    // reads every packet, still carry the reading — so the nulls above
+    // are the gate, not a record that happened to hold nothing.
+    let (_, operator) = get(app(true).await, "/api/yard/regions", "operator").await;
+    let arrivals = operator["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "arrivals")
+        .unwrap();
+    assert_eq!(arrivals["undeclared"][0]["moves"], 2, "{arrivals}");
+}
+
 /// `GET /api/yard/routes` serves the derived routes with their sources,
 /// the observed counts beside them, and 503 — naming the registry — when
 /// there is nothing to walk.

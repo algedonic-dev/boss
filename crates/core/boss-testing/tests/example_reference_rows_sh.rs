@@ -198,14 +198,16 @@ fn seeds_is_the_example_tenants_own_rows_counted_independently() {
     );
     assert_eq!(v["sales_tax_rates"].as_array().unwrap().len(), 27);
     // The department roster (backlog 7edf0e97): the brewery's
-    // departments.toml carries the thirteen rows migration
-    // 20260919181324 seeds into every instance.
+    // departments.toml carries the rows migration 20260919181324 seeds
+    // into every instance — all but the platform's `it` — plus the two
+    // it runs that no migration seeds, packaging and taproom (c87e3d6d:
+    // 13 − 1 + 2).
     assert_eq!(
         v["departments"].as_array().unwrap().len(),
         toml_headers(&brewery.join("departments.toml"), "department"),
         "departments = the brewery's [[department]] codes"
     );
-    assert_eq!(v["departments"].as_array().unwrap().len(), 13);
+    assert_eq!(v["departments"].as_array().unwrap().len(), 14);
     let sources: Vec<&str> = v["sources"]
         .as_array()
         .unwrap()
@@ -304,7 +306,10 @@ fn the_retired_device_shop_rows_are_the_ones_its_migration_seeds_and_outlive_its
         "the retired list names rows 01-registries.sql does not seed: {invented:?}"
     );
     // And it names every one the car-0 measure counted (2026-09-24): 26
-    // roles, ten departments, three account types, one location kind.
+    // roles, ten departments, three account types, one location kind —
+    // and, since c87e3d6d, the eleventh department Class, `it`, which
+    // stopped being the platform's when an employee's department became
+    // a departments row.
     // Together with the fresh-schema run in example_reference_rows_sql.rs
     // (without examples/used-device-shop, what remains is exactly what
     // the platform names), this is the equality: the rows not kept by
@@ -317,10 +322,13 @@ fn the_retired_device_shop_rows_are_the_ones_its_migration_seeds_and_outlive_its
             .count()
     };
     assert_eq!(count("employee", "role"), 26);
-    assert_eq!(count("employee", "department"), 10);
+    assert_eq!(count("employee", "department"), 11);
     assert_eq!(count("account", "type"), 3);
     assert_eq!(count("location", "kind"), 1);
-    assert_eq!(retired.len(), 40, "and nothing else: {retired:?}");
+    // 9b28f849: the two marketing-asset kinds no row and no code used,
+    // which no live example declares.
+    assert_eq!(count("marketing-asset", "kind"), 2);
+    assert_eq!(retired.len(), 43, "and nothing else: {retired:?}");
 
     let manifest = std::fs::read_to_string(dir.join("tenant.toml")).unwrap();
     assert!(
@@ -375,15 +383,12 @@ fn the_retired_device_shop_rows_are_the_ones_its_migration_seeds_and_outlive_its
     assert!(String::from_utf8_lossy(&out.stderr).contains("/nonexistent/retired"));
 }
 
-/// The rows the platform itself needs, derived from the files that
-/// need them: the bootstrap admin's row (boss-people
-/// operator_baseline.rs `bootstrap_admin_row`), the operator
-/// baseline's hire (infra/operator-baseline/operator_hires.toml), and
-/// the account_type column's default (22-accounts.sql). None may be an
-/// example candidate.
-fn platform_named_class_rows() -> Vec<(String, String)> {
+/// The value each platform employee row sets for `field`, derived from
+/// the files that set them: the bootstrap admin's row (boss-people
+/// operator_baseline.rs `bootstrap_admin_row`) and the operator
+/// baseline's hires (infra/operator-baseline/operator_hires.toml).
+fn platform_employee_values(field: &str) -> Vec<String> {
     let root = repo_root();
-    let mut rows = Vec::new();
     let src =
         std::fs::read_to_string(root.join("crates/modules/boss-people/src/operator_baseline.rs"))
             .unwrap();
@@ -392,26 +397,37 @@ fn platform_named_class_rows() -> Vec<(String, String)> {
         .nth(1)
         .expect("bootstrap_admin_row exists");
     let body = body.split("\n}").next().unwrap();
-    for (field, kind) in [
-        ("role", "employee"),
-        ("department", "employee"),
-        ("employment_type", "employee"),
-        ("status", "employee"),
-    ] {
-        let needle = format!("{field}: Some(\"");
-        let v = body
-            .split(&needle)
-            .nth(1)
-            .unwrap_or_else(|| panic!("bootstrap_admin_row sets {field}"));
-        rows.push((kind.to_string(), v.split('"').next().unwrap().to_string()));
-    }
+    let needle = format!("{field}: Some(\"");
+    let v = body
+        .split(&needle)
+        .nth(1)
+        .unwrap_or_else(|| panic!("bootstrap_admin_row sets {field}"));
+    let mut values = vec![v.split('"').next().unwrap().to_string()];
     let hires: toml::Value = toml::from_str(
         &std::fs::read_to_string(root.join("infra/operator-baseline/operator_hires.toml")).unwrap(),
     )
     .unwrap();
     for h in hires["hire"].as_array().unwrap() {
-        for field in ["role", "department", "employment_type", "status"] {
-            rows.push(("employee".into(), h[field].as_str().unwrap().to_string()));
+        values.push(h[field].as_str().unwrap().to_string());
+    }
+    values.sort();
+    values.dedup();
+    values
+}
+
+/// The rows the platform itself needs, derived from the files that
+/// need them: the platform employees' role / employment_type / status
+/// Classes (`platform_employee_values`) and the account_type column's
+/// default (22-accounts.sql). None may be an example candidate. Their
+/// DEPARTMENT is not a Class since backlog c87e3d6d — it is a
+/// departments row, held by `the_platforms_own_rows_are_in_no_example_seed`
+/// against the examples' departments.toml instead.
+fn platform_named_class_rows() -> Vec<(String, String)> {
+    let root = repo_root();
+    let mut rows = Vec::new();
+    for field in ["role", "employment_type", "status"] {
+        for v in platform_employee_values(field) {
+            rows.push(("employee".to_string(), v));
         }
     }
     let accounts =
@@ -448,6 +464,24 @@ fn the_platforms_own_rows_are_in_no_example_seed() {
     let (rc, out, _) = run(&["seeds"], None);
     assert_eq!(rc, 0);
     let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    // The department the platform's own people sit in (`it`) is a
+    // departments row since backlog c87e3d6d, so no example may declare
+    // it: a fresh company instance would evict it at boot and the
+    // operator baseline's hire into it would be refused.
+    let departments = strs(&v, "departments");
+    let platform_departments = platform_employee_values("department");
+    assert_eq!(
+        platform_departments,
+        ["it"],
+        "the baseline's people sit in IT"
+    );
+    for d in platform_departments {
+        assert!(
+            !departments.contains(&d),
+            "department {d} is where the platform's baseline hires, and an example's \
+             departments.toml declares it — a fresh company instance would evict it at boot"
+        );
+    }
     let locations: Vec<&str> = v["locations"]
         .as_array()
         .unwrap()
@@ -744,12 +778,14 @@ fn redeclaring_tenant(name: &str) -> PathBuf {
         &t.join("seeds/tax.toml"),
         "[[tax_kind]]\nkind = \"sales\"\nliability_account = \"1100\"\n\n[[tax_kind]]\nkind = \"gross-receipts\"\nliability_account = \"1100\"\n\n[[sales_tax_rate]]\nstate = \"CA\"\njurisdiction = \"US-CA\"\nrate_bps = 725\n\n[[sales_tax_rate]]\nstate = \"HI\"\njurisdiction = \"US-HI\"\nrate_bps = 400\n",
     );
-    // The brewery's `it` department, and a retired `warehouse` —
+    // The brewery's `sales` department, and a retired `warehouse` —
     // a code the tenant declares withdrawn is still its declaration,
     // never residue (backlog 7edf0e97) — beside `hosting`, no example's.
+    // (`sales`, not `it`: since c87e3d6d `it` is the platform's and in
+    // no example's roster, so it was never a candidate to subtract.)
     write(
         &t.join("seeds/departments.toml"),
-        "[[department]]\ncode = \"it\"\ndisplay_name = \"IT\"\nfunction = \"operations\"\n\n[[department]]\ncode = \"warehouse\"\ndisplay_name = \"Warehouse\"\nfunction = \"operations\"\nretired = true\n\n[[department]]\ncode = \"hosting\"\ndisplay_name = \"Hosting\"\nfunction = \"operations\"\n",
+        "[[department]]\ncode = \"sales\"\ndisplay_name = \"Sales\"\nfunction = \"revenue\"\n\n[[department]]\ncode = \"warehouse\"\ndisplay_name = \"Warehouse\"\nfunction = \"operations\"\nretired = true\n\n[[department]]\ncode = \"hosting\"\ndisplay_name = \"Hosting\"\nfunction = \"operations\"\n",
     );
     t
 }
@@ -807,7 +843,7 @@ fn a_row_the_tenant_declares_leaves_the_candidate_set_and_is_named() {
     assert!(strs(&v, "tax_kinds").contains(&"income".to_string()));
     assert!(!strs(&v, "sales_tax_rates").contains(&"CA".to_string()));
     assert!(strs(&v, "sales_tax_rates").contains(&"TX".to_string()));
-    assert!(!strs(&v, "departments").contains(&"it".to_string()));
+    assert!(!strs(&v, "departments").contains(&"sales".to_string()));
     assert!(!strs(&v, "departments").contains(&"warehouse".to_string()));
     assert!(strs(&v, "departments").contains(&"production".to_string()));
     assert_eq!(
@@ -830,7 +866,7 @@ fn a_row_the_tenant_declares_leaves_the_candidate_set_and_is_named() {
     assert_eq!(strs(d, "companies"), Vec::<String>::new());
     assert_eq!(strs(d, "tax_kinds"), ["sales"]);
     assert_eq!(strs(d, "sales_tax_rates"), ["CA"]);
-    assert_eq!(strs(d, "departments"), ["it", "warehouse"]);
+    assert_eq!(strs(d, "departments"), ["sales", "warehouse"]);
     assert_eq!(d["directory"], tenant);
     assert!(
         plain["declared_by_tenant"].is_null(),
@@ -871,7 +907,7 @@ fn a_row_the_tenant_declares_leaves_the_candidate_set_and_is_named() {
             .and_then(|rest| rest.split(']').next())
             .expect("the SQL embeds the departments candidates");
         assert!(
-            !departments.contains(r#""it""#)
+            !departments.contains(r#""sales""#)
                 && !departments.contains(r#""warehouse""#)
                 && departments.contains(r#""production""#),
             "a department the tenant declares, retired or live, is not a candidate: {departments}"

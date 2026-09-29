@@ -116,6 +116,21 @@ from = "gate-run@failed"
 to = "gate-run@record-verdict"
 why = "A re-gate after a red: boss gate files a fresh gate-run on the branch the garage holds, and the branch goes back into a bay (design e765b3fc §1, route F)."
 
+# A GATE THAT DIES IN LINE REACHES THE GARAGE FROM THE SHOP FLOOR
+# (backlog b43042cf). A gate-run waiting for a bay occupies none, so it
+# stands on no region (yard.rs::gates); when its waiter dies the
+# conductor's reconcile settles it `lost` and it first appears in the
+# garage's limbo, handed off from the run that filed it. Measured
+# 2026-09-28: gate-run 40385690 (feat/three-bounded-github-verbs), filed
+# by run 8403148a at 06:11:48, last queue beat 06:29:33, settled lost at
+# 06:50:30 while the run was still `building` — the one undeclared route
+# on the live map, and it troubled the garage.
+[[hand_off]]
+by = "cadence:train-reconcile"
+from = "agent-run@building"
+to = "gate-run@lost"
+why = "A builder's gate that died waiting for a bay is settled lost by the conductor's reconcile (reap_dead_gate_runs, train/conductor.rs); a queued gate-run stood on no region, so it reaches the garage's limbo straight from the run on the shop floor that filed it."
+
 [[hand_off]]
 by = "verb:park"
 from = "gate-run@green"

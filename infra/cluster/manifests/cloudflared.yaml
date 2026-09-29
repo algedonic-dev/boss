@@ -74,6 +74,12 @@ spec:
     metadata:
       labels: {app.kubernetes.io/part-of: boss, app: cloudflared}
     spec:
+      # No API token: the connector calls no Kubernetes API (its
+      # credentials arrive as a Secret VOLUME, which the kubelet reads),
+      # and it is the pod that faces the internet. Its account is the
+      # namespace's `default`, which mounts nothing either since backlog
+      # 28367b57; said here too so this pod does not depend on it.
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

@@ -8,7 +8,7 @@
 // board and /it/design each had one layer below their fetch.
 
 import { describe, expect, test } from 'bun:test';
-import { readEnvelope, readList } from './shape';
+import { readEnvelope, readList, readRows } from './shape';
 
 const PATH = '/api/stations/load';
 
@@ -58,5 +58,26 @@ describe('readEnvelope', () => {
     expect(() => readEnvelope(PATH, 'down')).toThrow('the body is a string,');
     expect(() => readEnvelope(PATH, 7)).toThrow('the body is a number,');
     expect(() => readEnvelope(PATH, undefined)).toThrow('the body is an undefined,');
+  });
+});
+
+// Backlog 0ef5e008. Parts, the catalog and vendors read endpoints that
+// have answered both shapes, and each coerced ANY other body to no rows
+// with `Array.isArray(b) ? b : (b.data ?? [])` — a `{}` or an error
+// object became "No parts yet." Either list shape is read; nothing else.
+describe('readRows', () => {
+  test('a bare list and an envelope are both the rows', () => {
+    expect(readRows(PATH, [{ id: 'a' }])).toEqual([{ id: 'a' }]);
+    expect(readRows(PATH, { data: [{ id: 'b' }], total: 1 })).toEqual([{ id: 'b' }]);
+    expect(readRows(PATH, [])).toEqual([]);
+    expect(readRows(PATH, { data: [] })).toEqual([]);
+  });
+
+  test('any other body is refused, naming the read and what came back', () => {
+    expect(() => readRows(PATH, { error: 'down' })).toThrow(
+      '/api/stations/load: HTTP 200, but the body is an object with no data list, not a list or a {data: [...]} envelope',
+    );
+    expect(() => readRows(PATH, null)).toThrow('the body is null,');
+    expect(() => readRows(PATH, 'down')).toThrow('the body is a string,');
   });
 });

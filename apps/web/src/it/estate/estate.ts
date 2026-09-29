@@ -97,7 +97,18 @@ export type Comparison = Readonly<{
    *  null when they were (estate_compare.rs dead_letter_finding: UNREAD
    *  is never reported as zero). Absent on host rows. */
   dispatcher_unread?: string | null;
+  /** The machines behind `counts.drift`, each with the fields that
+   *  differ (ab3c54d7) — so the page names WHICH machine drifted on
+   *  WHAT, not only how many. Absent on a literal built without it. */
+  drift?: readonly DriftFinding[];
 }>;
+
+/** One field a comparison found different: both sides, as compared. */
+export type DriftField = Readonly<{ declared: unknown; observed: unknown }>;
+
+/** A drift finding, in compare()'s own shape (estate_compare.rs):
+ *  `{id, fields: {<field>: {declared, observed}}}`. */
+export type DriftFinding = Readonly<{ id: string; fields: Readonly<Record<string, DriftField>> }>;
 
 // THE HOST COMPARISON (backlog 2d8d983b; page audit 2cff1d6e, GAP 1).
 // Until this read the page rendered the cluster's verdict only, while
@@ -221,6 +232,19 @@ export const CLUSTER_OBSERVATIONS_READ = `/api/estate/observations?scope=${CLUST
 /** The cluster verdict is the newest comparison of ITS scope — the
  *  unscoped page of 20 it came from was spent the same way. */
 export const CLUSTER_COMPARISON_READ = `/api/estate/comparisons?scope=${CLUSTER_SCOPE}&limit=1`;
+
+/**
+ * The registry read's failure, said as what it was (backlog e5f7b51e).
+ * The estate reads ask policy now, so a 401/403 is the registry
+ * REFUSING this session — a fact about who is reading — and naming it
+ * "did not answer" would send the reader to look for an outage that is
+ * not there. Anything else is the unreachable registry it always was.
+ */
+export function registryFailure(error: string): string {
+  return /: HTTP 40[13]$/.test(error)
+    ? `The registry refused this session: ${error}. The estate reads ask policy — reading them needs Read on estate at scope all (platform-admin, break-glass, or the audit read).`
+    : `The registry did not answer: ${error}. This page refuses to guess — an unreachable registry is not an empty estate.`;
+}
 
 export function hostSeriesRead(scope: string, host: string): string {
   return `/api/estate/observations?scope=${scope}&host=${encodeURIComponent(host)}&limit=${SERIES_SAMPLE}`;
@@ -367,6 +391,8 @@ export type EstateState = Readonly<{
   hostComparisons: Remote<HostComparisonPage>;
   hosts: Readonly<{ known: boolean; series: readonly HostSeries[] }>;
   loops: readonly LoopRow[];
+  /** The open ESTATE ALARM packets (48ef9961). */
+  alarms: Remote<AlarmPage>;
 }>;
 
 // THE DEV WORKSPACE DOOR (design 5fc71f03, David 2026-09-18; backlog
@@ -380,19 +406,21 @@ export type EstateState = Readonly<{
 // here; the VIP still answers and is no longer advertised
 // (infra/cluster/manifests/boss-dev.yaml, Service boss-dev-ssh).
 //
-// HARDCODED, and loudly so, for the same reason the VIP was: the
-// hostname is DECLARED — the tunnel route in
+// ONE COPY, TWO READERS (design 125d405d, backlog fd6d6c08). The
+// hostname and the three client steps live in ./dev-door.json, which
+// this page imports and the printed recovery sheet reads
+// (infra/recovery/re-entry.toml, `boss recovery sheet`). Until
+// 2026-09-29 they were literals here and the paper would have been a
+// second spelling; one file cannot drift from itself (CLAUDE.md §9a).
+// The hostname is still DECLARED twice more — the tunnel route in
 // infra/cluster/tunnel-origins.toml and the application in
-// infra/cluster/dns/access.toml — but the jobs API serves only
-// /api/estate/nodes|observations|comparisons (boss-jobs http/mod.rs),
-// so no read reaches either file. A fact that lives twice gets an
-// equality test (CLAUDE.md §9a): the Rust test
-// the_dev_door_is_an_access_ssh_application.rs holds the literal below
-// to the route the connector serves, so a drift is a red test rather
-// than a terminal block that opens nothing. When the estate reader
-// lands (d471a8ce) this constant dies and the block renders from the
-// registry like everything else on the page.
-export const DEV_DOOR_HOST = 'dev.algedonic.dev';
+// infra/cluster/dns/access.toml — and the Rust test
+// the_dev_door_is_an_access_ssh_application.rs holds the data file to
+// the route the connector serves, so a drift is a red test rather than
+// a terminal block that opens nothing.
+import devDoor from './dev-door.json';
+
+export const DEV_DOOR_HOST: string = devDoor.host;
 
 /** One line of the terminal setup, with the reason it is there: a
  *  command an operator pastes blind is a command they cannot judge. */
@@ -401,25 +429,12 @@ export type DoorStep = Readonly<{ what: string; command: string; why: string }>;
 /** The one-time terminal setup for the dev door, in order. Steps 1 and
  *  2 are done once per machine; step 3 is every session — and after
  *  step 2, so is any other ssh to the name (scp, rsync, ProxyJump),
- *  because the stanza teaches ssh itself how to reach it. */
+ *  because the stanza teaches ssh itself how to reach it. `{host}` in
+ *  the data file is the host this is given — the sheet's renderer
+ *  fills it with the file's own `host`. */
 export function devDoorSteps(host: string = DEV_DOOR_HOST): readonly DoorStep[] {
-  return [
-    {
-      what: 'Install cloudflared, once per machine',
-      command: 'cloudflared --version',
-      why: 'it is the client half of the tunnel: ssh talks to it, it talks to the edge. Not found means not installed — take it from Cloudflare downloads, or your package manager, and run this again.',
-    },
-    {
-      what: 'Teach ssh the route, once per machine',
-      command: `grep -qsF 'Match host ${host} ' ~/.ssh/config || cloudflared access ssh-config --hostname ${host} --short-lived-cert | sed '/^Add to your/d' >> ~/.ssh/config`,
-      why: `it appends a ProxyCommand stanza for ${host}; ssh then reaches it like any other host. The sed drops cloudflared's "Add to your …/.ssh/config:" banner, which ssh cannot parse, and the grep makes a second run a no-op.`,
-    },
-    {
-      what: 'Open the workspace',
-      command: `ssh root@${host}`,
-      why: 'the browser asks who you are, Access issues a certificate for the session, and the pod accepts it. Nothing long-lived is stored.',
-    },
-  ];
+  const fill = (s: string) => s.replaceAll('{host}', host);
+  return devDoor.steps.map((s) => ({ what: fill(s.what), command: fill(s.command), why: fill(s.why) }));
 }
 
 function asArray(raw: unknown): readonly unknown[] {
@@ -506,7 +521,22 @@ export function parseComparisons(raw: unknown): readonly Comparison[] {
       },
       not_ready: notReady,
       dispatcher_unread: typeof f.dispatcher_unread === 'string' ? f.dispatcher_unread : null,
+      drift: parseDrift(f.drift),
     }];
+  });
+}
+
+function parseDrift(raw: unknown): readonly DriftFinding[] {
+  return (Array.isArray(raw) ? (raw as unknown[]) : []).flatMap((x) => {
+    const d = (x ?? {}) as { id?: unknown; fields?: unknown };
+    if (typeof d.id !== 'string' || !d.fields || typeof d.fields !== 'object') return [];
+    const fields = Object.fromEntries(
+      Object.entries(d.fields as Record<string, unknown>).map(([k, v]) => {
+        const pair = (v ?? {}) as { declared?: unknown; observed?: unknown };
+        return [k, { declared: pair.declared ?? null, observed: pair.observed ?? null }];
+      }),
+    );
+    return [{ id: d.id, fields }];
   });
 }
 
@@ -608,7 +638,14 @@ export function comparisonVerdict(c: Comparison): { ok: boolean; text: string } 
     problems.push(`${k.observed_not_declared} ${selfScoped ? 'observed but not declared' : 'in the cluster but undeclared'}`);
   }
   if (k.declared_not_observed > 0) problems.push(`${k.declared_not_observed} declared but not seen`);
-  if (k.drift > 0) problems.push(`${k.drift} drifted from declaration`);
+  if (k.drift > 0) {
+    // Named as the finding names them (ab3c54d7): "1 drifted" alone sent
+    // the reader to the comparison series to learn which machine, on what.
+    const named = (c.drift ?? []).flatMap((d) =>
+      Object.entries(d.fields).map(([f, v]) => `${d.id} ${f} ${plain(v.declared)} → ${plain(v.observed)}`),
+    );
+    problems.push(`${k.drift} drifted from declaration${named.length > 0 ? ` (${named.join(', ')})` : ''}`);
+  }
   // Headroom, not paperwork: a machine out of room stops the pipeline,
   // so "no drift" must not render beside it (a520737f).
   if ((k.disk_tight ?? 0) > 0) problems.push(`${k.disk_tight} short of disk`);
@@ -632,6 +669,155 @@ export function comparisonVerdict(c: Comparison): { ok: boolean; text: string } 
 }
 
 const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
+
+/** A compared value as the finding holds it; a missing side is a dash. */
+function plain(v: unknown): string {
+  return v === null || v === undefined ? '—' : String(v);
+}
+
+// DECLARED BESIDE OBSERVED (backlog ab3c54d7; page audit 2cff1d6e, GAP
+// 7). The subtitle promises it and the machines table drew declared
+// values only: observed ones reached the page as free-disk text in
+// another section, and a drift finding — which names the machine and the
+// field — reached it as a count. Measured 2026-09-28: forge memory_gb
+// declared 30, observed 31; boss-gcp declared 15, observed 16; the page
+// said "1 drifted from declaration" twice and named neither.
+//
+// Each machine's observed side comes from the series that observes it —
+// the cluster's for a `talos-*` node (the compare's participation rule),
+// the host's own series otherwise (declaredHosts) — and a field is
+// marked from the newest comparison OF THAT SERIES, the record of what
+// was judged. No read is added: every one of these was already made.
+
+/** The table's four value columns, in order, as the registry keys them. */
+export const MACHINE_FIELDS = ['address', 'cpu', 'memory_gb', 'disk_gb'] as const;
+export type MachineField = (typeof MACHINE_FIELDS)[number];
+
+/** A value as the machines table spells it: gigabytes with a G, a
+ *  missing one as a dash, never a zero. */
+export function machineValue(field: MachineField, v: unknown): string {
+  if (v === null || v === undefined) return '—';
+  return field === 'memory_gb' || field === 'disk_gb' ? `${String(v)}G` : String(v);
+}
+
+/** What the observing series says of one machine: seen in its newest
+ *  reading; absent from it; no reading at all; or unread (the read
+ *  failed, or no source could name the series). Four answers, because
+ *  "not seen" said of an unread series is the false-empty this page
+ *  exists to refuse. */
+export type MachineSight =
+  | Readonly<{ kind: 'seen'; node: ObservedNode }>
+  | Readonly<{ kind: 'absent' }>
+  | Readonly<{ kind: 'no-reading' }>
+  | Readonly<{ kind: 'unread' }>;
+
+const observesFromCluster = (n: EstateNode): boolean => n.role.startsWith('talos-');
+
+export function machineSight(estate: EstateState, n: EstateNode): MachineSight {
+  const series = observesFromCluster(n)
+    ? estate.cluster
+    : estate.hosts.series.find((h) => h.host === n.id)?.readings;
+  if (!series || series.kind !== 'ready') return { kind: 'unread' };
+  const newest = series.data.rows[0];
+  if (!newest) return { kind: 'no-reading' };
+  const seen = newest.nodes.find((o) => o.id === n.id);
+  return seen ? { kind: 'seen', node: seen } : { kind: 'absent' };
+}
+
+/** The fields the newest comparisons name as drift for one machine —
+ *  the cluster verdict's and the host's own — or none. */
+export function machineDrift(estate: EstateState, id: string): Readonly<Record<string, DriftField>> {
+  const cluster = estate.comparisons.kind === 'ready' ? latestComparison(estate.comparisons.data, CLUSTER_SCOPE) : null;
+  const host = estate.hostComparisons.kind === 'ready'
+    ? (latestPerHost(estate.hostComparisons.data.rows).find((c) => c.host === id) ?? null)
+    : null;
+  return Object.assign(
+    {},
+    ...[cluster, host].flatMap((c) => (c?.drift ?? []).filter((d) => d.id === id).map((d) => d.fields)),
+  ) as Record<string, DriftField>;
+}
+
+export type SeenCell = Readonly<{ text: string; drift: DriftField | null }>;
+
+/** The observed half of one cell. A field the finding names shows the
+ *  value the comparison JUDGED, so the mark and the number agree even
+ *  when a newer reading has moved on. */
+export function seenCell(
+  sight: MachineSight,
+  drift: Readonly<Record<string, DriftField>>,
+  field: MachineField,
+): SeenCell {
+  const d = drift[field];
+  if (d) return { text: `seen ${machineValue(field, d.observed)} · drifted`, drift: d };
+  switch (sight.kind) {
+    case 'seen':
+      return { text: `seen ${machineValue(field, sight.node[field])}`, drift: null };
+    case 'absent':
+      return { text: 'not seen', drift: null };
+    case 'no-reading':
+      return { text: 'no reading', drift: null };
+    case 'unread':
+      return { text: 'unread', drift: null };
+  }
+}
+
+// OPEN ESTATE ALARMS (backlog 48ef9961; page audit 2cff1d6e, GAP 9). The
+// page drew amber lines and never the alarm packet that explains one:
+// measured at filing, 20 ESTATE ALARM items and one open, and this page
+// had no link at all. estate.alarm stamps every packet it files with
+// `estate_finding` — the key it dedups on, alongside `scope` and `host`
+// (estate_alarm.rs alarm_body, staleness_body, door_body) — so that key
+// is the filter, rather than `area`: measured 2026-09-28, area=estate
+// held 9 open items of which 1 was an alarm, and an ops-queue alarm
+// carries area ops-runner.
+export const OPEN_ALARMS_READ = '/api/jobs?kind=backlog-item&status=open&metadata_has=estate_finding&limit=50';
+
+export type EstateAlarm = Readonly<{
+  id: string;
+  title: string;
+  /** The raiser's key: `disk_tight:boss-gcp`, `unobserved:forge`, … */
+  finding: string | null;
+  /** The series the alarm is about — the verdict line it explains. */
+  scope: string | null;
+  host: string | null;
+  /** When it opened. */
+  at: string | null;
+}>;
+
+export type AlarmPage = Readonly<{ rows: readonly EstateAlarm[]; total: number | null }>;
+
+export function parseAlarms(raw: unknown): AlarmPage {
+  const rows = asArray(raw).map((r) => {
+    const o = r as Record<string, unknown>;
+    if (typeof o.id !== 'string') throw new Error('jobs row missing id');
+    const md = (o.metadata ?? {}) as Record<string, unknown>;
+    return {
+      id: o.id,
+      title: str(o.title) ?? '',
+      finding: str(md.estate_finding),
+      scope: str(md.scope),
+      host: str(md.host),
+      at: str(o.opened_at) ?? str(md.opened_at),
+    };
+  });
+  const total = (raw as { total?: unknown } | null)?.total;
+  return { rows, total: typeof total === 'number' ? total : null };
+}
+
+/** The open alarms on one verdict line's series: same scope, same host
+ *  (none for the cluster's). An unread alarm list puts none beside it;
+ *  its own failure line says why. */
+export function alarmsOn(alarms: Remote<AlarmPage>, scope: string, host: string | null): readonly EstateAlarm[] {
+  if (alarms.kind !== 'ready') return [];
+  return alarms.data.rows.filter((a) => a.scope === scope && a.host === host);
+}
+
+/** The line under an alarm read that holds fewer than it counted, or
+ *  null when it holds them all (or the reader did not count). */
+export function alarmCoverText(page: AlarmPage): string | null {
+  if (page.total === null || page.rows.length >= page.total) return null;
+  return `The alarm read returned ${page.rows.length} of ${page.total} open estate alarms: the rest are not listed here.`;
+}
 
 export function parseLoopPackets(raw: unknown): readonly LoopPacket[] {
   return asArray(raw).map((r) => {
@@ -716,13 +902,14 @@ export async function fetchEstate(): Promise<EstateState> {
     const plan = hostPlan(n, hc);
     return { known: plan.known, series: await Promise.all(plan.hosts.map(fetchHostSeries)) };
   });
-  const [nodes, cluster, comparisons, hostComparisons, hosts, loops] = await Promise.all([
+  const [nodes, cluster, comparisons, hostComparisons, hosts, loops, alarms] = await Promise.all([
     nodesRead,
     fetchRemote(CLUSTER_OBSERVATIONS_READ, (raw) => parseSeriesPage(raw, CLUSTER_SCOPE, null)),
     fetchRemote(CLUSTER_COMPARISON_READ, parseComparisons),
     hostCmpRead,
     hostsRead,
     nodesRead.then((n) => Promise.all(loopPlan(n).map(fetchLoop))),
+    fetchRemote(OPEN_ALARMS_READ, parseAlarms),
   ]);
-  return { nodes, cluster, comparisons, hostComparisons, hosts, loops };
+  return { nodes, cluster, comparisons, hostComparisons, hosts, loops, alarms };
 }

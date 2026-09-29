@@ -9,6 +9,7 @@
   // (ActivityTimeline, AccountTeamPanel, NotesPanel) live in sibling
   // components; everything else stays inline.
 
+  import ClassesReadFailed from '@boss/web-kit/ui/ClassesReadFailed.svelte';
   import { onMount } from 'svelte';
   import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
@@ -365,6 +366,7 @@
                   <dt>Location</dt><dd>{account.city}, {account.state}</dd>
                   <dt>Customer since</dt><dd>{account.customer_since}</dd>
                 </dl>
+                <ClassesReadFailed subjectKind="account" what="account tiers" fallback="Tiers show by code, not by their registry names." />
             </Section>
             {#if devices.length > 0}
               <!-- Equipment summary — only renders when the

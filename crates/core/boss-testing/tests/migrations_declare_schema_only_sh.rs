@@ -462,7 +462,9 @@ fn a_migration_that_deletes_a_workflow_or_updates_a_subject_kind_is_refused() {
         &format!("{SCHEMA}/{NEW_REGISTRY_REWRITE}:4 updates subject_kinds"),
         "infra/platform/workflows/",
         "jobs.kind.retired",
-        "no write door",
+        // the SubjectKind door, and the fact it leaves (backlog abc2e9d5)
+        "PATCH /api/subject-kinds/{kind}/metadata",
+        "subject_kind.updated",
     ] {
         assert!(
             msg.contains(expect),

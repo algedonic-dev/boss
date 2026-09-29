@@ -29,6 +29,44 @@
 #   url-token          a 40-hex Forgejo/Gitea token embedded in a URL
 #                      as basic-auth
 #   gcp-sa-json        GCP service-account JSON markers
+#   role-password      the SQL password keyword followed by a literal in
+#                      any quoting ('…', E'…', U&'…', $$…$$, $tag$…$tag$)
+#                      — the shape migration 111 shipped, a LOGIN role
+#                      whose password was its own name, which no rule
+#                      above could see: token-assignment wants 32+ chars
+#                      after `=`/`:`, and SQL spells neither (backlog
+#                      7ec7113b). A migration runs on every database the
+#                      tree deploys to, so a literal there is one
+#                      credential shared by every instance and every
+#                      reader. The keyword is matched on its own, not
+#                      beside CREATE/ALTER ROLE, so a statement that
+#                      breaks the line before it and CREATE GROUP are
+#                      both seen (adversarial review, 2026-09-28).
+#                      `PASSWORD NULL`, a psql variable, a format()
+#                      placeholder and the quote_literal() idiom carry
+#                      no value and pass. The match runs to the closing
+#                      quote so the redaction takes the whole value.
+#   url-password       a literal password in a URL's userinfo, any
+#                      scheme — the shape the deleted gateway drop-in
+#                      (infra/gateway/audit-events.conf) carried for six
+#                      weeks, `postgres://<role>:<role>@…`, which
+#                      url-token could not see: it wants http(s) and a
+#                      40-hex value (backlog 9be722f0). A password that
+#                      is interpolated or formatted in (`$`, `{`, `%`),
+#                      an <angle> stand-in, already redacted (`***`), or
+#                      the field's own name (`pass`, `p`, `password`)
+#                      carries no value and passes — see
+#                      url_password_placeholder. The published demo
+#                      `boss:boss` and the tests' planted values go
+#                      through the allow-list, one named file each. The
+#                      password stops at `/` as well as `@`,
+#                      because RFC 3986 userinfo cannot hold one — so
+#                      `http://host:7910/…/someone@example.org` is a
+#                      port and a path, not a credential.
+#   psql-set-password  a psql `\set` of a variable whose name holds
+#                      `pass` or `pw`, to a quoted or bare literal (same
+#                      backlog item). `:'var'` and a backtick command
+#                      carry no value and pass.
 #
 # False positives are expected in fixtures and seeds. They go in
 # infra/lint/no-secrets-allow.txt as `path:pattern-id`, each with a
@@ -63,7 +101,7 @@ cd "$LINT_DIR/../.." || exit 1
 LINT=no-secrets
 REPO_ALLOW_FILE="infra/lint/no-secrets-allow.txt"
 
-PATTERN_IDS="private-key kubeconfig-data talos-cert-bundle wireguard-key token-assignment url-token gcp-sa-json"
+PATTERN_IDS="private-key kubeconfig-data talos-cert-bundle wireguard-key token-assignment url-token gcp-sa-json role-password url-password psql-set-password"
 
 # One ERE per pattern-id. Two constraints shape how these are written:
 # they must run identically under grep -E and sed -E on both BSD and
@@ -91,6 +129,25 @@ regex_for() {
             printf '%s' 'https?://[^/[:space:]:]+:[0-9a-f]{40}@' ;;
         gcp-sa-json)
             printf '%s' '"private_key_id"[[:space:]]*:|"private_key"[[:space:]]*:[[:space:]]*"?-----BEGIN' ;;
+        role-password)
+            # Case spelled out in classes for the same BSD-sed reason as
+            # token-assignment — which is also why this line cannot match
+            # itself. The value must OPEN with a quote (or a dollar tag)
+            # right after the keyword and carry a non-space first
+            # character, so `PASSWORD NULL`, `PASSWORD :'var'` (psql),
+            # `PASSWORD %L` (format) and `' PASSWORD ' || quote_literal(…)`
+            # pass. The tail consumes the value to its close, for the
+            # redaction (the reviewer's ERE, 2026-09-28, plus that tail).
+            printf '%s' "(^|[[:space:]])[pP][aA][sS][sS][wW][oO][rR][dD][[:space:]]+([eE]|[uU]&)?('[^' ][^']*'?|[\$][A-Za-z_]*[\$][^\$]*[\$]?[A-Za-z_]*[\$]?)" ;;
+        url-password)
+            # Cannot match itself: after `://` its own text has `[`, and
+            # the user class ends at the `/` that follows it. Which hits
+            # are placeholders is url_password_placeholder's call.
+            printf '%s' '[a-z][a-z0-9+.-]*://[^/:@[:space:]]+:[^/@[:space:]]+@' ;;
+        psql-set-password)
+            # The value must open with a quote carrying a character, or
+            # with a letter or digit — so `:'var'` and a backtick pass.
+            printf '%s' "[\\]set[[:space:]]+[A-Za-z0-9_]*([pP][aA][sS][sS]|[pP][wW])[A-Za-z0-9_]*[[:space:]]+('[^']+'?|[A-Za-z0-9][^[:space:]]*)" ;;
     esac
 }
 
@@ -99,6 +156,29 @@ regex_for() {
 # word. Everything else that is still a false positive (committed test
 # fixtures, seeds) goes through the allow-list, visibly.
 PLACEHOLDER_RE='(\$\{|<[^>]*>|xxx|example|changeme|change-me|change_me|dummy|placeholder|not-?a-?real|fake)'
+
+# url_password_placeholder <content> — 0 iff EVERY url-password match on
+# the line carries no value: a password that is a shell/env variable
+# (`$pw`, `${PGPASSWORD}`), a format placeholder (`{password}`, `%s`), an
+# <angle-bracket> stand-in, already redacted (`***`), or the word that
+# names the field (`user:pass`, `u:p` — how a comment or a refusal spells
+# the URL's shape). One real value among them fails the line.
+# Narrower than PLACEHOLDER_RE on purpose — it judges the password, not
+# the line, so `example` in a hostname cannot excuse a literal.
+url_password_placeholder() {
+    local regex m pw
+    regex=$(regex_for url-password)
+    while IFS= read -r m; do
+        pw=${m#*://}
+        pw=${pw#*:}
+        pw=${pw%@}
+        case "$pw" in
+            *'$'* | *'{'* | *'%'* | '***' | '<'*'>' | p | pass | password) ;;
+            *) return 1 ;;
+        esac
+    done < <(grep -oE -e "$regex" <<< "$1")
+    return 0
+}
 
 # ---------------------------------------------------------------------
 # Engine
@@ -170,6 +250,10 @@ scan_paths() {
                 grep -qiE "$PLACEHOLDER_RE" <<< "$content"; then
                 continue
             fi
+            if [ "$id" = "url-password" ] &&
+                url_password_placeholder "$content"; then
+                continue
+            fi
             if allowed "$file" "$id" "$allow"; then
                 printf '%s\n' "${file}:${line} [${id}]" >> "$supp_out"
             else
@@ -211,6 +295,20 @@ self_test() {
         _id "$hex" > "$tmp/fx-gcp-sa-json"
     printf 'password = "%s"  # example value, must not be flagged\n' \
         "$hex" > "$tmp/fx-placeholder"
+    printf 'DO $$ BEGIN CREATE ROLE app LOGIN PASSWORD %s%s%s; END $$;\n' \
+        "'" "$hex" "'" > "$tmp/fx-role-password"
+    # The spelling that carries no value — the one the migration that
+    # neutralised 111's role uses — must pass.
+    printf 'ALTER ROLE app NOLOGIN PASSWORD NULL;\n' > "$tmp/fx-role-nopassword"
+    # The deleted gateway drop-in's line shape (backlog 9be722f0), with
+    # the planted value where its role name stood.
+    printf 'Environment=BOSS_GATEWAY_AUDIT_DB_URL=postgres://%s:%s@127.0.0.1/boss\n' \
+        audit "$hex" > "$tmp/fx-url-password"
+    # The same URL with its password interpolated carries no value.
+    printf 'DB=postgres://audit:%s@127.0.0.1/boss\n' '${AUDIT_PASSWORD}' \
+        > "$tmp/fx-url-nopassword"
+    printf '%sset gateway_password %s%s%s\n' '\' "'" "$hex" "'" \
+        > "$tmp/fx-psql-set-password"
 
     # Run 1: empty allow-list — every pattern must catch its fixture,
     # the placeholder must not fire, and no output line may contain
@@ -225,6 +323,14 @@ self_test() {
     done
     if grep -q 'fx-placeholder' "$viol"; then
         echo "no-secrets self-test FAIL: placeholder fixture was flagged" >&2
+        fails=1
+    fi
+    if grep -q 'fx-role-nopassword' "$viol"; then
+        echo "no-secrets self-test FAIL: a role statement carrying PASSWORD NULL was flagged" >&2
+        fails=1
+    fi
+    if grep -q 'fx-url-nopassword' "$viol"; then
+        echo "no-secrets self-test FAIL: a URL whose password is a variable was flagged" >&2
         fails=1
     fi
     # Grep for short PREFIXES of the planted material: a leak clipped
@@ -256,7 +362,9 @@ self_test() {
         echo "no-secrets: self-test FAILED — the detectors cannot be trusted, fix them first" >&2
         exit 1
     fi
-    echo "no-secrets: self-test ok — 7/7 patterns caught, placeholder skipped, allow-list suppression visible, no fixture material leaked"
+    local n
+    n=$(set -- $PATTERN_IDS; echo $#)
+    echo "no-secrets: self-test ok — ${n}/${n} patterns caught, placeholder skipped, allow-list suppression visible, no fixture material leaked"
 }
 
 # ---------------------------------------------------------------------

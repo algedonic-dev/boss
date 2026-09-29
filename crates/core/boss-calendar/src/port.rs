@@ -160,11 +160,69 @@ pub trait CalendarClient: Send + Sync {
     /// upsert plus a DELETE-and-reinsert of the closed days, and the
     /// tenant publish runs at every boot, so an operator's edit to a
     /// calendar lived until the next converge.
+    ///
+    /// Each code the call CHANGES records one [`published_fact`] signed
+    /// by `stamp` — the actor the door's policy ladder resolved — in the
+    /// write's own transaction; a code it leaves as it was is neither
+    /// written nor recorded (backlog 05f61acf).
     async fn publish_business_calendars(
         &self,
         calendars: &[BusinessCalendar],
         mode: PublishMode,
+        stamp: &EventStamp,
     ) -> Result<BusinessCalendarsOutcome, CalendarError>;
+}
+
+/// The fact publishing `declared` leaves, given what the store `held`
+/// for its code — and so whether the adapter writes at all: `None` is
+/// "nothing changes, write nothing" (a kept row under the default, or a
+/// take that restates the held row). One builder for both adapters, so
+/// the in-memory double records exactly what the Pg adapter stages.
+///
+/// WHY (backlog 05f61acf, 2026-09-28). The batch door asked policy and
+/// dropped the actor the ladder resolved, and the publish staged no
+/// event (06590554), so a `?mode=take` that replaced a held calendar's
+/// closed-day set — the days the dispatcher's timing triggers count
+/// business days from — left no row, event or log line naming who did
+/// it. The payload carries the row as written (value-primary: a
+/// rebuilder needs nothing else), `mode`, and the signer under
+/// `declared_by` / `updated_by`, read from the stamp so it is the value
+/// `_actor` carries.
+pub fn published_fact(
+    stamp: &EventStamp,
+    held: Option<&BusinessCalendar>,
+    declared: &BusinessCalendar,
+    mode: PublishMode,
+) -> Result<Option<boss_core::event::Event>, CalendarError> {
+    let row = |extra: serde_json::Value| -> Result<serde_json::Value, CalendarError> {
+        let mut payload =
+            serde_json::to_value(declared).map_err(|e| CalendarError::Storage(e.to_string()))?;
+        if let (serde_json::Value::Object(map), serde_json::Value::Object(more)) =
+            (&mut payload, extra)
+        {
+            map.insert("mode".into(), mode.as_str().into());
+            map.extend(more);
+        }
+        Ok(payload)
+    };
+    let signer = stamp.actor().to_string();
+    match held {
+        None => Ok(Some(stamp.event(
+            crate::events::BUSINESS_CALENDAR_DECLARED,
+            row(serde_json::json!({ "declared_by": signer }))?,
+        ))),
+        Some(held) if mode.is_take() => {
+            let changes = calendar_changes(held, declared);
+            if changes.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(stamp.event(
+                crate::events::BUSINESS_CALENDAR_UPDATED,
+                row(serde_json::json!({ "changes": changes, "updated_by": signer }))?,
+            )))
+        }
+        Some(_) => Ok(None),
+    }
 }
 
 /// What a business-calendar batch did: rows received, rows inserted,

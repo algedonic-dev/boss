@@ -43,6 +43,29 @@ describe('fetchPaged', () => {
     expect(res.kind).toBe('failed');
     if (res.kind === 'failed') expect(res.error).toContain('Failed to fetch');
   });
+
+  // Backlog 0ef5e008. A 200 that is not the envelope is not a read that
+  // said "no rows": `normalise` turned it into an empty page, and the
+  // page painted it as an empty source — or, before that car, as "No X
+  // match those filters." It is a failed read naming what came back.
+  it.each([
+    ['a bare list', [1, 2], 'the body is a list'],
+    ['an object with no data list', { rows: [] }, 'the body is an object with no data list'],
+    ['null', null, 'the body is null'],
+  ])('a 200 body that is %s is failed, never an empty page', async (_, body, what) => {
+    stubFetch(async () => new Response(JSON.stringify(body), { status: 200 }));
+    const res = await fetchPaged<number>('/api/things');
+    expect(res).toEqual({
+      kind: 'failed',
+      error: `/api/things: HTTP 200, but ${what}, not a {data: [...]} envelope`,
+    });
+  });
+
+  it('a 200 envelope with no rows is the one empty page', async () => {
+    stubFetch(async () => new Response(JSON.stringify({ data: [], total: 0 }), { status: 200 }));
+    const res = await fetchPaged<number>('/api/things');
+    expect(res).toEqual({ kind: 'ready', page: { data: [], total: 0, limit: 0, offset: 0 } });
+  });
 });
 
 describe('normalise', () => {

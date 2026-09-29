@@ -95,10 +95,25 @@ pub fn env_override() -> Option<String> {
     override_from(std::env::var(PLATFORM_OWNER_ENV).ok())
 }
 
-/// One holder of the role, as the registry answers it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The roster read every adapter sends, relative to the people
+/// service's base: the active holders of the role. Two adapters send it
+/// — the people client's (Tier 2, for every filer) and the gateway's
+/// (Tier 1, which may not depend on the people client; it asks who owns
+/// the platform before it elevates a session, backlog 3c92c5b8) — so it
+/// is spelled once, here (CLAUDE.md §9a).
+pub fn roster_path() -> String {
+    format!(
+        "/api/people?role={}&status=active",
+        crate::roles::PLATFORM_ADMIN_ROLE
+    )
+}
+
+/// One holder of the role, as the registry answers it. Deserialises
+/// from a roster row, reading only these two fields.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct Holder {
     pub id: String,
+    #[serde(default)]
     pub hire_date: Option<NaiveDate>,
 }
 

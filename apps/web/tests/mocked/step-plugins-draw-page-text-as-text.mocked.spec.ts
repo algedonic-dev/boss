@@ -249,7 +249,9 @@ test('incident-review draws the findings, each step and a refusal as text', asyn
         },
       ],
     },
-    '/api/jobs/job-1/steps': THROWS(`refused ${PAYLOAD}`),
+    // The completion is a status-only PUT to the step's own resource
+    // (backlog e39a9d2a); it no longer reads the steps list first.
+    '/api/jobs/job-1/steps/step-review': THROWS(`refused ${PAYLOAD}`),
   });
   for (const drawn of ['incident', 'when', 'summary', 'timeline', 'by', 'found']) {
     await drawnAsText(page, errs, `${drawn} ${PAYLOAD}`);

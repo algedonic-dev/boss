@@ -1,0 +1,109 @@
+# ---------------------------------------------------------------------
+# The credential broker mints the org-admin token the GitHub verbs act
+# with on algedonic-dev, WHEN A REQUEST FOR ONE IS FILED (design 76c46869,
+# David 2026-09-28; backlog bf8726c9). THIS RULE AND ITS TWIN ARE THE
+# CREDENTIAL'S CONSUMER DECLARATION, the convention of
+# `broker-rotates-the-github-dr-push-token`: registry id
+# `github-app-algedonic-dev`, Secret boss/github-app-algedonic-dev key
+# `token-<ops-request id>`, minted from the GitHub App root as a one-hour INSTALLATION
+# TOKEN with administration:write, contents:write and metadata:read on
+# every repository the algedonic-dev installation holds, proven by
+# reading algedonic-dev/boss.
+#
+# MINTED PER ACT, NEVER KEPT ALIVE (design 76c46869 Q1, decided B). No
+# clock re-mints this token. It is minted on the two moments a GitHub act
+# needs it — here, when an ops-request naming a verb that runs
+# infra/forge/github-act.sh is filed (the `--plan` half loads the token
+# too, before any approval exists), and in
+# `broker-re-mints-the-algedonic-dev-admin-token-when-a-github-request-is-approved`
+# when that request's plan is approved — and the verb revokes it once
+# its write has read GitHub back. Outside those moments no admin token
+# that has not expired exists anywhere. The DR token stays separate and
+# narrow: it is a standing credential by necessity (its push runs on a
+# clock), and widening it would put admin power on every DR push.
+#
+# WHY THE REFRESH PATH, AND WHY 59. The handler's `phase = "refresh"`
+# mints when the Secret holds no token or fewer than
+# `refresh_within_minutes` remain, needs no packet, and records ONE
+# `credential.installed` event naming the triggering event. The act
+# before this one revoked the token the Secret holds and set its recorded
+# expiry to now (github-act.sh, after its write) — but a verb that died
+# between its act and that write leaves a revoked token under a live
+# expiry, so the filing mints for anything but a token minted in the last
+# minute: 59 is the widest window the handler accepts (it refuses 60 and
+# over — a token lives 60), and a token newer than a minute was minted
+# for a request filed alongside this one. Keyed per request since
+# 2026-09-29 (ONE TOKEN PER REQUEST, below), a filing finds its own key
+# empty and mints; the window now matters only to a redelivered filing.
+#
+# ONE TOKEN PER REQUEST (backlog 4ce4ec55; the review of car 57a2c56e,
+# finding 1). `request_id` names the ops-request this firing serves — the
+# filed Job's `id` here, the approved request's `job_id` in the twin —
+# and the handler keys the token `token-<request id>` (with its
+# `.expires-at` and `.minted-for` beside it) instead of the one `token`
+# key the owner had. With one key, two writes approved before the first
+# ran shared a token: approval 2 found it fresh and minted nothing, write
+# 1 revoked it, and write 2 was stranded with its single-use approval
+# spent. Now every request mints on filing into a key nobody else reads,
+# and github-act.sh renders and revokes the key of the request it answers
+# (the runner's OPS_REQUEST_ID), so one act's revoke cannot reach another
+# request's token. The Secret and the broker's name-scoped grant are
+# unchanged: keys are data inside the one Secret.
+#
+# NO REPOSITORIES NAMED (design 76c46869 Q3). A repository being created
+# cannot be named in advance, and GitHub refuses to narrow a token to a
+# repository the installation cannot see. `verify_repo` is
+# algedonic-dev/boss, which the installation holds (measured by triage
+# run 4011ab5f, 2026-09-28: GET /orgs/algedonic-dev/repos answers it).
+#
+# WHICH REQUESTS. `jobs.job.created` carries the serialized Job, so its
+# `metadata.verb` is the request's verb. The list below is every verb in
+# infra/ops/verbs/ whose argv runs infra/forge/github-act.sh — the three
+# writes and their three plan verbs — pinned equal to that directory by
+# crates/core/boss-dispatcher/tests/github_app_installation_token_rules.rs,
+# so a GitHub verb added there without a line here fails the gate rather
+# than acting with a token nobody minted. `publish-github-pr` is not one:
+# it pushes through its own publish credential.
+#
+# WHICH ORGANISATION. Only a request whose first argument — the owner, in
+# all six GitHub verbs — is `algedonic-dev`, exactly as github-act.sh
+# selects its slot (`metadata.args.0`). Until 2026-09-29 a request naming
+# another owner minted this organisation's admin token, which then lived
+# its hour unused, since the verb reads that other owner's slot (review
+# of car 0660454c; backlog bf8726c9). The owner here and the one in
+# `credential_id` are one fact, pinned by the same test.
+#
+# THE CONSUMER is off the cluster: github-act.sh on the forge host reads
+# /etc/boss-publish/github-app/algedonic-dev.token, which
+# infra/forge/credential-render.sh renders from this Secret: the verb
+# renders its own slot before it reads it, finding this rule by its
+# `credential_id`, from the key of the request it answers, and after a
+# write marks that key's token expired and revokes it. The Secret is created EMPTY by the cluster converge from this
+# file's secret_namespace / secret_name (cluster-deploy-lib.sh
+# ensure_declared_secrets); the broker's name-scoped grant on it is
+# `credential-broker-github-app` in
+# infra/cluster/manifests/boss-credential-broker.yaml. The registry row
+# `github-app-algedonic-dev` is instance data (POST
+# /api/credentials/batch), and until it is declared every firing refuses
+# before anything is minted, naming the row.
+[[rule]]
+name = "broker-mints-the-algedonic-dev-admin-token-when-a-github-request-is-filed"
+why = """
+EXTERNAL GLUE, the census class for reactions whose effect lives outside
+the system: the broker speaks to GITHUB's App API (the installation-token
+exchange) and the k8s Secret store, neither of which a Workflow
+definition can address. The ops-request protocol cannot mint a
+credential for its own act; this rule mints the one its GitHub verbs
+read, on the request that needs it. It adds no routing and spawns
+nothing: it fills one Secret and records credential.installed. Design
+76c46869 (2026-09-28): a token minted per act, never kept alive.
+"""
+# v2 (backlog 732c3cf9, 2026-09-29): the org filter (#808) and
+# `request_id` (#819) were edited in at v1, so the seed kept the v1 row
+# and neither was live. A content edit is a version bump.
+version = 2
+on_event = "jobs.job.created"
+when = 'kind = "ops-request" AND metadata.args.0 = "algedonic-dev" AND (metadata.verb = "github-create-repository" OR metadata.verb = "github-delete-refs" OR metadata.verb = "github-set-branch-protection" OR metadata.verb = "plan-a-github-repository" OR metadata.verb = "plan-a-github-ref-delete" OR metadata.verb = "plan-a-github-branch-protection")'
+[[rule.do]]
+handler = "credential.rotate.github-app-installation"
+args = { phase = "\"refresh\"", refresh_within_minutes = "\"59\"", secret_namespace = "\"boss\"", secret_name = "\"github-app-algedonic-dev\"", secret_key = "\"token\"", credential_id = "\"github-app-algedonic-dev\"", verify_repo = "\"algedonic-dev/boss\"", permissions = "\"administration:write,contents:write,metadata:read\"", request_id = "id" }

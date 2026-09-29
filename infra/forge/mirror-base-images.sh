@@ -107,11 +107,74 @@ pull_with_retry() {
     done
 }
 
+# THE READ-BACK (backlog 1058e686, car E). `done` used to follow three
+# exit codes — pull, tag, push — and nothing asked the registry what the
+# tag now serves: a push that answered 0 over a tag still serving an
+# older manifest printed done. So after each push, three reads:
+#   1. the forge tag is, locally, the very image the pull brought (the
+#      same image id as the source ref) — the tag did not name another;
+#   2. the digest that PULLED image records for the forge repository
+#      (RepoDigests; docker writes `<repo>@sha256:…` when a push lands) —
+#      what this push sent, as docker computed it from the pulled bytes;
+#   3. the REGISTRY, twice: the manifest it holds at that digest, and the
+#      manifest its TAG serves — which must be the same manifest.
+# The comparison is manifest to manifest in the forge's own registry,
+# never the forge's digest against the SOURCE registry's: a push may
+# re-encode a manifest (an OCI index pulled, one platform pushed), so the
+# source's digest can differ from a faithful mirror's, and a read-back
+# that failed every honest run would be read as noise. `--insecure`
+# because the forge registry is plain HTTP on the LAN (the reason
+# prune-registry-tags.lib.sh gives). No answer is CANNOT ANSWER and a
+# different answer is FAILED. NEITHER STOPS THE LOOP (review of car E,
+# run 7fe34bd7): the store a daemon keeps decides what RepoDigests holds
+# — under the containerd image store it is the pulled INDEX digest, which
+# a single-platform push never sends — so a read-back that exited on the
+# first image would leave every later image unmirrored, and the mirror
+# is the tool that repairs a missing base. Every image is pushed and read
+# back; the run then exits 1 naming each one that did not read back, and
+# prints `done`, its declared effect, only when all of them did.
+read_back() { # <source ref> <forge ref>
+    local ext="$1" forge="$2" repo="${2%:*}" src_id="" dst_id="" digest="" line="" by_digest="" by_tag=""
+    if ! src_id=$(docker image inspect --format '{{.Id}}' "$ext" 2>&1) \
+        || ! dst_id=$(docker image inspect --format '{{.Id}}' "$forge" 2>&1); then
+        echo "mirror-base-images: CANNOT ANSWER — pushed $forge, but the local images could not be read back: $src_id $dst_id" >&2
+        return 1
+    fi
+    if [ -z "$src_id" ] || [ "$src_id" != "$dst_id" ]; then
+        echo "mirror-base-images: FAILED — $forge is local image ${dst_id:-none}, not the pulled $ext (${src_id:-none}); nothing vouches that the push sent what the pull brought" >&2
+        return 1
+    fi
+    while IFS= read -r line; do
+        case "$line" in "$repo@sha256:"*) digest="${line#"$repo"@}" ;; esac
+    done < <(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$ext" 2>/dev/null || true)
+    if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        echo "mirror-base-images: CANNOT ANSWER — pushed $forge, but the pulled $ext records no digest for $repo (RepoDigests), so there is nothing to compare the registry with" >&2
+        return 1
+    fi
+    if ! by_digest=$(docker manifest inspect --insecure "$repo@$digest" 2>&1); then
+        echo "mirror-base-images: CANNOT ANSWER — pushed $forge, but the registry gave no manifest at $repo@$digest, the digest the pulled image records: $by_digest" >&2
+        return 1
+    fi
+    if ! by_tag=$(docker manifest inspect --insecure "$forge" 2>&1); then
+        echo "mirror-base-images: CANNOT ANSWER — pushed $forge, but the registry gave no manifest for the tag: $by_tag" >&2
+        return 1
+    fi
+    if [ -z "$by_tag" ] || [ "$by_tag" != "$by_digest" ]; then
+        echo "mirror-base-images: FAILED — the push of $forge exited 0, but the registry's tag serves a different manifest than $repo@$digest, the digest the pulled $ext records — the tag was not moved to what was pushed" >&2
+        return 1
+    fi
+    echo "mirror-base-images: read back $forge — the registry's tag serves $digest, the digest the pulled $ext records for it"
+}
+
 count=0
 skipped=0
+unread=()
 while IFS='|' read -r ext dst; do
     forge="$REGISTRY_BASE/$dst"
-    if $ONLY_MISSING && docker manifest inspect "$forge" >/dev/null 2>&1; then
+    # `--insecure`: the forge registry is plain HTTP, and without it the
+    # CLI asks over HTTPS, is refused, and reads every tag as absent — so
+    # every converge re-pulled all ten public bases (review of car E).
+    if $ONLY_MISSING && docker manifest inspect --insecure "$forge" >/dev/null 2>&1; then
         echo "mirror-base-images: $forge already in the registry — skipped"
         skipped=$((skipped + 1))
         continue
@@ -121,10 +184,17 @@ while IFS='|' read -r ext dst; do
     docker tag "$ext" "$forge" || { echo "mirror-base-images: tag FAILED: $ext -> $forge" >&2; exit 1; }
     docker push "$forge"      || { echo "mirror-base-images: push FAILED (registry auth? DOCKER_CONFIG=$DOCKER_CONFIG): $forge" >&2; exit 1; }
     count=$((count + 1))
+    read_back "$ext" "$forge" || unread+=("$forge")
 done < <(mappings)
 
+# The done line is the verb's declared `effect`: it prints only when
+# every pushed tag read back above.
+if [ "${#unread[@]}" -gt 0 ]; then
+    echo "mirror-base-images: FAILED — pushed ${count} image(s) to ${REGISTRY_BASE}, and ${#unread[@]} did not read back from the registry (each named above): ${unread[*]}" >&2
+    exit 1
+fi
 if $ONLY_MISSING; then
-    echo "mirror-base-images: done — ${count} image(s) mirrored to ${REGISTRY_BASE} (${skipped} already in the registry)"
+    echo "mirror-base-images: done — ${count} image(s) mirrored to ${REGISTRY_BASE}, each read back from the registry at the digest its pulled source records (${skipped} already in the registry)"
 else
-    echo "mirror-base-images: done — ${count} image(s) mirrored to ${REGISTRY_BASE}"
+    echo "mirror-base-images: done — ${count} image(s) mirrored to ${REGISTRY_BASE}, each read back from the registry at the digest its pulled source records"
 fi

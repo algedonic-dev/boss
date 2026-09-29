@@ -30,19 +30,15 @@
 #      step is ready, and takes the PR's head sha and url off its
 #      completed `open-pr` step — the sha publish-github-pr RECORDED
 #      when it pushed (`snapshot_commit`), never re-derived;
-#   2. reads GET /repos/<mirror>/commits/<head>/check-runs — the
-#      mirror is public, so no credential — and WAITS until the
-#      code-scanning checks are completed: the check named $SCAN_CHECK
+#   2. reads GET /repos/<mirror>/commits/<head>/check-runs ONCE — the
+#      mirror is public, so no credential — and reads the scan when the
+#      code-scanning checks have completed: the check named $SCAN_CHECK
 #      and its `Analyze (…)` jobs (Analyze (rust) took 13 min on both
-#      #238 and #239), polling every $POLL seconds up to $DEADLINE,
-#      which is below the verb's allowlist timeout so the script's own
-#      FAILED line is what the packet sees, never the runner's kill.
-#      ONLY those, since backlog d167e7d7 (2026-09-23): the mirror now
-#      runs the full infra/gate.sh on every PR (car 5ede7044), cold on a
-#      4-vCPU GitHub runner with a 180-minute timeout, which outlasts
-#      $DEADLINE — so waiting for EVERY check-run held the forge's
-#      serial ops-runner for 25 minutes and then failed the read with
-#      complete=false;
+#      #238 and #239). A head with no check-runs yet, or with those
+#      still running, is NOT YET: the partial reading goes on the
+#      packet, the step stays open, and the verb exits 75 at once
+#      (backlog b81ff4ca — see THE RUNNER IS NEVER HELD below). A
+#      GitHub that cannot be read is a FAILED line, never a not-yet;
 #   2b. BUT THE STEP COMPLETES ONLY ON EVERY CHECK (backlog c6cb678b,
 #      2026-09-24). d167e7d7 reasoned that `judge-checks` reads nothing
 #      but the scan, and so completed the step with the gate still
@@ -76,27 +72,32 @@
 #      `rules`. The protocol's `judge-checks` step then asks the agent
 #      for a disposition per rule; the merge on GitHub stays David's.
 #
-# THE WAIT BLOCKS THE FORGE'S OPS-RUNNER, and that is a stated cost, not
-# an accident: the runner is a one-minute oneshot that answers requests
-# serially, so for the length of this wait no other forge request is
-# answered (a converge request is delayed, not lost — its own timers
-# fire every ten minutes). The alternatives were measured and declined
-# for now: a cadence rule that re-files the request every few minutes
-# leaves a closed no-op packet per firing behind while a publish waits
-# at approval (days, on 2026-09-17), and a detached unit that reports
-# later has no rule that can alert on its failure. A publish happens
-# at most once a day and its checks take ~15 minutes; revisit if the
-# runner's queue shows the delay.
+# THE RUNNER IS NEVER HELD (backlog b81ff4ca, 2026-09-28). The forge's
+# ops-runner is a one-minute oneshot that answers requests serially, so
+# for as long as this verb runs no other forge request is answered.
+# Until this change the verb WAITED in-verb for the scan — polling every
+# 60 s up to 1500 s — under a header that called the wait a stated cost
+# "to revisit if the runner's queue shows the delay". It showed it:
+# read-publish-checks 444d0f22 held the runner 786 s, waited out
+# Analyze (rust), then exited 75 on the mirror's Gate anyway, while
+# eight requests queued behind it (depth 8, oldest wait 748 s — a train
+# converge and six car probes among them) and ops.queue.alarm 2163a4c5
+# fired on a runner that was busy, not silent. The reason the wait was
+# kept — that a cadence rule re-filing the request would leave a no-op
+# packet per firing — had already gone: the re-reads below file this
+# verb every fifteen minutes anyway. So the scan is waited for the way
+# every other check is: one reading, not yet, and the next re-read. The
+# cost, stated: the scan's verdict reaches the packet up to fifteen
+# minutes after it concludes, once per publish, against a runner held
+# thirteen minutes for every other forge request.
 #
-# The re-reads (2b) take that declined cadence back, for the checks
-# slower than the scan: unconditional, with the idempotence here — a
-# firing with no packet waiting answers `nothing to do`, as mirror-drift
-# does on a quiet day. Hourly until backlog 663589cd, and every fifteen
-# minutes since, because the same firing now asks what became of each
-# publish PR (step 0) and a close must not alarm for an hour. Its cost
-# is stated: 96 ops-requests a day, almost all of them that answer. Holding this runner for a gate whose own
-# timeout is three hours was the alternative, and d167e7d7 measured
-# why not.
+# The re-reads (2b) are that cadence: unconditional, with the
+# idempotence here — a firing with no packet waiting answers `nothing
+# to do`, as mirror-drift does on a quiet day. Hourly until backlog
+# 663589cd, and every fifteen minutes since, because the same firing
+# now asks what became of each publish PR (step 0) and a close must not
+# alarm for an hour. Its cost is stated: 96 ops-requests a day, almost
+# all of them that answer.
 #
 # Idempotent: re-running for the same packet re-reads and re-PATCHes
 # the same keys; a step already completed is nothing to do.
@@ -129,19 +130,10 @@ GITHUB_API="${BOSS_GITHUB_API:-https://api.github.com}"
 # roll-up posts as one check-run named for the tool.
 SCAN_CHECK="${BOSS_CODE_SCANNING_CHECK:-CodeQL}"
 # Its per-language jobs, by name prefix — GitHub's CodeQL setup names
-# them `Analyze (rust)`, `Analyze (javascript-typescript)`. The wait
-# covers these and $SCAN_CHECK, nothing else (backlog d167e7d7).
+# them `Analyze (rust)`, `Analyze (javascript-typescript)`. Until these
+# and $SCAN_CHECK have completed the reading is not yet (backlog
+# d167e7d7).
 SCAN_JOBS="${BOSS_CODE_SCANNING_JOBS:-Analyze (}"
-POLL="${BOSS_CHECKS_POLL_SECONDS:-60}"
-DEADLINE="${BOSS_CHECKS_DEADLINE_SECONDS:-1500}"
-# A bound on the wait counted in POLLS, beside the wall-clock one; 0 (the
-# default, and the forge's) is no bound, so $DEADLINE alone governs there.
-# It exists for the tests (backlog 167f26e3): they poll with no sleep, and
-# a case that must see N polls before giving up cannot be bounded in
-# seconds — a loaded pod took seven over ONE poll (2026-09-23, load 124),
-# so a three-second deadline sometimes allowed one poll and sometimes
-# hundreds. A count is the same number on an idle pod and a loaded one.
-MAX_POLLS="${BOSS_CHECKS_MAX_POLLS:-0}"
 # THE CEILING on a check still running after the scan is read, counted
 # from the instant `open-pr` completed (backlog c6cb678b). Four hours:
 # the mirror gate's own `timeout-minutes: 180` in .github/workflows/
@@ -162,6 +154,15 @@ fail() { echo "$me: FAILED — $*" >&2; exit 1; }
 workdir=$(mktemp -d) || { echo "$me: FAILED — no working directory under ${TMPDIR:-/tmp}" >&2; exit 1; }
 trap 'rm -rf "$workdir"' EXIT
 
+# The machine token rides to curl in a 0600 file, never in its argv,
+# where every local user reads it in ps (backlog 5f3ad356). Made here,
+# in the script's own shell and after the trap above, because the reads
+# below run inside $(…).
+# shellcheck source=infra/lib/secret-header.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/secret-header.sh"
+secret_header MT_HDR ${BOSS_MACHINE_TOKEN:+"x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+    || fail "the machine token's header file could not be written"
+
 check_inputs() {
     local rc=0
     for tool in curl jq; do
@@ -173,11 +174,8 @@ check_inputs() {
         */*) ;;
         *) echo "$me: BOSS_MIRROR_SLUG '$MIRROR_SLUG' is not owner/repo" >&2; rc=1 ;;
     esac
-    case "${POLL:-empty}${DEADLINE:-empty}${CEILING:-empty}" in
-        *[!0-9]*) echo "$me: BOSS_CHECKS_POLL_SECONDS ($POLL), BOSS_CHECKS_DEADLINE_SECONDS ($DEADLINE) and BOSS_CHECKS_CEILING_SECONDS ($CEILING) must be whole seconds" >&2; rc=1 ;;
-    esac
-    case "${MAX_POLLS:-empty}" in
-        empty|*[!0-9]*) echo "$me: BOSS_CHECKS_MAX_POLLS ($MAX_POLLS) must be a whole number of polls (0 is no bound)" >&2; rc=1 ;;
+    case "${CEILING:-empty}" in
+        empty|*[!0-9]*) echo "$me: BOSS_CHECKS_CEILING_SECONDS ($CEILING) must be whole seconds" >&2; rc=1 ;;
     esac
     return $rc
 }
@@ -186,7 +184,7 @@ if [ "${1:-}" = "--check" ]; then
     echo "$me --check"
     echo "  mirror     : $MIRROR_SLUG via $GITHUB_API (public, unauthenticated)"
     echo "  scan check : $SCAN_CHECK, with its jobs named '$SCAN_JOBS…'"
-    echo "  wait       : every ${POLL}s up to ${DEADLINE}s for those check-runs to complete; any other still running is not yet (exit 75), re-read every 15 minutes, which also re-reads every standing publish PR's state"
+    echo "  reading    : ONE per run, never a wait; any check still running is not yet (exit 75), re-read every 15 minutes, which also re-reads every standing publish PR's state"
     echo "  ceiling    : ${CEILING}s after the PR opened, a check still running completes the step as unfinished"
     echo "  jobs api   : ${BOSS_JOBS_URL:-<unset — the ops-runner pins it on its Exec line>}"
     if check_inputs; then
@@ -265,7 +263,7 @@ job_id=$(printf '%s' "$target" | jq -r '.id')
 if [[ "${OPS_REQUEST_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
     jq -n -c --arg p "$job_id" '{for_publish: $p}' > "$workdir/for-publish"
     if curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
-            ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+            ${MT_HDR:+-H "$MT_HDR"} \
             --data-binary @"$workdir/for-publish" "$BASE/api/jobs/$OPS_REQUEST_ID/metadata" > /dev/null 2>"$workdir/err"; then
         say "request ${OPS_REQUEST_ID:0:8} names publish $job_id (for_publish)"
     else
@@ -287,7 +285,7 @@ esac
 [ -n "$pr_url" ] || refuse "packet ${job_id:0:8}: the open-pr step recorded no pr_url; nothing was read"
 say "packet ${job_id:0:8} — reading the checks on $pr_url (head ${head:0:12})"
 
-# 2. The check-runs, waited for. `SECONDS` is bash's own elapsed clock.
+# 2. The check-runs: ONE reading, never a wait (backlog b81ff4ca).
 gh_get() {
     # One GET against the public API; the body to stdout, curl's words
     # to $workdir/err. No token: the mirror is public, and this verb
@@ -295,59 +293,54 @@ gh_get() {
     curl -fsS -H "accept: application/vnd.github+json" "$GITHUB_API/repos/$MIRROR_SLUG/$1" 2>"$workdir/err"
 }
 checks="$workdir/checks.json"
-seen=0
+# A GitHub that cannot be read is a FAILURE, not a not-yet: nothing was
+# measured, and the answer rule troubles the step and alerts on it. An
+# empty 200 is no check list either — `jq` alone reads silence as a
+# pass (d96e38ab).
+if ! gh_get "commits/$head/check-runs?per_page=100" > "$checks"; then
+    fail "GET commits/${head:0:12}/check-runs — $(head -c 200 "$workdir/err" | tr '\n' ' ')"
+fi
+jq_doc_file "$checks" \
+    || fail "GET commits/${head:0:12}/check-runs answered something that is not JSON: $(head -c 200 "$checks" | tr '\n' ' ')"
+total=$(jq -r '.total_count // 0' "$checks")
+running=$(jq -r '[.check_runs[]? | select(.status != "completed") | .name] | join(", ")' "$checks")
+# The scan is read when its check has COMPLETED and none of its jobs is
+# still running. A head where only a non-scanning check has registered
+# is not yet — the gate can start before CodeQL.
+scan_state=$(jq -r --arg n "$SCAN_CHECK" --arg p "$SCAN_JOBS" '
+    [.check_runs[]?] as $r
+    | if ([$r[] | select(.name == $n or (.name | startswith($p)))
+                | select(.status != "completed")] | length) > 0 then "running"
+      elif ([$r[] | select(.name == $n)] | length) == 0 then "absent"
+      else "done" end' "$checks")
 note=""
-polls=0
-SECONDS=0
-while :; do
-    polls=$((polls + 1))
-    if gh_get "commits/$head/check-runs?per_page=100" > "$checks.new"; then
-        mv "$checks.new" "$checks"
-        seen=1
-        total=$(jq -r '.total_count // 0' "$checks")
-        running=$(jq -r '[.check_runs[]? | select(.status != "completed") | .name] | join(", ")' "$checks")
-        # The scan is read when its check has COMPLETED and none of its
-        # jobs is still running. A head where only a non-scanning check
-        # has registered is not yet — the gate can start before CodeQL.
-        scan_state=$(jq -r --arg n "$SCAN_CHECK" --arg p "$SCAN_JOBS" '
-            [.check_runs[]?] as $r
-            | if ([$r[] | select(.name == $n or (.name | startswith($p)))
-                        | select(.status != "completed")] | length) > 0 then "running"
-              elif ([$r[] | select(.name == $n)] | length) == 0 then "absent"
-              else "done" end' "$checks")
-        case "${total:-0}" in
-            0) note="no check-runs registered on ${head:0:12} yet" ;;
-            *) if [ -z "$running" ] || [ "$scan_state" = "done" ]; then break; fi
-               case "$scan_state" in
-                   absent) note="$total check-runs on ${head:0:12}, no $SCAN_CHECK check-run yet, still running: $running" ;;
-                   *) note="$total check-runs on ${head:0:12}, still running: $running" ;;
-               esac ;;
-        esac
-    else
-        note="GET commits/${head:0:12}/check-runs — $(head -c 200 "$workdir/err" | tr '\n' ' ')"
-    fi
-    if [ "$SECONDS" -ge "$DEADLINE" ] || { [ "$MAX_POLLS" -gt 0 ] && [ "$polls" -ge "$MAX_POLLS" ]; }; then
-        # Past the deadline: what was seen goes on the record as a
-        # PARTIAL reading, and the step stays open — a check still
-        # running is not a conclusion.
-        if [ "$seen" -eq 1 ]; then
-            jq -c --arg head "$head" --arg pr "$pr_url" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg note "$note" '
-                {code_scanning: {
-                    read_at: $at, head: $head, pr_url: $pr, complete: false, note: $note,
-                    checks: [.check_runs[]? | {name, status, conclusion, title: .output.title,
-                                              annotations: .output.annotations_count, url: .html_url,
-                                              app: .app.slug}],
-                    still_running: [.check_runs[]? | select(.status != "completed") | .name]}}' "$checks" > "$workdir/partial"
-            curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
-                ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
-                --data-binary @"$workdir/partial" "$BASE/api/jobs/$job_id/metadata" > /dev/null 2>"$workdir/err" \
-                || say "the partial reading could not be written onto ${job_id:0:8} — $(head -c 200 "$workdir/err" | tr '\n' ' ')"
-        fi
-        fail "$note after $polls polls, ${SECONDS}s — the reading is partial (code_scanning.complete=false on ${job_id:0:8}); re-file the request once the checks finish"
-    fi
-    say "not yet — $note; polling again in ${POLL}s"
-    sleep "$POLL"
-done
+case "${total:-0}" in
+    0) note="no check-runs registered on ${head:0:12} yet" ;;
+    *) if [ -n "$running" ] && [ "$scan_state" != "done" ]; then
+           case "$scan_state" in
+               absent) note="$total check-runs on ${head:0:12}, no $SCAN_CHECK check-run yet, still running: $running" ;;
+               *) note="$total check-runs on ${head:0:12}, still running: $running" ;;
+           esac
+       fi ;;
+esac
+if [ -n "$note" ]; then
+    # NOT YET: what was seen goes on the record as a PARTIAL reading and
+    # the step stays open — a scan still running is not a conclusion,
+    # and this runner is not the place to wait for one.
+    jq -c --arg head "$head" --arg pr "$pr_url" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg note "$note" '
+        {code_scanning: {
+            read_at: $at, head: $head, pr_url: $pr, complete: false, note: $note,
+            checks: [.check_runs[]? | {name, status, conclusion, title: .output.title,
+                                      annotations: .output.annotations_count, url: .html_url,
+                                      app: .app.slug}],
+            still_running: [.check_runs[]? | select(.status != "completed") | .name]}}' "$checks" > "$workdir/partial"
+    curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+        ${MT_HDR:+-H "$MT_HDR"} \
+        --data-binary @"$workdir/partial" "$BASE/api/jobs/$job_id/metadata" > /dev/null 2>"$workdir/err" \
+        || fail "writing the partial reading onto ${job_id:0:8} (PATCH /api/jobs/$job_id/metadata) — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
+    echo "$me: not yet: $note — the partial reading is on ${job_id:0:8} (code_scanning.complete=false), read-checks stays open, and reread-publish-pr-every-15-minutes reads it again"
+    exit 75
+fi
 if [ -z "$running" ]; then
     say "$total check-runs on ${head:0:12}, all completed"
 else
@@ -496,7 +489,7 @@ if [ -n "$running" ]; then
         # The partial reading goes on the packet — the scan's counts are
         # final, and what is still running is named — and nothing else.
         curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
-            ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+            ${MT_HDR:+-H "$MT_HDR"} \
             --data-binary @"$workdir/reading" "$BASE/api/jobs/$job_id/metadata" > /dev/null 2>"$workdir/err" \
             || fail "writing the partial reading onto ${job_id:0:8} (PATCH /api/jobs/$job_id/metadata) — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
         echo "$me: not yet: $running still running on ${head:0:12}, ${age} after the PR opened (ceiling ${CEILING}s) — the partial reading is on ${job_id:0:8} (code_scanning.complete=false), read-checks stays open, and reread-publish-pr-every-15-minutes reads it again"
@@ -519,7 +512,7 @@ failing=$(jq -r '[.code_scanning.failing[]
     | join("; ")' "$workdir/reading")
 
 curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
-    ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+    ${MT_HDR:+-H "$MT_HDR"} \
     --data-binary @"$workdir/reading" "$BASE/api/jobs/$job_id/metadata" > /dev/null 2>"$workdir/err" \
     || fail "writing the reading onto ${job_id:0:8} (PATCH /api/jobs/$job_id/metadata) — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
 say "reading written onto ${job_id:0:8} as code_scanning"
@@ -533,7 +526,7 @@ printf '%s' "$target" | jq -c --arg c "$conclusion" --arg a "$alerts" --arg r "$
                    failing: $f, still_running: $s})}' \
     > "$workdir/payload"
 curl -fsS -X PUT -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
-    ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+    ${MT_HDR:+-H "$MT_HDR"} \
     --data-binary @"$workdir/payload" "$BASE/api/jobs/$job_id/steps/$step_id" > /dev/null 2>"$workdir/err" \
     || fail "the reading is on ${job_id:0:8} but completing read-checks failed — $(head -c 300 "$workdir/err" | tr '\n' ' '); complete the step by hand with conclusion=$conclusion alerts=$alerts rules=$rules"
 

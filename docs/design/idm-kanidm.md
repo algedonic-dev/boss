@@ -28,7 +28,8 @@ online-backup sidecar ships Kanidm's state to boss-gcp hourly
 the last shipment. The inversion has a consequence the old text hid:
 cluster repair must never depend on in-cluster Kanidm being up, so
 break-glass local auth (below) is load-bearing for exactly that
-path, and the DR runbook's access-recovery story is the other half.
+path, and the recovery sheet (`infra/recovery/re-entry.toml`, rendered
+by `boss recovery sheet`) is the other half.
 
 ## The shape
 

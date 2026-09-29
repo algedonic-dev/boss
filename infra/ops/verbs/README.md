@@ -170,6 +170,37 @@ plan. `/var/backups`, homes, `/usr/local`, `/opt/boss` and
 `/opt/boss-cli` are data and David's call, out of its reach by
 construction.
 
+## Effect — an exit 0 is not a proof
+
+Every MUTATING verb declares how a run SHOWS ITS EFFECT (backlog
+fdbb447e part 1, design 3036296f mechanism B, David 2026-09-27).
+`answered` says the verb ran and `exit_code` says it did not fail;
+neither says that what it exists to change changed — the daily prune's
+proof read the outcome alone and counted a refused run as proof. So the
+verb file carries exactly one of:
+
+- `effect` — the regex (jq's engine, the runner's) of the line its
+  script prints ONLY after it has read back what it changed — a
+  re-list, a re-stat, a re-query — or, in a dry-run mode, the line
+  saying it changed nothing. Opens `^<name>: `, in the script's own
+  voice, and every literal stretch of it is text the script carries.
+- `effect_unread` — why the script has no such read-back yet, and what
+  would read it. The set of verbs carrying it only shrinks: a new
+  MUTATING verb prints its read-back and declares `effect`.
+
+`ops-runner.sh` judges the declaration ONCE, on the run's own output,
+and records the verdict on the execute step beside `exit_code`, for an
+exit 0 only: `effect` (the last matching line), `effect_unproven` (no
+line matched, or the regex could not be judged), or `effect_unread`
+(the file's reason, copied, so the run says out loud that exit 0 is all
+it proves). Every reader takes that verdict — `boss ops --wait` fails an
+exit 0 whose effect was not shown, and `verb_failure` (the answered-
+ops-request judges) treats it as a failed verb. Nothing is REFUSED: the
+verb has already run, and a verb that cannot prove its effect says so
+loudly (DR rule 62dac114). Pinned by
+`crates/core/boss-testing/tests/a_mutating_verb_declares_its_effect.rs`
+and `ops_runner_sh.rs`.
+
 ## Approval verbs
 
 A verb that declares `requires_approval` runs only under a passkey

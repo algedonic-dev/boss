@@ -52,7 +52,7 @@ pub trait PeopleClient: Send + Sync {
 /// service can't wedge a write indefinitely.
 pub struct ReqwestPeopleClient {
     base_url: String,
-    http: reqwest::Client,
+    http: boss_core::machine_token::Client,
 }
 
 impl ReqwestPeopleClient {

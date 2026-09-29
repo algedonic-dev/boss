@@ -14,6 +14,8 @@ pub mod subject_kinds_config;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "postgres")]
+pub mod rebuild;
+#[cfg(feature = "postgres")]
 pub mod subjects;
 
 pub use http::{SubjectKindsApiState, router};

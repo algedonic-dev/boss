@@ -20,7 +20,7 @@ struct ConsumedProduct {
 }
 
 pub struct ProductsConsume {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     products_base: String,
 }
 

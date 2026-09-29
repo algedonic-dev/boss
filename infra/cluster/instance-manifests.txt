@@ -134,6 +134,14 @@ boss-estate-observe.yaml pipeline
 # target, each without the credential (design 0e07ce64, 2026-09-18).
 boss-playground-crawl.yaml pipeline
 #
+# boss-recovery-sheet: renders the recovery sheet from a clone of main
+# and files the print job on prod's jobs door — one sheet, one owner,
+# one queue. It runs in boss-dev for the crawl's reason: the clone uses
+# `forge-read`, the pipeline namespace's credential. Rendered per
+# instance it would file one print job per namespace for the same paper
+# (design 125d405d, car 3).
+boss-recovery-sheet.yaml pipeline
+#
 # boss-backup: the nightly dump ships to boss-gcp and to GCS under the
 # name `boss-<stamp>.sql.gz` with a keep-21 retention shared by every
 # dump in the bucket. A playground dump under the same name would spend

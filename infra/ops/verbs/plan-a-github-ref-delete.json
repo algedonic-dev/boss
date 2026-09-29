@@ -1,0 +1,12 @@
+{
+  "about": "READ-ONLY: renders which named refs `github-delete-refs` WOULD delete from a GitHub repository, and changes nothing (infra/forge/github-act.sh delete-refs --plan; design 76155676, backlog 6a8ff89f). It lists the repository with git ls-remote, as the GitHub App's installation on <owner>, and names each requested ref (heads/<branch> or tags/<tag>, in full, comma-separated, at most 200) with the sha it stands at — the lease the write will push against — or as already absent, plus the default branch and the reason. Naming the repository's DEFAULT branch, naming heads/main or heads/master with the reason `none`, a ref git does not allow, a pattern, a duplicate, or an unusable token slot is a refusal, exit 78, not a plan. No clock and no token in the bytes; its sha256 is printed on stderr as `plan-sha256:`, and that hash is what David's passkey signs (design 17835005 q1).",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/github-act.sh", "delete-refs", "--plan", "{1}", "{2}", "{3}", "{4}"],
+  "params": [
+    { "name": "owner", "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{0,38}$" },
+    { "name": "repo", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$" },
+    { "name": "refs", "pattern": "^(heads|tags)/[A-Za-z0-9_][A-Za-z0-9._/-]*(,(heads|tags)/[A-Za-z0-9_][A-Za-z0-9._/-]*)*$" },
+    { "name": "reason", "pattern": "^(none|[a-z0-9][a-z0-9-]{7,79})$" }
+  ],
+  "timeout": 120
+}

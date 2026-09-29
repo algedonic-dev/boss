@@ -154,6 +154,61 @@ fn queued_lane_line(run: &Value, trains: &[Value]) -> String {
     )
 }
 
+/// A GATING line's two ages and the median beside them (backlog
+/// 4d088a7e): how long the run waited in line, how long its Job has run,
+/// and the measured median running time — read off the yard's own
+/// reading of the bay (`GET /api/yard/status`, `gates`), so the verb and
+/// the floor judge a bay with one definition. Until 2026-09-28 the
+/// packet's age was the only one any surface had, and a gate queued 46
+/// minutes and running 14 read as "going for an hour". Empty when the
+/// yard does not list the run (it settled between the two reads); an
+/// unread yard is said, never dropped.
+fn gate_times(packet: &str, gates: &Result<boss_jobs::yard::Gates, String>) -> String {
+    use boss_jobs::region_states::{RUN_PAST_MEDIAN_TIMES, duration_text};
+    let gates = match gates {
+        Ok(g) => g,
+        Err(why) => return format!("  (times unavailable: {why})"),
+    };
+    let Some(bay) = gates.active.iter().find(|a| a.packet_id == packet) else {
+        return String::new();
+    };
+    let minutes = |s: i64| duration_text(s / 60);
+    let queued = bay.queued_seconds.map_or_else(
+        || "wait unrecorded".to_string(),
+        |s| format!("queued {}", minutes(s)),
+    );
+    let running = bay.running_seconds.map_or_else(
+        || "running ?".to_string(),
+        |s| format!("running {}", minutes(s)),
+    );
+    let median = gates.typical_seconds.map_or_else(
+        || "no median measured".to_string(),
+        |s| format!("median {}", minutes(s)),
+    );
+    let mark = if bay.stale {
+        " — STALE: past the gate deadline, a corpse holding a bay".to_string()
+    } else if bay.troubled {
+        format!(" — TROUBLED: running past {RUN_PAST_MEDIAN_TIMES}× the median")
+    } else {
+        String::new()
+    };
+    format!("  {queued} · {running} · {median}{mark}")
+}
+
+/// How long a queued run has stood in line: its `queued_at` against the
+/// clock. Empty when the stamp is absent or does not parse.
+fn queued_for(run: &Value, now: chrono::DateTime<chrono::Utc>) -> String {
+    chrono::DateTime::parse_from_rfc3339(md_str(run, boss_jobs::yard::QUEUED_AT))
+        .map(|t| {
+            let waited = (now - t.with_timezone(&chrono::Utc)).num_minutes().max(0);
+            format!(
+                "  (waiting {})",
+                boss_jobs::region_states::duration_text(waited)
+            )
+        })
+        .unwrap_or_default()
+}
+
 /// Branches whose base has fallen behind `origin/main`. Each pair is
 /// (branch, exit code of `git merge-base --is-ancestor origin/main
 /// origin/<branch>`), read through the ONE definition of that code
@@ -267,7 +322,7 @@ fn troubled_dock_cars(cars: &[Value]) -> Vec<(String, u64, String)> {
         .filter_map(|c| {
             let skips = c
                 .get("metadata")
-                .and_then(|m| m.get("skips"))
+                .and_then(|m| m.get(boss_jobs::car::SKIPS))
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
             (skips >= TROUBLED_SKIPS).then(|| {
@@ -278,6 +333,45 @@ fn troubled_dock_cars(cars: &[Value]) -> Vec<(String, u64, String)> {
                     reason.to_string()
                 };
                 (md_str(c, "branch").to_string(), skips, reason)
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// Cars the DOCK has held through train after train — branch, how many
+/// consecutive departures left it, and the reason the last hold gave.
+///
+/// A SECOND COUNTER, A SECOND THRESHOLD, AND ONE DEFINITION OF IT (backlog
+/// 7919fdcc, item 10). `skips` counts assembly's conflicts, which 39% of
+/// trains carry, so [`TROUBLED_SKIPS`] is five; `left_behind_trains`
+/// counts the dock's own holds — a red or in-flight re-gate, a stale
+/// receipt, a missing branch — and the conductor files an urgent alarm at
+/// `LEFT_BEHIND_ALARM_TRAINS`. They are two facts, so two numbers; what
+/// must not be two is the second one. Until 2026-09-28 no read an
+/// operator runs carried that streak at all, so a car could have its
+/// alarm open while this verb said nothing about it. The threshold is the
+/// conductor's own constant, and a test holds this list to its alarm
+/// predicate (`left_behind_alarm_due`).
+fn left_behind_dock_cars(cars: &[Value]) -> Vec<(String, u64, String)> {
+    let mut out: Vec<(String, u64, String)> = cars
+        .iter()
+        .filter(|c| c.get("status").and_then(Value::as_str) == Some("open"))
+        .filter(|c| boss_jobs::car::is_parked(c))
+        .filter_map(|c| {
+            let trains = c
+                .pointer(&format!("/metadata/{}", boss_jobs::car::LEFT_BEHIND_TRAINS))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            (trains >= crate::train::LEFT_BEHIND_ALARM_TRAINS).then(|| {
+                let reason = md_str(c, "skip_reason");
+                let reason = if reason.is_empty() {
+                    "no reason recorded".to_string()
+                } else {
+                    reason.to_string()
+                };
+                (md_str(c, "branch").to_string(), trains, reason)
             })
         })
         .collect();
@@ -307,7 +401,10 @@ fn troubled_dock_cars(cars: &[Value]) -> Vec<(String, u64, String)> {
 /// them). Two previews pair only when both cars are open and parked
 /// (`boss_jobs::car::is_parked`, the dock's shared predicate) and both
 /// were measured over the SAME `anchored.parked_set` — one measurement,
-/// stale-not-wrong the moment either input moves.
+/// stale-not-wrong the moment either input moves — and each against the
+/// head its car still carries ([`preview_heads`], backlog 43a7fc47: the
+/// set moves only when the conductor next measures, so a rerailed car
+/// passed the set check for up to a tick).
 fn unboardable_pairs(cars: &[Value]) -> Vec<(String, String, Vec<String>)> {
     let set_of = |c: &Value| {
         c.pointer("/metadata/merge_preview/anchored/parked_set")
@@ -319,6 +416,7 @@ fn unboardable_pairs(cars: &[Value]) -> Vec<(String, String, Vec<String>)> {
         .iter()
         .filter(|c| c.get("status").and_then(Value::as_str) == Some("open"))
         .filter(|c| boss_jobs::car::is_parked(c))
+        .filter(|c| preview_heads(c).2)
         .filter_map(|c| Some((md_str(c, "branch").to_string(), (set_of(c)?, c))))
         .collect();
     let mut out: Vec<(String, String, Vec<String>)> = dock
@@ -348,8 +446,106 @@ fn unboardable_pairs(cars: &[Value]) -> Vec<(String, String, Vec<String>)> {
     out
 }
 
-/// Dock cars that no longer merge onto main — `(branch, files, main)`,
-/// branch-sorted, `main` the short sha the verdict was measured against.
+/// The head a dock car's preview was measured against, the head the
+/// car's receipt vouches for now, and whether they are the same head —
+/// `(measured, carries, same)`, both heads in full.
+///
+/// A VERDICT IS ABOUT A HEAD (backlog 43a7fc47). `boss rerail --finish`
+/// repoints a car to a new head at once; the conductor rewrites its
+/// preview only on its next tick. Measured 2026-09-27: a car repointed at
+/// ~20:51Z to a head that merges clean was named under CONFLICTS WITH
+/// MAIN at 20:57Z off a preview computed at 20:50:27Z against the head it
+/// had left, and the operator re-planned around it; at 22:58Z a second
+/// car cost a needless rerail the same way. The parked-set anchor could
+/// not catch it — every car still carried the previous tick's set — so
+/// the preview now names the head it measured (`anchored.head`,
+/// `dock_preview::preview_payload`) and a reader compares it with the
+/// receipt's. A preview naming no head (written before that) or a car
+/// whose receipt names none cannot be matched, and is not the same.
+fn preview_heads(c: &Value) -> (Option<String>, Option<String>, bool) {
+    let measured = c
+        .pointer("/metadata/merge_preview/anchored/head")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let carries = crate::receipt::select_receipt(c)
+        .as_ref()
+        .and_then(|r| r.get("head"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let same = match (&measured, &carries) {
+        // Either side may be abbreviated; seven characters is git's own
+        // floor for an unambiguous short sha.
+        (Some(m), Some(h)) => m.len().min(h.len()) >= 7 && (m.starts_with(h) || h.starts_with(m)),
+        _ => false,
+    };
+    (measured, carries, same)
+}
+
+/// One dock car whose preview says it no longer merges onto main.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MainConflict {
+    pub branch: String,
+    /// The conflicted paths, as merge-tree named them.
+    pub files: Vec<String>,
+    /// The main the verdict was measured against, short.
+    pub main: String,
+    /// The car head the verdict was measured against, short; `None`
+    /// when the preview names none.
+    pub measured: Option<String>,
+    /// The head the car's receipt vouches for now, short.
+    pub carries: Option<String>,
+    /// When the conductor measured it, as stamped.
+    pub checked_at: String,
+    /// Measured against the head the car carries: a verdict. `false` is
+    /// a stale preview awaiting the conductor's next tick, not a verdict.
+    pub current: bool,
+}
+
+/// `checked_at` as an age at `now` — "N min ago" — or the stamp itself
+/// when it does not parse (an age cannot be invented).
+fn minutes_ago(checked_at: &str, now: chrono::DateTime<chrono::Utc>) -> String {
+    match chrono::DateTime::parse_from_rfc3339(checked_at) {
+        Ok(t) => format!(
+            "{} min ago",
+            (now - t.with_timezone(&chrono::Utc)).num_minutes().max(0)
+        ),
+        Err(_) => format!("at {checked_at}"),
+    }
+}
+
+/// The row CONFLICTS WITH MAIN prints for one car: the verdict with the
+/// head, main and age it was measured at, or — for a preview measured
+/// against a head the car no longer carries — that it is stale and
+/// which heads differ, and no files, because they are not this car's.
+pub(crate) fn main_conflict_line(c: &MainConflict, now: chrono::DateTime<chrono::Utc>) -> String {
+    let age = minutes_ago(&c.checked_at, now);
+    let head = |h: &Option<String>, none: &str| h.clone().unwrap_or_else(|| none.to_string());
+    if c.current {
+        format!(
+            "    {}  —  {}  (head {} onto main@{}, checked {age})",
+            c.branch,
+            c.files.join(", "),
+            head(&c.measured, "?"),
+            c.main,
+        )
+    } else {
+        format!(
+            "    {}  —  preview stale (computed against {}, {age}; the car now carries {}) — \
+             re-judged on the conductor's next tick, not a verdict",
+            c.branch,
+            head(&c.measured, "a head it did not record"),
+            head(&c.carries, "a head its receipt does not name"),
+        )
+    }
+}
+
+/// Dock cars that no longer merge onto main, branch-sorted — each with
+/// the head, main and time the verdict was measured at, and whether that
+/// head is still the car's ([`preview_heads`]).
 ///
 /// THE OTHER HALF OF THE SAME PREVIEW (backlog 20d0d717). `preview_dock`
 /// writes `merge_preview.vs_main` beside `conflicts_with` on every tick,
@@ -364,7 +560,7 @@ fn unboardable_pairs(cars: &[Value]) -> Vec<(String, String, Vec<String>)> {
 /// change of set rewrites every parked-ready car's preview in one tick.
 /// A car carrying an older set was not in the last measurement (held,
 /// or left and back), so its verdict is stale, not wrong, and unread.
-fn conflicts_with_main(cars: &[Value]) -> Vec<(String, Vec<String>, String)> {
+fn conflicts_with_main(cars: &[Value]) -> Vec<MainConflict> {
     let preview = |c: &Value, key: &str| {
         c.pointer(&format!("/metadata/merge_preview/{key}"))
             .and_then(Value::as_str)
@@ -389,7 +585,8 @@ fn conflicts_with_main(cars: &[Value]) -> Vec<(String, Vec<String>, String)> {
     else {
         return Vec::new();
     };
-    let mut out: Vec<(String, Vec<String>, String)> = dock
+    let short = |s: String| s.chars().take(8).collect::<String>();
+    let mut out: Vec<MainConflict> = dock
         .iter()
         .filter(|c| preview(c, "anchored/parked_set").as_ref() == Some(&current))
         .filter(|c| {
@@ -406,15 +603,19 @@ fn conflicts_with_main(cars: &[Value]) -> Vec<(String, Vec<String>, String)> {
                 .filter_map(Value::as_str)
                 .map(str::to_string)
                 .collect();
-            let main: String = preview(c, "anchored/main")
-                .unwrap_or_else(|| "?".to_string())
-                .chars()
-                .take(8)
-                .collect();
-            (md_str(c, "branch").to_string(), files, main)
+            let (measured, carries, same) = preview_heads(c);
+            MainConflict {
+                branch: md_str(c, "branch").to_string(),
+                files,
+                main: short(preview(c, "anchored/main").unwrap_or_else(|| "?".to_string())),
+                measured: measured.map(short),
+                carries: carries.map(short),
+                checked_at: preview(c, "checked_at").unwrap_or_default(),
+                current: same,
+            }
         })
         .collect();
-    out.sort();
+    out.sort_by(|a, b| a.branch.cmp(&b.branch));
     out
 }
 
@@ -450,12 +651,121 @@ pub(crate) fn stranded_gate_runs_query() -> String {
 
 /// The FLAKES section: how many times each check went red then green
 /// at one head this week, read off gate-runs the green stamped
-/// `flake_of` (`boss_jobs::flake`, backlog 36cc4913). One line either
-/// way — the count is the point, and a zero is a stated zero.
+/// `flake_of` (`boss_jobs::flake`, backlog 36cc4913) — and under it the
+/// dock's red-then-green across a main move, which that relation cannot
+/// see ([`rebased_flakes`], 4d928d0a). One line each either way — the
+/// count is the point, and a zero is a stated zero.
 pub(crate) fn flakes_line(gate_runs: &[Value]) -> String {
     format!(
-        "\n  {}",
-        boss_jobs::flake::line(&boss_jobs::flake::tally(gate_runs), GATE_RUN_WINDOW_DAYS)
+        "\n  {}\n{}",
+        boss_jobs::flake::line(&boss_jobs::flake::tally(gate_runs), GATE_RUN_WINDOW_DAYS),
+        rebased_flakes_line(&rebased_flakes(gate_runs), GATE_RUN_WINDOW_DAYS)
+    )
+}
+
+/// The checks that went red on a dock re-gate of a car and green on the
+/// dock's NEXT re-gate of the same car on the same branch, at a new
+/// head, over the week's gate-runs — by check.
+///
+/// THE SAME-HEAD RELATION CANNOT SEE THE DOCK'S RETRY (backlog 4d928d0a,
+/// part 2). The dock replays a parked car onto each main that moves into
+/// its files (`train/dock_regate.rs`), so its retry after a red is at a
+/// NEW head and never carries `flake_of`: on 2026-09-27 dock re-gate
+/// 7b2acdc4 went red on web-suite at one spec the car does not touch, the
+/// re-gate at the next main was green, and FLAKES counted nothing. Two
+/// dock re-gates of one car on one branch are the same parked change —
+/// a parked car is frozen, and a rerail moves it to a new branch —
+/// replayed onto two mains, so red then green between them is one of two
+/// things this read cannot tell apart: a flake, or main's own fix. It is
+/// counted apart from the same-head line for that reason, and a refusal
+/// (it judged nothing), a green that is not the dock's, a pair with any
+/// other gate of the branch between them (the author may have changed
+/// the car) and a same-head flake (counted above) are not.
+pub(crate) fn rebased_flakes(gate_runs: &[Value]) -> BTreeMap<String, usize> {
+    use boss_jobs::flake;
+    let md = |r: &Value, k: &str| {
+        r.pointer(&format!("/metadata/{k}"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    // Every closed run of a branch, oldest first — the builder's too, so
+    // a builder's gate BETWEEN two dock re-gates breaks the pair: the
+    // change may have moved there.
+    let mut by_branch: BTreeMap<String, Vec<(String, &Value)>> = BTreeMap::new();
+    for r in gate_runs
+        .iter()
+        .filter(|r| r.get("status").and_then(Value::as_str) == Some("closed"))
+    {
+        let Some(branch) = md(r, "branch") else {
+            continue;
+        };
+        let at = md(r, "opened_at")
+            .or_else(|| {
+                r.get("opened_on")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        by_branch.entry(branch).or_default().push((at, r));
+    }
+    let mut out = BTreeMap::new();
+    for runs in by_branch.values_mut() {
+        runs.sort_by(|a, b| a.0.cmp(&b.0));
+        for pair in runs.windows(2) {
+            let (red, green) = (pair[0].1, pair[1].1);
+            let car = md(red, "dock_regate/car");
+            if car.is_none() || car != md(green, "dock_regate/car") {
+                continue;
+            }
+            let receipt = flake::receipt(red);
+            let red_counts = matches!(flake::verdict(red), Some("failed" | "lost"))
+                && receipt
+                    .as_ref()
+                    .and_then(|r| r.get("verdict"))
+                    .and_then(Value::as_str)
+                    != Some(flake::REFUSED);
+            if !red_counts
+                || flake::verdict(green) != Some("green")
+                || md(green, flake::FLAKE_OF).is_some()
+                || md(red, "sha") == md(green, "sha")
+            {
+                continue;
+            }
+            let checks = receipt
+                .as_ref()
+                .and_then(flake::failing_checks)
+                .unwrap_or_default();
+            if checks.is_empty() {
+                *out.entry(flake::NO_CHECK_NAMED.to_string()).or_insert(0) += 1;
+            }
+            for c in checks {
+                *out.entry(c).or_insert(0) += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The line under FLAKES for [`rebased_flakes`], one line either way —
+/// most flaky first, or a stated none.
+pub(crate) fn rebased_flakes_line(tally: &BTreeMap<String, usize>, days: i64) -> String {
+    if tally.is_empty() {
+        return format!(
+            "    FLAKES AT A NEW HEAD — none: no dock re-gate went red then green at the next \
+             main in the last {days} days"
+        );
+    }
+    let mut rows: Vec<(&String, &usize)> = tally.iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    let listed: Vec<String> = rows.iter().map(|(c, n)| format!("{c}: {n}")).collect();
+    format!(
+        "    FLAKES AT A NEW HEAD — {} check(s) red then green when the dock re-gated the same \
+         car onto the next main in the last {days} days (a flake or main's own fix; the car's \
+         change did not move): {}",
+        tally.len(),
+        listed.join(", ")
     )
 }
 
@@ -515,7 +825,19 @@ fn held_greens(gate_runs: &[Value], car_branches: &BTreeSet<String>) -> Vec<(Str
 /// `landed` names, by packet, the places whose work main already holds
 /// ([`superseded_by_main`]), and each is reported as superseded, with
 /// what closes it and no verb to run.
-fn abandoned_report(places: &[AbandonedPlace], landed: &BTreeMap<String, String>) -> Vec<String> {
+///
+/// AND A VOUCHED PLACE IS WITHDRAWN, ASKED FIRST (backlog b1c82a82).
+/// `vouched` names, by packet, the places whose head a car already
+/// carries with a current green (`gate::vouching_car`, the twin-car
+/// guard's own question). On 2026-09-28 this line printed the recovery
+/// for gate-run 8c2f644a and `boss gate` refused it for exactly that
+/// reason; such a place gets the withdraw door instead, and the settle
+/// that withdraws it on its own (8d7d0a2b).
+fn abandoned_report(
+    places: &[AbandonedPlace],
+    landed: &BTreeMap<String, String>,
+    vouched: &BTreeMap<String, crate::gate::Vouch>,
+) -> Vec<String> {
     if places.is_empty() {
         return Vec::new();
     }
@@ -547,7 +869,18 @@ fn abandoned_report(places: &[AbandonedPlace], landed: &BTreeMap<String, String>
             "    {branch}  packet {}  {idle}{owed}",
             &p.packet[..8.min(p.packet.len())],
         ));
-        if let Some(how) = landed.get(&p.packet) {
+        if let Some(v) = vouched.get(&p.packet) {
+            out.push(format!(
+                "      ALREADY CARRIED — car {} ({}) holds a CURRENT green for this head, so a \
+                 re-gate is refused as a twin and nothing is owed. Withdraw it: boss gate \
+                 --withdraw {}  — or leave it: the conductor withdraws it itself once nothing \
+                 has held it for {} min.",
+                &v.car[..8.min(v.car.len())],
+                v.where_it_is,
+                &p.packet[..8.min(p.packet.len())],
+                crate::train::ORPHAN_GATE_RUN_MINUTES
+            ));
+        } else if let Some(how) = landed.get(&p.packet) {
             // Closed by the conductor's orphan settle: no gate Job carries
             // it and nothing has held it for the window (backlog
             // 137c176d). Both of 2026-09-24's waited for the three-hour
@@ -824,8 +1157,11 @@ pub(crate) fn orphan_lines(orphans: &[String], shown: usize, all: bool) -> Vec<S
 /// `pr-opened` the instant the head is recorded, so an open-only read
 /// would see no claim at all (01915167: the first orient after PR #239
 /// opened listed `publish/2026-09-19` as 'a forge head no packet
-/// claims' with the archive-sweep hint). Deleting the branch once the
-/// PR is merged stays with the archive sweep, which knows the forge.
+/// claims' with the archive-sweep hint). Deleting the branch once GitHub
+/// reads its PR merged or closed is the NEXT publish's job, forge first
+/// and then the fork (publish-github-pr.sh step 4c, backlog 1a2bcf11):
+/// the archive sweep this used to name judges car branches off an
+/// archive database and holds no GitHub credential, so it never did.
 pub(crate) fn published_heads(
     publish_packets: &[Value],
 ) -> std::collections::BTreeMap<String, String> {
@@ -1574,7 +1910,7 @@ fn machine_text(m: &Value) -> String {
 }
 
 pub async fn run(all: bool) -> Result<()> {
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
 
     println!("boss orient — the approach, before you build");
     println!(
@@ -1749,9 +2085,28 @@ pub async fn run(all: bool) -> Result<()> {
     let (waiting, running): (Vec<&Value>, Vec<&Value>) = gating
         .iter()
         .partition(|g| !md_str(g, boss_jobs::yard::QUEUED_AT).is_empty());
+    // The yard's reading of the bays: each run's queued and running ages
+    // and the median running time (backlog 4d088a7e). Read only when
+    // something is gating; a failed read is printed beside each line.
+    let bays: Result<boss_jobs::yard::Gates, String> = if running.is_empty() {
+        Err("no run".into())
+    } else {
+        match api(&http, reqwest::Method::GET, "/api/yard/status", None).await {
+            Ok(Some(v)) => v
+                .get("data")
+                .unwrap_or(&v)
+                .get("gates")
+                .cloned()
+                .ok_or_else(|| "the yard status carries no gates".to_string())
+                .and_then(|g| serde_json::from_value(g).map_err(|e| e.to_string())),
+            Ok(None) => Err("the yard status answered nothing".into()),
+            Err(e) => Err(format!("{e:#}")),
+        }
+    };
     println!("\n  GATING — {} run(s)", running.len());
     for g in &running {
-        println!("    {}", gating_line(g, &trains));
+        let id = g.get("id").and_then(Value::as_str).unwrap_or_default();
+        println!("    {}{}", gating_line(g, &trains), gate_times(id, &bays));
     }
     // A PLACE NOBODY HOLDS IS NOT A QUEUE. The two readings are the
     // system of record's own: `queue_order` is every place a live
@@ -1773,7 +2128,7 @@ pub async fn run(all: bool) -> Result<()> {
             let id = g.get("id").and_then(Value::as_str).unwrap_or_default();
             in_line.iter().any(|held| held == id)
         }) {
-            println!("    {}", queued_lane_line(g, &trains));
+            println!("    {}{}", queued_lane_line(g, &trains), queued_for(g, now));
         }
     }
     // Which of them main already holds — asked only when there is a
@@ -1797,7 +2152,22 @@ pub async fn run(all: bool) -> Result<()> {
             })
             .collect()
     };
-    for line in abandoned_report(&abandoned, &landed) {
+    // Every car, paged on `total` (backlog 10776b6c): the shed, the
+    // dock's held and troubled lanes and the stranded cross-ref all read
+    // this list, and one bare `limit=800` page would have dropped the
+    // oldest landed cars out of all four silently once the yard passed
+    // 800. Read HERE, before the abandoned lines, because a place whose
+    // head a car already carries green is withdrawn rather than recovered
+    // — the twin-car guard's own question, asked through its own function
+    // (backlog b1c82a82).
+    let cars = crate::gate::all_cars(&http).await?;
+    let vouched: BTreeMap<String, crate::gate::Vouch> = abandoned
+        .iter()
+        .filter_map(|p| {
+            crate::gate::vouching_car(&p.branch, &p.sha, &cars).map(|v| (p.packet.clone(), v))
+        })
+        .collect();
+    for line in abandoned_report(&abandoned, &landed, &vouched) {
         println!("{line}");
     }
 
@@ -1828,12 +2198,6 @@ pub async fn run(all: bool) -> Result<()> {
         .and_then(Value::as_i64);
     let held_runs = rows(held_body)?;
     let held_cut = cut_note(held_total, held_runs.len());
-    // Every car, paged on `total` (backlog 10776b6c): the shed, the
-    // dock's held and troubled lanes and the stranded cross-ref all read
-    // this list, and one bare `limit=800` page would have dropped the
-    // oldest landed cars out of all four silently once the yard passed
-    // 800.
-    let cars = crate::gate::all_cars(&http).await?;
     let car_branches: BTreeSet<String> = cars
         .iter()
         .map(|c| md_str(c, "branch").to_string())
@@ -1932,7 +2296,7 @@ pub async fn run(all: bool) -> Result<()> {
             if !on_forge.is_empty() {
                 println!(
                     "\n  PUBLISHED — {} forge head(s) backing a mirror pull request (stays until \
-                     GitHub reports the PR merged or closed; the archive sweep deletes it):",
+                     GitHub reports the PR merged or closed; the next publish deletes it):",
                     on_forge.len()
                 );
                 for (branch, pr_url) in &on_forge {
@@ -2065,6 +2429,22 @@ pub async fn run(all: bool) -> Result<()> {
         }
     }
 
+    // LEFT BEHIND — a car the DOCK keeps holding while trains leave; the
+    // same cars the conductor's left-behind alarm is filed for, at the
+    // same count (backlog 7919fdcc, item 10).
+    let left = left_behind_dock_cars(&cars);
+    if !left.is_empty() {
+        println!(
+            "  LEFT BEHIND — {} car(s) the dock has held through {}+ consecutive departures \
+             (the conductor files an urgent LEFT BEHIND alarm at this count; the reason names the repair):",
+            left.len(),
+            crate::train::LEFT_BEHIND_ALARM_TRAINS
+        );
+        for (branch, trains, reason) in &left {
+            println!("    {branch}  —  left behind {trains}x  —  {reason}");
+        }
+    }
+
     // CANNOT BOTH BOARD — the conductor's merge preview, read (5c567c27).
     // Each car of a pair merges clean onto main alone; together one is
     // left at assembly. Named at the first tick after the second parks,
@@ -2085,15 +2465,32 @@ pub async fn run(all: bool) -> Result<()> {
     // CONFLICTS WITH MAIN — the preview's other half, read (20d0d717).
     // Not FRESHNESS: a car behind main is repaired by a re-gate, a car
     // that conflicts with it only by a rerail.
-    let off_main = conflicts_with_main(&cars);
+    // A verdict measured against a head the car has since left is said
+    // to be stale, apart from the verdicts, and never under the repair
+    // (43a7fc47: twice on 2026-09-27 it was read as a conflict).
+    let (off_main, stale_previews): (Vec<MainConflict>, Vec<MainConflict>) =
+        conflicts_with_main(&cars)
+            .into_iter()
+            .partition(|c| c.current);
+    let now = boss_clock_client::wall_now();
     if !off_main.is_empty() {
         println!(
             "  CONFLICTS WITH MAIN — {} dock car(s) that no longer merge onto main \
              (repair: boss rerail <car>, which stops for you on a real conflict):",
             off_main.len()
         );
-        for (branch, files, main) in &off_main {
-            println!("    {branch}  —  {}  (as of main@{main})", files.join(", "));
+        for c in &off_main {
+            println!("{}", main_conflict_line(c, now));
+        }
+    }
+    if !stale_previews.is_empty() {
+        println!(
+            "  MERGE PREVIEW STALE — {} dock car(s) whose conflict with main was computed \
+             against a head they no longer carry (no rerail on this read):",
+            stale_previews.len()
+        );
+        for c in &stale_previews {
+            println!("{}", main_conflict_line(c, now));
         }
     }
 
@@ -2347,6 +2744,86 @@ mod tests {
             super::in_transit_line(&green),
             "    PR train 2026-09-24 17:17  at: CI verdict green — not merged yet"
         );
+    }
+
+    /// A GATING LINE READS TWO AGES AND THE MEDIAN (backlog 4d088a7e).
+    /// Gate-run 6d5d85fb opened 01:44Z, waited 46 minutes and ran 14, and
+    /// read "going for an hour" everywhere; the answer took kubectl. The
+    /// line takes the yard's own reading of the bay, so the terminal and
+    /// the floor cannot disagree about which run is troubled.
+    #[test]
+    fn a_gating_line_reads_queued_and_running_apart_beside_the_median() {
+        use boss_jobs::yard::{ActiveGate, Gates};
+        let id = "6d5d85fb-df15-4de2-9bc3-5fe6be8f499e";
+        let bay = ActiveGate {
+            branch: "fix/drift-names-unpublished-protocol-versions".into(),
+            packet_id: id.into(),
+            since: "2026-09-28T01:44:10Z".into(),
+            launched_at: Some("2026-09-28T02:30:00Z".into()),
+            queued_seconds: Some(46 * 60),
+            running_seconds: Some(14 * 60),
+            ..Default::default()
+        };
+        let gates = |bay: ActiveGate| Gates {
+            capacity: 4,
+            active: vec![bay],
+            queued: vec![],
+            typical_seconds: Some(18 * 60),
+        };
+        assert_eq!(
+            super::gate_times(id, &Ok(gates(bay.clone()))),
+            "  queued 46m · running 14m · median 18m"
+        );
+        // Past twice the median, the line says so — the same word the
+        // gates region uses.
+        let slow = ActiveGate {
+            running_seconds: Some(41 * 60),
+            troubled: true,
+            ..bay.clone()
+        };
+        assert_eq!(
+            super::gate_times(id, &Ok(gates(slow))),
+            "  queued 46m · running 41m · median 18m — TROUBLED: running past 2× the median"
+        );
+        // A run filed before the launch stamp: its wait is unknown, not
+        // zero; and nothing measured is said, not invented.
+        let old = ActiveGate {
+            launched_at: None,
+            queued_seconds: None,
+            ..bay.clone()
+        };
+        let unmeasured = Gates {
+            typical_seconds: None,
+            ..gates(old)
+        };
+        assert_eq!(
+            super::gate_times(id, &Ok(unmeasured)),
+            "  wait unrecorded · running 14m · no median measured"
+        );
+        // Not in the yard's bays (it settled between the reads): nothing.
+        assert_eq!(super::gate_times("other", &Ok(gates(bay))), "");
+        // The yard unread: said, never silent.
+        assert_eq!(
+            super::gate_times(id, &Err("HTTP 503".into())),
+            "  (times unavailable: HTTP 503)"
+        );
+    }
+
+    /// A queued run says how long it has stood in line, from its own
+    /// stamp against the clock.
+    #[test]
+    fn a_queued_line_says_how_long_it_has_waited() {
+        use serde_json::json;
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-28T02:30:10Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let run = json!({"metadata": {
+            "branch": "fix/x",
+            boss_jobs::yard::QUEUED_AT: "2026-09-28T01:44:10Z",
+        }});
+        assert_eq!(super::queued_for(&run, now), "  (waiting 46m)");
+        let blank = json!({"metadata": { "branch": "fix/x" }});
+        assert_eq!(super::queued_for(&blank, now), "");
     }
 
     /// A TRAIN's gate-run (128b5496) in the GATING lane is the train being
@@ -3002,18 +3479,188 @@ mod tests {
             gate_run("fix/d", json!({}), "green"),
         ];
         let line = flakes_line(&runs);
+        let none_moved = "\n    FLAKES AT A NEW HEAD — none: no dock re-gate went red then green \
+                          at the next main in the last 7 days";
         assert_eq!(
             line,
-            "\n  FLAKES — 2 check(s) red then green at the same head in the last 7 days: test: 2, fmt: 1"
+            format!(
+                "\n  FLAKES — 2 check(s) red then green at the same head in the last 7 days: \
+                 test: 2, fmt: 1{none_moved}"
+            )
         );
         assert_eq!(
             flakes_line(&[]),
-            "\n  FLAKES — none: no gate went red then green at the same head in the last 7 days"
+            format!(
+                "\n  FLAKES — none: no gate went red then green at the same head in the last 7 \
+                 days{none_moved}"
+            )
         );
         // The window the line names is the window the read narrows on.
         let q = stranded_gate_runs_query();
         assert!(params(&q).contains(&("closed_within", "7")), "{q}");
         assert!(line.contains("last 7 days"), "{line}");
+    }
+
+    /// A closed gate-run as the dock's re-gate files it: `dock_regate`
+    /// names the car (train/dock_regate.rs `marks`), the verdict and the
+    /// receipt ride the `record-verdict` step as the gate writes them.
+    fn dock_run(
+        car: &str,
+        branch: &str,
+        sha: &str,
+        at: &str,
+        verdict: &str,
+        fails: &[&str],
+    ) -> Value {
+        let checks: Vec<Value> = fails
+            .iter()
+            .map(|n| json!({ "name": n, "result": "fail" }))
+            .chain(std::iter::once(json!({ "name": "fmt", "result": "pass" })))
+            .collect();
+        let receipt = json!({ "verdict": verdict, "head": sha, "checks": checks }).to_string();
+        json!({
+            "id": format!("{car}-{sha}"),
+            "kind": "gate-run",
+            "status": "closed",
+            "metadata": {
+                "branch": branch,
+                "sha": sha,
+                "opened_at": at,
+                "dock_regate": { "car": car, "main": "m" },
+            },
+            "steps": [{
+                "spec_slug": "record-verdict",
+                "metadata": { "verdict": verdict, "receipt": receipt },
+            }],
+        })
+    }
+
+    /// A FLAKE RE-GATED AT A NEW HEAD IS COUNTED (backlog 4d928d0a, part
+    /// 2). Dock re-gate 7b2acdc4 on
+    /// feat/experiments-page-shows-what-decides-trust went red on
+    /// web-suite, on a spec the car does not touch, and the dock's
+    /// re-gate at the next main came back green — a new head, because
+    /// the dock replays the car onto main, so the same-head relation
+    /// (`flake_of`) never formed and FLAKES did not count it. Two dock
+    /// re-gates of one car on one branch are the same parked change
+    /// replayed onto two mains; red then green between them is counted
+    /// on its own line, because a flake and main's own fix look alike
+    /// from here. A red then a builder's green is not counted (the author
+    /// may have changed the car), nor a refusal (it judged nothing), nor
+    /// a same-head flake already counted above.
+    #[test]
+    fn a_dock_regate_red_then_green_at_the_next_main_is_counted_on_its_own_line() {
+        let mut refused = dock_run(
+            "car-4",
+            "fix/w",
+            "h7",
+            "2026-09-27T10:00:00Z",
+            "failed",
+            &[],
+        );
+        refused["steps"][0]["metadata"]["receipt"] =
+            json!(json!({ "verdict": "refused", "refused_because": "disk floor" }).to_string());
+        let mut builder_green =
+            dock_run("car-2", "fix/y", "h4", "2026-09-27T11:00:00Z", "green", &[]);
+        builder_green["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("dock_regate");
+        let mut same_head = dock_run("car-3", "fix/z", "h6", "2026-09-27T11:00:00Z", "green", &[]);
+        same_head["metadata"]["flake_of"] = json!("car-3-h5");
+        let runs = vec![
+            // Newest first, as the jobs API answers: the order is the
+            // reader's to establish.
+            dock_run(
+                "car-1",
+                "feat/experiments-page-shows-what-decides-trust",
+                "h2",
+                "2026-09-27T23:40:00Z",
+                "green",
+                &[],
+            ),
+            dock_run(
+                "car-1",
+                "feat/experiments-page-shows-what-decides-trust",
+                "h1",
+                "2026-09-27T22:50:00Z",
+                "failed",
+                &["web-suite"],
+            ),
+            dock_run(
+                "car-2",
+                "fix/y",
+                "h3",
+                "2026-09-27T10:00:00Z",
+                "failed",
+                &["test"],
+            ),
+            builder_green,
+            dock_run(
+                "car-3",
+                "fix/z",
+                "h5",
+                "2026-09-27T10:00:00Z",
+                "failed",
+                &["clippy"],
+            ),
+            same_head,
+            refused,
+            dock_run("car-4", "fix/w", "h8", "2026-09-27T11:00:00Z", "green", &[]),
+            // A builder's gate between two dock re-gates: the change may
+            // have moved there, so the dock's green is not a replay of
+            // the red's change.
+            dock_run(
+                "car-5",
+                "fix/v",
+                "h9",
+                "2026-09-27T10:00:00Z",
+                "failed",
+                &["test"],
+            ),
+            {
+                let mut b = dock_run(
+                    "car-5",
+                    "fix/v",
+                    "h10",
+                    "2026-09-27T10:30:00Z",
+                    "green",
+                    &[],
+                );
+                b["metadata"].as_object_mut().unwrap().remove("dock_regate");
+                b
+            },
+            dock_run(
+                "car-5",
+                "fix/v",
+                "h11",
+                "2026-09-27T11:00:00Z",
+                "green",
+                &[],
+            ),
+        ];
+        let tally = rebased_flakes(&runs);
+        assert_eq!(
+            tally,
+            BTreeMap::from([("web-suite".to_string(), 1usize)]),
+            "{tally:?}"
+        );
+        assert_eq!(
+            rebased_flakes_line(&tally, GATE_RUN_WINDOW_DAYS),
+            "    FLAKES AT A NEW HEAD — 1 check(s) red then green when the dock re-gated the \
+             same car onto the next main in the last 7 days (a flake or main's own fix; the \
+             car's change did not move): web-suite: 1"
+        );
+        assert_eq!(
+            rebased_flakes_line(&BTreeMap::new(), GATE_RUN_WINDOW_DAYS),
+            "    FLAKES AT A NEW HEAD — none: no dock re-gate went red then green at the next \
+             main in the last 7 days"
+        );
+        assert!(
+            flakes_line(&runs).contains("FLAKES AT A NEW HEAD — 1 check(s)"),
+            "the FLAKES section carries both counts: {}",
+            flakes_line(&runs)
+        );
     }
 
     /// The truncation note is a reading of `total` against the page, and
@@ -3104,6 +3751,7 @@ mod tests {
                 park_intent: true,
             }],
             &BTreeMap::new(),
+            &BTreeMap::new(),
         );
         let all = lines.join("\n");
         assert!(all.contains("ABANDONED"), "{all}");
@@ -3142,11 +3790,54 @@ mod tests {
                 park_intent: true,
             }],
             &BTreeMap::new(),
+            &BTreeMap::new(),
         );
         let all = lines.join("\n");
         assert!(
             all.contains("recover: boss gate fix/x --wait --rebase"),
             "the recovery replays onto main in the verb, never by hand: {all}"
+        );
+    }
+
+    /// A VOUCHED STRAND IS WITHDRAWN, NOT RECOVERED (backlog b1c82a82).
+    /// Measured 2026-09-28 00:45Z on gate-run 8c2f644a: this line printed
+    /// `boss gate <branch> --wait --rebase`, and the verb REFUSED it —
+    /// the head already had a current green, carried by car 59e1f436,
+    /// and re-gating it would file a twin. The condition is checked
+    /// FIRST, and the line names the withdraw door and what closes the
+    /// packet on its own, never the recovery the verb refuses.
+    #[test]
+    fn an_abandoned_place_a_car_already_vouches_for_names_the_withdraw_door() {
+        let place = AbandonedPlace {
+            packet: "8c2f644a-1b71-4a5a-bb46-cb2f340d59d4".to_string(),
+            branch: "feat/credential-broker-mints-github-app-installation-tokens".to_string(),
+            sha: "1c82e857aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            queued_at: "2026-09-28T00:20:00Z".to_string(),
+            idle_secs: Some(25 * 60),
+            park_intent: true,
+        };
+        let vouched = BTreeMap::from([(
+            place.packet.clone(),
+            crate::gate::Vouch {
+                car: "59e1f436-0000-4000-8000-000000000000".to_string(),
+                head: place.sha.clone(),
+                where_it_is: "parked at the dock".to_string(),
+            },
+        )]);
+        // Even a place main also holds reads as vouched: the check is first.
+        let landed = BTreeMap::from([(place.packet.clone(), "merged".to_string())]);
+        let all = abandoned_report(&[place], &landed, &vouched).join("\n");
+        assert!(all.contains("8c2f644a"), "still reported: {all}");
+        assert!(all.contains("car 59e1f436"), "names the car: {all}");
+        assert!(
+            all.contains("boss gate --withdraw 8c2f644a"),
+            "names the door: {all}"
+        );
+        assert!(!all.contains("recover:"), "no refused recovery: {all}");
+        assert!(!all.contains("LANDED"), "the vouch is read first: {all}");
+        assert!(
+            all.contains(&format!("{} min", crate::train::ORPHAN_GATE_RUN_MINUTES)),
+            "names what closes it on its own: {all}"
         );
     }
 
@@ -3170,7 +3861,7 @@ mod tests {
             place.packet.clone(),
             "main already holds its version of every file it changed".to_string(),
         )]);
-        let all = abandoned_report(&[place], &landed).join("\n");
+        let all = abandoned_report(&[place], &landed, &BTreeMap::new()).join("\n");
         assert!(all.contains("03af83b4"), "still reported: {all}");
         assert!(all.contains("LANDED"), "{all}");
         assert!(
@@ -3257,7 +3948,7 @@ mod tests {
     /// already says how many places are held.
     #[test]
     fn a_healthy_queue_reports_no_abandoned_section() {
-        assert!(abandoned_report(&[], &BTreeMap::new()).is_empty());
+        assert!(abandoned_report(&[], &BTreeMap::new(), &BTreeMap::new()).is_empty());
     }
 
     /// A RECOVERY LINE THAT NAMES NO BRANCH IS NOT ADVICE. A packet with
@@ -3275,6 +3966,7 @@ mod tests {
                 idle_secs: Some(600),
                 park_intent: false,
             }],
+            &BTreeMap::new(),
             &BTreeMap::new(),
         );
         let all = lines.join("\n");
@@ -3301,6 +3993,7 @@ mod tests {
                 park_intent: false,
             }],
             &BTreeMap::new(),
+            &BTreeMap::new(),
         );
         let all = lines.join("\n");
         assert!(
@@ -3324,6 +4017,55 @@ mod tests {
         let mut c = car(branch, status, review, json!({}));
         c["metadata"] = json!({ "branch": branch, "skips": skips, "skip_reason": reason });
         c
+    }
+
+    /// ITEM 10 OF BACKLOG 7919fdcc — THE PIN. The dock's streak is read at
+    /// the conductor's own threshold, and a car appears on this list
+    /// exactly when the conductor owes it a left-behind alarm (for a car
+    /// that names none yet): one threshold, two readers, held equal here
+    /// across the boundary rather than by a comment. `skips` is a
+    /// different counter and moves nothing on this list.
+    #[test]
+    fn the_left_behind_list_is_exactly_the_cars_the_alarm_is_due_for() {
+        let left = |trains: Value, skips: u64| {
+            let mut c = car("fix/held", "open", "ready", json!({}));
+            c["metadata"] = json!({
+                "branch": "fix/held",
+                boss_jobs::car::LEFT_BEHIND_TRAINS: trains,
+                "skips": skips,
+                "skip_reason": "its dock re-gate is red on test",
+            });
+            c
+        };
+        for n in 0..=crate::train::LEFT_BEHIND_ALARM_TRAINS + 3 {
+            let c = left(json!(n), 0);
+            assert_eq!(
+                !left_behind_dock_cars(std::slice::from_ref(&c)).is_empty(),
+                crate::train::left_behind_alarm_due(&c, n),
+                "at {n} departures the list and the alarm disagree"
+            );
+        }
+        assert!(
+            left_behind_dock_cars(&[left(json!(null), 40)]).is_empty(),
+            "assembly's skips are not the dock's streak"
+        );
+        assert_eq!(
+            left_behind_dock_cars(&[left(json!(4), 0)]),
+            vec![(
+                "fix/held".to_string(),
+                4,
+                "its dock re-gate is red on test".to_string()
+            )]
+        );
+        assert!(
+            left_behind_dock_cars(&[{
+                let mut c = left(json!(9), 0);
+                c["status"] = json!("closed");
+                c
+            }])
+            .is_empty(),
+            "a car that left the dock is not left behind on it"
+        );
     }
 
     /// ONE SKIP IS ROUTINE. 39% of trains carry a skipped branch and
@@ -3410,13 +4152,48 @@ mod tests {
             .iter()
             .map(|(b, f)| json!({ "branch": b, "files": f }))
             .collect();
+        // The car vouches for DOCK_HEAD and the preview measured it —
+        // the steady state; `repointed` below moves the car off it.
+        c["metadata"]["regate_receipt"] =
+            json!(format!(r#"{{"verdict":"green","head":"{DOCK_HEAD}"}}"#));
         c["metadata"]["merge_preview"] = json!({
             "vs_main": { "clean": true },
             "conflicts_with": co,
-            "anchored": { "main": "m", "parked_set": set },
+            "anchored": { "main": "m", "head": DOCK_HEAD, "parked_set": set },
             "checked_at": "2026-09-23T10:10:55Z",
         });
         c
+    }
+
+    const DOCK_HEAD: &str = "ad0f99f6aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const REPOINTED_HEAD: &str = "b1ec12e8bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// The car after `boss rerail --finish` moved it to a new head, its
+    /// preview not yet rewritten — the conductor's next tick does that.
+    fn repointed(mut c: Value) -> Value {
+        c["metadata"]["regate_receipt"] = json!(format!(
+            r#"{{"verdict":"green","head":"{REPOINTED_HEAD}"}}"#
+        ));
+        c
+    }
+
+    /// A PAIR IS READ ONLY OFF PREVIEWS MEASURED AGAINST THE HEADS THE
+    /// CARS CARRY (backlog 43a7fc47). The parked-set anchor moves only
+    /// when the conductor next measures, so after a rerail every car
+    /// still carries the old set, and the set check alone passes a pair
+    /// computed against a head one of them no longer has.
+    #[test]
+    fn a_pair_measured_against_a_head_one_car_no_longer_carries_is_not_named() {
+        let cars = vec![
+            repointed(previewed(
+                "fix/b",
+                "ready",
+                "s1",
+                &[("fix/a", &["WorldMap.svelte"])],
+            )),
+            previewed("fix/a", "ready", "s1", &[("fix/b", &["WorldMap.svelte"])]),
+        ];
+        assert!(unboardable_pairs(&cars).is_empty());
     }
 
     /// THE PAIR IS NAMED ONCE, with its files. On 2026-09-20 three cars
@@ -3502,11 +4279,100 @@ mod tests {
         ];
         assert_eq!(
             conflicts_with_main(&cars),
-            vec![(
-                "fix/my-work".to_string(),
-                vec!["orient.rs".to_string()],
-                "1d917084".to_string(),
-            )]
+            vec![MainConflict {
+                branch: "fix/my-work".to_string(),
+                files: vec!["orient.rs".to_string()],
+                main: "1d917084".to_string(),
+                measured: Some("ad0f99f6".to_string()),
+                carries: Some("ad0f99f6".to_string()),
+                checked_at: "2026-09-23T10:10:55Z".to_string(),
+                current: true,
+            }]
+        );
+    }
+
+    /// A VERDICT ON A HEAD THE CAR NO LONGER CARRIES IS STALE, NOT A
+    /// CONFLICT (backlog 43a7fc47). Measured 2026-09-27 20:57Z: car
+    /// fix/it-registry-read-failures-provenance-and-shadow-list was
+    /// repointed to its -rerail head b1ec12e8 (merges clean) at ~20:51Z,
+    /// and orient still named it under CONFLICTS WITH MAIN off a preview
+    /// computed at 20:50:27Z against ad0f99f6 — the sweep rewrote it at
+    /// 21:00:29Z. The operator re-planned around it; a second instance
+    /// at 22:58Z cost a needless rerail. The row now says which head the
+    /// verdict was measured against and that the car carries another.
+    #[test]
+    fn a_main_conflict_measured_against_a_head_the_car_no_longer_carries_is_stale() {
+        let cars = vec![repointed(off_main(
+            "fix/it-registry-read-failures-provenance-and-shadow-list",
+            "ready",
+            "s1",
+            "2026-09-27T20:50:27Z",
+            &["registry.rs"],
+        ))];
+        let rows = conflicts_with_main(&cars);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(!rows[0].current, "{rows:?}");
+        assert_eq!(rows[0].measured.as_deref(), Some("ad0f99f6"));
+        assert_eq!(rows[0].carries.as_deref(), Some("b1ec12e8"));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-27T20:57:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let line = main_conflict_line(&rows[0], now);
+        assert!(
+            line.contains("preview stale")
+                && line.contains("ad0f99f6")
+                && line.contains("b1ec12e8")
+                && line.contains("6 min ago"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("registry.rs"),
+            "a stale verdict names no files: {line}"
+        );
+    }
+
+    /// A preview that names no head — written before the head was part of
+    /// the anchor — cannot say which head it judged, so its conflict is
+    /// stale too rather than a verdict; the conductor's next tick
+    /// rewrites it with the head.
+    #[test]
+    fn a_main_conflict_whose_preview_names_no_head_is_stale() {
+        let mut c = off_main(
+            "fix/old-writer",
+            "ready",
+            "s1",
+            "2026-09-23T10:10:55Z",
+            &["a.rs"],
+        );
+        c["metadata"]["merge_preview"]["anchored"]
+            .as_object_mut()
+            .unwrap()
+            .remove("head");
+        let rows = conflicts_with_main(&[c]);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(!rows[0].current);
+        assert_eq!(rows[0].measured, None);
+    }
+
+    /// The current verdict carries its head and its age beside main, so
+    /// the row can be judged without re-deriving when it was measured
+    /// (the second 2026-09-27 instance asked for exactly this).
+    #[test]
+    fn a_current_main_conflict_row_names_its_files_head_main_and_age() {
+        let cars = vec![off_main(
+            "fix/my-work",
+            "ready",
+            "s1",
+            "2026-09-23T10:10:55Z",
+            &["orient.rs"],
+        )];
+        let rows = conflicts_with_main(&cars);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-23T10:40:55Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            main_conflict_line(&rows[0], now),
+            "    fix/my-work  —  orient.rs  (head ad0f99f6 onto main@1d917084, checked 30 min ago)"
         );
     }
 

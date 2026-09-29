@@ -41,8 +41,10 @@ describe('the roster is the catalog', () => {
     // backlog left the catalog with their pages — each board is a
     // station's panel on /it now. 43 since backlog 62988516
     // (2026-09-27): the Agents tab on Registry, the agents registry as
-    // a directory, joined the catalog and so the march.
-    expect(paths.length).toBe(43);
+    // a directory, joined the catalog and so the march. 44 since backlog
+    // 851259b9 (2026-09-27): the Credentials tab on Registry, the
+    // credentials registry with its lifecycle as packets.
+    expect(paths.length).toBe(44);
   });
 
   it('a parameterised catalog path is a page the march audits', () => {

@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
     // by the inner client (backlog 85e7f10f).
     let policy: Arc<dyn boss_policy_client::PolicyClient> =
         boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
-            boss_policy_client::ReqwestPolicyClient::new(cli.policy_url),
+            boss_policy_client::ReqwestPolicyClient::new("views", cli.policy_url),
         ));
 
     let app = boss_views::http::router(boss_views::http::ViewsApiState {

@@ -130,6 +130,7 @@ async fn main() -> Result<()> {
     let policy: Arc<dyn boss_policy_client::PolicyClient> =
         boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
             boss_policy_client::ReqwestPolicyClient::new(
+                "people",
                 std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
             ),
         ));
@@ -159,6 +160,19 @@ async fn main() -> Result<()> {
     .merge(boss_people::webauthn::webauthn_router(
         pool.clone(),
         clock.clone(),
+    ))
+    // The passkey promote door (design 2cb6256f): it flips a key to the
+    // operator tier only on a ticket the gateway signed after the
+    // promoted key AND a break-glass key asserted on /me, verified with
+    // the gateway's own key file, over a packet it reads live from the
+    // jobs API. Held unmounted until that ticket existed (review of car
+    // 293d5dc1); pinned in the module as mounted here, once.
+    .merge(boss_people::passkey_promotion::promotion_router(
+        pool.clone(),
+        std::sync::Arc::new(
+            boss_people::passkey_promotion::JobsApiPromotionPackets::new(boss_ports::url("jobs")),
+        ),
+        std::sync::Arc::new(boss_people::passkey_promotion::TicketKey::from_env()),
     ));
     // people-api owns only the employee-side routers. The
     // accounts-side routers (accounts, account_team_members,

@@ -600,7 +600,7 @@ struct Visitor<'a> {
 /// `cfg(any(test, feature = "…"))` and `cfg_attr(test, …)` are all test
 /// code, and a pass that only recognised the first would measure the
 /// others.
-fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
+pub(crate) fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
         let Some(ident) = attr.path().get_ident() else {
             return false;

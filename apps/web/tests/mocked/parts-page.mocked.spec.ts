@@ -14,7 +14,8 @@
 //             ModuleDisabled, one button, no reads.
 //   State B — the module on (the brewery's tenant.toml): PartsList —
 //             1 link kind (the SKU cell, once per row), 6 stock-status
-//             buttons + up to 4 kind buttons, 1 search input, 4 reads,
+//             buttons (7 when a catalogued part was never stocked,
+//             4cb8c06a) + up to 4 kind buttons, 1 search input, 4 reads,
 //             0 writes — and, below the list, the warehouse
 //             department's own packets (backlog 044dffa1): a fifth
 //             read, the jobs listing narrowed by department, pinned in
@@ -94,7 +95,8 @@ const CATALOG_PARTS_BODY = [
   flatPart('ING-MALT-01', 'Pale malt', '2-row base malt'),
   flatPart('ING-HOPS-01', 'Citra hops', 'Pellet hops, T90'),
   flatPart('PKG-CAN-01', '16oz can', 'Aluminium can, printed'),
-  // Catalogued but never stocked: no inventory row (gap 8, 4cb8c06a).
+  // Catalogued but never stocked: no inventory row (gap 8, 4cb8c06a,
+  // fixed) — a row of its own, last, with "—" where stock would be.
   flatPart('ING-YEAST-01', 'Ale yeast', 'Dry yeast, 500g'),
 ];
 
@@ -135,6 +137,8 @@ const ROWS: ReadonlyArray<ReadonlyArray<string>> = [
   // Stocked under a catalog MODEL's sku: no name from either source, so
   // the name is the SKU; kind from the prefix fallback; Used by "—".
   ['DM-KEG-1', 'DM-KEG-1', 'spare', '3', '0', '1', '—', 'healthy', '—', 'D-01'],
+  // Catalogued, no inventory row (4cb8c06a): no stock figures to show.
+  ['ING-YEAST-01', 'Ale yeast', 'ingredient', '—', '—', '—', '—', 'never stocked', '0', '—'],
 ];
 const SKUS = ROWS.map((r) => r[0]!);
 
@@ -202,12 +206,12 @@ test.describe('/ux/parts — State A, the parts module off (the live instance)',
       await expect(notice.locator('strong')).toHaveText(ROUTE_CATALOG.parts.label);
       await expect(notice.locator('strong')).toHaveText('Ingredients & parts');
       await expect(notice).toContainText(
-        "The Ingredients & parts module is turned off in this tenant's tenant.toml. The page exists in the platform — the active tenant just doesn't surface it.",
+        "The Ingredients & parts module is turned off in this tenant's manifest. The page exists in the platform — the active tenant just doesn't surface it.",
       );
-      // Gap 3 (fa838818): the one instruction names examples/<tenant>,
-      // and this instance's tenant is not in examples/.
+      // Gap 3 (fa838818, fixed): the instruction names the manifest by
+      // what it is, not an examples/<tenant> path this instance lacks.
       await expect(notice).toContainText(
-        'To enable: set parts = true in examples/<tenant>/seeds/tenant.toml under [modules], redeploy, and the page comes back.',
+        "To enable: set parts = true in the [modules] section of the tenant's manifest, redeploy, and the page comes back.",
       );
       await expect(notice.getByRole('button')).toHaveCount(1);
       await expect(notice.locator('a')).toHaveCount(0);
@@ -254,21 +258,23 @@ test.describe('/ux/parts — State B, the module on: the list', () => {
 
     await expect(page.locator('.exec-eyebrow')).toHaveText('Inventory');
     // The label fallback: the mocked manifest carries no labels.
-    await expect(body(page).locator('h1.exec-title')).toHaveText('6 parts');
+    await expect(body(page).locator('h1.exec-title')).toHaveText('7 parts');
     await expect(body(page).locator('header p')).toHaveText('3 need attention · 1 out · 1 critical');
     await expect(body(page).locator('.filter-label')).toHaveText(['Search', 'Stock status', 'Kind']);
 
-    // 6 stock-status buttons + all 4 kind buttons (each kind is present),
-    // and nothing else on the page is a button.
+    // 7 stock-status buttons (Never stocked is drawn because one part
+    // was) + all 4 kind buttons (each kind is present), and nothing else
+    // on the page is a button.
     await expect(body(page).locator('.filter-group').nth(1).getByRole('button')).toHaveText([
-      'Needs attention (3)', 'All (6)', 'Out of stock (1)', 'Critical (1)', 'Low (1)', 'Healthy (3)',
+      'Needs attention (3)', 'All (7)', 'Out of stock (1)', 'Critical (1)', 'Low (1)', 'Healthy (3)',
+      'Never stocked (1)',
     ]);
     await expect(body(page).locator('.filter-group').nth(2).getByRole('button')).toHaveText([
-      'Ingredients (2)', 'Packaging (1)', 'Spare parts (2)', 'Consumables (1)',
+      'Ingredients (3)', 'Packaging (1)', 'Spare parts (2)', 'Consumables (1)',
     ]);
-    await expect(body(page).getByRole('button')).toHaveCount(10);
+    await expect(body(page).getByRole('button')).toHaveCount(11);
     // Default filter is All.
-    await expect(body(page).locator('.filter-btn-active')).toHaveText('All (6)');
+    await expect(body(page).locator('.filter-btn-active')).toHaveText('All (7)');
     await expect(search(page)).toHaveValue('');
 
     await expect(body(page).locator('thead th')).toHaveText(HEADINGS);
@@ -276,10 +282,10 @@ test.describe('/ux/parts — State B, the module on: the list', () => {
     for (const [i, cells] of ROWS.entries()) {
       await expect(rows.nth(i).locator('td')).toHaveText([...cells]);
     }
-    // Gap 8 (4cb8c06a): a catalogued part with no inventory row is not a
-    // row, and the title counts inventory rows only.
-    await expect(body(page)).not.toContainText('ING-YEAST-01');
-    await expect(body(page)).not.toContainText('Ale yeast');
+    // Gap 8 (4cb8c06a), fixed: a catalogued part with no inventory row
+    // was not a row while the title counted the rest as the page's parts.
+    // It is the last row now, and the title's 7 is the table's 7.
+    await expect(rows.last().locator('td').first()).toHaveText('ING-YEAST-01');
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
 
     expect(seen.writes.map((r) => `${r.method()} ${r.url()}`)).toEqual([]);
@@ -294,7 +300,7 @@ test.describe('/ux/parts — State B, the module on: the list', () => {
       }),
     );
     await mountParts(page);
-    await expect(body(page).locator('h1.exec-title')).toHaveText('6 ingredients & packaging items');
+    await expect(body(page).locator('h1.exec-title')).toHaveText('7 ingredients & packaging items');
   });
 
   test('a brewery-only inventory shows only the kind buttons it has', async ({ page }) => {
@@ -302,15 +308,16 @@ test.describe('/ux/parts — State B, the module on: the list', () => {
     await page.route(MODELS, (r) => json(r, []));
     await page.route(ITEMS, (r) => json(r, ITEMS_BODY.filter((i) => /^(ING|PKG)-/.test(i.part_sku))));
     await mountPage(page, PATH);
-    await expect(body(page).locator('tbody tr')).toHaveCount(3);
+    // Three stocked, and the catalogued yeast that never was (4cb8c06a).
+    await expect(body(page).locator('tbody tr')).toHaveCount(4);
 
     await expect(body(page).locator('.filter-group').nth(2).getByRole('button')).toHaveText([
-      'Ingredients (2)', 'Packaging (1)',
+      'Ingredients (3)', 'Packaging (1)',
     ]);
     await expect(button(page, /^Spare parts/)).toHaveCount(0);
     await expect(button(page, /^Consumables/)).toHaveCount(0);
     // Gap 9 (e709ee79): with no device linkage every row reads "used by 0".
-    await expect(body(page).locator('tbody tr td:nth-child(9)')).toHaveText(['0', '0', '0']);
+    await expect(body(page).locator('tbody tr td:nth-child(9)')).toHaveText(['0', '0', '0', '0']);
   });
 });
 
@@ -321,14 +328,17 @@ test.describe('/ux/parts — State B: every filter button does what its label sa
     ['Critical (1)', ['ING-HOPS-01']],
     ['Low (1)', ['SP-GASKET-01']],
     ['Healthy (3)', ['ING-MALT-01', 'CN-CIP-01', 'DM-KEG-1']],
-    ['Ingredients (2)', ['ING-HOPS-01', 'ING-MALT-01']],
+    // Not "needs attention": with no inventory row there is no reorder
+    // point to fall below (4cb8c06a).
+    ['Never stocked (1)', ['ING-YEAST-01']],
+    ['Ingredients (3)', ['ING-HOPS-01', 'ING-MALT-01', 'ING-YEAST-01']],
     ['Packaging (1)', ['PKG-CAN-01']],
     ['Spare parts (2)', ['SP-GASKET-01', 'DM-KEG-1']],
     ['Consumables (1)', ['CN-CIP-01']],
-    ['All (6)', SKUS],
+    ['All (7)', SKUS],
   ];
 
-  test('each of the ten narrows the table to its set, client-side, without a read or a history entry', async ({ page }) => {
+  test('each of the eleven narrows the table to its set, client-side, without a read or a history entry', async ({ page }) => {
     const seen = watch(page);
     await installParts(page);
     await mountParts(page);
@@ -374,7 +384,7 @@ test.describe('/ux/parts — State B: the search input', () => {
       ['2-row', ['ING-MALT-01']], //             description
       ['gasket', ['SP-GASKET-01']], //           device-linkage name
       ['clean-in-place', ['CN-CIP-01']], //      device-linkage description
-      ['01', ['PKG-CAN-01', 'ING-HOPS-01', 'SP-GASKET-01', 'ING-MALT-01', 'CN-CIP-01']],
+      ['01', ['PKG-CAN-01', 'ING-HOPS-01', 'SP-GASKET-01', 'ING-MALT-01', 'CN-CIP-01', 'ING-YEAST-01']],
     ] as const) {
       await search(page).fill(q);
       await expect(skuColumn(page), q).toHaveText([...skus]);
@@ -469,14 +479,16 @@ test.describe('/ux/parts — State B: the SKU link, and back', () => {
 });
 
 test.describe('/ux/parts — State B: empty, loading, and a failed read', () => {
-  test('an empty backend paints the filters sentence, not a failure (gap 6)', async ({ page }) => {
+  test('an empty backend says there are no parts, not a failure and not the filters (gap 6)', async ({ page }) => {
     await installParts(page);
     for (const re of [MODELS, ITEMS, ORDERS, CATALOG_PARTS]) await page.route(re, (r) => json(r, []));
     await mountPage(page, PATH);
 
-    // Gap 6 (bc38daa8): "nothing here" is told to loosen filters it
-    // never set — the same line a too-narrow filter paints.
-    await expect(status(page)).toHaveText('No parts match those filters.');
+    // Gap 6 (bc38daa8), fixed by 0ef5e008: "nothing here" was told to
+    // loosen filters it never set — the line a too-narrow filter paints,
+    // which the next test keeps for that case alone.
+    await expect(status(page)).toHaveText('No parts yet.');
+    await expect(page.getByText('No parts match those filters.')).toHaveCount(0);
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
     await expect(body(page).locator('table')).toHaveCount(0);
     await expect(body(page).locator('h1.exec-title')).toHaveText('0 parts');
@@ -513,15 +525,17 @@ test.describe('/ux/parts — State B: empty, loading, and a failed read', () => 
     release();
     await expect(skuColumn(page)).toHaveText(SKUS);
     await expect(page.getByText('Loading…', { exact: true })).toHaveCount(0);
-    await expect(body(page).locator('h1.exec-title')).toHaveText('6 parts');
+    await expect(body(page).locator('h1.exec-title')).toHaveText('7 parts');
     await expect(body(page).locator('header p')).toHaveText('3 need attention · 1 out · 1 critical');
-    await expect(button(page, 'All (6)')).toBeVisible();
+    await expect(button(page, 'All (7)')).toBeVisible();
   });
 
-  for (const [name, re] of [
-    ['GET /api/catalog/models', MODELS],
-    ['GET /api/inventory/items', ITEMS],
-    ['GET /api/catalog/parts', CATALOG_PARTS],
+  // Each failure names the read it was: "HTTP 503" alone stood for any
+  // of three (backlog 0ef5e008).
+  for (const [name, re, path] of [
+    ['GET /api/catalog/models', MODELS, '/api/catalog/models'],
+    ['GET /api/inventory/items', ITEMS, '/api/inventory/items'],
+    ['GET /api/catalog/parts', CATALOG_PARTS, '/api/catalog/parts'],
   ] as const) {
     test(`a failed ${name} is said, never drawn as an empty list`, async ({ page }) => {
       await installParts(page);
@@ -529,7 +543,7 @@ test.describe('/ux/parts — State B: empty, loading, and a failed read', () => 
       await mountPage(page, PATH);
 
       const failed = page.locator(FAILURE_MARKER);
-      await expect(failed).toHaveText("Couldn't load parts — HTTP 503");
+      await expect(failed).toHaveText(`Couldn't load parts — ${path}: HTTP 503`);
       await expect(failed).toHaveAttribute('role', 'alert');
       await expect(body(page).locator('table')).toHaveCount(0);
       await expect(page.getByText('No parts match those filters.')).toHaveCount(0);
@@ -542,7 +556,7 @@ test.describe('/ux/parts — State B: empty, loading, and a failed read', () => 
     await installParts(page);
     await page.route(ITEMS, (r) => json(r, { error: 'down' }, 500));
     await mountPage(page, PATH);
-    await expect(page.locator(FAILURE_MARKER)).toHaveText("Couldn't load parts — HTTP 500");
+    await expect(page.locator(FAILURE_MARKER)).toHaveText("Couldn't load parts — /api/inventory/items: HTTP 500");
     await expect(body(page).locator('h1.exec-title')).toHaveText('Parts');
     await expect(body(page).locator('header p')).toHaveText('Counts unknown: parts did not load');
     await expect(body(page).locator('header')).not.toContainText('0 need attention');
@@ -557,7 +571,7 @@ test.describe('/ux/parts — State B: empty, loading, and a failed read', () => 
     await installParts(page);
     await page.route(MODELS, (r) => json(r, { error: 'down' }, 503));
     await mountPage(page, PATH);
-    await expect(page.locator(FAILURE_MARKER)).toHaveText("Couldn't load parts — HTTP 503");
+    await expect(page.locator(FAILURE_MARKER)).toHaveText("Couldn't load parts — /api/catalog/models: HTTP 503");
     await expect(body(page).locator('h1.exec-title')).toHaveText('Parts');
     await expect(body(page).locator('header p')).toHaveText('Counts unknown: parts did not load');
     await expectNoCountedButton(page);
@@ -567,7 +581,7 @@ test.describe('/ux/parts — State B: empty, loading, and a failed read', () => 
     await installParts(page);
     await page.route(ITEMS, (r) => r.abort('failed'));
     await mountPage(page, PATH);
-    await expect(page.locator(FAILURE_MARKER)).toHaveText("Couldn't load parts — Failed to fetch");
+    await expect(page.locator(FAILURE_MARKER)).toHaveText("Couldn't load parts — /api/inventory/items: Failed to fetch");
     await expect(body(page).locator('table')).toHaveCount(0);
   });
 
@@ -582,18 +596,47 @@ test.describe('/ux/parts — State B: empty, loading, and a failed read', () => 
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
   });
 
-  // Gap 7 (b6b74115): a 200 whose body is neither a list nor {data} is
-  // read as empty, with no failure line.
-  test('a 200 with an unexpected body paints as empty; a {data} envelope is read', async ({ page }) => {
-    await installParts(page);
-    await page.route(ITEMS, (r) => json(r, { error: 'contract changed' }));
-    await mountPage(page, PATH);
-    await expect(status(page)).toHaveText('No parts match those filters.');
-    await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
+  // Gap 7 (b6b74115), fixed: a 200 whose body is neither a list nor
+  // {data} was read as empty, with no failure line — and since 4cb8c06a
+  // that painted every catalogued part as never stocked (0f239091). It
+  // is a failed read naming the read and what came back. 0ef5e008 fixed
+  // the three row sources; b6b74115 holds the purchase-order read to it
+  // too, since a contract break is not an outage (gap 4 is the outage).
+  // Each read, one at a time: the line names it, and no part is called
+  // never stocked on a read that said nothing about stock.
+  for (const [path, re] of [
+    ['/api/catalog/models', MODELS],
+    ['/api/inventory/items', ITEMS],
+    ['/api/inventory/orders', ORDERS],
+    ['/api/catalog/parts', CATALOG_PARTS],
+  ] as const) {
+    test(`a 200 from ${path} that is neither a list nor {data} is a failed read`, async ({ page }) => {
+      await installParts(page);
+      await page.route(re, (r) => json(r, { error: 'contract changed' }));
+      await mountPage(page, PATH);
 
+      const failed = page.locator(FAILURE_MARKER);
+      await expect(failed).toHaveText(
+        `Couldn't load parts — ${path}: HTTP 200, but the body is an object with no data list, not a list or a {data: [...]} envelope`,
+      );
+      await expect(failed).toHaveAttribute('role', 'alert');
+      await expect(body(page).locator('table')).toHaveCount(0);
+      await expect(page.getByText('never stocked', { exact: true })).toHaveCount(0);
+      await expect(body(page).getByRole('button', { name: /never stocked/i })).toHaveCount(0);
+      await expect(body(page).locator('header p')).toHaveText('Counts unknown: parts did not load');
+    });
+  }
+
+  test('a {data} envelope is read as its rows, from every read', async ({ page }) => {
+    await installParts(page);
+    await page.route(MODELS, (r) => json(r, { data: MODELS_BODY }));
     await page.route(ITEMS, (r) => json(r, { data: ITEMS_BODY }));
-    await page.reload();
+    await page.route(ORDERS, (r) => json(r, { data: ORDERS_BODY }));
+    await page.route(CATALOG_PARTS, (r) => json(r, { data: CATALOG_PARTS_BODY }));
+    await mountParts(page);
     await expect(skuColumn(page)).toHaveText(SKUS);
+    await expect(body(page).locator('tbody tr td:nth-child(7)')).toHaveText(ROWS.map((r) => r[6]!));
+    await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
   });
 });
 

@@ -5,11 +5,17 @@
 // fleet aggregate groups server-side — spec_slug with the title as
 // the pre-migration-100 fallback — or the client's item lists and
 // the server's depth badges disagree about which node a Job is on.
-import type { Job, Step } from './types';
+import type { ListedJob, ListedStep } from './types';
+
+// Typed on the LISTED shape (backlog ea80b5fd): a position reads a
+// step's status, slug and title, never its metadata, so these take a
+// slim row off an unflagged list read as readily as a whole Job — and
+// hand back whichever step type they were given.
+type Stepped<S extends ListedStep> = Readonly<{ steps?: ReadonlyArray<S> }>;
 
 /// A Job's current in-flight step (first `ready`/`active` by the
 /// server's sort order), if any.
-export function currentStep(j: Job): Step | undefined {
+export function currentStep<S extends ListedStep>(j: Stepped<S>): S | undefined {
   const steps = Array.isArray(j.steps) ? j.steps : [];
   return steps.find((s) => s.status === 'ready' || s.status === 'active');
 }
@@ -33,17 +39,17 @@ export function standingNote(status: string): string {
 }
 
 /// The fleet-node key the Job sits at: `spec_slug`, else title.
-export function positionOf(j: Job): string | null {
+export function positionOf(j: Stepped<ListedStep>): string | null {
   const current = currentStep(j);
   if (!current) return null;
-  const slug = (current as Step & { spec_slug?: string | null }).spec_slug;
+  const slug = (current as ListedStep & { spec_slug?: string | null }).spec_slug;
   return slug && slug !== '' ? slug : (current.title ?? null);
 }
 
 /// Where the Job stands, as a person reads it: its position with the
 /// current step's status beside it (`promoted (ready, not yet done)`),
 /// or `null` when no step is in flight.
-export function standingOf(j: Job): string | null {
+export function standingOf(j: Stepped<ListedStep>): string | null {
   const current = currentStep(j);
   const pos = positionOf(j);
   return current && pos ? standingAt(pos, current.status) : null;
@@ -58,8 +64,8 @@ const PRIORITY_ORDER: Record<string, number> = {
 
 /// Group Jobs by their position, each list priority-first then
 /// oldest-first — the queue order a triager works in.
-export function groupByPosition(jobs: ReadonlyArray<Job>): Map<string, Job[]> {
-  const out = new Map<string, Job[]>();
+export function groupByPosition<J extends ListedJob>(jobs: ReadonlyArray<J>): Map<string, J[]> {
+  const out = new Map<string, J[]>();
   for (const j of jobs) {
     const pos = positionOf(j);
     if (!pos) continue;

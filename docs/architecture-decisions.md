@@ -328,7 +328,21 @@ was answered on design `8c3e9599` (2026-09-25; §Step UX & frontend).
 It has nine live rows, `engineering` folds into `it`, `people` stays
 as a row, and the six physical-operations rows are retired on this
 instance. That design also gives a department a second axis,
-`practices`, beside its single `function`.
+`practices`, beside its single `function`. **The move landed with
+backlog `c87e3d6d`** (page audit `9f7ba57d`, decided 2026-09-27; the
+departments write door and publish path had landed with `7edf0e97`):
+an employee's `department` validates against the un-retired
+`departments` rows (boss-people `departments`) and an agent's against
+the same rows at its batch door; no seed declares a department Class;
+the SPA's roster, employee page, HR headcount and policy scope picker
+label departments from `GET /api/departments`; the platform's own `it`
+is a `departments` row no example declares, so the migration's `it`
+department Class is eviction residue like its ten siblings; and the
+eviction keeps a department an employee, agent or requisition sits in.
+The live rows move through the evented doors, not a migration: the
+founder to `executive` (David 2026-09-27), the agent to `it`, then the
+nine department Classes retired one by one. Point (3), the role
+Classes' `metadata.department`, is still open (backlog `bac1d71d`).
 
 **The People roster holds people** (design `7aa2d1c5`, David
 2026-09-23; answers backlog `6a123f1f`, gap 12 of the `/ux/people`
@@ -2030,9 +2044,26 @@ system that runs the company.
 lines; with a real front door they are security telemetry, and "who
 tried the door" is a company fact. The gateway therefore gains **one
 small Postgres pool used only for audit staging**, on the existing
-`EventRecorder`/`PgOutboxRecorder` recipe, connecting as a dedicated
-role with INSERT-only rights on `event_outbox` — least privilege for
-the one internet-facing service. The alternative, an authenticated
+`EventRecorder`/`PgOutboxRecorder` recipe. It was decided to connect
+as a dedicated role with INSERT-only rights on `event_outbox` — least
+privilege for the one internet-facing service — and that half was
+**reversed on 2026-09-28** (backlogs 7ec7113b, d49b4355): the role's
+password was its own name, published in migration 111; only the
+retired bare-metal drop-in ever set the URL that carried it, so in
+the cluster no auth event ever reached the log; and the privilege it
+bounded was never bounded in the container, whose launcher hands the
+gateway `BOSS_POSTGRES_URL` along with everything else — a URL for
+`boss`, the Postgres SUPERUSER the cluster's database is created with
+(`POSTGRES_USER` in boss.yaml). The pool now reads that URL, and a
+later migration leaves the role unable to log in. So the internet-
+facing gateway now holds two live superuser connections (this pool's
+two), where before it held the credential but no connection; that
+lasts until the gateway gets its own environment — its own process,
+or its own pod — which is a deployment change, not a role, and is
+filed as its own item. Its unauthenticated doors take an 8 KB body
+and a denied login keeps at most 254 characters of the claimed email,
+because the claim becomes an outbox row and the relay cannot publish
+one larger than NATS's 1 MiB payload. The alternative, an authenticated
 ingest endpoint on events-api, was **rejected**: it either reopens
 the measured single-writer decision or reintroduces the retired
 post-commit-publish shape over an HTTP hop, spending a new
@@ -2258,9 +2289,36 @@ declared writer is satisfied only by a `CredentialedCaller` request
 extension, which no client can set, so until the resolve step inserts
 one nothing satisfies it — which is why no live protocol declares a
 writer yet; ops-request's row declares `runner:ops` in the same car
-that delivers the credential. Not yet built: the credential kind, its
-broker handler, the resolve step in the machine door, the `signer` and
-`executor` rules, and the declaration on ops-request.
+that delivers the credential. The resolve step is built
+(`boss_jobs::runner_credential`, 2026-09-29): a runner presents its
+credential as `x-boss-runner-credential` (a header file, never argv —
+`ops-runner.sh` reads it from `/etc/boss/ops-runner.credential`), and
+the jobs API compares it in constant time against the slots of a
+mounted directory, `<host>.current|next|previous`, inserting
+`CredentialedCaller { runner:ops, host }` for the one host that holds
+it. It refuses nothing, and with no directory mounted every request
+passes uncredentialed, as before. The issuer is that directory — the
+mount of a Secret only the broker writes — rather than a table: the
+broker's authority to mint is then the name-scoped Role admin already
+grants, the value lives where every other brokered credential lives,
+and the database never holds one. `runner:ops` stays out of
+`RESOLVABLE_PRINCIPALS` until a credential is delivered, so the
+declaration cannot land first and lock the runner out of the plan the
+founder signs. Not yet built: the credential kind and its broker
+handler (mint, the Secret and its mount, verify through `GET
+/api/jobs/runner-credential`, delivery to each runner host), the
+`signer` and `executor` rules, and the declaration on ops-request. The
+write strip below never drops the declared writer's own re-send — its
+write is the record (follow-up of car `f3365343`). What the
+adversarial review of the writer rule required BEFORE that declaration
+landed on 2026-09-28: the approve step declares all five runner keys as
+required fields (`args` an array, so a zero-arg request's `[]`
+completes); a re-pin refuses to move a live step's declared writer or
+write a reserved key, and the publish lint refuses a default projected
+into one; a packet whose steps declare a writer has its `host` fixed
+at admission at both job doors; and the merge door drops an unchanged
+re-send of a reserved key instead of applying it to a row the writer
+may have moved since the read.
 
 **Presence authorises a break-glass enrolment, and the bootstrap token
 retires** (design `03451237`, David 2026-09-22, all four questions
@@ -2284,7 +2342,67 @@ with David, not a role — a role is registry data, and would make
 enrolment depend on whoever can write a policy row; (3) **single-use by
 record**: the gateway writes the credential id and instant onto the step
 and refuses a step already carrying one, naming it; (4) **the token
-retires**, and with it the zero-credentials window. Not yet built.
+retires**, and with it the zero-credentials window. Built for `1c4c100a`
+(2026-09-28): the packet is the `break-glass-enrolment` protocol — the
+filer's `label`, `rp_id` and `origin` bound into a presence-assured
+`authorise` sign-off, the spend written onto its `enrol` step before the
+record leaves the gateway — and the list is `BOSS_BREAK_GLASS_AUTHORISERS`
+in `boss.yaml`. One tightening the design did not state: the key is
+touched from the SIGNER'S OWN session, because a packet id is on the
+board and an approved packet was otherwise spendable on anyone's key.
+And the durable half of the incident: every record names the `rp_id`
+it was enrolled under, the gateway never offers a key bound to another
+party (it says which keys and which party instead), and the gateway
+test `the_break_glass_records_answer_the_door_they_serve` holds each
+committed record to `BOSS_PUBLIC_URL`, so the next cutover is refused at
+its gate. The two keys enrolled under `playground.algedonic.dev` are
+named there as awaiting re-enrolment, which is David's key touch.
+
+**The break-glass key is the door for a lockout inside BOSS, not for a
+dark edge; a second road on the same origin is decided and held**
+(design `c5ce1aeb`, backlog `a15a1cd2`, David 2026-09-29, all three
+questions accepted as proposed). Measured: the key reaches the gateway
+by one road — Cloudflare's edge (the only certificate for
+boss.algedonic.dev; the gateway's LAN address is plain http, and the
+Caddy TLS front was deleted 2026-09-17), the Access one-time code (one
+application over the whole host, `infra/cluster/dns/access.toml`), the
+in-cluster tunnel, and the gateway, whose relying party accepts one
+origin — and the key doc named none of the first three. An Access
+bypass on `/break-glass` alone does not open a usable door (the
+ceremony's API and the HttpOnly session it opens sit behind Access on
+every other path), and a whole-host bypass exposes every gateway route
+while keeping the edge and the tunnel on the road. Decided: (1) **the
+scope is written down now**, as a docs car that refuses nothing and so
+is not held by DR readiness `62dac114`: the key doc's "What this door
+does not cover" names each hop and, for a dark edge, mailbox or
+cluster, the road that owes Cloudflare nothing — the LAN ssh door, the
+WireGuard hub, kube-apiserver rollback, the forge's emergency merge —
+while the printed sheet (`125d405d`) derives its own needs line from
+the files and does not restate the doc; (2) **the second road is a LAN
+TLS listener on the SAME origin**, https://boss.algedonic.dev, reached
+by a hosts line or a local-DNS override, because a new hostname is a
+new rp_id and a re-enrolment — a second door, not a second road — and
+its certificate comes from a **local CA whose root key is generated on
+an air-gapped run of the recovery USB drive and kept encrypted there**
+in the recovery kit (`c1bb822e`), never in the cluster or on the
+forge; the cluster Secret holds only a one-year leaf for
+boss.algedonic.dev, and a rehearsal packet reissues the leaf from the
+kit and walks the road each time; (3) **the root is trusted only where
+the ceremony is run** — David's workstation and the phone holding his
+passkey, not the emergency delegate's phone, whose holder takes the
+ordinary edge road — and is **name-constrained to
+boss.algedonic.dev**, so a stolen root mints for no other name.
+Rejected: ACME DNS-01 (it reverses the 2026-09-17 deletion to buy a
+certificate whose renewal needs the provider this road avoids) and a
+CLI assertion over plain http (the assertion and its session cross the
+LAN in cleartext and can be relayed). Not yet built: the LAN road. It
+adds a road into the break-glass door, so it rides as its own
+trust-boundary car with an adversarial review, held behind `62dac114`,
+and must settle `2710c8fc` (the LAN machine door trusts
+`x-boss-user`) before it widens LAN reach to the gateway; placing the
+root is David's act. Until it is walked on record, a lockout inside
+BOSS during a dark edge or mailbox has no web road, and the repair
+comes from the cluster side.
 
 **One bootstrap, at the identity layer** (design `af6dfcdb`, David
 2026-09-22: "a 1-time password for the admin's initial passkey
@@ -2309,6 +2427,116 @@ out, which may argue for keeping the row until a second factor exists;
 admin passkey**, so a shared secret never authorises an emergency
 credential, at the cost of a window where that passkey is the only door.
 Not yet built: `init.sh` still defaults to `change-me`.
+
+**Every control has a real person who holds it, and no write can take
+the last one away** (design `1c4e42e1`, David 2026-09-28, all three
+questions accepted as proposed; answers backlog `47aed706`: "make sure
+that all required permissions to operate exist in the context of at
+least one real user ... guards to make sure users, especially the
+platform-admin can't create a policy or security configuration that
+permanently locks any controls"). Measured at f04f7cf7 and live
+2026-09-28: one real person; 60 policy pairs a door asks for (58 static
+from 135 `Action::` sites, the rest `step-signoff:<role>` and
+`authority_role` off 65 active workflows), all held by emp-david at
+`all` through platform-admin; ZERO human holders of the operator tier,
+because elevation needs an operator-tier key and no person had one; no
+key bound to the break-glass door (`a9bfc232`); and nothing refusing on
+coverage — platform-admin could set its own `policy-rule:update` to
+scope none, because `judge_rule` skips its holds check for a write that
+grants nothing, and `DELETE /api/policy/rules/{id}` was not judged at
+all. **A control is anything a door asks for before it acts**, of four
+kinds: policy pairs (static ones declared in code, dynamic ones read off
+every active workflow version); the operator tier (a real person with
+platform-admin and an operator-tier passkey, what `elevation.rs`
+requires); the platform owner (a real person with platform-admin, what
+`platform_owner` resolves); and presence (every step declaring
+`assurance_required = "presence"` has a real person in its audience —
+in the tree today break-glass-enrolment, ops-request approve,
+publish-to-github approve and passkey-promotion). Decided: (1) **a real
+person is an active employee with at least one bound passkey** — a fact
+the record already holds, so system accounts (emp-audit, 0 keys), the
+deploy superuser and `automation:*` actors never count, and removing a
+person's last key stops them counting, the same answer the people
+last-key guard gives; (2) **a pair is held at the widest scope any
+active rule grants for it**, because authority rule 1 lets a person
+re-grant only within their own scope, so a narrower holder cannot
+restore it; (3) **the guard refuses only a write that orphans a control
+covered now** — `orphaned(after) ⊄ orphaned(before)` — so a write that
+leaves an existing gap as it was passes, or the operator-tier gap would
+block its own repair; (4) **no role is exempt and there is no override
+flag** (Q1): platform-admin is bound like everyone, because it is the
+actor most able to lock itself out; the way past a refusal is to add a
+second holder first, and the 409 names each control it would orphan and
+the write that would make it safe — when that write is a human act, the
+machine files and renders it and the human's act is a passkey signature
+on the rendered bytes, never a typed command (`3df309bf`); break-glass
+is exempt only when it restores a rule core ships exactly, the one
+write it may make, and every other break-glass write is guarded like
+anyone's; (5) **the operator tier counts as a control before any
+operator key exists** (Q2): the coverage read reports it as a live gap
+with 0 holders and the backstop files its alarm naming `2a228d0c` and
+`1d9970d1` as the remedy; the guard is inert on it until the promotion
+door lands, and from then the last operator-tier key and the last
+platform-admin person cannot be removed; (6) **one real person is the
+invariant** (Q3) — on this instance that is David on every control —
+with break-glass as the recovery of last resort; break-glass binding is
+the recovery path, watched by its own alarm (`break_glass_alarm.rs`),
+never a human-held control, and the guard never depends on it;
+(7) **one definition, called everywhere**: a pure
+`coverage(controls, rules, overrides, roster, keys) -> Vec<Orphan>` in
+`boss-policy-client`, each `Orphan` naming the control, its kind and
+who held it before, so a refusal and an alarm read the same way;
+policy writes are judged inside `port::Judge` (roster and keys read
+through the people port before the transaction, rules and overrides
+inside it — the read-before, decide-inside split authority already
+takes), with the DELETE made a judged write; people writes (role,
+status, delete, offboarding, the webauthn DELETE, the register tier,
+the promotion door) at the boss-people repository port, asking
+`POST /api/policy/coverage` before committing; workflow publish in
+boss-jobs, refusing a version whose `sign_offs_required` role or
+`authority_role` no real person can satisfy; (8) **the static pair list
+is declared once and pinned now, collapsed later** (§9a): `CONTROLS` in
+`boss-policy-client` with a test that reruns the triage's scan and
+names every door site missing from it, until a later car makes every
+door ask through a `Control` const and the compiler is the pin.
+`GET /api/policy/coverage` lists every control, its holders and every
+orphan, readable by anyone; a dispatcher clock rule reads it and files
+one alarm per orphaned control, deduped on the control id, closing when
+the next read shows it covered — which is what catches the routes no
+write path sees (`tenant publish --force`, migrations, seeds, restores).
+Limits, stated: a policy write reads the roster before its transaction
+and a people write reads policy before its own, so two writes each safe
+alone can together orphan a control — the backstop sees it on its next
+tick, and one lock spanning two services is not worth building for a
+roster this small; coverage says someone can act, not that two can;
+controls data defines outside workflows (view and search resources,
+tenant crates) and the readers of `/api/credentials` entries are not
+enumerated yet — named as unmeasured, not covered. **The emergency
+delegate** (DR readiness `62dac114` item 4: a phone passkey handed to a
+named second person, scoped for emergency use only) is a real person by
+(1) the moment their key is bound, and counts as a holder of exactly
+what their standing grants hold — no more, because coverage reads rules,
+not intentions. So an emergency-only delegate who holds nothing at rest
+leaves David the sole holder and every refusal above binds exactly as
+designed; a delegate given standing holdings is a second holder, shown
+as one on the coverage read, and the guard then permits the orderings
+that second holder makes safe. Either way the coverage read is where
+"scoped for emergency use only" is audited, the delegate's road through
+break-glass counts as recovery and never as coverage, and the platform
+owner does not move: `platform_owner` resolves the EARLIEST platform-admin
+hire, so an admin who joins later changes no filing. Who the delegate
+is, what they hold and how it is revoked is that item's design, not
+this one. **Sequencing** (`62dac114`, David 2026-09-28): no car that
+adds a refusal on a human's path boards until the one-person DR
+checklist is proven — two hardware keys touched at `/break-glass`
+(closing `a9bfc232`), a second road to the emergency door, the USB
+recovery drive, the emergency delegate, the printed re-entry sheet. So
+the coverage core (function, `CONTROLS` and its pin, the read) and the
+backstop ship now and only report; the policy write guard, the people
+guard (after `1d9970d1`, landed 2026-09-28, so the register tier is read
+from the key, not the body) and the workflow publish guard wait for
+`62dac114`; the collapse to `Control` consts refuses no human and rides
+whenever it is ready. Not yet built: all of it.
 
 ## Calendar
 
@@ -3033,6 +3261,56 @@ the ring), pinned by `world-motion.test.ts` and
 real-event tokens (M3, decision 7), so the map runs the replay layer
 alone and says so; and region pages adopting the vocabulary (M4).
 
+**Agent B is not a page: it is the SENSORS station on the map, and its
+panel shows each inbox's mail arriving and leaving** (design
+`eb008249`, David 2026-09-28, no open questions; answers backlog
+`486b0753`, his 2026-09-21 ask "have 'Agent B' as a page in the IT
+Department where I can see the mail sensor and outbound email activity
+flowing by department inbox"). Measured that day: nothing to render
+yet — `GET /api/sensors` held three rows (`stripe-payouts`,
+`stripe-sponsorships`, `www-visits`), none of source `mail`; no mail
+adapter reads Bridge; `receive-a-message` answered 404 beside a 200 for
+`backlog-item`; `MailTransport` has no SMTP arm; and the credentials
+registry holds no Agent B row. Since the item was filed, the Department
+Map (`e765b3fc`) turned pages into selection details under one map and
+`16091dfb` made that map a transit monitor, so the question became which
+station this is and what its panel shows. Decided: (1) **a station, not
+a page** — it stands where outside traffic enters, selecting it opens the
+panel below the map, and there is no new route and no sidebar row; (2)
+**the station is SENSORS and mail is one source on it** — one panel row
+per sensor row (id, source, selector — the inbox address for mail — the
+protocol it opens, last polled), because the sensor registry is already
+the one list of inboxes (`bffc0aba`), so a panel that only reads it
+cannot keep a second list; it renders today with the three live rows,
+and `support@` and `finance@` arrive later as rows with no page change;
+(3) **arriving is the readings door that exists**,
+`GET /api/sensors/{id}/readings?since=` over the station counts' 24 h
+window — arrived, stamped, unstamped, packets opened — with no new API;
+an unstamped reading older than a poll interval turns the station
+attention, an open urgent `sensor_unreadable:<id>` turns it troubled, so
+a logged-out Bridge shows where it happens; (4) **leaving is the
+completed, presence-approved `sent` step, never a transport log** — each
+counted under the sensor whose reading opened the packet and linked to
+the packet rather than copied, a failed send shown held, and until the
+SMTP transport and the reply car exist the column reads "no outbound
+transport", never 0, because a zero there claims nothing was sent; (5)
+**each department map starts at its own inbox** by sensor row →
+protocol → department, the IT station showing every inbox; (6) **"Agent
+B" is a label, not a key** — rows sharing a source credential group
+under it by the `credential` column, with no brand word in code, so a
+second mailbox groups itself; (7) **order** — (1)–(3) are one read-only
+car buildable now behind the transit map's flight, (4) waits for the
+support `receive-a-message` car (`86f32b7d`) and its send step, (5) for
+the department-map car of `e765b3fc`, and the pixels for the redesign;
+this design fixes structure and data only. Left undecided on purpose:
+where the mail adapter runs (the support build under `bffc0aba` and
+`0390f7d2`) and the station's colours and marks (Design's tokens,
+`16091dfb` Q1, `e765b3fc` Q2). The first car owes a probe: the panel
+lists exactly the rows `GET /api/sensors` returns, and each row's
+arrived count equals that sensor's readings door over the last 24 h,
+row by row. Not built, any of it (2026-09-29): no sensors station or
+panel exists in `apps/web`.
+
 **What the website says is checked against what the record holds;
 whether it works is a reading with a threshold named first** (design
 `59a776c5`, 2026-09-20). Correct and effective are two protocols with
@@ -3730,7 +4008,12 @@ set it is expected to hold** (`BOSS_OPS_CREDENTIALS=kubeconfig` on
 boss-gcp), since a talosconfig has no scoped form and a full one on the
 public edge is the unbounded grant the scoping exists to avoid — so
 the converge reports the truth about that host rather than a
-permanently red absence. The delivery verb is not yet built.
+permanently red absence. The delivery verb is not yet built. Decision
+(3) was built as data rather than as that variable (2026-09-29, backlog
+f371c749): the `[ops_credentials.<host>]` tables of
+`infra/estate/estate.toml`, read by the host check and by
+`estate.compare`, whose alarm names David only for root material and
+names the broker delivery for a scoped credential.
 
 **Agent B's mailbox: BOSS holds the operational pair, the founder holds
 the account** (design `0ec5e1d2`, David 2026-09-21, all three questions
@@ -3755,6 +4038,86 @@ keyring, so a session that dies at 03:00 stops the mail sensor —
 built: the credentials registry holds no Agent B row. Whether the
 founder-held pair belongs on the one-stick recovery kit (`c1bb822e`) is
 that kit's question.
+
+**The way back in is a printed sheet rendered from the tree and signed
+when printed; the paper carries locations and order, the kit carries
+values** (design `125d405d`, answering backlog `fd6d6c08`, David
+2026-09-28: "we are going to maintain the fidelity of those
+instructions or generate a new print job. The print job can simply be
+a PDF download to print"; all three questions accepted as proposed). Measured on
+origin/main `b4c80a0d`: no printable re-entry sheet existed, and the
+two prose runbooks playing its part each contradicted the tree —
+`docs/runbooks/access-recovery.md` names Kanidm as the human door's
+recovery while the gateway boots `LocalAuth`, and
+`docs/runbooks/dev-pod-access.md` lands in tmux session `main` while
+`boss-dev.yaml` starts `dev` — the retyped copy §9a exists to refuse.
+Several facts a human needs under stress lived in no file at all; the
+admin kubeconfig has two spellings (`fb444bbb`); and the break-glass
+door has one road in, Cloudflare Access plus the in-cluster tunnel,
+with nothing saying so (`a15a1cd2`). **The rule it serves: a human act
+is a signature on rendered bytes, never a transcription.** Decided in
+the design from the company frame: (1) **one source**,
+`infra/recovery/re-entry.toml`, an ordered list of roads, each an
+ordered list of lines that are exactly one of a **fact** reference
+(`file` + `key`, resolved by the parser that file's real consumer uses,
+so there is no second opinion of what a file says), **prose** that
+states no host, port, URL, path or name (a pin refuses the literal),
+or **`not_tree_held`**, printed as "NOT HELD BY THE TREE: <why>" rather
+than going silent; the dev door's client steps, the one fact already
+spelled twice (the `/it/estate` page and the paper), **collapse** into
+one data file both read; (2) **the version is a sha256 over the sorted
+fact set, never over PDF bytes**, which carry their own timestamps and
+would call every day stale — the PDF's own sha is recorded beside it,
+because the fact hash says what the paper says and the byte hash says
+which bytes were signed; it is rendered from origin/main, the one sha
+every reader can name; (3) **a road's dependencies are derived, not
+written**, so the break-glass road says it needs Cloudflare's edge, the
+Access one-time code and the in-cluster tunnel, and reprints by itself
+when `a15a1cd2` changes that; each road prints the packet that last
+proved it or **NOT EXERCISED ON RECORD** — no evidence is not a pass;
+(4) **the printed version is the fact hash on the last completed
+`print` step of a `reprint-recovery-sheet` packet**, and there is no
+other record of what is on paper: a daily chore in the shape of the
+playground crawl (the `boss-ci` image, which already carries Chromium,
+so no browser enters the production image) compares the tree's hash
+with it and files, or refreshes in place, ONE print job carrying the
+PDF as a file_ref and the fact-level diff; its `print` step is a
+presence-signed sign-off whose statement — "printed version X,
+destroyed version Y" — the machine fills, so David types nothing; (5)
+the two runbooks are **deleted** in the car that lands the sheet, so
+there is never a window with two copies. David's three answers:
+(1) **the paper holds LOCATIONS, ADDRESSES and ORDER only** — which
+door first, which host, which file, which console, and the kit
+(`c1bb822e`) by NAME with its restore order — never a secret, a PIN, a
+recovery code or any value; every artifact that is itself a credential
+or restores state lives in the kit. One-time recovery codes on the
+paper are rejected, because a sheet holding a secret must be guarded
+as one and then cannot be left where it will be found under stress;
+(2) **reprint on every change, plus a 90-day existence check** — a
+presence-signed step reading the version last signed and asking that
+the copy be confirmed where it is kept, because a sheet nobody can
+find fails exactly like a stale one; (3) **the location facts become
+tree keys, published by the public mirror**: the bastion's GCP
+project, zone and instance, the cluster API VIP, the bastion ssh user,
+the domain registrar, the mail provider behind the Access one-time
+code, and the kit's contents by name with its restore order; **which
+private key opens the LAN door, and which device holds it, is never
+declared** and prints NOT HELD BY THE TREE. The plan is five cars,
+every one trust area `credentials`, gated held for an adversarial
+review whose single question is whether any value, or any new
+exposure, reaches the paper or the public mirror. Car 1 landed the
+source, `boss recovery sheet` and the pin; car 2 the PDF. **Car 3 is
+the reprint loop, and the 90-day existence check rides it**: `boss
+recovery reprint`, run daily by the `boss-recovery-sheet` CronJob
+(boss-ci's Chromium, a clone of main, the `boss` CLI copied from the
+boss image), reads the version on paper off the newest `print` step
+completed `approved` with a LIVE presence stamp, files or refreshes ONE
+`reprint-recovery-sheet` print job with the PDF attached to that step
+and the fact-level diff on the packet, and — when the paper is current
+and the newer of the signature and the last `kept` confirmation is 90
+days old — files one `confirm-recovery-sheet-kept` packet, whose
+`missing` outcome makes the next run file a reprint of the same
+version. Car 4 (the `/it/estate` line) and car 5 (the Q3 keys) remain.
 
 **The knobs outside the tree become declared settings** (design
 `16115a17`, David 2026-09-12; all four questions accepted as proposed).

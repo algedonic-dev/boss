@@ -35,6 +35,11 @@ futures = { workspace = true }
 rand = "0.10"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# The credential broker's GitHub App issuer (design 76155676): the App
+# JWT is RS256 over the App private key. `rsa` is already in the lock
+# (sqlx-mysql); `sha2` re-exported through it keeps the digest version
+# the one its PKCS#1 v1.5 signer is built against.
+rsa = { version = "0.9", features = ["sha2"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"] }
@@ -48,6 +53,9 @@ tracing-subscriber = { workspace = true }
 boss-testing = { path = "../../core/boss-testing", features = ["postgres"] }
 http-body-util = "0.1"
 tower = { workspace = true }
+# A test key is GENERATED per test binary, never checked in: a PEM
+# private key in the tree would trip the public mirror's secret scanning.
+rsa = { version = "0.9", features = ["sha2", "getrandom"] }
 
 [lints]
 workspace = true

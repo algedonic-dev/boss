@@ -432,18 +432,18 @@ async fn post_json(router: axum::Router, path: &str, body: Value) -> (StatusCode
     (status, parsed)
 }
 
-/// Same shape as `post_json` but synthesises an auditor-role caller
-/// via `X-Boss-User`. Matches what the gateway builds for real
-/// sessions — the ledger service trusts the header because only
-/// the gateway speaks to it on the prod loopback.
-async fn post_as_auditor(router: axum::Router, path: &str, body: Value) -> (StatusCode, Value) {
+/// `post_json`, signed by a finance controller: every ledger write door
+/// names its caller and refuses an unsigned one 401 (backlog 34f0a954).
+/// The routers here are permissive — which grant admits a door is
+/// tests/a_ledger_write_asks_policy.rs's subject, not this file's.
+async fn post_signed(router: axum::Router, path: &str, body: Value) -> (StatusCode, Value) {
     let user_json = json!({
-        "id": "emp-auditor",
-        "role": "auditor",
-        "access_tier": "auditor",
+        "id": "emp-controller",
+        "role": "controller",
+        "access_tier": "user",
         "territory_account_ids": [],
         "direct_report_ids": [],
-        "department": null,
+        "department": "finance",
     })
     .to_string();
     let resp = router
@@ -480,7 +480,7 @@ async fn post_manual_entry_happy_path() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, body) = post_json(
+    let (status, body) = post_signed(
         r,
         "/api/ledger/journal-entries",
         json!({
@@ -499,9 +499,8 @@ async fn post_manual_entry_happy_path() {
     assert_eq!(body["posted_on"], "2026-03-15");
 
     // The fact landed as kind=finance.manual.entry, authored by the
-    // signed caller — this request is unsigned, so the platform
-    // automation its event is stamped with (backlog 7bf42e2b; a signed
-    // author is pinned in tests/a_ledger_write_is_authored_by_its_signer.rs).
+    // signed caller (backlog 7bf42e2b; pinned in
+    // tests/a_ledger_write_is_authored_by_its_signer.rs).
     let (kind, created_by): (String, String) = sqlx::query_as(
         "SELECT kind, created_by FROM financial_facts \
          WHERE id = $1::uuid",
@@ -511,7 +510,7 @@ async fn post_manual_entry_happy_path() {
     .await
     .unwrap();
     assert_eq!(kind, "finance.manual.entry");
-    assert_eq!(created_by, "automation:platform");
+    assert_eq!(created_by, "emp-controller");
 
     // And the lines projected into the GL with the right codes + amounts.
     let lines: Vec<(String, i64, i64)> = sqlx::query_as(
@@ -541,7 +540,7 @@ async fn post_manual_entry_rejects_unbalanced() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, _body) = post_json(
+    let (status, _body) = post_signed(
         r,
         "/api/ledger/journal-entries",
         json!({
@@ -566,7 +565,7 @@ async fn post_manual_entry_rejects_unknown_account() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, _body) = post_json(
+    let (status, _body) = post_signed(
         r,
         "/api/ledger/journal-entries",
         json!({
@@ -612,7 +611,7 @@ async fn post_manual_entry_rejects_locked_period() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, _body) = post_json(
+    let (status, _body) = post_signed(
         r,
         "/api/ledger/journal-entries",
         json!({
@@ -895,7 +894,7 @@ async fn bank_settlement_create_and_settle_round_trip() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, body) = post_json(
+    let (status, body) = post_signed(
         r1,
         "/api/ledger/bank-settlements",
         json!({
@@ -942,7 +941,7 @@ async fn bank_settlement_create_and_settle_round_trip() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, body) = post_json(
+    let (status, body) = post_signed(
         r3,
         "/api/ledger/bank-settlements/set-1/settle",
         json!({"settled_on": "2026-03-22"}),
@@ -1008,7 +1007,7 @@ async fn bank_settlement_sweep_settles_only_due_rows() {
         } else {
             "2026-03-20"
         };
-        let (status, _) = post_json(
+        let (status, _) = post_signed(
             r,
             "/api/ledger/bank-settlements",
             json!({
@@ -1033,7 +1032,7 @@ async fn bank_settlement_sweep_settles_only_due_rows() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, body) = post_json(
+    let (status, body) = post_signed(
         r,
         "/api/ledger/bank-settlements/sweep?as_of=2026-03-20",
         Value::Null,
@@ -1087,7 +1086,7 @@ async fn bank_settlement_create_is_idempotent_on_id() {
             // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
             policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
         });
-        let (status, _) = post_json(
+        let (status, _) = post_signed(
             r,
             "/api/ledger/bank-settlements",
             json!({
@@ -1206,7 +1205,7 @@ async fn payroll_run_posts_compound_journal_entry() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, body) = post_json(
+    let (status, body) = post_signed(
         r,
         "/api/ledger/payroll-runs",
         json!({
@@ -1285,7 +1284,7 @@ async fn payroll_run_is_idempotent_on_id() {
             // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
             policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
         });
-        let (status, _) = post_json(r, "/api/ledger/payroll-runs", body.clone()).await;
+        let (status, _) = post_signed(r, "/api/ledger/payroll-runs", body.clone()).await;
         assert_eq!(status, StatusCode::OK);
     }
 
@@ -1333,7 +1332,7 @@ async fn payroll_run_detail_returns_header_plus_lines() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, _) = post_json(
+    let (status, _) = post_signed(
         r,
         "/api/ledger/payroll-runs",
         json!({
@@ -1381,7 +1380,7 @@ async fn payroll_run_rejects_line_arithmetic_mismatch() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, _) = post_json(
+    let (status, _) = post_signed(
         r,
         "/api/ledger/payroll-runs",
         json!({
@@ -1474,7 +1473,7 @@ async fn tax_filing_remit_posts_finance_tax_remitted_and_drains_2300() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, _) = post_json(
+    let (status, _) = post_signed(
         r,
         "/api/ledger/tax-filings",
         json!({
@@ -1499,7 +1498,7 @@ async fn tax_filing_remit_posts_finance_tax_remitted_and_drains_2300() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, body) = post_json(
+    let (status, body) = post_signed(
         r,
         "/api/ledger/tax-filings/tf-sales-US-CA-2026-03/remit",
         json!({"filed_on": "2026-04-20"}),
@@ -1565,7 +1564,7 @@ async fn tax_filing_remit_is_idempotent() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, _) = post_json(r, "/api/ledger/tax-filings", body).await;
+    let (status, _) = post_signed(r, "/api/ledger/tax-filings", body).await;
     assert_eq!(status, StatusCode::OK);
 
     // Remit twice — second call should short-circuit.
@@ -1577,7 +1576,7 @@ async fn tax_filing_remit_is_idempotent() {
             // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
             policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
         });
-        let (status, _) = post_json(
+        let (status, _) = post_signed(
             r,
             "/api/ledger/tax-filings/tf-idem/remit",
             json!({"filed_on": "2026-04-20"}),
@@ -1646,7 +1645,7 @@ async fn tax_filing_upsert_is_idempotent_on_period() {
             // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
             policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
         });
-        let (status, _) = post_json(r, "/api/ledger/tax-filings", b).await;
+        let (status, _) = post_signed(r, "/api/ledger/tax-filings", b).await;
         assert_eq!(status, StatusCode::OK);
     }
 
@@ -1678,7 +1677,7 @@ async fn income_tax_accrue_plus_remit_nets_2310_to_zero_and_lands_expense() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, _) = post_json(
+    let (status, _) = post_signed(
         r,
         "/api/ledger/tax-filings",
         json!({
@@ -1724,7 +1723,7 @@ async fn income_tax_accrue_plus_remit_nets_2310_to_zero_and_lands_expense() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, _) = post_json(
+    let (status, _) = post_signed(
         r,
         "/api/ledger/tax-filings/tf-income-US-FEDERAL-2026-Q1/remit",
         json!({"filed_on": "2026-04-15"}),
@@ -1760,7 +1759,7 @@ async fn tax_liability_summary_includes_accrued_and_next_due() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, _) = post_json(
+    let (status, _) = post_signed(
         r,
         "/api/ledger/tax-filings",
         json!({
@@ -1919,127 +1918,6 @@ async fn deferred_revenue_runoff_projects_active_schedules() {
     assert_eq!(body["drift_cents"], -160_000);
 }
 
-// --- auditor write-gate ---------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread")]
-async fn auditor_role_is_rejected_from_every_ledger_write() {
-    // Sweeps every POST endpoint on the ledger router. An auditor
-    // session calling any write should get a 403 before any DB work
-    // runs — parallel to the UI-level `role === 'auditor'` hiding in
-    // `apps/web/src/finance/FinancePage.svelte`.
-    let db = TestDb::new().await;
-    db.declare_revenue_categories_of("brewery").await;
-    let mk = || {
-        router(LedgerApiState {
-            pool: db.pool.clone(),
-            publisher: None,
-            clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-            // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
-            policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
-        })
-    };
-
-    // Use a valid-shape payload where possible; when it's wrong the
-    // handler ought to 400 *for non-auditor* callers, but we never
-    // get that far — the auditor reject fires before validation.
-    let cases: Vec<(&str, Value)> = vec![
-        (
-            "/api/ledger/periods/00000000-0000-0000-0000-000000000000/lock",
-            json!({"locked_by": "emp-auditor"}),
-        ),
-        (
-            "/api/ledger/periods/00000000-0000-0000-0000-000000000000/unlock",
-            json!({}),
-        ),
-        (
-            "/api/ledger/journal-entries",
-            json!({
-                "posted_on": "2026-04-01",
-                "lines": [
-                    {"account_code": "1000", "debit_cents": 1, "credit_cents": 0, "memo": null},
-                    {"account_code": "4100", "debit_cents": 0, "credit_cents": 1, "memo": null},
-                ],
-            }),
-        ),
-        (
-            "/api/ledger/bank-settlements",
-            json!({
-                "id": "no-write",
-                "invoice_id": "inv-1",
-                "account_id": "p-1",
-                "amount_cents": 100,
-                "currency": "USD",
-                "received_on": "2026-04-01",
-                "bank_provider": "chase",
-                "payment_method": "ach",
-            }),
-        ),
-        (
-            "/api/ledger/bank-settlements/no-write/settle",
-            json!({"settled_on": "2026-04-02"}),
-        ),
-        ("/api/ledger/bank-settlements/sweep", json!({})),
-        (
-            "/api/ledger/payroll-runs",
-            json!({
-                "id": "no-write",
-                "run_date": "2026-04-01",
-                "period_start": "2026-04-01",
-                "period_end": "2026-04-15",
-                "employer_tax_cents": 0,
-                "provider": "gusto",
-                "lines": [],
-            }),
-        ),
-        (
-            "/api/ledger/tax-filings",
-            json!({
-                "id": "no-write",
-                "kind": "sales",
-                "jurisdiction": "CA",
-                "period_start": "2026-04-01",
-                "period_end": "2026-04-30",
-                "due_on": "2026-05-15",
-                "amount_cents": 100,
-                "liability_account": "2300",
-                "provider": "avalara",
-                "accrue": false,
-                "expense_account": null,
-            }),
-        ),
-        (
-            "/api/ledger/tax-filings/no-write/remit",
-            json!({"filed_on": "2026-04-10"}),
-        ),
-        (
-            "/api/ledger/revenue-schedules",
-            json!({
-                "id": "rs-no-write",
-                "source_kind": "service_agreement",
-                "source_id": "sa-no-write",
-                "account_id": "p-1",
-                "revenue_category": "distribution",
-                "revenue_account": "4140",
-                "deferred_account": "2200",
-                "total_cents": 1200,
-                "start_date": "2026-05-01",
-                "end_date": "2027-04-30",
-                "frequency": "monthly",
-                "next_recognition_date": "2026-05-31",
-            }),
-        ),
-    ];
-
-    for (path, body) in cases {
-        let (status, _) = post_as_auditor(mk(), path, body).await;
-        assert_eq!(
-            status,
-            StatusCode::FORBIDDEN,
-            "POST {path} should 403 for auditor role",
-        );
-    }
-}
-
 // --- year-end close ------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2089,7 +1967,7 @@ async fn close_yearly_period_posts_closing_entries_and_locks() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, body) = post_json(
+    let (status, body) = post_signed(
         r,
         "/api/ledger/journal-entries",
         json!({
@@ -2112,7 +1990,7 @@ async fn close_yearly_period_posts_closing_entries_and_locks() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, body) = post_json(r, "/api/ledger/periods", json!({"year": 2026})).await;
+    let (status, body) = post_signed(r, "/api/ledger/periods", json!({"year": 2026})).await;
     assert_eq!(status, StatusCode::OK, "create period body={body:?}");
     let period_id = body["id"].as_str().unwrap().to_string();
     assert_eq!(body["kind"], "year");
@@ -2126,7 +2004,7 @@ async fn close_yearly_period_posts_closing_entries_and_locks() {
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let path = format!("/api/ledger/periods/{period_id}/close");
-    let (status, body) = post_json(r, &path, json!({})).await;
+    let (status, body) = post_as_operator(r, &path, json!({})).await;
     assert_eq!(status, StatusCode::OK, "close body={body:?}");
     assert_eq!(body["status"], "locked");
     assert_eq!(body["revenue_closed_cents"], 5_000);
@@ -2164,7 +2042,7 @@ async fn close_yearly_period_posts_closing_entries_and_locks() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status2, body2) = post_json(r, &path, json!({})).await;
+    let (status2, body2) = post_as_operator(r, &path, json!({})).await;
     assert_eq!(status2, StatusCode::OK);
     assert_eq!(body2["status"], "locked");
     assert_eq!(body2["checksum"], body["checksum"]);
@@ -2213,7 +2091,7 @@ async fn close_yearly_period_writes_off_wip_variance() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, body) = post_json(
+    let (status, body) = post_signed(
         r,
         "/api/ledger/journal-entries",
         json!({
@@ -2237,7 +2115,7 @@ async fn close_yearly_period_writes_off_wip_variance() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, body) = post_json(
+    let (status, body) = post_signed(
         r,
         "/api/ledger/journal-entries",
         json!({
@@ -2260,7 +2138,7 @@ async fn close_yearly_period_writes_off_wip_variance() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, body) = post_json(r, "/api/ledger/periods", json!({"year": 2026})).await;
+    let (status, body) = post_signed(r, "/api/ledger/periods", json!({"year": 2026})).await;
     assert_eq!(status, StatusCode::OK, "create period body={body:?}");
     let period_id = body["id"].as_str().unwrap().to_string();
 
@@ -2272,7 +2150,7 @@ async fn close_yearly_period_writes_off_wip_variance() {
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let path = format!("/api/ledger/periods/{period_id}/close");
-    let (status, body) = post_json(r, &path, json!({})).await;
+    let (status, body) = post_as_operator(r, &path, json!({})).await;
     assert_eq!(status, StatusCode::OK, "close body={body:?}");
     assert_eq!(body["status"], "locked");
     assert_eq!(body["net_income_cents"], 3_000);
@@ -2338,7 +2216,7 @@ async fn close_monthly_period_is_rejected() {
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
     let path = format!("/api/ledger/periods/{monthly_id}/close");
-    let (status, _) = post_json(r, &path, json!({})).await;
+    let (status, _) = post_as_operator(r, &path, json!({})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -2491,14 +2369,14 @@ async fn bills_approve_routes_by_category_then_pay_run_drains_ap() {
 
     // Approve a rent bill (→ 6200) and a utilities bill (→ 6300). The free
     // `bill_category` routes the debit via bill_accounts.toml.
-    let (s1, b1) = post_json(
+    let (s1, b1) = post_signed(
         router(state()),
         "/api/ledger/bills",
         json!({"id": "bill-rent", "vendor": "Acme Realty", "bill_category": "rent", "amount_cents": 120_000}),
     )
     .await;
     assert_eq!(s1, StatusCode::CREATED, "body: {b1}");
-    let (s2, _) = post_json(
+    let (s2, _) = post_signed(
         router(state()),
         "/api/ledger/bills",
         json!({"id": "bill-util", "vendor": "City Power", "bill_category": "utilities", "amount_cents": 80_000}),
@@ -2522,7 +2400,7 @@ async fn bills_approve_routes_by_category_then_pay_run_drains_ap() {
     assert_eq!(row("2100")["balance_cents"], 200_000);
 
     // Pay-run settles every approved bill: A/P drains, Cash drops.
-    let (s3, payrun) = post_json(router(state()), "/api/ledger/bills/pay-run", json!({})).await;
+    let (s3, payrun) = post_signed(router(state()), "/api/ledger/bills/pay-run", json!({})).await;
     assert_eq!(s3, StatusCode::OK);
     assert_eq!(payrun["paid_count"], 2);
     assert_eq!(payrun["total_paid_cents"], 200_000);
@@ -2559,36 +2437,16 @@ async fn bills_approve_is_idempotent_on_id() {
     };
     let body =
         json!({"id": "bill-x", "vendor": "V", "bill_category": "rent", "amount_cents": 50_000});
-    let (s1, _) = post_json(router(state()), "/api/ledger/bills", body.clone()).await;
+    let (s1, _) = post_signed(router(state()), "/api/ledger/bills", body.clone()).await;
     assert_eq!(s1, StatusCode::CREATED);
     // Re-POST the same id: the bill is returned without a second posting.
-    let (_, _) = post_json(router(state()), "/api/ledger/bills", body).await;
+    let (_, _) = post_signed(router(state()), "/api/ledger/bills", body).await;
 
     let (_, tb) = get(router(state()), "/api/ledger/trial-balance").await;
     assert_eq!(tb["balanced"], true);
     let rows = tb["rows"].as_array().unwrap();
     let rent = rows.iter().find(|r| r["account_code"] == "6200").unwrap();
     assert_eq!(rent["debit_total_cents"], 50_000); // not double-posted to 100_000
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn bills_reject_auditor_writes() {
-    let db = TestDb::new().await;
-    db.declare_revenue_categories_of("brewery").await;
-    let r = router(LedgerApiState {
-        pool: db.pool.clone(),
-        publisher: None,
-        clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
-        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
-    });
-    let (status, _) = post_as_auditor(
-        r,
-        "/api/ledger/bills",
-        json!({"id": "b", "vendor": "V", "bill_category": "rent", "amount_cents": 1000}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 // --- keg deposit settlements (93f936b9: full balance-sheet keg model) ------
@@ -2614,7 +2472,7 @@ async fn keg_deposit_settlement_books_both_legs_and_drains_the_liability() {
         "shipped_on": "2026-03-01",
         "returned_on": "2026-03-15",
     });
-    let (status, resp) = post_json(
+    let (status, resp) = post_signed(
         router(state()),
         "/api/ledger/keg-deposit-settlements",
         body.clone(),
@@ -2682,7 +2540,7 @@ async fn keg_deposit_settlement_books_both_legs_and_drains_the_liability() {
     // Redelivery: the same settlement re-POSTs as a no-op 200 — the
     // facts key on the job id, so nothing double-books.
     let (status2, resp2) =
-        post_json(router(state()), "/api/ledger/keg-deposit-settlements", body).await;
+        post_signed(router(state()), "/api/ledger/keg-deposit-settlements", body).await;
     assert_eq!(status2, StatusCode::OK, "body: {resp2}");
     let fact_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)::bigint FROM financial_facts WHERE kind LIKE 'finance.keg_deposit.%'",
@@ -2707,7 +2565,7 @@ async fn keg_deposit_settlement_rejects_non_conserving_counts_as_422() {
     // 1 out, 1 returned AND 1 lost — the shape the free-field faker
     // used to produce (feedback 52f49cc7). Deterministic data error →
     // 422 so the dispatcher Terms instead of NAK-retrying.
-    let (status, body) = post_json(
+    let (status, body) = post_signed(
         r,
         "/api/ledger/keg-deposit-settlements",
         json!({
@@ -2732,34 +2590,6 @@ async fn keg_deposit_settlement_rejects_non_conserving_counts_as_422() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn keg_deposit_settlement_rejects_auditor_writes() {
-    let db = TestDb::new().await;
-    db.declare_revenue_categories_of("brewery").await;
-    let r = router(LedgerApiState {
-        pool: db.pool.clone(),
-        publisher: None,
-        clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
-        policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
-    });
-    let (status, _) = post_as_auditor(
-        r,
-        "/api/ledger/keg-deposit-settlements",
-        json!({
-            "job_id": "job-keg-aud",
-            "kegs_out": 2,
-            "kegs_returned": 2,
-            "kegs_lost": 0,
-            "deposit_cents": 6_000,
-            "shipped_on": "2026-03-01",
-            "returned_on": "2026-03-15",
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn keg_deposit_same_day_settlement_survives_a_rebuild() {
     // The nasty edge: a fleet reconciled the same day it shipped means
     // charge and release share `happened_on`, and both facts were
@@ -2777,7 +2607,7 @@ async fn keg_deposit_same_day_settlement_survives_a_rebuild() {
         // The read gate is not this test's subject (tests/the_ledger_read_gate.rs).
         policy: std::sync::Arc::new(boss_policy_client::PermissivePolicyClient),
     });
-    let (status, resp) = post_json(
+    let (status, resp) = post_signed(
         r,
         "/api/ledger/keg-deposit-settlements",
         json!({
@@ -2994,26 +2824,34 @@ async fn chart_batch_refuses_an_invalid_kind_by_row_and_writes_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn chart_batch_is_operator_tier_and_refuses_an_auditor_and_an_anonymous_caller() {
+async fn chart_batch_refuses_the_external_auditor_403_and_an_anonymous_caller_401() {
     let db = TestDb::new().await;
     db.declare_revenue_categories_of("brewery").await;
     let rows = json!([
         {"code": "4300", "name": "Hosting revenue", "kind": "revenue", "normal_balance": "credit"},
     ]);
-    let (status, _) = post_as_auditor(
-        router(chart_state(&db)),
+    // The external auditor as it ships: `audit-readonly` reads the
+    // ledger by the core defaults and holds no write (backlog 432f0eb4;
+    // this leg sent the role string "auditor", which no one carries,
+    // past the permissive client).
+    let defaults = boss_policy_client::FakePolicyClient::builder()
+        .with_default_rules()
+        .build();
+    let (status, out) = post_as(
+        router(policy_state(&db, defaults)),
         "/api/ledger/accounts/batch",
         rows.clone(),
+        &caller("emp-audit", "audit-readonly", "user"),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::FORBIDDEN, "{out}");
     let (status, _) = post_json(
         router(chart_state(&db)),
         "/api/ledger/accounts/batch",
         rows.clone(),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
     // Backlog 85e7f10f: a sim chain is not an identity. Anonymous ON one
     // — what a forged `x-sim-origin` produced — is refused the same way.
     let (status, _) = boss_core::sim_origin::with_sim_chain(
@@ -3021,7 +2859,7 @@ async fn chart_batch_is_operator_tier_and_refuses_an_auditor_and_an_anonymous_ca
         post_json(router(chart_state(&db)), "/api/ledger/accounts/batch", rows),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM gl_accounts WHERE code = '4300'")
         .fetch_one(&db.pool)
         .await
@@ -3193,36 +3031,314 @@ async fn tax_batch_refuses_an_account_the_chart_does_not_hold_and_writes_nothing
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn tax_batch_is_operator_tier_and_refuses_an_auditor_and_an_anonymous_caller() {
+async fn tax_batch_refuses_the_external_auditor_403_and_an_anonymous_caller_401() {
     let db = TestDb::new().await;
     db.declare_revenue_categories_of("brewery").await;
     let body =
         json!({"sales_tax_rate": [{"state": "HI", "jurisdiction": "US-HI", "rate_bps": 400}]});
-    let (status, _) = post_as_auditor(
-        router(chart_state(&db)),
+    // The external auditor as it ships: `audit-readonly` reads the
+    // ledger by the core defaults and holds no write (backlog 432f0eb4;
+    // this leg sent the role string "auditor", which no one carries,
+    // past the permissive client).
+    let defaults = boss_policy_client::FakePolicyClient::builder()
+        .with_default_rules()
+        .build();
+    let (status, out) = post_as(
+        router(policy_state(&db, defaults)),
         "/api/ledger/tax/batch",
         body.clone(),
+        &caller("emp-audit", "audit-readonly", "user"),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::FORBIDDEN, "{out}");
     let (status, _) = post_json(
         router(chart_state(&db)),
         "/api/ledger/tax/batch",
         body.clone(),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
     // Backlog 85e7f10f: anonymous on a sim chain is refused too.
     let (status, _) = boss_core::sim_origin::with_sim_chain(
         true,
         post_json(router(chart_state(&db)), "/api/ledger/tax/batch", body),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (n,): (i64,) =
         sqlx::query_as("SELECT count(*) FROM sales_tax_rate_by_state WHERE state = 'HI'")
             .fetch_one(&db.pool)
             .await
             .unwrap();
     assert_eq!(n, 0);
+}
+
+// ---------------------------------------------------------------------------
+// The chart and tax doors ask policy (backlog 59deda40, 2026-09-28): Create
+// on `ledger-account` and on `tax-regime`, through the registry-write
+// ladder, instead of the Operator tier alone.
+// ---------------------------------------------------------------------------
+
+/// POST `body` to `path` as the `x-boss-user` `user`.
+async fn post_as(
+    router: axum::Router,
+    path: &str,
+    body: Value,
+    user: &Value,
+) -> (StatusCode, Value) {
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("Content-Type", "application/json")
+                .header("x-boss-user", user.to_string())
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let parsed: Value = serde_json::from_slice(&bytes)
+        .unwrap_or(Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+    (status, parsed)
+}
+
+/// `x-boss-user` for `id` at `role` and `tier`.
+fn caller(id: &str, role: &str, tier: &str) -> Value {
+    json!({
+        "id": id,
+        "role": role,
+        "access_tier": tier,
+        "territory_account_ids": [],
+        "direct_report_ids": [],
+        "department": "finance",
+    })
+}
+
+/// The ledger surface asking `policy` — the core defaults plus whatever
+/// the test adds, never the permissive client.
+fn policy_state(db: &TestDb, policy: boss_policy_client::FakePolicyClient) -> LedgerApiState {
+    LedgerApiState {
+        policy: std::sync::Arc::new(policy),
+        ..chart_state(db)
+    }
+}
+
+/// A policy service that cannot be asked (the classes and calendar
+/// doors' own double).
+struct DarkPolicy;
+
+#[async_trait::async_trait]
+impl boss_policy_client::PolicyClient for DarkPolicy {
+    async fn check(
+        &self,
+        _: &boss_policy_client::User,
+        _: boss_policy_client::Action,
+        _: boss_policy_client::Resource,
+    ) -> Result<boss_policy_client::Decision, boss_policy_client::PolicyClientError> {
+        Err(boss_policy_client::PolicyClientError::Unreachable(
+            "dark".into(),
+        ))
+    }
+    async fn scope_predicate(
+        &self,
+        _: &boss_policy_client::User,
+        _: boss_policy_client::Resource,
+    ) -> Result<boss_policy_client::Predicate, boss_policy_client::PolicyClientError> {
+        Err(boss_policy_client::PolicyClientError::Unreachable(
+            "dark".into(),
+        ))
+    }
+}
+
+fn one_account() -> Value {
+    json!([{"code": "4300", "name": "Hosting revenue", "kind": "revenue", "normal_balance": "credit"}])
+}
+
+fn one_rate() -> Value {
+    json!({"sales_tax_rate": [{"state": "HI", "jurisdiction": "US-HI", "rate_bps": 400}]})
+}
+
+async fn count(db: &TestDb, sql: &str) -> i64 {
+    let (n,): (i64,) = sqlx::query_as(sql).fetch_one(&db.pool).await.unwrap();
+    n
+}
+
+/// A caller the tier check refused — USER tier, a role the core defaults
+/// grant nothing — declares a GL account and a tax rate once policy
+/// rules grant it Create on `ledger-account` and `tax-regime` (and the
+/// `ledger` read every ledger route asks), and each staged fact is
+/// signed by it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_granting_rule_lets_a_non_admin_declare_the_chart_and_the_tax_regime() {
+    use boss_policy_client::{Action, FakePolicyClient, Resource, Scope};
+    let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
+    let policy = || {
+        FakePolicyClient::builder()
+            .with_default_rules()
+            .allow("bookkeeper", Action::Read, Resource::ledger(), Scope::All)
+            .allow(
+                "bookkeeper",
+                Action::Create,
+                Resource::ledger_account(),
+                Scope::All,
+            )
+            .allow(
+                "bookkeeper",
+                Action::Create,
+                Resource::tax_regime(),
+                Scope::All,
+            )
+            .build()
+    };
+    let me = caller("emp-bookkeeper", "bookkeeper", "user");
+    let (status, body) = post_as(
+        router(policy_state(&db, policy())),
+        "/api/ledger/accounts/batch",
+        one_account(),
+        &me,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post_as(
+        router(policy_state(&db, policy())),
+        "/api/ledger/tax/batch",
+        one_rate(),
+        &me,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let staged: Vec<(String, Value)> = sqlx::query_as(
+        "SELECT kind, payload FROM event_outbox WHERE kind = $1 OR kind = $2 ORDER BY kind",
+    )
+    .bind(boss_ledger::chart::ACCOUNT_DECLARED)
+    .bind(boss_ledger::tax_registry::SALES_TAX_RATE_DECLARED)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(staged.len(), 2, "{staged:?}");
+    for (kind, payload) in &staged {
+        assert_eq!(
+            payload["declared_by"], "emp-bookkeeper",
+            "{kind}: {payload}"
+        );
+        assert_eq!(payload["_actor"], "emp-bookkeeper", "{kind}: {payload}");
+    }
+}
+
+/// A platform-admin at operator tier — everything the tier check
+/// admitted — is refused 403 at each door by a user override that denies
+/// that door's resource, and nothing is written. And the rest of the
+/// ladder: a header claiming the anonymous id with a platform role is no
+/// caller (401), and a policy service that cannot answer is 503.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_denying_override_refuses_a_platform_admin_at_each_door() {
+    use boss_policy_client::{Action, FakePolicyClient, Resource, Scope, UserOverride};
+    let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
+    let admin_id = "claude@algedonic.dev";
+    let deny = |resource: Resource| {
+        FakePolicyClient::builder()
+            .with_default_rules()
+            .with_override(UserOverride {
+                id: format!("deny-{resource}"),
+                user_id: admin_id.into(),
+                resource,
+                action: Action::Create,
+                scope: Scope::None,
+                reason: "the books are frozen for the audit".into(),
+                expires_at: None,
+            })
+            .build()
+    };
+    let admin = caller(admin_id, "platform-admin", "operator");
+    for (path, body, resource) in [
+        (
+            "/api/ledger/accounts/batch",
+            one_account(),
+            Resource::ledger_account(),
+        ),
+        ("/api/ledger/tax/batch", one_rate(), Resource::tax_regime()),
+    ] {
+        let (status, out) = post_as(
+            router(policy_state(&db, deny(resource))),
+            path,
+            body.clone(),
+            &admin,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {out}");
+        assert!(
+            out.to_string().contains("frozen for the audit"),
+            "{path}: {out}"
+        );
+
+        let forged = caller(
+            boss_policy_client::User::ANONYMOUS_ID,
+            "platform-admin",
+            "operator",
+        );
+        let defaults = FakePolicyClient::builder().with_default_rules().build();
+        let (status, out) = post_as(
+            router(policy_state(&db, defaults)),
+            path,
+            body.clone(),
+            &forged,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: {out}");
+
+        // A policy service that cannot be asked is not a gate that
+        // passed: its own 503, for the same admin (backlog 05f61acf —
+        // this docstring claimed the case before the body ran it).
+        let dark = LedgerApiState {
+            policy: std::sync::Arc::new(DarkPolicy),
+            ..chart_state(&db)
+        };
+        let (status, out) = post_as(router(dark), path, body, &admin).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {out}");
+    }
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM gl_accounts WHERE code = '4300'").await,
+        0
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM sales_tax_rate_by_state WHERE state = 'HI'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM event_outbox WHERE kind LIKE 'ledger.%.declared'"
+        )
+        .await,
+        0
+    );
+}
+
+/// `boss tenant publish`'s own identity passes both doors on the core
+/// defaults alone — the live caller that lands every tenant's chart and
+/// tax regime must keep working.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_tenant_seed_passes_both_doors_on_the_core_defaults() {
+    use boss_policy_client::FakePolicyClient;
+    let db = TestDb::new().await;
+    db.declare_revenue_categories_of("brewery").await;
+    let seed = caller("automation:tenant-seed", "platform-admin", "operator");
+    for (path, body) in [
+        ("/api/ledger/accounts/batch", one_account()),
+        ("/api/ledger/tax/batch", one_rate()),
+    ] {
+        let defaults = FakePolicyClient::builder().with_default_rules().build();
+        let (status, out) = post_as(router(policy_state(&db, defaults)), path, body, &seed).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {out}");
+    }
 }

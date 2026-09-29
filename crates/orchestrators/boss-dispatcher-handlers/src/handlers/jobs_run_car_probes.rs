@@ -85,7 +85,7 @@ pub(crate) const REQUEST_TITLE: &str = "run the recorded probe for ";
 const PROOF_PROBE: &str = "proof_probe";
 
 pub struct JobsRunCarProbes {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
 }
 

@@ -16,6 +16,6 @@ Type=oneshot
 User=root
 # Job visibility. The forge host has no /opt/boss — it runs from
 # this checkout, which is where the installed units already point.
-ExecStartPre=/home/david/boss/infra/boss-maintenance-wrap.sh maintenance-reap-ci-jobs "Reap dead CI jobs"
+ExecStartPre=-/home/david/boss/infra/boss-maintenance-wrap.sh maintenance-reap-ci-jobs "Reap dead CI jobs"
 ExecStart=/home/david/boss/infra/forge/reap-dead-ci-jobs.sh
 ExecStopPost=-/home/david/boss/infra/boss-step.sh maintenance-reap-ci-jobs run

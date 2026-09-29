@@ -96,12 +96,10 @@ fn real_git() -> PathBuf {
 /// `a_host_that_trusts_every_directory_does_not_reach_the_fixture`). All four
 /// channels are closed, the shape `the_gate_reads_a_foreign_owned_checkout.rs`
 /// already uses. Silencing the gate's own scoped `safe.directory` slot costs
-/// nothing here: it names the real checkout, never a fixture.
+/// nothing here: it names the real checkout, never a fixture. The four
+/// channels are closed by the one shared helper (backlog 3bef4198).
 fn isolated(cmd: &mut Command) -> &mut Command {
-    cmd.env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_COUNT", "0")
-        .env_remove("GIT_CONFIG_PARAMETERS")
+    boss_testing::git_config_isolated(cmd)
 }
 
 struct Fixture {
@@ -121,6 +119,7 @@ impl Fixture {
         for sub in [
             "infra/lint/lib",
             "infra/postgres/schema",
+            "infra/dispatcher/rules",
             "infra/step-plugins",
             "crates/core/boss-jobs/seeds",
             "apps/web/src",
@@ -166,6 +165,7 @@ impl Fixture {
             &dir.join("infra/postgres/schema/100-a.sql"),
             "CREATE TABLE a();\n",
         );
+        boss_testing::write_file(&dir.join(RULE_FILE), &rule_file(2, "the reason", "a"));
         boss_testing::write_file(
             &dir.join("apps/web/src/styles.css"),
             ".alpha { color: red }\n.beta { color: blue }\n",
@@ -313,7 +313,21 @@ const LINTS: &[&str] = &[
     "migrations-append-only",
     "steptype-bundle-ratchet",
     "a-new-style-has-a-caller",
+    "a-rule-edit-bumps-its-version",
 ];
+
+/// The fixture's one dispatcher rule, for `a-rule-edit-bumps-its-version`.
+const RULE_FILE: &str = "infra/dispatcher/rules/r.toml";
+
+/// A rule file in the directory's own idiom: a comment, `why`, a
+/// `version`, a trigger and a `do` step whose one arg is `arg`.
+fn rule_file(version: u32, why: &str, arg: &str) -> String {
+    format!(
+        "# a comment\n[[rule]]\nname = \"r\"\nwhy = \"{why}\"\nversion = {version}\n\
+         on_event = \"jobs.job.created\"\n[[rule.do]]\nhandler = \"jobs.spawn\"\n\
+         args = {{ kind = \"\\\"{arg}\\\"\" }}\n"
+    )
+}
 
 /// The refusal's four facts, each of which was re-derived by hand during
 /// the measurement: which lint, which git command, what status, and git's
@@ -686,6 +700,79 @@ fn steptype_bundle_ratchet_reads_the_tree_or_says_it_could_not() {
     }
     let (code, out) = fx.run(lint, "", true);
     assert_refusal(lint, code, &out, "git rev-parse", OWNER_SAID);
+}
+
+/// A dispatcher rule edited at the version its row already holds never
+/// goes live (backlog 732c3cf9: four such edits on 2026-09-29, among
+/// them the org-admin GitHub token's per-request key), so the gate
+/// refuses one — and refuses nothing the seed does not compare.
+#[test]
+fn a_rule_edit_bumps_its_version_reads_the_tree_or_says_it_could_not() {
+    let fx = Fixture::new("a-rule-edit-bumps-its-version");
+    let lint = "a-rule-edit-bumps-its-version";
+
+    let (code, out) = fx.run(lint, "", false);
+    assert_eq!(code, 0, "a clean fixture must pass:\n{out}");
+    assert!(
+        out.contains("clean"),
+        "a clean fixture must say clean:\n{out}"
+    );
+
+    // Prose the row never stores — a comment and `why` — needs no bump.
+    fx.write(
+        RULE_FILE,
+        &format!(
+            "# another comment\n{}",
+            rule_file(2, "a better reason", "a")
+        ),
+    );
+    fx.commit("reword the rule's why");
+    let (code, out) = fx.run(lint, "", false);
+    assert_eq!(code, 0, "a prose-only edit must pass:\n{out}");
+
+    // The defect: a `do` arg changed at the version the row holds.
+    fx.write(RULE_FILE, &rule_file(2, "a better reason", "b"));
+    fx.commit("change the rule's do at v2");
+    let (code, out) = fx.run(lint, "", false);
+    assert_eq!(code, 1, "a content edit without a bump must fail:\n{out}");
+    assert!(
+        out.contains("VIOLATION: r.toml") && out.contains("changes do at v2"),
+        "the failure names the file, the field and the version:\n{out}"
+    );
+    assert!(
+        out.contains("`version = 3`"),
+        "the failure names the bump that fixes it:\n{out}"
+    );
+
+    // Refusals, while the branch has a changed file to `git show`.
+    for (broken, named) in [
+        ("rev-parse", "git rev-parse"),
+        ("merge-base", "git merge-base"),
+        ("diff", "git diff"),
+        ("show", "git show"),
+    ] {
+        let (code, out) = fx.run(lint, broken, false);
+        assert_refusal(lint, code, &out, named, SHIM_SAID);
+        assert!(
+            !out.contains("Fetch the trunk") && !out.contains("VIOLATION"),
+            "a git that could not answer is reported as a verdict:\n{out}"
+        );
+    }
+    let (code, out) = fx.run(lint, "", true);
+    assert_refusal(lint, code, &out, "git rev-parse", OWNER_SAID);
+
+    // The same edit WITH the bump is the supported way to change a rule.
+    fx.write(RULE_FILE, &rule_file(3, "a better reason", "b"));
+    fx.commit("bump the rule to v3");
+    let (code, out) = fx.run(lint, "", false);
+    assert_eq!(code, 0, "a bumped content edit must pass:\n{out}");
+
+    // And a version that goes DOWN is dead text too.
+    fx.write(RULE_FILE, &rule_file(1, "a better reason", "a"));
+    fx.commit("walk the rule back to v1");
+    let (code, out) = fx.run(lint, "", false);
+    assert_eq!(code, 1, "a lowered version must fail:\n{out}");
+    assert!(out.contains("goes from v2 to v1"), "{out}");
 }
 
 /// The bundle path inside a fixture, and the first pipe-enum

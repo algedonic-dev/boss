@@ -95,9 +95,22 @@ echo "==> chain integrity check (source)"
 /usr/local/bin/boss-audit-integrity-check --config /etc/boss-audit-integrity-check.toml \
     || fail "source audit_log chain is broken — do NOT migrate; investigate first"
 
+# Pending is the relay's own predicate — neither delivered nor dead-
+# lettered — and a dead letter is counted apart (backlog e22b692e). A
+# dead-lettered row is one the bus refused and the relay set aside: it
+# will never drain, so counting it as pending made one refused event
+# wait out the whole drain bound and then blame a stuck relay. Its fact
+# is already in audit_log (the relay logs before it publishes), which
+# is what this copies, so it holds nothing up — it is only named.
+# "Open" is not yet resolved by an operator (`boss events redeliver
+# <outbox id> --resolve`).
+PENDING_SQL="SELECT count(*) FROM event_outbox WHERE delivered_at IS NULL AND dead_lettered_at IS NULL"
+DEAD_LETTERED_SQL="SELECT count(*) FROM event_outbox WHERE dead_lettered_at IS NOT NULL AND dead_letter_resolved_at IS NULL"
+
 if [[ "${1:-}" == "--check" ]]; then
-    outbox=$(psql_boss "SELECT count(*) FROM event_outbox WHERE delivered_at IS NULL")
-    echo "==> check mode: copy-set present, chain green, outbox pending $outbox (drains at export time)"
+    outbox=$(psql_boss "$PENDING_SQL")
+    dead=$(psql_boss "$DEAD_LETTERED_SQL")
+    echo "==> check mode: copy-set present, chain green, outbox pending $outbox (drains at export time), dead-lettered $dead (never drains; in audit_log, not on the bus)"
     echo "OK"
     exit 0
 fi
@@ -111,15 +124,15 @@ restart_writers() {
 }
 trap restart_writers EXIT
 
-# Drain: PENDING (undelivered) outbox rows must read zero on TWO
-# consecutive polls one second apart (a single zero can race a
-# straggling in-flight write). Delivered rows are retained in the
-# table — counting them would never reach zero; `delivered_at IS
-# NULL` is the pending predicate the relay itself indexes on.
+# Drain: PENDING outbox rows must read zero on TWO consecutive polls
+# one second apart (a single zero can race a straggling in-flight
+# write). Delivered and dead-lettered rows are retained in the table —
+# counting either would never reach zero; PENDING_SQL is the pending
+# predicate the relay itself indexes on.
 echo "==> draining outbox"
 zeros=0
 for _ in $(seq 1 60); do
-    n=$(psql_boss "SELECT count(*) FROM event_outbox WHERE delivered_at IS NULL")
+    n=$(psql_boss "$PENDING_SQL")
     if [[ "$n" == "0" ]]; then
         zeros=$((zeros + 1))
         [[ $zeros -ge 2 ]] && break
@@ -129,8 +142,12 @@ for _ in $(seq 1 60); do
     fi
     sleep 1
 done
-[[ $zeros -ge 2 ]] || fail "outbox did not drain within 60s — is boss-event-relay running?"
+dead=$(psql_boss "$DEAD_LETTERED_SQL")
+[[ $zeros -ge 2 ]] || fail "outbox did not drain within 60s: $n rows still pending — is boss-event-relay running? (dead-lettered rows are not counted: $dead open, set aside by the relay)"
 echo "    outbox empty (verified twice)"
+if [[ "$dead" != "0" ]]; then
+    echo "    NOTE: $dead dead-lettered outbox row(s) — refused by the bus, in audit_log (so in this copy), never published; redeliver or resolve each with 'boss events redeliver <outbox id>'"
+fi
 
 # --- dump -------------------------------------------------------------
 WORKDIR=$(mktemp -d)

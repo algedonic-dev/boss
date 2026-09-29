@@ -202,18 +202,33 @@ pub(crate) fn empty_roster_refusal(
     ))
 }
 
-/// The client every handler's production constructor uses: a plain
-/// reqwest client that carries the machine token as a default header
-/// when the process has one configured (7fcd78fa phase 1). One
+/// The client every handler's production constructor uses, for the
+/// estate's own services and nothing else: it stamps the machine token
+/// (7fcd78fa phase 1; design 6805c764) on every request it builds. One
 /// definition, so a new handler cannot forget the token by writing
 /// `Client::new()` out of habit -- the gate's 401 names the header if
 /// one does.
-pub fn api_client() -> reqwest::Client {
-    let mut headers = reqwest::header::HeaderMap::new();
-    boss_core::machine_token::attach(&mut headers);
-    reqwest::Client::builder()
-        .default_headers(headers)
-        .build()
+///
+/// STAMPED PER REQUEST (design 6805c764 car 2, the handlers slice;
+/// review S1 of car 2 slice 1). Until this slice it read the token ONCE
+/// into `default_headers`, and the dispatcher builds every handler, and
+/// so every client, once at boot: after the broker rotated `current`,
+/// all sixty-odd handlers went on sending the boot-time value until a
+/// restart, and car 3's revoke of `previous` would have refused them
+/// all at an enforcing gate. `machine_token::Client` reads the process's
+/// one watched source on each request instead.
+///
+/// NEVER A THIRD PARTY'S CLIENT. The type is `machine_token::Client`,
+/// not `reqwest::Client`, in every handler field, `with_client` and
+/// shared helper below, so this client cannot be handed to anything
+/// that speaks to Stripe, a webhook URL, the forge, Cloudflare or
+/// GitHub — those take a `reqwest::Client` of their own
+/// (`webhook_notify`, `stripe_*`, `credential_issuer`), and a mix-up is
+/// a compile error rather than a leak. It follows no redirect, so a 3xx
+/// from anything it reached comes back to the handler as a response
+/// instead of carrying the token to the host a `Location` names.
+pub fn api_client() -> boss_core::machine_token::Client {
+    boss_core::machine_token::Client::build(reqwest::Client::builder())
         .expect("reqwest client always builds")
 }
 
@@ -257,7 +272,7 @@ pub use boss_dispatcher::rules::actor::dispatcher_actor_header;
 /// differs (a PUT, a response-body read, a lenient no-fail webhook, or an
 /// omitted header) keep their inline call.
 pub(crate) async fn post_json(
-    client: &reqwest::Client,
+    client: &boss_core::machine_token::Client,
     url: &str,
     body: &Value,
     rule_name: &str,
@@ -299,7 +314,7 @@ pub(crate) async fn post_json(
 /// same POST-and-read (ac3270c7) — one definition rather than a second
 /// copy (CLAUDE.md §9a).
 pub(crate) async fn post_json_minted_id(
-    client: &reqwest::Client,
+    client: &boss_core::machine_token::Client,
     url: &str,
     body: &Value,
     rule_name: &str,
@@ -339,7 +354,7 @@ pub(crate) async fn post_json_minted_id(
 /// transport failures and non-2xx responses into
 /// `HandlerError::Downstream`.
 pub(crate) async fn get_json(
-    client: &reqwest::Client,
+    client: &boss_core::machine_token::Client,
     url: &str,
     rule_name: &str,
 ) -> Result<Value, HandlerError> {
@@ -497,7 +512,7 @@ pub(crate) fn row_or_refuse(body: Value, what: &str) -> Result<Value, String> {
 /// needed the same walk (c34583cb) — one definition rather than a
 /// second copy (CLAUDE.md §9a).
 pub(crate) async fn open_jobs_of_kind(
-    client: &reqwest::Client,
+    client: &boss_core::machine_token::Client,
     jobs_base: &str,
     kind: &str,
     rule_name: &str,
@@ -511,7 +526,7 @@ pub(crate) async fn open_jobs_of_kind(
 /// looks for steps held by a dead executor run, and those sit on
 /// packets of every kind an agent block appears on (a3397b01).
 pub(crate) async fn open_jobs(
-    client: &reqwest::Client,
+    client: &boss_core::machine_token::Client,
     jobs_base: &str,
     kind: Option<&str>,
     rule_name: &str,
@@ -543,7 +558,7 @@ pub(crate) async fn open_jobs(
 /// one flag here keeps the "steps inline" this crate's doc promises,
 /// for every caller.
 pub(crate) async fn jobs_where(
-    client: &reqwest::Client,
+    client: &boss_core::machine_token::Client,
     jobs_base: &str,
     filter: &str,
     rule_name: &str,
@@ -584,7 +599,7 @@ pub(crate) async fn jobs_where(
 /// same two verbs — one definition rather than a second copy
 /// (CLAUDE.md 9a: collapse it if you can).
 pub(crate) async fn write_json(
-    client: &reqwest::Client,
+    client: &boss_core::machine_token::Client,
     method: reqwest::Method,
     url: &str,
     body: &Value,
@@ -662,7 +677,7 @@ pub(crate) fn step_completion_writes(
 /// [`step_completion_writes`], each through [`write_json`] against
 /// `base`, stopping at the first refusal.
 pub(crate) async fn complete_step(
-    client: &reqwest::Client,
+    client: &boss_core::machine_token::Client,
     base: &str,
     jid: &str,
     sid: &str,
@@ -706,9 +721,11 @@ pub(crate) fn triage_step(job: &Value) -> Option<String> {
 const WITHDRAWING_SLUGS: [&str; 2] = ["measure", "build"];
 
 /// How a machine withdraws an alarm it raised once the condition has
-/// cleared (backlog a2d8bad3).
+/// cleared (backlog a2d8bad3). `pub` because the train conductor closes
+/// its own alarms by the same judgement (backlog e61093a1) rather than a
+/// copy of it.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Retraction {
+pub enum Retraction {
     /// Complete this step with `disposition = stale`, through
     /// [`complete_step`] — the step's own keys are not carried, because
     /// the merge door keeps every key it is not sent (e39a9d2a).
@@ -751,7 +768,13 @@ pub(crate) enum Retraction {
 ///
 /// `None` is a packet with no triage step, which is not an alarm this
 /// crate can judge.
-pub(crate) fn retraction(job: &Value) -> Option<Retraction> {
+///
+/// THE TRAIN CONDUCTOR READS IT TOO (backlog e61093a1). Its LEFT BEHIND
+/// and stranded-green alarms closed at `triage` only — the defect this
+/// function was written to cure, rebuilt a crate away — and on
+/// 2026-09-28 two LEFT BEHIND alarms routed to `build` sat open urgent
+/// on a 409 every pass. One judgement, two callers (CLAUDE.md §9a).
+pub fn retraction(job: &Value) -> Option<Retraction> {
     let steps: Vec<&Value> = job
         .get("steps")
         .and_then(Value::as_array)
@@ -845,11 +868,11 @@ pub(crate) fn withdrawal_fields(
 /// The packet-metadata key a recovery is stamped under — the same key
 /// `estate.recover` has written onto the packets it closes since
 /// ef421cd3, so a reader asks one question of every alarm.
-pub(crate) const RECOVERED_AT: &str = "recovered_at";
+pub const RECOVERED_AT: &str = "recovered_at";
 
 /// The merge that tells a person the condition is over when the machine
 /// may not close the packet itself ([`Retraction::Annotate`]).
-pub(crate) fn recovery_note(
+pub fn recovery_note(
     evidence: &str,
     cleared_by: &str,
     recovered_at: &str,
@@ -880,6 +903,67 @@ pub(crate) fn relapse_patch() -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The handlers that speak to a party OUTSIDE the estate, and whom.
+    /// Each holds a `reqwest::Client` of its own and must never reach
+    /// the machine client: `webhook.notify` sent on `api_client()` until
+    /// backlog ee96c839 (2026-09-28), so the configured host received
+    /// the estate token on every forwarded event.
+    const THIRD_PARTY: &[(&str, &str, &str)] = &[
+        (
+            "webhook_notify.rs",
+            include_str!("webhook_notify.rs"),
+            "the configured webhook host",
+        ),
+        (
+            "stripe_charges.rs",
+            include_str!("stripe_charges.rs"),
+            "Stripe",
+        ),
+        (
+            "stripe_payouts.rs",
+            include_str!("stripe_payouts.rs"),
+            "Stripe",
+        ),
+        (
+            "credential_issuer.rs",
+            include_str!("credential_issuer.rs"),
+            "the forge, Cloudflare and GitHub",
+        ),
+    ];
+
+    /// Design 6805c764 car 2, the handlers slice: `api_client()` is now
+    /// a `machine_token::Client`, and a third party's client stays a
+    /// plain `reqwest::Client`, so passing one for the other is a
+    /// compile error. What the type cannot stop is a third-party
+    /// handler BUILDING its client from `api_client()` — the ee96c839
+    /// shape — so each is read here, comments stripped (a doc comment
+    /// saying why it does not is not a use).
+    #[test]
+    fn a_third_party_handler_never_holds_the_machine_client() {
+        let doors = ["api_client(", "machine_token::"];
+        let leaks: Vec<String> = THIRD_PARTY
+            .iter()
+            .filter_map(|(file, src, whom)| {
+                let prod = boss_testing::production_source::production_text(src)
+                    .unwrap_or_else(|e| panic!("{file} does not parse: {e}"));
+                let code = boss_testing::production_source::without_comments(&prod);
+                let hit: Vec<&str> = doors.iter().copied().filter(|d| code.contains(d)).collect();
+                (!hit.is_empty()).then(|| format!("{file} ({whom}) names {hit:?}"))
+            })
+            .collect();
+        assert!(
+            leaks.is_empty(),
+            "a handler that sends to a party outside the estate reaches the machine client, \
+             so that party would receive the estate token:\n  {}",
+            leaks.join("\n  ")
+        );
+        // The control: the scan sees the door in a file that uses it.
+        let own = boss_testing::production_source::without_comments(
+            &boss_testing::production_source::production_text(include_str!("common.rs")).unwrap(),
+        );
+        assert!(own.contains("machine_token::"), "the scan reads nothing");
+    }
 
     /// Backlog 833e2d0a — THE JUDGEMENT LIVES ONCE. A listing with no
     /// `data` array is no answer: an error shape, a changed contract, a
@@ -1280,9 +1364,22 @@ mod lane_pin {
         // (`estate.alarm`'s `door_dark`, e6406701), stamped `Telemetry`
         // like the estate alarms beside it; thirteen since `ops.judge`'s
         // WATCH alarm (backlog 8d77d670), a watched unattended verb that
-        // did not do its job, stamped `PipelineFailure` like the chain's.
+        // did not do its job, stamped `PipelineFailure` like the chain's;
+        // fourteen since `maintenance.chore.file_reds` files ONE item for
+        // a night whose reds share a cause (backlog c8c6b9a8), stamped
+        // `PipelineFailure` like its per-route item; fifteen since
+        // `estate.alarm`'s BLIND alarm (a276f7c2), a hard class left
+        // unmeasured three rows running, stamped `Telemetry` like the
+        // estate alarms beside it; sixteen since `policy.coverage.alarm`
+        // (design 1c4e42e1), a control no real person holds, stamped
+        // `Telemetry` — a reading, like the estate alarms; seventeen since
+        // its `coverage-unreadable` alarm (review M2), a dark read said
+        // rather than swallowed, stamped `Telemetry` beside it; eighteen
+        // since the boot seed's rule-drift alarm (backlog 732c3cf9), a
+        // rule file edited without a version bump, stamped `Telemetry` —
+        // a reading of the registry against the tree.
         assert_eq!(
-            filings, 13,
+            filings, 18,
             "the number of machine filing sites changed. That is fine — but check the new \
              one stamps a lane, then update this count, which exists so a filing that \
              DISAPPEARS from the scan (a renamed key, a reshaped body) cannot read as \

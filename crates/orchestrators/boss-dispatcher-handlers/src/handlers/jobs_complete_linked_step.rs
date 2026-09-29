@@ -225,7 +225,7 @@ const DEFAULT_EVIDENCE_KEY: &str = "arrived_from";
 const OPEN_STATUSES: [&str; 2] = ["ready", "active"];
 
 pub struct JobsCompleteLinkedStep {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
     /// Who the failure alert (v6) is filed to — the platform owner as
     /// the port answers it, resolved per invocation by
@@ -248,7 +248,7 @@ impl JobsCompleteLinkedStep {
     /// Construct with a custom reqwest client (tests point it at a
     /// local stand-in for jobs-api).
     pub fn with_client(
-        client: reqwest::Client,
+        client: boss_core::machine_token::Client,
         jobs_base: impl Into<String>,
         owner: Arc<dyn boss_core::platform_owner::PlatformOwner>,
     ) -> Arc<Self> {
@@ -1277,7 +1277,9 @@ const FAILURE_MARKERS: [&str; 2] = ["FAILED", "REFUSED"];
 pub(crate) const NOT_YET_EXIT: &str = "75";
 
 /// PURE over the closing packet: `Some` when its `execute` step records
-/// a non-zero `exit_code` other than [`NOT_YET_EXIT`] — the ops-runner's
+/// a non-zero `exit_code` other than [`NOT_YET_EXIT`], or an exit 0 the
+/// runner recorded `effect_unproven` beside (the verb's declared effect
+/// was not shown, backlog fdbb447e) — the ops-runner's
 /// record of a verb that RAN and failed (a RUNNER refusal ran nothing,
 /// carries no exit, and closes `refused`, which no answered-rule fires
 /// on). The line is the last one carrying the first marker above that
@@ -1298,7 +1300,21 @@ pub(crate) fn verb_failure(closing: &serde_json::Value) -> Option<VerbFailure> {
         serde_json::Value::Number(n) => n.to_string(),
         _ => return None,
     };
-    if exit.is_empty() || exit == "0" || exit == NOT_YET_EXIT {
+    // AN EXIT 0 IS NOT AN EFFECT (backlog fdbb447e part 1): the runner
+    // judged the verb's declared effect on this run and recorded that it
+    // was NOT shown. That is a verb that did not do its job, whatever its
+    // exit — the shape the daily prune's proof missed.
+    if exit == "0" {
+        let unproven = meta
+            .get("effect_unproven")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())?;
+        return Some(VerbFailure {
+            exit,
+            line: format!("EFFECT NOT SHOWN — {}", unproven.trim()),
+        });
+    }
+    if exit.is_empty() || exit == NOT_YET_EXIT {
         return None;
     }
     let output = meta.get("output").and_then(|v| v.as_str()).unwrap_or("");
@@ -1356,6 +1372,34 @@ mod verb_failure_tests {
         let f = verb_failure(&answered("1", out)).expect("exit 1 is a failure");
         assert_eq!(f.exit, "1");
         assert_eq!(f.line, "publish-github-pr: FAILED — remote rejected");
+    }
+
+    /// AN EXIT 0 IS NOT AN EFFECT (backlog fdbb447e part 1). The runner
+    /// records `effect_unproven` beside an exit 0 whose declared effect
+    /// the run did not show; every judge in this family reads that as a
+    /// failure, with the runner's reason as the line — so a chain does
+    /// not spend a `--for-real` on it, a linked step is troubled rather
+    /// than completed, and a watch files its alarm.
+    #[test]
+    fn an_exit_0_whose_effect_was_not_shown_is_a_failure() {
+        let mut closing = answered("0", "acts: REFUSED — the keep set could not be derived\n");
+        closing["steps"][0]["metadata"]["effect_unproven"] = json!(
+            "exit 0, and no line of the output matches the effect this verb declares (^acts: OK)"
+        );
+        let f = verb_failure(&closing).expect("an unshown effect is a failure");
+        assert_eq!(f.exit, "0");
+        assert_eq!(
+            f.line,
+            "EFFECT NOT SHOWN — exit 0, and no line of the output matches the effect this verb declares (^acts: OK)"
+        );
+
+        // A shown effect, or a verb that declares no read-back, is not.
+        let mut shown = answered("0", "acts: OK — deleted 3\n");
+        shown["steps"][0]["metadata"]["effect"] = json!("acts: OK — deleted 3");
+        assert_eq!(verb_failure(&shown), None);
+        let mut unread = answered("0", "acts: done\n");
+        unread["steps"][0]["metadata"]["effect_unread"] = json!("prints no re-list");
+        assert_eq!(verb_failure(&unread), None);
     }
 
     /// The runner records 124 when it kills a verb at its timeout — the
@@ -1737,6 +1781,7 @@ mod tests {
 
     fn ctx(payload: serde_json::Value) -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "complete-feedback-branch-on-car-merged".into(),
             triggering_event_id: "evt-close-1".into(),
             triggering_topic: "jobs.job.closed".into(),
@@ -2111,7 +2156,11 @@ mod tests {
             train(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
 
         assert!(
@@ -2172,7 +2221,11 @@ mod tests {
             train(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args_with_route(), &ctx(close_marker()))
             .await
             .expect("runs");
@@ -2222,7 +2275,11 @@ mod tests {
             train(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args_with_route(), &ctx(close_marker()))
             .await
             .expect("runs");
@@ -2258,7 +2315,11 @@ mod tests {
             train(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args_with_route(), &ctx(close_marker()))
             .await
             .expect("runs");
@@ -2309,7 +2370,11 @@ mod tests {
             train(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args_with_route(), &ctx(close_marker()))
             .await
             .expect("runs");
@@ -2330,7 +2395,11 @@ mod tests {
         .await;
         let mut a = args_with_done_metadata();
         a.push(("route".to_string(), Value::String("not json".into())));
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&a, &ctx(close_marker())).await.expect("runs");
 
         assert!(puts.lock().unwrap().is_empty());
@@ -2362,7 +2431,11 @@ mod tests {
             train(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args_with_routes(), &ctx(close_marker()))
             .await
             .expect("runs");
@@ -2405,7 +2478,11 @@ mod tests {
             train(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args_with_routes(), &ctx(close_marker()))
             .await
             .expect("runs");
@@ -2430,7 +2507,11 @@ mod tests {
             train(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args_with_routes(), &ctx(close_marker()))
             .await
             .expect("runs");
@@ -2497,7 +2578,11 @@ mod tests {
             train(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args_with_also(), &ctx(close_marker()))
             .await
             .expect("runs");
@@ -2528,7 +2613,11 @@ mod tests {
             second_untriaged_packet(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         for _ in 0..2 {
             h.invoke(&args_with_also(), &ctx(close_marker()))
                 .await
@@ -2548,7 +2637,11 @@ mod tests {
             second_untriaged_packet(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args_with_also(), &ctx(close_marker()))
             .await
             .expect("runs");
@@ -2572,7 +2665,11 @@ mod tests {
             second_untriaged_packet(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args_with_routes(), &ctx(close_marker()))
             .await
             .expect("runs");
@@ -2595,7 +2692,11 @@ mod tests {
             train(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
 
         let calls = puts.lock().unwrap().clone();
@@ -2641,7 +2742,11 @@ mod tests {
             train(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args_with_done_metadata(), &ctx(close_marker()))
             .await
             .expect("runs");
@@ -2677,7 +2782,11 @@ mod tests {
             train(),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args_with_done_metadata(), &ctx(close_marker()))
             .await
             .expect("runs");
@@ -2705,7 +2814,11 @@ mod tests {
             packet("ready"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
         assert!(
             puts.lock().unwrap().is_empty(),
@@ -2730,7 +2843,11 @@ mod tests {
             packet("ready"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args_with_route(), &ctx(close_marker()))
             .await
             .expect("runs");
@@ -2750,7 +2867,11 @@ mod tests {
             packet("ready"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
         assert!(puts.lock().unwrap().is_empty(), "nothing to complete");
     }
@@ -2762,7 +2883,11 @@ mod tests {
         let mut closed = packet("ready");
         closed["status"] = json!("closed");
         let (base, puts, _) = mock_jobs(vec![car(json!({ "backlog_item": PACKET })), closed]).await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
         assert!(puts.lock().unwrap().is_empty(), "a closed packet is done");
     }
@@ -2778,7 +2903,11 @@ mod tests {
             packet("completed"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
         assert!(
             puts.lock().unwrap().is_empty(),
@@ -2795,7 +2924,11 @@ mod tests {
         stamped["steps"][2]["metadata"]["arrived_from"] = json!({ "car": CAR });
         let (base, puts, _) =
             mock_jobs(vec![car(json!({ "backlog_item": PACKET })), stamped]).await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
         assert!(puts.lock().unwrap().is_empty(), "already stamped by us");
     }
@@ -2809,7 +2942,11 @@ mod tests {
         nothing_open["status"] = json!("open");
         let (base, puts, _) =
             mock_jobs(vec![car(json!({ "backlog_item": PACKET })), nothing_open]).await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
         assert!(
             puts.lock().unwrap().is_empty(),
@@ -2827,7 +2964,11 @@ mod tests {
             packet("ready"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
 
         let calls = puts.lock().unwrap().clone();
@@ -2964,7 +3105,11 @@ mod tests {
             feedback_routed_to_design("ready"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         let mut ctx = ctx(design_close_marker());
         ctx.rule_name = "complete-feedback-design-review-on-design-doc-published".into();
         h.invoke(&design_rule_args(), &ctx).await.expect("runs");
@@ -3055,7 +3200,11 @@ mod tests {
             feedback_drafted_for_design("completed", "ready"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         let mut ctx = ctx(design_close_marker());
         ctx.rule_name = "complete-feedback-design-review-on-design-doc-published".into();
         h.invoke(&design_rule_args(), &ctx).await.expect("runs");
@@ -3088,7 +3237,11 @@ mod tests {
             feedback_drafted_for_design("ready", "pending"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         let mut ctx = ctx(design_close_marker());
         ctx.rule_name = "complete-feedback-design-review-on-design-doc-published".into();
         h.invoke(&design_rule_args(), &ctx).await.expect("runs");
@@ -3113,7 +3266,11 @@ mod tests {
             feedback_routed_to_design("completed"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&design_rule_args(), &ctx(design_close_marker()))
             .await
             .expect("runs");
@@ -3163,7 +3320,11 @@ mod tests {
         open_design["status"] = json!("open");
         let (base, puts, patches) =
             mock_jobs(vec![open_design, feedback_routed_to_design("ready")]).await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         let mut ctx = ctx(design_review_done_marker());
         ctx.rule_name = "complete-feedback-design-review-on-design-review-decided".into();
         ctx.triggering_topic = "step.done.review-design".into();
@@ -3301,6 +3462,7 @@ mod tests {
 
     fn step_ctx(payload: serde_json::Value) -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "agent-run-delivers-when-its-step-is-done".into(),
             triggering_event_id: "evt-step-done-1".into(),
             triggering_topic: "step.done.task".into(),
@@ -3320,7 +3482,11 @@ mod tests {
             run("ready"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(
             &delivery_args(),
             &step_ctx(step_done_marker(json!({ "agent_run": RUN }))),
@@ -3363,7 +3529,11 @@ mod tests {
     #[tokio::test]
     async fn a_step_with_no_run_reads_nothing() {
         let (base, puts, patches) = mock_jobs(vec![]).await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         for metadata in [
             json!({}),
             json!({ "agent_run": "" }),
@@ -3388,7 +3558,11 @@ mod tests {
             run("completed"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(
             &delivery_args(),
             &step_ctx(step_done_marker(json!({ "agent_run": RUN }))),
@@ -3411,7 +3585,11 @@ mod tests {
     #[tokio::test]
     async fn an_unusable_step_edge_is_skipped() {
         let (base, puts, _patches) = mock_jobs(vec![]).await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(
             &delivery_args(),
             &step_ctx(step_done_marker(json!({ "agent_run": "55555555" }))),
@@ -3482,7 +3660,11 @@ mod tests {
             run("ready"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         let marker = json!({ "id": GATE, "kind": "gate-run", "outcome": "completed",
                              "closed_on": "2026-09-24", "parent_step_id": null });
         h.invoke(&landing_args(), &ctx(marker.clone()))
@@ -3501,7 +3683,11 @@ mod tests {
             run("ready"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&landing_args(), &ctx(marker)).await.expect("runs");
         let puts = puts.lock().unwrap().clone();
         let gate_run = &puts[0].1["metadata"]["gate_run"];
@@ -3628,6 +3814,7 @@ mod answer_tests {
 
     fn ctx(payload: serde_json::Value) -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "complete-release-tag-on-tag-release-answered".into(),
             triggering_event_id: "evt-close-9".into(),
             triggering_topic: "jobs.job.closed".into(),
@@ -3727,7 +3914,11 @@ mod answer_tests {
             release_packet("ready"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&tag_release_rule_args(), &ctx(request_close_marker()))
             .await
             .expect("runs");
@@ -3771,7 +3962,11 @@ mod answer_tests {
             release_packet("ready"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&tag_release_rule_args(), &ctx(request_close_marker()))
             .await
             .expect("runs");
@@ -3800,7 +3995,11 @@ mod answer_tests {
             release_packet("ready"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&tag_release_rule_args(), &ctx(request_close_marker()))
             .await
             .expect("runs");
@@ -3817,7 +4016,11 @@ mod answer_tests {
             release_packet("completed"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         h.invoke(&tag_release_rule_args(), &ctx(request_close_marker()))
             .await
             .expect("runs");
@@ -3834,7 +4037,11 @@ mod answer_tests {
             release_packet("ready"),
         ])
         .await;
-        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base, test_owner());
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
         let mut a = tag_release_rule_args();
         for (k, v) in a.iter_mut() {
             if k == "verdict_pattern" {

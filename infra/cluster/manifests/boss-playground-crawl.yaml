@@ -130,10 +130,17 @@ spec:
                   set -euo pipefail
                   # The clone is INSIDE the check: a forge that refuses the
                   # credential is a failed run the packet records, with the
-                  # refusal in its output.
+                  # refusal in its output. Then the tree's guard waits out a
+                  # converge rolling the playground (the converge packet
+                  # open, or a head it built within the settle window) before
+                  # the browser starts, and says so on this packet: on
+                  # 2026-09-28 the crawl ran inside train #768's roll and every
+                  # route read no-shell (backlog c8c6b9a8). It never fails
+                  # the check.
                   /tools/boss-chore.sh maintenance-playground-crawl "Playground crawl" -- bash -c '
                     set -euo pipefail
                     git clone --depth 1 "$FORGE_URL" /work/boss
+                    BOSS_API_CURL=/tools/boss-api-curl.sh bash /work/boss/infra/wait-out-a-converge.sh
                     cd /work/boss/apps/web
                     PUPPETEER_SKIP_DOWNLOAD=1 bun install --frozen-lockfile
                     bun run test:live

@@ -32,5 +32,6 @@
       "optional": true
     }
   ],
-  "timeout": 300
+  "timeout": 300,
+  "effect": "^sweep-archive-branches: (OK — deleted [0-9]+ of [0-9]+ planned branch[(]es[)] from remote .+, each read back absent|DRY RUN — would delete [0-9]+ branch[(]es[)] from remote )"
 }

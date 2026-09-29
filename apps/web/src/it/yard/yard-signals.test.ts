@@ -230,6 +230,21 @@ describe("yardSignals — what fired what, in the packets' own stamps", () => {
       sev: 'err',
       what: 'converge refused on forge — verb not allowlisted',
     });
+    // Exit 75 is "not yet" — a converge already running took the start
+    // (backlog 1058e686, car D) — the warn tone, never err; any other
+    // non-zero exit is still trouble.
+    const withExit = (id: string, code: string): JobLite =>
+      opsRequest(id, {
+        steps: [step('execute', 'completed', { disposition: 'answered', exit_code: code, output: 'converge-now: not yet: …', runner_host: 'forge' })],
+      });
+    expect(yardSignals([], [], [withExit('o4', '75')]).find(x => x.who === 'ops-runner')).toMatchObject({
+      sev: 'warn',
+      what: 'converge answered on forge · exit 75 (not yet)',
+    });
+    expect(yardSignals([], [], [withExit('o5', '1')]).find(x => x.who === 'ops-runner')).toMatchObject({
+      sev: 'err',
+      what: 'converge answered on forge · exit 1',
+    });
   });
 
   test('all sources interleave by instant, newest first, capped at the panel size', () => {

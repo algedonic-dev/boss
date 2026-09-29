@@ -81,6 +81,7 @@ fn ctx() -> InvocationContext {
 /// release leg (v7) closes a different request under a different rule.
 fn ctx_for(rule: &str, request_id: &str) -> InvocationContext {
     InvocationContext {
+        event_timestamp: None,
         rule_name: rule.into(),
         triggering_event_id: format!("evt-close-{}", &request_id[..8]),
         triggering_topic: "jobs.job.closed".into(),
@@ -295,7 +296,7 @@ async fn mock_jobs(
 
 fn handler(base: String) -> Arc<JobsCompleteLinkedStep> {
     JobsCompleteLinkedStep::with_client(
-        reqwest::Client::new(),
+        boss_dispatcher_handlers::handlers::common::api_client(),
         base,
         Arc::new(boss_core::platform_owner::Fixed(OWNER.into())),
     )
@@ -382,6 +383,21 @@ async fn a_failed_publish_annotates_the_open_step_and_files_an_urgent_item() {
     assert_eq!(
         note["alert"], MINTED,
         "the step points at the packet filed for it"
+    );
+    // The list lifts exactly these keys off a step for `failed_verbs=true`
+    // (backlog ea80b5fd), so the note and that list are one fact held
+    // equal here (CLAUDE.md §9a): a key added to the note and not the
+    // list would never reach the receiving yard.
+    let mut written: Vec<&str> = note
+        .as_object()
+        .map(|o| o.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    written.sort_unstable();
+    let mut lifted = boss_jobs::http::FAILED_VERB_KEYS.to_vec();
+    lifted.sort_unstable();
+    assert_eq!(
+        written, lifted,
+        "the note's keys are the keys the list lifts"
     );
     assert!(
         !w.iter()

@@ -52,13 +52,21 @@ A bundle exposes a single contract:
 ```
 
 That's the whole API. There is no `save`/`done`/`cancel` helper:
-to persist, you `fetch` a `PUT /api/jobs/{jobId}/steps/{step.id}`
-yourself (set `status: "completed"` to complete the step — a status is
-one of `pending`, `ready`, `active`, `completed`, `skipped`, and any
-other word is refused with 400; the pin
+to persist, you `fetch` yourself, through two doors, then call
+`onUpdate()`. The keys your surface owns go to the step merge door,
+`PATCH /api/jobs/{jobId}/steps/{step.id}/metadata` — it merges them
+against the row as it stands, keeps every key you do not name, and
+deletes a key sent as `null`. The status goes ALONE to
+`PUT /api/jobs/{jobId}/steps/{step.id}` as `{ status }` (`"completed"`
+to complete the step — a status is one of `pending`, `ready`, `active`,
+`completed`, `skipped`, and any other word is refused with 400; the pin
 `crates/core/boss-testing/tests/a_step_plugin_writes_only_step_statuses.rs`
-holds every bundle here to that list), then call
-`onUpdate()`. The props type is `StepPluginProps` in
+holds every bundle here to that list). The PUT keeps every field its
+body omits, and it is closing to any metadata body (backlog e39a9d2a):
+`apps/web/src/steps/a-step-plugin-put-carries-no-metadata.test.ts`
+refuses a step PUT here whose body is anything but the status. Send
+the PUT only after the merge answered ok, so a failed save moves no
+status. The props type is `StepPluginProps` in
 `apps/web/src/steps/pluginHost.ts`; `StepPluginMount.svelte` calls
 your `mount`. The full decision record is in
 `docs/architecture-decisions.md` §Step UX & frontend.
@@ -149,19 +157,22 @@ no build step:
     const readOnly = step.status === 'completed';
     const checks = (step.metadata && step.metadata.checks) || [];
 
-    // Persist step.metadata via the same PUT every step uses, then
-    // ask the host to refetch. Set status='completed' to complete.
+    // Persist our own keys through the step merge door, then (on
+    // Complete) the status alone through the step PUT, then ask the
+    // host to refetch. Set status='completed' to complete.
     async function save(status) {
-      await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
-        method: 'PUT',
+      const merged = await fetch(`/api/jobs/${jobId}/steps/${step.id}/metadata`, {
+        method: 'PATCH',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          job_id: jobId,
-          ...(status ? { status } : {}),
-          metadata: { ...step.metadata, checks,
-                      visited_at: new Date().toISOString() },
-        }),
+        body: JSON.stringify({ checks, visited_at: new Date().toISOString() }),
       });
+      if (merged.ok && status) {
+        await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ status }),
+        });
+      }
       onUpdate();
     }
 
@@ -309,7 +320,8 @@ exists.sh` refuses a row whose JS is absent from this directory.
   the platform.
 - **Don't fetch the world on mount.** `props.step` (with its
   `metadata`) and `props.currentUser` arrive already loaded. Hit
-  `/api/*` only for the Job's own write (the step `PUT`) or a peer
+  `/api/*` only for the step's own writes (the merge door and the
+  status `PUT`) or a peer
   resource the host didn't hand you.
 - **Don't keep state outside `step.metadata`.** The audit log is
   the system of record; metadata is its surface. Anything you

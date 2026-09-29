@@ -23,6 +23,9 @@ boss-core = { path = "../boss-core" }
 # transaction (backlog 92473357).
 boss-events = { path = "../boss-events", default-features = false, optional = true }
 boss-policy-client = { path = "../boss-policy-client" }
+# The write door's policy URL fallback, as every policy-asking service
+# reads it (backlog abc2e9d5).
+boss-ports = { path = "../boss-ports" }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
@@ -54,4 +57,12 @@ required-features = ["rebuild-bin"]
 
 [[test]]
 name = "subjects_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "subject_kinds_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_subject_kind_registry_pg"
 required-features = ["postgres"]

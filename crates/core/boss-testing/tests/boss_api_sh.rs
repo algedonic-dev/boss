@@ -26,7 +26,9 @@
 //!     read from beside the script, so the system-of-record address is
 //!     spelled once in infra/dev (CLAUDE.md §9a);
 //!   * the machine token rides as `X-Boss-Machine-Token` only when its
-//!     file exists (the stub records the header NAME, never a value);
+//!     file exists (the stub records the header NAME, never a value),
+//!     and in a 0600 header file handed over as `-H @file`, never in
+//!     curl's argv (backlog 5f3ad356, `infra/lib/secret-header.sh`);
 //!   * a bad method or a missing path is refused with exit 2 before
 //!     curl runs;
 //!   * the PORT follows the path (backlog de0989d2, 2026-09-17): the
@@ -101,15 +103,25 @@ impl Fixture {
         // a newline, the code. STUB_BODY / STUB_CODE choose the answer.
         // A header whose name is the machine token is recorded by name
         // only: the test asserts the header is PRESENT, never its value.
+        // A `-H @file` is read the way curl reads it — the file's line is
+        // what the header list records — and the argv exactly as handed
+        // over goes to `<argv>.raw`, which is where a token in the
+        // command line would show (backlog 5f3ad356).
         write_exec(
             &bin.join("curl"),
             "#!/usr/bin/env bash\n\
              : > \"$STUB_ARGV\"\n\
+             : > \"$STUB_ARGV.raw\"\n\
+             prev=\n\
              for a in \"$@\"; do\n\
-                 case \"$a\" in\n\
+                 printf '%s\\n' \"$a\" >> \"$STUB_ARGV.raw\"\n\
+                 h=$a\n\
+                 if [ \"$prev\" = -H ]; then case \"$a\" in @*) h=$(cat \"${a#@}\") ;; esac; fi\n\
+                 case \"$h\" in\n\
                      X-Boss-Machine-Token:*) echo 'X-Boss-Machine-Token: <present>' ;;\n\
-                     *) printf '%s\\n' \"$a\" ;;\n\
+                     *) printf '%s\\n' \"$h\" ;;\n\
                  esac >> \"$STUB_ARGV\"\n\
+                 prev=$a\n\
              done\n\
              printf '%s\\n%s' \"${STUB_BODY:-}\" \"${STUB_CODE:-200}\"\n",
         );
@@ -582,6 +594,21 @@ fn the_machine_token_header_rides_only_when_its_file_exists() {
         Some("<present>"),
         "the token header must ride when the file exists: {:?}",
         f.curl_argv()
+    );
+    // ...and it rides in a FILE: curl's command line is world-readable in
+    // ps and /proc/<pid>/cmdline while it runs, and until 2026-09-28 this
+    // door put `X-Boss-Machine-Token: $TOK` there (backlog 5f3ad356).
+    let raw = std::fs::read_to_string(format!("{}.raw", f.argv.display())).unwrap_or_default();
+    assert!(
+        !raw.contains("stub-token-for-the-test"),
+        "the token must never be in curl's argv:\n{raw}"
+    );
+    assert!(
+        raw.lines()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|w| w[0] == "-H" && w[1].starts_with('@')),
+        "the token header is handed over as -H @<file>:\n{raw}"
     );
 }
 

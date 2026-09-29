@@ -49,7 +49,18 @@ async fn main() -> Result<()> {
         Arc::new(boss_locations::PgLocations::new(pool))
     };
 
-    let state = LocationsApiState { locations };
+    // The batch door asks policy (backlog 59deda40), wired the way
+    // boss-classes-api wires its doors: the sim bypass is installed on a
+    // sim instance only and admits only a sim caller there (85e7f10f).
+    let policy: Arc<dyn boss_policy_client::PolicyClient> =
+        boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
+            boss_policy_client::ReqwestPolicyClient::new(
+                "locations",
+                std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
+            ),
+        ));
+
+    let state = LocationsApiState { locations, policy };
     let app = router(state);
     // Sim-origin middleware: extract x-sim-origin header and set the
     // per-request task-local so the publisher inherits the sim

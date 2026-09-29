@@ -206,7 +206,10 @@ async fn build_files_router(
     );
 
     let policy: Arc<dyn boss_policy_client::PolicyClient> = match &cfg.policy_api_url {
-        Some(url) => Arc::new(boss_policy_client::ReqwestPolicyClient::new(url.clone())),
+        Some(url) => Arc::new(boss_policy_client::ReqwestPolicyClient::new(
+            "content",
+            url.clone(),
+        )),
         None => {
             tracing::warn!(
                 "no policy_api_url configured — file-references operate without policy enforcement \

@@ -58,17 +58,42 @@ fn active_spec() -> WorkflowSpec {
         .expect("ship-a-change is a platform workflow")
 }
 
-/// A later version of it, edited by `edit` — seeded as a draft so the
-/// active row the packet opens under stays the one `get_active` finds,
-/// and the conversion names its target with `to_version`.
-fn next_version(kinds: &InMemoryWorkflows, bump: i32, edit: impl FnOnce(&mut WorkflowSpec)) -> i32 {
-    let mut spec = active_spec();
-    spec.version += bump;
-    spec.status = WorkflowStatus::Draft;
-    edit(&mut spec);
+/// A later version of it, edited by `edit` and PUBLISHED: the row the
+/// packet opened under is retired and the target is the active one, as
+/// a publish leaves them — a packet is moved only onto a version that
+/// ran (backlog ce8b7d66; [`a_draft_is_not_a_version_a_packet_is_moved_to`]).
+/// Seeded rather than published so the edits need not pass the publish
+/// gate; the conversion names its target with `to_version`.
+async fn next_version(
+    kinds: &InMemoryWorkflows,
+    bump: i32,
+    edit: impl FnOnce(&mut WorkflowSpec),
+) -> i32 {
+    let spec = later_version(bump, WorkflowStatus::Active, edit);
+    kinds
+        .retire(KIND, &admin_actor(), chrono::Utc::now())
+        .await
+        .expect("retire the admission version");
     let version = spec.version;
     kinds.seed(spec).expect("seed target version");
     version
+}
+
+/// The spec of a later version, not yet written anywhere.
+fn later_version(
+    bump: i32,
+    status: WorkflowStatus,
+    edit: impl FnOnce(&mut WorkflowSpec),
+) -> WorkflowSpec {
+    let mut spec = active_spec();
+    spec.version += bump;
+    spec.status = status;
+    edit(&mut spec);
+    spec
+}
+
+fn admin_actor() -> boss_core::actor::ActorId {
+    boss_core::actor::ActorId::Human("emp-bootstrap-admin".into())
 }
 
 fn set_procedure(spec: &mut WorkflowSpec, slug: &str, text: &str) {
@@ -274,7 +299,8 @@ async fn a_pending_procedure_is_reprojected_and_a_completed_one_is_kept() {
     let to = next_version(&kinds, 1, |s| {
         set_procedure(s, "build", "Build it, and say what you measured.");
         set_procedure(s, "scope", "Scope it, in writing.");
-    });
+    })
+    .await;
 
     let (status, body) = convert(&app, &id, to).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -338,7 +364,8 @@ async fn an_inserted_step_is_materialised_and_named() {
             .clone();
         extra.title = "archived".to_string();
         s.steps.push(extra);
-    });
+    })
+    .await;
 
     let (status, body) = convert(&app, &id, to).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -383,7 +410,8 @@ async fn a_move_that_demands_evidence_retroactively_is_refused_and_writes_nothin
             item_one_of: Vec::new(),
             writer: None,
         });
-    });
+    })
+    .await;
 
     let (status, body) = convert(&app, &id, to).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
@@ -412,11 +440,59 @@ async fn a_job_writer_who_cannot_publish_a_protocol_may_not_move_a_packet() {
     } = app();
     let id = open_at_build(&app).await;
     let pinned = get_job(&app, &id).await["workflow_version"].clone();
-    let to = next_version(&kinds, 1, |s| set_procedure(s, "build", "New text."));
+    let to = next_version(&kinds, 1, |s| set_procedure(s, "build", "New text.")).await;
 
     let (status, body) = convert_as(&app, ENGINEER, &id, to).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(get_job(&app, &id).await["workflow_version"], pinned);
+}
+
+/// Backlog ce8b7d66: a packet is moved only onto a version that RAN.
+/// A draft is its author's workspace — written on Create/Update, never
+/// through the publish gate — so moving a live packet onto one would
+/// make it that packet's protocol with nobody having made it live. The
+/// dry run and the move answer the same obstacle, and nothing is
+/// written. Publish the draft first, then move the packet onto it.
+#[tokio::test]
+async fn a_draft_is_not_a_version_a_packet_is_moved_to() {
+    let App {
+        router: app,
+        kinds,
+        jobs,
+    } = app();
+    let id = open_at_build(&app).await;
+    let pinned = get_job(&app, &id).await["workflow_version"].clone();
+    let draft = later_version(1, WorkflowStatus::Draft, |s| {
+        set_procedure(s, "build", "Unpublished text.")
+    });
+    let to = draft.version;
+    kinds.seed(draft).expect("seed the draft");
+
+    let (status, body) = send(
+        &app,
+        req(
+            "GET",
+            &format!("/api/jobs/{id}/convert?to_version={to}"),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["convertible"], false, "{body}");
+
+    let (status, body) = convert(&app, &id, to).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["converted"], false);
+    assert!(
+        body["obstacles"]
+            .as_array()
+            .expect("obstacles")
+            .iter()
+            .any(|o| o["reason"].as_str().is_some_and(|r| r.contains("draft"))),
+        "the obstacle says the target is a draft: {body}"
+    );
+    assert_eq!(get_job(&app, &id).await["workflow_version"], pinned);
+    assert!(repinned_events(&jobs).is_empty());
 }
 
 /// Q1: the dry run is a READ — the verdict and the plan the write would
@@ -431,7 +507,7 @@ async fn a_dry_run_answers_the_plan_and_writes_nothing() {
     } = app();
     let id = open_at_build(&app).await;
     let pinned = get_job(&app, &id).await["workflow_version"].clone();
-    let to = next_version(&kinds, 1, |s| set_procedure(s, "build", "New text."));
+    let to = next_version(&kinds, 1, |s| set_procedure(s, "build", "New text.")).await;
     let events_before = jobs.recorded_events().len();
 
     let (status, body) = send(
@@ -481,6 +557,338 @@ async fn the_metadata_patch_refuses_the_repins_list() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body.to_string().contains("/convert"), "{body}");
+}
+
+// ---------------------------------------------------------------------
+// Backlog 4c6b4b74: a backlog-item stuck at `measure` could be neither
+// dispatched (its v2 `measure` declares no agent block) nor converted.
+// ---------------------------------------------------------------------
+
+const BACKLOG: &str = "backlog-item";
+
+/// The platform's backlog-item as the target, numbered as the live
+/// active version was when this was measured (v14, 2026-09-28).
+fn backlog_v14() -> WorkflowSpec {
+    let mut spec = seedable_platform_workflows()
+        .into_iter()
+        .find(|s| s.kind == BACKLOG)
+        .expect("backlog-item is a platform workflow");
+    spec.version = 14;
+    spec.status = WorkflowStatus::Active;
+    spec
+}
+
+/// backlog-item v2 as the live registry served it on 2026-09-28
+/// (`GET /api/workflows/backlog-item/versions/2`): no `prove-delivery`,
+/// and every branch read `triage` alone — so a `verify` route proved
+/// them all unsatisfiable the moment triage completed, and the engine
+/// SKIPPED them while `measure` was still to run. Only the predicates
+/// and the step set are v2's; the rest is the target's, so the move
+/// differs in exactly what 70da1212's refusal named.
+fn backlog_v2() -> WorkflowSpec {
+    const V2: [(&str, &str); 7] = [
+        (
+            "draft-design",
+            r#"steps.triage.done AND steps.triage.metadata.disposition = "design""#,
+        ),
+        ("design-review", "steps.draft-design.done"),
+        (
+            "build",
+            r#"(steps.triage.done AND steps.triage.metadata.disposition = "build") OR (steps.design-review.done AND steps.design-review.metadata.verdict = "approved")"#,
+        ),
+        (
+            "duplicate",
+            r#"steps.triage.done AND steps.triage.metadata.disposition = "duplicate""#,
+        ),
+        (
+            "stale",
+            r#"steps.triage.done AND steps.triage.metadata.disposition = "stale""#,
+        ),
+        (
+            "declined",
+            r#"(steps.triage.done AND steps.triage.metadata.disposition = "decline") OR (steps.design-review.done AND steps.design-review.metadata.verdict = "declined")"#,
+        ),
+        (
+            "closed",
+            r#"steps.measure.done OR steps.build.done OR (steps.design-review.done AND NOT (steps.design-review.metadata.verdict = "approved" OR steps.design-review.metadata.verdict = "declined"))"#,
+        ),
+    ];
+    let mut spec = backlog_v14();
+    spec.version = 2;
+    spec.steps.retain(|s| s.title != "prove-delivery");
+    for (slug, ready_when) in V2 {
+        spec.steps
+            .iter_mut()
+            .find(|s| s.title == slug)
+            .unwrap_or_else(|| panic!("backlog-item has a `{slug}` step"))
+            .ready_when = ready_when.to_string();
+    }
+    spec
+}
+
+/// Complete `slug` as a read-merge-write, laying `fields` over the
+/// metadata it holds (the step PUT refuses a body that omits a stored
+/// key, e39a9d2a).
+async fn complete(app: &axum::Router, id: &str, slug: &str, fields: serde_json::Value) {
+    let full = get_job(app, id).await;
+    let step = step_named(&full, slug).clone();
+    let mut metadata = step["metadata"].clone();
+    for (k, v) in fields.as_object().expect("fields").iter() {
+        metadata[k] = v.clone();
+    }
+    let step_id = step["id"].as_str().expect("step id");
+    let (status, body) = send(
+        app,
+        req(
+            "PUT",
+            &format!("/api/jobs/{id}/steps/{step_id}"),
+            serde_json::json!({"status": "completed", "metadata": metadata}),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "complete {slug}: {status}: {body}");
+}
+
+/// A backlog-item admitted under v2 and routed by triage to `route`.
+/// `v14` is published afterwards, as it was in the registry.
+async fn backlog_item_routed(app: &App, route: &str) -> String {
+    app.kinds
+        .retire(BACKLOG, &admin_actor(), chrono::Utc::now())
+        .await
+        .expect("retire the bundle's version");
+    app.kinds.seed(backlog_v2()).expect("seed v2");
+    let (status, job) = send(
+        &app.router,
+        req(
+            "POST",
+            "/api/jobs",
+            serde_json::json!({
+                "kind": BACKLOG,
+                "subject": {"subject_kind": "custom", "id": "jobs"},
+                "title": "t", "owner_id": "emp-bootstrap-admin",
+                "status": "open", "priority": "standard",
+                "metadata": {}, "tags": [],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "job create: {job}");
+    let id = job["id"].as_str().expect("job id").to_string();
+    if step_named(&get_job(&app.router, &id).await, "filed")["status"] != "completed" {
+        complete(&app.router, &id, "filed", serde_json::json!({})).await;
+    }
+    complete(
+        &app.router,
+        &id,
+        "triage",
+        serde_json::json!({"disposition": route, "evidence": "measured"}),
+    )
+    .await;
+    app.kinds
+        .retire(BACKLOG, &admin_actor(), chrono::Utc::now())
+        .await
+        .expect("retire v2");
+    app.kinds.seed(backlog_v14()).expect("seed v14");
+    id
+}
+
+fn status_of(job: &serde_json::Value, slug: &str) -> String {
+    step_named(job, slug)["status"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// THE MEASURED CASE, shaped like 70da1212 (v2, opened 2026-09-18):
+/// triage routed `verify`, `measure` is active, and the six branches v2
+/// proved unsatisfiable are SKIPPED. The dry run refused on seven
+/// changed predicates, none of them on a step that had ever been
+/// ready. Now the move is taken, the skipped branches are re-derived
+/// under v14 — where `measure` can still route to them, so they are
+/// pending again — and the packet walks on: `measure` routing `build`
+/// opens the build. Recorded exactly as every other move.
+#[tokio::test]
+async fn a_backlog_item_at_measure_on_v2_converts_and_its_branches_are_re_derived() {
+    let app = app();
+    let id = backlog_item_routed(&app, "verify").await;
+    let step_id = step_named(&get_job(&app.router, &id).await, "measure")["id"]
+        .as_str()
+        .expect("measure id")
+        .to_string();
+    let (status, body) = send(
+        &app.router,
+        req(
+            "POST",
+            &format!("/api/jobs/{id}/steps/{step_id}/claim"),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "claim measure: {status}: {body}");
+
+    const BRANCHES: [&str; 6] = [
+        "draft-design",
+        "design-review",
+        "build",
+        "duplicate",
+        "stale",
+        "declined",
+    ];
+    let before = get_job(&app.router, &id).await;
+    assert_eq!(status_of(&before, "measure"), "active", "{before}");
+    assert_eq!(status_of(&before, "closed"), "pending", "{before}");
+    for slug in BRANCHES {
+        assert_eq!(
+            status_of(&before, slug),
+            "skipped",
+            "the 70da1212 shape: {slug}"
+        );
+    }
+
+    let (status, preview) = send(
+        &app.router,
+        req(
+            "GET",
+            &format!("/api/jobs/{id}/convert?to_version=14"),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert_eq!(preview["convertible"], true, "{preview}");
+
+    let (status, body) = convert(&app.router, &id, 14).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["converted"], true, "{body}");
+
+    let after = get_job(&app.router, &id).await;
+    assert_eq!(after["workflow_version"], 14);
+    assert_eq!(status_of(&after, "measure"), "active", "untouched");
+    for slug in BRANCHES.iter().chain(&["closed", "prove-delivery"]) {
+        assert_eq!(
+            status_of(&after, slug),
+            "pending",
+            "{slug}: v14 can still reach it from `measure`: {after}"
+        );
+    }
+
+    // On the record exactly as every move is: one entry, one event,
+    // and the un-skipping named as the change it is.
+    let repins = after["metadata"]["repins"].as_array().expect("repins list");
+    assert_eq!(repins.len(), 1, "{repins:?}");
+    assert_eq!(repins[0]["from"], 2);
+    assert_eq!(repins[0]["to"], 14);
+    let build = repins[0]["reprojected"]
+        .as_array()
+        .expect("reprojected")
+        .iter()
+        .find(|r| r["step"] == "build")
+        .expect("build named as re-projected");
+    assert!(
+        build["changed"]
+            .as_array()
+            .expect("changed")
+            .iter()
+            .any(|c| c == "status"),
+        "{build}"
+    );
+    assert_eq!(repins[0]["inserted"][0]["step"], "prove-delivery");
+    assert_eq!(
+        repins[0]["unskipped"],
+        serde_json::json!(BRANCHES),
+        "every step the move un-skipped is named on its own"
+    );
+    let events = repinned_events(&app.jobs);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["job_id"], id.as_str());
+    assert_eq!(events[0]["unskipped"], serde_json::json!(BRANCHES));
+
+    // Not stranded: the route v14 added is the one that opens the build.
+    complete(
+        &app.router,
+        &id,
+        "measure",
+        serde_json::json!({"disposition": "build", "evidence": "measured again"}),
+    )
+    .await;
+    let walked = get_job(&app.router, &id).await;
+    assert_eq!(status_of(&walked, "build"), "ready", "{walked}");
+    assert_eq!(status_of(&walked, "draft-design"), "skipped", "{walked}");
+}
+
+/// REVIEW OF 28f3f28a: the move is judged, then written. A packet that
+/// closes in between must not receive the pending rows the plan made
+/// for it while it was open — the write re-checks, refuses whole, and
+/// writes nothing (the in-memory half; the Pg half is pinned in
+/// repin_writes_the_move_whole_pg.rs).
+#[tokio::test]
+async fn a_packet_that_closed_after_the_move_was_judged_is_not_written() {
+    use boss_jobs::JobsRepository;
+    let app = app();
+    let id = backlog_item_routed(&app, "verify").await;
+    let job_id = boss_core::job::JobId::from_uuid(uuid::Uuid::parse_str(&id).expect("job id"));
+    let job = app.jobs.get_job(&job_id).await.unwrap().expect("packet");
+    let rows = app.jobs.list_steps(&job_id).await.unwrap();
+    let plan = boss_jobs::repin::plan(&backlog_v2(), &backlog_v14(), &job, &rows).expect("planned");
+    assert!(!plan.unskipped().is_empty(), "the plan un-skips: {plan:?}");
+
+    let closed = boss_core::job::Job {
+        status: boss_core::job::JobStatus::Closed,
+        ..job.clone()
+    };
+    app.jobs
+        .update_job(&closed)
+        .await
+        .expect("close the packet");
+
+    let stamp = boss_core::publisher::EventStamp::new("jobs", admin_actor());
+    let record = boss_jobs::repin::record(&plan, 2, 14, "emp-bootstrap-admin", stamp.timestamp);
+    let refused = app
+        .jobs
+        .repin_workflow_version_at(&job_id, 14, &plan, &record, &stamp)
+        .await;
+    assert!(
+        matches!(refused, Err(boss_jobs::JobsError::TerminalJob { .. })),
+        "{refused:?}"
+    );
+    let after = get_job(&app.router, &id).await;
+    assert_eq!(after["workflow_version"], 2, "the pin stays");
+    assert!(after["metadata"].get("repins").is_none(), "{after}");
+    assert_eq!(status_of(&after, "build"), "skipped", "nothing un-skipped");
+    assert!(repinned_events(&app.jobs).is_empty());
+}
+
+/// THE CONTROL: triage routed `build`, so `build` is READY under v2's
+/// predicate. The predicate that opened it is the old one, and nothing
+/// proves v14's agrees — the refusal the packet asked to keep. Nothing
+/// is written.
+#[tokio::test]
+async fn a_backlog_item_whose_build_is_ready_is_still_refused() {
+    let app = app();
+    let id = backlog_item_routed(&app, "build").await;
+    assert_eq!(
+        status_of(&get_job(&app.router, &id).await, "build"),
+        "ready"
+    );
+
+    let (status, body) = convert(&app.router, &id, 14).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let obstacles = body["obstacles"].as_array().expect("obstacles");
+    assert!(
+        obstacles.iter().any(|o| o["step"] == "build"
+            && o["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("ready_when"))),
+        "{body}"
+    );
+    assert!(
+        obstacles.iter().all(|o| o["step"] == "build"),
+        "the skipped branches do not bite: {body}"
+    );
+    let after = get_job(&app.router, &id).await;
+    assert_eq!(after["workflow_version"], 2, "the pin stays");
+    assert!(after["metadata"].get("repins").is_none(), "{after}");
+    assert!(repinned_events(&app.jobs).is_empty());
 }
 
 /// The scope completion as a read-merge-write: the step's stored

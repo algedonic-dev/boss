@@ -73,6 +73,10 @@ name = "asc606_e2e"
 required-features = ["postgres"]
 
 [[test]]
+name = "a_ledger_write_asks_policy"
+required-features = ["postgres"]
+
+[[test]]
 name = "control_plane_audit_trail"
 required-features = ["postgres"]
 
@@ -154,6 +158,10 @@ required-features = ["postgres"]
 
 [[test]]
 name = "the_ledger_read_gate"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_period_lock_asks_policy"
 required-features = ["postgres"]
 
 [[test]]

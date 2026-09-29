@@ -404,11 +404,24 @@ async fn check_step_plugins_mount() -> Check {
             };
         }
     };
+    // A jobs-API read asserts an identity, so it carries the machine
+    // token (design 6805c764 car 2); the install checks above reach NATS
+    // and the gateway's health, assert none, and stay plain.
+    let http = match crate::gate::machine_client() {
+        Ok(http) => http,
+        Err(e) => {
+            return Check {
+                label,
+                passed: false,
+                detail: format!("unknown, not clean — {e:#}"),
+            };
+        }
+    };
     let get = |path: String| {
         let url = format!("{base}{path}");
+        let http = &http;
         async move {
-            reqwest::Client::new()
-                .get(url)
+            http.get(url)
                 .header(
                     "x-boss-user",
                     crate::identity::header(&crate::identity::reader()),

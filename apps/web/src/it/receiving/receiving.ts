@@ -382,7 +382,9 @@ export function parseJobsPage(raw: unknown): JobsPage {
           .map((s) => ({
             kind: str(s.kind) ?? '',
             who: str(s.assignee_id),
-            failed: failedVerb(s.metadata),
+            // The server's reading of the note (`failed_verbs=true`),
+            // off a SLIM step — backlog ea80b5fd.
+            failed: failedVerb(s.failed_verb),
           })),
         takenIn: takenIn(steps),
       },
@@ -539,8 +541,10 @@ export function loadWorkflows(): Promise<
 
 /** One kind's packets: everything open, plus what closed inside the
  *  window. Real work only — the demo tenant's packets are not inbound.
- *  `lane=true` asks the server to put its lane reading on each row, and
- *  `origin=true` its source-and-area reading. */
+ *  `lane=true` asks the server to put its lane reading on each row,
+ *  `origin=true` its source-and-area reading, and `failed_verbs=true` a
+ *  FAILED verb's note on each step that carries one — so the rows stay
+ *  SLIM, with no step's metadata riding (backlog ea80b5fd). */
 export function loadKind(
   kind: string,
   windowDays: number,
@@ -548,7 +552,7 @@ export function loadKind(
   offset = 0,
 ): Promise<Exclude<Remote<JobsPage>, { kind: 'loading' }>> {
   return fetchRemote(
-    `/api/jobs?kind=${encodeURIComponent(kind)}&simulated=false&closed_within=${windowDays}&lane=true&origin=true&full=true&limit=${limit}&offset=${offset}`,
+    `/api/jobs?kind=${encodeURIComponent(kind)}&simulated=false&closed_within=${windowDays}&lane=true&origin=true&failed_verbs=true&limit=${limit}&offset=${offset}`,
     parseJobsPage,
   );
 }

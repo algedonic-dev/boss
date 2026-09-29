@@ -13,10 +13,14 @@
 // The inventory this spec covers, measured on origin/main on 2026-09-25
 // (the measure step's controls_md was read on 2026-09-23, before the
 // loops section landed with its links):
-//   links     2 kinds — a loop's newest finished packet, a loop's open
+//   links     4 kinds — a loop's newest finished packet, a loop's open
 //                        packet; both land on the job detail surface.
 //                        Up to 2 per loop row: 6 declared loops plus one
-//                        ops-request row per host declaring `ops-runner`
+//                        ops-request row per host declaring `ops-runner`.
+//                        Since gap 9 (48ef9961), an open estate alarm in
+//                        the list at the head of section 01, and the same
+//                        alarm beside the verdict of its own series — both
+//                        on the job detail surface too
 //   buttons   0         — no manual refresh
 //   forms     0, inputs 0
 //   snippets  3         — the dev door's copyable command lines
@@ -26,7 +30,7 @@
 //             (75027a93) the observations are one read PER SERIES — the
 //             cluster's, then per host its host and host-units series —
 //             and the cluster comparison is read by its scope: 4 + 2 per
-//             host.
+//             host. Plus one jobs read of the open estate alarms (48ef9961).
 //   writes    0
 //   timer     1         — every read again each 60 s
 //
@@ -66,6 +70,8 @@ const CMP_READ = /\/api\/estate\/comparisons\?scope=kubernetes-nodes&limit=1$/;
 const HOST_CMP_READ = /\/api\/estate\/comparisons\?scope=host&latest_per=host&limit=50$/;
 /// The loops' reads (two per row).
 const LOOPS_READ = /\/api\/jobs\?kind=(maintenance-|ops-request)/;
+/// The open estate alarms (gap 9, 48ef9961), keyed as the raiser keys them.
+const ALARMS_READ = /\/api\/jobs\?kind=backlog-item&status=open&metadata_has=estate_finding&limit=50$/;
 
 /// Stamps relative to the test's own clock, taken when the read is
 /// answered (the estate-page spec's reason: a stamp taken at file load
@@ -108,8 +114,14 @@ const GCP_UNITS = [unit('boss-gcp-converge.timer', true), unit('boss-gcp-converg
 const observations = () => [
   ...series('door', 'boss-door-observe', Array.from({ length: 20 }, (_, i) => 0.5 + i * 2), () => [{ id: 'dev-ssh' }]),
   ...series('kubernetes-nodes', 'boss-estate-observe', [3, 18, 33], () => [{ id: 'cp-1', disk_free_gb: 40 }, { id: 'w-1' }]),
-  ...series('host', 'boss-estate-observe-host', [5, 20, 35], (i) => [{ id: 'forge', disk_free_gb: 210 + i }]),
-  ...series('host', 'boss-estate-observe-host', [200, 200 + 1440, 200 + 2880], () => [{ id: 'boss-gcp', disk_free_gb: 13 }]),
+  // Each host reading carries what observe-host.sh measures — the live
+  // 2026-09-28 shape: one GiB more memory than each host declares.
+  ...series('host', 'boss-estate-observe-host', [5, 20, 35], (i) => [
+    { id: 'forge', address: '192.0.2.15', cpu: 16, memory_gb: 31, disk_gb: 480, disk_free_gb: 210 + i },
+  ]),
+  ...series('host', 'boss-estate-observe-host', [200, 200 + 1440, 200 + 2880], () => [
+    { id: 'boss-gcp', address: '192.0.2.20', cpu: 4, memory_gb: 16, disk_gb: 60, disk_free_gb: 13 },
+  ]),
   ...series('host-units', 'boss-estate-observe-units', [1, 6, 11], () => [{ id: 'forge', healthy: false, units: FORGE_UNITS }]),
   ...series('host-units', 'boss-estate-observe-units', [60, 65, 70], () => [{ id: 'boss-gcp', healthy: true, units: GCP_UNITS }]),
 ];
@@ -143,21 +155,45 @@ const comparisons = (cluster: Record<string, unknown> = {}, findings: Record<str
 
 /// A host comparison as compare_host shapes it (estate_compare.rs):
 /// stamped with its host, four counts, no declared total.
-const hostCmp = (host: string, minutes: number, counts: Record<string, number> = {}) =>
+const hostCmp = (host: string, minutes: number, counts: Record<string, number> = {}, findings: Record<string, unknown> = {}) =>
   envelope({
     scope: 'host', observed_at: ago(minutes), host,
     counts: { observed: 1, observed_not_declared: 0, drift: 0, disk_tight: 0, ...counts },
+    findings,
   });
+
+/// A drift finding in compare_host's own shape: the machine, and each
+/// field that differs with both sides.
+const memoryDrift = (id: string, declared: number, observed: number) => ({
+  drift: [{ id, fields: { memory_gb: { declared, observed } } }],
+});
 
 /// The live shape measured on 2026-09-23, as the grouped read serves it
 /// (725532ab: `latest_per=host`, one row per host, `total` counting
 /// hosts): forge drifted (memory declared 30, observed 31), and
 /// boss-gcp's daily row short of disk (13 G free against a 17 G floor)
-/// AND drifted.
+/// AND drifted (memory declared 15, observed 16 — re-read 2026-09-28).
 const hostComparisons = () => ({
   data: [
-    hostCmp('forge', 2, { drift: 1 }),
-    hostCmp('boss-gcp', 200, { drift: 1, disk_tight: 1 }),
+    hostCmp('forge', 2, { drift: 1 }, memoryDrift('forge', 30, 31)),
+    hostCmp('boss-gcp', 200, { drift: 1, disk_tight: 1 }, memoryDrift('boss-gcp', 15, 16)),
+  ],
+  total: 2,
+});
+
+/// The open estate alarms (gap 9, 48ef9961), as GET /api/jobs lists them:
+/// the live one of 2026-09-28 — boss-gcp short of disk, on the host
+/// series — and a door alarm, which has no verdict line on this page.
+const DISK_ALARM = 'd3c7eada-0000-0000-0000-000000000009';
+const DOOR_ALARM = 'd00d0000-0000-0000-0000-00000000000a';
+const alarm = (id: string, title: string, minutes: number, md: Record<string, unknown>) =>
+  ({ id, kind: 'backlog-item', status: 'open', title, opened_at: ago(minutes), metadata: { area: 'estate', ...md } });
+const openAlarms = () => ({
+  data: [
+    alarm(DISK_ALARM, 'ESTATE ALARM: disk_tight:boss-gcp persisted 3 consecutive comparisons', 90,
+      { estate_finding: 'disk_tight:boss-gcp', scope: 'host', host: 'boss-gcp' }),
+    alarm(DOOR_ALARM, 'ESTATE ALARM: door:dev-ssh:edge — the edge half (dev.algedonic.dev) is dark past its 10-minute band', 12,
+      { estate_finding: 'door:dev-ssh:edge', scope: 'door' }),
   ],
   total: 2,
 });
@@ -184,7 +220,9 @@ type Reads = Readonly<{
   cluster?: Answer;
   /** Every host's host and host-units series. */
   series?: Answer;
-  cmpBody?: () => unknown; hostBody?: () => unknown;
+  /** The open estate alarms. */
+  alarms?: Answer;
+  cmpBody?: () => unknown; hostBody?: () => unknown; alarmsBody?: () => unknown;
 }>;
 
 type Seen = Record<'nodes' | 'cluster' | 'series' | 'cmp' | 'host', number>;
@@ -215,6 +253,11 @@ async function install(page: Page, reads: Reads = {}): Promise<Seen> {
   await page.route(LOOPS_READ, (r) => {
     const data = loopAnswer(new URL(r.request().url()));
     return json(r, { data, total: data.length });
+  });
+  await page.route(ALARMS_READ, (r) => {
+    const mode = reads.alarms ?? 'fixture';
+    if (mode === 'down') return json(r, { error: 'jobs upstream unavailable' }, 503);
+    return json(r, mode === 'empty' ? { data: [], total: 0 } : (reads.alarmsBody ?? openAlarms)());
   });
   return seen;
 }
@@ -297,8 +340,12 @@ test.describe('/it/estate — the chrome, the loading line and the reads', () =>
       'GET /api/estate/observations?scope=host-units&host=forge&limit=10',
       'GET /api/estate/observations?scope=kubernetes-nodes&limit=10',
     ]);
-    // Six declared loops plus the two ops-runner hosts, two reads each.
-    expect(sent.filter((s) => s.startsWith('GET /api/jobs?kind=')).length).toBe((6 + 2) * 2);
+    // Six declared loops plus the two ops-runner hosts, two reads each,
+    // and the open estate alarms once (gap 9, 48ef9961).
+    expect(sent.filter((s) => s.startsWith('GET /api/jobs?kind=')).length).toBe((6 + 2) * 2 + 1);
+    expect(sent.filter((s) => s.startsWith('GET /api/jobs?kind=backlog-item'))).toEqual([
+      'GET /api/jobs?kind=backlog-item&status=open&metadata_has=estate_finding&limit=50',
+    ]);
     expect(sent.filter((s) => !s.startsWith('GET ')), 'the page wrote').toEqual([]);
 
     const root = page.locator('.estate-root');
@@ -341,23 +388,74 @@ test.describe('/it/estate — the chrome, the loading line and the reads', () =>
 test.describe('/it/estate — 00 THE MACHINES', () => {
   // CURRENT, gap 12 (d6d39f60): a retired machine is filtered out with
   // no count of how many were.
-  test('one row per live machine, in registry order, every cell verbatim; CURRENT, gap 12: retired machines vanish uncounted', async ({ page }) => {
+  // Gap 7 (ab3c54d7), FIXED: this test pinned the cells verbatim as the
+  // declared value alone ('30G'), while the subtitle promised declared
+  // beside observed. Each value cell now reads the declared value, then
+  // what the newest reading of that machine's own series saw.
+  test('one row per live machine, in registry order, every cell declared then seen; CURRENT, gap 12: retired machines vanish uncounted', async ({ page }) => {
     await install(page);
     await mountPage(page, PATH, TITLE);
 
     await expect(machines(page).locator('thead th')).toHaveText(['machine', 'role', 'address', 'cpu', 'mem', 'disk']);
+    await expect(page.locator('p.estate-legend')).toHaveText(
+      'Each value is what the registry declares, then what the newest observation saw. A field a comparison names as drift reads amber.',
+    );
     const rows = machines(page).locator('tbody tr');
     await expect(rows).toHaveCount(3);
-    await expect(rows.nth(0).locator('td')).toHaveText(['forge', 'forge · cluster-operator · ops-runner', '192.0.2.15', '16', '30G', '500G']);
-    await expect(rows.nth(1).locator('td')).toHaveText(['boss-gcp', 'gateway-host · ops-runner', '192.0.2.20', '4', '15G', '60G']);
-    // A machine that declares nothing reads a dash, never a zero.
-    await expect(rows.nth(2).locator('td')).toHaveText(['w-1', 'talos-worker', '—', '—', '—', '—']);
+    await expect(rows.nth(0).locator('td')).toHaveText([
+      'forge', 'forge · cluster-operator · ops-runner',
+      '192.0.2.15 seen 192.0.2.15', '16 seen 16', '30G seen 31G · drifted', '500G seen 480G',
+    ]);
+    await expect(rows.nth(1).locator('td')).toHaveText([
+      'boss-gcp', 'gateway-host · ops-runner',
+      '192.0.2.20 seen 192.0.2.20', '4 seen 4', '15G seen 16G · drifted', '60G seen 60G',
+    ]);
+    // A machine that declares nothing reads a dash, never a zero — on
+    // both sides: w-1's cluster reading carries no capacity.
+    await expect(rows.nth(2).locator('td')).toHaveText(['w-1', 'talos-worker', '— seen —', '— seen —', '— seen —', '— seen —']);
     // The notes ride as the row's tooltip; no notes, an empty one.
     await expect(rows.nth(0)).toHaveAttribute('title', 'the forge host');
     await expect(rows.nth(1)).toHaveAttribute('title', '');
 
     await expect(page.locator('.estate-root').getByText('old-1')).toHaveCount(0);
     await expect(page.locator('.estate-root').getByText(/retired/i)).toHaveCount(0);
+  });
+
+  // Gap 7 (ab3c54d7): the pin the finding asked for — a mocked drift
+  // finding, and the one field it names marked on the machine it names.
+  test('gap 7: the field a drift finding names is marked on its machine, amber, with both sides; no other cell is', async ({ page }) => {
+    await install(page);
+    await mountPage(page, PATH, TITLE);
+
+    const forge = machines(page).locator('tbody tr').nth(0);
+    const marked = machines(page).locator('td[data-drift]');
+    await expect(marked).toHaveCount(2);
+    await expect(forge.locator('td[data-drift]')).toHaveAttribute('data-drift', 'memory_gb');
+    await expect(forge.locator('td[data-drift]')).toHaveAttribute('title', 'drift: declared 30G, observed 31G');
+    await expect(forge.locator('td[data-drift] .estate-seen')).toHaveClass(/\bestate-drift\b/);
+    // An agreeing field stays grey.
+    await expect(forge.locator('td').nth(3).locator('.estate-seen')).not.toHaveClass(/\bestate-drift\b/);
+    // And the verdict names the machine and the field, not only a count.
+    await expect(hostRows(page).filter({ hasText: 'forge:' }).locator('span:nth-child(2)'))
+      .toHaveText('forge: 1 drifted from declaration (forge memory_gb 30 → 31)');
+  });
+
+  test('gap 7: a machine whose series failed reads unread, and one missing from its reading reads not seen — never a guess', async ({ page }) => {
+    await install(page, {
+      series: 'down',
+      cmpBody: () => comparisons({ drift: 0 }),
+      hostBody: () => ({ data: [], total: 0 }),
+    });
+    await page.route(/\/api\/estate\/observations\?scope=kubernetes-nodes&/, (r) => json(r, {
+      data: [envelope({ scope: 'kubernetes-nodes', observer: 'boss-estate-observe', observed_at: ago(3), nodes: [{ id: 'cp-1' }] })],
+      total: 1,
+    }));
+    await mountPage(page, PATH, TITLE);
+
+    const rows = machines(page).locator('tbody tr');
+    await expect(rows.nth(0).locator('td').nth(4)).toHaveText('30G unread');
+    await expect(rows.nth(2).locator('td').nth(4)).toHaveText('— not seen');
+    await expect(machines(page).locator('td[data-drift]')).toHaveCount(0);
   });
 
   // CURRENT, gap 12 (d6d39f60): an empty registry paints a table of
@@ -527,9 +625,10 @@ test.describe('/it/estate — 01 OBSERVED vs DECLARED', () => {
 
     await expect(hostRows(page)).toHaveCount(2);
     const verdicts = hostRows(page).locator('span:nth-child(2)');
+    // Each drift named as its finding names it (ab3c54d7).
     await expect(verdicts).toHaveText([
-      'boss-gcp: 1 drifted from declaration; 1 short of disk',
-      'forge: 1 drifted from declaration',
+      'boss-gcp: 1 drifted from declaration (boss-gcp memory_gb 15 → 16); 1 short of disk',
+      'forge: 1 drifted from declaration (forge memory_gb 30 → 31)',
     ]);
     for (let i = 0; i < 2; i += 1) {
       await expect(verdicts.nth(i)).toHaveClass(/\bestate-drift\b/);
@@ -736,6 +835,89 @@ test.describe('/it/estate — 01 OBSERVED vs DECLARED', () => {
     await expect(obsRows(page)).toHaveCount(7);
     await expect(hostRows(page)).toHaveCount(2);
     await expect(page.getByText(/no drift/)).toHaveCount(0);
+  });
+});
+
+// Gap 9 (48ef9961), FIXED: the audit pinned this indirectly — the page
+// had exactly two link kinds, both on loop packets, and no way to reach
+// the alarm behind an amber line. The open ESTATE ALARM packets are
+// listed at the head of section 01, each linked, and each also sits
+// beside the verdict of the series it is about.
+test.describe('/it/estate — 01 the open estate alarms', () => {
+  const alarmRows = (page: Page) => page.locator('.estate-alarms .estate-alarm-row');
+
+  test('gap 9: every open alarm is listed, linked to its packet on the job detail surface', async ({ page }) => {
+    await install(page);
+    await mountPage(page, PATH, TITLE);
+
+    await expect(alarmRows(page)).toHaveCount(2);
+    await expect(alarmRows(page).locator('.estate-scope')).toHaveText(['open alarm', 'open alarm']);
+    const links = alarmRows(page).locator('a');
+    await expect(links).toHaveText([
+      'ESTATE ALARM: disk_tight:boss-gcp persisted 3 consecutive comparisons',
+      'ESTATE ALARM: door:dev-ssh:edge — the edge half (dev.algedonic.dev) is dark past its 10-minute band',
+    ]);
+    const hrefs = await links.evaluateAll((as) => as.map((a) => a.getAttribute('href')));
+    expect(hrefs).toEqual([`${ROUTE_CATALOG.jobs.path}/${DISK_ALARM}`, `${ROUTE_CATALOG.jobs.path}/${DOOR_ALARM}`]);
+    for (const [href, jobId] of [[hrefs[0]!, DISK_ALARM], [hrefs[1]!, DOOR_ALARM]] as const) {
+      expect(route(href)).toEqual({ kind: 'jobDetail', jobId });
+    }
+    await expect(alarmRows(page).locator('.estate-when')).toHaveText([/ ago$/, / ago$/]);
+    await expect(page.locator('.estate-alarm-none')).toHaveCount(0);
+    await expect(page.locator('.estate-alarm-cover')).toHaveCount(0);
+  });
+
+  test('gap 9: an alarm sits beside the verdict of its own series, and nowhere else', async ({ page }) => {
+    await install(page);
+    await mountPage(page, PATH, TITLE);
+
+    const gcp = hostRows(page).filter({ hasText: 'boss-gcp:' }).locator('a.estate-alarm-link');
+    await expect(gcp).toHaveText('alarm');
+    await expect(gcp).toHaveAttribute('href', `/ux/jobs/${DISK_ALARM}`);
+    await expect(gcp).toHaveAttribute('title', 'ESTATE ALARM: disk_tight:boss-gcp persisted 3 consecutive comparisons');
+    // One inline link: the door alarm has no verdict line on this page,
+    // so it is in the list only.
+    await expect(page.locator('.estate-obs a.estate-alarm-link')).toHaveCount(1);
+  });
+
+  test('gap 9: an alarm link opens the packet, and back returns to the estate', async ({ page }) => {
+    await install(page);
+    await mountPage(page, PATH, TITLE);
+
+    await hostRows(page).filter({ hasText: 'boss-gcp:' }).getByRole('link', { name: 'alarm', exact: true }).click();
+    await expect(page).toHaveURL(new RegExp(`/ux/jobs/${DISK_ALARM}$`));
+    await page.goBack();
+    await expect(page).toHaveURL(new RegExp(`${PATH}$`));
+    await expect(alarmRows(page)).toHaveCount(2);
+  });
+
+  test('gap 9: with none open the page says so, and puts no alarm beside any verdict', async ({ page }) => {
+    await install(page, { alarms: 'empty' });
+    await mountPage(page, PATH, TITLE);
+
+    await expect(page.locator('p.estate-alarm-none')).toHaveText('No estate alarm is open.');
+    await expect(alarmRows(page)).toHaveCount(0);
+    await expect(page.locator('a.estate-alarm-link')).toHaveCount(0);
+  });
+
+  test('gap 9: a failed alarm read says so in the page\'s words — never "no alarm" — and hides no verdict', async ({ page }) => {
+    await install(page, { alarms: 'down' });
+    await mountPage(page, PATH, TITLE);
+
+    await expect(page.locator(`.estate-alarms p.estate-fail${FAILURE_MARKER}`)).toHaveText(
+      'Estate alarms unavailable: /api/jobs?kind=backlog-item&status=open&metadata_has=estate_finding&limit=50: HTTP 503',
+    );
+    await expect(page.locator('.estate-alarm-none')).toHaveCount(0);
+    await expect(hostRows(page)).toHaveCount(2);
+  });
+
+  test('gap 9: a read holding fewer alarms than it counted says how many it holds', async ({ page }) => {
+    await install(page, { alarmsBody: () => ({ ...openAlarms(), total: 61 }) });
+    await mountPage(page, PATH, TITLE);
+
+    await expect(page.locator('p.estate-alarm-cover')).toHaveText(
+      'The alarm read returned 2 of 61 open estate alarms: the rest are not listed here.',
+    );
   });
 });
 

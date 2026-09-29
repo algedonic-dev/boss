@@ -281,7 +281,7 @@ pub fn alarms_by_step(rows: &[Json]) -> BTreeMap<String, Json> {
 }
 
 pub struct JobsAgentStepOverdue {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
     /// Who the alarms are owned by — the platform owner through the port
     /// (backlog 3c23662d); never a literal.
@@ -475,6 +475,7 @@ mod tests {
 
     fn ctx() -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "agent-held-real-work-is-watched-hourly".into(),
             triggering_event_id: format!("clock-tick:{NOW}"),
             triggering_topic: "clock.tick".into(),

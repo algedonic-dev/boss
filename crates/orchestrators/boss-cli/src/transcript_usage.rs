@@ -35,6 +35,14 @@
 //! count it was given, because guessing between two transcripts would
 //! record one run's spend against another.
 //!
+//! WHICH TURNS. One agent may run several dispatched runs and write
+//! them all to one transcript, so a report counts only its run's
+//! [`Slice`] of the file — after the run's start and the last report
+//! already metered from the same file, up to its own instant — and
+//! records the bounds it read (backlog 4f74727b). A transcript that
+//! carries each run's [`marker`] is cut on those first, so a batch
+//! reported all at once still splits by run (backlog 11a0998a).
+//!
 //! WHICH MODEL. The same transcript says which model every turn was
 //! billed as, so the record names that model rather than the one the
 //! step's agent block declared ([`RunModels`], backlog 6bb85880).
@@ -42,6 +50,7 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 /// A run's four billed counts, summed over its turns, plus the two
@@ -131,10 +140,7 @@ pub(crate) fn sum_usage(jsonl: &str) -> Option<Usage> {
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
         };
-        let key = v
-            .pointer("/message/id")
-            .or_else(|| v.get("requestId"))
-            .and_then(Value::as_str)
+        let key = turn_key(&v)
             .map(str::to_string)
             .unwrap_or_else(|| format!("line-{n}"));
         match turns.get(&key) {
@@ -330,6 +336,339 @@ pub(crate) fn read_models(jsonl: &str) -> RunModels {
         })
 }
 
+/// The part of a transcript one report may count (backlog 4f74727b).
+///
+/// THE RUNNING TOTAL THIS REPLACES. The meter summed a transcript from
+/// its first line, and `since` chose which FILES to search, never which
+/// turns to count. One agent that runs several dispatched runs writes
+/// ONE transcript, so each later report recorded everything before it
+/// again: the triage batch of 2026-09-28 (four runs, one agent,
+/// `agent-abb03ad066e8e7222.jsonl`) recorded $0.93, $1.14, $1.49 and
+/// $1.66 — the file's running total at each report — and the table
+/// summed $5.21 for about $1.66 of work. Batching small runs into one
+/// spawn is deliberate, so the meter supports it rather than the
+/// batching stopping.
+///
+/// A run's turns are the ones after the LATER of two instants — the
+/// run's own start, and the last report already metered from the same
+/// file (every run in that batch was dispatched before the agent began,
+/// so their starts separated nothing; the reports did) — and at or
+/// before the report's own instant. Both bounds ride the record
+/// ([`Sliced`]), so the figure can be re-derived from the file.
+///
+/// MARKERS FIRST (backlog 11a0998a). Report instants separate runs only
+/// when each is reported before the next begins. When the PARENT
+/// reports a whole batch after one handback, every report is after the
+/// file's last line: the first took the whole transcript and the rest a
+/// metered zero — the total right, the split wrong. So every run's
+/// prompt carries a [`marker`], the transcript records the instant it
+/// ARRIVED (the prompt, or the tool result that read it), and
+/// [`Slice::marked`] cuts on those before it cuts on reports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Slice {
+    /// Turns at or before this instant are not this run's.
+    pub after: Option<DateTime<Utc>>,
+    /// What set `after`: `run start`, `report of run <id>`, or
+    /// `marker of run <id>`.
+    pub after_by: Option<String>,
+    /// Turns after this instant are not this run's.
+    pub until: Option<DateTime<Utc>>,
+    /// What set `until`: `this report`, or `marker of run <id>` — the
+    /// next run's marker.
+    pub until_by: Option<String>,
+    /// The run's own start and every earlier report metered from the
+    /// same file ([`earlier_reports`]) — the bounds `after` was the
+    /// latest of, kept because [`Slice::marked`] must weigh them one by
+    /// one: a report of a run marked elsewhere in the file bounds
+    /// nothing before that run's marker.
+    started: Option<DateTime<Utc>>,
+    reports: Vec<(DateTime<Utc>, String)>,
+}
+
+/// The latest of a run's start and the given reports, with what set it.
+fn latest<'a>(
+    started: Option<DateTime<Utc>>,
+    reports: impl Iterator<Item = &'a (DateTime<Utc>, String)>,
+) -> (Option<DateTime<Utc>>, Option<String>) {
+    let start = started.map(|t| (t, "run start".to_string()));
+    let report = reports
+        .max_by_key(|(t, _)| *t)
+        .map(|(t, run)| (*t, format!("report of run {run}")));
+    match (start, report) {
+        (Some(s), Some(r)) if r.0 > s.0 => (Some(r.0), Some(r.1)),
+        (Some(s), _) => (Some(s.0), Some(s.1)),
+        (None, Some(r)) => (Some(r.0), Some(r.1)),
+        (None, None) => (None, None),
+    }
+}
+
+impl Slice {
+    /// The slice for a run that started at `started`, reported at
+    /// `until`, with `earlier` the reports already metered from its
+    /// transcript ([`earlier_reports`]).
+    pub(crate) fn bounded(
+        started: Option<DateTime<Utc>>,
+        earlier: Vec<(DateTime<Utc>, String)>,
+        until: DateTime<Utc>,
+    ) -> Slice {
+        let (after, after_by) = latest(started, earlier.iter());
+        Slice {
+            after,
+            after_by,
+            until: Some(until),
+            until_by: Some("this report".to_string()),
+            started,
+            reports: earlier,
+        }
+    }
+
+    /// This slice, cut on the transcript's markers (backlog 11a0998a).
+    /// No marker in the file, and it is the slice it was.
+    ///
+    /// The markers split the file into segments — each from one marker
+    /// to the next — and a run's segment is the one its own marker
+    /// opens, up to its report. The first run's also holds the lines
+    /// before any marker (the batch's preamble), bounded by its start
+    /// and by the reports of runs that carry no marker, which are the
+    /// only other runs that could have counted them.
+    ///
+    /// Markers that arrived TOGETHER (a prompt pasting several runs'
+    /// sections at once) separate nothing between those runs, so they
+    /// share their segment by report instants, as before. A run with NO
+    /// marker in a marked file — dispatched before this car, reported
+    /// after it — keeps its report bounds and stops at the next marker.
+    /// Either way no turn is counted twice: a segment is one run's, or
+    /// is split among its sharers by the report rule that already
+    /// conserved.
+    ///
+    /// The turn that reads the next run's prompt is before that
+    /// marker arrives, so it is billed to the run it ends.
+    pub(crate) fn marked(self, marks: &[Mark], run_id: &str) -> Slice {
+        if marks.is_empty() {
+            return self;
+        }
+        let own = marks.iter().find(|m| m.run == run_id).map(|m| m.at);
+        let shared = own.is_some_and(|t| marks.iter().any(|m| m.run != run_id && m.at == t));
+        let first = own.is_some_and(|t| marks.iter().all(|m| m.at >= t));
+        // The runs whose reports can bound this run's segment: runs
+        // with no marker, and runs sharing this run's marker.
+        let rival = |run: &str| {
+            marks
+                .iter()
+                .find(|m| m.run == run)
+                .is_none_or(|m| Some(m.at) == own)
+        };
+        let by_marker = |t: DateTime<Utc>| (Some(t), Some(format!("marker of run {run_id}")));
+        let (after, after_by) = match own {
+            None => (self.after, self.after_by.clone()),
+            Some(t) => {
+                let (b, b_by) = latest(
+                    self.started,
+                    self.reports.iter().filter(|(_, run)| rival(run)),
+                );
+                match (shared, first) {
+                    (true, true) => (b, b_by),
+                    (true, false) if b.is_some_and(|b| b > t) => (b, b_by),
+                    (false, true) if b.is_none_or(|b| b <= t) => (b, b_by),
+                    _ => by_marker(t),
+                }
+            }
+        };
+        let from = own.or(after);
+        let next = marks
+            .iter()
+            .filter(|m| from.is_none_or(|f| m.at > f))
+            .min_by_key(|m| m.at);
+        let (until, until_by) = match next {
+            Some(m) if self.until.is_none_or(|u| m.at < u) => {
+                (Some(m.at), Some(format!("marker of run {}", m.run)))
+            }
+            _ => (self.until, self.until_by.clone()),
+        };
+        Slice {
+            after,
+            after_by,
+            until,
+            until_by,
+            ..self
+        }
+    }
+}
+
+/// The line every run's prompt carries (`dispatch::run_section`), which
+/// [`markers`] reads back: the instant it arrived is where the run
+/// begins. It holds [`needle`], so a marked transcript is found too.
+pub(crate) fn marker(run_id: &str) -> String {
+    format!("{MARKER_HEAD}{run_id}{MARKER_TAIL}")
+}
+const MARKER_HEAD: &str = "run-marker: agent-run ";
+const MARKER_TAIL: &str = " begins here";
+
+/// A run's marker as the transcript recorded it: when it arrived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Mark {
+    pub at: DateTime<Utc>,
+    pub run: String,
+}
+
+/// Each run's FIRST marker, in file order. Read only off `user` lines —
+/// the prompt, and tool results, which is what reading a prompt file
+/// or running a claim leaves — because an assistant line is the agent
+/// speaking, and it may quote a marker it has not reached. A line with
+/// no `timestamp` takes the last one above it, as in [`cut`].
+pub(crate) fn markers(jsonl: &str) -> Vec<Mark> {
+    let mut last_seen: Option<DateTime<Utc>> = None;
+    let mut found: Vec<Mark> = Vec::new();
+    for line in jsonl.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(t) = v
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+        {
+            last_seen = Some(t);
+        }
+        if v.get("type").and_then(Value::as_str) != Some("user") || !line.contains(MARKER_HEAD) {
+            continue;
+        }
+        let Some(at) = last_seen else {
+            continue;
+        };
+        for run in marked_runs(line) {
+            if !found.iter().any(|m| m.run == run) {
+                found.push(Mark { at, run });
+            }
+        }
+    }
+    found
+}
+
+/// The run ids `text` marks: an id-shaped word between the marker's
+/// head and tail, so a placeholder or a phrase without the tail is not
+/// a marker.
+fn marked_runs(text: &str) -> Vec<String> {
+    text.match_indices(MARKER_HEAD)
+        .filter_map(|(at, _)| {
+            let rest = &text[at + MARKER_HEAD.len()..];
+            let id: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .collect();
+            (!id.is_empty() && rest[id.len()..].starts_with(MARKER_TAIL)).then_some(id)
+        })
+        .collect()
+}
+
+/// Every report already metered from `transcript`, among `rows`
+/// (`GET /api/agent-runs`), oldest first: the `finished_at` — a
+/// report's own instant — of each other run whose
+/// `detail.metered.transcript` names the same file, before `until`.
+/// Files are matched by NAME: the harness names a subagent transcript
+/// `agent-<random id>.jsonl`, and an operator's `--transcript` may
+/// spell the directory differently.
+pub(crate) fn earlier_reports(
+    rows: &[Value],
+    transcript: &Path,
+    run_id: &str,
+    until: DateTime<Utc>,
+) -> Vec<(DateTime<Utc>, String)> {
+    let Some(name) = transcript.file_name() else {
+        return Vec::new();
+    };
+    let mut found: Vec<(DateTime<Utc>, String)> = rows
+        .iter()
+        .filter(|r| r.get("run_id").and_then(Value::as_str) != Some(run_id))
+        .filter(|r| {
+            r.pointer("/detail/metered/transcript")
+                .and_then(Value::as_str)
+                .is_some_and(|t| Path::new(t).file_name() == Some(name))
+        })
+        .filter_map(|r| {
+            let at = r
+                .get("finished_at")
+                .and_then(Value::as_str)?
+                .parse::<DateTime<Utc>>()
+                .ok()?;
+            let run = r.get("run_id").and_then(Value::as_str)?.to_string();
+            Some((at, run))
+        })
+        .filter(|(at, _)| *at < until)
+        .collect();
+    found.sort();
+    found
+}
+
+/// The key one turn's lines share: `message.id`, else `requestId`.
+fn turn_key(v: &Value) -> Option<&str> {
+    v.pointer("/message/id")
+        .or_else(|| v.get("requestId"))
+        .and_then(Value::as_str)
+}
+
+/// The lines of `jsonl` inside `slice`, with the first and last line
+/// numbers (1-based) kept. A line without a `timestamp` takes the last
+/// one written above it — the file is appended in time order. A turn is
+/// judged by its FIRST line, so a turn streamed across a bound is one
+/// run's whole and none of the other's. The model attachment is the
+/// session's, not a turn's, and belongs to every slice of it.
+pub(crate) fn cut(jsonl: &str, slice: &Slice) -> (String, Option<usize>, Option<usize>) {
+    let mut last_seen: Option<DateTime<Utc>> = None;
+    let mut turn_at: std::collections::HashMap<String, Option<DateTime<Utc>>> =
+        std::collections::HashMap::new();
+    let mut kept: Vec<&str> = Vec::new();
+    let (mut first, mut last) = (None, None);
+    for (n, line) in jsonl.lines().enumerate() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.pointer("/attachment/type").and_then(Value::as_str) == Some("model") {
+            kept.push(line);
+            continue;
+        }
+        if let Some(t) = v
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+        {
+            last_seen = Some(t);
+        }
+        let at = match (v.get("type").and_then(Value::as_str), turn_key(&v)) {
+            (Some("assistant"), Some(k)) => *turn_at.entry(k.to_string()).or_insert(last_seen),
+            _ => last_seen,
+        };
+        let inside = slice.after.is_none_or(|a| at.is_some_and(|t| t > a))
+            && slice.until.is_none_or(|u| at.is_none_or(|t| t <= u));
+        if inside {
+            kept.push(line);
+            first = first.or(Some(n + 1));
+            last = Some(n + 1);
+        }
+    }
+    let mut text = kept.join("\n");
+    text.push('\n');
+    (text, first, last)
+}
+
+/// Where in the transcript a metered figure came from, so it can be
+/// re-derived by reading the same lines (backlog 4f74727b).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Sliced {
+    pub after: Option<DateTime<Utc>>,
+    pub after_by: Option<String>,
+    pub until: Option<DateTime<Utc>>,
+    /// What set `until`: the report, or the next run's marker.
+    pub until_by: Option<String>,
+    /// The first and last transcript line (1-based) the slice held.
+    pub first_line: Option<usize>,
+    pub last_line: Option<usize>,
+    /// Why a metered count is zero, when it is: the transcript was read
+    /// and holds no turn of this run. A zero with its reason, never a
+    /// missing count, because the reading was made.
+    pub zero_reason: Option<String>,
+}
+
 /// What the report read, and from where.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Metered {
@@ -339,19 +678,21 @@ pub(crate) struct Metered {
     pub models: RunModels,
     /// Where its tool time and context went (backlog 2f23f4c6).
     pub profile: boss_jobs::agent_runs::WorkProfile,
+    /// Which lines of `path` were counted (backlog 4f74727b).
+    pub slice: Sliced,
 }
 
-/// The run's metered usage: from `explicit` when the operator named a
-/// transcript, else the one transcript [`find_transcripts`] finds.
-/// `Err` is a sentence saying why nothing was read — printed, and the
-/// report goes on with the count it was given.
-pub(crate) fn meter(
+/// The run's transcript: `explicit` when the operator named one, else
+/// the one transcript [`find_transcripts`] finds. `Err` is a sentence
+/// saying why none was chosen — printed, and the report goes on with
+/// the count it was given.
+pub(crate) fn locate(
     explicit: Option<&Path>,
     root: Option<&Path>,
     run_id: &str,
     since: SystemTime,
-) -> Result<Metered, String> {
-    let path = match explicit {
+) -> Result<PathBuf, String> {
+    Ok(match explicit {
         Some(p) => p.to_path_buf(),
         None => {
             let root = root.ok_or(
@@ -384,24 +725,74 @@ pub(crate) fn meter(
                 }
             }
         }
-    };
-    let text = std::fs::read_to_string(&path)
+    })
+}
+
+/// The run's metered usage: the turns of `path` inside `slice`.
+///
+/// A ZERO IS A READING. When the file holds billed turns but none of
+/// this run's — the slice is empty, or a transcript named outright
+/// never names the run — the count is a metered zero with its reason
+/// on the record, not a missing count and not the file's whole spend.
+/// `Err` is kept for a file that could not be read or holds no billed
+/// turn at all, where nothing was measured.
+pub(crate) fn meter(path: &Path, run_id: &str, slice: &Slice) -> Result<Metered, String> {
+    let text = std::fs::read_to_string(path)
         .map_err(|e| format!("could not read transcript {}: {e}", path.display()))?;
-    let usage = sum_usage(&text)
-        .ok_or_else(|| format!("transcript {} holds no turn usage", path.display()))?;
-    let models = read_models(&text);
-    let profile = crate::transcript_profile::work_profile(&text);
+    if sum_usage(&text).is_none() {
+        return Err(format!("transcript {} holds no turn usage", path.display()));
+    }
+    let named = text.contains(&needle(run_id));
+    // Markers first, report instants second (backlog 11a0998a).
+    let slice = &slice.clone().marked(&markers(&text), run_id);
+    let (sliced, first_line, last_line) = match named {
+        true => cut(&text, slice),
+        false => (String::new(), None, None),
+    };
+    let (usage, zero_reason) = match (named, sum_usage(&sliced)) {
+        (false, _) => (
+            Usage::default(),
+            Some(format!(
+                "transcript never names {:?}, so it holds no turn of this run",
+                needle(run_id)
+            )),
+        ),
+        (true, Some(u)) => (u, None),
+        (true, None) => (
+            Usage::default(),
+            Some(format!(
+                "no billed turn after {} and at or before {} — every turn in the file is \
+                 outside this run's slice",
+                slice
+                    .after
+                    .map_or("the file's start".to_string(), |t| t.to_rfc3339()),
+                slice
+                    .until
+                    .map_or("the file's end".to_string(), |t| t.to_rfc3339()),
+            )),
+        ),
+    };
     Ok(Metered {
-        path,
+        path: path.to_path_buf(),
         usage,
-        models,
-        profile,
+        models: read_models(&sliced),
+        profile: crate::transcript_profile::work_profile(&sliced),
+        slice: Sliced {
+            after: slice.after,
+            after_by: slice.after_by.clone(),
+            until: slice.until,
+            until_by: slice.until_by.clone(),
+            first_line,
+            last_line,
+            zero_reason,
+        },
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     /// Two lines of one turn (the thinking block, then the tool call,
     /// output growing 5 -> 155) and one line of the next — the shape
@@ -552,11 +943,414 @@ mod tests {
     #[test]
     fn a_metered_run_carries_the_models_its_transcript_names() {
         let root = boss_testing::scratch_dir("transcript-usage-model");
-        let path = write(&root, "s/subagents/agent-m.jsonl", OPUS_5_5);
-        let got = meter(Some(&path), None, "r-1", SystemTime::UNIX_EPOCH).expect("named");
+        let text = format!(
+            "{}\n{OPUS_5_5}",
+            r#"{"type":"user","message":{"content":"agent-run r-1"}}"#
+        );
+        let path = write(&root, "s/subagents/agent-m.jsonl", &text);
+        let got = meter(&path, "r-1", &Slice::default()).expect("named");
         assert_eq!(got.models.recorded().as_deref(), Some("opus-5-5[1m]"));
         assert_eq!(got.usage.turns, 3, "the synthetic line is a turn of zero");
         assert_eq!(got.usage.output, 16);
+    }
+
+    /// ONE AGENT, TWO RUNS, ONE TRANSCRIPT (backlog 4f74727b) — the
+    /// shape of the triage batch measured 2026-09-28 on
+    /// `agent-abb03ad066e8e7222.jsonl`: every run named up front, the
+    /// model attachment once at the top, and each run's `--report` run
+    /// by the agent itself between its turns. Four reports from that
+    /// file recorded $0.93, $1.14, $1.49, $1.66 — each the transcript's
+    /// running total — so the table summed $5.21 for about $1.66.
+    const BATCH: &str = concat!(
+        r#"{"type":"user","timestamp":"2026-09-28T09:52:14.973Z","message":{"content":"agent-run r-1 then agent-run r-2"}}"#,
+        "\n",
+        r#"{"type":"attachment","timestamp":"2026-09-28T09:52:15.581Z","attachment":{"type":"model","identity":{"modelId":"claude-opus-5-5[1m]"}}}"#,
+        "\n",
+        r#"{"type":"assistant","timestamp":"2026-09-28T09:52:17.156Z","message":{"id":"msg_1","model":"claude-opus-5-5","usage":{"input_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":1000,"output_tokens":5}}}"#,
+        "\n",
+        r#"{"type":"assistant","timestamp":"2026-09-28T09:52:18.000Z","message":{"id":"msg_1","model":"claude-opus-5-5","usage":{"input_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":1000,"output_tokens":50}}}"#,
+        "\n",
+        r#"{"type":"user","timestamp":"2026-09-28T09:52:20.000Z","message":{"content":[{"type":"tool_result"}]}}"#,
+        "\n",
+        // The turn that runs r-1's `--report`; the report finishes at
+        // 09:56:30, and its answer is the next line.
+        r#"{"type":"assistant","timestamp":"2026-09-28T09:55:28.861Z","message":{"id":"msg_2","model":"claude-opus-5-5","usage":{"input_tokens":1,"cache_creation_input_tokens":10,"cache_read_input_tokens":2000,"output_tokens":30}}}"#,
+        "\n",
+        r#"{"type":"user","timestamp":"2026-09-28T09:56:31.000Z","message":{"content":[{"type":"tool_result"}]}}"#,
+        "\n",
+        r#"{"type":"assistant","timestamp":"2026-09-28T09:56:33.475Z","message":{"id":"msg_3","model":"claude-opus-5-5","usage":{"input_tokens":3,"cache_creation_input_tokens":20,"cache_read_input_tokens":3000,"output_tokens":40}}}"#,
+        "\n",
+        r#"{"type":"assistant","timestamp":"2026-09-28T09:57:45.246Z","message":{"id":"msg_4","model":"claude-opus-5-5","usage":{"input_tokens":1,"cache_creation_input_tokens":5,"cache_read_input_tokens":3100,"output_tokens":60}}}"#,
+        "\n",
+    );
+
+    fn at(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn two_runs_on_one_transcript_each_meter_only_their_own_turns() {
+        let root = boss_testing::scratch_dir("transcript-usage-batch");
+        let path = write(&root, "s/subagents/agent-abb.jsonl", BATCH);
+
+        // r-1: from its start to its own report.
+        let first = Slice::bounded(
+            Some(at("2026-09-28T09:52:00Z")),
+            vec![],
+            at("2026-09-28T09:56:30Z"),
+        );
+        let one = meter(&path, "r-1", &first).expect("r-1 metered");
+        assert_eq!(one.usage.turns, 2);
+        assert_eq!(one.usage.output, 50 + 30);
+        assert_eq!(one.usage.cache_read, 1000 + 2000);
+        assert_eq!(
+            (one.slice.first_line, one.slice.last_line),
+            (Some(1), Some(6))
+        );
+
+        // r-2: started at the same instant — the batch dispatched every
+        // run before the agent began — so its start separates nothing;
+        // r-1's report is the bound that does.
+        let row = json!([{
+            "run_id": "r-1",
+            "finished_at": "2026-09-28T09:56:30Z",
+            "detail": { "metered": { "transcript": path.display().to_string() } },
+        }]);
+        let earlier = earlier_reports(
+            row.as_array().unwrap(),
+            &path,
+            "r-2",
+            at("2026-09-28T09:58:00Z"),
+        );
+        let second = Slice::bounded(
+            Some(at("2026-09-28T09:52:00Z")),
+            earlier,
+            at("2026-09-28T09:58:00Z"),
+        );
+        assert_eq!(second.after, Some(at("2026-09-28T09:56:30Z")));
+        assert_eq!(second.after_by.as_deref(), Some("report of run r-1"));
+        let two = meter(&path, "r-2", &second).expect("r-2 metered");
+        assert_eq!(two.usage.turns, 2, "r-1's two turns are not r-2's");
+        assert_eq!(two.usage.output, 40 + 60);
+        assert_eq!(two.usage.cache_read, 3000 + 3100);
+        assert_eq!(
+            (two.slice.first_line, two.slice.last_line),
+            (Some(7), Some(9))
+        );
+        assert_eq!(
+            two.models.recorded().as_deref(),
+            Some("opus-5-5[1m]"),
+            "the session's model attachment belongs to every slice of it"
+        );
+        assert_eq!(two.slice.zero_reason, None);
+
+        // CONSERVATION: the two slices sum to the whole, not to more.
+        let whole = sum_usage(BATCH).unwrap();
+        assert_eq!(one.usage.total() + two.usage.total(), whole.total());
+        assert_eq!(one.usage.turns + two.usage.turns, whole.turns);
+    }
+
+    #[test]
+    fn a_turn_is_judged_by_its_first_line_so_no_turn_is_split_between_runs() {
+        // msg_1 streams across the bound: its first line is before it,
+        // its second after. The turn is r-1's whole, and none of r-2's.
+        let bound = at("2026-09-28T09:52:17.500Z");
+        let before = cut(BATCH, &Slice::bounded(None, vec![], bound)).0;
+        let after = cut(
+            BATCH,
+            &Slice::bounded(Some(bound), vec![], at("2026-09-28T10:00:00Z")),
+        )
+        .0;
+        assert_eq!(sum_usage(&before).unwrap().output, 50);
+        assert!(!after.contains("msg_1"), "{after}");
+    }
+
+    #[test]
+    fn an_empty_slice_is_a_metered_zero_that_says_why() {
+        let root = boss_testing::scratch_dir("transcript-usage-empty");
+        let path = write(&root, "s/subagents/agent-abb.jsonl", BATCH);
+        // Every turn is already claimed by an earlier report.
+        let late = Slice::bounded(
+            Some(at("2026-09-28T09:58:00Z")),
+            vec![],
+            at("2026-09-28T09:59:00Z"),
+        );
+        let got = meter(&path, "r-2", &late).expect("a measured zero");
+        assert_eq!(got.usage, Usage::default());
+        let why = got.slice.zero_reason.expect("the zero names its reason");
+        assert!(why.contains("no billed turn"), "{why}");
+
+        // A transcript named outright that never names the run holds
+        // none of its turns: a zero, and the reason, rather than the
+        // whole of another run's spend.
+        let got = meter(&path, "r-7", &Slice::default()).expect("a measured zero");
+        assert_eq!(got.usage, Usage::default());
+        assert_eq!(got.models, RunModels::default());
+        let why = got.slice.zero_reason.expect("the zero names its reason");
+        assert!(why.contains("never names"), "{why}");
+
+        // A file with no billed turn at all is still not a transcript
+        // to meter from — no count, not a zero.
+        let empty = write(&root, "s/subagents/agent-none.jsonl", "agent-run r-1\n");
+        assert!(meter(&empty, "r-1", &Slice::default()).is_err());
+    }
+
+    #[test]
+    fn the_earlier_report_is_the_latest_other_run_metered_from_the_same_file() {
+        let path = PathBuf::from("/h/.claude/projects/p/s/subagents/agent-abb.jsonl");
+        let row = |run: &str, fin: &str, transcript: Option<&str>| match transcript {
+            Some(t) => {
+                json!({"run_id": run, "finished_at": fin, "detail": {"metered": {"transcript": t}}})
+            }
+            None => json!({"run_id": run, "finished_at": fin, "detail": {}}),
+        };
+        let same = "/h/.claude/projects/p/s/subagents/agent-abb.jsonl";
+        let rows = vec![
+            row("r-0", "2026-09-28T09:40:00Z", Some(same)),
+            row("r-1", "2026-09-28T09:56:30Z", Some(same)),
+            // Another transcript, an unmetered row, this run's own row
+            // (a retried report), and a report after this one's instant.
+            row(
+                "r-x",
+                "2026-09-28T09:57:00Z",
+                Some("/h/.claude/projects/p/s/subagents/agent-zzz.jsonl"),
+            ),
+            row("r-y", "2026-09-28T09:57:01Z", None),
+            row("r-2", "2026-09-28T09:57:10Z", Some(same)),
+            row("r-3", "2026-09-28T09:59:00Z", Some(same)),
+        ];
+        let earlier = earlier_reports(&rows, &path, "r-2", at("2026-09-28T09:58:00Z"));
+        assert_eq!(
+            earlier,
+            vec![
+                (at("2026-09-28T09:40:00Z"), "r-0".to_string()),
+                (at("2026-09-28T09:56:30Z"), "r-1".to_string()),
+            ]
+        );
+        assert_eq!(
+            earlier_reports(&rows[2..4], &path, "r-2", at("2026-09-28T09:58:00Z")),
+            vec![]
+        );
+        // The latest of them bounds the slice.
+        let s = Slice::bounded(None, earlier, at("2026-09-28T09:58:00Z"));
+        assert_eq!(s.after, Some(at("2026-09-28T09:56:30Z")));
+        assert_eq!(s.after_by.as_deref(), Some("report of run r-1"));
+
+        // The run's own start wins when it is the later bound.
+        let s = Slice::bounded(
+            Some(at("2026-09-28T09:57:00Z")),
+            vec![(at("2026-09-28T09:56:30Z"), "r-1".into())],
+            at("2026-09-28T09:58:00Z"),
+        );
+        assert_eq!(s.after, Some(at("2026-09-28T09:57:00Z")));
+        assert_eq!(s.after_by.as_deref(), Some("run start"));
+    }
+
+    /// ONE AGENT, TWO RUNS, NO REPORT BETWEEN THEM (backlog 11a0998a) —
+    /// the batch shape 4f74727b's slice could not split: both runs
+    /// dispatched before the agent began, a batch prompt naming both
+    /// ids at once, each run's prompt READ when its item starts (the
+    /// read's tool result is where its marker lands), and the parent
+    /// reporting both after the one handback. Report instants separate
+    /// nothing here; the markers do.
+    const MARKED: &str = concat!(
+        r#"{"type":"user","timestamp":"2026-09-28T13:00:00.000Z","message":{"content":"Batch: agent-run r-1 then agent-run r-2; read each prompt file as you start it"}}"#,
+        "\n",
+        r#"{"type":"attachment","timestamp":"2026-09-28T13:00:00.500Z","attachment":{"type":"model","identity":{"modelId":"claude-opus-5-5[1m]"}}}"#,
+        "\n",
+        // The turn that reads r-1's prompt, and the read's answer.
+        r#"{"type":"assistant","timestamp":"2026-09-28T13:00:02.000Z","message":{"id":"msg_1","model":"claude-opus-5-5","usage":{"input_tokens":1,"cache_creation_input_tokens":100,"cache_read_input_tokens":1000,"output_tokens":10}}}"#,
+        "\n",
+        r#"{"type":"user","timestamp":"2026-09-28T13:00:03.000Z","message":{"content":[{"type":"tool_result","content":"== THE RUN ==\nrun-marker: agent-run r-1 begins here\n"}]}}"#,
+        "\n",
+        r#"{"type":"assistant","timestamp":"2026-09-28T13:01:00.000Z","message":{"id":"msg_2","model":"claude-opus-5-5","usage":{"input_tokens":2,"cache_creation_input_tokens":200,"cache_read_input_tokens":2000,"output_tokens":20}}}"#,
+        "\n",
+        // The agent's own text quoting r-2's marker is not a marker: an
+        // assistant line is the agent speaking, not a prompt arriving.
+        r#"{"type":"assistant","timestamp":"2026-09-28T13:02:00.000Z","message":{"id":"msg_3","model":"claude-opus-5-5","content":[{"type":"text","text":"next: run-marker: agent-run r-2 begins here"}],"usage":{"input_tokens":3,"cache_creation_input_tokens":300,"cache_read_input_tokens":3000,"output_tokens":30}}}"#,
+        "\n",
+        r#"{"type":"user","timestamp":"2026-09-28T13:02:05.000Z","message":{"content":[{"type":"tool_result","content":"== THE RUN ==\nrun-marker: agent-run r-2 begins here\n"}]}}"#,
+        "\n",
+        r#"{"type":"assistant","timestamp":"2026-09-28T13:03:00.000Z","message":{"id":"msg_4","model":"claude-opus-5-5","usage":{"input_tokens":4,"cache_creation_input_tokens":400,"cache_read_input_tokens":4000,"output_tokens":40}}}"#,
+        "\n",
+        r#"{"type":"assistant","timestamp":"2026-09-28T13:04:00.000Z","message":{"id":"msg_5","model":"claude-opus-5-5","usage":{"input_tokens":5,"cache_creation_input_tokens":500,"cache_read_input_tokens":5000,"output_tokens":50}}}"#,
+        "\n",
+    );
+
+    #[test]
+    fn a_marker_is_read_only_off_a_line_that_arrived_and_only_once_per_run() {
+        let got = markers(MARKED);
+        assert_eq!(
+            got,
+            vec![
+                Mark {
+                    at: at("2026-09-28T13:00:03Z"),
+                    run: "r-1".into()
+                },
+                Mark {
+                    at: at("2026-09-28T13:02:05Z"),
+                    run: "r-2".into()
+                },
+            ],
+            "the assistant's quotation at 13:02:00 is not r-2's marker"
+        );
+        assert!(markers(BATCH).is_empty(), "no marker, none read");
+        // A placeholder is not an id, and a phrase without its ending is
+        // not the marker.
+        let prose = concat!(
+            r#"{"type":"user","timestamp":"2026-09-28T13:00:00Z","message":{"content":"run-marker: agent-run <id> begins here; run-marker: agent-run r-9 starts"}}"#,
+            "\n"
+        );
+        assert!(markers(prose).is_empty(), "{:?}", markers(prose));
+        assert_eq!(marker("r-1"), "run-marker: agent-run r-1 begins here");
+        assert!(
+            marker("r-1").contains(&needle("r-1")),
+            "a marked transcript is found by the run's own phrase"
+        );
+    }
+
+    /// The report the PARENT runs for each run after one handback, in
+    /// either order: each report's instant is after the file's last line.
+    #[test]
+    fn two_marked_runs_with_no_report_between_them_each_meter_their_own_turns() {
+        let root = boss_testing::scratch_dir("transcript-usage-marked");
+        let path = write(&root, "s/subagents/agent-mark.jsonl", MARKED);
+        let started = Some(at("2026-09-28T12:59:00Z"));
+        let (first_report, second_report) =
+            (at("2026-09-28T13:10:00Z"), at("2026-09-28T13:10:30Z"));
+        let row = |run: &str, fin: &str| {
+            json!({
+                "run_id": run, "finished_at": fin,
+                "detail": { "metered": { "transcript": path.display().to_string() } },
+            })
+        };
+        let whole = sum_usage(MARKED).unwrap();
+
+        for order in [["r-1", "r-2"], ["r-2", "r-1"]] {
+            let one = meter(
+                &path,
+                order[0],
+                &Slice::bounded(started, vec![], first_report),
+            )
+            .expect("metered");
+            let rows = vec![row(order[0], "2026-09-28T13:10:00Z")];
+            let earlier = earlier_reports(&rows, &path, order[1], second_report);
+            assert!(!earlier.is_empty(), "the first report bounds the second");
+            let two = meter(
+                &path,
+                order[1],
+                &Slice::bounded(started, earlier, second_report),
+            )
+            .expect("metered");
+            let (r1, r2) = match order[0] {
+                "r-1" => (one, two),
+                _ => (two, one),
+            };
+
+            // r-1: its own read and its work, and the turn that reads
+            // r-2's prompt (it runs before r-2's marker arrives).
+            assert_eq!(r1.usage.turns, 3, "{order:?}: {:?}", r1.slice);
+            assert_eq!(r1.usage.output, 10 + 20 + 30, "{order:?}");
+            assert_eq!(
+                r1.slice.until_by.as_deref(),
+                Some("marker of run r-2"),
+                "{order:?}"
+            );
+            assert_eq!(r1.slice.until, Some(at("2026-09-28T13:02:05Z")));
+            assert_eq!(r1.slice.zero_reason, None, "{order:?}");
+            // r-2: from its own marker to its report.
+            assert_eq!(r2.usage.turns, 2, "{order:?}: {:?}", r2.slice);
+            assert_eq!(r2.usage.output, 40 + 50, "{order:?}");
+            assert_eq!(r2.slice.after, Some(at("2026-09-28T13:02:05Z")));
+            assert_eq!(r2.slice.after_by.as_deref(), Some("marker of run r-2"));
+            assert_eq!(r2.slice.zero_reason, None, "{order:?}");
+            assert_eq!(
+                r2.models.recorded().as_deref(),
+                Some("opus-5-5[1m]"),
+                "the session's model attachment belongs to every slice"
+            );
+
+            // CONSERVATION, whichever report ran first.
+            assert_eq!(
+                r1.usage.total() + r2.usage.total(),
+                whole.total(),
+                "{order:?}"
+            );
+            assert_eq!(r1.usage.turns + r2.usage.turns, whole.turns, "{order:?}");
+        }
+    }
+
+    /// A transcript that carries no marker — every one written before
+    /// this car — is sliced exactly as 4f74727b sliced it.
+    #[test]
+    fn a_transcript_with_no_marker_is_sliced_by_report_instants_as_before() {
+        let s = Slice::bounded(
+            Some(at("2026-09-28T09:52:00Z")),
+            vec![(at("2026-09-28T09:56:30Z"), "r-1".into())],
+            at("2026-09-28T09:58:00Z"),
+        );
+        assert_eq!(s.clone().marked(&markers(BATCH), "r-2"), s);
+        assert_eq!(s.until_by.as_deref(), Some("this report"));
+    }
+
+    /// Markers that arrived TOGETHER separate nothing — a batch prompt
+    /// that pastes every run's section at once. Those runs fall back to
+    /// the report instants among themselves, so the sum still holds.
+    #[test]
+    fn markers_that_arrive_together_fall_back_to_the_report_instants() {
+        let root = boss_testing::scratch_dir("transcript-usage-comarked");
+        let text = MARKED
+            .replace(
+                "Batch: agent-run r-1 then agent-run r-2; read each prompt file as you start it",
+                "run-marker: agent-run r-1 begins here\\nrun-marker: agent-run r-2 begins here",
+            )
+            .replace("run-marker: agent-run r-1 begins here\\n\"}]", "read\"}]")
+            .replace("run-marker: agent-run r-2 begins here\\n\"}]", "read\"}]");
+        let path = write(&root, "s/subagents/agent-together.jsonl", &text);
+        let got = markers(&text);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].at, got[1].at, "{got:?}");
+
+        let started = Some(at("2026-09-28T12:59:00Z"));
+        let one = meter(
+            &path,
+            "r-1",
+            &Slice::bounded(started, vec![], at("2026-09-28T13:10:00Z")),
+        )
+        .unwrap();
+        let rows = vec![json!({
+            "run_id": "r-1", "finished_at": "2026-09-28T13:10:00Z",
+            "detail": { "metered": { "transcript": path.display().to_string() } },
+        })];
+        let later = at("2026-09-28T13:10:30Z");
+        let earlier = earlier_reports(&rows, &path, "r-2", later);
+        let two = meter(&path, "r-2", &Slice::bounded(started, earlier, later)).unwrap();
+        let whole = sum_usage(&text).unwrap();
+        assert_eq!(
+            one.usage.total(),
+            whole.total(),
+            "the first report, today's way"
+        );
+        assert_eq!(two.usage, Usage::default(), "and nothing counted twice");
+        assert!(two.slice.zero_reason.is_some());
+    }
+
+    /// A run with no marker in a transcript that has them — a run
+    /// dispatched before this car, reported after it — is cut at the
+    /// first marker after its own start, so it cannot count the marked
+    /// run's turns as its own.
+    #[test]
+    fn an_unmarked_run_stops_at_the_first_marker_after_it() {
+        let marks = markers(MARKED);
+        let s = Slice::bounded(
+            Some(at("2026-09-28T12:59:00Z")),
+            vec![],
+            at("2026-09-28T13:10:00Z"),
+        )
+        .marked(&marks, "r-0");
+        assert_eq!(s.until, Some(at("2026-09-28T13:00:03Z")));
+        assert_eq!(s.until_by.as_deref(), Some("marker of run r-1"));
+        assert_eq!(s.after, Some(at("2026-09-28T12:59:00Z")));
     }
 
     fn write(root: &Path, rel: &str, text: &str) -> PathBuf {
@@ -581,7 +1375,9 @@ mod tests {
         let epoch = SystemTime::UNIX_EPOCH;
         assert_eq!(find_transcripts(&root, "r-1", epoch), vec![mine.clone()]);
 
-        let got = meter(None, Some(&root), "r-1", epoch).expect("found");
+        let found = locate(None, Some(&root), "r-1", epoch).expect("found");
+        assert_eq!(found, mine);
+        let got = meter(&found, "r-1", &Slice::default()).expect("metered");
         assert_eq!(got.path, mine);
         assert_eq!(got.usage.turns, 2);
 
@@ -594,13 +1390,19 @@ mod tests {
             "-work-boss/s-2/subagents/agent-b1.jsonl",
             "agent-run r-1",
         );
-        let why = meter(None, Some(&root), "r-1", epoch).expect_err("two is ambiguous");
+        let why = locate(None, Some(&root), "r-1", epoch).expect_err("two is ambiguous");
         assert!(why.contains("refusing to guess"), "{why}");
-        let why = meter(None, Some(&root), "r-9", epoch).expect_err("none is none");
+        let why = locate(None, Some(&root), "r-9", epoch).expect_err("none is none");
         assert!(why.contains("--transcript"), "{why}");
 
         // Named outright, the search is skipped.
-        let named = meter(Some(&mine), None, "r-1", epoch).expect("named");
-        assert_eq!(named.usage.output, 466);
+        let named = locate(Some(&mine), None, "r-1", epoch).expect("named");
+        assert_eq!(
+            meter(&named, "r-1", &Slice::default())
+                .unwrap()
+                .usage
+                .output,
+            466
+        );
     }
 }

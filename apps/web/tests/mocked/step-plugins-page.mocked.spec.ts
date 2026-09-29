@@ -167,14 +167,14 @@ test.describe('/it/registry/step-plugins — the controls', () => {
     expect(writes.map((w) => `${w.method()} ${w.url()}`)).toEqual([]);
   });
 
-  test('the eight registry tabs land on catalogued routes, and back returns here', async ({ page }) => {
+  test('the nine registry tabs land on catalogued routes, and back returns here', async ({ page }) => {
     const writes = watchWrites(page);
     await install(page);
     await mountPage(page, PAGE, { titleMatch: new RegExp(TITLE) });
 
     // Rules joined the strip beside Dispatcher (backlog 0a98d93f).
     const tabs = page.locator('nav.it-tabs[aria-label="IT registry"] a');
-    await expect(tabs).toHaveText(['Workflows', 'Dispatcher', 'Rules', 'Step plugins', 'Policy', 'Subjects', 'Drift', 'Agents']);
+    await expect(tabs).toHaveText(['Workflows', 'Dispatcher', 'Rules', 'Step plugins', 'Policy', 'Subjects', 'Drift', 'Agents', 'Credentials']);
     const hrefs = await tabs.evaluateAll((as) => as.map((a) => a.getAttribute('href') ?? ''));
     const catalogPaths = new Set(Object.values(ROUTE_CATALOG).map((r) => (r as { path: string }).path));
     for (const h of hrefs) {

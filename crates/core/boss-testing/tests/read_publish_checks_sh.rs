@@ -25,15 +25,15 @@
 //!     — and the `read-checks` step is completed with `conclusion` and
 //!     `alerts`; the LAST line is the answer line the dispatcher rule's
 //!     `verdict_pattern` reads (one fact, two files, CLAUDE.md §9a);
-//!   * with a check-run still running, nothing is written until it
-//!     completes, and past the deadline the verb FAILS naming the run
-//!     still in flight — a partial reading, never a clean one;
-//!   * only the code-scanning checks are waited for (backlog d167e7d7):
-//!     a non-scanning check still running — the mirror's full gate —
-//!     does not hold the forge's runner, but it is NOT YET (backlog
-//!     c6cb678b): the partial reading goes on the packet, the step
-//!     stays open, exit 75 — and past the ceiling the step completes
-//!     `unfinished`, naming it;
+//!   * the verb takes ONE reading and never waits (backlog b81ff4ca): a
+//!     code-scanning check still running, or a head with no check-runs
+//!     yet, is NOT YET at once — the partial reading on the packet, the
+//!     step open, exit 75 — and `reread-publish-pr-every-15-minutes`
+//!     finishes the wait. On 2026-09-28 one in-verb wait held the forge's
+//!     serial ops-runner 786 s while eight requests queued behind it;
+//!   * a non-scanning check still running — the mirror's full gate — is
+//!     NOT YET the same way (backlog c6cb678b), and past the ceiling the
+//!     step completes `unfinished`, naming it;
 //!   * the step's `conclusion` is the verdict over EVERY check: a
 //!     failing gate over a clean scan reads `failure` and is named in
 //!     `failing`, so the judge step reads it (PR #243 closed clean with
@@ -66,18 +66,6 @@ const NO_CEILING: (&str, &str) = ("BOSS_CHECKS_CEILING_SECONDS", "9999999999");
 /// The CodeQL check-run's id in the fixture — the annotations URL
 /// GitHub hands back is keyed on it.
 const CODEQL_RUN: &str = "105867839495";
-/// How many polls a case tolerates before the verb gives up. The wait in
-/// a test is counted in POLLS, never wall-clock seconds (backlog
-/// 167f26e3): a three-second deadline stood in for "two or three polls"
-/// until a loaded pod (load 124, 2026-09-23) took seven seconds over ONE
-/// poll, and a case that must see two polls before running out of time
-/// can then see one. A count is the same number on an idle pod and a
-/// loaded one.
-const POLLS: u32 = 3;
-/// The wall-clock deadline in a test, set far past any poll count's
-/// worth of work so it is never the bound a case measures — it only
-/// stops a verb that ignores the poll bound from spinning forever.
-const WALL_SECONDS: &str = "300";
 
 fn fixture(name: &str) -> PathBuf {
     repo_root()
@@ -162,8 +150,8 @@ if [ "$method" != GET ]; then
     exit 0
 fi
 # First route whose file still exists wins; a `*.once.json` file is
-# served once and removed, so the next poll falls through to the route
-# behind it (a check list that fills in between two polls).
+# served once and removed, so the next read falls through to the route
+# behind it (a check list that fills in between two reads).
 while IFS='	' read -r needle file; do
     [ -f "$file" ] || continue
     case "$url" in *"$needle"*)
@@ -231,12 +219,10 @@ exit 22
             )
             .env("BOSS_JOBS_URL", "http://jobs.invalid")
             .env("BOSS_GITHUB_API", "https://api.github.invalid")
-            .env("BOSS_MIRROR_SLUG", "fixture-upstream/mirror")
-            // No waiting in a test: the loop polls at once, and the
-            // bound is the number of polls it tolerates (see POLLS).
-            .env("BOSS_CHECKS_POLL_SECONDS", "0")
-            .env("BOSS_CHECKS_MAX_POLLS", POLLS.to_string())
-            .env("BOSS_CHECKS_DEADLINE_SECONDS", WALL_SECONDS);
+            // No poll or deadline knob: the verb takes one reading and
+            // never waits (backlog b81ff4ca), so a case that has it
+            // wait would hang here rather than pass.
+            .env("BOSS_MIRROR_SLUG", "fixture-upstream/mirror");
         for (k, v) in extra {
             cmd.env(k, v);
         }
@@ -433,12 +419,25 @@ fn a_completed_prs_checks_and_alerts_are_read_onto_the_packet_and_the_step_compl
     );
 }
 
-/// A check-run still running is not a reading. The verb polls until it
-/// completes; here it never does, and past the deadline the verb FAILS
-/// naming the run — with what it saw on the packet as a PARTIAL reading
-/// (`complete: false`), and the step left open.
+/// How many times a run asked GitHub for the head's check-runs.
+fn check_run_reads(run: &Run) -> usize {
+    run.log()
+        .matches(&format!("/commits/{HEAD}/check-runs"))
+        .count()
+}
+
+/// A code-scanning check still running is not a reading — and it is not
+/// a reason to hold the forge's runner either (backlog b81ff4ca). Until
+/// 2026-09-28 the verb POLLED here, every 60 s up to 1500 s, inside the
+/// serial ops-runner: read-publish-checks 444d0f22 ran 786 s waiting on
+/// Analyze (rust), then exited 75 on the mirror's Gate anyway, while
+/// eight requests queued behind it (depth 8, oldest wait 748 s) and
+/// ops.queue.alarm 2163a4c5 fired. The fifteen-minute re-read already
+/// finishes every other wait, so this one is finished the same way: ONE
+/// reading, the partial reading on the packet (`complete: false`, the
+/// check named), the step left open, `not yet` and exit 75 at once.
 #[test]
-fn a_check_still_running_is_waited_for_and_named_when_the_deadline_passes() {
+fn a_scanning_check_still_running_is_not_yet_at_once_from_one_reading() {
     let run = Run::new("running", open_pr_done());
     let mut checks = fixture_json("check-runs-pr239.json");
     // Analyze (rust) is the slow one: 13 minutes on both #238 and #239.
@@ -455,29 +454,36 @@ fn a_check_still_running_is_waited_for_and_named_when_the_deadline_passes() {
     write_file(&running, &checks.to_string());
     run.route(&format!("/commits/{HEAD}/check-runs"), &running);
 
-    let (code, text) = run.go(&[], &[]);
-    assert_eq!(code, 1, "{text}");
+    let (code, text) = run.go(&[], &[NO_CEILING]);
+    assert_eq!(code, 75, "a scan still running is not yet:\n{text}");
+    assert_eq!(
+        check_run_reads(&run),
+        1,
+        "ONE reading — the verb does not wait on the scan inside the runner:\n{}",
+        run.log()
+    );
     let last = text.lines().last().unwrap_or("");
     assert!(
-        last.starts_with("read-publish-checks: FAILED — ") && last.contains("Analyze (rust)"),
-        "the failure names the run still in flight: {last}"
-    );
-    assert_eq!(
-        run.log()
-            .matches(&format!("/commits/{HEAD}/check-runs"))
-            .count(),
-        POLLS as usize,
-        "the verb polled exactly its bound before giving up, however long each poll took:\n{}",
-        run.log()
+        last.starts_with("read-publish-checks: not yet: ") && last.contains("Analyze (rust)"),
+        "the not-yet line names the check still in flight: {last}"
     );
     assert!(
-        last.contains(&format!("after {POLLS} polls")),
-        "the failure says how long it waited in the unit it was bounded by: {last}"
+        last.contains("reread-publish-pr-every-15-minutes"),
+        "the not-yet line names what reads it again: {last}"
+    );
+    assert!(
+        rule_pattern().captures(last).is_none(),
+        "a not-yet line is never read as an answer: {last}"
     );
     // What it saw is on the record, marked partial; the step is not done.
     let reading = run.reading();
     assert_eq!(reading["complete"], false);
     assert_eq!(reading["checks"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        reading["still_running"],
+        serde_json::json!(["Analyze (rust)"]),
+        "the reading names what was still running when it was read"
+    );
     assert!(
         !run.writes().contains("PUT "),
         "a partial reading completes nothing:\n{}",
@@ -487,11 +493,12 @@ fn a_check_still_running_is_waited_for_and_named_when_the_deadline_passes() {
 
 /// Before the first check-run is registered, the commit's list is empty
 /// — GitHub answers `total_count: 0`, which is "not yet", never "no
-/// checks". The verb keeps polling and reads the full set once it lands.
+/// checks". That run answers not-yet from its one reading, and the NEXT
+/// run — the fifteen-minute re-read — reads the full set once it lands.
 #[test]
-fn an_empty_check_list_is_not_yet_and_the_next_poll_reads_it() {
+fn an_empty_check_list_is_not_yet_and_the_next_run_reads_it() {
     let run = Run::new("empty-then-complete", open_pr_done());
-    // Served once, then gone: the second poll falls through to #239's
+    // Served once, then gone: the second run falls through to #239's
     // complete listing routed behind it.
     let empty = run.root.join("no-check-runs.once.json");
     write_file(&empty, r#"{"total_count": 0, "check_runs": []}"#);
@@ -499,15 +506,31 @@ fn an_empty_check_list_is_not_yet_and_the_next_poll_reads_it() {
     run.route_pr239_complete();
 
     let (code, text) = run.go(&[], &[]);
-    assert_eq!(code, 0, "{text}");
-    assert_eq!(run.reading()["complete"], true);
+    assert_eq!(code, 75, "an empty list is not yet:\n{text}");
+    assert_eq!(check_run_reads(&run), 1, "one reading:\n{}", run.log());
+    let last = text.lines().last().unwrap_or("");
+    assert!(
+        last.starts_with("read-publish-checks: not yet: ") && last.contains("no check-runs"),
+        "the not-yet line says nothing has registered: {last}"
+    );
+    assert!(
+        !run.writes().contains("PUT "),
+        "nothing read completes nothing:\n{}",
+        run.writes()
+    );
+
+    let (code, text) = run.go(&[], &[]);
+    assert_eq!(code, 0, "the re-read finds the full set:\n{text}");
     assert_eq!(
-        run.log()
-            .matches(&format!("/commits/{HEAD}/check-runs"))
-            .count(),
+        check_run_reads(&run),
         2,
-        "the verb polled once more after the empty list, and no more:\n{}",
+        "one reading per run, and no more:\n{}",
         run.log()
+    );
+    let last = text.lines().last().unwrap_or("");
+    assert!(
+        rule_pattern().captures(last).is_some(),
+        "the re-read's answer line is read: {last}"
     );
 }
 
@@ -539,7 +562,7 @@ fn pr239_with_the_gate_running() -> serde_json::Value {
 /// c6cb678b): on PR #243 the step completed with the Gate in_progress,
 /// the Gate concluded failure minutes later, and nothing in BOSS read
 /// it. So the verb answers "not yet" at once — the partial reading on
-/// the packet, the step left open, exit 75 — and the hourly re-read
+/// the packet, the step left open, exit 75 — and the fifteen-minute re-read
 /// reads it again.
 #[test]
 fn a_non_scanning_check_still_running_is_not_yet_and_does_not_hold_the_runner() {
@@ -907,7 +930,8 @@ fn a_check_still_running_past_the_ceiling_completes_the_step_unfinished() {
 
 /// The gate can register before CodeQL does. A head whose only check-run
 /// is a running non-scanning one has no scanning result to read yet —
-/// "not yet", never a reading of an absent scan.
+/// "not yet" from that one reading, never a reading of an absent scan —
+/// and the next run reads the scan once it has landed.
 #[test]
 fn a_running_gate_before_the_scan_registers_is_not_yet() {
     let run = Run::new("gate-before-scan", open_pr_done());
@@ -930,19 +954,42 @@ fn a_running_gate_before_the_scan_registers_is_not_yet() {
     run.route_pr239_complete();
 
     let (code, text) = run.go(&[], &[NO_CEILING]);
+    assert_eq!(code, 75, "no scan registered yet is not yet:\n{text}");
+    assert_eq!(check_run_reads(&run), 1, "one reading:\n{}", run.log());
+    let last = text.lines().last().unwrap_or("");
+    assert!(
+        last.starts_with("read-publish-checks: not yet: ") && last.contains("no CodeQL check-run"),
+        "the not-yet line says the scan has not registered: {last}"
+    );
+    assert!(
+        run.reading()["alerts"].is_null(),
+        "an absent scan is never read as a scan: {}",
+        run.reading()
+    );
+
+    let (code, text) = run.go(&[], &[NO_CEILING]);
     assert_eq!(
         code, 75,
         "the gate is still running once the scan is read:\n{text}"
     );
     assert_eq!(
-        run.log()
-            .matches(&format!("/commits/{HEAD}/check-runs"))
-            .count(),
+        check_run_reads(&run),
         2,
-        "the gate alone was not yet; the next poll read the scan:\n{}",
+        "the next run read the scan, once:\n{}",
         run.log()
     );
-    assert_eq!(run.reading()["alerts"]["conclusion"], "failure");
+    let writes = run.writes();
+    let latest: serde_json::Value = writes
+        .lines()
+        .rev()
+        .find_map(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .ok()?
+                .get("code_scanning")
+                .cloned()
+        })
+        .unwrap_or_else(|| panic!("no reading written:\n{writes}"));
+    assert_eq!(latest["alerts"]["conclusion"], "failure");
 }
 
 #[test]
@@ -1200,12 +1247,20 @@ fn check_asks_for_tools_and_addresses_and_touches_no_network() {
     assert_eq!(run.writes(), "");
 }
 
+/// The most the forge's SERIAL ops-runner may be held by one reading.
+/// A reading is a handful of GETs — the jobs list, each standing PR's
+/// state, the check-runs, at most ten annotation pages — seconds, not
+/// minutes. Until backlog b81ff4ca the verb waited in-verb for the scan
+/// and declared 1800 s, and one run held the runner 786 s while eight
+/// requests queued (2026-09-28).
+const MAX_HOLD_SECONDS: u64 = 120;
+
 /// The verb file: serves the forge, reads the script in the tree, admits
-/// only the literal `--check`, and declares a timeout above the deadline
-/// the script bounds its own wait with — so the runner's kill never
-/// pre-empts the script's own FAILED line.
+/// only the literal `--check`, and holds the serial runner no longer
+/// than one reading takes — the runner's kill is the bound on a hung
+/// GET, and the script itself never sleeps.
 #[test]
-fn the_verb_file_serves_the_forge_and_outlives_the_scripts_own_deadline() {
+fn the_verb_file_serves_the_forge_and_holds_the_runner_for_one_reading() {
     let path = repo_root().join("infra/ops/verbs/read-publish-checks.json");
     let v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -1214,18 +1269,21 @@ fn the_verb_file_serves_the_forge_and_outlives_the_scripts_own_deadline() {
     assert_eq!(v["params"][0]["one_of"], serde_json::json!(["--check"]));
     assert_eq!(v["params"][0]["optional"], true);
     let timeout = v["timeout"].as_u64().expect("a timeout");
-    let script = std::fs::read_to_string(repo_root().join(SCRIPT)).unwrap();
-    let deadline: u64 = script
-        .lines()
-        .find_map(|l| {
-            l.trim()
-                .strip_prefix("DEADLINE=\"${BOSS_CHECKS_DEADLINE_SECONDS:-")
-                .and_then(|r| r.strip_suffix("}\""))
-                .and_then(|n| n.parse().ok())
-        })
-        .expect("the script declares DEADLINE=\"${BOSS_CHECKS_DEADLINE_SECONDS:-<n>}\"");
     assert!(
-        timeout > deadline,
-        "verb timeout {timeout}s must exceed the script's deadline {deadline}s"
+        timeout <= MAX_HOLD_SECONDS,
+        "verb timeout {timeout}s holds the forge's serial runner past one reading ({MAX_HOLD_SECONDS}s)"
+    );
+    let script = std::fs::read_to_string(repo_root().join(SCRIPT)).unwrap();
+    let sleeps: Vec<&str> = script
+        .lines()
+        .filter(|l| {
+            let l = l.trim_start();
+            !l.starts_with('#') && l.split_whitespace().any(|w| w == "sleep")
+        })
+        .collect();
+    assert!(
+        sleeps.is_empty(),
+        "the verb takes one reading and never waits inside the runner; it sleeps at:\n{}",
+        sleeps.join("\n")
     );
 }

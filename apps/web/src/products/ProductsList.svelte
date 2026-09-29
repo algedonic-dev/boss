@@ -20,7 +20,13 @@
   }>();
 
   let products = $state<Product[]>([]);
-  let totals = $state<Record<string, number>>({});
+  /// Each SKU's stock, or why it could not be read. A failed detail
+  /// read used to land here as 0 — the paint of "no stock" — with no
+  /// marker (backlog 35e95b89, page audit 6b4e43a1 gap 4); an unknown
+  /// figure is now drawn as unknown and the page says how many.
+  type OnHand = { readonly ok: true; readonly n: number } | { readonly ok: false; readonly why: string };
+  let totals = $state<Record<string, OnHand>>({});
+  let unreadStock = $derived(Object.values(totals).filter((t) => !t.ok).length);
   /// Non-null when the load failed — rendered instead of the empty
   /// state, so an outage never reads as "no products yet" (packet
   /// 3fba9c35, the false-empty sweep).
@@ -58,14 +64,14 @@
         // Roll up total_on_hand per SKU via the detail endpoint —
         // the list endpoint omits inventory to keep payloads small.
         const detailEntries = await Promise.all(
-          body.map(async (p) => {
+          body.map(async (p): Promise<readonly [string, OnHand]> => {
             try {
               const r = await fetch(`/api/products/${encodeURIComponent(p.sku)}`);
-              if (!r.ok) return [p.sku, 0] as const;
+              if (!r.ok) return [p.sku, { ok: false, why: `HTTP ${r.status}` }];
               const d = (await r.json()) as ProductDetail;
-              return [p.sku, d.total_on_hand] as const;
-            } catch {
-              return [p.sku, 0] as const;
+              return [p.sku, { ok: true, n: d.total_on_hand }];
+            } catch (e) {
+              return [p.sku, { ok: false, why: e instanceof Error ? e.message : String(e) }];
             }
           }),
         );
@@ -134,6 +140,11 @@
       {/if}
     </p>
   {:else}
+    {#if unreadStock > 0}
+      <p class="load-failed stock-failed" role="alert">
+        Couldn't read stock for {unreadStock} of {products.length} products — their Total on hand shows —, not 0.
+      </p>
+    {/if}
     <table class="prod-table">
       <thead>
         <tr>
@@ -148,12 +159,17 @@
       </thead>
       <tbody>
         {#each filteredRows as p (p.sku)}
+          {@const t = totals[p.sku]}
           <tr class:retired={!p.active}>
             <td><Link to={entityHref('product', p.sku)} className="sku">{p.sku}</Link></td>
             <td>{p.name}</td>
             <td>{p.product_kind}</td>
             <td>{p.package_unit}</td>
-            <td class="num">{totals[p.sku] ?? 0}</td>
+            {#if t?.ok}
+              <td class="num">{t.n}</td>
+            {:else}
+              <td class="num stock-unknown" title="Couldn't read stock — {t?.why ?? 'no read'}">—</td>
+            {/if}
             <td class="num">{fmtMoney(p.metadata?.msrp_cents as number | undefined)}</td>
             <td class="muted">{metaStr(p, 'style')}</td>
           </tr>
@@ -206,6 +222,13 @@
     font-variant-numeric: tabular-nums;
   }
   .muted {
+    color: var(--static);
+  }
+  .stock-failed {
+    margin: 0 0 12px;
+    font-size: 13px;
+  }
+  .stock-unknown {
     color: var(--static);
   }
   .retired {

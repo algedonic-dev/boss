@@ -174,6 +174,7 @@ fn the_spa_reads_the_departments_registry_and_not_the_employee_drawer() {
 /// company's instance as nobody's department, and a row that differs
 /// would have the brewery's publish KEEP the migration's version and
 /// name the field, on the one instance where the brewery is the tenant.
+/// The one row the file must lack is the platform's `it` (c87e3d6d).
 #[tokio::test(flavor = "multi_thread")]
 async fn the_brewery_declares_exactly_the_rows_the_migration_seeds() {
     const SEED: &str = "examples/brewery/seeds/departments.toml";
@@ -214,11 +215,35 @@ async fn the_brewery_declares_exactly_the_rows_the_migration_seeds() {
     })
     .collect();
     assert_eq!(seeded.len(), 13, "the migration seeds thirteen rows");
+    // Since backlog c87e3d6d (2026-09-27) the file is the migration's
+    // rows with ONE left out and TWO added. Left out: `it`, the
+    // platform's department — the operator baseline hires into it and
+    // an employee's department is a departments row now, so it must
+    // never be an eviction candidate. Added: departments the brewery
+    // runs that no migration seeds (packaging, taproom) — harmless to
+    // the eviction, which only ever deletes a row it finds seeded.
+    let code = |r: &(String, String, String, i64, bool)| r.0.clone();
+    let seeded_codes: BTreeSet<String> = seeded.iter().map(code).collect();
+    let declared_codes: BTreeSet<String> = declared.iter().map(code).collect();
     assert_eq!(
-        declared, seeded,
-        "{SEED} and migration 20260919181324 disagree — the file is the brewery's declaration \
-         of the migration's rows, and example-reference-rows.sh evicts from a company's \
-         instance exactly what it names"
+        seeded_codes
+            .difference(&declared_codes)
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["it"],
+        "{SEED} must declare every row migration 20260919181324 seeds except the platform's \
+         `it` — a row the file lacks stays on every company's instance as nobody's department, \
+         and a file that declares `it` has a company's instance evict the department its \
+         operator baseline hires into"
+    );
+    let differs: Vec<_> = declared
+        .iter()
+        .filter(|d| seeded_codes.contains(&d.0) && !seeded.contains(d))
+        .collect();
+    assert!(
+        differs.is_empty(),
+        "{SEED} and migration 20260919181324 disagree on {differs:?} — the brewery's publish \
+         would KEEP the migration's version and name the field"
     );
 }
 

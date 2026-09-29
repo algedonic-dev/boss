@@ -51,9 +51,10 @@ pub struct Employee {
     /// assigned.
     #[serde(default)]
     pub role: Option<String>,
-    /// Class registry code under
-    /// `(subject_kind='employee', member_attribute='department')`.
-    /// Validated on writes via the boss-classes-client. `None` until assigned.
+    /// A code of the departments registry (`GET /api/departments`, the
+    /// `departments` table). Validated on writes against its
+    /// un-retired rows (`crate::departments`) — it was an `employee`
+    /// department Class until backlog c87e3d6d. `None` until assigned.
     #[serde(default)]
     pub department: Option<String>,
     pub skill_level: Option<u8>,

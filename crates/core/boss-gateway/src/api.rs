@@ -33,6 +33,21 @@ pub struct SessionResponse {
     /// unknown users — the SPA renders those as "unrecognized".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// The identity every request this session makes carries in
+    /// `x-boss-user` — `Session::policy_id` and the effective role — so
+    /// the SPA asks `POST /api/policy/check` about ITSELF and not about a
+    /// people row that may say otherwise (a login maps an unregistered
+    /// role to `visitor`; a role edited mid-session is not in the cookie).
+    /// Always present (backlog 9dad102c).
+    pub policy_user: PolicyUser,
+}
+
+/// `{id, role}` — the two fields of `boss_policy_client::User` that
+/// policy's decision and its self-arm read.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct PolicyUser {
+    pub id: String,
+    pub role: String,
 }
 
 impl From<Session> for SessionResponse {
@@ -48,7 +63,12 @@ impl From<Session> for SessionResponse {
     /// complete. Pulled out of the handler so that contract is a
     /// tested value rather than a shape assembled inline.
     fn from(s: Session) -> Self {
+        let policy_user = PolicyUser {
+            id: s.policy_id().to_string(),
+            role: s.effective_role().to_string(),
+        };
         Self {
+            policy_user,
             username: s.username,
             expires_at: s.expiry,
             employee_id: s.employee_id,
@@ -359,9 +379,16 @@ mod tests {
             expires_at: 1234567890,
             employee_id: None,
             role: None,
+            policy_user: PolicyUser {
+                id: "alice".into(),
+                role: "visitor".into(),
+            },
         };
         let json = serde_json::to_string(&r).unwrap();
-        assert_eq!(json, r#"{"username":"alice","expires_at":1234567890}"#);
+        assert_eq!(
+            json,
+            r#"{"username":"alice","expires_at":1234567890,"policy_user":{"id":"alice","role":"visitor"}}"#
+        );
     }
 
     /// Tenant manifest + revenue categories both read from the
@@ -596,6 +623,45 @@ shop = true
         assert!(json.contains(r#""role":"break-glass""#), "{json}");
     }
 
+    /// The SPA asks `POST /api/policy/check` about itself with the
+    /// `policy_user` this endpoint answers, and boss-policy's self-arm
+    /// (`may_read_for`) admits the body only when its id AND role equal
+    /// the `x-boss-user` the role-header layer signed onto that same
+    /// request. So the two must be one identity for every session shape
+    /// — an employee, a guest, break-glass, a roleless and a blank-role
+    /// login — or the check 403s and the web hides every write it gates,
+    /// for everyone (backlog 9dad102c, the risk its triage named).
+    #[test]
+    fn the_session_answer_names_the_identity_every_request_carries() {
+        let mut employee = Session::new("david@algedonic.dev", 3600);
+        employee.employee_id = Some("emp-001".into());
+        employee.role = Some("platform-admin".into());
+        let mut guest = Session::new("guest@algedonic.dev", 3600);
+        guest.role = Some("visitor".into());
+        let (_cookie, break_glass) = boss_gateway::break_glass::mint_session(KEY);
+        let roleless = Session::new("nobody@example.com", 3600);
+        let mut blank = Session::new("blank@example.com", 3600);
+        blank.employee_id = Some("emp-blank".into());
+        blank.role = Some("  ".into());
+
+        for s in [employee, guest, break_glass, roleless, blank] {
+            let header: serde_json::Value =
+                serde_json::from_str(&crate::role_headers::build_user_json(&s)).unwrap();
+            let answer = SessionResponse::from(s.clone());
+            assert_eq!(
+                (
+                    answer.policy_user.id.as_str(),
+                    answer.policy_user.role.as_str()
+                ),
+                (
+                    header["id"].as_str().unwrap(),
+                    header["role"].as_str().unwrap()
+                ),
+                "/api/session and x-boss-user disagree for {s:?}"
+            );
+        }
+    }
+
     #[test]
     fn session_response_includes_employee_id_and_role_when_set() {
         let r = SessionResponse {
@@ -603,11 +669,15 @@ shop = true
             expires_at: 1234567890,
             employee_id: Some("emp-cto".into()),
             role: Some("cto".into()),
+            policy_user: PolicyUser {
+                id: "emp-cto".into(),
+                role: "cto".into(),
+            },
         };
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(
             json,
-            r#"{"username":"emp-cto@example.com","expires_at":1234567890,"employee_id":"emp-cto","role":"cto"}"#
+            r#"{"username":"emp-cto@example.com","expires_at":1234567890,"employee_id":"emp-cto","role":"cto","policy_user":{"id":"emp-cto","role":"cto"}}"#
         );
     }
 }

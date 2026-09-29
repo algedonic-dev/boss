@@ -65,7 +65,7 @@ pub const PLATFORM_OWNER_READER: &str = r#"{"id":"automation:platform-owner","ro
 /// Production adapter over reqwest, with the per-process cache.
 pub struct ReqwestPlatformOwner {
     base_url: String,
-    http: reqwest::Client,
+    http: boss_core::machine_token::Client,
     /// `BOSS_PLATFORM_OWNER` as read at construction — a process's
     /// environment does not change under it, and reading it once is
     /// what lets a test set it without an env write.
@@ -102,10 +102,8 @@ impl ReqwestPlatformOwner {
     /// The query this adapter sends, so a test can pin it and a reader
     /// can find it.
     pub fn url(&self) -> String {
-        format!(
-            "{}/api/people?role={PLATFORM_ADMIN_ROLE}&status=active",
-            self.base_url
-        )
+        // The one spelling, shared with the gateway's adapter (3c92c5b8).
+        format!("{}{}", self.base_url, platform_owner::roster_path())
     }
 
     fn cached(&self) -> Option<(Instant, String)> {

@@ -244,7 +244,7 @@ pub(crate) fn resolve_job_id(candidates: &[Value], given: &str) -> Result<String
 /// a write that cannot land costs a printed line saying what to do by
 /// hand, which is also the warning the builder wanted at park time.
 pub(crate) async fn route_linked_item(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     item_id: &str,
     car_id: &str,
     branch: &str,
@@ -348,7 +348,7 @@ pub(crate) async fn run(
     // The operator's now, taken once at the CLI entry point.
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
 
     // The receipt first: refuse before anything is created, so a red
     // gate costs a line of output rather than a half-filled packet.
@@ -363,6 +363,16 @@ pub(crate) async fn run(
     )?;
     let head_now = crate::gate::resolve_sha(branch);
     let receipt = receipt_for(&open, branch, &head_now)?;
+    // A CAR THAT TOUCHES A MUTATING VERB IS NOT PARKED BY A VERB THAT
+    // CANNOT HOLD IT (backlog fdbb447e part 3): this one files and
+    // refreshes cars unheld, so such a car would board before its
+    // review. Refused before anything is written, by the one predicate
+    // `boss gate` and `boss rerail --finish` read.
+    let base = crate::freshness::observe(std::path::Path::new("."), branch).base;
+    let judged = crate::mutating_verb::judge(std::path::Path::new("."), &base, &head_now);
+    if let Some(why) = crate::mutating_verb::park_refusal(branch, &judged) {
+        anyhow::bail!("{why}");
+    }
     println!(
         "boss park: {branch} is green at {} ({})",
         &receipt.head[..12.min(receipt.head.len())],

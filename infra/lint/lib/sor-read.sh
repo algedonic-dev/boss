@@ -62,8 +62,13 @@ LINT_SOR_WAIT_SECONDS=60
 # `reader_header`). The id is the gate's own actor, automation:gate-runner,
 # because every lint runs under infra/gate.sh; it signs here with the
 # read role alone, so no lint can write through this helper.
-# `a_lint_read_of_the_record_is_signed` holds every caller to it.
-LINT_SOR_READER='{"id":"automation:gate-runner","role":"audit-readonly","access_tier":"auditor","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
+# `a_lint_read_of_the_record_is_signed` holds every caller to it. The
+# shape itself is infra/lib/sor-reader.sh's, the one shell spelling
+# node-roles.sh signs with too (backlog e5f7b51e; it was a literal copy
+# here until then).
+# shellcheck source=infra/lib/sor-reader.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../../lib/sor-reader.sh" || exit 3
+LINT_SOR_READER=$(sor_reader_header automation:gate-runner)
 
 # lint_sor_read WHO SERVICE URL BODY_FILE — prints the HTTP code.
 lint_sor_read() {

@@ -7,6 +7,7 @@
   // shaped pages live in the regular sidebar gated by the policy
   // role check.
 
+  import ClassesReadFailed from '@boss/web-kit/ui/ClassesReadFailed.svelte';
   import { session } from '@boss/web-kit/session/session.svelte';
   import { moduleEnabled, getLabel } from '@boss/web-kit/session/manifest.svelte';
   import { canSeeRoute, type Role } from '@boss/web-kit/session/permissions';
@@ -273,6 +274,7 @@
           Couldn't load your employee record — {session.value.error}.
         </p>
       {/if}
+      <ClassesReadFailed subjectKind="employee" what="roles" fallback="The sidebar shows every surface, not the ones your role declares." style="font-size:12px" />
     </div>
   </aside>
 

@@ -1190,10 +1190,43 @@ ensure_declared_secrets() {
 
 # converge_held HOLD_FILE — an operator's hold stands: print its reason
 # and return 0; no hold, return 1. The runner asks before it builds.
+#
+# ANYTHING STANDING AT THE PATH HOLDS (backlog d94d287e). The runner
+# reads as david what root wrote; a hold that stands and cannot be read
+# used to fail `cat` and pass as "no hold", so the roll went ahead
+# against a human's stop. Unreadable is held, and says why.
+#
+# AN UNSEARCHABLE DIRECTORY HOLDS TOO (review F3 of d94d287e). When david
+# cannot search the hold's directory, `[ -e ]` answers false exactly as
+# it does for no hold at all, so that case is told apart before "no hold"
+# is answered. And what stands there is NAMED: a directory, a socket or
+# a FIFO at the path is not an unreadable hold.
 converge_held() {
-    local f="$1"
-    [ -f "$f" ] || return 1
-    cat "$f"
+    local f="$1" d who kind
+    d="$(dirname -- "$f")"
+    who="$(id -un 2>/dev/null || id -u)"
+    if [ -e "$f" ] || [ -L "$f" ]; then
+        if [ -f "$f" ] && cat -- "$f" 2>/dev/null; then
+            return 0
+        fi
+        if [ -f "$f" ]; then
+            echo "a hold stands at $f but cannot be read as $who — held until it is released"
+        else
+            kind="$(stat -c %F -- "$f" 2>/dev/null || echo "something")"
+            echo "a $kind stands at $f, where the hold lives — held until it is removed"
+        fi
+        return 0
+    fi
+    if [ -d "$d" ] && [ ! -x "$d" ]; then
+        echo "the hold's directory $d cannot be searched as $who, so whether a hold stands cannot be read — held"
+        return 0
+    fi
+    case "$(LC_ALL=C stat -- "$d" 2>&1 >/dev/null)" in
+        *"Permission denied"*)
+            echo "the hold's directory $d cannot be reached as $who, so whether a hold stands cannot be read — held"
+            return 0 ;;
+    esac
+    return 1
 }
 
 # THE RUN ANSWERS THE PACKET THAT ASKED FOR IT (backlog d66f92b2).

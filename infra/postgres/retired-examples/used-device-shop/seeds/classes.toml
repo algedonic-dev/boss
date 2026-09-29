@@ -23,8 +23,20 @@
 # kinds, account-team roles, `auditor`) are not here: no instance got
 # them without publishing the shop. The platform's rows are not here
 # either (`platform-admin`, `audit-readonly`, `owner`, `smoke-tester`,
-# the `it` department, `hq` and `field-region`, which the platform's
-# default locations wear) — a candidate is a row an instance may lose.
+# `hq` and `field-region`, which the platform's default locations
+# wear) — a candidate is a row an instance may lose. Two rows the shop's
+# seed never carried are here too, the marketing-asset kinds `brief-body`
+# and `retro` (backlog 9b28f849): their section at the foot says why.
+#
+# The `it` department Class IS here since backlog c87e3d6d (2026-09-27).
+# It sat in the same 01-registries.sql block as its ten siblings and was
+# kept back as the platform's because the operator baseline hires into
+# `it` and an employee's department was validated against these Classes.
+# It is not any longer: an employee's department is a row of the
+# departments registry, where the platform's `it` lives now (migration
+# 20260919181324 seeds it and no example declares it). So no department
+# Class is the platform's, and the migration's `it` Class is residue
+# like the rest of the block.
 #
 # HELD EQUAL TO THE MIGRATION, not by a comment (CLAUDE.md §9a):
 # crates/core/boss-testing/tests/example_reference_rows_sh.rs refuses a
@@ -169,7 +181,12 @@ subject_kind = "employee"
 member_attribute = "role"
 code = "brand-designer"
 
-# --- employee departments (all but `it`, the platform's) ---------------
+# --- employee departments (all eleven, `it` included — c87e3d6d) -------
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "department"
+code = "it"
 
 [[class]]
 subject_kind = "employee"
@@ -245,3 +262,27 @@ code = "clinic"
 subject_kind = "location"
 member_attribute = "kind"
 code = "warehouse-zone"
+
+# --- marketing-asset kinds (backlog 9b28f849, decided 2026-09-28) -------
+# The two of 01-registries.sql's nine that no live example declares. No
+# example's seed file ever carried them — the migration seeded them for
+# the marketing launch motion (brief, retro) that retired with the shop
+# (a8991c86, the car that retired the launch calendar and the
+# marketing-launch StepType) — and they are here because this list is
+# where a retired example's migration rows are declared: measured
+# 2026-09-28 on origin/main 7b46f277, 0 of the brewery's 43 assets wear
+# either and no code names them. The seven the brewery uses moved into
+# examples/brewery/seeds/classes.json. A running instance retires these
+# two through the Class registry's door (POST /api/classes/
+# marketing-asset/{code}/retire, a class.retired fact), since a
+# migration may not rewrite a Class (migrations-declare-schema-only.sh).
+
+[[class]]
+subject_kind = "marketing-asset"
+member_attribute = "kind"
+code = "brief-body"
+
+[[class]]
+subject_kind = "marketing-asset"
+member_attribute = "kind"
+code = "retro"

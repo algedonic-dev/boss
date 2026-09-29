@@ -32,9 +32,16 @@
 //! skipped silently: every lint is in exactly one of the two sets.
 //!
 //! The roster is asked of `infra/gate.sh --roster`, never re-derived
-//! from the directory: the four lints the gate does not pre-flight
-//! (live-DB sweeps, a built-binary check, the web install) are excluded
-//! THERE, once, and pinned by gate_sh.rs.
+//! from the directory: the lints the gate does not pre-flight (live-DB
+//! sweeps, built-binary checks, the web install, and since design
+//! d349e0ba the two live-registry comparisons) are excluded THERE, once,
+//! by their own `# consist: skip` headers, and pinned by gate_sh.rs. So
+//! this sweep does not run `the-live-protocols-are-the-authored-
+//! protocols` or `the-live-rules-are-the-authored-rules` against the
+//! live estate: a car's `test` check went red on a live kind its base
+//! predated (gate 2f82e7fa, backlog b79054b2). Both are still invoked by
+//! path below, against an unreachable registry, so their self-test and
+//! tree half keep running in this suite.
 
 use boss_testing::repo_root;
 use std::collections::BTreeMap;
@@ -141,6 +148,14 @@ const NOT_SCANNERS: &[(&str, &str)] = &[
     (
         "migrations-append-only",
         "branch-diff check on the migration set; empty on the trunk by construction",
+    ),
+    (
+        "a-rule-edit-bumps-its-version",
+        "branch-diff check on the dispatcher rule files; empty on the trunk by construction",
+    ),
+    (
+        "break-glass-awaiting-re-enrolment-only-shrinks",
+        "branch-diff ratchet on the break-glass waiver list; nothing new on the trunk by construction, and the list is meant to reach zero rows",
     ),
     (
         "a-car-stays-under-the-edit-level",

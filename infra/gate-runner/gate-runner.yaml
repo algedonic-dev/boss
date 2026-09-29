@@ -358,9 +358,14 @@ spec:
             runAsGroup: 1500
             capabilities: {drop: ["ALL"]}
           resources:
-            # CPU/memory: three concurrent gates request 12 CPU / 24Gi
-            # against w-1's 32 / 64Gi; the 20-CPU limit lets a lone
-            # gate use the box. ephemeral-storage is the DISK half of
+            # CPU/memory: four concurrent gates (policy v3, backlog
+            # 366c2ed5, 2026-09-28) request 16 CPU / 32Gi against w-1's
+            # 32 / 63Gi; the 20-CPU limit lets a lone gate use the box.
+            # Disk at four: 4 x 90Gi ephemeral + the 200Gi seed + ~39G
+            # containerd fits the 929GB disk. Five is the measured
+            # cliff (2026-08-26: I/O pressure 65%, a ~35-min gate took
+            # ~93), so four is measured for a day before any further
+            # step. ephemeral-storage is the DISK half of
             # the concurrency bound: each workspace is seed (~74G) +
             # rebuild delta + clone, and the request makes the
             # SCHEDULER refuse a gate the node's disk cannot hold —

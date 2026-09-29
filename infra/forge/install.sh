@@ -145,6 +145,26 @@ if [ "$ETC" = "/etc/systemd/system" ] && [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+# THE CONVERGE HOLD'S DIRECTORY, BEFORE ANYTHING ELSE (backlog d94d287e).
+# The hold moved out of world-writable /var/tmp to /var/lib/boss
+# (forge-defaults.sh says why); this root step makes that directory
+# root:root 0755 on every tick and, once, carries a hold standing at the
+# old path across. FIRST, because this tick's checkout is the one that
+# moved the path: the deploy runner reading the new path while a hold
+# still stood at the old one is the window this closes, and every line
+# below it is time the window would stay open. Its failure is carried,
+# not fatal, like the ops runner's: a refused prepare reds the run and
+# names itself, but never leaves a unit uninstalled. A scratch run (the
+# lints, INSTALL_ETC elsewhere) leaves the host's directory alone unless
+# it names a hold of its own.
+hold_rc=0
+if [ "$ETC" = "/etc/systemd/system" ] || [ -n "${BOSS_CONVERGE_HOLD:-}" ]; then
+    bash "${HERE}/converge-hold.sh" prepare || hold_rc=$?
+    [ "$hold_rc" -eq 0 ] || run_summary_field converge_hold "prepare failed (exit $hold_rc) — see the journal"
+else
+    echo "install.sh: scratch run (INSTALL_ETC=$ETC) — the converge hold's directory is the host's, left alone"
+fi
+
 # THE ADDRESS FILE, FIRST. /etc/boss/sor.env is the one place on this
 # host that spells the system of record and the forge's own addresses;
 # every unit installed below reads it with EnvironmentFile= (no `-`: a
@@ -239,7 +259,9 @@ if has_role cluster-operator; then
     # a second copy of the version pin is the drift CLAUDE.md §9a names.
     # One definition, sourced so it can report through run_summary_field.
     . "${HERE}/../estate/install-cluster-operator.sh"
-    install_cluster_operator
+    # The id forge-converge.sh reads the roles with, which picks the
+    # credentials checked here (backlog f371c749).
+    install_cluster_operator "${BOSS_NODE_ID:-forge}"
 
     # THE CLI, FROM THE IMAGE AT THE SHA THIS CONVERGE CHECKED OUT.
     # forge-converge.sh hands the sha over as BOSS_CONVERGE_SHA (root
@@ -329,6 +351,18 @@ INSTALL_ETC="$ETC" INSTALL_SYSTEMCTL="$SYSTEMCTL" \
     bash "${HERE}/../ops/install-ops-runner.sh" forge || ops_runner_rc=$?
 installed=$((installed + 1))
 
+# THE RECOVERY KIT'S READER (backlog c1bb822e): a root-owned copy of
+# recovery-kit-read.sh outside this checkout, and the one sudoers rule
+# that grants it — the review of car 3d12b774 refused a rule pointing
+# into a tree its grantee can edit. Carried, not fatal, like the ops
+# runner's. A scratch run (the lints) leaves /usr/local and /etc/sudoers.d
+# alone unless it names a directory of its own.
+kit_reader_rc=0
+if [ "$ETC" = "/etc/systemd/system" ] || [ -n "${INSTALL_KIT_LIBEXEC:-}" ]; then
+    bash "${HERE}/install-recovery-kit-reader.sh" || kit_reader_rc=$?
+    [ "$kit_reader_rc" -eq 0 ] || run_summary_field recovery_kit_reader "install failed (exit $kit_reader_rc) — see the journal"
+fi
+
 "$SYSTEMCTL" daemon-reload
 for u in "${UNITS[@]}"; do
     "$SYSTEMCTL" enable --now "${u}.timer"
@@ -367,4 +401,15 @@ if [ "$cli_rc" -ne 0 ]; then
     echo "install.sh: the CLI did NOT install (exit $cli_rc) — cli_result on the packet says why." >&2
     echo "    Every unit converged; /usr/local/bin/boss is whatever the previous converge confirmed." >&2
     exit "$cli_rc"
+fi
+# The hold's prepare, the same way: its refusal is above, in its own words.
+if [ "$kit_reader_rc" -ne 0 ]; then
+    echo "install.sh: the recovery kit's reader did NOT install (exit $kit_reader_rc) — it named what failed" >&2
+    echo "    above. Every unit converged; no workstation can write a kit until it installs." >&2
+    exit "$kit_reader_rc"
+fi
+if [ "$hold_rc" -ne 0 ]; then
+    echo "install.sh: the converge hold's directory was NOT prepared (exit $hold_rc) — converge-hold.sh said why above." >&2
+    echo "    Every unit converged; a hold-converge refuses loudly until the directory is root's." >&2
+    exit "$hold_rc"
 fi

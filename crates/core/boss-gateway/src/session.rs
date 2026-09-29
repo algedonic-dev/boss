@@ -39,9 +39,22 @@ pub struct Session {
     #[serde(rename = "i", default, skip_serializing_if = "Option::is_none")]
     pub employee_id: Option<String>,
     /// Access tier: "operator" (full system) or "user" (frontend only).
-    /// Defaults to "user". Elevated to "operator" by FIDO key authentication.
+    /// Every login mints "user" — OIDC, password, guest and break-glass
+    /// alike. PRIVATE, with the one writer of "operator" beside it
+    /// ([`Session::into_operator`]), whose one caller is
+    /// `crate::elevation::elevate`, reached only after a verified
+    /// WebAuthn assertion from the platform owner's operator-tier
+    /// passkey (backlog 3c92c5b8; until then this comment promised an
+    /// elevation nothing did). Read it through [`Session::access_tier`],
+    /// which says "operator" only when `elevated_at` is set too.
     #[serde(rename = "t", default = "default_tier")]
-    pub access_tier: String,
+    access_tier: String,
+    /// When the passkey assertion that elevated this session was
+    /// verified, seconds since epoch. `None` on every session that was
+    /// never elevated; serialised only when set. The elevation lives no
+    /// longer than the cookie it rides: `expiry` is not extended.
+    #[serde(rename = "ea", default, skip_serializing_if = "Option::is_none")]
+    elevated_at: Option<u64>,
     /// Department for the authenticated employee (e.g. "executive").
     /// None for unknown users; serialised only when populated. Fed into
     /// `x-boss-user` so Department-scoped policy rules can match.
@@ -61,8 +74,12 @@ pub struct Session {
     pub direct_report_ids: Vec<String>,
 }
 
+/// The two tiers a session can carry.
+pub const USER_TIER: &str = "user";
+pub const OPERATOR_TIER: &str = "operator";
+
 fn default_tier() -> String {
-    "user".to_string()
+    USER_TIER.to_string()
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -82,7 +99,8 @@ impl Session {
             expiry: now() + ttl_seconds,
             role: None,
             employee_id: None,
-            access_tier: "user".to_string(),
+            access_tier: USER_TIER.to_string(),
+            elevated_at: None,
             department: None,
             territory_account_ids: Vec::new(),
             direct_report_ids: Vec::new(),
@@ -100,6 +118,49 @@ impl Session {
     /// It was `audit-readonly`, the widest read, until design 2830b6b7.
     pub fn effective_role(&self) -> &str {
         boss_core::roles::effective_role(self.role.as_deref())
+    }
+
+    /// The id this session acts as downstream: the signed `employee_id`
+    /// when it has one, otherwise the username — a guest or break-glass
+    /// session has no employee id by design. ONE definition, because two
+    /// readers must agree on it: the role-header layer that writes it into
+    /// `x-boss-user`, and `/api/session`, which hands it to the SPA so the
+    /// web can ask policy about itself (`POST /api/policy/check`, whose
+    /// self-arm admits only this id with this role — backlog 9dad102c).
+    pub fn policy_id(&self) -> &str {
+        self.employee_id.as_deref().unwrap_or(&self.username)
+    }
+
+    /// The tier every reader forwards: "operator" ONLY for a session
+    /// that was elevated — the stored tier AND the elevation's instant —
+    /// and "user" for everything else, whatever a cookie's `t` says. The
+    /// two fields are written together by [`Session::into_operator`]
+    /// alone, so the conjunction is belt and braces, not a second rule
+    /// (adversarial review of car 0bde9b99, M2).
+    pub fn access_tier(&self) -> &'static str {
+        if self.access_tier == OPERATOR_TIER && self.elevated_at.is_some() {
+            OPERATOR_TIER
+        } else {
+            USER_TIER
+        }
+    }
+
+    /// When this session was elevated, if it was.
+    pub fn elevated_at(&self) -> Option<u64> {
+        self.elevated_at
+    }
+
+    /// THE ONE WRITER OF THE OPERATOR TIER: this session, elevated by an
+    /// assertion verified at `asserted_at`, its expiry unchanged. Crate-
+    /// private, and its one caller is `crate::elevation::elevate`, which
+    /// decides whether it may be called — pinned there by a source scan
+    /// of this function's call sites.
+    pub(crate) fn into_operator(self, asserted_at: u64) -> Session {
+        Session {
+            access_tier: OPERATOR_TIER.to_string(),
+            elevated_at: Some(asserted_at),
+            ..self
+        }
     }
 
     /// Encode and sign into a cookie value.
@@ -175,6 +236,21 @@ mod tests {
         let decoded = Session::decode(&cookie, KEY).unwrap();
         assert_eq!(decoded.username, "alice");
         assert_eq!(decoded.expiry, s.expiry);
+    }
+
+    /// Review M2: the tier every reader forwards is "operator" only for
+    /// a session carrying the elevation's instant as well — a payload
+    /// that says `t: operator` alone (none is minted so, and the HMAC
+    /// guards the cookie, so this is belt and braces) reads as "user".
+    #[test]
+    fn a_stored_operator_tier_without_an_elevation_reads_user() {
+        let bare: Session =
+            serde_json::from_str(r#"{"u":"x","e":9999999999,"t":"operator"}"#).unwrap();
+        assert_eq!(bare.access_tier(), USER_TIER);
+        let elevated: Session =
+            serde_json::from_str(r#"{"u":"x","e":9999999999,"t":"operator","ea":1}"#).unwrap();
+        assert_eq!(elevated.access_tier(), OPERATOR_TIER);
+        assert_eq!(Session::new("alice", 60).access_tier(), USER_TIER);
     }
 
     #[test]

@@ -24,8 +24,14 @@
 //! And a plugin's Save-draft keeps the claim (backlog d88d9601 (a)):
 //! a draft sent the snapshot's `status` and `assignee_id`, which is the
 //! release body when someone claimed the step after the page loaded.
-//! The fix landed with car 6ef4a36b (both bundles now drop the drawn
-//! status and holder before the PUT); the second test holds it there.
+//! The fix landed with car 6ef4a36b (both bundles dropped the drawn
+//! status and holder before the PUT), and a test here held it. It was
+//! retired with backlog e39a9d2a (Stage 2 car 3), which took the rule a
+//! step further: a draft is now a merge-door PATCH alone, and every
+//! step PUT a bundle sends carries the status and nothing else, so no
+//! holder can ride one at all.
+//! `apps/web/src/steps/a-step-plugin-put-carries-no-metadata.test.ts`
+//! holds that, over every bundle and this directory's README.
 
 use boss_core::job::StepStatus;
 use boss_testing::repo_root;
@@ -120,42 +126,6 @@ fn every_status_a_step_plugin_names_is_a_step_status() {
         "a step's status is one of {statuses:?} — the step PUT refuses any other word \
          with 400 (StepStatus has no aliases: complete with 'completed', waive with \
          'skipped'):\n  {}",
-        offenders.join("\n  ")
-    );
-}
-
-#[test]
-fn a_plugins_save_draft_sends_no_status_and_no_holder() {
-    let draws_neither = Regex::new(
-        r"const\s*\{\s*status:\s*_\w+,\s*assignee_id:\s*_\w+,\s*\.\.\.\w+\s*\}\s*=\s*step",
-    )
-    .unwrap();
-    let mut drafting = 0;
-    let mut offenders = Vec::new();
-    for file in plugin_files()
-        .into_iter()
-        .filter(|p| p.extension().is_some_and(|e| e == "js"))
-    {
-        let text = std::fs::read_to_string(&file).unwrap();
-        if !text.contains("'Save draft'") {
-            continue;
-        }
-        drafting += 1;
-        if !draws_neither.is_match(&text) {
-            offenders.push(rel(&file));
-        }
-    }
-    // Two bundles carry a Save-draft today (sr-triage, diagnostic-call);
-    // none found means the button was renamed, not that the rule holds.
-    assert!(
-        drafting > 0,
-        "no plugin carries a 'Save draft' button — the scan moved"
-    );
-    assert!(
-        offenders.is_empty(),
-        "a Save-draft PUT that carries the page's drawn status and holder is the release \
-         body once someone else claims the step (backlog d88d9601): drop both from the \
-         drawn step before the PUT, as sr-triage.js does:\n  {}",
         offenders.join("\n  ")
     );
 }

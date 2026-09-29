@@ -143,6 +143,13 @@ BOSS_USER="{\"id\":\"$BOSS_ACTOR\",\"role\":\"platform-admin\",\"access_tier\":\
 TMP=$(mktemp -d) || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
+# The machine token rides to curl in a 0600 file, never in its argv,
+# where every local user reads it in ps (backlog 5f3ad356). After the
+# trap above, so the lib's cleanup is chained in front of it.
+# shellcheck source=infra/lib/secret-header.sh
+. "$SELF_DIR/../lib/secret-header.sh" || { echo "$NAME: $SELF_DIR/../lib/secret-header.sh is missing — nothing compared, nothing published" >&2; exit 78; }
+secret_header MT_HDR ${BOSS_MACHINE_TOKEN:+"x-boss-machine-token: $BOSS_MACHINE_TOKEN"} || exit 78
+
 # --- git, as the checkout's owner -------------------------------------------
 OWNER="$(stat -c %U "$REPO" 2>/dev/null)"
 OWNER_UID="$(stat -c %u "$REPO" 2>/dev/null)"
@@ -173,7 +180,7 @@ say "checkout $REPO at ${HEAD:0:12} — $MODE (packet ${OPS_REQUEST_ID:-none}, a
 # never "no train has landed".
 TRAINS_URL="$BOSS_JOBS_URL/api/jobs?kind=pr-train&limit=40&full=true"
 if ! curl -fsS --max-time 20 -H "x-boss-user: $BOSS_USER" \
-        ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+        ${MT_HDR:+-H "$MT_HDR"} \
         "$TRAINS_URL" > "$TMP/trains.json" 2>"$TMP/curl.err"; then
     say "cannot answer: the system of record did not answer the pr-train read ($TRAINS_URL): $(tr '\n' ' ' <"$TMP/curl.err")"
     say "whether this checkout carries the newest train cannot be judged, so nothing was compared or published"

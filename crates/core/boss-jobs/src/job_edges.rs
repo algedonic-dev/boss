@@ -47,11 +47,16 @@ impl JobEdgesRegistry for InMemoryJobEdges {
             description: d.into(),
         };
         Ok(vec![
+            // Migration 110's own words. The double carried only the
+            // first sentence until the adapters-agree suite held both
+            // copies to one roster (backlog be459ab9, 2026-09-29), so
+            // an instrument served by the double lost the half that
+            // says who clears the wait.
             mk(
                 "*",
                 "waiting_on",
                 "job_id",
-                "The Job whose closure this Job waits on",
+                "The Job whose closure this Job waits on. Boards render the wait; the dispatcher clears it when the blocker closes.",
             ),
             // The three RELATION edges (design c0d2787a): plain facts
             // about how two packets stand to each other, carrying no

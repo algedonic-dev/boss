@@ -75,7 +75,7 @@ struct ProducedProduct {
 }
 
 pub struct ProductsProduce {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     products_base: String,
     jobs_base: String,
     inventory_base: String,

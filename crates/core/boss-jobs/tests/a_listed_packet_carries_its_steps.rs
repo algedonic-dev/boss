@@ -32,11 +32,11 @@
 //! stamps, and without `metadata` or `fields`. `full=true` serves them
 //! whole, and every reader that reads a listed step's metadata asks for
 //! it — the ops-runner first among them, whose query below is the one
-//! it sends — so the default can flip to slim once every deployed copy
-//! of those readers asks (the server's `STEPS_WHOLE_BY_DEFAULT`). A
-//! slim step has no metadata key at all, never an empty one that reads
-//! as "the step recorded nothing", and the envelope says which shape it
-//! served (`full`).
+//! it sends. Since backlog ea80b5fd an unflagged read is SLIM. A slim
+//! step has no metadata key at all, never an empty one that reads as
+//! "the step recorded nothing"; it carries `slim: true`, which a typed
+//! `Step` parse refuses; and the envelope says which shape it served
+//! (`full`).
 
 use std::sync::Arc;
 
@@ -44,7 +44,9 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use boss_clock_client::{ClockClient, ClockNow, FixedClockClient};
-use boss_core::job::{Job, JobId, JobStatus, Priority, Step, StepId, StepStatus, Subject};
+use boss_core::job::{
+    Job, JobId, JobStatus, Priority, SLIM_STEP_MARKER, Step, StepId, StepStatus, Subject,
+};
 use boss_core::port::EventBus;
 use boss_core::publisher::DomainPublisher;
 use boss_jobs::InMemoryJobs;
@@ -61,6 +63,8 @@ use uuid::Uuid;
 
 const FIRST: &str = "00000000-0000-0000-0000-00000000f001";
 const SECOND: &str = "00000000-0000-0000-0000-00000000f002";
+const ALERT: &str = "00000000-0000-0000-0000-00000000a1e7";
+const FAILED_LINE: &str = "publish-drift: FAILED — the mirror refused the push";
 
 fn day(y: i32, m: u32, d: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, d).expect("valid date")
@@ -149,7 +153,20 @@ async fn seed() -> Router {
     }));
     for (id, verb, exit) in [(FIRST, "converge", "0"), (SECOND, "publish-drift", "75")] {
         jobs.create_job(&request(id, verb)).await.expect("job");
-        jobs.add_step(&execute_step(id, exit)).await.expect("step");
+        let mut step = execute_step(id, exit);
+        if id == SECOND {
+            // The note jobs.complete_linked_step writes on a step whose
+            // verb FAILED, beside keys that are not part of it.
+            step.metadata = serde_json::json!({
+                "exit_code": exit,
+                "output": "a long verb output the list should not carry",
+                "failed": FAILED_LINE,
+                "failed_exit": "75",
+                "failed_source": FIRST,
+                "alert": ALERT,
+            });
+        }
+        jobs.add_step(&step).await.expect("step");
     }
     let state = JobsApiState::minimal(jobs, bus, publisher, policy, clock);
     router(state)
@@ -251,14 +268,24 @@ async fn a_listed_step_carries_no_metadata_when_asked_slim() {
             row["metadata"]["verb"].is_string(),
             "the JOB's metadata still rides: {row}"
         );
+        // The shape is marked on the step itself, so a TYPED reader
+        // that forgot `full=true` fails instead of reading a step that
+        // recorded nothing (backlog ea80b5fd).
+        assert_eq!(step[SLIM_STEP_MARKER], true, "{row}");
+        let refused = serde_json::from_value::<Step>(step.clone());
+        assert!(
+            refused.is_err(),
+            "a slim listed step must not parse as a Step: {row}"
+        );
     }
 }
 
-/// An unflagged read serves the shape its envelope names — whichever
-/// the server's default is — so a reader can always tell a slim step
-/// from a step that recorded nothing. Today that default is WHOLE
-/// (expand, then contract: `STEPS_WHOLE_BY_DEFAULT`), so every reader
-/// still on a copy that never asks keeps what it reads until the flip.
+/// The contract, flipped (backlog ea80b5fd, 2026-09-27): an unflagged
+/// read serves SLIM steps and its envelope says so. Every reader of a
+/// listed step's metadata asks `full=true` by name — the sweep that
+/// moved them landed as train #740 and every deployed copy converged
+/// past it before this flipped — so a reader that does not ask reads
+/// only what a board selects and gates on.
 #[tokio::test]
 async fn an_unflagged_list_serves_the_shape_its_envelope_names() {
     let app = seed().await;
@@ -266,16 +293,65 @@ async fn an_unflagged_list_serves_the_shape_its_envelope_names() {
     let full = body["full"]
         .as_bool()
         .unwrap_or_else(|| panic!("the envelope names its shape: {body}"));
-    assert!(
-        full,
-        "the default stays whole until every reader asks: {body}"
-    );
+    assert!(!full, "an unflagged read is slim: {body}");
     for row in body["data"].as_array().expect("data array") {
-        assert_eq!(
-            execute_of(row).get("metadata").is_some(),
-            full,
-            "a step's metadata rides exactly when the envelope says full: {row}"
-        );
+        let step = execute_of(row);
+        assert!(step.get("metadata").is_none(), "{row}");
+        assert_eq!(step[SLIM_STEP_MARKER], true, "{row}");
+    }
+}
+
+/// A whole step carries no slim marker, and parses as a Step.
+#[tokio::test]
+async fn a_whole_listed_step_carries_no_slim_marker() {
+    let app = seed().await;
+    let body = list(&app, "kind=ops-request&full=true").await;
+    for row in body["data"].as_array().expect("data array") {
+        let step = execute_of(row);
+        assert!(step.get(SLIM_STEP_MARKER).is_none(), "{row}");
+        serde_json::from_value::<Step>(step.clone())
+            .unwrap_or_else(|e| panic!("a whole listed step parses: {e}: {row}"));
+    }
+}
+
+/// THE FAILED-VERB NOTE IS A SERVER READING (backlog ea80b5fd). The
+/// receiving yard drew a step whose verb FAILED as troubled by reading
+/// the note off the listed step's metadata, so it had to ask the whole
+/// list for four keys. `failed_verbs=true` puts exactly those keys on
+/// each listed step that carries the note, as `failed_verb`, and on a
+/// slim read — the rest of the metadata stays home.
+#[tokio::test]
+async fn a_slim_listed_step_carries_its_failed_verb_when_asked() {
+    let app = seed().await;
+    let body = list(&app, "kind=ops-request&failed_verbs=true").await;
+    assert_eq!(body["full"], false, "{body}");
+    let rows = body["data"].as_array().expect("data array");
+    let failed = rows
+        .iter()
+        .find(|r| r["id"] == SECOND)
+        .map(execute_of)
+        .expect("the failed request is listed");
+    assert_eq!(
+        failed["failed_verb"],
+        serde_json::json!({
+            "failed": FAILED_LINE,
+            "failed_exit": "75",
+            "failed_source": FIRST,
+            "alert": ALERT,
+        }),
+        "the note's four keys and nothing else: {failed}"
+    );
+    let clean = rows
+        .iter()
+        .find(|r| r["id"] == FIRST)
+        .map(execute_of)
+        .expect("the clean request is listed");
+    assert!(clean.get("failed_verb").is_none(), "{clean}");
+
+    // Opt-in, like `lane` and `origin`: nobody meets it unasked.
+    let unasked = list(&app, "kind=ops-request").await;
+    for row in unasked["data"].as_array().expect("data array") {
+        assert!(execute_of(row).get("failed_verb").is_none(), "{row}");
     }
 }
 

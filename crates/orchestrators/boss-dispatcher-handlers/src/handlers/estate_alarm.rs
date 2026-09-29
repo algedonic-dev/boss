@@ -51,6 +51,11 @@
 //!   cluster-operator without the root material only David can place,
 //!   714bc71f — recorded, never fatal, on the converge, so this is the
 //!   reader that interrupts someone).
+//!   And BLINDNESS to a hard class (a276f7c2): a reading the
+//!   comparator lists as unmeasured (`ops_credentials_unmeasured`,
+//!   `disk_unmeasured`, see [`BLIND_CLASSES`]) is informational once
+//!   and a `blind:<class>/<id>` alarm after [`PERSIST_N`] in a row —
+//!   a class nobody can see cannot raise its own alarm.
 //!   `observed_not_declared` is a paperwork gap and `drift` is config
 //!   — real, but not 03:00-urgent, and an alarm that cries over
 //!   paperwork trains operators to ignore it.
@@ -153,12 +158,8 @@ const WATCHED_SERIES: [(&str, bool); 4] = [
 ];
 
 pub struct EstateAlarm {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
-    /// The `now` the silence sweep measures observation ages against.
-    /// The dispatcher is not on the no-wallclock allowlist, so this
-    /// comes from the clock service like every other stamp.
-    clock: Arc<dyn boss_clock_client::ClockClient>,
     /// Who the packets this handler files are owned by — the platform
     /// owner through the port (backlog 3c23662d), resolved once per
     /// invocation by `common::owner_for_filing`; never a literal.
@@ -168,13 +169,11 @@ pub struct EstateAlarm {
 impl EstateAlarm {
     pub fn new(
         jobs_base: impl Into<String>,
-        clock_url: impl Into<String>,
         owner: Arc<dyn boss_core::platform_owner::PlatformOwner>,
     ) -> Arc<Self> {
         Arc::new(Self {
             client: api_client(),
             jobs_base: jobs_base.into(),
-            clock: Arc::new(boss_clock_client::ReqwestClockClient::new(clock_url)),
             owner,
         })
     }
@@ -312,61 +311,165 @@ fn entries<'a>(comparison: &'a Value, field: &str) -> impl Iterator<Item = &'a V
         .flatten()
 }
 
-/// The HARD findings of one comparison payload as (key, entry) pairs:
-/// `not_ready:<id>` / `gone:<id>` / `disk_tight:<id>` /
-/// `unit_unhealthy:<host>/<unit>`. The key is the dedup identity; the
-/// entry is the evidence excerpt the packet will carry. Ids arrive
-/// both bare (`not_ready` pushes strings) and wrapped (`{"id": ...}`),
-/// so both are read; anything else is ignored rather than guessed at.
-fn hard_findings(comparison: &Value) -> Vec<(String, Value)> {
-    let mut out = Vec::new();
-    for (field, prefix) in [
-        ("not_ready", "not_ready"),
-        ("declared_not_observed", "gone"),
-        // The host scope's disk floor (49a8d842): a machine below the
-        // headroom a full gate needs is as hard as a sick node.
-        ("disk_tight", "disk_tight"),
-        // A dead-letter that left NO durable record (8834804a): no
-        // packet to annotate, or the annotation write was itself the
-        // failure. The dispatcher counted it on its own surface, the
-        // cluster observer carried the count here, and this is the
-        // reader that owes nothing to the jobs API — the path CLAUDE.md
-        // §Diagnosis asks of an arm. Keyed on the dispatcher's id.
-        ("dead_letters_unrecorded", "dead_letters_unrecorded"),
-        // A door half dark past its declared band (backlog e6406701):
-        // keyed `<door>/<half>`, so WHICH half is down is the finding.
-        // Band-judged — see [`banded_findings`] — so it raises on sight.
-        ("door_dark", "door_dark"),
-        // A declared cluster-operator without its root material
-        // (backlog 714bc71f). The converge records it as not-ready and
-        // stays green, because no converge can place what only David
-        // can; this is the reader that makes the absence interrupt
-        // someone, keyed by host, the entry naming the act.
-        ("ops_credentials_absent", "ops_credentials_absent"),
-    ] {
-        for v in entries(comparison, field) {
-            let id = v
-                .as_str()
-                .or_else(|| v.get("id").and_then(Value::as_str))
-                .unwrap_or("");
-            if !id.is_empty() {
-                out.push((format!("{prefix}:{id}"), v.clone()));
-            }
-        }
-    }
+/// Every HARD finding class, as `(the comparison's findings field, the
+/// key prefix it raises under)` — ONE table, read by the raise
+/// ([`hard_findings`]) and by recovery's evidence test ([`evaluated`]),
+/// so a class cannot be raisable without the recovery knowing where its
+/// evaluation is recorded (backlog c11bfb77).
+pub(super) const HARD_CLASSES: [(&str, &str); 7] = [
+    ("not_ready", "not_ready"),
+    ("declared_not_observed", "gone"),
+    // The host scope's disk floor (49a8d842): a machine below the
+    // headroom a full gate needs is as hard as a sick node.
+    ("disk_tight", "disk_tight"),
+    // A dead-letter that left NO durable record (8834804a): no
+    // packet to annotate, or the annotation write was itself the
+    // failure. The dispatcher counted it on its own surface, the
+    // cluster observer carried the count here, and this is the
+    // reader that owes nothing to the jobs API — the path CLAUDE.md
+    // §Diagnosis asks of an arm. Keyed on the dispatcher's id.
+    ("dead_letters_unrecorded", "dead_letters_unrecorded"),
+    // A door half dark past its declared band (backlog e6406701):
+    // keyed `<door>/<half>`, so WHICH half is down is the finding.
+    // Band-judged — see [`banded_findings`] — so it raises on sight.
+    ("door_dark", "door_dark"),
+    // A declared cluster-operator without its root material
+    // (backlog 714bc71f). The converge records it as not-ready and
+    // stays green, because no converge can place what only David
+    // can; this is the reader that makes the absence interrupt
+    // someone, keyed by host, the entry naming the act.
+    ("ops_credentials_absent", "ops_credentials_absent"),
     // The quiet-conductor class (729329c6): a watched unit the
     // observer derived unhealthy — dead, failed, crash-looping, or
     // active-but-functionless enough that its own health derivation
     // said no. Keyed host + unit: the same unit sick on two hosts is
     // two conditions.
-    for v in entries(comparison, "units_unhealthy") {
+    ("units_unhealthy", "unit_unhealthy"),
+];
+
+/// The classes a comparator can be BLIND to, as `(the findings field
+/// that lists an unmeasured reading, the HARD findings field it could
+/// not judge)` (backlog a276f7c2). One unmeasured reading stays
+/// informational — a guess is the crying-wolf class — but a declared
+/// host left unmeasured on [`PERSIST_N`] consecutive rows of its series
+/// is a condition: the forge read `unmeasured: /etc/boss-ops is not
+/// searchable by david` on 202 of 202 rows from 2026-09-26 and nothing
+/// filed, because only the `evaluated` record (c11bfb77) showed the
+/// gap, as an empty list. Raised as `blind:<hard field>/<id>`; recovery
+/// reads the hard field's `evaluated` list, so the two names must agree
+/// (pinned by `every_blind_class_blinds_a_hard_class`).
+pub(super) const BLIND_CLASSES: [(&str, &str); 2] = [
+    ("ops_credentials_unmeasured", "ops_credentials_absent"),
+    ("disk_unmeasured", "disk_tight"),
+];
+
+/// The prefix of a blind class's keys (`blind:<hard field>/<id>`).
+const BLIND: &str = "blind";
+
+/// The prefix of the silence sweep's keys (`unobserved:<series>`).
+const UNOBSERVED: &str = "unobserved";
+
+/// The id one findings entry is keyed by. Ids arrive both bare
+/// (`not_ready` pushes strings) and wrapped (`{"id": ...}`); a unit is
+/// `<host>/<unit>`. Anything else is ignored rather than guessed at.
+fn entry_id(field: &str, v: &Value) -> Option<String> {
+    let id = if field == "units_unhealthy" {
         let host = v.get("host").and_then(Value::as_str).unwrap_or("");
         let unit = v.get("unit").and_then(Value::as_str).unwrap_or("");
-        if !host.is_empty() && !unit.is_empty() {
-            out.push((format!("unit_unhealthy:{host}/{unit}"), v.clone()));
+        if host.is_empty() || unit.is_empty() {
+            return None;
         }
-    }
-    out
+        format!("{host}/{unit}")
+    } else {
+        v.as_str()
+            .or_else(|| v.get("id").and_then(Value::as_str))
+            .unwrap_or("")
+            .to_string()
+    };
+    (!id.is_empty()).then_some(id)
+}
+
+/// The HARD findings of one comparison payload as (key, entry) pairs:
+/// `not_ready:<id>` / `gone:<id>` / `disk_tight:<id>` /
+/// `unit_unhealthy:<host>/<unit>`, one per [`HARD_CLASSES`] row. The key
+/// is the dedup identity; the entry is the evidence excerpt the packet
+/// will carry.
+fn hard_findings(comparison: &Value) -> Vec<(String, Value)> {
+    HARD_CLASSES
+        .iter()
+        .flat_map(|&(field, prefix)| {
+            entries(comparison, field).filter_map(move |v| {
+                entry_id(field, v).map(|id| (format!("{prefix}:{id}"), v.clone()))
+            })
+        })
+        .collect()
+}
+
+/// The BLIND readings of one comparison as (key, entry) pairs:
+/// `blind:<hard field>/<id>` per [`BLIND_CLASSES`] row, the entry being
+/// the unmeasured reading itself (its `state` names why, verbatim).
+fn blind_findings(comparison: &Value) -> Vec<(String, Value)> {
+    BLIND_CLASSES
+        .iter()
+        .flat_map(|&(unmeasured, hard)| {
+            entries(comparison, unmeasured).filter_map(move |v| {
+                entry_id(unmeasured, v).map(|id| (format!("{BLIND}:{hard}/{id}"), v.clone()))
+            })
+        })
+        .collect()
+}
+
+/// The keys persistence intersects: every hard key and every blind one.
+/// Kept apart from [`hard_finding_keys`] so a single unmeasured reading
+/// is never read as a hard finding — only its persistence raises.
+fn alarm_keys(comparison: &Value) -> BTreeSet<String> {
+    let mut keys = hard_finding_keys(comparison);
+    keys.extend(blind_findings(comparison).into_iter().map(|(k, _)| k));
+    keys
+}
+
+/// Does this comparison RECORD that it evaluated `key`? The comparator
+/// lists, per findings field, every id it judged
+/// (`estate_compare::EVALUATED`); an id whose reading was unmeasured,
+/// unread, or simply not in the observation is not listed. Pure; the
+/// pin that every finding a comparator records is one it lists reads
+/// this, not [`evaluated`], so the shortcut there cannot hide a gap.
+pub(super) fn lists_as_evaluated(comparison: &Value, key: &str) -> bool {
+    let Some((prefix, id)) = key.split_once(':') else {
+        return false;
+    };
+    // A blind key names the hard FIELD it could not judge: the rows
+    // that list its id there are the ones that looked (a276f7c2).
+    let (field, id) = if prefix == BLIND {
+        let Some((field, id)) = id.split_once('/') else {
+            return false;
+        };
+        (field, id)
+    } else {
+        let Some(&(field, _)) = HARD_CLASSES.iter().find(|&&(_, p)| p == prefix) else {
+            return false;
+        };
+        (field, id)
+    };
+    comparison
+        .get(super::estate_compare::EVALUATED)
+        .and_then(|e| e.get(field))
+        .and_then(Value::as_array)
+        .is_some_and(|ids| ids.iter().any(|v| v.as_str() == Some(id)))
+}
+
+/// Is this comparison EVIDENCE about `key` — may its absence of the key
+/// be read as the condition gone (backlog c11bfb77)? Absence in a
+/// comparison that never looked is silence, and silence counted as
+/// recovery closed alarms with the words "the condition has recovered"
+/// over readings that could not have seen it. Three ways a row bears on
+/// a key: it carries the finding (a presence is an observation); it
+/// lists the key as evaluated; or the key is `unobserved:<series>`,
+/// whose evidence is the series' row arriving at all.
+pub(super) fn evaluated(comparison: &Value, key: &str) -> bool {
+    key.split_once(':').is_some_and(|(p, _)| p == UNOBSERVED)
+        || unrecovered_keys(comparison).contains(key)
+        || lists_as_evaluated(comparison, key)
 }
 
 /// The hard findings whose persistence the INSTRUMENT already
@@ -384,13 +487,14 @@ fn banded_findings(comparison: &Value) -> Vec<(String, Value)> {
 }
 
 /// The keys that say a condition has NOT recovered: every hard key,
-/// plus a door half dark again inside its band (`door_dimming`), keyed
+/// every blind one (a reading still unmeasured), plus a door half dark again inside its band (`door_dimming`), keyed
 /// as the `door_dark` it would become. A door that answered once and
 /// went dark again is not answering, and closing its alarm on three
 /// dimming readings would re-raise it a quarter-hour later — the flap
 /// the band exists to absorb. `estate.recover` judges by this set.
 pub(super) fn unrecovered_keys(comparison: &Value) -> BTreeSet<String> {
-    let mut keys = hard_finding_keys(comparison);
+    // A reading still unmeasured is a blind alarm not yet recovered.
+    let mut keys = alarm_keys(comparison);
     keys.extend(
         entries(comparison, "door_dimming")
             .filter_map(|v| v.get("id").and_then(Value::as_str))
@@ -434,12 +538,9 @@ fn persistent_keys(
         return BTreeSet::new();
     }
     let mut iter = same_series.iter();
-    let mut keys = iter
-        .next()
-        .map(|c| hard_finding_keys(c))
-        .unwrap_or_default();
+    let mut keys = iter.next().map(|c| alarm_keys(c)).unwrap_or_default();
     for c in iter {
-        let these = hard_finding_keys(c);
+        let these = alarm_keys(c);
         keys = keys.intersection(&these).cloned().collect();
     }
     keys
@@ -652,6 +753,61 @@ fn alarm_body(
     })
 }
 
+/// The urgent packet one persistently BLIND reading becomes (backlog
+/// a276f7c2). The unmeasured `state` is quoted verbatim, because the
+/// observer's own words name the act that clears it (`/etc/boss-ops is
+/// not searchable by david`); an entry with no state (a bare
+/// `disk_unmeasured` id) says so rather than inventing one. `(scope,
+/// host)` is the triggering series', as for every alarm, so
+/// `estate.recover` closes it on N rows that list the id evaluated.
+fn blind_body(
+    key: &str,
+    scope: &str,
+    host: Option<&str>,
+    evidence: &str,
+    entry: &Value,
+    owner: &str,
+) -> Value {
+    let (class, id) = key
+        .split_once(':')
+        .and_then(|(_, rest)| rest.split_once('/'))
+        .unwrap_or(("?", "?"));
+    let state = entry
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("(the reading records no state: no measurement arrived at all)");
+    let mut metadata = json!({
+        "area": "estate",
+        "estate_finding": key,
+        "scope": scope,
+        "detail": format!(
+            "Raised by estate.alarm (a276f7c2): the comparator could not judge \
+             `{class}` for `{id}` on {PERSIST_N} consecutive `{scope}` comparisons, \
+             so that hard class is BLIND there — its alarm cannot fire, and silence \
+             reads as health. The reading, verbatim: {state}. Latest entry: \
+             {latest}. Evidence: {evidence}. It closes itself once {PERSIST_N} \
+             comparisons list `{id}` in `evaluated.{class}` (estate.recover, \
+             c11bfb77). The series rides /api/estate/comparisons?scope={scope}.",
+            latest = excerpt(entry),
+        ),
+    });
+    if let (Some(h), Some(obj)) = (host, metadata.as_object_mut()) {
+        obj.insert("host".into(), json!(h));
+    }
+    json!({
+        "kind": "backlog-item",
+        "title": format!(
+            "ESTATE ALARM: {key} — {class} unmeasured for {id} on {PERSIST_N} consecutive comparisons: {state}"
+        ),
+        "subject": {"subject_kind": "custom", "id": "bosspipeline"},
+        "owner_id": owner,
+        "priority": "urgent",
+        "status": "open",
+        "tags": [],
+        "metadata": super::common::with_lane(metadata, InputChannel::Telemetry),
+    })
+}
+
 /// The urgent packet one door half dark past its band becomes (backlog
 /// e6406701). The title names the half, what it points at and the band
 /// — WHICH door is down is the first question, and a person reading the
@@ -708,7 +864,7 @@ fn door_body(key: &str, entry: &Value, evidence: &str, owner: &str) -> Value {
 /// `unobserved:kubernetes-nodes` for the cluster observer.
 fn unobserved_key(stale: &Value) -> String {
     format!(
-        "unobserved:{}",
+        "{UNOBSERVED}:{}",
         stale
             .get("series")
             .and_then(Value::as_str)
@@ -820,9 +976,12 @@ impl Handler for EstateAlarm {
                 .entry(key.clone())
                 .or_insert_with(|| door_body(key, entry, &evidence, &owner));
         }
+        // A blind reading (a276f7c2) rides the same persistence: one is
+        // weather, PERSIST_N in a row is a class nobody can see.
         let hard: Vec<(String, Value)> = hard_findings(comparison)
             .into_iter()
             .filter(|(k, _)| !banded.iter().any(|(b, _)| b == k))
+            .chain(blind_findings(comparison))
             .collect();
         if !hard.is_empty() {
             // The recorded series IS the state (the handler keeps
@@ -872,12 +1031,20 @@ impl Handler for EstateAlarm {
                         .map(|r| r.get("payload").cloned().unwrap_or_else(|| r.clone()))
                         .collect();
                     for key in persistent_keys(&payloads, scope, host, PERSIST_N) {
-                        let latest = hard
-                            .iter()
-                            .find(|(k, _)| *k == key)
-                            .map(|(_, e)| excerpt(e))
-                            .unwrap_or_default();
-                        let body = alarm_body(&key, scope, host, &evidence, &latest, &owner);
+                        let entry = hard.iter().find(|(k, _)| *k == key).map(|(_, e)| e);
+                        let body = if key.split_once(':').is_some_and(|(p, _)| p == BLIND) {
+                            blind_body(
+                                &key,
+                                scope,
+                                host,
+                                &evidence,
+                                entry.unwrap_or(&Value::Null),
+                                &owner,
+                            )
+                        } else {
+                            let latest = entry.map(excerpt).unwrap_or_default();
+                            alarm_body(&key, scope, host, &evidence, &latest, &owner)
+                        };
                         to_raise.entry(key).or_insert(body);
                     }
                 }
@@ -892,7 +1059,13 @@ impl Handler for EstateAlarm {
         // this on the triggering comparison having findings would make
         // the sweep run least when the estate looks healthiest — which
         // is exactly when a dead observer is lying loudest.
-        let now = boss_clock_client::now_from(&self.clock).await;
+        //
+        // Ages are measured at THE COMPARISON THAT FIRED THIS PASS — its
+        // event's own timestamp — not at the moment the dispatcher read
+        // it (backlog 2b03a2df): a redelivered or replayed comparison must
+        // judge, and write into an alarm's evidence, the age the estate
+        // had then. A firing with no instant is refused, not guessed.
+        let now = ctx.firing_instant()?;
         for (watched_scope, per_host) in WATCHED_SERIES {
             // A self-scoped series is read host by host (111996f5); a
             // whole-scope page is spent by its fastest host.
@@ -1163,6 +1336,104 @@ mod tests {
             .next()
             .expect("the hard finding");
         assert!(excerpt(&entry).contains("root:root 600"), "{entry}");
+        // One unmeasured reading is still weather, not a condition
+        // (a276f7c2): only PERSIST_N of them in a row raise `blind:`.
+        assert!(
+            persistent_keys(&[c], "host", Some("forge"), PERSIST_N).is_empty(),
+            "a single unmeasured reading must not alarm"
+        );
+    }
+
+    // ----- a class the comparator could not look at (a276f7c2) -----
+
+    /// The forge's host comparison as `estate.compare` computes it, with
+    /// its credentials reading in the observer's own words.
+    fn forge_host(state: &str) -> Value {
+        use crate::handlers::estate_compare::compare_host;
+        let declared = [json!({"id": "forge", "role": "forge", "roles": ["cluster-operator"]})];
+        let obs = json!({"scope": "host", "nodes": [{
+            "id": "forge", "cpu": 16, "memory_gb": 30, "disk_gb": 437, "disk_free_gb": 300,
+            "ready": true, "ops_credentials": {"dir": "/etc/boss-ops", "state": state}}]});
+        let mut c = compare_host(&declared, &obs);
+        c["scope"] = json!("host");
+        c
+    }
+
+    const UNSEARCHABLE: &str = "unmeasured: /etc/boss-ops is not searchable by david";
+    const BLIND_FORGE: &str = "blind:ops_credentials_absent/forge";
+
+    #[test]
+    fn a_class_unmeasured_on_n_consecutive_rows_raises_blind() {
+        // The live forge series, 2026-09-26..28: 202 of 202 rows read
+        // UNSEARCHABLE and nothing filed. Three in a row is a condition.
+        let blind = [
+            forge_host(UNSEARCHABLE),
+            forge_host(UNSEARCHABLE),
+            forge_host(UNSEARCHABLE),
+        ];
+        let keys = persistent_keys(&blind, "host", Some("forge"), PERSIST_N);
+        assert!(keys.contains(BLIND_FORGE), "{keys:?}");
+        // Two is not enough evidence.
+        assert!(persistent_keys(&blind[..2], "host", Some("forge"), PERSIST_N).is_empty());
+        // One reading that LOOKED breaks the run, whatever it found.
+        let broken = [
+            forge_host(UNSEARCHABLE),
+            forge_host("present"),
+            forge_host(UNSEARCHABLE),
+        ];
+        assert!(persistent_keys(&broken, "host", Some("forge"), PERSIST_N).is_empty());
+    }
+
+    #[test]
+    fn a_cluster_node_with_no_disk_reading_n_times_raises_blind() {
+        use crate::handlers::estate_compare::compare;
+        let row = || {
+            let mut c = compare(
+                &[json!({"id": "w-1", "role": "talos-worker"})],
+                &json!({"scope": "kubernetes-nodes", "nodes": [{"id": "w-1", "ready": true}]}),
+            );
+            c["scope"] = json!("kubernetes-nodes");
+            c
+        };
+        let keys = persistent_keys(&[row(), row(), row()], "kubernetes-nodes", None, PERSIST_N);
+        assert!(keys.contains("blind:disk_tight/w-1"), "{keys:?}");
+    }
+
+    #[test]
+    fn a_blind_alarm_quotes_the_unmeasured_state_verbatim() {
+        // The state names the act that clears it; the packet must carry
+        // it word for word, not a paraphrase.
+        let c = forge_host(UNSEARCHABLE);
+        let (key, entry) = blind_findings(&c)
+            .into_iter()
+            .next()
+            .expect("the blind finding");
+        assert_eq!(key, BLIND_FORGE);
+        let body = blind_body(&key, "host", Some("forge"), "ev", &entry, "emp-x");
+        let detail = body["metadata"]["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains(UNSEARCHABLE), "{detail}");
+        assert_eq!(body["metadata"]["estate_finding"], BLIND_FORGE);
+        assert_eq!(body["metadata"]["host"], "forge");
+        assert_eq!(body["priority"], "urgent");
+        // And a row that could not look carries the key as unrecovered,
+        // while one that listed the host evaluated is evidence it can see.
+        assert!(unrecovered_keys(&c).contains(BLIND_FORGE));
+        let seeing = forge_host("present");
+        assert!(!unrecovered_keys(&seeing).contains(BLIND_FORGE));
+        assert!(evaluated(&seeing, BLIND_FORGE));
+        assert!(lists_as_evaluated(&seeing, BLIND_FORGE));
+    }
+
+    /// Every blind class names a HARD class, so the key a blind alarm
+    /// carries resolves to the `evaluated` list its recovery reads.
+    #[test]
+    fn every_blind_class_blinds_a_hard_class() {
+        for (unmeasured, hard) in BLIND_CLASSES {
+            assert!(
+                HARD_CLASSES.iter().any(|&(f, _)| f == hard),
+                "`{unmeasured}` blinds `{hard}`, which is not a hard class"
+            );
+        }
     }
 
     #[test]
@@ -1709,6 +1980,7 @@ mod per_host_series_tests {
 
     fn firing(comparison: Value) -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "estate-alarm".into(),
             triggering_event_id: "evt-cmp-1".into(),
             triggering_topic: "estate.comparison.recorded".into(),
@@ -1716,12 +1988,18 @@ mod per_host_series_tests {
         }
     }
 
+    /// The comparison fired at `at` — its event's own timestamp, the
+    /// instant the silence half measures every age against (2b03a2df).
+    fn firing_at(comparison: Value, at: DateTime<Utc>) -> InvocationContext {
+        InvocationContext {
+            event_timestamp: Some(at),
+            ..firing(comparison)
+        }
+    }
+
     fn handler(base: String) -> Arc<EstateAlarm> {
-        // The clock is unreachable on purpose: `now` falls back to the
-        // wall clock, which is what the fixtures below are dated from.
         EstateAlarm::new(
             base,
-            "http://127.0.0.1:1",
             Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
         )
     }
@@ -1832,7 +2110,7 @@ mod per_host_series_tests {
             .map(|(_, r)| r["payload"].clone())
             .unwrap();
         let res = handler(stub.base.clone())
-            .invoke(&[], &firing(trigger))
+            .invoke(&[], &firing_at(trigger, now))
             .await;
         assert!(res.is_ok(), "{res:?}");
         assert_eq!(raised(&stub), vec!["disk_tight:boss-gcp".to_string()]);
@@ -1872,7 +2150,7 @@ mod per_host_series_tests {
         .await;
         let trigger = cmp_row("forge", forge_newest, false)["payload"].clone();
         let res = handler(stub.base.clone())
-            .invoke(&[], &firing(trigger))
+            .invoke(&[], &firing_at(trigger, now))
             .await;
         assert!(res.is_ok(), "{res:?}");
         assert_eq!(raised(&stub), vec!["unobserved:boss-gcp".to_string()]);
@@ -1903,10 +2181,85 @@ mod per_host_series_tests {
         .await;
         let trigger = cmp_row("forge", forge_newest, false)["payload"].clone();
         let res = handler(stub.base.clone())
-            .invoke(&[], &firing(trigger))
+            .invoke(&[], &firing_at(trigger, now))
             .await;
         assert!(res.is_ok(), "{res:?}");
         assert!(raised(&stub).is_empty(), "{:?}", raised(&stub));
+    }
+
+    /// A SERIES' AGE IS MEASURED AT THE COMPARISON THAT FIRED THE SWEEP
+    /// (backlog 2b03a2df). It was measured against the clock service at
+    /// the moment the dispatcher consumed the event, so a redelivered or
+    /// replayed comparison judged — and wrote into the alarm's evidence —
+    /// an age the estate never had at that comparison. Pinned on a series
+    /// dated days before the test runs: at the comparison's own instant
+    /// boss-gcp is sixteen hours quiet on a daily cadence, which is fresh.
+    #[tokio::test]
+    async fn a_series_age_is_measured_at_the_comparisons_instant() {
+        let at = DateTime::parse_from_rfc3339("2026-09-24T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let serve_at = |gcp_newest: DateTime<Utc>| {
+            let forge_newest = at - chrono::Duration::minutes(2);
+            let obs = interleaved(forge_newest, gcp_newest, obs_row);
+            let hosts = json!({"data": [
+                cmp_row("forge", forge_newest, false),
+                cmp_row("boss-gcp", gcp_newest, false),
+            ], "total": 2});
+            serve(vec![
+                ("/api/estate/comparisons?scope=host&latest_per=host", hosts),
+                ("/api/estate/comparisons", empty_listing()),
+                (
+                    "/api/estate/observations?scope=host&host=boss-gcp",
+                    page(&only(&obs, "boss-gcp"), 50),
+                ),
+                (
+                    "/api/estate/observations?scope=host&host=forge",
+                    page(&only(&obs, "forge"), 50),
+                ),
+                ("/api/estate/observations", empty_listing()),
+                ("/api/jobs", empty_listing()),
+            ])
+        };
+        let trigger = cmp_row("forge", at - chrono::Duration::minutes(2), false)["payload"].clone();
+        let fired = firing_at(trigger.clone(), at);
+
+        let fresh = serve_at(at - chrono::Duration::hours(16)).await;
+        let res = handler(fresh.base.clone()).invoke(&[], &fired).await;
+        assert!(res.is_ok(), "{res:?}");
+        assert!(
+            raised(&fresh).is_empty(),
+            "sixteen hours quiet is fresh AT THE COMPARISON: {:?}",
+            raised(&fresh)
+        );
+
+        // Four days quiet at the comparison raises, and the evidence
+        // states the age at that instant, to the second.
+        let dead = serve_at(at - chrono::Duration::days(4)).await;
+        let res = handler(dead.base.clone()).invoke(&[], &fired).await;
+        assert!(res.is_ok(), "{res:?}");
+        let posts: Vec<Value> = dead
+            .sent()
+            .into_iter()
+            .filter(|(w, _)| w == "POST /api/jobs")
+            .map(|(_, b)| b)
+            .collect();
+        assert_eq!(posts.len(), 1, "{posts:?}");
+        let detail = posts[0]["metadata"]["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains(&format!("\"age_s\":{}", 4 * 86_400)),
+            "the age at the comparison: {detail}"
+        );
+
+        // No timestamp on the firing: refused, and nothing raised on an
+        // age the dispatcher would have had to invent.
+        let dark = serve_at(at - chrono::Duration::days(4)).await;
+        let err = handler(dark.base.clone())
+            .invoke(&[], &firing(trigger))
+            .await
+            .expect_err("no instant to measure at");
+        assert!(err.is_permanent(), "{err}");
+        assert!(raised(&dark).is_empty(), "{:?}", raised(&dark));
     }
 }
 
@@ -1930,6 +2283,11 @@ mod no_data_array_tests {
 
     fn firing(comparison: Value) -> InvocationContext {
         InvocationContext {
+            event_timestamp: Some(
+                DateTime::parse_from_rfc3339("2026-09-24T12:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
             rule_name: "estate-alarm".into(),
             triggering_event_id: "evt-cmp-1".into(),
             triggering_topic: "estate.comparison.recorded".into(),
@@ -1938,11 +2296,8 @@ mod no_data_array_tests {
     }
 
     fn handler(base: String) -> Arc<EstateAlarm> {
-        // The clock is unreachable on purpose: the silence half's `now`
-        // falls back, and nothing here depends on its value.
         EstateAlarm::new(
             base,
-            "http://127.0.0.1:1",
             Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
         )
     }

@@ -301,7 +301,7 @@ async fn run(
 /// as the gateway (`passkey::sign_as_gateway`), ten seconds at most —
 /// the drain task's time, never a visitor's.
 pub struct JobsApi {
-    http: reqwest::Client,
+    http: boss_gateway::machine_client::MachineClient,
     base: String,
 }
 
@@ -314,10 +314,13 @@ impl JobsApi {
 
     pub fn new(base: String) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap_or_default(),
+            // Stamped per request, redirects off (review of 6fbc7fc7,
+            // finding 1). A built client whose policy follows redirects
+            // would carry the estate token to the host a 302 names.
+            http: boss_gateway::machine_client::MachineClient::build(
+                reqwest::Client::builder().timeout(Duration::from_secs(10)),
+            )
+            .expect("reqwest client always builds"),
             base,
         }
     }

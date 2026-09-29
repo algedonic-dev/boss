@@ -153,7 +153,7 @@ pub(crate) fn approval_kinds(step_types: &[Value]) -> BTreeSet<String> {
 
 /// The `maintenance.sweep.inspect` handler, empty-decisions target.
 pub struct MaintenanceSweepInspect {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
 }
 
@@ -167,7 +167,10 @@ impl MaintenanceSweepInspect {
 
     /// Tests point the client at a local server.
     #[cfg(test)]
-    pub fn with_client(client: reqwest::Client, jobs_base: impl Into<String>) -> Arc<Self> {
+    pub fn with_client(
+        client: boss_core::machine_token::Client,
+        jobs_base: impl Into<String>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client,
             jobs_base: jobs_base.into(),
@@ -543,9 +546,12 @@ mod tests {
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move { axum::serve(listener, app).await });
-        let handler =
-            MaintenanceSweepInspect::with_client(reqwest::Client::new(), format!("http://{addr}"));
+        let handler = MaintenanceSweepInspect::with_client(
+            crate::handlers::common::api_client(),
+            format!("http://{addr}"),
+        );
         let ctx = InvocationContext {
+            event_timestamp: None,
             rule_name: "inspect-empty-decisions-sweep-on-step-ready".into(),
             triggering_event_id: "evt-1".into(),
             triggering_topic: "step.ready.checklist".into(),
@@ -629,9 +635,12 @@ mod tests {
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move { axum::serve(listener, app).await });
-        let handler =
-            MaintenanceSweepInspect::with_client(reqwest::Client::new(), format!("http://{addr}"));
+        let handler = MaintenanceSweepInspect::with_client(
+            crate::handlers::common::api_client(),
+            format!("http://{addr}"),
+        );
         let ctx = InvocationContext {
+            event_timestamp: None,
             rule_name: "inspect-empty-decisions-sweep-on-step-ready".into(),
             triggering_event_id: "evt-1".into(),
             triggering_topic: "step.ready.checklist".into(),
@@ -753,9 +762,12 @@ mod tests {
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move { axum::serve(listener, app).await });
-        let handler =
-            MaintenanceSweepInspect::with_client(reqwest::Client::new(), format!("http://{addr}"));
+        let handler = MaintenanceSweepInspect::with_client(
+            crate::handlers::common::api_client(),
+            format!("http://{addr}"),
+        );
         let ctx = InvocationContext {
+            event_timestamp: None,
             rule_name: "inspect-empty-decisions-sweep-on-step-ready".into(),
             triggering_event_id: "evt-1".into(),
             triggering_topic: "step.ready.checklist".into(),
@@ -860,9 +872,12 @@ mod tests {
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move { axum::serve(listener, app).await });
-        let handler =
-            MaintenanceSweepInspect::with_client(reqwest::Client::new(), format!("http://{addr}"));
+        let handler = MaintenanceSweepInspect::with_client(
+            crate::handlers::common::api_client(),
+            format!("http://{addr}"),
+        );
         let ctx = InvocationContext {
+            event_timestamp: None,
             rule_name: "inspect-deploy-convergence-sweep-on-step-ready".into(),
             triggering_event_id: "evt-1".into(),
             triggering_topic: "step.ready.checklist".into(),

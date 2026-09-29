@@ -50,6 +50,18 @@
 //! measured from — without it a session working for seven hours would
 //! be ended six hours after it opened.
 //!
+//! ## What is never silent, whatever its age (b951c00a)
+//!
+//! `unless_job_holds = "<key>"` spares a packet whose metadata holds a
+//! value under that key. The clock's template says a record NEVER
+//! ARRIVED — `handback = absent` for an agent-run — and on 2026-09-28
+//! it said so of run e737a54f while the builder's handback sat on the
+//! packet as `metadata.report`: the report had come before the gate's
+//! green, and nothing had moved it onto the step. The rule that lands
+//! such a record (`jobs.complete_step_from_record`) reads presence
+//! through the same function, `job_holds`, so the two agree on what a
+//! record is. A spared packet stays open and is logged, never guessed.
+//!
 //! `now` is the tick's own `_at`, which the schedule runner writes onto
 //! every sub-day firing. The handler holds no clock: a rule that fires
 //! this on a DAILY cadence gets no `_at` and is refused as permanent —
@@ -63,6 +75,7 @@
 
 use super::common::{api_client, complete_step, open_jobs_of_kind};
 use super::jobs_complete_linked_step::{is_open, is_unset, step_by_slug, template_arg};
+use super::jobs_complete_step_from_record::job_holds;
 use async_trait::async_trait;
 use boss_dispatcher::rules::expr::Value;
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext, arg, arg_string};
@@ -79,7 +92,7 @@ const DEFAULT_EVIDENCE_KEY: &str = "aged_out";
 const TICK_AT: &str = "_at";
 
 pub struct JobsAgeOutStep {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
 }
 
@@ -93,7 +106,10 @@ impl JobsAgeOutStep {
 
     /// Construct with a custom reqwest client (tests point it at a
     /// local stand-in for jobs-api).
-    pub fn with_client(client: reqwest::Client, jobs_base: impl Into<String>) -> Arc<Self> {
+    pub fn with_client(
+        client: boss_core::machine_token::Client,
+        jobs_base: impl Into<String>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client,
             jobs_base: jobs_base.into(),
@@ -178,6 +194,10 @@ impl Handler for JobsAgeOutStep {
             Some(Value::String(s)) if !s.is_empty() => Some(s.as_str()),
             _ => None,
         };
+        let unless_job_holds = match arg(args, "unless_job_holds") {
+            Some(Value::String(s)) if !s.is_empty() => Some(s.as_str()),
+            _ => None,
+        };
 
         // The tick's own instant. Absent on a daily firing, which is a
         // rule-authoring error this handler cannot make good by
@@ -201,6 +221,23 @@ impl Handler for JobsAgeOutStep {
             let Some(step) = step_by_slug(job, step_slug).filter(|s| is_open(s)) else {
                 continue;
             };
+            // A packet already holding the record this step stands for
+            // is not silent, whatever its age: writing the template
+            // onto it would say the record never came while it sits on
+            // the packet (run e737a54f, 2026-09-28, b951c00a). It is
+            // left open and said so — the shop floor keeps counting it,
+            // and a hand, or the rule that lands the record, closes it.
+            if let Some(key) = unless_job_holds
+                && job_holds(job, key)
+            {
+                tracing::warn!(
+                    rule = %ctx.rule_name,
+                    packet = %job_id,
+                    "`{step_slug}` is open and the packet holds `{key}` — not aged out: the \
+                     record is there to land, not absent"
+                );
+                continue;
+            }
             let Some(silent) = silent_hours(job, since_key, now) else {
                 tracing::warn!(
                     rule = %ctx.rule_name,
@@ -273,6 +310,7 @@ mod tests {
 
     fn ctx(payload: serde_json::Value) -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "agent-run-dies-when-building-is-silent".into(),
             triggering_event_id: "tick-1".into(),
             triggering_topic: "schedule".into(),
@@ -442,7 +480,7 @@ mod tests {
             run(FRESH, Some("2026-09-18T14:00:00Z"), None),
         ])
         .await;
-        let h = JobsAgeOutStep::with_client(reqwest::Client::new(), &base);
+        let h = JobsAgeOutStep::with_client(crate::handlers::common::api_client(), &base);
         h.invoke(&args(), &ctx(tick("2026-09-18T15:00:00Z")))
             .await
             .expect("the tick runs");
@@ -488,7 +526,7 @@ mod tests {
             run(AGELESS, None, None),
         ])
         .await;
-        let h = JobsAgeOutStep::with_client(reqwest::Client::new(), &base);
+        let h = JobsAgeOutStep::with_client(crate::handlers::common::api_client(), &base);
         h.invoke(&args(), &ctx(tick("2026-09-18T15:00:00Z")))
             .await
             .expect("the tick runs");
@@ -505,7 +543,7 @@ mod tests {
         let mut silent = run(SILENT, Some("2026-09-18T10:00:00Z"), None);
         silent["steps"][2]["metadata"]["result"] = json!("refused");
         let (base, puts) = mock_jobs(vec![silent]).await;
-        let h = JobsAgeOutStep::with_client(reqwest::Client::new(), &base);
+        let h = JobsAgeOutStep::with_client(crate::handlers::common::api_client(), &base);
         h.invoke(&args(), &ctx(tick("2026-09-18T15:00:00Z")))
             .await
             .expect("the tick runs");
@@ -517,12 +555,70 @@ mod tests {
         );
     }
 
+    /// THE FALSE RECORD (b951c00a): run e737a54f was aged out as
+    /// `handback = absent` at 19:00Z on 2026-09-28 while its builder's
+    /// report sat on the packet as `metadata.report`. A packet holding
+    /// the key the rule names is never aged out, however long its step
+    /// has been open; one holding nothing — or an empty string — still
+    /// is, which is the silence the clock exists to end.
+    #[tokio::test]
+    async fn a_packet_holding_its_report_is_never_aged_out_as_absent() {
+        let reported = |id: &str, report: Option<&str>| {
+            let mut r = run(id, Some("2026-09-28T16:00:00Z"), None);
+            r["steps"][2]["status"] = json!("completed");
+            r["steps"][2]["metadata"]["result"] = json!("gated");
+            if let Some(t) = report {
+                r["metadata"]["report"] = json!(t);
+            }
+            r
+        };
+        let (base, puts) = mock_jobs(vec![
+            reported(SILENT, Some("packet x, branch y, sha z, gate-run g")),
+            reported(FRESH, None),
+            reported(AGELESS, Some("")),
+        ])
+        .await;
+        let args = vec![
+            ("kind".to_string(), Value::String("agent-run".into())),
+            ("step".to_string(), Value::String("reported".into())),
+            ("hours".to_string(), Value::String("2".into())),
+            (
+                "unless_job_holds".to_string(),
+                Value::String("report".into()),
+            ),
+            (
+                "done_metadata".to_string(),
+                Value::String(r#"{"handback": "absent", "summary": "No handback"}"#.into()),
+            ),
+        ];
+        let h = JobsAgeOutStep::with_client(crate::handlers::common::api_client(), &base);
+        h.invoke(&args, &ctx(tick("2026-09-28T19:00:00Z")))
+            .await
+            .expect("the tick runs");
+        let written = puts.lock().unwrap().clone();
+        let mut aged: Vec<&str> = written
+            .iter()
+            .filter(|(_, s, _)| s.ends_with("/metadata"))
+            .map(|(j, _, _)| j.as_str())
+            .collect();
+        aged.sort();
+        assert_eq!(
+            aged,
+            vec![FRESH, AGELESS],
+            "the run holding its report is spared; the silent ones are not: {written:?}"
+        );
+        assert!(
+            !written.iter().any(|(j, _, _)| j == SILENT),
+            "nothing is written onto the run whose report is on the packet: {written:?}"
+        );
+    }
+
     /// A daily firing carries no `_at`; the handler refuses rather than
     /// reading a clock of its own, and says which cadence to use.
     #[tokio::test]
     async fn a_firing_without_an_instant_is_a_permanent_refusal() {
         let (base, puts) = mock_jobs(vec![run(SILENT, Some("2026-09-18T10:00:00Z"), None)]).await;
-        let h = JobsAgeOutStep::with_client(reqwest::Client::new(), &base);
+        let h = JobsAgeOutStep::with_client(crate::handlers::common::api_client(), &base);
         let err = h
             .invoke(&args(), &ctx(json!({ "_day": "2026-09-18" })))
             .await
@@ -618,7 +714,7 @@ mod tests {
                 Value::String(r#"{"ended": "silent"}"#.into()),
             ),
         ];
-        let h = JobsAgeOutStep::with_client(reqwest::Client::new(), &base);
+        let h = JobsAgeOutStep::with_client(crate::handlers::common::api_client(), &base);
         h.invoke(&args, &ctx(tick("2026-09-19T09:00:00Z")))
             .await
             .expect("the tick runs");
@@ -644,7 +740,7 @@ mod tests {
 
     #[test]
     fn the_handler_is_registered_under_its_name() {
-        let h = JobsAgeOutStep::with_client(reqwest::Client::new(), "http://unused");
+        let h = JobsAgeOutStep::with_client(crate::handlers::common::api_client(), "http://unused");
         assert_eq!(h.name(), "jobs.age_out_step");
         assert_eq!(
             crate::cascade::handler_emits()

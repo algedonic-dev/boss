@@ -571,8 +571,27 @@ pub fn step_shape_hash(title: &str, metadata: &serde_json::Value) -> String {
     hex::encode(h.finalize())
 }
 
+/// The key a SLIM listed step carries (`"slim": true`), and the reason
+/// [`Step`]'s `Deserialize` refuses one.
+///
+/// `GET /api/jobs` serves each listed step without `metadata` and
+/// `fields` unless the read asks `full=true` (backlog 9b473d4a, the
+/// default since ea80b5fd). Both keys default on `Step` — a `POST` body
+/// may carry a title alone — so a slim step would otherwise parse as a
+/// step that recorded NOTHING, and a typed reader that forgot the flag
+/// would read "no receipt", "no plan", "no verdict" where the wire held
+/// no answer at all. That is the answers-instead-of-erroring shape
+/// CLAUDE.md §Doors names, so the server marks the shape on each slim
+/// step and the typed parse refuses it, naming the read that fixes it.
+pub const SLIM_STEP_MARKER: &str = "slim";
+
 /// A line item on a Job — one typed unit of work that must be completed.
+///
+/// `Serialize`/`Deserialize` are derived as `remote = "Self"` so the
+/// trait impls below can refuse a [`SLIM_STEP_MARKER`] step before the
+/// derived parse runs; the wire shape is exactly the derived one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct Step {
     #[serde(default)]
     pub id: StepId,
@@ -665,6 +684,27 @@ pub struct Step {
     /// `None` for ordinary steps.
     #[serde(default)]
     pub embedded_job: Option<JobId>,
+}
+
+impl Serialize for Step {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // The derived (inherent) serializer: the wire shape is unchanged.
+        Step::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Step {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get(SLIM_STEP_MARKER).is_some() {
+            return Err(D::Error::custom(
+                "a slim listed step (no metadata, no fields) is not a Step: \
+                 read the list with full=true, or GET /api/jobs/{id}",
+            ));
+        }
+        Step::deserialize(value).map_err(D::Error::custom)
+    }
 }
 
 fn default_workflow_version() -> i32 {
@@ -947,6 +987,34 @@ mod tests {
         let json = serde_json::to_string(&step).unwrap();
         let back: Step = serde_json::from_str(&json).unwrap();
         assert_eq!(step, back);
+    }
+
+    /// A slim listed step is not a Step (backlog ea80b5fd). `metadata`
+    /// and `fields` both default, so without this refusal a row read off
+    /// `GET /api/jobs` without `full=true` parsed as a step that
+    /// recorded nothing — an answer where the read held no answer.
+    #[test]
+    fn a_slim_listed_step_refuses_a_typed_parse_and_names_full() {
+        let step = Step::new(JobId::new(), "task", "execute", 0);
+        let mut slim = serde_json::to_value(&step).unwrap();
+        let o = slim.as_object_mut().unwrap();
+        o.remove("metadata");
+        o.remove("fields");
+        o.insert(SLIM_STEP_MARKER.into(), serde_json::Value::Bool(true));
+        let err = serde_json::from_value::<Step>(slim)
+            .expect_err("a slim step must not parse as a Step")
+            .to_string();
+        assert!(
+            err.contains("full=true"),
+            "names the read that fixes it: {err}"
+        );
+
+        // Everything a writer sends still parses: a whole step, and the
+        // bare body `POST /api/jobs/{id}/steps` takes (a title alone).
+        let whole = serde_json::to_value(&step).unwrap();
+        assert_eq!(serde_json::from_value::<Step>(whole).unwrap(), step);
+        let bare: Step = serde_json::from_value(serde_json::json!({"title": "t"})).unwrap();
+        assert_eq!(bare.metadata, serde_json::json!({}));
     }
 
     #[test]

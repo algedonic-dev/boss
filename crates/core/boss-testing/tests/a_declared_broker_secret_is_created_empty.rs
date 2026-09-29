@@ -212,6 +212,14 @@ fn the_secrets_are_derived_from_the_broker_rules_and_nothing_else() {
         "broker-rotates-the-forge-host-checkout-token declares boss/forge-host-checkout-token \
          (design 1c90d183, D5), once — its delivery rule names the same Secret: {got:?}"
     );
+    assert_eq!(
+        got.iter()
+            .filter(|l| **l == "boss\tgithub-app-algedonic-dev")
+            .count(),
+        1,
+        "the per-act admin token's two rules (design 76c46869) declare \
+         boss/github-app-algedonic-dev, once: {got:?}"
+    );
     for line in &got {
         let (ns, name) = line.split_once('\t').expect("ns<TAB>name");
         assert!(
@@ -243,12 +251,36 @@ fn every_declared_broker_secret_is_granted_to_the_broker_by_name() {
     )
     .expect("the broker manifest");
     let docs: Vec<&str> = manifest.split("\n---").collect();
+    // The boss pod's service account, read from boss.yaml rather than
+    // typed here: until 2026-09-28 this test held the literal `default`,
+    // which pinned the very exposure backlog 28367b57 removed. The binding
+    // subject and the Deployment's account are held equal, by name, in
+    // no_default_service_account_reads_a_secret.rs.
+    let boss_yaml = std::fs::read_to_string(repo_root().join("infra/cluster/manifests/boss.yaml"))
+        .expect("boss.yaml");
+    let pod_sa = boss_yaml
+        .lines()
+        .find_map(|l| l.trim_start().strip_prefix("serviceAccountName: "))
+        .expect("the boss Deployment names its service account");
+    let subject = format!("    name: {pod_sa}\n    namespace: boss");
+    // One Role may name several Secrets of one issuer — the GitHub App's
+    // Role names each installation token's Secret beside the others
+    // (design 76c46869 added boss/github-app-algedonic-dev beside
+    // boss/github-dr-push-token) — so a name is granted when it is an
+    // ITEM of a `resourceNames: [..]` list, never a substring of one.
+    let names = |d: &str| -> Vec<String> {
+        d.lines()
+            .filter_map(|l| l.trim().strip_prefix("resourceNames: ["))
+            .filter_map(|l| l.strip_suffix(']'))
+            .flat_map(|l| l.split(',').map(|n| n.trim().to_string()))
+            .collect()
+    };
     for line in out.lines() {
         let (ns, name) = line.split_once('\t').expect("ns<TAB>name");
         let role = docs.iter().find(|d| {
             d.contains("\nkind: Role\n")
                 && d.contains(&format!("  namespace: {ns}\n"))
-                && d.contains(&format!("resourceNames: [{name}]"))
+                && names(d).iter().any(|n| n == name)
         });
         let role = role
             .unwrap_or_else(|| panic!("no Role in {ns} grants the broker Secret {name} by name"));
@@ -268,8 +300,8 @@ fn every_declared_broker_secret_is_granted_to_the_broker_by_name() {
             docs.iter().any(|d| d.contains("\nkind: RoleBinding\n")
                 && d.contains(&format!("  namespace: {ns}\n"))
                 && d.contains(&format!("  name: {role_name}\n"))
-                && d.contains("    name: default\n    namespace: boss")),
-            "{ns}/{name}: Role {role_name} is bound to the boss pod's service account"
+                && d.contains(&subject)),
+            "{ns}/{name}: Role {role_name} is bound to the boss pod's service account `{pod_sa}`"
         );
     }
 }

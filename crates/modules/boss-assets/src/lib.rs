@@ -30,7 +30,7 @@ pub mod types;
 pub use in_memory::InMemoryAssets;
 pub use port::{AssetsError, AssetsRepository};
 #[cfg(feature = "postgres")]
-pub use postgres::PgAssets;
+pub use postgres::{AssetsRebuildReport, PgAssets};
 pub use project::project;
 pub use types::{
     AssetCurrentState, AssetEvent, AssetEventKind, AssetId, AssetLifecyclePhase, IntakeSource,

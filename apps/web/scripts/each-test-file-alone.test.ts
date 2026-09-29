@@ -6,7 +6,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { TEST_TIMEOUT_MS, runEachAlone, testFiles } from './each-test-file-alone';
+import { loadScale, scaled, timingLine } from '../src/dev-load';
+import { TEST_TIMEOUT_MS, fileTimings, runEachAlone, testFiles } from './each-test-file-alone';
 
 // apps/web — this file is in scripts/.
 const WEB_ROOT = new URL('..', import.meta.url).pathname;
@@ -77,7 +78,7 @@ describe('what it refuses', () => {
     expect(byFile['./src/plants.test.ts']).toBe(0);
     expect(byFile['./src/leans.test.ts']).not.toBe(0);
     expect(results.find((r) => r.file === './src/leans.test.ts')?.output).toContain('(fail) leans');
-  }, 60_000);
+  }, scaled(60_000));
 });
 
 describe('the per-test budget it states', () => {
@@ -106,5 +107,30 @@ describe('the per-test budget it states', () => {
     const [run] = await runEachAlone(dir, testFiles(dir, ['src']), 1);
     expect(run?.output).not.toContain('timed out');
     expect(run?.code).toBe(0);
-  }, 60_000);
+  }, scaled(60_000));
+});
+
+describe('under a loaded gate (backlog ebb750cd)', () => {
+  // The 00:01Z train of 2026-09-28 lost bunfig-keys-take-effect.test.ts
+  // at 30 155 ms against a 30 s budget, beside two 20-wide cargo builds;
+  // the same file takes 5.0 s alone on the dev pod. The gate-runner
+  // declares the load, the budget scales, and the gate's receipt reads
+  // back what each file took.
+  test('the per-test budget is the quiet 30 s, scaled by the load this run declares', () => {
+    expect(TEST_TIMEOUT_MS).toBe(30_000 * loadScale());
+  });
+
+  test('each file becomes one line of the gate\'s timings file: its wall time, its suite, its verdict', () => {
+    const lines = fileTimings(
+      [
+        { file: './scripts/bunfig-keys-take-effect.test.ts', code: 1, ms: 30_155, output: '' },
+        { file: './src/router.test.ts', code: 0, ms: 41, output: '' },
+      ],
+      'unit:web',
+    );
+    expect(lines).toEqual([
+      timingLine(30_155, 'unit:web', 'failed', './scripts/bunfig-keys-take-effect.test.ts'),
+      timingLine(41, 'unit:web', 'passed', './src/router.test.ts'),
+    ]);
+  });
 });

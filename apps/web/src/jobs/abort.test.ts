@@ -89,25 +89,25 @@ describe('reasonIsSentence', () => {
 });
 
 describe('abortBody', () => {
-  test('completes the step with the reason merged into the metadata it already has', () => {
-    const t = step({ metadata: { outcome_kind: 'aborted', authority_role: 'platform-admin' } });
-    expect(abortBody(t, '  The vendor withdrew the quote.  ')).toEqual({
+  // Backlog e39a9d2a, Stage 2: the reason alone, for the step merge
+  // door. The step's own keys — `outcome_kind`, the very fact that makes
+  // it the abort — stay as they stand on the row; re-sending the page's
+  // copy of them is how a key written since the page read the step was
+  // put back as it was.
+  test('completes the step with the reason as its only metadata key', () => {
+    expect(abortBody('  The vendor withdrew the quote.  ')).toEqual({
       status: 'completed',
-      metadata: {
-        outcome_kind: 'aborted',
-        authority_role: 'platform-admin',
-        reason: 'The vendor withdrew the quote.',
-      },
+      metadata: { reason: 'The vendor withdrew the quote.' },
     });
   });
 
   test('a reason that is not a sentence yields no body — nothing to send', () => {
-    expect(abortBody(step({}), 'dup')).toBeNull();
-    expect(abortBody(step({}), '')).toBeNull();
+    expect(abortBody('dup')).toBeNull();
+    expect(abortBody('')).toBeNull();
   });
 
   test('names no completed_by: the server stamps the signing actor', () => {
-    const body = abortBody(step({}), 'Filed twice; the other packet carries the work.');
+    const body = abortBody('Filed twice; the other packet carries the work.');
     expect(body).not.toBeNull();
     expect(Object.keys(body ?? {})).toEqual(['status', 'metadata']);
   });

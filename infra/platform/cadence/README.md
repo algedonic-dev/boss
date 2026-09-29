@@ -7,9 +7,14 @@ whose `name` is the file name, carrying every column of the
 `verb`, `basis`, and the basis's own columns — `every_minutes` (wall),
 `at_times` (clock, calendar), `min_dock_depth` + `cooldown_minutes`
 (queue-depth), `cadence` + `anchor_date` + `business_calendar`
-(calendar), and `regate_hold_minutes` on a rule that departs a train
-(`board`, `run`: how long a departure waits for the dock's re-gate
-round, `20260925200737`). A column the basis does not use is simply
+(calendar). `regate_hold_minutes` (`20260925200737`, how long a
+departure waited for the dock's re-gate round) is no longer a column
+a file may declare: the board stopped waiting on re-gates in backlog
+96f02540, the boarding rule's v10 dropped it (backlog d1d4275d), and
+the loader refuses it by name. The table column stays, unwritten and
+unread, until a later deploy drops it — expand/contract
+(`docs/design/schema-migrations.md`), because the binary this one
+replaces still selects it during a rollout. A column the basis does not use is simply
 absent — TOML has no null. **Adding a rule is dropping a file in.**
 Changing one is bumping its `version`. `train-dock-refresh` (design
 42279fb2, 2026-09-25) was the first rule born here rather than in a

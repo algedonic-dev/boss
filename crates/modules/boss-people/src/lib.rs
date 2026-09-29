@@ -5,12 +5,15 @@
 //! service tickets name the assignee, sales opportunities have an owner.
 
 pub mod assets_client;
+pub mod departments;
 #[cfg(feature = "postgres")]
 pub mod employee_changes;
 mod grants;
 pub mod http;
 pub mod in_memory;
 pub mod operator_baseline;
+#[cfg(feature = "postgres")]
+pub mod passkey_promotion;
 pub mod people_config;
 pub mod port;
 #[cfg(feature = "postgres")]

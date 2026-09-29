@@ -94,6 +94,8 @@ fn local_auth(guest_access: GuestAccess) -> Arc<LocalAuthState> {
         store,
         session_key: KEY.to_vec(),
         http: reqwest::Client::new(),
+        machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+            .unwrap(),
         audit: boss_gateway::audit::AuthAudit::disabled(),
         guest_access,
         oidc: None,
@@ -127,6 +129,8 @@ pub(crate) fn gateway_declaring(
         proxy_client,
         perf: Arc::new(PerfCollector::new()),
         machine_token: Default::default(),
+        machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+            .unwrap(),
     });
     build_router(Some(local_auth(guests)), reads).with_state(state)
 }

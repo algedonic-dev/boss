@@ -60,16 +60,23 @@ struct AgentDbRow {
     max_concurrent_runs: Option<i32>,
 }
 
-/// Every alias grouped under its actor, sorted.
+/// Every alias grouped under its actor, sorted in BYTE order.
+///
+/// `COLLATE "C"` here, in `row_in_tx` and in `list`: a bare `ORDER BY`
+/// sorts by the database's locale, which ignores `-` at first level, so
+/// `ab@…` sorted before `a-z@…` here and after it in memory, and the
+/// order a listing answered depended on the server it ran against
+/// (backlog be459ab9, found by the adapters-agree suite).
 async fn aliases_by_actor<'e, E>(exec: E) -> Result<BTreeMap<String, Vec<String>>, AgentsError>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
-    let pairs: Vec<(String, String)> =
-        sqlx::query_as("SELECT actor_id, alias FROM actor_aliases ORDER BY actor_id, alias")
-            .fetch_all(exec)
-            .await
-            .map_err(storage)?;
+    let pairs: Vec<(String, String)> = sqlx::query_as(
+        "SELECT actor_id, alias FROM actor_aliases ORDER BY actor_id, alias COLLATE \"C\"",
+    )
+    .fetch_all(exec)
+    .await
+    .map_err(storage)?;
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (actor, alias) in pairs {
         out.entry(actor).or_default().push(alias);
@@ -108,12 +115,13 @@ async fn row_in_tx(
     let Some(row) = row else {
         return Ok(None);
     };
-    let aliases: Vec<String> =
-        sqlx::query_scalar("SELECT alias FROM actor_aliases WHERE actor_id = $1 ORDER BY alias")
-            .bind(id)
-            .fetch_all(&mut **tx)
-            .await
-            .map_err(storage)?;
+    let aliases: Vec<String> = sqlx::query_scalar(
+        "SELECT alias FROM actor_aliases WHERE actor_id = $1 ORDER BY alias COLLATE \"C\"",
+    )
+    .bind(id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(storage)?;
     let by_actor = BTreeMap::from([(id.to_string(), aliases)]);
     Ok(Some(to_row(row, &by_actor)))
 }
@@ -129,7 +137,7 @@ impl AgentsRegistry for PgAgents {
     }
 
     async fn list(&self) -> Result<Vec<AgentRow>, AgentsError> {
-        let rows: Vec<AgentDbRow> = sqlx::query_as(&format!("{SELECT} ORDER BY id"))
+        let rows: Vec<AgentDbRow> = sqlx::query_as(&format!("{SELECT} ORDER BY id COLLATE \"C\""))
             .fetch_all(&self.pool)
             .await
             .map_err(storage)?;

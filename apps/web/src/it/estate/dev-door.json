@@ -1,0 +1,21 @@
+{
+  "about": "The dev workspace door's client setup, in order: ONE copy read by the /it/estate page (estate.ts devDoorSteps) and by the printed recovery sheet (infra/recovery/re-entry.toml, boss recovery sheet). Design 125d405d collapsed the two spellings into this file (CLAUDE.md 9a). {host} in any step is this file's host. The host is held equal to the tunnel route by crates/core/boss-testing/tests/the_dev_door_is_an_access_ssh_application.rs.",
+  "host": "dev.algedonic.dev",
+  "steps": [
+    {
+      "what": "Install cloudflared, once per machine",
+      "command": "cloudflared --version",
+      "why": "it is the client half of the tunnel: ssh talks to it, it talks to the edge. Not found means not installed — take it from Cloudflare downloads, or your package manager, and run this again."
+    },
+    {
+      "what": "Teach ssh the route, once per machine",
+      "command": "grep -qsF 'Match host {host} ' ~/.ssh/config || cloudflared access ssh-config --hostname {host} --short-lived-cert | sed '/^Add to your/d' >> ~/.ssh/config",
+      "why": "it appends a ProxyCommand stanza for {host}; ssh then reaches it like any other host. The sed drops cloudflared's \"Add to your …/.ssh/config:\" banner, which ssh cannot parse, and the grep makes a second run a no-op."
+    },
+    {
+      "what": "Open the workspace",
+      "command": "ssh root@{host}",
+      "why": "the browser asks who you are, Access issues a certificate for the session, and the pod accepts it. Nothing long-lived is stored."
+    }
+  ]
+}

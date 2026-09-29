@@ -11,6 +11,7 @@
     "./links": "./src/links.ts",
     "./sim-clock": "./src/sim-clock.svelte.ts",
     "./sim-clock-types": "./src/sim-clock-types.ts",
+    "./step-doors": "./src/step-doors.ts",
     "./SystemTime.svelte": "./src/SystemTime.svelte",
     "./SignInControl.svelte": "./src/SignInControl.svelte",
     "./PerspectiveTabs.svelte": "./src/PerspectiveTabs.svelte",

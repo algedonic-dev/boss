@@ -73,6 +73,165 @@ async fn outbox(db: &TestDb, kind: &str) -> Vec<serde_json::Value> {
     .collect()
 }
 
+/// Backlog 4c6b4b74: a SKIPPED row the plan re-derived to live under
+/// the target is written pending, with the target's text; a skipped
+/// row the plan left skipped keeps what it has. Skipped is the one
+/// terminal status the readiness engine sets alone — no actor, no
+/// evidence — so it is the one a re-pin may re-judge, and only through
+/// the plan's own `unskipped` flag, never by a live write.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repin_unskips_only_the_rows_the_plan_re_derived() {
+    let db = TestDb::new().await;
+    let repo = boss_jobs::PgJobs::new(db.pool.clone());
+
+    let from = spec();
+    let j = job(&from);
+    repo.create_job(&j).await.unwrap();
+    let mut rows = materialize_steps_at(
+        &from,
+        &j.subject,
+        j.id,
+        &j.metadata,
+        StepId::new,
+        Some(j.opened_on),
+        None,
+    );
+    for s in rows.iter_mut() {
+        if matches!(s.spec_slug.as_deref(), Some("build") | Some("merged")) {
+            s.status = StepStatus::Skipped;
+        }
+        repo.add_step(s).await.unwrap();
+    }
+    let row = |slug: &str| {
+        rows.iter()
+            .find(|s| s.spec_slug.as_deref() == Some(slug))
+            .unwrap_or_else(|| panic!("{slug} row"))
+            .clone()
+    };
+    let rewritten = |slug: &str, unskipped: bool| {
+        let mut step = row(slug);
+        step.status = if unskipped {
+            StepStatus::Pending
+        } else {
+            StepStatus::Skipped
+        };
+        step.metadata["procedure"] = serde_json::json!("the target's text");
+        boss_jobs::repin::Reprojected {
+            step,
+            changed: vec!["`procedure`".into()],
+            kept: vec![],
+            unskipped,
+        }
+    };
+    let plan = boss_jobs::repin::RepinPlan {
+        reprojected: vec![rewritten("build", true), rewritten("merged", false)],
+        inserted: vec![],
+    };
+    let stamp = EventStamp::new("jobs", ActorId::Human("emp-bootstrap-admin".into()));
+    let record = boss_jobs::repin::record(&plan, 1, 2, "emp-bootstrap-admin", stamp.timestamp);
+    repo.repin_workflow_version_at(&j.id, 2, &plan, &record, &stamp)
+        .await
+        .unwrap();
+
+    let steps = repo.list_steps(&j.id).await.unwrap();
+    let by = |slug: &str| {
+        steps
+            .iter()
+            .find(|s| s.spec_slug.as_deref() == Some(slug))
+            .unwrap_or_else(|| panic!("{slug} row: {steps:?}"))
+    };
+    assert_eq!(by("build").status, StepStatus::Pending);
+    assert_eq!(by("build").metadata["procedure"], "the target's text");
+    assert_eq!(by("merged").status, StepStatus::Skipped);
+    assert_eq!(
+        by("merged").metadata["procedure"],
+        row("merged").metadata["procedure"],
+        "a skipped row the plan did not re-derive keeps its text"
+    );
+    assert!(
+        outbox(&db, "jobs.step.updated")
+            .await
+            .iter()
+            .any(|p| p["spec_slug"] == "build" && p["status"] == "pending"),
+        "the un-skipping rides the outbox as the row was written, so a replay reproduces it"
+    );
+}
+
+/// Review of 28f3f28a: a move whose plan un-skips (or inserts) a step
+/// is written only onto a packet still walked. A close that lands
+/// between the judgement and the write is answered by the statement
+/// itself — refused whole, naming the stored status, nothing written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repin_that_opens_rows_refuses_a_packet_closed_since_it_was_judged() {
+    let db = TestDb::new().await;
+    let repo = boss_jobs::PgJobs::new(db.pool.clone());
+
+    let from = spec();
+    let j = job(&from);
+    repo.create_job(&j).await.unwrap();
+    let mut rows = materialize_steps_at(
+        &from,
+        &j.subject,
+        j.id,
+        &j.metadata,
+        StepId::new,
+        Some(j.opened_on),
+        None,
+    );
+    for s in rows.iter_mut() {
+        if s.spec_slug.as_deref() == Some("build") {
+            s.status = StepStatus::Skipped;
+        }
+        repo.add_step(s).await.unwrap();
+    }
+    let mut build = rows
+        .iter()
+        .find(|s| s.spec_slug.as_deref() == Some("build"))
+        .expect("build row")
+        .clone();
+    build.status = StepStatus::Pending;
+    let plan = boss_jobs::repin::RepinPlan {
+        reprojected: vec![boss_jobs::repin::Reprojected {
+            step: build,
+            changed: vec!["status".into()],
+            kept: vec![],
+            unskipped: true,
+        }],
+        inserted: vec![],
+    };
+
+    sqlx::query("UPDATE jobs SET status = 'closed' WHERE id = $1")
+        .bind(*j.id.inner().as_uuid())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let stamp = EventStamp::new("jobs", ActorId::Human("emp-bootstrap-admin".into()));
+    let record = boss_jobs::repin::record(&plan, 1, 2, "emp-bootstrap-admin", stamp.timestamp);
+    let refused = repo
+        .repin_workflow_version_at(&j.id, 2, &plan, &record, &stamp)
+        .await;
+    assert!(
+        matches!(&refused, Err(boss_jobs::JobsError::TerminalJob { status, .. }) if status == "closed"),
+        "{refused:?}"
+    );
+    let stored = repo.get_job(&j.id).await.unwrap().expect("packet");
+    assert_eq!(stored.workflow_version, from.version, "the pin stays");
+    assert!(
+        stored.metadata.get("repins").is_none(),
+        "{}",
+        stored.metadata
+    );
+    let steps = repo.list_steps(&j.id).await.unwrap();
+    assert!(
+        steps
+            .iter()
+            .any(|s| s.spec_slug.as_deref() == Some("build") && s.status == StepStatus::Skipped),
+        "nothing un-skipped: {steps:?}"
+    );
+    assert!(outbox(&db, "jobs.job.repinned").await.is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_repin_writes_the_whole_move_in_one_transaction() {
     let db = TestDb::new().await;

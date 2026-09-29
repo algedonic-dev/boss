@@ -25,8 +25,13 @@
 //! rules already grant everything to, so the file grants nothing and
 //! the policy engine still allows him); `emp-audit` landed.
 //!
-//! WHAT THIS PROOF STOPS SHORT OF, BY NAME. The four other doors —
-//! classes, calendars, the company Subject, and the Workflows — answer
+//! The business-calendar door is REAL too (`PgCalendar`, asking the
+//! core defaults, backlog 05f61acf): the seed's calendar lands through
+//! the policy ladder, its fact is signed by the publish's identity, and
+//! a `--take calendars` records who replaced the closed-day set.
+//!
+//! WHAT THIS PROOF STOPS SHORT OF, BY NAME. The three other doors —
+//! classes, the company Subject, and the Workflows — answer
 //! from a stub here: the jobs API's design-Job walk needs the whole
 //! platform bundle and is proven by boss-jobs' own tests and the
 //! stub-level tests in src/tenant_publish.rs; the stub answers the
@@ -79,8 +84,8 @@ const OPERATOR_HIRES: &str = "infra/operator-baseline/operator_hires.toml";
 const FOUNDER_EMAIL: &str = "david@algedonic.dev";
 const FOUNDER_ID: &str = "emp-david";
 
-/// The real people, locations and policy routers over `pool`, plus a
-/// stub for the four doors outside this proof, on one ephemeral port
+/// The real people, locations, calendar and policy routers over `pool`,
+/// plus a stub for the doors outside this proof, on one ephemeral port
 /// — the shape `--gateway` expects (every /api prefix through one
 /// base).
 async fn serve(pool: PgPool) -> String {
@@ -96,8 +101,16 @@ async fn serve(pool: PgPool) -> String {
     // The locations door (backlog 1ec8312a): the real router over the
     // same pool, so `employees.location` FKs into rows the tenant
     // itself declared.
+    // It asks policy for Create on `location` (backlog 59deda40), judged
+    // here against the core defaults the live policy service ships — so
+    // this proves `boss tenant publish`'s own identity passes the door.
     let locations_router = boss_locations::http::router(boss_locations::http::LocationsApiState {
         locations: Arc::new(boss_locations::PgLocations::new(pool.clone())),
+        policy: Arc::new(
+            boss_policy_client::FakePolicyClient::builder()
+                .with_default_rules()
+                .build(),
+        ),
     });
     // The agents door (backlog f56155f0): the real registry over the
     // same pool — the schema's migration already registered
@@ -105,9 +118,24 @@ async fn serve(pool: PgPool) -> String {
     // Like the people router above, no Class registry is wired: the
     // classes batch is a stub here, and the door's own test proves the
     // role / department check (boss_jobs::agents::http).
+    // The business-calendar door (backlog 05f61acf): the real router
+    // over the same pool, asking the core defaults the way the locations
+    // door does — so the seed's calendar lands through the policy ladder
+    // and its fact is signed by the publish's own identity, end to end.
+    let calendar_router = boss_calendar::router(boss_calendar::CalendarApiState {
+        calendar: Arc::new(boss_calendar::PgCalendar::new(pool.clone())),
+        publisher: None,
+        clock: Arc::new(boss_clock_client::WallClockClient),
+        policy: Arc::new(
+            boss_policy_client::FakePolicyClient::builder()
+                .with_default_rules()
+                .build(),
+        ),
+    });
     let agents_router = boss_jobs::agents::http::router(boss_jobs::agents::http::AgentsApiState {
         registry: Arc::new(boss_jobs::agents::PgAgents::new(pool.clone())),
         classes: None,
+        departments: None,
     });
     // The tenant publish stamp door (backlog 42da8bd2): the real router
     // over the same pool, so the row `boss tenant published` reads is
@@ -140,13 +168,6 @@ async fn serve(pool: PgPool) -> String {
         // The batch doors' answer shape (design e187198f): the verb
         // reads counts, kept and updated off every door.
         .route(
-            "/api/calendar/business-calendars/batch",
-            post(|Json(rows): Json<Vec<Value>>| async move {
-                Json(json!({"received": rows.len(), "inserted": rows.len(),
-                            "kept": [], "updated": [], "unchanged": 0}))
-            }),
-        )
-        .route(
             "/api/subjects/company",
             post(|| async {
                 (
@@ -178,6 +199,7 @@ async fn serve(pool: PgPool) -> String {
     // is proven here, not assumed.
     let app = people_router
         .merge(locations_router)
+        .merge(calendar_router)
         .merge(agents_router)
         .merge(stamps_router)
         .merge(policy_router)
@@ -387,7 +409,7 @@ async fn the_real_tenant_verbatim_lands_its_location_before_its_founder() {
         agents_line.contains(
             "received 1, inserted 0, updated 1: agent-claude (display_name Claude \
              (Claude Code sessions on the dev pod) → Claude (engineering), \
-             role null → engineering-agent, department null → engineering)"
+             role null → engineering-agent, department null → it)"
         ) && !agents_line.contains("kept:"),
         "{agents_line}"
     );
@@ -398,7 +420,7 @@ async fn the_real_tenant_verbatim_lands_its_location_before_its_founder() {
     );
     assert_eq!(
         (role.as_deref(), department.as_deref()),
-        (Some("engineering-agent"), Some("engineering")),
+        (Some("engineering-agent"), Some("it")),
         "the agent holds the role and sits in the department the tenant declared"
     );
 
@@ -735,6 +757,124 @@ async fn baseline_then_tenant_reads_the_declared_roster_and_leaves_one_founder_r
     .await
     .unwrap();
     assert_eq!(admins, vec![FOUNDER_ID.to_string()]);
+}
+
+/// The closed days the database holds for `code`, as ISO dates.
+async fn closed_days(pool: &PgPool, code: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT day::text FROM business_calendar_closed_days WHERE calendar_code = $1 ORDER BY day",
+    )
+    .bind(code)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// Every business-calendar fact on the outbox, oldest first.
+async fn calendar_facts(pool: &PgPool) -> Vec<(String, Value)> {
+    sqlx::query_as(
+        "SELECT kind, payload FROM event_outbox WHERE kind LIKE 'business-calendar.%' ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// THE SEED'S CALENDAR LANDS THROUGH THE REAL DOOR, AND WHO REPLACED IT
+/// IS ON THE RECORD (backlog 05f61acf, 2026-09-28). The calendar batch
+/// used to answer from a stub here, so the automatic seed was never
+/// proven through it end to end — and the door itself dropped the actor
+/// its policy ladder resolved and staged no fact, so a take that
+/// replaced a held closed-day set named nobody. Run verbatim: the
+/// tenant's calendar lands whole, on the core defaults alone, with one
+/// `business-calendar.declared` signed `automation:tenant-seed`. The
+/// file then moves a closed day: the default publish KEEPS the held set
+/// and records nothing; `--take calendars` replaces it and records one
+/// `business-calendar.updated` naming the signer and the set it
+/// replaced; the same take again records nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_seed_calendar_lands_through_the_real_door_and_a_take_names_who_took_it() {
+    let db = TestDb::new().await;
+    let base = serve(db.pool.clone()).await;
+    let dir = tenant_copy("calendar");
+    let declared = ["2026-11-26", "2026-11-27", "2026-12-25", "2027-01-01"];
+
+    let (ok, out) = boss_tenant_publish(&dir, &base);
+    assert!(ok, "the verbatim tenant publishes:\n{out}");
+    let line = |out: &str| {
+        out.lines()
+            .find(|l| l.contains("seeds/business_calendars.json"))
+            .unwrap_or_else(|| panic!("the calendars have a line:\n{out}"))
+            .to_string()
+    };
+    let calendars = line(&out);
+    assert!(
+        calendars.contains("POST /api/calendar/business-calendars/batch")
+            && calendars.contains("received 1, inserted 1"),
+        "{calendars}"
+    );
+    assert_eq!(closed_days(&db.pool, "algedonic-founder").await, declared);
+    let facts = calendar_facts(&db.pool).await;
+    assert_eq!(facts.len(), 1, "{facts:?}");
+    assert_eq!(facts[0].0, "business-calendar.declared");
+    assert_eq!(facts[0].1["code"], "algedonic-founder");
+    assert_eq!(facts[0].1["closed"], json!(declared));
+    assert_eq!(facts[0].1["declared_by"], "automation:tenant-seed");
+    assert_eq!(facts[0].1["_actor"], "automation:tenant-seed");
+
+    // The tenant's file drops the day after Thanksgiving.
+    let path = dir.join("seeds/business_calendars.json");
+    let mut file: Vec<Value> =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    file[0]["closed"] = json!(["2026-11-26", "2026-12-25", "2027-01-01"]);
+    std::fs::write(&path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+
+    // By default the instance's set is kept, and nothing is recorded.
+    let (ok, out) = boss_tenant_publish(&dir, &base);
+    assert!(ok, "the default republish:\n{out}");
+    let calendars = line(&out);
+    assert!(
+        calendars.contains("kept: algedonic-founder differs on closed"),
+        "{calendars}"
+    );
+    assert_eq!(closed_days(&db.pool, "algedonic-founder").await, declared);
+    assert_eq!(
+        calendar_facts(&db.pool).await.len(),
+        1,
+        "a kept row records nothing"
+    );
+
+    // Under --take calendars the declaration replaces the set, and the
+    // fact says who did it and what it replaced.
+    let (ok, out) = boss_tenant_publish_taking(&dir, &base, Some("calendars"));
+    assert!(ok, "the take:\n{out}");
+    let calendars = line(&out);
+    assert!(
+        calendars.contains("updated 1: algedonic-founder (closed"),
+        "{calendars}"
+    );
+    assert_eq!(
+        closed_days(&db.pool, "algedonic-founder").await,
+        ["2026-11-26", "2026-12-25", "2027-01-01"]
+    );
+    let facts = calendar_facts(&db.pool).await;
+    assert_eq!(facts.len(), 2, "{facts:?}");
+    let (kind, updated) = &facts[1];
+    assert_eq!(kind, "business-calendar.updated");
+    assert_eq!(updated["mode"], "take");
+    assert_eq!(updated["changes"][0]["field"], "closed");
+    assert_eq!(updated["changes"][0]["from"], json!(declared));
+    assert_eq!(updated["updated_by"], "automation:tenant-seed");
+    assert_eq!(updated["_actor"], "automation:tenant-seed");
+
+    // The same take again restates the held row: nothing recorded.
+    let (ok, out) = boss_tenant_publish_taking(&dir, &base, Some("calendars"));
+    assert!(ok, "the second take:\n{out}");
+    assert_eq!(
+        calendar_facts(&db.pool).await.len(),
+        2,
+        "no change, no fact"
+    );
 }
 
 /// The shipped binary with the services container's environment:

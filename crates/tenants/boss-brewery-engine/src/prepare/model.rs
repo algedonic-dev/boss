@@ -4,7 +4,9 @@
 //! brewery tenant model through the public API, in dependency order:
 //!
 //! 1. classes — POST /api/classes/batch (the taxonomy that employee +
-//!    account writes validate against, so it lands first).
+//!    account writes validate against, so it lands first), then the
+//!    departments — POST /api/departments/batch (what an employee's
+//!    `department` validates against; each row's `function` is a Class).
 //! 2. policy — tenant role grants ([`boss_policy::bootstrap`]); these are
 //!    capability-level (`resource = "workflow"`, not a specific kind), so
 //!    they need no published Workflows, and the design-Job approval in
@@ -87,6 +89,12 @@ pub fn prepare_model(gateway_base: Option<&str>, seeds_dir: &Path) -> Result<()>
     // 1. Classes first — employee role + account-type writes validate
     //    against the Class registry.
     seed_classes(&classes_base, seeds_dir)?;
+
+    // 1a. Departments — an employee's `department` validates against
+    //     the departments registry (c87e3d6d), so the tenant's roster
+    //     of departments lands before any employee; after the classes,
+    //     because each row's `function` is a Class (backlog e22ee67a).
+    seed_departments(&jobs_base, seeds_dir)?;
 
     // 1b. Business calendars — reference data (banking/tax holidays) the
     //     dispatcher's timing triggers and the simulator resolve business
@@ -278,4 +286,135 @@ fn seed_business_calendars(api_base: &str, seeds_dir: &Path) -> Result<()> {
     }
     info!(path = %path.display(), "brewery business calendars seeded");
     Ok(())
+}
+
+/// POST the tenant's departments (`seeds/departments.toml`) to
+/// `/api/departments/batch` — the door `boss tenant publish` uses,
+/// insert-if-absent by code (backlog e22ee67a). An employee's
+/// `department` is validated against this registry since the Class
+/// collapse (c87e3d6d), and `taproom` and `packaging` are declared
+/// ONLY here — no migration seeds them — so the prepare that seeds
+/// the employees must land them first. Each row's `function` is a
+/// Class under `(department, function)`, so this runs after the
+/// classes.
+fn seed_departments(api_base: &str, seeds_dir: &Path) -> Result<()> {
+    let path = seeds_dir.join("departments.toml");
+    let rows = boss_jobs::department::declare::load_departments_toml(&path)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let url = format!("{}/api/departments/batch", api_base.trim_end_matches('/'));
+    let resp = client
+        .post(&url)
+        .header("x-sim-origin", "true")
+        .header(
+            "x-boss-user",
+            r#"{"id":"automation:departments-seed","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}"#,
+        )
+        .json(&rows)
+        .send()
+        .with_context(|| format!("POST {url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("POST {url} → {status} {}", resp.text().unwrap_or_default());
+    }
+    info!(path = %path.display(), departments = rows.len(), "brewery departments seeded");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    /// One HTTP exchange: answer `status` to the first request and hand
+    /// back its request line and body. A stand-in for the jobs API's
+    /// batch door, so the test reads what the engine SENT rather than
+    /// what its source says it sends.
+    fn one_request_answering(status: &'static str) -> (String, mpsc::Receiver<(String, String)>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let base = format!("http://{}", listener.local_addr().expect("its address"));
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("the engine connects");
+            let mut reader = BufReader::new(stream.try_clone().expect("a second handle"));
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).expect("a request line");
+            let mut length = 0usize;
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).expect("a header line");
+                if header.trim().is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = header.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().expect("a numeric length");
+                }
+            }
+            let mut body = vec![0u8; length];
+            reader.read_exact(&mut body).expect("the body");
+            let mut stream = stream;
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            )
+            .expect("the answer");
+            tx.send((
+                request_line.trim().to_string(),
+                String::from_utf8(body).expect("a UTF-8 body"),
+            ))
+            .expect("the test is listening");
+        });
+        (base, rx)
+    }
+
+    fn brewery_seeds() -> std::path::PathBuf {
+        boss_testing::repo_root().join("examples/brewery/seeds")
+    }
+
+    /// Backlog e22ee67a: the prepare seeded classes, policy and
+    /// employees but never the tenant's departments, so an instance
+    /// prepared by the engine alone had 100 employees in `taproom` and
+    /// `packaging`, which no migration seeds.
+    #[test]
+    fn the_prepare_publishes_every_declared_department_through_the_batch_door() {
+        let (base, rx) = one_request_answering("200 OK");
+        seed_departments(&base, &brewery_seeds()).expect("a 200 is a publish");
+        let (request_line, body) = rx.recv().expect("the engine sent a request");
+        assert!(
+            request_line.starts_with("POST /api/departments/batch "),
+            "the departments door, insert-if-absent by code: {request_line}"
+        );
+        let sent: Vec<boss_jobs::department::declare::DepartmentInput> =
+            serde_json::from_str(&body).expect("the body is the door's row shape");
+        let declared = boss_jobs::department::declare::load_departments_toml(
+            &brewery_seeds().join("departments.toml"),
+        )
+        .expect("the brewery's departments.toml loads");
+        assert_eq!(sent, declared, "every declared row, as declared");
+        for code in ["taproom", "packaging"] {
+            assert!(
+                sent.iter().any(|d| d.code == code),
+                "{code}: a department only this file declares"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_publish_stops_the_prepare_naming_the_door() {
+        let (base, _rx) = one_request_answering("422 Unprocessable Entity");
+        let err = seed_departments(&base, &brewery_seeds())
+            .expect_err("a refusal is not a publish")
+            .to_string();
+        assert!(
+            err.contains("/api/departments/batch") && err.contains("422"),
+            "the error names the door and the answer: {err}"
+        );
+    }
 }

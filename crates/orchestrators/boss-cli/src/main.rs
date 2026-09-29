@@ -26,6 +26,7 @@ mod documents;
 mod door;
 mod envelope;
 mod estate;
+mod events;
 mod freshness;
 mod gate;
 mod git_auth;
@@ -34,8 +35,11 @@ mod identity;
 mod inspect;
 mod item_source;
 mod job;
+mod kept_probe;
+mod ledger;
 mod memory_index;
 mod merged;
+mod mutating_verb;
 mod ops;
 mod ops_request;
 mod orient;
@@ -50,9 +54,11 @@ mod publish_requests;
 mod queue;
 mod reach;
 mod receipt;
+mod recovery;
 mod repair;
 mod reporting_to;
 mod rerail;
+mod review_verdict;
 mod running;
 mod scratch_target;
 mod script;
@@ -68,6 +74,7 @@ mod train;
 mod train_gate;
 mod transcript_profile;
 mod transcript_usage;
+mod trust_boundary;
 mod upgrade;
 mod workflow;
 
@@ -116,20 +123,10 @@ enum Commands {
         #[command(subcommand)]
         action: ScriptAction,
     },
-    /// Asset maintenance subcommands
-    Assets {
-        #[command(subcommand)]
-        action: AssetsAction,
-    },
     /// Run the Boss simulator (thin wrapper around `boss-sim`)
     Sim {
         #[command(subcommand)]
         action: SimAction,
-    },
-    /// Ledger operations — rebuild the GL projection from financial_facts
-    Ledger {
-        #[command(subcommand)]
-        action: LedgerAction,
     },
     /// Read-only diagnostic queries against the gateway's HTTP
     /// APIs. Replaces the `sudo -u postgres psql` muscle memory
@@ -196,8 +193,42 @@ enum Commands {
     /// replaces a hand-rolled retry loop. Without `--wait` the bound
     /// refuses, naming the running gates and filing nothing.
     Gate {
-        /// Branch to gate.
-        branch: String,
+        /// Branch to gate. Absent only with --withdraw, which names a
+        /// gate-run instead.
+        // A reason explains a withdrawal and nothing else, so a branch
+        // refuses one outright: clap's `requires` on the reason did not
+        // fire beside `required_unless_present` (measured under 4.6).
+        #[arg(
+            required_unless_present = "withdraw",
+            conflicts_with_all = ["reason", "reason_file"]
+        )]
+        branch: Option<String>,
+        /// Withdraw a gate-run whose purpose is gone, before any runner
+        /// pod exists: close it on the protocol's `withdrawn` terminal
+        /// with the reason, deleting a queued Job whose pod never
+        /// appeared. Refused once a pod exists — that run may be judging,
+        /// and its verdict is the record. Needs --reason unless a car
+        /// already carries a CURRENT green for the head it was filed for,
+        /// which is then the reason, named. Measured 2026-09-28 on
+        /// gate-run 8c2f644a: with no such door a redundant queued gate
+        /// could only be closed `lost` (backlog 8d7d0a2b).
+        #[arg(
+            long,
+            value_name = "GATE-RUN",
+            conflicts_with_all = [
+                "branch", "wait", "mode", "manifest", "rebase", "hold",
+                "force_regate", "stale_base_anyway", "park_file",
+            ]
+        )]
+        withdraw: Option<String>,
+        /// Why the gate-run is withdrawn (with --withdraw). Single-quote
+        /// it, or use --reason-file: backticks in double quotes are run
+        /// by the shell and leave a hole (2376b89e).
+        #[arg(long, requires = "withdraw", value_name = "WHY")]
+        reason: Option<String>,
+        /// The reason, read from a file — no word expansion at all.
+        #[arg(long, requires = "withdraw", conflicts_with = "reason")]
+        reason_file: Option<std::path::PathBuf>,
         /// Gate mode: "auto" (or "--auto"), or "-p `<crate>`". Empty = full.
         ///
         /// Checked before the cluster is touched — an unknown mode is a
@@ -445,6 +476,9 @@ enum Commands {
         /// (the key `boss hold` writes), so it boards only after `boss
         /// release` — for a trust-boundary car awaiting its adversarial
         /// review, with every receipt field carried (backlog 486dde37).
+        /// A park intent naming an item marked trust-boundary
+        /// (`metadata.trust_boundary`, set by `boss triage
+        /// --trust-boundary`) is REFUSED without this flag.
         #[arg(long, value_name = "REASON")]
         hold: Option<String>,
     },
@@ -706,6 +740,14 @@ enum Commands {
         /// gate-run vouches for the branch's head right now.
         #[arg(long)]
         finish: bool,
+        /// Replay the car in THIS checkout (a worktree of this repo,
+        /// clean), so a conflict is resolved where you already work.
+        /// Default: the worktree you run from when it is a linked one —
+        /// a worktree-isolated builder cannot run git under the main
+        /// repository's `.git` (ce9a7d8f) — and a disposable worktree
+        /// under the shared git directory from the main checkout.
+        #[arg(long, conflicts_with = "finish")]
+        worktree: Option<String>,
         /// Report what would happen without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -970,6 +1012,10 @@ enum Commands {
     #[command(flatten)]
     Credential(credential::Cmd),
     #[command(flatten)]
+    Events(events::Cmd),
+    #[command(flatten)]
+    Ledger(ledger::Cmd),
+    #[command(flatten)]
     Merged(merged::Cmd),
     #[command(flatten)]
     Receipt(receipt::Cmd),
@@ -983,6 +1029,8 @@ enum Commands {
     Tenant(tenant::Cmd),
     #[command(flatten)]
     Estate(estate::Cmd),
+    #[command(flatten)]
+    Recovery(recovery::Cmd),
 }
 
 #[derive(Subcommand)]
@@ -1276,17 +1324,6 @@ enum PacketAction {
 }
 
 #[derive(Subcommand)]
-enum AssetsAction {
-    /// Rebuild the `systems` projection table from the `system_events` log.
-    /// Idempotent — safe to run on a healthy DB.
-    RebuildProjection {
-        /// Postgres URL. Defaults to the local assets service DB.
-        #[arg(long, default_value = "postgres://boss:boss@127.0.0.1/boss")]
-        postgres_url: String,
-    },
-}
-
-#[derive(Subcommand)]
 enum SimAction {
     /// Replay a simulation config against the live service APIs.
     /// Shells out to the installed `boss-sim` binary.
@@ -1306,47 +1343,6 @@ enum SimAction {
         /// Live mode: each simulated day posts through real write APIs
         #[arg(long, default_value_t = false)]
         live: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum LedgerAction {
-    /// Rebuild journal entries for every open period. Locked periods are
-    /// never touched — their pinned rule version keeps them stable.
-    /// Idempotent: running it twice produces the same projection.
-    Rebuild {
-        /// Postgres URL. Defaults to the local Boss DB.
-        #[arg(long, default_value = "postgres://boss:boss@127.0.0.1/boss")]
-        postgres_url: String,
-        /// Output as JSON (for machine parsing)
-        #[arg(long)]
-        json: bool,
-    },
-    /// List all periods with their status + totals.
-    Periods {
-        #[arg(long, default_value = "postgres://boss:boss@127.0.0.1/boss")]
-        postgres_url: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Lock a period by starting date (YYYY-MM-DD). Pins the active rule
-    /// version and writes a checksum. Rejects further writes to that
-    /// period until unlocked.
-    Lock {
-        /// Period starts_on date (e.g. 2026-03-01)
-        starts_on: String,
-        #[arg(long, default_value = "postgres://boss:boss@127.0.0.1/boss")]
-        postgres_url: String,
-        /// Identifier recorded as who locked the period.
-        #[arg(long, default_value = "operator")]
-        locked_by: String,
-    },
-    /// Unlock a period by starting date. Clears lock fields and returns
-    /// status to 'open'. Operator-tier action.
-    Unlock {
-        starts_on: String,
-        #[arg(long, default_value = "postgres://boss:boss@127.0.0.1/boss")]
-        postgres_url: String,
     },
 }
 
@@ -1641,28 +1637,6 @@ async fn main() -> Result<()> {
         Commands::Script { action } => match action {
             ScriptAction::List { category } => script::list(category.as_deref()).await,
             ScriptAction::Info { id } => script::info(&id).await,
-        },
-        Commands::Assets { action } => match action {
-            AssetsAction::RebuildProjection { postgres_url } => {
-                cmd_assets_rebuild_projection(&postgres_url).await
-            }
-        },
-        Commands::Ledger { action } => match action {
-            LedgerAction::Rebuild { postgres_url, json } => {
-                cmd_ledger_rebuild(&postgres_url, json).await
-            }
-            LedgerAction::Periods { postgres_url, json } => {
-                cmd_ledger_periods(&postgres_url, json).await
-            }
-            LedgerAction::Lock {
-                starts_on,
-                postgres_url,
-                locked_by,
-            } => cmd_ledger_lock(&postgres_url, &starts_on, &locked_by).await,
-            LedgerAction::Unlock {
-                starts_on,
-                postgres_url,
-            } => cmd_ledger_unlock(&postgres_url, &starts_on).await,
         },
         Commands::Inspect { action } => match action {
             InspectAction::Invoices {
@@ -2015,8 +1989,18 @@ async fn main() -> Result<()> {
         Commands::Rerail {
             car,
             finish,
+            worktree,
             dry_run,
-        } => rerail::run(&car, finish, dry_run, chrono::Utc::now()).await,
+        } => {
+            rerail::run(
+                &car,
+                finish,
+                worktree.as_deref(),
+                dry_run,
+                chrono::Utc::now(),
+            )
+            .await
+        }
         Commands::Prove {
             car,
             probe,
@@ -2095,7 +2079,26 @@ async fn main() -> Result<()> {
             publish_requests::run(&clone, &remote, dry_run, chrono::Utc::now()).await
         }
         Commands::Gate {
+            withdraw: Some(packet),
+            reason,
+            reason_file,
+            namespace,
+            dry_run,
+            ..
+        } => {
+            let reason = crate::prose::opt_text_or_file(
+                "--reason",
+                "--reason-file",
+                reason,
+                reason_file.as_deref(),
+            )?;
+            gate::withdraw(&packet, reason, &namespace, dry_run).await
+        }
+        Commands::Gate {
             branch,
+            withdraw: _,
+            reason: _,
+            reason_file: _,
             mode,
             manifest,
             namespace,
@@ -2166,6 +2169,10 @@ async fn main() -> Result<()> {
                     max_wait_hours: park_waits_on_max_wait_hours,
                 }),
             };
+            // clap requires the branch unless --withdraw is present, and
+            // that arm is matched above.
+            let branch =
+                branch.ok_or_else(|| anyhow::anyhow!("boss gate: a branch to gate is required"))?;
             gate::run(
                 &branch,
                 mode,
@@ -2231,6 +2238,8 @@ async fn main() -> Result<()> {
         Commands::Attach(cmd) => attach::dispatch(cmd).await,
         Commands::Correct(cmd) => correct::dispatch(cmd).await,
         Commands::Credential(cmd) => credential::dispatch(cmd).await,
+        Commands::Events(cmd) => events::dispatch(cmd).await,
+        Commands::Ledger(cmd) => ledger::dispatch(cmd).await,
         Commands::Merged(cmd) => merged::dispatch(cmd),
         Commands::Receipt(cmd) => receipt::dispatch(cmd).await,
         Commands::Repair(cmd) => repair::dispatch(cmd).await,
@@ -2238,6 +2247,7 @@ async fn main() -> Result<()> {
         Commands::Steps(cmd) => steps::dispatch(cmd).await,
         Commands::Tenant(cmd) => tenant::dispatch(cmd).await,
         Commands::Estate(cmd) => estate::dispatch(cmd),
+        Commands::Recovery(cmd) => recovery::dispatch(cmd, chrono::Utc::now()).await,
     }
 }
 
@@ -2270,161 +2280,6 @@ async fn cmd_sim_replay(
     Ok(())
 }
 
-async fn cmd_ledger_rebuild(postgres_url: &str, json: bool) -> Result<()> {
-    use sqlx::postgres::PgPoolOptions;
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(postgres_url)
-        .await?;
-
-    if !json {
-        println!("Rebuilding GL projection from financial_facts (open periods only)...");
-    }
-    let report = boss_ledger::rebuild(&pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("rebuild failed: {e}"))?;
-
-    if json {
-        let out = serde_json::json!({
-            "facts_processed": report.facts_processed,
-            "entries_dropped": report.entries_dropped,
-            "entries_created": report.entries_created,
-            "periods_rebuilt": report.periods_rebuilt,
-            "total_debits": report.total_debits.to_string(),
-            "total_credits": report.total_credits.to_string(),
-            "balanced": report.is_balanced(),
-        });
-        println!("{}", serde_json::to_string_pretty(&out)?);
-    } else {
-        println!(
-            "  {} facts processed → {} entries created ({} dropped, {} periods rebuilt)",
-            report.facts_processed,
-            report.entries_created,
-            report.entries_dropped,
-            report.periods_rebuilt,
-        );
-        println!(
-            "  trial balance: debits=${} credits=${}  {}",
-            report.total_debits,
-            report.total_credits,
-            if report.is_balanced() {
-                "BALANCED"
-            } else {
-                "MISMATCH"
-            },
-        );
-    }
-
-    if !report.is_balanced() {
-        anyhow::bail!(
-            "trial balance mismatch: debits={} credits={}",
-            report.total_debits,
-            report.total_credits
-        );
-    }
-    Ok(())
-}
-
-async fn cmd_ledger_periods(postgres_url: &str, json: bool) -> Result<()> {
-    use sqlx::postgres::PgPoolOptions;
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(postgres_url)
-        .await?;
-    let periods = boss_ledger::periods::list_periods(&pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("list_periods: {e}"))?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&periods)?);
-    } else {
-        println!(
-            "{:<12}  {:<8}  {:>8}  {:>14}  {:>14}  LOCKED_BY",
-            "STARTS_ON", "STATUS", "ENTRIES", "DEBITS", "CREDITS"
-        );
-        println!("{}", "-".repeat(80));
-        for p in &periods {
-            println!(
-                "{:<12}  {:<8}  {:>8}  {:>14}  {:>14}  {}",
-                p.starts_on,
-                p.status,
-                p.entry_count,
-                p.total_debits,
-                p.total_credits,
-                p.locked_by.as_deref().unwrap_or("-")
-            );
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_ledger_lock(postgres_url: &str, starts_on: &str, locked_by: &str) -> Result<()> {
-    use sqlx::postgres::PgPoolOptions;
-    let date: chrono::NaiveDate = starts_on
-        .parse()
-        .map_err(|e| anyhow::anyhow!("bad date `{starts_on}`: {e}"))?;
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(postgres_url)
-        .await?;
-    let id: uuid::Uuid =
-        sqlx::query_scalar("SELECT id FROM gl_periods WHERE kind = 'month' AND starts_on = $1")
-            .bind(date)
-            .fetch_optional(&pool)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("no period with starts_on={starts_on}"))?;
-    let stamp = boss_core::publisher::EventStamp::new(
-        "ledger",
-        boss_core::actor::ActorId::Automation("operator-cli".into()),
-    );
-    let checksum = boss_ledger::periods::lock_period(&pool, id, locked_by, &stamp, locked_by)
-        .await
-        .map_err(|e| anyhow::anyhow!("lock_period: {e}"))?;
-    println!("locked period {starts_on} — {checksum}");
-    Ok(())
-}
-
-async fn cmd_ledger_unlock(postgres_url: &str, starts_on: &str) -> Result<()> {
-    use sqlx::postgres::PgPoolOptions;
-    let date: chrono::NaiveDate = starts_on
-        .parse()
-        .map_err(|e| anyhow::anyhow!("bad date `{starts_on}`: {e}"))?;
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(postgres_url)
-        .await?;
-    let id: uuid::Uuid =
-        sqlx::query_scalar("SELECT id FROM gl_periods WHERE kind = 'month' AND starts_on = $1")
-            .bind(date)
-            .fetch_optional(&pool)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("no period with starts_on={starts_on}"))?;
-    let stamp = boss_core::publisher::EventStamp::new(
-        "ledger",
-        boss_core::actor::ActorId::Automation("operator-cli".into()),
-    );
-    boss_ledger::periods::unlock_period(&pool, id, &stamp, "operator-cli")
-        .await
-        .map_err(|e| anyhow::anyhow!("unlock_period: {e}"))?;
-    println!("unlocked period {starts_on}");
-    Ok(())
-}
-
-async fn cmd_assets_rebuild_projection(postgres_url: &str) -> Result<()> {
-    use sqlx::postgres::PgPoolOptions;
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(postgres_url)
-        .await?;
-    let assets = boss_assets::PgAssets::new(pool);
-    println!("Rebuilding systems projection from system_events log...");
-    let written = assets
-        .rebuild_projection()
-        .await
-        .map_err(|e| anyhow::anyhow!("rebuild failed: {e}"))?;
-    println!("Wrote {written} rows.");
-    Ok(())
-}
-
 async fn cmd_emit(kind: String, payload: String) -> Result<()> {
     let payload: serde_json::Value = serde_json::from_str(&payload)?;
     // CLI one-off — boundary tool that builds an Event for stdout
@@ -2447,6 +2302,149 @@ mod tests {
     #[test]
     fn command_tree_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// NO VERB DEFAULTS TO A DATABASE (backlog 05cd6572, 52dc6ffb). Five
+    /// verbs — `ledger lock`/`unlock`/`rebuild`/`periods` and `assets
+    /// rebuild-projection` — defaulted `--postgres-url` to
+    /// the demo credentials on 127.0.0.1: a write past boss-policy,
+    /// credited to `automation:operator-cli`, into whatever database
+    /// answered on that port, which need not be the system of record (a
+    /// wrong target answers instead of erroring, CLAUDE.md §Doors). A
+    /// verb reaches a service through its signed door; a rebuild is
+    /// `boss-rebuild-all`, which takes its URL spelled out. Walks the
+    /// whole tree, so a new verb cannot bring the default back.
+    #[test]
+    fn no_verb_defaults_to_a_database_url() {
+        fn walk(cmd: &clap::Command, path: &str, found: &mut Vec<String>) {
+            for arg in cmd.get_arguments() {
+                for v in arg.get_default_values() {
+                    let v = v.to_string_lossy();
+                    if v.contains("postgres://") || v.contains("postgresql://") {
+                        found.push(format!("{path} --{}: {v}", arg.get_id()));
+                    }
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), found);
+            }
+        }
+        let mut found = Vec::new();
+        walk(&Cli::command(), "boss", &mut found);
+        assert!(
+            found.is_empty(),
+            "a verb defaults to a database instead of reaching its service's door: {found:#?}"
+        );
+    }
+
+    /// The lines of `src` that spell a database URL, outside any item
+    /// marked `#[cfg(test)]`. A test-only item is skipped from its
+    /// attribute to the end of the item it marks: the first line ending
+    /// in `;` before any brace opens (a `use`), or the line where the
+    /// braces it opened balance again (a `mod`, `fn`, `impl`). Brace
+    /// counting does not parse strings, so a lone brace in a literal
+    /// could end a skip early — which reports a line, loudly, and never
+    /// hides one outside a test item.
+    fn database_url_literals(file: &str, src: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut skipping = false;
+        let mut depth = 0i64;
+        let mut opened = false;
+        for (n, line) in src.lines().enumerate() {
+            let t = line.trim();
+            let rest = if let Some(after) = t.strip_prefix("#[cfg(test)]") {
+                skipping = true;
+                depth = 0;
+                opened = false;
+                after.trim()
+            } else {
+                t
+            };
+            if skipping {
+                for c in rest.chars() {
+                    match c {
+                        '{' => {
+                            depth += 1;
+                            opened = true;
+                        }
+                        '}' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                if (opened && depth <= 0) || (!opened && rest.ends_with(';')) {
+                    skipping = false;
+                }
+                continue;
+            }
+            if line.contains("postgres://") || line.contains("postgresql://") {
+                found.push(format!("{file}:{}: {t}", n + 1));
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn the_database_url_scan_skips_test_items_and_nothing_else() {
+        let src = concat!(
+            "#[cfg(test)]\n",
+            "use x::y;\n",
+            "const A: &str = \"postgres://a\";\n",
+            "#[cfg(test)]\n",
+            "#[derive(Default)]\n",
+            "struct S {\n",
+            "    url: &'static str, // postgres://in-a-test-struct\n",
+            "}\n",
+            "fn live() -> String { \"postgresql://b\".into() }\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    fn f() { let _ = \"postgres://in-tests\"; }\n",
+            "}\n",
+        );
+        assert_eq!(
+            database_url_literals("f.rs", src),
+            vec![
+                "f.rs:3: const A: &str = \"postgres://a\";".to_string(),
+                "f.rs:9: fn live() -> String { \"postgresql://b\".into() }".to_string(),
+            ]
+        );
+    }
+
+    /// NO DATABASE URL IS SPELLED IN THE CLI (backlog df6aedb4). The walk
+    /// above sees only clap defaults; an `unwrap_or("postgres://…")`, a
+    /// `const`, or a `format!` puts the same default into a verb and it
+    /// never reaches clap. So this reads every file under `src/` and
+    /// refuses any postgres URL outside a `#[cfg(test)]` item: a verb
+    /// that needs the database takes its URL from the operator, spelled
+    /// out, or reaches its service through the signed door.
+    #[test]
+    fn no_database_url_is_spelled_in_the_cli_source() {
+        fn walk(dir: &std::path::Path, root: &std::path::Path, found: &mut Vec<String>) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .expect("read boss-cli src")
+                .map(|e| e.expect("dir entry").path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    walk(&path, root, found);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    let src = std::fs::read_to_string(&path).expect("read source");
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string();
+                    found.extend(database_url_literals(&rel, &src));
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found = Vec::new();
+        walk(&root, &root, &mut found);
+        assert!(
+            found.is_empty(),
+            "boss-cli spells a database URL outside a test item: {found:#?}"
+        );
     }
 
     /// EVERY HAND-OFF VERB IS A SUBCOMMAND (design e765b3fc §2b, car R2):
@@ -2529,6 +2527,30 @@ mod tests {
         }
     }
 
+    /// `boss gate --withdraw <gate-run>` names a packet, not a branch
+    /// (backlog 8d7d0a2b): the branch is required only without it, the
+    /// two are exclusive, and a withdrawal carries none of a launch's
+    /// flags — a reason means nothing without the withdrawal it explains.
+    #[test]
+    fn a_withdrawal_names_a_gate_run_instead_of_a_branch() {
+        Cli::try_parse_from(["boss", "gate", "--withdraw", "8c2f644a"])
+            .unwrap_or_else(|e| panic!("a bare withdrawal parses: {e}"));
+        Cli::try_parse_from(["boss", "gate", "feat/x", "--wait", "--mode", "auto"])
+            .unwrap_or_else(|e| panic!("a launch still parses: {e}"));
+        for refused in [
+            vec!["boss", "gate"],
+            vec!["boss", "gate", "feat/x", "--withdraw", "8c2f644a"],
+            vec!["boss", "gate", "--withdraw", "8c2f644a", "--wait"],
+            vec!["boss", "gate", "--withdraw", "8c2f644a", "--rebase"],
+            vec!["boss", "gate", "feat/x", "--reason", "why"],
+        ] {
+            assert!(
+                Cli::try_parse_from(refused.clone()).is_err(),
+                "{refused:?} must be refused"
+            );
+        }
+    }
+
     /// The OPTIONAL prose flags get the same twin (backlog 6f1e9b99):
     /// absent is still absent, either alone parses, both together are
     /// refused. `boss prove --verified` and `--method` are sentences a
@@ -2554,6 +2576,12 @@ mod tests {
                 vec!["boss", "dispatch", "abcd1234", "--report"],
                 "--summary",
                 "--summary-file",
+            ),
+            (
+                "gate --withdraw",
+                vec!["boss", "gate", "--withdraw", "abcd1234"],
+                "--reason",
+                "--reason-file",
             ),
         ] {
             for flag in [text, file] {
@@ -2698,9 +2726,11 @@ mod tests {
         let cmd = Cli::command();
         let names: Vec<&str> = cmd.get_subcommands().map(|c| c.get_name()).collect();
         for expected in [
-            "doctor", "emit", "upgrade", "script", "assets", "sim", "ledger", "inspect", "train",
-            "gate", "park", "merged", "receipt", "running", "workflow", "job", "prove", "publish",
-            "queue", "packet", "audit", "triage", "fold", "hold", "release",
+            // `assets` left on purpose: its one verb became
+            // boss-rebuild-all's `assets` step (backlog 05cd6572).
+            "doctor", "emit", "upgrade", "script", "sim", "ledger", "inspect", "train", "gate",
+            "park", "merged", "receipt", "running", "workflow", "job", "prove", "publish", "queue",
+            "packet", "audit", "triage", "fold", "hold", "release",
         ] {
             assert!(
                 names.contains(&expected),

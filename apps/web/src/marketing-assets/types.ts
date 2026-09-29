@@ -15,7 +15,7 @@ export type MarketingAsset = {
   description: string | null;
   file_url: string | null;
   tags: ReadonlyArray<string>;
-  linked_device_skus: ReadonlyArray<string>;
+  linked_skus: ReadonlyArray<string>;
   linked_account_ids: ReadonlyArray<string>;
   linked_campaign_ids: ReadonlyArray<string>;
   owner_id: string | null;

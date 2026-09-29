@@ -11,6 +11,7 @@ use boss_core::primitives::ClassRef;
 use boss_locations_client::LocationsClient;
 use sqlx::PgPool;
 
+use crate::departments::{DepartmentRoster, PgDepartmentRoster, validate_department};
 use crate::port::{PeopleError, PeopleRepository};
 use crate::types::*;
 
@@ -18,7 +19,7 @@ pub struct PgPeople {
     pool: PgPool,
     /// Optional Class registry client. When present, every write
     /// validates the closed-set attributes of `Employee` (`role`,
-    /// `department`, `employment_type`, `status`) against
+    /// `employment_type`, `status`) against
     /// `class_exists_on(("employee", code), column)` before the row
     /// hits the DB — on the column's own axis, not merely the kind.
     /// `skill_level` is a numeric range (1..=5), not a closed enum,
@@ -28,6 +29,12 @@ pub struct PgPeople {
     /// Optional Locations registry client. When present, every write
     /// validates `location` against `location_exists(id)`.
     locations: Option<Arc<dyn LocationsClient>>,
+    /// Optional departments registry. When present, every write
+    /// validates `department` against the un-retired `departments`
+    /// rows — the registry `GET /api/departments` serves — and not the
+    /// `employee` department Classes it was checked against until
+    /// backlog c87e3d6d (see `crate::departments`).
+    departments: Option<Arc<dyn DepartmentRoster>>,
 }
 
 impl PgPeople {
@@ -39,22 +46,28 @@ impl PgPeople {
             pool,
             classes: None,
             locations: None,
+            departments: None,
         }
     }
 
-    /// Construct a PgPeople wired to both registries. Every write
-    /// validates closed-set Class attributes (`role`, `department`,
-    /// `employment_type`, `status`) and the Location id before
-    /// committing.
+    /// Construct a PgPeople wired to its registries. Every write
+    /// validates the closed-set Class attributes (`role`,
+    /// `employment_type`, `status`), the `department` against the
+    /// departments registry — read on this same pool, the table being
+    /// in the database the service already holds — and the Location
+    /// id before committing.
     pub fn with_registries(
         pool: PgPool,
         classes: Arc<dyn ClassesClient>,
         locations: Arc<dyn LocationsClient>,
     ) -> Self {
+        let departments: Arc<dyn DepartmentRoster> =
+            Arc::new(PgDepartmentRoster::new(pool.clone()));
         Self {
             pool,
             classes: Some(classes),
             locations: Some(locations),
+            departments: Some(departments),
         }
     }
 
@@ -64,11 +77,13 @@ impl PgPeople {
         self.validate_employee_class("role", role_code).await
     }
 
-    /// Reject writes whose `department` doesn't resolve to an active
-    /// Class. No-op when no `classes` client is configured.
+    /// Reject writes whose `department` is not an active department in
+    /// the departments registry. No-op when no registry is configured.
     async fn validate_department(&self, department_code: &str) -> Result<(), PeopleError> {
-        self.validate_employee_class("department", department_code)
-            .await
+        let Some(departments) = &self.departments else {
+            return Ok(());
+        };
+        validate_department(departments.as_ref(), department_code).await
     }
 
     /// Reject writes whose `employment_type` doesn't resolve to an
@@ -124,7 +139,9 @@ impl PgPeople {
 /// code). Until that day this asked only whether `(employee, code)`
 /// existed, so `role = "terminated"` and `department = "platform-admin"`
 /// both passed. Asking on the axis is what keeps the four apart while
-/// they still share a kind.
+/// they still share a kind. Three since backlog c87e3d6d (2026-09-27):
+/// `department` left the drawer for the departments registry
+/// (`crate::departments`).
 async fn validate_employee_class(
     classes: &dyn ClassesClient,
     attribute: &str,
@@ -576,7 +593,10 @@ mod tests {
     /// One row per axis the live `employee` drawer carries (22 codes
     /// across role, department, status and employment_type, read from
     /// `GET /api/classes?subject_kind=employee` on 2026-09-23 — backlog
-    /// a45ab09d), enough to ask each column about another's code.
+    /// a45ab09d), enough to ask each column about another's code. The
+    /// department axis is gone from the check (c87e3d6d) — its column
+    /// asks the departments registry — but a drawer still holding a
+    /// department row must not lend it to another column.
     fn drawer() -> FakeClassesClient {
         let row = |code: &str, attribute: &str| Class {
             subject_kind: "employee".into(),
@@ -601,7 +621,6 @@ mod tests {
         let classes = drawer();
         for (attribute, code) in [
             ("role", "platform-admin"),
-            ("department", "it"),
             ("status", "terminated"),
             ("employment_type", "contractor"),
         ] {
@@ -622,7 +641,7 @@ mod tests {
         let classes = drawer();
         for (attribute, code) in [
             ("role", "terminated"),
-            ("department", "platform-admin"),
+            ("role", "it"),
             ("status", "contractor"),
             ("employment_type", "it"),
         ] {

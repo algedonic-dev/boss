@@ -25,18 +25,28 @@
 //! mostly-sure guard. So a declared writer is satisfied ONLY by a
 //! [`CredentialedCaller`] request extension, which a client cannot set:
 //! only a server-side door that resolved a presented credential inserts
-//! one. Until that door is mounted (the credential kind, its broker
-//! handler and the resolve step are the next cars of design f623e425),
-//! no caller satisfies a declared writer, which is why no live protocol
-//! declares one yet — the declaration lands on the ops-request row with
-//! the credential delivery, never before it. The viability lint holds
-//! that: a `writer` not in [`RESOLVABLE_PRINCIPALS`] is refused at
-//! publish.
+//! one. That door is [`crate::runner_credential`] (the resolve step of
+//! design f623e425 option A); until the broker's Secret it reads is
+//! mounted and filled (the credential kind and its broker handler, the
+//! next car), no caller satisfies a declared writer, which is why no
+//! live protocol declares one yet — the declaration lands on the
+//! ops-request row with the credential delivery, never before it. The
+//! viability lint holds that: a `writer` not in
+//! [`RESOLVABLE_PRINCIPALS`] is refused at publish.
 //!
 //! THE HOST BINDING. A credential bound to a host writes only packets
 //! whose `host` (job metadata) is that host — "a runner for host h
 //! writes only requests whose host is h" — so the credential of one
 //! runner cannot author the plan another host's runner is asked to run.
+//! That holds only while `host` cannot move under it, so on a packet
+//! whose steps declare a writer both job doors refuse a change to it
+//! after admission ([`host_changed`], review S2 of car 1e603cfd).
+//!
+//! THE OTHER DOORS (the same review). A re-pin never moves a live
+//! step's declared writer nor writes a key one reserves
+//! ([`repin_refusals`], S1); the merge door drops an unchanged re-send
+//! of a reserved key rather than apply it to a row the writer may have
+//! moved since the read ([`strip_unchanged_reserved`], S3).
 
 use boss_core::job::StepField;
 use serde::Serialize;
@@ -73,6 +83,14 @@ pub struct ReservedKey {
 /// here, and only then may a protocol declare it — which is how "the
 /// declaration lands with the credential delivery, never before it"
 /// stopped being a sentence and became a refusal.
+///
+/// STILL EMPTY WITH THE DOOR MOUNTED (2026-09-29). The resolve step
+/// ([`crate::runner_credential`]) resolves `runner:ops`, but only from a
+/// slot the broker has filled, and no broker fills one yet: listed now,
+/// a protocol could declare the writer and lock the runner out of the
+/// plan David approves. `runner:ops` enters here in the car that
+/// delivers a credential the runner can present; the door's test pins
+/// every entry to a principal it resolves.
 pub const RESOLVABLE_PRINCIPALS: &[&str] = &[];
 
 /// The job-metadata key a host-bound credential is judged against.
@@ -94,6 +112,149 @@ pub fn reserved_keys_changed(fields: &[StepField], old: &Value, new: &Value) -> 
             })
         })
         .collect()
+}
+
+/// Remove from `patch` every key with a declared writer whose patched
+/// value equals `stored` — a set to the stored value, or a `null` for a
+/// key the row does not hold — and answer whether any was removed
+/// (backlog 6c9183de, review S3 of car 1e603cfd, 2026-09-26).
+///
+/// WHY. The merge door judges a patch against the row it READ, and the
+/// adapter applies it to the row as it STANDS. An unchanged re-send is
+/// not a change, so a caller who is not the writer is admitted with it
+/// — and if the writer wrote between that read and the merge, the
+/// re-send put the old value back: the runner's newer plan reverted by
+/// a caller who may not write plans. A key this write does not change
+/// has no business in the write, so it never reaches the adapter.
+///
+/// NEVER THE WRITER'S OWN (review of car f3365343, 2026-09-28, follow-up
+/// a). The strip guards a key's writer AGAINST other callers. Applied to
+/// the writer too, it answered a runner pass that raced another pass 204
+/// and threw its write away — the one caller whose value the key exists
+/// to hold. So a key `caller` is the admitted writer of (for a packet
+/// whose host is `job_host`) stays in the patch and lands as sent.
+pub fn strip_unchanged_reserved(
+    fields: &[StepField],
+    stored: &Value,
+    patch: &mut serde_json::Map<String, Value>,
+    caller: Option<&CredentialedCaller>,
+    job_host: Option<&str>,
+) -> bool {
+    let before = patch.len();
+    for f in fields.iter() {
+        let Some(writer) = f.writer.as_deref() else {
+            continue;
+        };
+        if admits(caller, writer, job_host).is_ok() {
+            continue;
+        }
+        let unchanged = match patch.get(&f.name) {
+            Some(Value::Null) => stored.get(&f.name).is_none(),
+            Some(v) => stored.get(&f.name) == Some(v),
+            None => false,
+        };
+        if unchanged {
+            patch.remove(&f.name);
+        }
+    }
+    patch.len() != before
+}
+
+/// Whether any of a packet's steps declares a field writer — the packets
+/// whose job-metadata [`HOST_KEY`] is fixed at admission (review S2).
+pub fn declares_a_writer<'a>(steps: impl IntoIterator<Item = &'a boss_core::job::Step>) -> bool {
+    steps
+        .into_iter()
+        .any(|s| s.fields.iter().any(|f| f.writer.is_some()))
+}
+
+/// Whether a job-metadata write moves [`HOST_KEY`]: `old` is the stored
+/// metadata, `new` what the write leaves (absent = removed).
+pub fn host_changed(old: &Value, new: &Value) -> bool {
+    old.get(HOST_KEY) != new.get(HOST_KEY)
+}
+
+/// The refusal a job door answers a moved [`HOST_KEY`] with, on a
+/// packet whose steps declare a writer.
+pub fn host_refusal_body(job_id: &str, stored_host: Option<&Value>) -> Value {
+    serde_json::json!({
+        "error": "this packet's host is fixed at admission: a key on it is reserved to a \
+                  host-bound writer, and that writer is judged against this host",
+        "job_id": job_id,
+        "refused_keys": [HOST_KEY],
+        "stored_host": stored_host,
+        "hint": "a request for another host is a new packet: file it again naming that host",
+        "rule": "a key a human signs has one declared writer, and the server knows who that \
+                 writer is (design f623e425; backlog 6c9183de review S2)",
+    })
+}
+
+/// Why a re-pin may not rewrite a LIVE step from `now` (the packet's own
+/// fields and metadata) to `next` (the target's) — empty when it may
+/// (backlog 6c9183de, review S1 of car 1e603cfd, 2026-09-26). The
+/// convert door rewrote a live step's `fields` from the target
+/// wholesale and re-projected its defaults, consulting no writer, so a
+/// protocol version could release a reserved key, re-assign it, or
+/// write into it. Two refusals:
+///
+/// - A field's declared writer MOVES — dropped, changed, or declared
+///   where there was none. Dropped or changed releases a key whose
+///   value only the old writer could have put there; ADDED presents a
+///   value anyone wrote as the new writer's. Either misstates who
+///   wrote the record, so neither happens to a step in flight.
+/// - The re-pin itself would change a reserved key's value. The
+///   re-projection is the protocol writing, and the protocol is not
+///   the declared writer.
+pub fn repin_refusals(
+    now_fields: &[StepField],
+    next_fields: &[StepField],
+    now_metadata: &Value,
+    next_metadata: &Value,
+) -> Vec<String> {
+    let writer_of = |fields: &[StepField], name: &str| {
+        fields
+            .iter()
+            .find(|f| f.name == name)
+            .and_then(|f| f.writer.clone())
+    };
+    let mut names: Vec<&str> = now_fields
+        .iter()
+        .chain(next_fields)
+        .filter(|f| f.writer.is_some())
+        .map(|f| f.name.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let shown = |w: &Option<String>| w.as_deref().unwrap_or("none").to_string();
+    let mut out: Vec<String> = names
+        .iter()
+        .filter_map(|name| {
+            let (was, will) = (writer_of(now_fields, name), writer_of(next_fields, name));
+            (was != will).then(|| {
+                format!(
+                    "field `{name}` declares writer `{}` on the packet and `{}` in the target: \
+                     a live step's declared writer does not move on a re-pin",
+                    shown(&was),
+                    shown(&will),
+                )
+            })
+        })
+        .collect();
+    let mut changed = reserved_keys_changed(now_fields, now_metadata, next_metadata);
+    changed.extend(reserved_keys_changed(
+        next_fields,
+        now_metadata,
+        next_metadata,
+    ));
+    changed.sort_by(|a, b| a.key.cmp(&b.key));
+    changed.dedup_by(|a, b| a.key == b.key);
+    out.extend(changed.into_iter().map(|r| {
+        format!(
+            "the re-pin would change `{}`, which only `{}` may write",
+            r.key, r.writer
+        )
+    }));
+    out
 }
 
 /// Whether `caller` is the declared `writer` for a packet whose `host`
@@ -228,6 +389,65 @@ mod tests {
             reserved_keys_changed(&fields, &json!({}), &json!({ "plan": "p" })).len(),
             1
         );
+    }
+
+    /// Review S3: only a reserved key the patch leaves as stored is
+    /// dropped — a set to the stored value, or a null for an absent key.
+    /// A change stays (for the writer check to judge) and so does every
+    /// undeclared key.
+    #[test]
+    fn only_an_unchanged_reserved_key_is_stripped_from_a_patch() {
+        let fields = [
+            field("plan", Some("runner:ops")),
+            field("verb", Some("runner:ops")),
+            field("comment", None),
+        ];
+        let stored = json!({ "plan": "PLAN a", "comment": "x" });
+        let mut patch = json!({ "plan": "PLAN a", "verb": null, "comment": "x" })
+            .as_object()
+            .cloned()
+            .unwrap();
+        assert!(strip_unchanged_reserved(
+            &fields, &stored, &mut patch, None, None
+        ));
+        assert_eq!(Value::Object(patch), json!({ "comment": "x" }));
+
+        let mut patch = json!({ "plan": "PLAN b" }).as_object().cloned().unwrap();
+        assert!(!strip_unchanged_reserved(
+            &fields, &stored, &mut patch, None, None
+        ));
+        assert_eq!(Value::Object(patch), json!({ "plan": "PLAN b" }));
+    }
+
+    /// Follow-up a of the review of car f3365343: the declared writer's
+    /// own unchanged re-send is never stripped — it is the record — while
+    /// the same patch from a credential for another host still is.
+    #[test]
+    fn the_declared_writers_own_re_send_is_never_stripped() {
+        let fields = [field("plan", Some("runner:ops")), field("comment", None)];
+        let stored = json!({ "plan": "PLAN a" });
+        let sent = json!({ "plan": "PLAN a" }).as_object().cloned().unwrap();
+
+        let mut patch = sent.clone();
+        let own = runner(Some("forge"));
+        assert!(!strip_unchanged_reserved(
+            &fields,
+            &stored,
+            &mut patch,
+            Some(&own),
+            Some("forge")
+        ));
+        assert_eq!(Value::Object(patch), json!({ "plan": "PLAN a" }));
+
+        let mut patch = sent;
+        assert!(strip_unchanged_reserved(
+            &fields,
+            &stored,
+            &mut patch,
+            Some(&own),
+            Some("boss-gcp")
+        ));
+        assert!(patch.is_empty());
     }
 
     #[test]

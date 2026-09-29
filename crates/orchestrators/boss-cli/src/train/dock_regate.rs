@@ -52,6 +52,22 @@
 //! in `jobs_auto_park.rs`, the path CLAUDE.md §Doors names as the repair
 //! for a moved branch. Nothing here copies a receipt.
 //!
+//! ONLY AFTER A RED TRAIN, SINCE BACKLOG 96f02540 (David, 2026-09-28).
+//! This rule used to run on every LANDING against every parked car, and
+//! its cost grew as (parked cars) x (landings): after train #766 landed at
+//! 02:40Z five of seven parked cars were re-gated, queued 40-60 minutes
+//! behind saturated bays, and a quarter of all gate capacity went to
+//! re-proving parked cars the TRAIN gate tests again on the assembled
+//! consist anyway (design 128b5496). And each landing re-staled the last
+//! round, so throughput FELL as the dock filled. So the rule is kept for
+//! exactly one trigger: a red train that judged its cars owes a re-gate to
+//! the cars it released whose files meet the failure (`owed_by`) — to all
+//! of them when the red named no path — and records it on the car
+//! (`REGATE_OWED`). Only a car carrying that marker is judged here; every
+//! other car whose receipt vouches for its head boards as gated. And the
+//! board never waits on a re-gate: the departure hold that waited for the
+//! dock's round is gone with the round.
+//!
 //! AND IT MUST NEVER FREEZE A LANDING (the ordering edge's rule, in
 //! `boarding.rs`). An unreadable base, an unreachable cluster, a push the
 //! forge refused — every way the MEANS fail boards the car as gated,
@@ -205,6 +221,11 @@ pub(crate) struct RegateStamp {
     pub base: String,
     /// The head the car was replayed to; empty when the replay was refused.
     pub head: String,
+    /// The head the replay started FROM — the car as its review read it.
+    /// Recorded so a release given at that head can be carried to the
+    /// replayed one when the car's own diff is unchanged (backlog
+    /// b7b02024, review F3). Empty on a stamp written before it existed.
+    pub from: String,
     /// The gate-run filed for `head`; empty until one is filed.
     pub gate_run: String,
     /// Why the replay was refused; empty otherwise.
@@ -213,12 +234,6 @@ pub(crate) struct RegateStamp {
     pub touched: Vec<String>,
     /// How many there were.
     pub touched_count: usize,
-    /// How many departures have left this car behind while a re-gate of
-    /// it was in flight (backlog d9530df2). Carried from launch to launch,
-    /// because the re-launch on the next main is exactly what follows a
-    /// miss; a car with one is waited for to its own verdict
-    /// (`departure_hold`).
-    pub missed: u32,
     /// How many dock re-gates of this car in a row went red before this
     /// one was launched (backlog 2fccbfd6). A red is retried once — on
     /// the next main move, or after the bound — and the retry carries the
@@ -243,14 +258,6 @@ impl RegateStamp {
             touched: touched.iter().take(STAMP_SAMPLE).cloned().collect(),
             touched_count: touched.len(),
             ..Default::default()
-        }
-    }
-
-    /// This stamp, keeping the misses the car's `prior` stamp counted.
-    pub(crate) fn carrying(self, prior: Option<&RegateStamp>) -> Self {
-        RegateStamp {
-            missed: prior.map_or(0, |p| p.missed),
-            ..self
         }
     }
 
@@ -286,6 +293,7 @@ impl RegateStamp {
             main,
             base: text("base"),
             head: text("head"),
+            from: text("from"),
             gate_run: text("gate_run"),
             refused: text("refused"),
             touched_count: s
@@ -293,10 +301,6 @@ impl RegateStamp {
                 .and_then(Value::as_u64)
                 .map_or(touched.len(), |n| n as usize),
             touched,
-            missed: s
-                .get("missed")
-                .and_then(Value::as_u64)
-                .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX)),
             reds: s
                 .get("reds")
                 .and_then(Value::as_u64)
@@ -309,11 +313,11 @@ impl RegateStamp {
             "main": self.main,
             "base": self.base,
             "head": self.head,
+            "from": self.from,
             "gate_run": self.gate_run,
             "refused": self.refused,
             "touched": self.touched,
             "touched_count": self.touched_count,
-            "missed": self.missed,
             "reds": self.reds,
             "at": at.to_rfc3339(),
             "why": "backlog 969a1092: main moved into this car's files after its gate",
@@ -409,9 +413,7 @@ pub(crate) fn in_flight(stamp: &RegateStamp, verdict: Option<&str>) -> InFlight 
 // on its own gate; what changed is main, or the moment (a lint reading
 // live state, a runner that died). So a red is RETRIED ONCE: on the next
 // main move — a fresh base, the case above — or, if main does not move,
-// after a bound (twice the registry's `regate_hold_minutes`, the bound a
-// departure already gives a car it left behind mid-re-gate), at the same
-// head. The retry carries the count (`RegateStamp::reds`), and a retry
+// after a bound (`RED_RETRY_MINUTES`), at the same head. The retry carries the count (`RegateStamp::reds`), and a retry
 // that goes red too is GARAGED: the dock stops re-gating that head, and
 // the car stands with the failure named until its builder repairs it.
 //
@@ -431,10 +433,12 @@ pub(crate) fn in_flight(stamp: &RegateStamp, verdict: Option<&str>) -> InFlight 
 // before the packet's (`judged_verdict`), as `flake::prior` reads it.
 // ---------------------------------------------------------------------------
 
-/// A red is retried after this many of the registry's re-gate holds when
-/// main does not move — the bound `departure_hold` gives a car a
-/// departure already left behind mid-re-gate.
-const RED_RETRY_HOLDS: i64 = 2;
+/// A red is retried at the same head after this many minutes when main
+/// does not move. It was twice the fifteen minutes the departure hold
+/// gave a car it left behind (design 42279fb2); that hold is gone
+/// (backlog 96f02540) and so is its column on the boarding rule's row
+/// (backlog d1d4275d), and the bound keeps the value it had.
+const RED_RETRY_MINUTES: i64 = 30;
 
 /// What the dock does about a car whose re-gate came back red.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -451,14 +455,13 @@ pub(crate) enum AfterRed {
 
 /// PURE: what a red re-gate owes the car. `verdict` is the gate-run's
 /// word, `main_now` the clone's `origin/main` (`None` = unreadable),
-/// `red_at` when the red was recorded, `hold_minutes` the registry's.
+/// `red_at` when the red was recorded.
 pub(crate) fn after_red(
     stamp: &RegateStamp,
     verdict: &str,
     main_now: Option<&str>,
     red_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
-    hold_minutes: u32,
 ) -> AfterRed {
     // A fresh base first, garaged or not: a red main shares is not the
     // car's, and the fix to main may be what it was waiting for.
@@ -469,10 +472,9 @@ pub(crate) fn after_red(
     if verdict == "failed" && stamp.reds > 0 {
         return AfterRed::Garage;
     }
-    let bound = RED_RETRY_HOLDS * i64::from(hold_minutes);
     match red_at {
-        Some(at) if bound > 0 => {
-            let left = bound - (now - at).num_minutes().max(0);
+        Some(at) => {
+            let left = RED_RETRY_MINUTES - (now - at).num_minutes().max(0);
             if left > 0 {
                 AfterRed::Wait {
                     more_minutes: Some(left),
@@ -547,17 +549,26 @@ pub(crate) fn stamp_garaged(stamp: &Value) -> bool {
 
 /// PURE: is the car a hold is about GARAGED — read off the stamp the hold
 /// writes, or, when it writes none (a garaged car's retry waiting for a
-/// gate bay), off the red the car already carries (round-2 re-review of
-/// car 5eb1967e, N1).
-pub(crate) fn hold_garaged(stamp: Option<&Value>, car: &Value) -> bool {
-    stamp.map_or_else(
-        || {
-            car.get("metadata")
-                .and_then(boss_jobs::dock_red::regate_red)
-                .is_some_and(|r| r.garaged)
-        },
-        stamp_garaged,
-    )
+/// gate bay), off the stamp this pass CLEARS its red to (`cleared`, from
+/// `cleared_stamp`), or, when neither, off the red the car already
+/// carries (round-2 re-review of car 5eb1967e, N1). The cleared stamp
+/// comes before the car's own red because the car is the snapshot read
+/// BEFORE this pass took the red off (L1 of the round-3 review, backlog
+/// f8383a38): read first, a re-parked car drew GARAGED for one pass.
+pub(crate) fn hold_garaged(stamp: Option<&Value>, cleared: Option<&Value>, car: &Value) -> bool {
+    stamp
+        .or(cleared)
+        .map_or_else(|| car_garaged(car), stamp_garaged)
+}
+
+/// PURE: does the car's own recorded red say GARAGED? The one reading of
+/// "already garaged" — never `reds > 0`, which a first retry of a LOST
+/// red also carries (L2 of the round-3 review of car 5eb1967e, backlog
+/// f8383a38).
+pub(crate) fn car_garaged(car: &Value) -> bool {
+    car.get("metadata")
+        .and_then(boss_jobs::dock_red::regate_red)
+        .is_some_and(|r| r.garaged)
 }
 
 /// PURE: the car's stamp with its red and its red count taken off — what
@@ -595,115 +606,91 @@ pub(crate) fn retry_unlaunched_reason(
 }
 
 // ---------------------------------------------------------------------------
-// THE ROUND A DEPARTURE WAITS FOR (backlog 4890165b, design 42279fb2, D2)
+// THE ONE TRIGGER LEFT: A RED TRAIN OWES A RE-GATE (backlog 96f02540)
 //
-// Main moves only when a train merges, so a re-gate launched on main M is
-// still the right test of its car until the NEXT departure — and that
-// departure is exactly what used to make it stale. Measured at 19:26 on
-// 2026-09-25: the dock replayed a car onto 22c1a876 in the same pass that
-// departed train #686, whose merge (777a5888) changed four of that car's
-// files. With a lone car still shipping (depth 1), each car that did come
-// fresh left in its own one- or two-car train and re-staled the rest.
+// The departure hold that waited for "the dock's round" (D2 of design
+// 42279fb2) is gone, and with it the round, the misses it counted and the
+// stamp field that carried them. It anchored a 15-minute wait to the OLDEST
+// re-gate IN FLIGHT, and waited up to 30 more for a car a departure had
+// left behind — both measured from launches that a saturated gate queue
+// delays: on 2026-09-28 each finished re-gate launched the next in the same
+// pass, the anchor moved, and the board refused every tick from 02:37Z with
+// cars ready beside it.
 //
-// So a board that has cars ready HOLDS while the dock has re-gates in
-// flight on the current main, and departs once the oldest of them is
-// `regate_hold_minutes` old (the registry's number, 15 — the median dock
-// re-gate that day was 13.9 min). Counted from the OLDEST so a re-gate
-// launched late in a round can never extend it: the hold is one gate,
-// never a moving target. A re-gate on a main that has since moved is not
-// this departure's round, and a stamp with no readable launch time cannot
-// bound a wait, so it holds nothing.
-//
-// EXCEPT FOR A CAR THE ROUND HAS ALREADY FAILED (backlog d9530df2). The
-// oldest-first bound never waits for a re-gate launched late, and a car
-// in a busy crate is re-gated on every main, so it can be launched late
-// every time. Measured 2026-09-26: car 70165082 was left behind by trains
-// 14:39, 15:19 and 16:14 while its own re-gate ran each time — launched
-// 2 to 17 minutes after main moved, running 17 to 24 minutes — and
-// boarded at 17:09 only because that board happened to fire after the
-// green. So a departure that leaves a car behind mid-re-gate counts it on
-// the car (`base_regate.missed`), and from then on a departure on its
-// main waits for that car's OWN verdict, bounded by TWICE the hold from
-// its own launch, so even a re-gate that never answers is waited for a
-// fixed time. A car in its first round keeps the oldest-first rule: one
-// miss is the accepted cost of a bounded wait.
+// What remains is the bisect. A red train's cancel records `REGATE_OWED`
+// on each car it releases whose files meet the failure (`owed_by`): the
+// same path, or the same unit (`neighbourhood` — a Rust crate, a web
+// directory) on either side, because the car's change anywhere in a crate
+// can break a test anywhere in it. When the red names no path, every car
+// it released is owed one — the dock's old behaviour, for the cars that
+// actually rode the red. The marker is paid the pass a re-gate is FILED
+// (`owed_paid`) or the pass the car is found boardable, so a red costs each
+// car at most one re-gate, never one per landing after it.
 // ---------------------------------------------------------------------------
 
-/// One re-gate the dock has in flight: whose car, the main it was
-/// launched for, when, and how many departures have already left the car
-/// behind mid-re-gate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct InRound {
-    pub car: String,
-    pub main: String,
-    pub since: DateTime<Utc>,
-    pub missed: u32,
+/// The car key that says a red train owes this car a re-gate — the only
+/// thing that sends a car through `judge` since 96f02540.
+pub(crate) const REGATE_OWED: &str = "regate_owed";
+
+/// PURE: does the car carry an owed re-gate?
+pub(crate) fn owes_regate(car: &Value) -> bool {
+    car.pointer(&format!("/metadata/{REGATE_OWED}"))
+        .is_some_and(Value::is_object)
 }
 
-/// Why a departure waits: the round on `main`, how many re-gates are in
-/// it, how old the oldest is, the bound it waits against, how many of its
-/// cars a departure already left behind mid-re-gate and are waited for to
-/// their own verdict, and the most minutes the wait can still last.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RoundHold {
-    pub main: String,
-    pub in_flight: usize,
-    pub oldest_minutes: i64,
-    pub hold_minutes: u32,
-    pub missed: usize,
-    pub more_minutes: i64,
-}
-
-/// PURE: does a departure on `main` wait for the dock's round? `None` =
-/// depart.
-pub(crate) fn departure_hold(
-    round: &[InRound],
-    main: &str,
-    now: DateTime<Utc>,
-    hold_minutes: u32,
-) -> Option<RoundHold> {
-    if hold_minutes == 0 {
-        return None;
+/// PURE: is a re-gate owed to a car whose files are `car_files`, by a red
+/// whose located failures are `failing`? `Some(the failures it meets)`
+/// when it is; `None` when the red lies wholly outside the car.
+///
+/// A red that named nothing (`failing` empty) is owed by every car, and so
+/// is a car whose files could not be read — each is the old behaviour, the
+/// safe side of a guess. Unlike `touched_by_main` there is no leaf cut: a
+/// failing TEST is exactly where a car's change to its crate shows up.
+pub(crate) fn owed_by(car_files: &[String], failing: &[String]) -> Option<Vec<String>> {
+    if failing.is_empty() || car_files.is_empty() {
+        return Some(Vec::new());
     }
-    let age = |r: &InRound| (now - r.since).num_minutes().max(0);
-    let hold = i64::from(hold_minutes);
-    let on_main: Vec<&InRound> = round.iter().filter(|r| r.main == main).collect();
-    let oldest_minutes = on_main.iter().map(|r| age(r)).max()?;
-    // A car already left behind mid-re-gate, still inside its own bound.
-    let owed: Vec<i64> = on_main
+    let reach: BTreeSet<String> = car_files
         .iter()
-        .filter(|r| r.missed > 0)
-        .map(|r| 2 * hold - age(r))
-        .filter(|left| *left > 0)
+        .flat_map(|f| [f.clone(), neighbourhood(f)])
         .collect();
-    let more_minutes = owed
+    let met: Vec<String> = failing
         .iter()
-        .copied()
-        .chain(std::iter::once(hold - oldest_minutes))
-        .max()
-        .unwrap_or(0);
-    (more_minutes > 0).then(|| RoundHold {
-        main: main.to_string(),
-        in_flight: on_main.len(),
-        oldest_minutes,
-        hold_minutes,
-        missed: owed.len(),
-        more_minutes,
+        .filter(|f| reach.contains(f.as_str()) || reach.contains(&neighbourhood(f)))
+        .cloned()
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect();
+    (!met.is_empty()).then_some(met)
+}
+
+/// The `REGATE_OWED` marker a red train's cancel writes on a car.
+pub(crate) fn owed_stamp(
+    train: &str,
+    failing: &[String],
+    met: &[String],
+    at: DateTime<Utc>,
+) -> Value {
+    json!({
+        "train": train,
+        "failing": failing.iter().take(STAMP_SAMPLE).collect::<Vec<_>>(),
+        "met": met.iter().take(STAMP_SAMPLE).collect::<Vec<_>>(),
+        "at": at.to_rfc3339(),
+        "why": "backlog 96f02540: a red train released this car and its failure reaches the \
+                car's files (or named none) — the dock re-gates it once on current main",
     })
 }
 
-/// PURE: the `base_regate` stamp a car carries, with one more miss
-/// counted — what a departure that leaves it behind mid-re-gate writes.
-/// Replaced whole, like every write of the stamp, so everything else it
-/// said (its launch time above all) is kept. `None` when it carries none.
-pub(crate) fn missed_stamp(car: &Value) -> Option<Value> {
-    let mut stamp = car
-        .pointer(&format!("/metadata/{BASE_REGATE}"))
-        .filter(|s| s.is_object())?
-        .clone();
-    let missed = stamp.get("missed").and_then(Value::as_u64).unwrap_or(0);
-    stamp["missed"] = json!(missed.saturating_add(1));
-    Some(stamp)
+/// PURE: the write that pays a car's owed re-gate — a `null` (a merge
+/// deletes it) when the car owes one and the `base_regate` stamp this pass
+/// writes names a FILED gate-run. `None` otherwise: a refused replay, a
+/// gate that could not be filed, or a car that owed nothing.
+pub(crate) fn owed_paid(car: &Value, stamp: &Value) -> Option<Value> {
+    let filed = stamp
+        .get("gate_run")
+        .and_then(Value::as_str)
+        .is_some_and(|r| !r.is_empty());
+    (owes_regate(car) && filed).then_some(Value::Null)
 }
 
 /// PURE: what this pass writes to the car's claim on the next free gate
@@ -867,6 +854,21 @@ pub(crate) fn unfiled_reason(stamp: &RegateStamp, why: &str) -> String {
          — the next window files it",
         short(&stamp.main),
         short(&stamp.head),
+    )
+}
+
+/// The skip reason for a re-gate whose gate-run was FILED and then never
+/// started (backlog 7919fdcc, item 11): the run is named — it is on the
+/// stamp now, settled `lost` — and so is what happens next, because the
+/// next pass reads that verdict and the red rule bounds the retry.
+pub(crate) fn unstarted_reason(stamp: &RegateStamp, why: &str) -> String {
+    format!(
+        "replayed onto main {} as {} to re-gate it; gate-run {} was filed but its Job never \
+         started ({why}) — settled lost, so it is retried as a red: when main moves, or once \
+         its bound passes",
+        short(&stamp.main),
+        short(&stamp.head),
+        short(&stamp.gate_run),
     )
 }
 
@@ -1248,7 +1250,6 @@ mod tests {
             base: "4d1c0de0".into(),
             head: "51cac5a1c0b5455defeec10c8ea344e1ee51fe97".into(),
             gate_run: "e77c4e30-349a-4dc5-844f-8117fe63b12d".into(),
-            missed: 1,
             ..RegateStamp::for_main("620603309547562e3d27bde4433fa39cbd4ae6e5", &[])
         }
     }
@@ -1263,36 +1264,31 @@ mod tests {
         let s = top_board();
         let red_at = Some(at("12:01:29"));
         assert_eq!(
-            after_red(&s, "failed", Some("4ba3a93d"), red_at, at("15:10:00"), 15),
+            after_red(&s, "failed", Some("4ba3a93d"), red_at, at("15:10:00")),
             AfterRed::Retry { fresh_base: true },
             "main moved since the red: re-gate on the fresh base"
         );
         assert_eq!(
-            after_red(&s, "failed", Some(&s.main), red_at, at("12:10:00"), 15),
+            after_red(&s, "failed", Some(&s.main), red_at, at("12:10:00")),
             AfterRed::Wait {
                 more_minutes: Some(22)
             },
-            "main unmoved, eight minutes in: wait out twice the 15-minute hold"
+            "main unmoved, eight minutes in: wait out the 30-minute bound"
         );
         assert_eq!(
-            after_red(&s, "failed", Some(&s.main), red_at, at("12:31:29"), 15),
+            after_red(&s, "failed", Some(&s.main), red_at, at("12:31:29")),
             AfterRed::Retry { fresh_base: false },
             "thirty minutes and main never moved: re-gate the same head"
         );
         assert_eq!(
-            after_red(&s, "failed", Some(&s.main), red_at, at("15:10:00"), 0),
-            AfterRed::Wait { more_minutes: None },
-            "a registry that declares no hold gives no bound: only a main move retries"
-        );
-        assert_eq!(
-            after_red(&s, "failed", None, red_at, at("12:10:00"), 15),
+            after_red(&s, "failed", None, red_at, at("12:10:00")),
             AfterRed::Wait {
                 more_minutes: Some(22)
             },
             "an unreadable main is no move"
         );
         assert_eq!(
-            after_red(&s, "failed", Some(&s.main), None, at("15:10:00"), 15),
+            after_red(&s, "failed", Some(&s.main), None, at("15:10:00")),
             AfterRed::Wait { more_minutes: None },
             "a red with no readable time cannot start a bound"
         );
@@ -1321,7 +1317,6 @@ mod tests {
                 Some(&retried.main),
                 red_at,
                 at("12:10:00"),
-                15
             ),
             AfterRed::Garage,
             "red twice and main has not moved: nothing more at this head"
@@ -1333,20 +1328,12 @@ mod tests {
                 Some(&retried.main),
                 red_at,
                 at("15:10:00"),
-                15
             ),
             AfterRed::Garage,
             "the bound does not re-gate a head judged red twice"
         );
         assert_eq!(
-            after_red(
-                &retried,
-                "failed",
-                Some("4ba3a93d"),
-                red_at,
-                at("15:10:00"),
-                15
-            ),
+            after_red(&retried, "failed", Some("4ba3a93d"), red_at, at("15:10:00"),),
             AfterRed::Retry { fresh_base: true },
             "main moved: the fix to main may be what it was waiting for"
         );
@@ -1358,7 +1345,6 @@ mod tests {
                     Some(&retried.main),
                     red_at,
                     at("12:10:00"),
-                    15
                 ),
                 AfterRed::Wait {
                     more_minutes: Some(22)
@@ -1463,7 +1449,7 @@ mod tests {
     }
 
     /// The red rides the stamp the dock already writes — nothing else it
-    /// said is lost, above all its launch time and its misses — and comes
+    /// said is lost, above all its launch time — and comes
     /// off, with the count, once the receipt vouches for the head again.
     #[test]
     fn the_red_rides_the_stamp_and_comes_off_when_the_receipt_vouches_again() {
@@ -1477,7 +1463,6 @@ mod tests {
         let red = red_of(&s, "failed", None);
         let with_red = red_stamp(&car, &red).expect("a stamped car carries a red");
         assert_eq!(with_red["at"], s.to_value(launched)["at"]);
-        assert_eq!(with_red["missed"], 1);
         let carried = json!({"metadata": {BASE_REGATE: with_red}});
         assert_eq!(
             boss_jobs::dock_red::regate_red(&carried["metadata"]),
@@ -1512,19 +1497,78 @@ mod tests {
                     ..Default::default()
                 }.to_value()}}})
         };
-        assert!(hold_garaged(None, &red(true)), "busy, and still garaged");
-        assert!(!hold_garaged(None, &red(false)), "a red still retrying");
-        assert!(!hold_garaged(None, &json!({"metadata": {}})));
+        assert!(
+            hold_garaged(None, None, &red(true)),
+            "busy, and still garaged"
+        );
+        assert!(
+            !hold_garaged(None, None, &red(false)),
+            "a red still retrying"
+        );
+        assert!(!hold_garaged(None, None, &json!({"metadata": {}})));
         let written_clean = json!({"main": "m2", "head": "h2", "gate_run": "g2"});
         assert!(
-            !hold_garaged(Some(&written_clean), &red(true)),
+            !hold_garaged(Some(&written_clean), None, &red(true)),
             "a pass that launched a fresh re-gate wrote a stamp with no red"
         );
         let written_garaged = red(true)["metadata"][BASE_REGATE].clone();
         assert!(hold_garaged(
             Some(&written_garaged),
+            None,
             &json!({"metadata": {}})
         ));
+    }
+
+    /// L1 of the round-3 review of car 5eb1967e (backlog f8383a38): on the
+    /// pass after a re-park the car's receipt vouches for its head again,
+    /// so the pass CLEARS the red — and a busy base hold that same pass
+    /// writes no stamp of its own. Read off the pre-clear snapshot, the
+    /// car drew GARAGED for one pass on a red that pass was taking off,
+    /// and a window of nothing else refused as needs-human for it.
+    #[test]
+    fn a_hold_on_the_pass_that_clears_the_red_is_not_garaged() {
+        let garaged_car = json!({"metadata": {BASE_REGATE: {"main": "m", "head": "h",
+            "reds": 1,
+            boss_jobs::dock_red::RED: boss_jobs::dock_red::RegateRed {
+                gate_run: "gr-red".into(),
+                verdict: "failed".into(),
+                garaged: true,
+                ..Default::default()
+            }.to_value()}}});
+        let cleared = cleared_stamp(&garaged_car).expect("the red comes off");
+        assert!(
+            !hold_garaged(None, Some(&cleared), &garaged_car),
+            "the red this pass clears is not the car's any more"
+        );
+        assert!(
+            hold_garaged(None, None, &garaged_car),
+            "control: the same car, nothing cleared, is still garaged"
+        );
+    }
+
+    /// L2 of the same review: whether a red retry holds the car GARAGED is
+    /// the car's own recorded red, never `reds > 0` — a first retry of a
+    /// LOST red carries the one judged red before it, and was marked
+    /// garaged without earning it when its relaunch failed.
+    #[test]
+    fn garaged_is_read_off_the_cars_red_not_its_red_count() {
+        let car = |garaged: Option<bool>| {
+            let mut stamp = json!({"main": "m", "head": "h", "reds": 1});
+            if let Some(garaged) = garaged {
+                stamp[boss_jobs::dock_red::RED] = boss_jobs::dock_red::RegateRed {
+                    gate_run: "gr-red".into(),
+                    verdict: "lost".into(),
+                    garaged,
+                    ..Default::default()
+                }
+                .to_value();
+            }
+            json!({"metadata": {BASE_REGATE: stamp}})
+        };
+        assert!(!car_garaged(&car(None)), "one judged red, none standing");
+        assert!(!car_garaged(&car(Some(false))), "a red still retrying");
+        assert!(car_garaged(&car(Some(true))), "a red the dock garaged");
+        assert!(!car_garaged(&json!({})));
     }
 
     /// A retry owed but not launched says so, beside the red it answers.
@@ -1610,195 +1654,90 @@ mod tests {
         );
     }
 
-    fn in_round(main: &str, at: &str) -> InRound {
-        InRound {
-            car: format!("car-{at}"),
-            main: main.into(),
-            since: at.parse().unwrap(),
-            missed: 0,
-        }
-    }
+    // ---- the one trigger left: a red train owes a re-gate (96f02540) ----
 
-    /// A re-gate whose car a departure has already left behind `missed`
-    /// times while a re-gate of it was running.
-    fn missed_round(car: &str, main: &str, at: &str, missed: u32) -> InRound {
-        InRound {
-            car: car.into(),
-            missed,
-            ..in_round(main, at)
-        }
-    }
-
-    /// Backlog d9530df2, replayed from the 15:19 departure of 2026-09-26.
-    /// Car 70165082's re-gate 69236ad5 was still running when train 14:39
-    /// departed (a miss). On main 604ed86f the oldest dock re-gate,
-    /// 14458749, launched at 15:02:35Z, so the oldest-first bound ended at
-    /// 15:17:35Z; the car's OWN re-gate 93ffd5ee launched only at
-    /// 15:14:49Z and went green at 15:35:53Z. Train 15:19 opened at
-    /// 15:21:00Z, six minutes into it — the second miss of three. A car
-    /// already left behind mid-re-gate is waited for to its own verdict,
-    /// bounded by twice the hold from its own launch.
+    /// A red reaches a car through the same path or the same unit on
+    /// either side — and, unlike main's move, a failing TEST in the car's
+    /// crate reaches it, because that is where a change to the crate shows.
     #[test]
-    fn a_car_left_behind_mid_regate_holds_the_next_departure_for_its_own_verdict() {
-        let main = "604ed86faaaa";
-        let at = |t: &str| -> DateTime<Utc> { format!("2026-09-26T{t}Z").parse().unwrap() };
-        let round = [
-            in_round(main, "2026-09-26T15:02:35Z"),
-            missed_round("70165082", main, "2026-09-26T15:14:49Z", 1),
-        ];
+    fn a_red_owes_a_regate_only_to_the_cars_its_failure_reaches() {
+        let car = paths(&["crates/core/boss-jobs/src/yard.rs"]);
         assert_eq!(
-            departure_hold(&round, main, at("15:21:00"), 15),
-            Some(RoundHold {
-                main: main.into(),
-                in_flight: 2,
-                oldest_minutes: 18,
-                hold_minutes: 15,
-                missed: 1,
-                more_minutes: 24,
-            }),
-            "the oldest is past its bound, but a car that already missed a train mid-re-gate \
-             is six minutes into its own: hold, up to 30 minutes from ITS launch"
+            owed_by(
+                &car,
+                &paths(&["crates/core/boss-jobs/tests/yard_status_http.rs"])
+            ),
+            Some(paths(&["crates/core/boss-jobs/tests/yard_status_http.rs"])),
+            "a failing test in the car's crate reaches the car"
         );
-        assert!(
-            departure_hold(&round, main, at("15:35:00"), 15).is_some(),
-            "still running at 15:35 — its green came at 15:35:53Z"
-        );
-        // 15:36: the verdict is in, so the car is no longer in the round
-        // (a Running re-gate is the only kind that joins it), and the
-        // oldest re-gate alone is long past its bound: depart, with the
-        // car aboard once the refresh has copied its green.
-        let after_green = [in_round(main, "2026-09-26T15:02:35Z")];
-        assert_eq!(departure_hold(&after_green, main, at("15:36:00"), 15), None);
-        // BOUNDED: a re-gate that never answers is waited for 2 x the
-        // hold from its own launch, and not a minute more.
-        assert!(departure_hold(&round, main, at("15:44:00"), 15).is_some());
         assert_eq!(
-            departure_hold(&round, main, at("15:44:49"), 15),
+            owed_by(
+                &car,
+                &paths(&["crates/orchestrators/boss-cli/src/train/conductor.rs"])
+            ),
             None,
-            "thirty minutes from its own launch: the bound is reached, depart"
+            "a red in another crate owes this car nothing"
+        );
+        let web = paths(&["apps/web/src/it/yard/phone-strip.ts"]);
+        assert_eq!(
+            owed_by(&web, &paths(&["apps/web/src/it/yard/regions.test.ts"])),
+            Some(paths(&["apps/web/src/it/yard/regions.test.ts"])),
+            "the web unit is the directory"
+        );
+        assert_eq!(
+            owed_by(
+                &web,
+                &paths(&["apps/web/tests/mocked/it-map.mocked.spec.ts"])
+            ),
+            None
+        );
+        assert_eq!(
+            owed_by(&car, &[]),
+            Some(vec![]),
+            "a red that named no path owes every car it released one — the old behaviour"
+        );
+        assert_eq!(
+            owed_by(&[], &paths(&["crates/core/boss-jobs/src/yard.rs"])),
+            Some(vec![]),
+            "a car whose files could not be read is owed one too"
         );
     }
 
-    /// A car in its FIRST round keeps the oldest-first rule — the 14:39
-    /// departure of the same day, which the car missed with no miss behind
-    /// it yet: its re-gate 69236ad5 was the only one on 564d044c, launched
-    /// 14:22:58Z, and the train opened at 14:40:38Z. That miss is the
-    /// accepted cost of a bounded wait; the stamp it leaves is what makes
-    /// the next one wait.
+    /// The marker is read off the car, and paid only by a FILED re-gate —
+    /// never by a refused replay or a gate that could not be filed, which
+    /// still owe the car its re-gate.
     #[test]
-    fn a_car_on_its_first_round_keeps_the_oldest_first_rule() {
-        let main = "564d044caaaa";
-        let now: DateTime<Utc> = "2026-09-26T14:40:38Z".parse().unwrap();
-        let first = [missed_round("70165082", main, "2026-09-26T14:22:58Z", 0)];
-        assert_eq!(departure_hold(&first, main, now, 15), None);
-        // A late launch in its first round still cannot extend the wait.
-        let late = [
-            in_round(main, "2026-09-26T14:22:58Z"),
-            missed_round("late", main, "2026-09-26T14:38:00Z", 0),
-        ];
-        assert_eq!(departure_hold(&late, main, now, 15), None);
-        // A missed car on a main that has since moved is not this
-        // departure's round, however starved.
-        let stale = [missed_round(
-            "70165082",
-            "0ldma1n0bbbb",
-            "2026-09-26T14:38:00Z",
-            3,
-        )];
-        assert_eq!(departure_hold(&stale, main, now, 15), None);
-        // And a registry that declares no hold holds nothing, missed or not.
-        let missed = [missed_round("70165082", main, "2026-09-26T14:38:00Z", 1)];
-        assert_eq!(departure_hold(&missed, main, now, 0), None);
-    }
-
-    /// The miss is recorded on the car's own stamp, and a stamp it
-    /// carries survives the next launch on a new main — otherwise the
-    /// re-launch that follows every miss would forget it.
-    #[test]
-    fn a_miss_is_counted_on_the_stamp_and_carried_to_the_next_launch() {
-        let at: DateTime<Utc> = "2026-09-26T14:22:58Z".parse().unwrap();
-        let s = RegateStamp {
+    fn an_owed_regate_is_paid_by_a_filed_gate_and_nothing_else() {
+        let now = at("02:50:00");
+        let owed = json!({"metadata": {
+            REGATE_OWED: owed_stamp("t-766", &paths(&["crates/x/y/z.rs"]), &[], now)
+        }});
+        assert!(owes_regate(&owed));
+        assert!(!owes_regate(&json!({"metadata": {}})));
+        assert!(!owes_regate(&json!({"metadata": {REGATE_OWED: null}})));
+        let filed = RegateStamp {
             head: "cafef00d".into(),
-            gate_run: "69236ad5".into(),
-            ..RegateStamp::for_main("564d044c", &[])
+            gate_run: "run-1".into(),
+            ..RegateStamp::for_main("m", &[])
         };
-        assert_eq!(s.missed, 0, "a fresh stamp has missed nothing");
-        let car = json!({"metadata": {BASE_REGATE: s.to_value(at)}});
-        let once = missed_stamp(&car).expect("a car with a stamp can miss");
-        assert_eq!(once["missed"], 1);
+        assert_eq!(owed_paid(&owed, &filed.to_value(now)), Some(Value::Null));
+        let unfiled = RegateStamp {
+            head: "cafef00d".into(),
+            ..RegateStamp::for_main("m", &[])
+        };
+        assert_eq!(owed_paid(&owed, &unfiled.to_value(now)), None);
         assert_eq!(
-            once["gate_run"], "69236ad5",
-            "the rest of the stamp is kept"
+            owed_paid(&json!({"metadata": {}}), &filed.to_value(now)),
+            None,
+            "a car that owed nothing writes nothing"
         );
-        assert_eq!(
-            once["at"],
-            s.to_value(at)["at"],
-            "and so is its launch time"
-        );
-        let car = json!({"metadata": {BASE_REGATE: once}});
-        assert_eq!(RegateStamp::of(&car).map(|s| s.missed), Some(1));
-        assert_eq!(missed_stamp(&car).unwrap()["missed"], 2);
-        assert_eq!(missed_stamp(&json!({"metadata": {}})), None);
-        // The next launch, on the next main, inherits the count.
-        let next = RegateStamp::for_main("604ed86f", &[]).carrying(RegateStamp::of(&car).as_ref());
-        assert_eq!(next.missed, 1);
-        assert_eq!(next.main, "604ed86f");
-        assert_eq!(RegateStamp::for_main("m", &[]).carrying(None).missed, 0);
+        let stamp = owed_stamp("t-766", &[], &[], now);
+        assert_eq!(stamp["train"], "t-766");
+        assert_eq!(stamp["at"], now.to_rfc3339());
     }
 
-    /// D2 of design 42279fb2, measured on its founding pass: at 19:26 on
-    /// 2026-09-25 the dock replayed a car onto 22c1a876 and, in the SAME
-    /// pass, train #686 departed and moved main to 777a5888 — four of that
-    /// car's files. A departure must wait for the round started on the
-    /// main it would move, bounded, and counted from the OLDEST re-gate in
-    /// it so a late launch never extends the wait.
-    #[test]
-    fn a_departure_waits_bounded_for_the_round_on_the_current_main() {
-        let now: DateTime<Utc> = "2026-09-25T19:40:00Z".parse().unwrap();
-        let main = "22c1a876aaaa";
-        let round = [
-            in_round(main, "2026-09-25T19:35:00Z"),
-            in_round(main, "2026-09-25T19:38:00Z"),
-            in_round("0ldma1n0bbbb", "2026-09-25T19:10:00Z"),
-        ];
-        assert_eq!(
-            departure_hold(&round, main, now, 15),
-            Some(RoundHold {
-                main: main.into(),
-                in_flight: 2,
-                oldest_minutes: 5,
-                hold_minutes: 15,
-                missed: 0,
-                more_minutes: 10,
-            }),
-            "two re-gates on this main, the oldest five minutes in: hold"
-        );
-        let later: DateTime<Utc> = "2026-09-25T19:50:00Z".parse().unwrap();
-        assert_eq!(
-            departure_hold(&round, main, later, 15),
-            None,
-            "fifteen minutes from the OLDEST, not the newest: the bound is reached, depart"
-        );
-        assert_eq!(
-            departure_hold(&round, "777a5888cccc", now, 15),
-            None,
-            "a round on a main that has since moved is not this departure's round"
-        );
-        assert_eq!(
-            departure_hold(&[], main, now, 15),
-            None,
-            "no round, no hold"
-        );
-        assert_eq!(
-            departure_hold(&round, main, now, 0),
-            None,
-            "a registry that declares no hold holds nothing"
-        );
-    }
-
-    /// The hold is dated from the stamp the launch wrote (`at`), which is
-    /// already on every re-gate stamp; a stamp without a readable one
-    /// cannot bound a wait, so it holds nothing.
+    /// A launch is dated by the stamp it wrote (`at`) — the time a red
+    /// with no readable `closed_at` bounds its retry from.
     #[test]
     fn a_launch_is_dated_by_its_stamp() {
         let at: DateTime<Utc> = "2026-09-25T19:35:00Z".parse().unwrap();

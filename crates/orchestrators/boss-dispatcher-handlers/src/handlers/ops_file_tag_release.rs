@@ -89,7 +89,7 @@ pub const HOST: &str = "forge";
 pub const LINK: &str = "release";
 
 pub struct OpsFileTagRelease {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
 }
 
@@ -101,7 +101,10 @@ impl OpsFileTagRelease {
         })
     }
 
-    pub fn with_client(client: reqwest::Client, jobs_base: impl Into<String>) -> Arc<Self> {
+    pub fn with_client(
+        client: boss_core::machine_token::Client,
+        jobs_base: impl Into<String>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client,
             jobs_base: jobs_base.into(),
@@ -574,6 +577,7 @@ mod tests {
 
     fn ctx(job_id: &str, step_id: &str) -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "file-tag-release-on-release-tag-ready".into(),
             triggering_event_id: "evt-ready-1".into(),
             triggering_topic: "step.ready.task".into(),
@@ -618,7 +622,7 @@ mod tests {
             ),
         ])
         .await;
-        let h = OpsFileTagRelease::with_client(reqwest::Client::new(), base);
+        let h = OpsFileTagRelease::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args(), &ctx(RELEASE, TAG_STEP))
             .await
             .expect("runs");
@@ -658,7 +662,7 @@ mod tests {
             Some("91e3d219f0ab"),
         ));
         let (base, posts) = mock_jobs(jobs).await;
-        let h = OpsFileTagRelease::with_client(reqwest::Client::new(), base);
+        let h = OpsFileTagRelease::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args(), &ctx(RELEASE, TAG_STEP))
             .await
             .expect("runs");
@@ -685,7 +689,7 @@ mod tests {
             train("newest", "closed", Some("2026-09-19T00:03:40Z"), Some("91e3d219f0ab")),
         ])
         .await;
-        let h = OpsFileTagRelease::with_client(reqwest::Client::new(), base);
+        let h = OpsFileTagRelease::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args(), &ctx("pub-1", "s-open-pr"))
             .await
             .expect("runs");
@@ -711,7 +715,7 @@ mod tests {
             ),
         ])
         .await;
-        let h = OpsFileTagRelease::with_client(reqwest::Client::new(), base);
+        let h = OpsFileTagRelease::with_client(crate::handlers::common::api_client(), base);
         h.invoke(&args(), &ctx(RELEASE, TAG_STEP))
             .await
             .expect("runs");
@@ -733,7 +737,7 @@ mod tests {
             ),
         ])
         .await;
-        let h = OpsFileTagRelease::with_client(reqwest::Client::new(), base);
+        let h = OpsFileTagRelease::with_client(crate::handlers::common::api_client(), base);
         let err = h
             .invoke(&args(), &ctx(RELEASE, TAG_STEP))
             .await
@@ -747,7 +751,8 @@ mod tests {
 
     #[test]
     fn the_handler_is_registered_under_its_name() {
-        let h = OpsFileTagRelease::with_client(reqwest::Client::new(), "http://unused");
+        let h =
+            OpsFileTagRelease::with_client(crate::handlers::common::api_client(), "http://unused");
         assert_eq!(h.name(), "ops.file_tag_release");
         assert_eq!(
             crate::cascade::handler_emits()

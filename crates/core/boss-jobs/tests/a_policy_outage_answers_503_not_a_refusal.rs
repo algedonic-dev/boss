@@ -264,7 +264,10 @@ async fn flaky_policy() -> (String, Arc<AtomicUsize>) {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_read_during_a_policy_blip_is_503_and_the_next_read_is_answered() {
     let (url, seen) = flaky_policy().await;
-    let (app, _) = app(Arc::new(boss_policy_client::ReqwestPolicyClient::new(url))).await;
+    let (app, _) = app(Arc::new(boss_policy_client::ReqwestPolicyClient::new(
+        "jobs", url,
+    )))
+    .await;
     let uri = format!("/api/jobs/{PACKET}");
 
     let during = send(&app, "GET", &uri, None).await;

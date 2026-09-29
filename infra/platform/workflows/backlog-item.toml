@@ -273,6 +273,17 @@ audience = { role = "platform-admin" }
 name = "verdict"
 field_type = "approved|declined|answered"
 required = true
+# The kind requires `answer` at done too ("The substance: what was
+# decided and why"), and a step declares every field its kind requires
+# so that each reader of the step's contract — its form, a brief, the
+# CLI — sees the whole of it (backlog a14f04b3; pinned by
+# tests/a_step_declares_what_its_kind_requires.rs). The answer-question
+# surface already writes it; this changes what is SHOWN, not what is
+# enforced.
+[[workflow.step.fields]]
+name = "answer"
+field_type = "string"
+required = true
 
 [[workflow.step]]
 title = "build"

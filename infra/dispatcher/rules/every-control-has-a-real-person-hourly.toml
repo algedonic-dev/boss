@@ -1,0 +1,46 @@
+# Every control a door checks has a real person who holds it — the
+# backstop (design 1c4e42e1, David 2026-09-28; backlog 47aed706).
+#
+# THE GAP IT NAMES TODAY. Measured 2026-09-28 by the triage of 47aed706:
+# one real person, every policy pair a door asks for held by him through
+# platform-admin — and nobody holding the operator tier, because the
+# gateway raises a session to operator only for a platform-admin with an
+# operator-tier passkey and no person had one. Nothing in the tree could
+# say so; the triage re-derived it by hand. `GET /api/policy/coverage`
+# now answers it from one pure function, and this rule reads it.
+#
+# WHY A CLOCK. The guards that will refuse a write that orphans a
+# control wait for DR readiness (62dac114), and even then they see only
+# the writes that pass through a port: a migration, a seed, a restore or
+# a `tenant publish --force` can orphan a control with no write path
+# involved. A reading on a clock is the only thing that sees those.
+#
+# HOURLY, because a lost control is a lockout in waiting and a day is a
+# long time to be the only one who does not know. The handler needs the
+# tick's `_at`, which only a sub-day cadence writes.
+#
+# NO DEDUP GUARD ON THE RULE, ON PURPOSE — the ops-queue shape. The
+# handler dedups on the control's id against the OPEN alarms itself, so
+# a firing that finds every control held writes nothing, and a standing
+# gap is one packet.
+[[rule]]
+name = "every-control-has-a-real-person-hourly"
+why = """
+A TIMER over a STATE, the standing exemption: the condition is a control
+nobody holds, and the routes that create one (a migration, a seed, a
+restore, a forced tenant publish) emit no event that could route to a
+rule. Measured 2026-09-28 (backlog 47aed706): the operator tier had no
+human holder and nothing in the system said so. It adds no routing and
+refuses nothing: one firing reads GET /api/policy/coverage, files ONE
+urgent alarm per orphaned control deduped on the control's id, and
+withdraws it once the read shows the control held. A read it cannot
+judge keeps ONE coverage-unreadable alarm naming the error, withdrawn
+by the next whole read. There is no acknowledged state: an alarm closed
+while its control is still unheld is filed again within the hour (up to
+24 a day), because the dedup reads OPEN alarms only — the remedy for a
+gap is a holder, never a close, and a pair denied to everyone on
+purpose is silenced only by granting it.
+"""
+schedule = { cadence = "hourly", anchor_date = "2026-09-29" }
+[[rule.do]]
+handler = "policy.coverage.alarm"

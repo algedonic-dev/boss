@@ -185,11 +185,21 @@ fi
 # --max-time, because an accelerator must never be the slowest thing in
 # a CI run; no retry loop, because the hourly timer is the floor and a
 # second attempt buys nothing a tick does not.
+#
+# The machine token rides to curl in a 0600 file, never in its argv,
+# where every process on the runner reads it (backlog 5f3ad356).
+# shellcheck source=infra/lib/secret-header.sh
+if ! . "$HERE/../lib/secret-header.sh" \
+    || ! secret_header MT_HDR ${BOSS_MACHINE_TOKEN:+"x-boss-machine-token: $BOSS_MACHINE_TOKEN"}; then
+    warn "the machine token's header file could not be made ($HERE/../lib/secret-header.sh), and it is never sent in curl's command line — nothing filed."
+    floor_still_covered
+    exit 0
+fi
 rc=0
 reply="$("$CURL_CMD" -fsS --max-time 20 -X POST "$BOSS_JOBS_URL/api/jobs" \
     -H "x-boss-user: $BOSS_USER" \
     -H 'content-type: application/json' \
-    ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+    ${MT_HDR:+-H "$MT_HDR"} \
     -d "$body" 2>&1)" || rc=$?
 if [ "$rc" -ne 0 ]; then
     warn "filing the reclaim request failed (curl exit $rc): ${reply:-no reply}"

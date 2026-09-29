@@ -24,7 +24,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 pub struct JobsClearWaiting {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
 }
 
@@ -38,7 +38,10 @@ impl JobsClearWaiting {
 
     /// Construct with a custom reqwest client (tests point it at a
     /// local server).
-    pub fn with_client(client: reqwest::Client, jobs_base: impl Into<String>) -> Arc<Self> {
+    pub fn with_client(
+        client: boss_core::machine_token::Client,
+        jobs_base: impl Into<String>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client,
             jobs_base: jobs_base.into(),
@@ -131,6 +134,7 @@ mod tests {
 
     fn ctx(payload: serde_json::Value) -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "jobs-clear-waiting-on".into(),
             triggering_event_id: "evt-close-1".into(),
             triggering_topic: "jobs.job.closed".into(),

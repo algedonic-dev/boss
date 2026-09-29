@@ -478,6 +478,22 @@ fn workflow_design_spec() -> WorkflowSpec {
             terminal: Some(Terminal {
                 outcome: "published".into(),
             }),
+            // Backlog a14f04b3 (2026-09-28): the kind requires the spec
+            // at done, and a step declares every field its kind requires
+            // (tests/a_step_declares_what_its_kind_requires.rs). Rides
+            // through BOTH copies for the reason the `approve` note gives.
+            fields: vec![boss_core::job::StepField {
+                name: "workflow_spec".into(),
+                field_type: "object".into(),
+                required: true,
+                filled_by: boss_core::job::FilledBy::Executor,
+                item_keys: Vec::new(),
+                covers: None,
+                binds: None,
+                item_value_max_bytes: None,
+                item_one_of: Vec::new(),
+                writer: None,
+            }],
             ..Default::default()
         },
         StepSpec {
@@ -1502,6 +1518,31 @@ fn resolve_triggers(
     changed
 }
 
+/// Stamp the instant on every step materialization left `Completed`.
+///
+/// [`resolve_triggers`] completes the firing trigger with the day it has
+/// (`completed_on`), because materialization is pure and holds no clock
+/// finer than the date anchor. The admission handler holds the instant,
+/// so it hands it here. Until 2026-09-28 nothing did, and every trigger
+/// on every packet read `completed_at: null` beside a set `completed_on`
+/// — measured on gate-run 6d5d85fb's `launched` step (backlog 4d088a7e),
+/// the one completion path that did not stamp both (c17871fe).
+pub fn stamp_born_completions(steps: Vec<Step>, at: chrono::DateTime<chrono::Utc>) -> Vec<Step> {
+    steps
+        .into_iter()
+        .map(|s| {
+            if s.status == StepStatus::Completed && s.completed_at.is_none() {
+                Step {
+                    completed_at: Some(at),
+                    ..s
+                }
+            } else {
+                s
+            }
+        })
+        .collect()
+}
+
 /// Humanize a kebab-case slug into a display title: `mash-in` →
 /// `Mash in`. Used when a `StepSpec` declares no `title_template`.
 fn humanize_slug(slug: &str) -> String {
@@ -1924,19 +1965,20 @@ pub trait WorkflowRegistry: Send + Sync {
     /// Return a specific historical version. Version 0 is reserved
     /// as "latest active."
     ///
-    /// NO STATUS FILTER, and that is a recorded open question, not a
-    /// settled rule: a DRAFT row is served too, which is how a packet
-    /// can be pinned to one — experiment admission of its
-    /// `candidate_version` (a draft by design) and `boss job convert
-    /// --to vN` (no status check) both read through here. A draft needs
-    /// only workflow Create/Update authority, not Publish, so whether a
-    /// draft may be a pinned protocol, and under what authority, is the
-    /// experiments design's decision (d8771dec), recorded on backlog
-    /// ce8b7d66. Until it lands, `get_version_serves_a_draft_today`
-    /// (both adapters) pins today's behaviour so the change is explicit.
+    /// NO STATUS FILTER, by decision (backlog ce8b7d66 — an engineering
+    /// call on the build; design d8771dec set only when an experiment
+    /// starts): a DRAFT row is served too, because experiment admission
+    /// reads its `candidate_version` here, and a candidate is a draft
+    /// until a promote publishes it. The guard sits at the two doors
+    /// that pin, not in this read: putting a split onto an unpublished
+    /// version in force takes Publish on `workflow` (the job write
+    /// doors, `refuse_an_unpublished_arm_without_publish`), and `boss
+    /// job convert --to vN` refuses a draft target outright.
+    /// `get_version_serves_a_draft` (both adapters) pins this read.
     async fn get_version(&self, kind: &str, version: i32) -> Result<WorkflowSpec, WorkflowError>;
 
-    /// List every active spec, optionally filtered by category.
+    /// List every active spec, optionally filtered by category, ordered
+    /// by kind in byte order on every adapter.
     async fn list_active(&self, category: Option<&str>)
     -> Result<Vec<WorkflowSpec>, WorkflowError>;
 
@@ -1997,9 +2039,17 @@ pub trait WorkflowRegistry: Send + Sync {
     /// `jobs.kind.draft_discarded` iff a row was removed; a missing
     /// row is `NotFound` so a typo cannot read as success. The
     /// discarded number stays SPENT — no later allocation reuses it —
-    /// and the HTTP route refuses a draft any packet is pinned to
-    /// before it gets here (backlog ce8b7d66; the pin count lives on
-    /// the jobs port, `JobsRepository::jobs_pinned_to_workflow`).
+    /// and a draft any packet is pinned to is refused with `Conflict`
+    /// (backlog ce8b7d66). The HTTP route asks the jobs port
+    /// (`JobsRepository::jobs_pinned_to_workflow`) first, so an adapter
+    /// that cannot see jobs still refuses; the Pg adapter asks again
+    /// inside the discard's own transaction, under a lock on the row,
+    /// and that answer decides. The in-memory adapter asks the jobs
+    /// store it was handed (`InMemoryWorkflows::with_packets`), and
+    /// the adapters-agree suite holds both to the refusal (be459ab9).
+    /// An admission racing the discard is ordered by the same lock:
+    /// counted if it locked the row first, refused `VersionDiscarded`
+    /// if it waited (part 4; see `JobsRepository::create_job_with_steps_at`).
     async fn discard_draft(
         &self,
         kind: &str,
@@ -2168,6 +2218,13 @@ pub struct InMemoryWorkflows {
     /// `workflow_discarded_versions`. A discarded number stays spent
     /// (backlog ce8b7d66), so `max_version` reads this beside the rows.
     discarded_high_water: Arc<Mutex<HashMap<String, i32>>>,
+    /// The packets a discard counts pins in — this adapter's `jobs`
+    /// table. `None` is a world with no packets, so nothing is pinned
+    /// (backlog be459ab9; see [`InMemoryWorkflows::with_packets`]).
+    /// The in-memory jobs store itself, not the port: the discard's
+    /// count and spend happen under that store's lock, which is what
+    /// orders them against an admission (backlog ce8b7d66, part 4).
+    packets: Option<Arc<crate::in_memory::InMemoryJobs>>,
 }
 
 impl Default for InMemoryWorkflows {
@@ -2183,7 +2240,30 @@ impl InMemoryWorkflows {
             bootstrap_owned: Arc::new(Mutex::new(std::collections::HashSet::new())),
             recorded: Arc::new(Mutex::new(Vec::new())),
             discarded_high_water: Arc::new(Mutex::new(HashMap::new())),
+            packets: None,
         }
+    }
+
+    /// Count the packets pinned to a draft in `jobs` before discarding
+    /// it, as the Pg adapter counts them in the jobs table of its own
+    /// database — pass the store the test admits packets through.
+    ///
+    /// WHY (backlog be459ab9, found by the adapters-agree suite on its
+    /// first run): the port says a draft any packet is pinned to is
+    /// refused (ce8b7d66), and only Postgres kept that promise, because
+    /// only Postgres could see packets. A caller reaching this adapter
+    /// without the HTTP route's pre-check discarded a pinned draft.
+    ///
+    /// AND THE DISCARD SPENDS THE NUMBER IN THAT STORE (backlog
+    /// ce8b7d66, part 4): the count and the spend happen under `jobs`'
+    /// own lock, and `jobs` refuses every later admission onto the pair
+    /// under that lock too — so an admission is either counted by the
+    /// discard or refused by it, never pinned to a removed draft. That
+    /// is why this takes the in-memory store and not the port: the
+    /// ordering is a lock only the store has.
+    pub fn with_packets(mut self, jobs: Arc<crate::in_memory::InMemoryJobs>) -> Self {
+        self.packets = Some(jobs);
+        self
     }
 
     /// Every event a write method recorded, in write order — the
@@ -2386,20 +2466,47 @@ impl WorkflowRegistry for InMemoryWorkflows {
         actor: &boss_core::actor::ActorId,
         _now: DateTime<Utc>,
     ) -> Result<(), WorkflowError> {
+        let key = (kind.to_string(), version);
+        // ONE HOLD OVER THE WHOLE DISCARD (backlog ce8b7d66, part 4):
+        // the row is judged, the pins counted and the number spent, and
+        // the row removed, all while these rows are held — the Pg
+        // adapter's `FOR UPDATE` on the draft. The count and the spend
+        // take the jobs store's lock inside it (rows, then jobs; nothing
+        // takes them the other way round), which is the lock every
+        // admission checks the spent pairs under. Nothing here awaits.
         let mut rows = self.rows.lock().unwrap();
-        let Some(row) = rows.get(&(kind.to_string(), version)) else {
+        let Some(status) = rows.get(&key).map(|r| r.status) else {
             return Err(WorkflowError::NotFound(format!("{kind} v{version}")));
         };
-        if row.status != WorkflowStatus::Draft {
+        if status != WorkflowStatus::Draft {
             return Err(WorkflowError::Conflict(format!(
-                "{kind} v{version} is {:?}, not a draft — an active or retired \
+                "{kind} v{version} is {status:?}, not a draft — an active or retired \
                  version is history; only a draft (which admitted nothing) can \
-                 be discarded",
-                row.status
+                 be discarded"
             )));
         }
-        let spec = rows.remove(&(kind.to_string(), version)).expect("checked");
+
+        // A pinned draft is not pre-history (backlog ce8b7d66): the
+        // same count and the same sentence the Pg adapter refuses with
+        // inside its discard transaction.
+        if let Some(packets) = &self.packets {
+            let pinned = packets.spend_workflow_version_unless_pinned(kind, version);
+            if pinned.count > 0 {
+                return Err(WorkflowError::Conflict(
+                    pinned.discard_refusal(kind, version),
+                ));
+            }
+        }
+
+        let removed = rows.remove(&key);
         drop(rows);
+        let Some(spec) = removed else {
+            // Unreachable under the hold above; refused rather than
+            // recorded, as the Pg adapter's `rows_affected() != 1` is.
+            return Err(WorkflowError::Conflict(format!(
+                "{kind} v{version} was not a draft when the discard reached it"
+            )));
+        };
         // The number stays spent: the next allocation reads above it.
         let mut high = self.discarded_high_water.lock().unwrap();
         let entry = high.entry(kind.to_string()).or_insert(version);
@@ -2460,7 +2567,7 @@ impl WorkflowRegistry for InMemoryWorkflows {
         &self,
         defaults: &[WorkflowSpec],
         actor: &boss_core::actor::ActorId,
-        _now: DateTime<Utc>,
+        now: DateTime<Utc>,
     ) -> Result<KindReconcileStats, WorkflowError> {
         let mut stats = KindReconcileStats::default();
         // Inserted/republished rows record `jobs.kind.published`;
@@ -2506,6 +2613,10 @@ impl WorkflowRegistry for InMemoryWorkflows {
                         .unwrap_or(0)
                         + 1;
                     spec.status = WorkflowStatus::Active;
+                    // The reconcile's own instant, as the Pg adapter
+                    // binds it — not the default's, which is whenever
+                    // the seed was built in memory (backlog be459ab9).
+                    spec.created_at = now;
                     let key = (spec.kind.clone(), spec.version);
                     rows.insert(key.clone(), spec.clone());
                     owned.insert(key);
@@ -2543,6 +2654,10 @@ impl WorkflowRegistry for InMemoryWorkflows {
                             let mut published = default.clone();
                             published.version = next;
                             published.status = WorkflowStatus::Active;
+                            // As the Pg adapter writes it: this instant,
+                            // and no authoring packet (backlog be459ab9).
+                            published.created_at = now;
+                            published.authoring_job_id = None;
                             let new_key = (published.kind.clone(), next);
                             rows.insert(new_key.clone(), published.clone());
                             owned.insert(new_key);
@@ -2705,6 +2820,12 @@ mod pg {
             &self,
             category: Option<&str>,
         ) -> Result<Vec<WorkflowSpec>, WorkflowError> {
+            // BYTE order, `COLLATE "C"`: a bare `ORDER BY kind` sorts by
+            // the database's locale, which ignores `-` at first level,
+            // so `ab` came before `a-z` here and after it in memory —
+            // the order a listing answered depended on the server it
+            // ran against (backlog be459ab9, found by the adapters-agree
+            // suite on its first run).
             let rows: Vec<Row> = match category {
                 Some(c) => {
                     sqlx::query_as(
@@ -2713,7 +2834,7 @@ mod pg {
                             on_complete_create, owning_team, authoring_job_id, created_at
                      FROM workflows
                      WHERE status = 'active' AND category = $1
-                     ORDER BY kind",
+                     ORDER BY kind COLLATE \"C\"",
                     )
                     .bind(c)
                     .fetch_all(&self.pool)
@@ -2726,7 +2847,7 @@ mod pg {
                             on_complete_create, owning_team, authoring_job_id, created_at
                      FROM workflows
                      WHERE status = 'active'
-                     ORDER BY kind",
+                     ORDER BY kind COLLATE \"C\"",
                     )
                     .fetch_all(&self.pool)
                     .await
@@ -2858,13 +2979,24 @@ mod pg {
             // it must come from data read INSIDE this transaction
             // (a post-commit re-fetch could observe a concurrent
             // writer and record a spec the flip never produced).
+            //
+            // FOR UPDATE (the review of car 06973644, finding A): the
+            // row this publish promotes is locked before anything is
+            // retired. Read unlocked, a discard holding the draft's
+            // lock deleted it underneath — the flip below updated 0
+            // rows, the retire had already landed, and the commit left
+            // the kind with NO active version beside a
+            // `jobs.kind.published` fact for a row that was gone. Now
+            // a publish that waits on a discard reads the row as the
+            // discard left it: gone, and refused as nothing to publish.
             let draft: Option<Row> = sqlx::query_as(
                 "SELECT kind, version, status, label, description, category,
                         subject_kinds, steps, metadata_schema, entitlements, metadata,
                         on_complete_create, owning_team, authoring_job_id, created_at
                  FROM workflows
                  WHERE kind = $1 AND status = 'draft'
-                 ORDER BY version DESC LIMIT 1",
+                 ORDER BY version DESC LIMIT 1
+                 FOR UPDATE",
             )
             .bind(kind)
             .fetch_optional(&mut *tx)
@@ -2891,16 +3023,28 @@ mod pg {
             .await
             .map_err(|e| WorkflowError::Storage(e.to_string()))?;
 
-            // Promote the draft.
-            sqlx::query(
+            // Promote the draft — exactly the one row read above, and
+            // still a draft. Anything but one row refuses, and the
+            // dropped transaction rolls the retire back with it: a
+            // `jobs.kind.published` fact is recorded only beside the
+            // row it describes (finding A; unreachable under the lock
+            // above, and refused rather than trusted to stay so).
+            let flipped = sqlx::query(
                 "UPDATE workflows SET status = 'active'
-                 WHERE kind = $1 AND version = $2",
+                 WHERE kind = $1 AND version = $2 AND status = 'draft'",
             )
             .bind(kind)
             .bind(promoted.version)
             .execute(&mut *tx)
             .await
             .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            if flipped.rows_affected() != 1 {
+                return Err(WorkflowError::Conflict(format!(
+                    "{kind} v{} was not a draft when the publish reached it — \
+                     nothing was retired or published",
+                    promoted.version
+                )));
+            }
             promoted.status = WorkflowStatus::Active;
 
             let event = crate::events::workflow_registry_event(
@@ -2994,13 +3138,20 @@ mod pg {
             // Read first: the refusal must say what the row IS (a typo
             // must read as NotFound, history as Conflict — never as a
             // silent no-op), and the discard event's payload is the
-            // spec being removed.
+            // spec being removed. FOR UPDATE, so the status judged here
+            // is the status deleted: a publish that already holds the
+            // row makes this read wait and then see it active. The
+            // lock protects the DISCARD only — a publish that reads
+            // after it is protected by its own FOR UPDATE on the same
+            // row, and its one-row check (the review of car 06973644,
+            // finding A: this comment used to claim both).
             let found: Option<Row> = sqlx::query_as(
                 "SELECT kind, version, status, label, description, category,
                         subject_kinds, steps, metadata_schema, entitlements, metadata,
                         on_complete_create, owning_team, authoring_job_id, created_at
                  FROM workflows
-                 WHERE kind = $1 AND version = $2",
+                 WHERE kind = $1 AND version = $2
+                 FOR UPDATE",
             )
             .bind(kind)
             .bind(version)
@@ -3021,11 +3172,30 @@ mod pg {
                 )));
             }
 
+            // THE PIN CHECK DECIDES HERE, inside the transaction that
+            // deletes (backlog ce8b7d66). The route asks the jobs port
+            // first so every adapter answers; that read and this delete
+            // used to be two transactions, and a packet committed
+            // between them was left pinned to a number with no protocol.
+            // Same statement as the port's, same sentence as the route's.
+            // An admission still in flight holds `FOR KEY SHARE` on this
+            // row, so the `FOR UPDATE` above waited for its commit and
+            // this count sees it; one that comes after waits on this
+            // transaction and is refused once it commits (part 4).
+            let pinned = crate::postgres::pinned_to_workflow(&mut *tx, kind, version)
+                .await
+                .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            if pinned.count > 0 {
+                return Err(WorkflowError::Conflict(
+                    pinned.discard_refusal(kind, version),
+                ));
+            }
+
             // The one DELETE the append-only registry permits: a draft
             // admitted nothing, so removing it rewrites no packet's
             // history — and the discard itself goes on the record in
             // the same transaction.
-            sqlx::query(
+            let deleted = sqlx::query(
                 "DELETE FROM workflows WHERE kind = $1 AND version = $2 AND status = 'draft'",
             )
             .bind(kind)
@@ -3033,6 +3203,14 @@ mod pg {
             .execute(&mut *tx)
             .await
             .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            if deleted.rows_affected() != 1 {
+                // Unreachable under the row lock above; refused rather
+                // than recorded, because a discard event and a spent
+                // number for a row still standing would be a false record.
+                return Err(WorkflowError::Conflict(format!(
+                    "{kind} v{version} was not a draft when the discard reached it"
+                )));
+            }
 
             // The number stays spent: `next_version` reads this table,
             // so the next draft of this kind can never take it
@@ -4375,17 +4553,14 @@ mod tests {
         assert_eq!(authored.version, 3, "v1 and v2 are spent; the next is v3");
     }
 
-    /// TODAY'S BEHAVIOUR, pinned on purpose — not endorsed. `get_version`
-    /// has no status filter, so a DRAFT row is reachable as a pinned
-    /// protocol: an experiment admits packets to its `candidate_version`
-    /// (a draft by design) and `boss job convert --to vN` checks no
-    /// status. Whether a draft may be a pinned protocol at all, and what
-    /// authority that demands (a draft needs only workflow Create/Update,
-    /// not Publish), is the experiments design's question (d8771dec),
-    /// recorded on backlog ce8b7d66. When that decision lands, this test
-    /// is the one that must change — deliberately.
+    /// BY DECISION (backlog ce8b7d66): `get_version` serves a DRAFT row,
+    /// because experiment admission reads its `candidate_version` here
+    /// and a candidate is a draft until a promote publishes it. The
+    /// guard is at the doors that pin — a split onto an unpublished
+    /// version takes Publish on `workflow`, and `boss job convert`
+    /// refuses a draft target — each pinned by its own test.
     #[tokio::test]
-    async fn get_version_serves_a_draft_today() {
+    async fn get_version_serves_a_draft() {
         let reg = InMemoryWorkflows::new();
         let d = reg
             .create_draft(seed_spec("repair"), &test_actor(), Utc::now())
@@ -4637,11 +4812,14 @@ mod tests {
                 "Reproduce and investigate.disposition".to_string(),
                 "Draft the design.design_id".to_string(),
                 "Decide the design.verdict".to_string(),
+                // Declared since backlog a14f04b3: the answer-question
+                // kind always required it and its surface collects it.
+                "Decide the design.answer".to_string(),
             ],
             "the feedback flow collects a disposition at each deciding step, the id of \
              the design the draft filed (`boss design --answers` writes it, f90ca046), \
-             and a verdict at the design review, nothing else; anything else here is \
-             a step no surface can complete"
+             and a verdict and answer at the design review, nothing else; anything else \
+             here is a step no surface can complete"
         );
     }
 

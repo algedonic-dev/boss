@@ -151,7 +151,7 @@ pub fn allocated_bbl(formats: &[FormatNeed], kegs: &[i64]) -> f64 {
 /// stamps per-format `outcome_<fork_key>` on its own step so the DAG
 /// routes package vs skip. Every number is data — no brewery constants.
 pub struct PackagingAllocate {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
     products_base: String,
 }
@@ -751,6 +751,7 @@ mod tests {
         // (daily × 30 days × 1.5), none on hand, so the batch of 10
         // splits 45 : 90 — 3 of SKU-A and 7 of SKU-B, 10 levied.
         let ctx = InvocationContext {
+            event_timestamp: None,
             rule_name: "packaging-allocate".into(),
             triggering_event_id: "evt-1".into(),
             triggering_topic: "step.ready.task".into(),

@@ -225,35 +225,29 @@ const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The production sink: `PATCH /api/jobs/{id}/metadata` on the jobs API.
 pub struct JobsApiDeadLetters {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
 }
 
 impl JobsApiDeadLetters {
     /// Construct with the jobs-api base URL (e.g. `http://127.0.0.1:7900`).
     ///
-    /// The client attaches the machine token the same way
-    /// `boss-dispatcher-handlers::handlers::common::api_client` does, and
-    /// adds [`WRITE_TIMEOUT`], which that shared client deliberately has
-    /// no opinion about — a handler's call is the work, this one is
-    /// visibility and must never outlive the settle it describes.
+    /// The client stamps the machine token on every request, from the
+    /// process's watched source (design 6805c764 car 2, review S1), and
+    /// adds [`WRITE_TIMEOUT`], which the handlers' shared client
+    /// deliberately has no opinion about — a handler's call is the work,
+    /// this one is visibility and must never outlive the settle it
+    /// describes.
+    ///
+    /// The one constructor: a caller-supplied `reqwest::Client` could
+    /// only be wrapped by a `From` that could not turn its redirects off,
+    /// and a redirect carries the token to whatever host it names
+    /// (review of 6fbc7fc7, 2026-09-28, finding 1).
     pub fn new(jobs_base: impl Into<String>) -> Arc<Self> {
-        let mut headers = reqwest::header::HeaderMap::new();
-        boss_core::machine_token::attach(&mut headers);
-        let client = reqwest::Client::builder()
-            .default_headers(headers)
-            .timeout(WRITE_TIMEOUT)
-            .build()
-            .unwrap_or_default();
-        Arc::new(Self {
-            client,
-            jobs_base: jobs_base.into(),
-        })
-    }
-
-    /// Construct with a caller-supplied client (tests point this at a
-    /// local server).
-    pub fn with_client(client: reqwest::Client, jobs_base: impl Into<String>) -> Arc<Self> {
+        let client = boss_core::machine_token::Client::build(
+            reqwest::Client::builder().timeout(WRITE_TIMEOUT),
+        )
+        .expect("reqwest client always builds");
         Arc::new(Self {
             client,
             jobs_base: jobs_base.into(),

@@ -37,6 +37,9 @@
       // The agents registry as a directory (62988516) — who runs work
       // besides people, beside the other registries.
       { label: 'Agents', path: '/it/registry/agents' },
+      // The credentials registry, its lifecycle as packets (851259b9;
+      // design 76155676 step 3) — what the estate holds access with.
+      { label: 'Credentials', path: '/it/registry/credentials' },
     ],
     design: [
       { label: 'Reviews', path: '/it/design' },

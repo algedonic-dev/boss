@@ -119,32 +119,56 @@ pub(super) struct ListJobsQuery {
     /// ([`SLIM_STEP_DROPS`]): design 3036296f mechanism D, backlog
     /// 9b473d4a — 200 open backlog-item rows weighed 3.6 MB, 2.2 MB of
     /// it those two keys, and truncated a reader twice. Absent is
-    /// [`STEPS_WHOLE_BY_DEFAULT`]. A reader that reads a listed step's
+    /// SLIM (backlog ea80b5fd). A reader that reads a listed step's
     /// metadata asks `full=true` by name; held by
     /// tests/a_listed_packet_carries_its_steps.rs.
-    #[serde(default = "steps_whole_by_default")]
+    #[serde(default)]
     full: bool,
+    /// `failed_verbs=true` puts the FAILED-verb note on each listed step
+    /// that carries one, as `failed_verb` ([`FAILED_VERB_KEYS`] and
+    /// nothing else), whole or slim — so the receiving yard reads a
+    /// troubled step off a slim row instead of asking every step's
+    /// metadata for four keys (backlog ea80b5fd). Opt-in, like `lane`.
+    #[serde(default)]
+    failed_verbs: bool,
 }
 
-/// What an unflagged list read serves: WHOLE steps, for now.
-///
-/// EXPAND, THEN CONTRACT (backlog 9b473d4a). The design's end state is
-/// a slim default, and every reader of a listed step's metadata in the
-/// tree now asks `full=true` — but those readers do not converge with
-/// this server. The conductor and the ops-runners run from host
-/// checkouts on their own timers (forge 10 min, boss-gcp 30), the
-/// dispatcher is its own deployment, and recorded probes read through
-/// the forge's copy of `boss-sor-read`. Flipped in the same car, every
-/// reader still on its old copy would be served slim WITHOUT asking,
-/// and would answer instead of erroring: an ops-runner re-rendering an
-/// approved plan and voiding its stamps, a conductor closing stranded
-/// alarms as cleared, a step matcher that matches nothing. So this car
-/// makes the flag exist and moves every reader onto it; the flip to
-/// `false` is its own car, once every copy asks.
-const STEPS_WHOLE_BY_DEFAULT: bool = true;
+// EXPAND, THEN CONTRACT — CONTRACTED (backlog 9b473d4a, then ea80b5fd,
+// 2026-09-27). An absent `full` is `false`: an unflagged read serves
+// SLIM steps. The expand car (train #740) made the flag exist and moved
+// every reader of a listed step's metadata onto `full=true`; this flip
+// waited until every copy of those readers had converged past it — the
+// conductor and the ops-runners run from host checkouts on their own
+// timers, the dispatcher is its own deployment, recorded probes read
+// through the forge's `boss-sor-read` — because a reader still on an
+// old copy, served slim without asking, would have answered instead of
+// erroring. Measured before the flip: forge and boss-gcp checkouts both
+// at 950779f, 22 trains past #740.
 
-fn steps_whole_by_default() -> bool {
-    STEPS_WHOLE_BY_DEFAULT
+/// The keys of the note `jobs.complete_linked_step` (and the sweep
+/// judge) write on a step whose ops verb FAILED — the line, the exit,
+/// the request that ran it and the alert filed for it — and the only
+/// keys `failed_verbs=true` lifts off a listed step's metadata. The
+/// writers are pinned to this list in boss-dispatcher-handlers'
+/// tests/publish_pr_answer.rs (CLAUDE.md §9a); the web's one reader of
+/// the note is `apps/web/src/steps/failedVerb.ts`.
+pub const FAILED_VERB_KEYS: [&str; 4] = ["failed", "failed_exit", "failed_source", "alert"];
+
+/// The failed-verb note on one step's metadata, or `None` when it
+/// carries none. Only the line decides, as on the web: a step with a
+/// non-empty string `failed` is a step whose verb failed; the other
+/// three ride beside it when recorded.
+fn failed_verb_of(metadata: &serde_json::Value) -> Option<serde_json::Value> {
+    let line = metadata.get("failed").and_then(serde_json::Value::as_str)?;
+    if line.is_empty() {
+        return None;
+    }
+    Some(serde_json::Value::Object(
+        FAILED_VERB_KEYS
+            .iter()
+            .filter_map(|k| metadata.get(*k).map(|v| ((*k).to_string(), v.clone())))
+            .collect(),
+    ))
 }
 
 /// The step keys a SLIM list row leaves out, and the only ones: a
@@ -159,23 +183,34 @@ fn steps_whole_by_default() -> bool {
 pub(crate) const SLIM_STEP_DROPS: [&str; 2] = ["metadata", "fields"];
 
 /// A listed row's `steps`, whole when `full`, else each without
-/// [`SLIM_STEP_DROPS`].
-fn listed_steps(steps: &[boss_core::job::Step], full: bool) -> serde_json::Value {
-    let whole = steps
-        .iter()
-        .map(|s| serde_json::to_value(s).unwrap_or_default());
-    if full {
-        return serde_json::Value::Array(whole.collect());
-    }
+/// [`SLIM_STEP_DROPS`] and marked [`boss_core::job::SLIM_STEP_MARKER`],
+/// which a typed `Step` parse refuses (backlog ea80b5fd). With
+/// `failed_verbs`, a step carrying the failed-verb note also carries it
+/// as `failed_verb`.
+fn listed_steps(
+    steps: &[boss_core::job::Step],
+    full: bool,
+    failed_verbs: bool,
+) -> serde_json::Value {
     serde_json::Value::Array(
-        whole
-            .map(|s| match s {
-                serde_json::Value::Object(o) => serde_json::Value::Object(
-                    o.into_iter()
-                        .filter(|(k, _)| !SLIM_STEP_DROPS.contains(&k.as_str()))
-                        .collect(),
-                ),
-                other => other,
+        steps
+            .iter()
+            .map(|s| {
+                let mut o = match serde_json::to_value(s).unwrap_or_default() {
+                    serde_json::Value::Object(o) => o,
+                    other => return other,
+                };
+                if failed_verbs && let Some(note) = failed_verb_of(&s.metadata) {
+                    o.insert("failed_verb".into(), note);
+                }
+                if !full {
+                    o.retain(|k, _| !SLIM_STEP_DROPS.contains(&k.as_str()));
+                    o.insert(
+                        boss_core::job::SLIM_STEP_MARKER.into(),
+                        serde_json::Value::Bool(true),
+                    );
+                }
+                serde_json::Value::Object(o)
             })
             .collect(),
     )
@@ -345,9 +380,8 @@ pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static
     // spelling of the verb's exit on the request (50fede8b): a
     // request-level reader never had to fetch them. Held by
     // tests/a_listed_packet_carries_its_steps.rs. Every step rides; its
-    // `metadata` and `fields` unless the read says `full=false` — and,
-    // once STEPS_WHOLE_BY_DEFAULT flips, only when it says `full=true`,
-    // as the ops-runner already does (backlog 9b473d4a).
+    // `metadata` and `fields` only when the read says `full=true`, as
+    // the ops-runner does (backlog 9b473d4a; the default since ea80b5fd).
     //
     // So a failed steps read FAILS the list, naming the packet. It used
     // to answer `unwrap_or_default()`: the row went out with `steps: []`,
@@ -361,7 +395,7 @@ pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static
             Err(e) => return steps_unreadable(&job.id, &e),
         };
         let mut j = serde_json::to_value(job).unwrap_or_default();
-        j["steps"] = listed_steps(&steps, q.full);
+        j["steps"] = listed_steps(&steps, q.full, q.failed_verbs);
         if q.lane {
             j["lane"] =
                 serde_json::to_value(crate::channels::lane_of(&job.metadata)).unwrap_or_default();
@@ -715,6 +749,12 @@ fn assignment_row_json(
     v["step"]["decision_shaped"] =
         serde_json::to_value(steps.get(&row.step.kind).map(|t| t.decision_shaped))
             .unwrap_or(serde_json::Value::Null);
+    // The third, and the only one read off the STEP rather than its
+    // kind (backlog 1dd6d7ad): does the step's own agent block hand it
+    // to an agent? A `checklist` is human by kind, yet the publish
+    // review step carrying an analyst block read to David as his.
+    v["step"]["agent_takes"] =
+        serde_json::Value::Bool(crate::agent_spec::agent_takes(&row.step.metadata));
     v
 }
 
@@ -769,6 +809,38 @@ pub(super) async fn jobs_summary<R: JobsRepository + 'static, B: EventBus + 'sta
             }))
             .into_response()
         }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// Every kind's packet ledger for the caller — `{ "kinds": [ { kind,
+/// packets, open, open_by_version: {"<version>": n}, newest_terminal } ] }`,
+/// sorted by kind, a kind with no packet in scope absent. /it/registry
+/// reads it to say how many in-flight packets run a version below their
+/// kind's active one and which kinds have never run (backlogs 112c0535,
+/// 5eacf6db; page audit 9da74410).
+///
+/// A packet read, not the public window. The decision on 112c0535 named
+/// a field beside `counts` on `/api/jobs/live`, but that endpoint answers
+/// a headerless caller by design and 9274e151 is still deciding whether
+/// it should answer that caller even what it does; packets-ever and the
+/// newest terminal are closed history, which 19f08bd6 took out of an
+/// anonymous caller's reach on the summary. So this asks the same door
+/// as [`jobs_summary`] and counts under the same scope.
+pub(super) async fn jobs_kinds<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    CurrentUser(user): CurrentUser,
+) -> Response {
+    let scope = match job_read_scope(&state, &user).await {
+        Ok(scope) => scope,
+        Err(refusal) => return refusal,
+    };
+    let scope = job_scope_from_predicate(
+        &user,
+        &boss_policy_client::scope_to_predicate(&scope, &user),
+    );
+    match state.jobs.kind_ledger(&scope).await {
+        Ok(kinds) => Json(serde_json::json!({ "kinds": kinds })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -1146,6 +1218,80 @@ async fn refuse_a_packet_it_may_not_open<R: JobsRepository + 'static, B: EventBu
     }
 }
 
+/// AN EXPERIMENT ON AN UNPUBLISHED VERSION TAKES PUBLISH (backlog
+/// ce8b7d66). An open `protocol-experiment` packet's split pins every
+/// packet admitted to its kind to an arm's version, and admission reads
+/// that version through `get_version`, which serves drafts — the
+/// candidate is a draft until a promote publishes it. A draft needs only
+/// workflow Create/Update, and opening the packet needed only Create on
+/// job, so a Create-only author could make their own draft the live
+/// protocol of a kind at split 100 (the review of 5d1c0b7a walked it to
+/// packets materialised held by that author as declared executor).
+///
+/// The call, made on the build — design d8771dec set only WHEN an
+/// experiment starts: the experiment stays the sanctioned way a draft
+/// meets traffic, and putting such a split in force is the act that
+/// makes a version live, so it asks Publish on `workflow`. Asked only
+/// of a write that NEWLY puts a split in force
+/// ([`crate::experiments::newly_in_force`]) — an admission, a PUT or a
+/// metadata PATCH — so annotating a running experiment asks nothing. An
+/// arm asks unless its row is the ACTIVE version: a draft, a number no
+/// row holds (the next draft would take it, and be admitted to
+/// unasked), a row the registry cannot read (fail closed), or a RETIRED
+/// row — superseded, and at split 100 a rollback of the kind to it,
+/// which is a publish by another name (the review of car 06973644,
+/// finding C). `None` when the write may proceed.
+async fn refuse_an_unpublished_arm_without_publish<R: JobsRepository, B: EventBus>(
+    state: &JobsApiState<R, B>,
+    user: &boss_policy_client::User,
+    before: Option<&Job>,
+    after: &Job,
+) -> Option<Response> {
+    let (kind, split) = crate::experiments::newly_in_force(before, after)?;
+    // No registry, no split: admission consults experiments only through it.
+    let reg = state.kind_registry.as_ref()?;
+    let mut arms = vec![split.control_version, split.candidate_version];
+    arms.dedup();
+    let mut not_active = Vec::new();
+    for version in arms {
+        let status = match reg.get_version(&kind, version).await {
+            Ok(spec) if spec.status == crate::registry::WorkflowStatus::Active => continue,
+            Ok(spec) if spec.status == crate::registry::WorkflowStatus::Retired => {
+                "retired".to_string()
+            }
+            Ok(_) => "draft".to_string(),
+            Err(crate::registry::WorkflowError::NotFound(_)) => "no such version yet".to_string(),
+            Err(e) => format!("unreadable: {e}"),
+        };
+        not_active.push(serde_json::json!({ "version": version, "status": status }));
+    }
+    if not_active.is_empty() {
+        return None;
+    }
+    match state
+        .policy
+        .check(user, Action::Publish, Resource::workflow())
+        .await
+    {
+        Ok(Decision::Allow { .. }) => None,
+        Ok(Decision::Deny { reason }) => Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "an experiment that admits packets to a version other than \
+                              the active one is put in force by whoever may publish one",
+                    "kind_under_test": kind,
+                    "not_active": not_active,
+                    "reason": reason,
+                    "hint": "ask a holder of publish on workflow to open it",
+                })),
+            )
+                .into_response(),
+        ),
+        Err(e) => Some(e.into_response()),
+    }
+}
+
 pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     CurrentUser(user): CurrentUser,
@@ -1342,6 +1488,14 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
         }
         Ok(None) => {}
         Err(e) => return persist_error_response(e),
+    }
+
+    // An experiment opened onto a version never published is a publish
+    // (backlog ce8b7d66; the reasoning is on the helper).
+    if let Some(refusal) =
+        refuse_an_unpublished_arm_without_publish(&state, &user, None, &job).await
+    {
+        return refusal;
     }
 
     // THE ADMISSION INSTANT, server-owned (backlog 6c2eba00, design
@@ -1580,7 +1734,7 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
         // metadata derives from the system clock (sim or wall
         // depending on the deploy's clock mode), matching what
         // the sim engine does with its own day cursor.
-        crate::registry::materialize_steps_at(
+        let steps = crate::registry::materialize_steps_at(
             spec,
             &job.subject,
             job_id,
@@ -1594,7 +1748,10 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
             // here, so this is the single point that makes triggers
             // honest.
             Some(state.step_registry.as_ref()),
-        )
+        );
+        // ...and that includes WHEN: the day above, the instant here,
+        // from the one `now` (backlog 4d088a7e).
+        crate::registry::stamp_born_completions(steps, now)
     });
 
     // Filer fields validate at ADMISSION — the flip side of
@@ -1753,6 +1910,22 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
                     .into_response(),
                 Err(e) => persist_error_response(e),
             };
+        }
+        // The version this packet was materialised from was discarded
+        // between the read above and the adapter's lock on its row
+        // (backlog ce8b7d66, part 4). Nothing was written; a re-send
+        // re-reads the kind and admits onto what it serves now.
+        Err(e @ crate::port::JobsError::VersionDiscarded { .. }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": e.to_string(),
+                    "kind": job.kind,
+                    "workflow_version": job.workflow_version,
+                    "hint": "the version was discarded while this packet was admitted; send it again",
+                })),
+            )
+                .into_response();
         }
         Err(e) => return persist_error_response(e),
     }
@@ -2326,6 +2499,11 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
     }
     job.workflow_version = existing.workflow_version;
 
+    // The host a declared writer is judged against (review S2).
+    if let Some(refusal) = refuse_host_move(&state, &existing, &job.metadata).await {
+        return refusal;
+    }
+
     // A CLOSED PACKET DOES NOT REOPEN, AND ITS OUTCOME IS THE CLOSE'S
     // (backlog 36352452). After a terminal close this route took
     // `{status: open, metadata: {outcome: aborted}}` whole: the packet
@@ -2391,6 +2569,14 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
             &existing.metadata,
             crate::job_outcome::OUTCOME_KEY,
         );
+    }
+
+    // Widening a split, moving an arm, or opening a held experiment onto
+    // a version never published is a publish (backlog ce8b7d66).
+    if let Some(refusal) =
+        refuse_an_unpublished_arm_without_publish(&state, &user, Some(&existing), &job).await
+    {
+        return refusal;
     }
 
     // Same opt-in subject validation as create_job. Catches a body that
@@ -2510,6 +2696,53 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// THE HOST A DECLARED WRITER IS BOUND TO IS FIXED AT ADMISSION (backlog
+/// 6c9183de, review S2 of car 1e603cfd, 2026-09-26). A host-bound
+/// credential writes only packets whose job-metadata `host` is its host
+/// (`field_writer::admits`), and both job doors let any caller with
+/// Update on the job move that key — so one host's runner could author
+/// another host's plan by flipping `host` to its own, writing, and
+/// flipping it back, and the binding the credential carries would be
+/// decoration. On a packet whose steps declare a writer, a write that
+/// moves `host` (a new value or a removal) is refused 409, naming the
+/// key; an unchanged re-send is not a move. Any other packet's `host`
+/// is an ordinary key, as it always was. The steps are read only when
+/// the write moves `host`, and a read that fails refuses the write
+/// rather than reading as "declares none" (5186c5e1).
+async fn refuse_host_move<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &Arc<JobsApiState<R, B>>,
+    existing: &Job,
+    after: &serde_json::Value,
+) -> Option<Response> {
+    use crate::field_writer;
+    if !field_writer::host_changed(&existing.metadata, after) {
+        return None;
+    }
+    match state.jobs.list_steps(&existing.id).await {
+        Ok(steps) if field_writer::declares_a_writer(&steps) => Some(
+            (
+                StatusCode::CONFLICT,
+                Json(field_writer::host_refusal_body(
+                    &existing.id.to_string(),
+                    existing.metadata.get(field_writer::HOST_KEY),
+                )),
+            )
+                .into_response(),
+        ),
+        Ok(_) => None,
+        Err(e) => Some(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "reading packet {}'s steps failed, so a change to its host is not written: {e}",
+                    existing.id
+                ),
+            )
+                .into_response(),
+        ),
+    }
+}
+
 /// `PATCH /api/jobs/{id}/metadata` — merge top-level metadata keys
 /// into the Job, atomically, server-side.
 ///
@@ -2590,6 +2823,38 @@ pub(super) async fn patch_job_metadata<R: JobsRepository + 'static, B: EventBus 
         return (StatusCode::FORBIDDEN, "job is outside your scope").into_response();
     }
 
+    // Moving an arm or widening a split onto a version never published
+    // is a publish (backlog ce8b7d66), judged on the row as this merge
+    // would leave it: null removes, every other key overwrites. The
+    // merge below lands only on the row read here (finding B).
+    let as_merged = {
+        let mut md = match &existing.metadata {
+            serde_json::Value::Object(m) => m.clone(),
+            _ => serde_json::Map::new(),
+        };
+        for (k, v) in &patch {
+            if v.is_null() {
+                md.remove(k);
+            } else {
+                md.insert(k.clone(), v.clone());
+            }
+        }
+        Job {
+            metadata: serde_json::Value::Object(md),
+            ..existing.clone()
+        }
+    };
+    // The host a declared writer is judged against (review S2), judged
+    // on the same as-merged row.
+    if let Some(refusal) = refuse_host_move(&state, &existing, &as_merged.metadata).await {
+        return refusal;
+    }
+    if let Some(refusal) =
+        refuse_an_unpublished_arm_without_publish(&state, &user, Some(&existing), &as_merged).await
+    {
+        return refusal;
+    }
+
     // And `outcome`, which the close writes (backlog 36352452): this door
     // answered 204 to `{outcome: forged}` on a closed packet. Unlike the
     // two lists above it has one other legitimate writer — `boss job
@@ -2663,14 +2928,34 @@ pub(super) async fn patch_job_metadata<R: JobsRepository + 'static, B: EventBus 
         .stamp_with_actor(actor.clone())
         .await
         .with_partition(existing.partition);
+    // The split judgement above read `existing`; on an experiment
+    // packet the merge lands only on that row, so a writer between the
+    // judgement and the merge (an arm moved onto a draft at split 0)
+    // cannot turn a patch judged harmless into a draft put in force
+    // (finding B of the review of car 06973644). Every other packet
+    // merges against the row as it stands — no decision here reads its
+    // other keys, and the conductor's markers must not queue on it.
+    let judged_on = (existing.kind == crate::experiments::EXPERIMENT_KIND).then_some(&existing);
     let merged = match state
         .jobs
-        .merge_job_metadata_at(&job_id, &patch, &stamp)
+        .merge_job_metadata_at(&job_id, &patch, judged_on, &stamp)
         .await
     {
         Ok(job) => job,
         Err(crate::port::JobsError::NotFound(_)) => {
             return (StatusCode::NOT_FOUND, "job not found").into_response();
+        }
+        Err(e @ crate::port::JobsError::JobChanged { .. }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": e.to_string(),
+                    "job_id": job_id.to_string(),
+                    "hint": "nothing was written; send the same patch again — the \
+                             door judges the row afresh",
+                })),
+            )
+                .into_response();
         }
         // The same door as create/update: a declared edge the guard
         // refuses is the CALLER's error (400 with the guard's sentence),
@@ -2697,6 +2982,9 @@ struct JudgedMove {
     existing: Job,
     from: i32,
     to: i32,
+    /// The target was never published (backlog ce8b7d66) — an obstacle
+    /// of its own, whatever the step verdict says.
+    to_is_draft: bool,
     verdict: crate::protocol_conversion::Convertibility,
     plan: Result<crate::repin::RepinPlan, crate::repin::Unplannable>,
 }
@@ -2805,38 +3093,82 @@ async fn judge_move<R: JobsRepository + 'static, B: EventBus + 'static>(
         ));
     }
 
-    // Where the packet actually stands: the slugs it has completed.
+    // Where the packet actually stands: each step's status, by slug —
+    // not only the completed ones, because a changed predicate bites a
+    // ready step and not a skipped one (backlog 4c6b4b74).
     let steps =
         state.jobs.list_steps(&job_id).await.map_err(|e| {
             answer((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
         })?;
-    let done: std::collections::BTreeSet<String> = steps
+    let at: std::collections::BTreeMap<String, boss_core::job::StepStatus> = steps
         .iter()
-        .filter(|s| s.status == boss_core::job::StepStatus::Completed)
-        .filter_map(|s| s.spec_slug.clone())
+        .filter_map(|s| s.spec_slug.clone().map(|slug| (slug, s.status)))
         .collect();
-    let verdict = crate::protocol_conversion::convertibility_for_packet(&from, &to, &done);
+    let verdict = crate::protocol_conversion::convertibility_for_packet(&from, &to, &at);
     let plan = crate::repin::plan(&from, &to, &existing, &steps);
     Ok(JudgedMove {
         existing,
         from: from.version,
         to: to.version,
+        to_is_draft: to.status == crate::registry::WorkflowStatus::Draft,
         verdict,
         plan,
     })
 }
 
-/// The obstacles a judged move answers with: the safety verdict's, and
-/// the one reason a packet cannot be planned at all.
+/// The obstacles a judged move answers with: a target never published,
+/// the safety verdict's, and the one reason a packet cannot be planned
+/// at all.
+///
+/// A DRAFT IS NOT A TARGET (backlog ce8b7d66). A draft is written on
+/// workflow Create/Update and has never passed the publish gate, so a
+/// move onto one made it a live packet's protocol with nobody having
+/// made it live — and `get_version` serves drafts, so nothing below
+/// this line would notice. Refused here rather than in the registry
+/// read, because an experiment's admission reads a draft candidate
+/// through the same call on purpose. Publish, then move.
 fn move_obstacles(judged: &JudgedMove) -> Vec<serde_json::Value> {
-    let mut out: Vec<serde_json::Value> = judged
-        .verdict
-        .obstacles()
-        .iter()
-        .map(|o| serde_json::json!({ "step": o.step, "reason": o.reason }))
+    let unpublished = judged.to_is_draft.then(|| {
+        serde_json::json!({
+            "step": null,
+            "reason": format!(
+                "v{} is a draft: a packet is moved only onto a version that was \
+                 published — publish it, then move the packet",
+                judged.to
+            ),
+        })
+    });
+    let mut out: Vec<serde_json::Value> = unpublished
+        .into_iter()
+        .chain(
+            judged
+                .verdict
+                .obstacles()
+                .iter()
+                .map(|o| serde_json::json!({ "step": o.step, "reason": o.reason })),
+        )
         .collect();
-    if let Err(why) = &judged.plan {
-        out.push(serde_json::json!({ "step": null, "reason": why.0 }));
+    match &judged.plan {
+        Err(why) => out.push(serde_json::json!({ "step": null, "reason": why.0 })),
+        // The adapters refuse this at the write; said here too, so the
+        // dry run answers what the move would (review of 28f3f28a).
+        Ok(plan)
+            if plan.opens_rows()
+                && matches!(
+                    judged.existing.status,
+                    JobStatus::Closed | JobStatus::Cancelled
+                ) =>
+        {
+            out.push(serde_json::json!({
+                "step": null,
+                "reason": format!(
+                    "the packet is {:?} and v{} inserts a step — a finished packet is not \
+                     walked again, so no live step is written onto it",
+                    judged.existing.status, judged.to
+                ),
+            }))
+        }
+        Ok(_) => {}
     }
     out
 }
@@ -2876,6 +3208,7 @@ pub(super) async fn preview_convert_job<R: JobsRepository + 'static, B: EventBus
             "obstacles": obstacles,
             "reprojected": reprojected,
             "inserted": inserted,
+            "unskipped": judged.plan.as_ref().map(crate::repin::RepinPlan::unskipped).unwrap_or_default(),
         })),
     )
         .into_response()
@@ -2977,10 +3310,31 @@ pub(super) async fn convert_job<R: JobsRepository + 'static, B: EventBus + 'stat
                     "to": job.workflow_version,
                     "reprojected": record["reprojected"],
                     "inserted": record["inserted"],
+                    "unskipped": record["unskipped"],
                 })),
             )
                 .into_response()
         }
+        // The packet finished between the judgement and the write, and
+        // the move would have written live rows onto it: refused whole,
+        // nothing written (review of 28f3f28a).
+        Err(crate::port::JobsError::TerminalJob { status, .. }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "converted": false,
+                "from": judged.from,
+                "to": judged.to,
+                "obstacles": [{
+                    "step": null,
+                    "reason": format!(
+                        "the packet is {status} — it finished after this move was judged, \
+                         and a move that un-skips or inserts a step is written only onto a \
+                         packet still walked; nothing was written"
+                    ),
+                }],
+            })),
+        )
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -2998,10 +3352,16 @@ pub(super) async fn convert_job<R: JobsRepository + 'static, B: EventBus + 'stat
 /// Declaring a machine is a change to the tree that converges — since
 /// backlog ee368d0c through the batch door below, before that as a
 /// schema migration.
+///
+/// It ASKS POLICY — Read on `estate` — and refuses a caller it does not
+/// grant (backlog e5f7b51e). See [`estate_read_refusal`].
 pub(super) async fn list_estate_nodes<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
-    CurrentUser(_user): CurrentUser,
+    CurrentUser(user): CurrentUser,
 ) -> Response {
+    if let Some(refused) = estate_read_refusal(&state, &user, "the estate registry").await {
+        return refused;
+    }
     match state.jobs.list_estate_nodes().await {
         Ok(nodes) => Json(serde_json::json!({ "data": nodes })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -3093,9 +3453,11 @@ pub(super) const LATEST_PER_KEYS: &[&str] = &["host"];
 /// page's data source — David has asked repeatedly for the running
 /// hardware rendered from the registry, declared beside observed.
 ///
-/// Guest-readable like `/api/estate/nodes`, and rows verbatim as
-/// recorded: a reader that reshapes its instrument is a second
-/// instrument. Small default, hard cap — this is a status surface,
+/// Rows verbatim as recorded: a reader that reshapes its instrument is
+/// a second instrument. They were guest-readable like
+/// `/api/estate/nodes` until backlog e5f7b51e; each now asks Read on
+/// `estate` through [`estate_read_refusal`]. Small default, hard cap —
+/// this is a status surface,
 /// not an export (the events service's export door owns bulk).
 ///
 /// `?scope=` is what makes that small cap honest. One kind carries
@@ -3134,18 +3496,90 @@ pub(super) const LATEST_PER_KEYS: &[&str] = &["host"];
 /// days running and nothing was filed.
 pub(super) async fn list_estate_observations<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
-    CurrentUser(_user): CurrentUser,
+    CurrentUser(user): CurrentUser,
     Query(q): Query<EstateEventsQuery>,
 ) -> Response {
+    if let Some(refused) = estate_read_refusal(&state, &user, "the estate observations").await {
+        return refused;
+    }
     estate_events(&state, crate::events::ESTATE_OBSERVED, &q).await
 }
 
 pub(super) async fn list_estate_comparisons<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
-    CurrentUser(_user): CurrentUser,
+    CurrentUser(user): CurrentUser,
     Query(q): Query<EstateEventsQuery>,
 ) -> Response {
+    if let Some(refused) = estate_read_refusal(&state, &user, "the estate comparisons").await {
+        return refused;
+    }
     estate_events(&state, crate::events::ESTATE_COMPARED, &q).await
+}
+
+/// Why the three estate reads refuse `user`, or `None` when policy
+/// grants Read on `estate` at scope ALL (backlog e5f7b51e).
+///
+/// ONE RESOURCE for all three, not `subject` for the registry and
+/// `event` for the series as the car first had it: the break-glass
+/// session must read the machines during a recovery (DR rule 62dac114
+/// allows no new refusal on David's emergency path) and must not gain
+/// `subject`, which would widen a door key into a data key. `estate`
+/// is granted to exactly the roles that should read it
+/// (`boss-policy-client` defaults, pinned there).
+///
+/// They answered every caller until this — every host's LAN address,
+/// its roles and capacity, every disk and unit reading — including one
+/// with no identity, which the `/ics` traversal (1d9b7db7) and the LAN
+/// machine door (2710c8fc) both deliver. They were the last three rows
+/// of the jobs API's PENDING ratchet, held there until every in-tree
+/// reader signed (`every_estate_read_is_signed` in boss-testing), since
+/// a reader that did not would be answered a refusal it reads as a
+/// dark registry.
+///
+/// The shipped grants decide who reads: platform-admin — David's
+/// session, elevated or not, and the dispatcher and conductor —
+/// `audit-readonly`, the machine readers' role (a probe, a lint,
+/// node-roles.sh), and break-glass, the hardware-key recovery session. A request with no identity (the extractor's `guest`)
+/// and the basic visitor — the OSS default guest session — are refused.
+/// A guest session on an instance that opts in to the audit read
+/// (`BOSS_GUEST_ACCESS=audit`, the playground) carries `audit-readonly`
+/// and IS answered: that install chose the full audit read for
+/// strangers, and the estate is part of it.
+/// A narrower scope is refused too, not answered: no estate row has an
+/// owner, team or department a scope could match, so a scoped read
+/// would be an empty estate — the wrong-target-answers shape.
+pub(super) async fn estate_read_refusal<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &Arc<JobsApiState<R, B>>,
+    user: &boss_policy_client::User,
+    what: &str,
+) -> Option<Response> {
+    match state
+        .policy
+        .check(user, Action::Read, Resource::estate())
+        .await
+    {
+        Ok(Decision::Allow {
+            scope: boss_policy_client::Scope::All,
+        }) => None,
+        Ok(Decision::Allow { scope }) => Some(
+            (
+                StatusCode::FORBIDDEN,
+                format!(
+                    "reading {what} needs Read at scope all — no estate row has an owner a \
+                     narrower scope could match, and this caller holds {scope:?}"
+                ),
+            )
+                .into_response(),
+        ),
+        Ok(Decision::Deny { reason }) => Some(
+            (
+                StatusCode::FORBIDDEN,
+                format!("reading {what} is refused: {reason}"),
+            )
+                .into_response(),
+        ),
+        Err(e) => Some(e.into_response()),
+    }
 }
 
 async fn estate_events<R: JobsRepository + 'static, B: EventBus + 'static>(

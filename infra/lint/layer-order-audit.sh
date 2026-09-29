@@ -131,6 +131,7 @@ rank_of() {
 # reviewer to agree the layer boundary genuinely does not apply.
 read -r -d '' SHAPE_ALLOW <<'ALLOW' || true
 boss-events/tail_http.rs memory-no-http-server Apps concern in the memory crate; eviction proposed in docs/design/crates-and-layers.md
+boss-events/outbox_http.rs memory-no-http-server the dead-letter door, mounted on boss-events-api beside tail_http at the adversarial review's direction (backlog e22b692e, H1: the service that owns event_outbox acts on it, not a CLI with a database URL); evicts with tail_http
 ALLOW
 
 allow_count=$(printf '%s\n' "$SHAPE_ALLOW" | grep -c . || true)

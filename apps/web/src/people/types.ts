@@ -4,12 +4,13 @@ import { failedRead, okRead, type ReadState } from '../data/readState';
 
 export type EmployeeId = string;
 
-/// Class registry code under
-/// `(subject_kind='employee', member_attribute='department')`.
-/// Open string — tenants extend the taxonomy via the registry.
-/// Display labels are looked up from the registry's `display_name`
-/// field; the SPA's local helper falls back to a kebab→Title-Case
-/// transform when the registry isn't loaded.
+/// A code of the departments registry (`GET /api/departments`) — an
+/// employee's department is one of its rows since backlog c87e3d6d
+/// (2026-09-27); it was an `(employee, department)` Class until then.
+/// Open string — a tenant adds a department by declaring the row.
+/// Labels come from the registry's display name via `departmentNames`;
+/// `classLabel` falls back to a kebab→Title-Case transform for a code
+/// the registry lacks, or while it loads.
 export type Department = string;
 
 /// Class registry code under
@@ -55,6 +56,18 @@ export function classLabel(
   classes: ReadonlyArray<ClassName>,
 ): string {
   return classes.find((c) => c.code === code)?.display_name ?? humanizeClassCode(code);
+}
+
+/// The departments registry's rows — as the web-kit loader
+/// (`departments()`) hands them over, `{ code, label }` — in the shape
+/// `classLabel` reads. The ONE source of a department's name on the
+/// roster, the employee page, HR and the policy scope picker since
+/// backlog c87e3d6d: the `(employee, department)` Classes they read
+/// before were a second list that had drifted from this one.
+export function departmentNames(
+  rows: ReadonlyArray<Readonly<{ code: string; label: string }>>,
+): ReadonlyArray<ClassName> {
+  return rows.map((d) => ({ code: d.code, display_name: d.label }));
 }
 
 export type EmploymentStatus = 'active' | 'on-leave' | 'terminated';

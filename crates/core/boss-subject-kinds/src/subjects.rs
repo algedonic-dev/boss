@@ -384,6 +384,11 @@ async fn post_subject_for_kind(
 
 const IDENTITY_SOURCES_TOML: &str = include_str!("../seeds/subject_identity_sources.toml");
 
+/// Held for the whole TRUNCATE-and-reproject so two rebuilds of the
+/// identity table never interleave — the lock every `boss-rebuild-all`
+/// step takes. This one took none until backlog 8d5ac7c5.
+const REBUILD_LOCK_KEY: i64 = boss_core::rebuild::lock_key("subjects");
+
 #[derive(Deserialize)]
 struct SourcesToml {
     source: Vec<IdentitySource>,
@@ -421,6 +426,16 @@ struct IdentitySource {
 pub async fn rebuild_subjects(pool: &PgPool) -> Result<u64, String> {
     let sources: SourcesToml = toml::from_str(IDENTITY_SOURCES_TOML).map_err(|e| e.to_string())?;
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(REBUILD_LOCK_KEY)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("taking the subjects rebuild lock: {e}"))?;
+    // A write-through (`record_subject_in_tx`) commits beside its
+    // caller's fact in event_outbox, and the mint door stages its own,
+    // so the truncate may run only against a log that holds them all
+    // (design b046f510).
+    boss_events::outbox::lock_and_assert_log_complete(&mut tx, &["subjects"]).await?;
     sqlx::query("TRUNCATE subjects")
         .execute(&mut *tx)
         .await

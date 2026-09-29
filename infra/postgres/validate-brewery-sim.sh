@@ -510,6 +510,13 @@ echo "    clean — no dead-letters (${REDELIVERED:-0} transient failure(s) self
 # truncated). The close endpoint is idempotent — re-running
 # the regen script over a fresh DB still works.
 echo "==> [7b/10] creating + closing fiscal-year periods"
+# Signed, as the deploy superuser's regen automation (backlog 34f0a954):
+# every /api/ledger/* call asks the ledger read grant, creating a year
+# asks Create and closing one Close on `ledger-period`, and an unsigned
+# write is refused. These calls sent an `X-Boss-Actor` header nothing
+# reads, so the ledger's read gate refused them as a caller with no
+# grant. The closer is the signer: the body names none.
+LEDGER_REGEN_USER='{"id":"automation:ledger-regen","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
 START_YEAR=$(date -u -d "$START" +%Y)
 END_YEAR=$(date -u -d "$START + $DAYS days" +%Y)
 CURRENT_YEAR=$(date -u +%Y)
@@ -517,7 +524,7 @@ for YEAR in $(seq "$START_YEAR" "$END_YEAR"); do
     # Create the yearly period.
     CREATE_RESP=$(curl -sS -w '\n%{http_code}' -X POST \
         -H "Content-Type: application/json" \
-        -H "X-Boss-Actor: ledger-regen" \
+        -H "x-boss-user: ${LEDGER_REGEN_USER}" \
         -d "{\"year\": ${YEAR}}" \
         "http://127.0.0.1:7080/api/ledger/periods" || echo $'\n000')
     HTTP_CODE=$(echo "$CREATE_RESP" | tail -n1)
@@ -530,7 +537,8 @@ for YEAR in $(seq "$START_YEAR" "$END_YEAR"); do
     if [[ -z "$PERIOD_ID" ]]; then
         # Fall back to lookup if the response didn't include the id
         # (e.g., 409 idempotent return).
-        PERIODS_JSON=$(curl -sS "http://127.0.0.1:7080/api/ledger/periods?kind=year")
+        PERIODS_JSON=$(curl -sS -H "x-boss-user: ${LEDGER_REGEN_USER}" \
+            "http://127.0.0.1:7080/api/ledger/periods?kind=year")
         PERIOD_ID=$(printf '%s' "$PERIODS_JSON" | jq -r --arg y "$YEAR" '
             (if type == "array" then . else (.data // .rows // []) end)
             | map(select((.starts_on // "") | startswith($y + "-")))
@@ -546,8 +554,8 @@ for YEAR in $(seq "$START_YEAR" "$END_YEAR"); do
         echo "    closing FY${YEAR} (period ${PERIOD_ID:0:8})"
         CLOSE_RESP=$(curl -sS -w '\n%{http_code}' -X POST \
             -H "Content-Type: application/json" \
-            -H "X-Boss-Actor: ledger-regen" \
-            -d '{"closed_by":"ledger-regen","retained_earnings_account":"3000"}' \
+            -H "x-boss-user: ${LEDGER_REGEN_USER}" \
+            -d '{"retained_earnings_account":"3000"}' \
             "http://127.0.0.1:7080/api/ledger/periods/${PERIOD_ID}/close" || echo $'\n000')
         CLOSE_CODE=$(echo "$CLOSE_RESP" | tail -n1)
         CLOSE_BODY=$(echo "$CLOSE_RESP" | sed '$d')

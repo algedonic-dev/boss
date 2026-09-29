@@ -245,11 +245,16 @@
       (f) => f && f.name && !TRIO.includes(f.name),
     );
     // Live values for declared fields, seeded from step metadata (a
-    // pre-filled `approved` renders filled and editable).
+    // pre-filled `approved` renders filled and editable). A value that is
+    // not a string is seeded as its JSON (backlog 6c9183de, review S4):
+    // String([]) is '', so ops-request's required `args` on a zero-arg
+    // request read as an empty required input and Approve never opened.
+    // Present is present, whatever its JSON type.
     const fieldValues = {};
     declared.forEach((f) => {
       const cur = (step.metadata || {})[f.name];
-      fieldValues[f.name] = cur == null ? '' : String(cur);
+      fieldValues[f.name] =
+        cur == null ? '' : typeof cur === 'string' ? cur : JSON.stringify(cur);
     });
     // WHAT A PASSKEY SIGNS IS SHOWN, NOT OFFERED FOR EDIT (adversarial
     // re-review of fd7090cc, 2026-09-25). On a presence-assured step a
@@ -348,12 +353,20 @@
         // byte for byte, with every other key the passkey signs.
         if (signedDoc.has(f.name) && signedVisible()) return;
         if (signedDoc.has(f.name)) {
+          // The step's own value, as the signed block draws it — never
+          // `fieldValues`, the input copy, where an array is seeded as its
+          // JSON text and so read as the string "[]" (follow-up b of the
+          // review of car f3365343, 2026-09-28).
           fieldsDiv.appendChild(
             h(
               'div',
               { className: 'step-field' },
               h('label', { for: id }, `${f.name} — what your passkey signs`),
-              h('pre', { className: 'step-signoff-signed', id }, signedText(fieldValues[f.name])),
+              h(
+                'pre',
+                { className: 'step-signoff-signed', id },
+                signedText((step.metadata || {})[f.name]),
+              ),
             ),
           );
           return;

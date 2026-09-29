@@ -254,7 +254,8 @@ fn an_allowance_is_held_to_its_count_both_ways() {
 
     let fixed: String = real
         .lines()
-        .filter(|l| !l.contains("cpResp.ok ? await cpResp.json()"))
+        // PartsList's one allowed site since 0ef5e008: the PO read.
+        .filter(|l| !l.contains("pResp.ok ? await pResp.json()"))
         .map(|l| format!("{l}\n"))
         .collect();
     assert_ne!(fixed, real, "the fixture must remove one allowed site");

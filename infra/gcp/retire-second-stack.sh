@@ -360,5 +360,44 @@ if [ "${#still[@]}" -gt 0 ]; then
     say "  something is starting them again (a timer not in the list? the converge?); this verb will not try again."
     exit 1
 fi
-say "OK — stopped+disabled ${#DONE[@]} units of the second stack on $NODE_ID, in the order above; captured first at $DUMP. Unit files, binaries and the database are untouched."
+
+# --- verified disabled, the other half of what the OK line claims ---------
+# (backlog 1058e686, car C). The listing above reads ACTIVE state only: a
+# unit `disable --now` stopped but left enabled is inactive now and starts
+# again at the next boot, and it passed. `systemctl is-enabled` answers the
+# second half, read by its WORD — its exit is 0 for `static` as well as
+# `enabled`, so the exit cannot tell them apart. Three words pass:
+#   disabled  what `disable` leaves;
+#   masked    disabled and more (a persistent mask; `masked-runtime` is
+#             gone at the reboot this check exists for, so it does not);
+#   static    no [Install] section — nothing can enable the unit, so
+#             nothing starts it at boot; a timer-driven chore's .service
+#             is one, and its .timer is read on its own line.
+# Every other word (enabled, enabled-runtime, linked, alias, indirect,
+# generated, transient, masked-runtime, bad …) FAILS by name; no word at
+# all is CANNOT ANSWER. Both exit 1, with the units already stopped.
+n_disabled=0; n_masked=0; n_static=0
+left=(); unread=()
+for u in "${DONE[@]+"${DONE[@]}"}"; do
+    word=$(systemctl is-enabled -- "$u" 2> "$TMP/enabled.err")
+    word="${word%%$'\n'*}"
+    case "$word" in
+        disabled) n_disabled=$((n_disabled + 1)) ;;
+        masked) n_masked=$((n_masked + 1)) ;;
+        static) n_static=$((n_static + 1)) ;;
+        '') unread+=("$u ($(head -c 300 "$TMP/enabled.err" | tr '\n' ' '))") ;;
+        *) left+=("$u=$word") ;;
+    esac
+done
+if [ "${#left[@]}" -gt 0 ]; then
+    say "FAILED — stopped ${#DONE[@]} units, but ${#left[@]} still answer is-enabled with something other than disabled, masked or static, so each would start again at the next boot: ${left[*]}"
+    say "  the capture at $DUMP stands; this verb will not try again."
+    exit 1
+fi
+if [ "${#unread[@]}" -gt 0 ]; then
+    say "CANNOT ANSWER — stopped ${#DONE[@]} units, but systemctl is-enabled gave no answer for ${#unread[@]}, so they are not proven disabled: ${unread[*]}"
+    say "  the capture at $DUMP stands."
+    exit 1
+fi
+say "OK — stopped+disabled ${#DONE[@]} units of the second stack on $NODE_ID, in the order above; read back: none active, and systemctl is-enabled answers disabled for $n_disabled, masked for $n_masked, static for $n_static; captured first at $DUMP. Unit files, binaries and the database are untouched."
 exit 0

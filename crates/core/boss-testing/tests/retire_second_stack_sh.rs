@@ -40,6 +40,7 @@ fn has(tool: &str) -> bool {
 const SCRIPT: &str = "infra/gcp/retire-second-stack.sh";
 const LIST: &str = "infra/gcp/second-stack-units.txt";
 const PASSWORD: &str = "s3cretpw";
+const VERB: &str = "retire-second-stack";
 
 /// The units the tree's list names, in the tree's order, comments and
 /// blanks dropped — the same reading the script does.
@@ -165,6 +166,25 @@ case "$1" in
     shift; [ "$1" = "--" ] && shift
     echo "reset-failed $1" >> "$STUB_STOPPED"
     ;;
+  is-enabled)
+    # systemctl is-enabled [--] <unit>: what systemd answers on stdout
+    # (its exit is 0 for enabled/static, 1 for disabled/masked — the
+    # script must read the WORD). A unit the log shows disabled answers
+    # disabled; the STUB_* names override: still enabled, static (no
+    # [Install] section), masked, or a bus that does not answer.
+    shift; [ "$1" = "--" ] && shift
+    if [ "$1" = "${STUB_IS_ENABLED_MUTE:-}" ]; then
+      echo "Failed to get unit file state for $1: Connection timed out" >&2
+      exit 1
+    fi
+    [ "$1" = "${STUB_STILL_ENABLED:-}" ] && { echo enabled; exit 0; }
+    [ "$1" = "${STUB_STATIC_UNIT:-}" ] && { echo static; exit 0; }
+    [ "$1" = "${STUB_MASKED_UNIT:-}" ] && { echo masked; exit 1; }
+    if [ -f "$STUB_STOPPED" ] && grep -qxF "disable --now $1" "$STUB_STOPPED"; then
+      echo disabled; exit 1
+    fi
+    echo enabled
+    ;;
   *) echo "stub systemctl: unexpected $*" >&2; exit 99 ;;
 esac
 "#,
@@ -184,7 +204,7 @@ exit 0
         );
         write_exec(
             &bin.join("curl"),
-            "#!/bin/sh\n# stub curl: the estate registry's /api/estate/nodes\ncat \"$STUB_NODES\"\n",
+            "#!/bin/sh\n# stub curl: the estate registry's /api/estate/nodes, answered the way\n# real curl answers node-roles.sh's `-w '\\n%{http_code}'`: the body, then the code.\ncat \"$STUB_NODES\"; printf '\\n200'\n",
         );
         write_file(
             &nodes,
@@ -608,6 +628,20 @@ fn the_real_run_captures_then_disables_exactly_the_list_in_order() {
         ],
         "the real run's record",
     );
+    // The effect is the line printed after BOTH read-backs — none
+    // active, and every retired unit answering disabled — and it is the
+    // one line the verb file's declared `effect` matches.
+    let n = tree_list().len();
+    assert!(
+        text.contains(&format!(
+            "read back: none active, and systemctl is-enabled answers disabled for {n}, masked for 0, static for 0"
+        )),
+        "the OK line does not state the is-enabled read-back:\n{text}"
+    );
+    if let Some(hits) = boss_testing::ops_runner_stub::effect_lines(VERB, &text) {
+        assert_eq!(hits.len(), 1, "exactly the OK line is the effect:\n{text}");
+        assert!(hits[0].contains(": OK — "), "{hits:?}");
+    }
     // The record states the order: the first unit stopped is the first
     // listed, and it appears before the last listed in the text.
     let first = text
@@ -686,6 +720,106 @@ fn a_failed_stop_exits_1_and_states_what_was_done() {
 }
 
 // ---------------------------------------------------------------------------
+// DISABLED IS READ BACK (backlog 1058e686, car C). The OK line claims
+// stopped+disabled, and the after-listing read only the first half: a
+// unit `disable --now` stopped but left enabled starts again at the next
+// boot, and passed. `systemctl is-enabled` answers the second half, by
+// WORD (its exit is 0 for enabled AND for static, so the exit cannot).
+// ---------------------------------------------------------------------------
+
+/// A unit still enabled after its `disable --now` fails the run by name,
+/// and no line of the output is the declared effect.
+#[test]
+fn a_unit_left_enabled_is_named_and_fails() {
+    let c = Case::new("still-enabled");
+    let (rc, text) = c.run_env(
+        &["--for-real"],
+        &[("STUB_STILL_ENABLED", "boss-docs-api.service".into())],
+    );
+    assert_eq!(rc, 1, "a unit left enabled passed:\n{text}");
+    contains_all(
+        &text,
+        &[
+            "FAILED",
+            "boss-docs-api.service=enabled",
+            "would start again at the next boot",
+        ],
+        "the still-enabled record",
+    );
+    assert!(!text.contains(": OK — "), "no OK line:\n{text}");
+    if let Some(hits) = boss_testing::ops_runner_stub::effect_lines(VERB, &text) {
+        assert!(hits.is_empty(), "an effect was claimed: {hits:?}\n{text}");
+    }
+}
+
+/// An `is-enabled` that cannot answer is not a pass: the units were
+/// stopped, nothing has shown them disabled, and the run says so.
+#[test]
+fn an_unanswered_is_enabled_is_cannot_answer() {
+    let c = Case::new("is-enabled-mute");
+    let (rc, text) = c.run_env(
+        &["--for-real"],
+        &[("STUB_IS_ENABLED_MUTE", "boss-jobs-api.service".into())],
+    );
+    assert_eq!(rc, 1, "an unanswered read-back passed:\n{text}");
+    contains_all(
+        &text,
+        &[
+            "CANNOT ANSWER",
+            "boss-jobs-api.service",
+            "Connection timed out",
+        ],
+        "the unanswered record",
+    );
+    assert!(!text.contains(": OK — "), "no OK line:\n{text}");
+    assert_eq!(
+        c.stopped(),
+        tree_list(),
+        "the stops still ran; only the proof is missing:\n{text}"
+    );
+}
+
+/// `masked` is disabled-and-more, and `static` is a unit with no
+/// [Install] section — nothing enables it, so nothing starts it at boot
+/// (a timer-driven oneshot's .service, whose timer is on its own line).
+/// Both pass, and the OK line counts each, so the record says which.
+#[test]
+fn masked_and_static_units_pass_and_are_counted() {
+    let c = Case::new("masked-static");
+    let (rc, text) = c.run_env(
+        &["--for-real"],
+        &[
+            ("STUB_MASKED_UNIT", "boss-docs-api.service".into()),
+            ("STUB_STATIC_UNIT", "boss-backup.service".into()),
+        ],
+    );
+    assert_eq!(rc, 0, "{text}");
+    let n = tree_list().len() - 2;
+    assert!(
+        text.contains(&format!(
+            "is-enabled answers disabled for {n}, masked for 1, static for 1"
+        )),
+        "{text}"
+    );
+    if let Some(hits) = boss_testing::ops_runner_stub::effect_lines(VERB, &text) {
+        assert_eq!(hits.len(), 1, "{text}");
+    }
+}
+
+/// A dry run's effect is the line saying nothing was stopped; the plan
+/// lines before it are not.
+#[test]
+fn a_dry_runs_effect_is_its_nothing_stopped_line() {
+    let c = Case::new("dry-effect");
+    let (rc, text) = c.run(&["--dry-run"]);
+    assert_eq!(rc, 0, "{text}");
+    if let Some(hits) = boss_testing::ops_runner_stub::effect_lines(VERB, &text) {
+        assert_eq!(hits.len(), 1, "{hits:?}\n{text}");
+        assert!(hits[0].contains("DRY RUN"), "{hits:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // THROUGH THE RUNNER, with the real allowlist, as boss-gcp.
 // ---------------------------------------------------------------------------
 
@@ -713,7 +847,7 @@ fn run_runner(c: &Case, verbs: &Path, args: &str) -> (String, Option<serde_json:
         &[
             "#!/bin/sh\n",
             boss_testing::ops_runner_stub::RECORD_STEP_METADATA,
-            "for a in \"$@\"; do case \"$a\" in */api/estate/nodes*) cat \"$STUB_NODES\"; exit 0;; esac; done\n\
+            "for a in \"$@\"; do case \"$a\" in */api/estate/nodes*) cat \"$STUB_NODES\"; printf '\\n200'; exit 0;; esac; done\n\
              cat \"$STUB_JOBS\"\n",
         ]
         .concat(),
@@ -829,4 +963,29 @@ fn the_runner_on_boss_gcp_answers_a_dry_run() {
         c.stopped().is_empty(),
         "a dry run stopped something:\n{text}"
     );
+}
+
+/// Through the door, a real retirement's effect is the read-back line —
+/// judged by the runner against the verb file's declared `effect`, where
+/// until car C (backlog 1058e686) the verb declared `effect_unread`.
+#[test]
+fn the_runner_records_a_real_runs_read_back_as_its_effect() {
+    if !has("jq") {
+        eprintln!("skipping: the ops-runner is sh + jq and this box has no jq");
+        return;
+    }
+    let c = Case::new("runner-for-real");
+    let verbs = shipped_verbs(&c.root);
+    let (text, meta) = run_runner(&c, &verbs, r#"["--for-real"]"#);
+    let meta = meta.expect("the runner completed the execute step");
+    assert_eq!(meta["exit_code"], "0", "{text}");
+    assert!(
+        meta["effect"]
+            .as_str()
+            .is_some_and(|e| e
+                .contains("read back: none active, and systemctl is-enabled answers disabled for")),
+        "the effect is not the read-back line: {meta}"
+    );
+    assert!(meta["effect_unread"].is_null(), "{meta}");
+    assert!(meta["effect_unproven"].is_null(), "{meta}");
 }

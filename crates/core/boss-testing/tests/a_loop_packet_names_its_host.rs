@@ -35,7 +35,7 @@
 //!     recovered — by the first run of its kind, as before — rather than
 //!     left open forever by a key it never carried.
 
-use boss_testing::{repo_root, scratch_dir, write_exec};
+use boss_testing::{create_dir, repo_root, scratch_dir, write_exec, write_file};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::process::Command;
@@ -60,6 +60,9 @@ while [ $# -gt 0 ]; do
         -X) method="$2"; shift 2 ;;
         -H) shift 2 ;;
         -d) data="$2"; shift 2 ;;
+        # The wrap sends its packet from a file (a ledger it carries can
+        # outgrow an argument, backlog 9fd7f51e).
+        --data-binary) data=$(cat "${2#@}"); shift 2 ;;
         http://*|https://*) url="$1"; shift ;;
         *) shift ;;
     esac
@@ -103,6 +106,14 @@ impl Api {
         write_exec(&bin.join("boss-maintenance-wrap.sh"), &read(WRAP));
         write_exec(&bin.join("boss-step.sh"), &read(STEP));
         write_exec(&bin.join("boss-api-curl.sh"), STUB_API);
+        // Both scripts hand the machine token to curl as a header file
+        // made by the lib beside them, and refuse without it (backlog
+        // 5f3ad356) — lib/ next to the pair, as in the image.
+        create_dir(&bin.join("lib"));
+        write_file(
+            &bin.join("lib/secret-header.sh"),
+            &read("infra/lib/secret-header.sh"),
+        );
         let store = bin.join("store.json");
         std::fs::write(&store, "[]").unwrap();
         Api { bin, store }
@@ -147,6 +158,10 @@ impl Api {
             .args(args)
             .env("BOSS_JOBS_URL", "http://jobs.test:7900")
             .env("STUB_STORE", &self.store)
+            // The wrap keeps runs it could not record in a ledger under
+            // HOME and replays them onto the next packet; the run's own
+            // HOME keeps a real one out of these packets.
+            .env("HOME", &self.bin)
             .env_remove("HOST_ID")
             .env_remove("BOSS_NODE_ID")
             .env_remove("KUBERNETES_SERVICE_HOST")

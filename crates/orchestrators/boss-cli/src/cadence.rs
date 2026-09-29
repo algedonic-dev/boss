@@ -72,7 +72,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use boss_clock_client::{ClockClient, ReqwestClockClient};
-use boss_jobs::cadence::{CadenceRuleRow, ClaimResult, LastFiring, NewFiring};
+use boss_jobs::board_decision::BoardDecision;
+use boss_jobs::cadence::{CadenceRuleRow, ClaimResult, FiringOutcome, LastFiring, NewFiring};
 use chrono::{DateTime, Duration, NaiveDate, NaiveTime, Timelike, Utc};
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
@@ -83,31 +84,13 @@ use boss_core::calendar::{BusinessCalendar, Cadence, fires_on_with_calendar};
 /// The `boss train` verbs a cadence rule may fire — the same set the
 /// CLI exposes. Pinned here so a hand-edited registry row cannot make
 /// the loop spawn arbitrary arguments. `refresh` is the dock's own pass
-/// (design 42279fb2, rule `train-dock-refresh`); the table's verb CHECK
-/// is held to this list by `every_conductor_verb_is_one_the_table_accepts`.
-const VERBS: &[&str] = &["preflight", "reconcile", "board", "run", "refresh"];
-
-/// How many minutes a departure waits for the dock's re-gate round on
-/// the current main — D2 of design 42279fb2 — READ from the registry's
-/// active rows rather than decided here: the bound is protocol data, on
-/// `train-board-on-dock-depth` since its v9, and an operator moves it
-/// with a version bump like any other cadence number.
-///
-/// Every active rule that DEPARTS a train may declare one, and the
-/// largest wins: the hold is a property of a departure, and a board run
-/// by the window rule, by hand or by the depth rule is the same
-/// departure. A rule that departs nothing holds nothing (the table
-/// refuses the column there too), and anything but a positive count is
-/// no hold — never a hold forever, because a departure that cannot leave
-/// is the one failure this bound exists to make impossible.
-pub(crate) fn regate_hold_minutes(rows: &[CadenceRuleRow]) -> u32 {
-    rows.iter()
-        .filter(|r| departs_a_train(&r.verb))
-        .filter_map(|r| r.regate_hold_minutes)
-        .filter_map(|m| u32::try_from(m).ok())
-        .max()
-        .unwrap_or(0)
-}
+/// (design 42279fb2, rule `train-dock-refresh`). ONE list since backlog
+/// be459ab9 (2026-09-29): the registry's own check (`boss_jobs::cadence::
+/// check_rule`) reads the same const, and the adapters-agree suite holds
+/// it equal to the table's verb CHECK both ways;
+/// `every_conductor_verb_is_one_the_table_accepts` still reads the
+/// migration text.
+const VERBS: &[&str] = &boss_jobs::cadence::CONDUCTOR_VERBS;
 
 /// How far a calendar rule looks back for its most recent elapsed
 /// firing day. Comfortably covers a month, so monthly rules resolve;
@@ -180,6 +163,50 @@ pub(crate) const IDLE_BOARD_RC: i32 = -2;
 /// track is occupied and the next window holds regardless.
 pub(crate) fn board_reduced_the_dock(before: u32, after: u32) -> bool {
     after < before
+}
+
+/// Where a departing firing's board decision is handed back from the
+/// child (`train::BOARD_DECISION_FILE_ENV`): under the temp dir, keyed on
+/// the firing and on this loop's uid and pid (`own_temp::own_temp_path`),
+/// so two loops, two accounts or two firings never share a file.
+fn decision_path(firing_id: &str) -> std::path::PathBuf {
+    let safe: String = firing_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    crate::own_temp::own_temp_path(&format!("boss-board-decision-{safe}"))
+}
+
+/// Read and remove the decision a child left at `path` — `None` when it
+/// left none or one that does not parse.
+fn read_decision(path: &std::path::Path) -> Option<BoardDecision> {
+    let text = std::fs::read_to_string(path).ok();
+    let _ = std::fs::remove_file(path);
+    serde_json::from_str(&text?).ok()
+}
+
+/// PURE: the decision a firing records (backlog 96f02540). The board's
+/// own when it wrote one; for a departing verb that exited non-zero
+/// without one, a HELD naming the exit, because a board that died is a
+/// board that did not board, and silence there would let the yard say
+/// "nothing holds it"; nothing for any other verb, or for a clean exit
+/// that decided nothing (a dry run).
+pub(crate) fn firing_decision(
+    verb: &str,
+    process_rc: i32,
+    recorded: Option<BoardDecision>,
+) -> Option<BoardDecision> {
+    if !departs_a_train(verb) {
+        return None;
+    }
+    recorded.or_else(|| {
+        (process_rc != 0).then(|| BoardDecision::Held {
+            reason: format!(
+                "`boss train {verb}` exited {process_rc} before it recorded a decision — the \
+                 conductor's journal names why"
+            ),
+        })
+    })
 }
 
 /// What the loop RECORDS as a firing's `rc`. The child's exit code
@@ -829,7 +856,10 @@ fn rule_from_row(row: &CadenceRuleRow) -> Result<CadenceRule> {
     })
 }
 
-async fn load_rules(http: &reqwest::Client, base: &str) -> Result<Vec<CadenceRule>> {
+async fn load_rules(
+    http: &boss_core::machine_token::Client,
+    base: &str,
+) -> Result<Vec<CadenceRule>> {
     // EVERY COLUMN rule_from_row READS MUST BE SERVED. The columns
     // live behind the API now (PgCadence::active_rules carries the
     // widening scar: the calendar basis landed without its columns
@@ -853,7 +883,11 @@ async fn load_rules(http: &reqwest::Client, base: &str) -> Result<Vec<CadenceRul
     Ok(out)
 }
 
-async fn last_firing(http: &reqwest::Client, base: &str, rule: &str) -> Result<Option<LastFiring>> {
+async fn last_firing(
+    http: &boss_core::machine_token::Client,
+    base: &str,
+    rule: &str,
+) -> Result<Option<LastFiring>> {
     // The endpoint answers `null` for "never fired" — an ANSWER, not
     // an absence: it means every window is a candidate.
     let v = api(
@@ -879,7 +913,7 @@ async fn last_firing(http: &reqwest::Client, base: &str, rule: &str) -> Result<O
 /// firing_id primary key; the API reports a losing claim as 200 +
 /// `{"claimed": false}` so a race never looks like a failure.
 async fn claim_firing(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     base: &str,
     id: &str,
     rule: &CadenceRule,
@@ -913,20 +947,20 @@ async fn claim_firing(
 }
 
 /// Merge the verb's outcome into the firing row — the runtime and
-/// exit code are what make "what did the cadence cost" a query.
+/// exit code are what make "what did the cadence cost" a query, and a
+/// board's decision is what the yard states (backlog 96f02540).
 async fn record_outcome(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     base: &str,
     id: &str,
-    rc: i32,
-    runtime_secs: u64,
+    outcome: &FiringOutcome,
 ) -> Result<()> {
     api(
         http,
         reqwest::Method::POST,
         base,
         &format!("/api/cadence/firings/{id}/outcome"),
-        Some(&json!({"rc": rc, "runtime_secs": runtime_secs})),
+        Some(&serde_json::to_value(outcome)?),
     )
     .await
     .context("recording the cadence outcome")?;
@@ -947,7 +981,7 @@ async fn record_outcome(
 /// (nothing was received); an ambiguous claim is settled by the next
 /// tick re-evaluating the window, never by re-sending blind.
 async fn api(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     method: reqwest::Method,
     base: &str,
     path: &str,
@@ -970,7 +1004,7 @@ async fn api(
 }
 
 async fn api_once(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     method: &reqwest::Method,
     base: &str,
     path: &str,
@@ -1008,7 +1042,10 @@ async fn api_once(
         })
 }
 
-pub(crate) async fn probe_dock_depth(http: &reqwest::Client, base: &str) -> Result<u32> {
+pub(crate) async fn probe_dock_depth(
+    http: &boss_core::machine_token::Client,
+    base: &str,
+) -> Result<u32> {
     // Every open car, not just page one. A limit is not a filter: the
     // dock builds past a page (in-flight + parked + landed-but-unclosed
     // residue), and a page-one read under-counts it, so the depth-driven
@@ -1074,7 +1111,7 @@ pub(crate) async fn probe_dock_depth(http: &reqwest::Client, base: &str) -> Resu
 /// that matters may sit behind merged ones — a limit is not a filter.
 /// The paginator errors on a body without `total`, never reads it as
 /// zero — zero is what a wrong deployment answers.
-async fn probe_open_trains(http: &reqwest::Client, base: &str) -> Result<u32> {
+async fn probe_open_trains(http: &boss_core::machine_token::Client, base: &str) -> Result<u32> {
     let listed = train::list_all_pages(|offset| async move {
         api(
             http,
@@ -1109,12 +1146,25 @@ pub(crate) fn track_holders(open_trains: &[Value]) -> u32 {
 /// return its exit code. The conductor's own flock makes an overlap
 /// with a manually-started run exit clean, and a preflight exit 3
 /// lands here as data instead of killing the loop.
-async fn run_verb(verb: &str, rule: &str, now: DateTime<Utc>) -> Result<i32> {
+///
+/// `decision_file` is where a departing verb writes the board's decision
+/// (`train::BOARD_DECISION_FILE_ENV`, backlog 96f02540) — handed to the
+/// child in its environment, read back by the caller once it exits.
+async fn run_verb(
+    verb: &str,
+    rule: &str,
+    now: DateTime<Utc>,
+    decision_file: Option<&std::path::Path>,
+) -> Result<i32> {
     match parse_action(verb)? {
         Action::Train(v) => {
             let exe = std::env::current_exe().context("resolving the boss binary path")?;
-            let status = tokio::process::Command::new(exe)
-                .args(["train", &v])
+            let mut cmd = tokio::process::Command::new(exe);
+            cmd.args(["train", &v]);
+            if let Some(path) = decision_file {
+                cmd.env(train::BOARD_DECISION_FILE_ENV, path);
+            }
+            let status = cmd
                 .status()
                 .await
                 .with_context(|| format!("spawning boss train {v}"))?;
@@ -1153,7 +1203,7 @@ async fn open_packet(kind: &str, rule: &str, now: DateTime<Utc>) -> Result<i32> 
         );
     }
 
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     // A HARD read: an answer that is not a list refuses rather than
     // reading as "none open", which would file a second packet beside
     // the open one (backlog 7b7e0529).
@@ -1255,7 +1305,7 @@ impl Runs {
     /// from an idle one — see `recorded_rc`.
     fn spawn_verb(
         &mut self,
-        http: &reqwest::Client,
+        http: &boss_core::machine_token::Client,
         base: &str,
         rule: &CadenceRule,
         firing_id: String,
@@ -1268,8 +1318,16 @@ impl Runs {
         let verb = rule.verb.clone();
         let rule_name = rule.name.clone();
         let started = Instant::now();
+        // Where a departing verb leaves the board's decision (96f02540):
+        // one file per firing, cleared before the run so a stale one from
+        // a crashed predecessor is never read as this firing's.
+        let decision_file = departs_a_train(&verb).then(|| decision_path(&firing_id));
+        if let Some(path) = &decision_file {
+            let _ = std::fs::remove_file(path);
+        }
         let handle = tokio::spawn(async move {
-            let process_rc = match run_verb(&verb, &rule_name, now).await {
+            let process_rc = match run_verb(&verb, &rule_name, now, decision_file.as_deref()).await
+            {
                 Ok(rc) => rc,
                 Err(e) => {
                     // The verb never started. Say so, then record it
@@ -1301,7 +1359,16 @@ impl Runs {
                     "{name}: board boarded nothing — idle firing, cooldown not held"
                 ));
             }
-            if let Err(e) = record_outcome(&http, &base, &firing_id, rc, secs).await {
+            let recorded = decision_file.as_deref().and_then(read_decision);
+            let outcome = FiringOutcome {
+                rc,
+                runtime_secs: secs,
+                board_decision: firing_decision(&verb, process_rc, recorded),
+            };
+            if let Some(d) = &outcome.board_decision {
+                log(format!("{name}: board decided — {}", d.line()));
+            }
+            if let Err(e) = record_outcome(&http, &base, &firing_id, &outcome).await {
                 log(format!(
                     "{name}: recording the firing outcome failed: {e:#}"
                 ));
@@ -1320,7 +1387,7 @@ struct TickSummary {
 }
 
 async fn tick(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     base: &str,
     clock: &dyn ClockClient,
     dry: bool,
@@ -1474,10 +1541,11 @@ pub async fn run(once: bool, dry: bool) -> Result<()> {
     // it wrote firings to whatever database BOSS_POSTGRES_URL named,
     // which on the conductor's host was not the system of record.
     let base = jobs_base()?;
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .context("building the jobs API client")?;
+    // Stamps the machine token per request, so a loop that runs for
+    // weeks follows a rotation (design 6805c764 car 2, the CLI slice).
+    let http = crate::gate::machine_client_with(
+        reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)),
+    )?;
     let clock_url = train::env_or("BOSS_CLOCK_URL", &boss_ports::url("clock"));
     let clock: Arc<dyn ClockClient> = Arc::new(ReqwestClockClient::new(clock_url.clone()));
     let tick_secs: u64 = train::env_or("BOSS_TRAIN_CADENCE_TICK_SECONDS", "60")
@@ -1610,7 +1678,6 @@ pub(crate) fn render_lineage(name: &str, rows: &[Value]) -> String {
             "cadence",
             "anchor_date",
             "business_calendar",
-            "regate_hold_minutes",
         ]
         .iter()
         .filter_map(|k| {
@@ -1806,7 +1873,6 @@ mod door_tests {
             cadence: Some("daily".into()),
             anchor_date: Some(NaiveDate::from_ymd_opt(2026, 8, 28).unwrap()),
             business_calendar: None,
-            regate_hold_minutes: None,
         }
     }
 
@@ -1814,7 +1880,7 @@ mod door_tests {
     async fn retire_retires_the_named_rule_and_prints_the_lineage_read_back() {
         let cadence = Arc::new(InMemoryCadence::new(vec![retro_row()]));
         let base = serve(cadence.clone()).await;
-        let wire = crate::steps::Wire::at(base, named());
+        let wire = crate::steps::Wire::at(base, named()).unwrap();
         let out = retire_on(&wire, "protocol-retro-daily").await.unwrap();
         assert!(out.contains("retired protocol-retro-daily v1"), "{out}");
         assert!(out.contains("v1   retired"), "the lineage line: {out}");
@@ -1843,7 +1909,7 @@ mod door_tests {
     async fn an_unnamed_caller_is_refused_before_the_wire() {
         let cadence = Arc::new(InMemoryCadence::new(vec![retro_row()]));
         let base = serve(cadence.clone()).await;
-        let unnamed = crate::steps::Wire::at(base, None);
+        let unnamed = crate::steps::Wire::at(base, None).unwrap();
         let err = retire_on(&unnamed, "protocol-retro-daily")
             .await
             .map(|_| ())
@@ -1871,10 +1937,9 @@ mod door_tests {
             cadence: None,
             anchor_date: None,
             business_calendar: None,
-            regate_hold_minutes: None,
         }]));
         let base = serve(cadence.clone()).await;
-        let wire = crate::steps::Wire::at(base, named());
+        let wire = crate::steps::Wire::at(base, named()).unwrap();
         let dir = boss_testing::scratch_dir("boss-cli-cadence-publish");
         let file = dir.join("train-reconcile.toml");
         let write = |version: i32| {
@@ -2016,50 +2081,6 @@ mod tests {
                 newest.display()
             );
         }
-    }
-
-    /// D2 of design 42279fb2: the departure hold is READ from the
-    /// registry, never a number of the conductor's own. The bound on any
-    /// active rule that departs a train; the largest if two declare one;
-    /// none (0) when no rule does, or when a value is not a real count.
-    #[test]
-    fn the_departure_hold_is_read_from_the_departing_rules() {
-        let row = |name: &str, verb: &str, hold: Option<i32>| CadenceRuleRow {
-            name: name.into(),
-            verb: verb.into(),
-            basis: "queue-depth".into(),
-            every_minutes: None,
-            at_times: None,
-            min_dock_depth: Some(1),
-            cooldown_minutes: Some(30),
-            cadence: None,
-            anchor_date: None,
-            business_calendar: None,
-            regate_hold_minutes: hold,
-        };
-        assert_eq!(regate_hold_minutes(&[]), 0, "no registry, no hold");
-        assert_eq!(
-            regate_hold_minutes(&[row("train-board-on-dock-depth", "board", Some(15))]),
-            15
-        );
-        assert_eq!(
-            regate_hold_minutes(&[
-                row("train-board-on-dock-depth", "board", Some(15)),
-                row("train-window", "run", Some(20)),
-                row("train-reconcile", "reconcile", Some(90)),
-            ]),
-            20,
-            "a verb that departs nothing holds nothing"
-        );
-        assert_eq!(
-            regate_hold_minutes(&[row("train-board-on-dock-depth", "board", Some(-5))]),
-            0,
-            "a negative count is no hold, never a hold forever"
-        );
-        assert_eq!(
-            regate_hold_minutes(&[row("train-board-on-dock-depth", "board", None)]),
-            0
-        );
     }
 
     #[test]
@@ -2278,6 +2299,7 @@ mod tests {
             firing_id: firing_id(&rule.name, window),
             fired_at: window,
             rc,
+            board_decision: None,
         }
     }
 
@@ -2484,12 +2506,66 @@ mod tests {
     /// cooldown — so four green cars that parked ~16:29 waited until ~17:04
     /// to board. An idle board must be a no-op for the cooldown; a board
     /// that DID board a car must still start it.
+    /// Backlog 96f02540: every departing firing records a decision. The
+    /// board's own when it wrote one; a board that died without one is
+    /// HELD, naming its exit — never nothing, which the yard would read as
+    /// "nothing holds it"; and a verb that departs no train records none.
+    #[test]
+    fn every_board_firing_records_a_decision_and_a_dead_board_is_held() {
+        let said = BoardDecision::NoBoardableCar {
+            reason: "no train departed — every car on the dock is held".into(),
+        };
+        assert_eq!(
+            firing_decision("board", 0, Some(said.clone())),
+            Some(said.clone())
+        );
+        assert_eq!(
+            firing_decision("board", 1, Some(said.clone())),
+            Some(said),
+            "its own words win over the exit"
+        );
+        match firing_decision("run", 3, None) {
+            Some(BoardDecision::Held { reason }) => {
+                assert!(reason.contains("exited 3"), "{reason}")
+            }
+            other => panic!("a dead board is held: {other:?}"),
+        }
+        assert_eq!(
+            firing_decision("board", 0, None),
+            None,
+            "a dry run decided nothing"
+        );
+        assert_eq!(firing_decision("reconcile", 1, None), None);
+        assert_eq!(firing_decision("refresh", 0, None), None);
+    }
+
+    /// The hand-back from the child: what it wrote is read once and the
+    /// file removed; nothing written, or garbage, reads as nothing.
+    #[test]
+    fn the_childs_decision_is_read_once_from_its_file() {
+        let dir = boss_testing::scratch_dir("cadence-decision");
+        let path = dir.join("d.json");
+        let d = BoardDecision::Boarded { cars: 2 };
+        std::fs::write(&path, serde_json::to_string(&d).unwrap()).unwrap();
+        assert_eq!(read_decision(&path), Some(d));
+        assert!(!path.exists(), "read once, then gone");
+        assert_eq!(read_decision(&path), None);
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(read_decision(&path), None);
+        assert_ne!(
+            decision_path("cadence:board:2026-09-28T02:45Z"),
+            decision_path("cadence:board:2026-09-28T02:46Z"),
+            "one file per firing"
+        );
+    }
+
     #[test]
     fn an_idle_board_does_not_hold_the_cooldown() {
         // The recording contract: a departing board that ran cleanly
         // (rc 0) yet boarded nothing is recorded as an idle firing, NOT
         // the success rc that holds the cooldown...
         assert_eq!(recorded_rc("board", 0, false), IDLE_BOARD_RC);
+
         assert_eq!(recorded_rc("run", 0, false), IDLE_BOARD_RC);
         // ...while a board that boarded a car keeps rc 0 and holds it.
         assert_eq!(recorded_rc("board", 0, true), 0);
@@ -2877,9 +2953,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let depth = probe_dock_depth(&reqwest::Client::new(), &format!("http://{addr}"))
-            .await
-            .expect("the stub answers");
+        let depth = probe_dock_depth(
+            &crate::gate::machine_client().unwrap(),
+            &format!("http://{addr}"),
+        )
+        .await
+        .expect("the stub answers");
         assert_eq!(
             depth, 2,
             "the clean car, and the GARAGED one: a red the dock still retries fires no train, \
@@ -3063,7 +3142,7 @@ mod db_tests {
     async fn seeded_rules_load_and_parse() {
         let db = boss_testing::TestDb::new().await;
         let base = serve_cadence_api(db.pool.clone()).await;
-        let http = reqwest::Client::new();
+        let http = crate::gate::machine_client().unwrap();
         let rules = load_rules(&http, &base).await.unwrap();
         let by_name = |n: &str| {
             rules
@@ -3177,7 +3256,7 @@ mod db_tests {
     async fn a_window_claims_exactly_once() {
         let db = boss_testing::TestDb::new().await;
         let base = serve_cadence_api(db.pool.clone()).await;
-        let http = reqwest::Client::new();
+        let http = crate::gate::machine_client().unwrap();
         let rule = CadenceRule {
             name: "train-window".into(),
             verb: "run".into(),
@@ -3212,7 +3291,23 @@ mod db_tests {
         assert_eq!(due_window(&rule, now, Some(&last), None), None);
 
         // The outcome merges into the claim's detail row.
-        record_outcome(&http, &base, &id, 0, 42).await.unwrap();
+        // So does a board's decision (backlog 96f02540), and the rule's
+        // last firing hands it back — the read the yard's hold takes.
+        let decision = BoardDecision::NoBoardableCar {
+            reason: "no train departed — every car on the dock is held".into(),
+        };
+        record_outcome(
+            &http,
+            &base,
+            &id,
+            &FiringOutcome {
+                rc: 0,
+                runtime_secs: 42,
+                board_decision: Some(decision.clone()),
+            },
+        )
+        .await
+        .unwrap();
         let detail: Value =
             sqlx::query_scalar("SELECT detail FROM cadence_firings WHERE firing_id = $1")
                 .bind(&id)
@@ -3221,6 +3316,11 @@ mod db_tests {
                 .unwrap();
         assert_eq!(detail.get("rc"), Some(&json!(0)));
         assert_eq!(detail.get("runtime_secs"), Some(&json!(42)));
+        let last = last_firing(&http, &base, &rule.name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.board_decision, Some(decision));
     }
 
     /// The registry is append-only with one live row per name: a
@@ -3333,7 +3433,7 @@ mod db_tests {
         // The system of record: the database behind /api/cadence/*.
         let sor = boss_testing::TestDb::new().await;
         let base = serve_cadence_api(sor.pool.clone()).await;
-        let http = reqwest::Client::new();
+        let http = crate::gate::machine_client().unwrap();
 
         // The loop fires a wall rule on schedule and records the
         // firing THE WAY THE LOOP RECORDS IT.
@@ -3388,7 +3488,8 @@ mod db_tests {
     async fn a_rule_that_never_fired_stays_null() {
         let sor = boss_testing::TestDb::new().await;
         let base = serve_cadence_api(sor.pool.clone()).await;
-        let body = reqwest::Client::new()
+        let body = crate::gate::machine_client()
+            .unwrap()
             .get(format!("{base}/api/cadence/rules/train-window/last-firing"))
             .header("x-boss-user", train::boss_user())
             .send()

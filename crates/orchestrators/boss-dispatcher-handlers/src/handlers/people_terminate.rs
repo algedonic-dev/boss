@@ -19,7 +19,7 @@ struct TerminateFields {
 }
 
 pub struct PeopleTerminate {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     people_base: String,
 }
 

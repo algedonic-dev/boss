@@ -166,7 +166,7 @@ async fn serve(state: &AppState, req: Request, base: &Path) -> Response {
     let content = match (serving_path.ends_with("index.html"), viewer) {
         (true, Some(viewer)) => match (
             std::str::from_utf8(&content),
-            flights_for(&state.proxy_client, viewer).await,
+            flights_for(state, viewer).await,
         ) {
             (Ok(html), Some(json)) => inline_flights(html, &json).into_bytes(),
             _ => content,
@@ -218,7 +218,8 @@ pub(crate) fn guess_content_type(path: &Path) -> HeaderValue {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let ct = match ext {
         "html" => "text/html; charset=utf-8",
-        "js" => "application/javascript; charset=utf-8",
+        // `.mjs`: Mermaid's ESM build under dist/vendor/ (4718d918).
+        "js" | "mjs" => "application/javascript; charset=utf-8",
         "css" => "text/css; charset=utf-8",
         "json" => "application/json",
         "svg" => "image/svg+xml",
@@ -314,15 +315,12 @@ pub(crate) fn inline_flights(html: &str, flights_json: &str) -> String {
 /// JSON the page carries — or `None` when it cannot be had: upstream
 /// down, slow (a page load waits at most two seconds for it), non-2xx,
 /// or a body that is not the answer's shape.
-async fn flights_for(client: &reqwest::Client, viewer: HeaderValue) -> Option<String> {
+async fn flights_for(state: &AppState, viewer: HeaderValue) -> Option<String> {
     let url = format!(
         "{}/api/flights/mine",
         crate::proxy::JOBS.upstream_url().trim_end_matches('/')
     );
-    let resp = client
-        .get(url)
-        .header("x-boss-user", viewer)
-        .timeout(std::time::Duration::from_secs(2))
+    let resp = flights_request(&state.machine, url, viewer)
         .send()
         .await
         .ok()?;
@@ -334,6 +332,25 @@ async fn flights_for(client: &reqwest::Client, viewer: HeaderValue) -> Option<St
         return None;
     }
     flights_body(&resp.json::<serde_json::Value>().await.ok()?)
+}
+
+/// The flights read, unsent — pure, so what goes on the wire is pinned
+/// without a socket. It carries the viewer the role-header layer signed,
+/// on the gateway's machine client, which stamps the token and follows
+/// no redirect by type: it is a read the gateway makes for that session,
+/// and it sent no token at all until review S2 of design 6805c764 car 2.
+/// It took any `&reqwest::Client` and stamped by hand until the review
+/// of 39949355 — redirect-free only because the proxy client it was
+/// handed happened to be built so.
+fn flights_request(
+    client: &boss_gateway::machine_client::MachineClient,
+    url: String,
+    viewer: HeaderValue,
+) -> reqwest::RequestBuilder {
+    client
+        .get(url)
+        .header("x-boss-user", viewer)
+        .timeout(std::time::Duration::from_secs(2))
 }
 
 /// The page's copy of a flights answer: exactly `{"flights": [codes]}`,
@@ -402,6 +419,41 @@ mod tests {
     }
 
     #[test]
+    fn the_flights_read_carries_the_viewer_and_the_machine_token() {
+        // Review S2 of design 6805c764 car 2: this read sent the viewer
+        // and no token, so a jobs port in enforce would refuse it and
+        // every page would render with every flight off.
+        use boss_core::machine_token::{HEADER, Source};
+        use boss_gateway::machine_client::MachineClient;
+        let client = |token: Option<&str>| {
+            MachineClient::build_with_source(
+                reqwest::Client::builder(),
+                std::sync::Arc::new(Source::fixed(token.map(String::from))),
+            )
+            .unwrap()
+        };
+        let viewer = HeaderValue::from_static(r#"{"id":"emp-1"}"#);
+        let req = super::flights_request(
+            &client(Some("estate-token")),
+            "http://127.0.0.1:9/api/flights/mine".into(),
+            viewer.clone(),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(req.headers().get(HEADER).unwrap(), "estate-token");
+        assert_eq!(req.headers().get("x-boss-user").unwrap(), &viewer);
+        // Nothing mounted: nothing sent, the deploy-order safety.
+        let bare = super::flights_request(
+            &client(None),
+            "http://127.0.0.1:9/api/flights/mine".into(),
+            viewer,
+        )
+        .build()
+        .unwrap();
+        assert!(bare.headers().get(HEADER).is_none());
+    }
+
+    #[test]
     fn the_flights_ride_the_document_beside_the_manifest() {
         let html = "<html><head></head><body><script type=\"module\" src=\"/m.js\"></script></body></html>";
         let out = super::inline_flights(html, r#"{"flights":["it-map-motion"]}"#);
@@ -467,6 +519,14 @@ mod tests {
     fn guess_content_type_for_known_extensions() {
         assert_eq!(
             guess_content_type(Path::new("app.js")),
+            "application/javascript; charset=utf-8"
+        );
+        // A module script served as octet-stream is refused by the
+        // browser ("Expected a JavaScript module script"), and /it/kb
+        // loads Mermaid's ESM build, whose files are all `.mjs`, by URL
+        // from dist/vendor/ (backlog 4718d918).
+        assert_eq!(
+            guess_content_type(Path::new("vendor/mermaid/mermaid.esm.min.mjs")),
             "application/javascript; charset=utf-8"
         );
         assert_eq!(
@@ -586,6 +646,8 @@ mod traversal_tests {
             proxy_client: reqwest::Client::new(),
             perf: Arc::new(PerfCollector::new()),
             machine_token: Default::default(),
+            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+                .unwrap(),
         }
     }
 

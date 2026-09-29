@@ -8,7 +8,7 @@
 // not hold — or holds nothing yet, while it loads or after it fails.
 
 import { describe, expect, it } from 'bun:test';
-import { classLabel, employeeRecordRead } from './types';
+import { classLabel, departmentNames, employeeRecordRead } from './types';
 
 /// Three live (employee, department) Classes, as the registry answered
 /// on 2026-09-24.
@@ -32,6 +32,31 @@ describe('classLabel', () => {
   it('renders a missing value as a dash, as humanizeClassCode does', () => {
     expect(classLabel(null, DEPARTMENT_CLASSES)).toBe('—');
     expect(classLabel(undefined, DEPARTMENT_CLASSES)).toBe('—');
+  });
+});
+
+// A department's label is the DEPARTMENTS REGISTRY's display_name
+// (backlog c87e3d6d, 2026-09-27): an employee's department is a row of
+// `GET /api/departments`, and the employee department Classes the
+// roster used to label it from retired. The web-kit loader hands the
+// rows over as { code, label }; classLabel reads { code, display_name }.
+describe('departmentNames', () => {
+  it("labels a registry department with the registry's display name", () => {
+    const names = departmentNames([
+      { code: 'executive', label: 'Executive' },
+      { code: 'it', label: 'IT' },
+    ]);
+    expect(names).toEqual([
+      { code: 'executive', display_name: 'Executive' },
+      { code: 'it', display_name: 'IT' },
+    ]);
+    expect(classLabel('executive', names)).toBe('Executive');
+  });
+
+  it('leaves a code the registry lacks to the humanized fallback', () => {
+    expect(classLabel('operations', departmentNames([{ code: 'it', label: 'IT' }]))).toBe(
+      'Operations',
+    );
   });
 });
 

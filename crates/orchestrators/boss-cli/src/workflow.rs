@@ -157,7 +157,7 @@ fn titles(spec: &Value) -> Vec<String> {
 /// Discard a draft version, then confirm it is GONE by reading the
 /// version list back — a 204 is a claim; the read-back is the fact.
 pub async fn discard(kind: &str, version: i32) -> Result<()> {
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     crate::gate::api(
         &http,
         reqwest::Method::DELETE,
@@ -228,7 +228,7 @@ fn load_spec(kind: &str, path: &std::path::Path) -> Result<Value> {
 }
 
 pub async fn publish(kind: &str, path: &std::path::Path, dry: bool) -> Result<()> {
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     let mut spec = load_spec(kind, path)?;
 
     // The active row, for the fields a draft needs and for the

@@ -1,0 +1,122 @@
+# While the estate reads boss-gcp below its disk floor, the request that
+# remedies it is FILED BY THE MACHINE, and David's only act is the
+# passkey on the plan the runner renders (backlog 3df309bf, car 1).
+#
+# THE HAND ACT IT RETIRES. On 2026-09-28 the alarm d3c7eada
+# (`disk_tight:boss-gcp`, raised by `estate-alarm-on-comparison` after
+# three below-floor readings) waited on David typing
+# `boss ops boss-gcp reclaim-gcp-root` from a box that signs as him, and
+# its `steps_for_david` told him to type a 64-hex hash as well — which
+# the CLI has REFUSED since 149553f67 (backlog fd7090cc): an approval
+# verb is filed without its hash, and the runner appends the hash of the
+# SIGNED plan. The agent session was refused filing it by its harness,
+# and nothing else filed it. Measured that morning: 0 reclaim-gcp-root
+# requests and 0 carrying requires_approval in the newest 500 of 4317
+# ops-requests. "A human act is a signature on rendered bytes, never a
+# transcription" (David, the packet).
+#
+# FILING GRANTS NOTHING, which is why a rule may do it. The request is
+# the same packet `boss ops` files (ops_request.rs `request_metadata`:
+# host, verb, args, requires_approval): `requires_approval` only makes
+# the approve step ready — "the flag is ROUTING, never authority"
+# (ops-request.toml). The runner on boss-gcp renders the verb's
+# read-only plan verb onto that step; the write runs only after a
+# presence stamp by an employee the verb file names in `approvers`,
+# bound to the step's current shape, inside the approval TTL, with the
+# plan re-rendered byte-identical before the claim, and the script
+# re-renders once more and removes nothing unless today's plan hashes
+# to what was signed (design 17835005; infra/ops/ops-runner.sh
+# `verify_approval`). None of that is touched here.
+#
+# THE MATCH IS THE ALARM'S KEY, read off the comparison the alarm reads.
+# `estate.alarm` keys a disk finding `disk_tight:<id>` from
+# `findings.disk_tight[].id`; a rule cannot index an array (it binds
+# `Absent`), so the predicate reads the same fact through the scalars
+# the self-scoped host comparison carries beside it: `scope = "host"`,
+# `host` (stamped from the one observed node, estate_compare.rs
+# `compare_host`), and `counts.disk_tight`. In a host comparison the
+# one observed node IS the host, so `host = "boss-gcp" AND
+# counts.disk_tight > 0` is exactly `disk_tight:boss-gcp`. Measured on
+# the live series (event b7c2d05a, 2026-09-28T10:25:02Z): scope host,
+# host boss-gcp, counts.disk_tight 1, free 11 GB against a 17 GB floor.
+# Every other series on the topic reads false before the dedup is asked
+# (AND short-circuits): the unit series has no `disk_tight` count
+# (Absent orders false), the cluster series has no `host`.
+#
+# ONE READING, NOT THREE, deliberately. The alarm integrates PERSIST_N
+# readings because it interrupts someone; this files a request whose
+# plan is rendered and signed or rejected on sight, and boss-gcp's host
+# series is DAILY, so waiting for three would cost two days for nothing
+# a reviewer does not already see. It fires on the comparison cadence
+# rather than on the alarm's open, so the ALREADY-OPEN d3c7eada is
+# covered by the next morning's reading without anyone re-raising it.
+#
+# THE RECLAIM ALONE DOES NOT CLEAR disk_tight:boss-gcp (review of car
+# 4d80316f). It frees the ~2.3 GB of July binary backups and vacuums
+# the journal to 1G, which leaves boss-gcp at ~16.4 GB free against its
+# 17 GB floor — so the finding PERSISTS after a successful run, and a
+# rule that refiled whenever no request was open would put a fresh
+# passkey prompt in David's queue every morning: the noise this rule
+# exists to remove. The lasting remedy is separate work (a journald cap,
+# a larger disk, or a lower floor for this host), and this rule does not
+# pretend to be it.
+#
+# SO THE DEDUP IS TWO GUARDS on the request's OWN subject,
+# `reclaim-gcp-root@boss-gcp` — verb-specific, because `custom/boss-gcp`
+# carries dozens of read-only requests a day and would read as "already
+# asked" forever:
+# - `open_job_exists`: at most ONE open request, however old it is.
+# - `recent_job_exists(..., 168)`: nothing refiled while any such
+#   request was OPENED in the last seven days, WHATEVER its status —
+#   answered, refused or rejected. A reclaim that ran is not asked for
+#   again the next day, and a rejection is not re-asked the next day
+#   either. After the week, a finding still present files again: at most
+#   one prompt a week, and none once the finding clears
+#   (`estate-recover-on-comparison` closes the alarm on the same
+#   readings).
+#
+# THE TWO OPEN APPROVAL HOLES, and what a machine filer does to each:
+# - d8f0b44e (2) "an ops-request awaiting approval never expires, so a
+#   stale plan can be signed days later". The runner renders the plan
+#   ONCE, when the approve step first becomes ready, and never again
+#   while it waits (re-rendering would move the bytes under a reviewer),
+#   so an unsigned request GOES STALE as the disk moves. A late
+#   signature is refused on drift: the runner re-renders before the
+#   claim and the script re-renders before it removes anything, each
+#   refusing a plan that no longer hashes the same. The next filing
+#   comes only after the dedup window above. Expiry of the stale request
+#   itself is d8f0b44e's to build; this rule does not widen it — the
+#   open guard holds it to ONE such request.
+# - 6c9183de "the approve step keys are writable through the merge
+#   door". This rule writes no step at all — only the new packet's own
+#   metadata at open, signed as the rule (`rule:<name>`, the dispatcher
+#   identity every spawn carries). The plan keys are written by the
+#   runner, as for a hand-filed request, and the runner's re-render and
+#   the stamp's shape binding refuse a swapped plan exactly as before.
+[[rule]]
+name = "file-reclaim-gcp-root-while-disk-tight-boss-gcp"
+why = """
+A THRESHOLD, and a CROSS-PROTOCOL REACTOR over EXTERNAL INGRESS: what
+files is a LEVEL — boss-gcp's free space below the floor a gate needs —
+read off `jobs.estate.compared`, the compare handler's reading of a
+host, which is not a packet; and the effect is a packet of a different
+protocol (ops-request) that no estate protocol can name. It is the
+remedy half of the algedonic loop `estate-alarm-on-comparison` raises
+and `estate-recover-on-comparison` closes: the alarm says the host is
+in pain, and this files the one request that relieves it, so the pain
+reaches a person as a rendered plan to sign rather than a command to
+type (backlog 3df309bf).
+
+It widens no authority. Filing is the same act `boss ops` performs, and
+the passkey of an employee the verb file names, on the plan bytes the
+runner rendered, stays the only thing that runs the write (design
+17835005). One open request at most, and none refiled within a week of
+the last one, deduped on the request's own verb-specific subject —
+because the reclaim alone does not clear the finding, and a daily
+refile would be a daily passkey prompt.
+"""
+on_event = "jobs.estate.compared"
+when = 'scope = "host" AND host = "boss-gcp" AND counts.disk_tight > 0 AND NOT open_job_exists("ops-request", "reclaim-gcp-root@boss-gcp") AND NOT recent_job_exists("ops-request", "reclaim-gcp-root@boss-gcp", 168)'
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = '"ops-request"', subject_kind = '"custom"', subject = '"reclaim-gcp-root@boss-gcp"', title = '"reclaim-gcp-root on boss-gcp — the estate reads disk_tight:boss-gcp"', "metadata.host" = '"boss-gcp"', "metadata.verb" = '"reclaim-gcp-root"', "metadata.args" = "[]", "metadata.requires_approval" = "true", "metadata.remedies" = '"disk_tight:boss-gcp"' }

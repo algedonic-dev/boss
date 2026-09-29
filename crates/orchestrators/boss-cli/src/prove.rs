@@ -2341,7 +2341,7 @@ pub(crate) const PROVEN_BY: &str = "run-car-probe";
 /// admitted; the car is re-read from the system of record, never
 /// trusted from the packet that asked.
 pub(crate) async fn run_unattended(car_id: &str, now: chrono::DateTime<chrono::Utc>) -> Result<()> {
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     let base = crate::gate::resolve_jobs_base(None)?;
     let car = crate::gate::api(
         &http,
@@ -2481,7 +2481,7 @@ pub(crate) async fn run(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     let overriding = override_reason(probe_anyway.as_deref())?;
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     let base = crate::gate::resolve_jobs_base(None)?;
     let cars = crate::gate::all_cars_at(&http, &base).await?;
     // THE TREE THE PROBE'S READER COMES OUT OF (backlog 18fee481): the
@@ -3791,7 +3791,7 @@ mod tests {
             r#"{"data":[{"id":"00000000-0000-0000-0000-0000000000cc","status":"closed"}]}"#,
         )
         .await;
-        let http = reqwest::Client::new();
+        let http = crate::gate::machine_client().unwrap();
         let why = crate::gate::all_cars_at(&http, &base)
             .await
             .expect_err("a page without its total cannot say the read is complete")
@@ -3867,7 +3867,7 @@ mod tests {
         });
 
         let base = format!("http://{addr}");
-        let http = reqwest::Client::new();
+        let http = crate::gate::machine_client().unwrap();
         let cars = crate::gate::all_cars_at(&http, &base)
             .await
             .expect("paging read succeeds");

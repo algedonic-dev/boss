@@ -119,9 +119,11 @@
 # THE EXEMPTION, and why it is not a list in here. Some fixed temp paths
 # are legitimate: a literal that names ANOTHER machine's path (a container
 # script's, quoted in order to be rebased), an expectation string about a
-# message, a pinned production default (`/var/tmp/boss-converge-hold` is
-# a real one — ops verbs run as root with no HOME and use fixed paths
-# deliberately). Which of those a line is cannot be derived from the
+# message, a retired production path a migration still has to name (the
+# converge hold's old one under /var/tmp, which converge-hold.sh carries
+# across once — backlog d94d287e moved the hold out of the shared
+# directory because any account could place it there). Which of those a
+# line is cannot be derived from the
 # text, so the CODE declares it, at the site:
 #
 #     // shared-tmp-ok: <at least three words of reason>
@@ -576,8 +578,8 @@ THE FIX, in order of preference:
 
   3. If the literal is LEGITIMATE — it names another machine's path (a
      container script's, quoted in order to be rebased), an expectation
-     string about a message, or a deliberate operational location like
-     /var/tmp/boss-converge-hold — declare that at the site:
+     string about a message, or a retired production path a migration
+     must still name — declare that at the site:
 
          // shared-tmp-ok: <at least three words saying why>
 

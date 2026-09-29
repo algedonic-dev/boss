@@ -745,6 +745,10 @@ pub mod live {
                 client: reqwest::blocking::Client::builder()
                     .default_headers(headers)
                     .timeout(std::time::Duration::from_secs(30))
+                    // The token rides in default headers; a followed
+                    // cross-host redirect would carry it (review of
+                    // 39949355, 2026-09-28).
+                    .redirect(reqwest::redirect::Policy::none())
                     .build()
                     .expect("HTTP client"),
                 api_base: api_base.to_string(),

@@ -52,12 +52,15 @@ export type CommerceSummary = {
 import { fetchPaged, type PagedResult } from '../data/paginated';
 import { ApAgingSchema, CommerceSummarySchema } from './schemas';
 
+/// The one invoice list read, named so the empty state can say which
+/// read failed (backlog 0ef5e008).
+export const INVOICES_LIST_URL = `${API_BASE}/invoices?limit=1000`;
+
 /// The invoice list, failure included. The old signature swallowed a
-/// failed fetch into an empty page, so an outage rendered "No
-/// invoices match those filters" with every count at 0 (packet
-/// 3fba9c35, the false-empty sweep).
+/// failed fetch into an empty page, so an outage rendered the filters
+/// line with every count at 0 (packet 3fba9c35, the false-empty sweep).
 export function loadInvoices(): Promise<PagedResult<Invoice>> {
-  return fetchPaged<Invoice>(`${API_BASE}/invoices?limit=1000`);
+  return fetchPaged<Invoice>(INVOICES_LIST_URL);
 }
 
 /// A 200 whose body is not the shape answers null, like a failed read:

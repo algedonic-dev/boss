@@ -37,7 +37,8 @@ const LIB: &str = "infra/lib/curl-through-a-roll.sh";
 /// The lint helper every registry-reading lint goes through.
 const LINT_LIB: &str = "infra/lint/lib/sor-read.sh";
 
-/// Each registry-reading lint in the pre-flight roster, with the env var
+/// Each registry-reading lint under infra/lint/ (two of them left the
+/// pre-flight roster with design d349e0ba and still read), with the env var
 /// its header names for its read surface.
 const LIVE_LINTS: &[(&str, &str)] = &[
     (

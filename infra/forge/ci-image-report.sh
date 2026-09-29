@@ -63,6 +63,10 @@ hr()  { say "== $* =="; }
 # (BOSS_CI_IMAGE_REPO overrides; a test names it outright).
 . "$(dirname "$0")/forge-defaults.sh"
 forge_need CI_IMAGE_REPO
+# The registry's pull token rides to curl as a 0600 header file, never
+# in its argv, where every local user reads it in ps (backlog 5f3ad356).
+# shellcheck source=infra/lib/secret-header.sh
+. "$(dirname "$0")/../lib/secret-header.sh"
 # The floating tag: build.sh's default, the tag ci.yml's build-image
 # pushes beside the per-commit one.
 TAG="${BOSS_CI_TAG:-rust1.96}"
@@ -174,7 +178,7 @@ registry_digest=""
 if [ -z "$unanswered" ] && [ "$local_absent" -eq 0 ]; then
     tmp="$(mktemp -d)"
     accept='application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json'
-    auth_header=""
+    AUTH_HDR=""
     # shellcheck disable=SC2086
     code="$($CURL -sS -m 15 -o "$tmp/ping.body" -D "$tmp/ping.hdr" -w '%{http_code}' "$REGISTRY_URL/v2/" 2>"$tmp/ping.err")"; rc=$?
     case "$rc:$code" in
@@ -192,9 +196,10 @@ if [ -z "$unanswered" ] && [ "$local_absent" -eq 0 ]; then
                 code="$($CURL -sS -m 15 -o "$tmp/token.json" -D "$tmp/token.hdr" -w '%{http_code}' "$turl" 2>"$tmp/token.err")"; rc=$?
                 token=""
                 [ "$rc" -eq 0 ] && [ "$code" = 200 ] && token="$(jq -r '.token // .access_token // empty' "$tmp/token.json" 2>/dev/null)"
-                if [ -n "$token" ]; then
+                if [ -n "$token" ] && ! secret_header AUTH_HDR "Authorization: Bearer $token"; then
+                    unanswered="registry: the pull token for $REPO_PATH could not be written to its header file (infra/lib/secret-header.sh), and it is never sent in curl's command line"
+                elif [ -n "$token" ]; then
                     say "pull token for $REPO_PATH: granted anonymously"
-                    auth_header="Authorization: Bearer $token"
                 else
                     unanswered="registry: the anonymous pull token for $REPO_PATH was refused ($turl answered HTTP $code, curl exit $rc: $(err_tail "$tmp/token.err"))"
                 fi
@@ -207,7 +212,7 @@ if [ -z "$unanswered" ] && [ "$local_absent" -eq 0 ]; then
     if [ -z "$unanswered" ]; then
         murl="$REGISTRY_URL/v2/$REPO_PATH/manifests/$TAG"
         # shellcheck disable=SC2086
-        code="$($CURL -sS -m 15 -I -o "$tmp/tag.body" -D "$tmp/tag.hdr" -w '%{http_code}' -H "Accept: $accept" ${auth_header:+-H "$auth_header"} "$murl" 2>"$tmp/tag.err")"; rc=$?
+        code="$($CURL -sS -m 15 -I -o "$tmp/tag.body" -D "$tmp/tag.hdr" -w '%{http_code}' -H "Accept: $accept" ${AUTH_HDR:+-H "$AUTH_HDR"} "$murl" 2>"$tmp/tag.err")"; rc=$?
         if [ "$rc" -eq 0 ] && [ "$code" = 200 ]; then
             registry_digest="$(sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p' "$tmp/tag.hdr" | tr -d '\r')"
             registry_digest="${registry_digest%%$'\n'*}"

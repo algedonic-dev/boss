@@ -132,7 +132,11 @@ pub(crate) fn remedy_by_branch<'a>(cars: &'a [Value], given: &str) -> Option<&'a
 
 /// The remedy packet `given` names: a car by branch, else any packet by
 /// id (open first, then closed), read in full.
-async fn resolve_remedy(http: &reqwest::Client, cars: &[Value], given: &str) -> Result<Value> {
+async fn resolve_remedy(
+    http: &boss_core::machine_token::Client,
+    cars: &[Value],
+    given: &str,
+) -> Result<Value> {
     if let Some(c) = remedy_by_branch(cars, given) {
         return Ok(c.clone());
     }
@@ -161,7 +165,7 @@ pub(crate) async fn run(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     let overriding = prove::override_reason(probe_anyway.as_deref())?;
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     // The actor FIRST: a write nobody names is refused, and the refusal
     // costs a line rather than a probe against production (5083d6f5).
     if !dry {

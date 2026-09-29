@@ -38,7 +38,7 @@ use std::sync::Arc;
 use super::common;
 
 pub struct ProductsConsumeFromInvoice {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     products_base: String,
 }
 

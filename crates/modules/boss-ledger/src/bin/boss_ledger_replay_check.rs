@@ -30,7 +30,7 @@ use boss_ledger::replay_check::{self, Divergence, FactDivergence};
 use clap::Parser;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -96,14 +96,37 @@ async fn main() -> Result<()> {
 /// milliseconds, so: wait (bounded) for pending = 0, and FAIL LOUDLY if
 /// the backlog doesn't clear — a stuck relay masks real divergence and
 /// is itself the incident, not a reason to skip the check silently.
+///
+/// Pending is the RELAY's own predicate, read through the relay's own
+/// function (`boss_events::outbox::pending_count`): a dead-lettered row
+/// is finished with, not lag. Until backlog e22b692e this counted
+/// `delivered_at IS NULL`, so one dead letter held the check for its
+/// whole bound and then failed it as a stuck relay — the wrong cause.
+/// Open dead letters are named separately instead: their facts are in
+/// `audit_log` (the relay logs before it publishes) but never reached
+/// the bus, so a projection a subscriber builds may lack them, and a
+/// divergence below may be exactly that.
 async fn wait_for_outbox_drain(pool: &PgPool) -> Result<()> {
+    use boss_events::outbox::{dead_lettered_count, pending_count};
     const ATTEMPTS: u32 = 30; // × 1s = 30s bound
+    let dead_lettered = dead_lettered_count(pool)
+        .await
+        .map_err(anyhow::Error::msg)
+        .with_context(|| "counting dead-lettered event_outbox rows")?;
+    if dead_lettered > 0 {
+        warn!(
+            dead_lettered,
+            "event_outbox holds dead-lettered rows: their events are in audit_log but never \
+             reached the bus, so a divergence below may be a projection that never saw them \
+             — read them in event_outbox (dead_lettered_at, dead_letter_reason) and redeliver \
+             or resolve each with `boss events redeliver <outbox id>`"
+        );
+    }
     for attempt in 0..ATTEMPTS {
-        let pending: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM event_outbox WHERE delivered_at IS NULL")
-                .fetch_one(pool)
-                .await
-                .with_context(|| "querying event_outbox backlog")?;
+        let pending = pending_count(pool)
+            .await
+            .map_err(anyhow::Error::msg)
+            .with_context(|| "querying event_outbox backlog")?;
         if pending == 0 {
             if attempt > 0 {
                 info!(
@@ -120,9 +143,12 @@ async fn wait_for_outbox_drain(pool: &PgPool) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
     error!(
+        dead_lettered,
         "event_outbox backlog did not drain within {ATTEMPTS}s — the relay is stuck \
          (check boss-event-relay); a replay comparison against a lagging log would \
-         report false divergence, and a stuck relay is itself the incident"
+         report false divergence, and a stuck relay is itself the incident. \
+         Dead-lettered rows are not counted as pending: this is rows the relay \
+         still owes a publish"
     );
     std::process::exit(2);
 }

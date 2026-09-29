@@ -20,6 +20,9 @@
 #
 # Usage: wt-cargo <cargo args…>        (run from inside the worktree)
 #        WT_JOBS=8 wt-cargo test -p boss-cli
+#        wt-cargo suite <crate>         (the whole suite, in chunks that
+#                                        fit a tool call; run it until it
+#                                        exits 0 — wt-cargo-suite.sh)
 # The seed is /scratch/target (kept warm by the shim's boss-cli build);
 # the per-worktree dir is /scratch/target-<worktree-basename>. Both roots
 # are overridable (WT_SEED, WT_TARGET_ROOT) so the test never touches
@@ -87,17 +90,41 @@ if [ ! -d "$dir" ]; then
         # no message naming it. A stale temp dir from a killed run is
         # cleared first; a failed copy is cleared, named (cp's exit
         # code), and $dir starts cold exactly as if there were no seed.
+        #
+        # EVERY SEEDED FILE IS BACKDATED before the rename (backlog
+        # 1150c518, 2026-09-28). cp -a keeps mtimes, and cargo trusts a
+        # path crate's artifact whose dep-info is NEWER than its
+        # sources, while the artifact's identity (the -C metadata hash)
+        # leaves the workspace path out. So a seed built AFTER this
+        # worktree was checked out, from a revision where a path crate
+        # reads differently, was taken as this tree's own build: analyst
+        # run d666c988 measured a first build print value=1 from a tree
+        # whose source says 2, no Compiling line, and the second run
+        # too. Dated to the epoch, every seeded artifact is older than
+        # every source, so each path crate is rebuilt from THIS tree;
+        # registry crates are fingerprinted by version, not mtime, and
+        # stay warm. Touching forward, or copying without -a, both still
+        # printed value=1 (run c51f125b, 2026-09-26). A backdate that
+        # fails is a seed that cannot be trusted: it is cleared and the
+        # target starts cold, exactly like a failed copy. The hazard is
+        # latent while /scratch/target is absent and arms the moment a
+        # pass re-builds the seed after worktrees exist (da1d903f).
         tmp=$dir.seeding
         rm -rf "$tmp"
         start=$(date +%s)
-        if cp -a --reflink=always "$seed" "$tmp"; then
+        rc=0
+        why=
+        cp -a --reflink=always "$seed" "$tmp" || { rc=$?; why="cp exit $rc"; }
+        if [ "$rc" -eq 0 ]; then
+            find "$tmp" -exec touch -h -d @1 {} + || { rc=$?; why="backdating exit $rc"; }
+        fi
+        if [ "$rc" -eq 0 ]; then
             mv "$tmp" "$dir"
-            echo "wt-cargo: seeded $dir from $seed by reflink in $(( $(date +%s) - start ))s" >&2
+            echo "wt-cargo: seeded $dir from $seed by reflink in $(( $(date +%s) - start ))s, every file backdated so cargo rebuilds each path crate from this tree" >&2
         else
-            rc=$?
             rm -rf "$tmp"
             mkdir -p "$dir"
-            echo "wt-cargo: seed from $seed failed (cp exit $rc) — $dir starts cold" >&2
+            echo "wt-cargo: seed from $seed failed ($why) — $dir starts cold" >&2
         fi
     else
         mkdir -p "$dir"
@@ -158,6 +185,20 @@ case "$name" in
     agent-*) export CARGO_BUILD_JOBS="${WT_JOBS:-4}"; runner=(nice -n 10 cargo) ;;
     *)       export CARGO_BUILD_JOBS="${WT_JOBS:-$CARGO_BUILD_JOBS}"; runner=(cargo) ;;
 esac
+
+# `wt-cargo suite <crate>` — the crate's whole suite in chunks that each
+# fit a builder's ten-minute tool call, resumable across calls (backlog
+# ede6245a; the measurement and the design are in the helper). It runs
+# here, after the target, its lock and the bound are set, so every chunk
+# builds under the same door as any other cargo call. Under set -e a
+# nonzero return exits with that status.
+if [ "${1:-}" = suite ]; then
+    shift
+    # shellcheck source=wt-cargo-suite.sh
+    . "$here/wt-cargo-suite.sh" || { echo "wt-cargo: $here/wt-cargo-suite.sh could not be read" >&2; exit 2; }
+    wt_suite "$@"
+    exit $?
+fi
 
 # SAY HOW MANY TEST BINARIES THE RUN MUST REACH, BEFORE IT REACHES ANY
 # (backlog 3566f5b4, 2026-09-22). Measured that day: `cargo test -p

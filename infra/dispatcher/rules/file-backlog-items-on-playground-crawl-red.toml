@@ -18,6 +18,19 @@
 # and says so on the packet. Backlog ac3270c7, in the shape of
 # judge-disk-headroom-sweep-on-report-answered (970c0c94) and
 # publish-drift-for-real-on-clean-check (a1d3c762).
+#
+# ONE CAUSE, ONE ITEM (backlog c8c6b9a8). The rule's first live firing,
+# 2026-09-28, judged crawl 55bcf7fb, which ran inside train #768's
+# converge roll: all 43 routes read `no-shell` and it filed 43 items the
+# coordinator closed stale by hand. When every red route shares one
+# cause — all `no-shell`, or one HTTP status on every finding — the
+# handler files ONE item naming the cause and listing the routes, deduped
+# by the cause, and notes `red_verdict: shell down (N routes)` on the
+# chore instead of `N routes red`. Every item's `source` is the chore as
+# `{kind: packet, id}`, the shape the receiving yard groups by. The
+# crawl itself now waits out a converge before it starts
+# (infra/wait-out-a-converge.sh), so this is the second line, not the
+# first.
 [[rule]]
 name = "file-backlog-items-on-playground-crawl-red"
 why = """
@@ -33,7 +46,8 @@ backlog-items on the queue the kind's owner_role already answers for,
 and one `judged` note on the chore's own packet. The judgement of a
 finding stays a person's — triage is the item's first step — and the
 dedup key is the route, so a surface that is red every night is one
-item until someone closes it.
+item until someone closes it; a night whose reds share one cause (the
+shell down, one HTTP status) is one item keyed by that cause (c8c6b9a8).
 """
 on_event = "jobs.job.closed"
 when = 'kind = "maintenance-playground-crawl" AND outcome = "failed"'

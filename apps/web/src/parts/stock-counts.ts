@@ -40,3 +40,20 @@ export function partsHeader(
     subtitle: read.kind === 'loading' ? 'Loading stock…' : 'Counts unknown: parts did not load',
   };
 }
+
+/// The catalogued parts with no inventory row (page audit 63d810aa gap
+/// 8, backlog 4cb8c06a, 2026-09-23). The page's rows were
+/// `inventory.map(...)`, so a part in /api/catalog/parts or in a device
+/// model's linkage that had never been stocked was not on the page at
+/// all — the one a warehouse most needs to see — while the title named
+/// the inventory count as the page's parts. The page adds these as rows,
+/// so what the title counts is what the page lists. Flat catalog order
+/// first, then device linkage; each SKU once.
+export function unstockedSkus(
+  inventory: ReadonlyArray<Readonly<{ part_sku: string }>>,
+  catalogSkus: ReadonlyArray<string>,
+  linkedSkus: ReadonlyArray<string>,
+): ReadonlyArray<string> {
+  const stocked = new Set(inventory.map((i) => i.part_sku));
+  return [...new Set([...catalogSkus, ...linkedSkus])].filter((sku) => !stocked.has(sku));
+}

@@ -4,7 +4,6 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use boss_policy_client::CurrentUser;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
@@ -86,12 +85,9 @@ async fn record_and_post_bill_fact(
 /// `ledger.bill.approved` for rebuild parity. Idempotent on the bill id.
 pub(super) async fn create_bill(
     State(state): State<Arc<LedgerApiState>>,
-    CurrentUser(user): CurrentUser,
+    LedgerCreate(user): LedgerCreate,
     Json(body): Json<CreateBillBody>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
-    }
     let now = boss_clock_client::now_from(&state.clock).await;
     let issued_on = body.issued_on.unwrap_or_else(|| now.date_naive());
     let approved_on = body.approved_on.unwrap_or(issued_on);
@@ -217,13 +213,10 @@ pub(super) struct PayBillBody {
 
 pub(super) async fn pay_bill(
     State(state): State<Arc<LedgerApiState>>,
-    CurrentUser(user): CurrentUser,
+    LedgerUpdate(user): LedgerUpdate,
     Path(id): Path<String>,
     Json(body): Json<PayBillBody>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
-    }
     let now = boss_clock_client::now_from(&state.clock).await;
     let paid_on = body.paid_on.unwrap_or_else(|| now.date_naive());
 
@@ -265,12 +258,9 @@ struct BatchPayBillsResponse {
 /// listing filter is `approved`.
 pub(super) async fn batch_pay_bills(
     State(state): State<Arc<LedgerApiState>>,
-    CurrentUser(user): CurrentUser,
+    LedgerUpdate(user): LedgerUpdate,
     Json(body): Json<BatchPayBillsBody>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
-    }
     let now = boss_clock_client::now_from(&state.clock).await;
     let paid_on = body.paid_on.unwrap_or_else(|| now.date_naive());
     let limit = body.max_count.unwrap_or(1000);

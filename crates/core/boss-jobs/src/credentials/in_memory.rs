@@ -1,7 +1,11 @@
 //! In-memory adapter for `CredentialsRegistry` — the port-level test
 //! double. Mirrors the Pg semantics that matter: `list` is ordered by
-//! id, an unknown rotation target is `UnknownCredential`, and the
-//! install phase stamps `rotated_at` with the event's own instant.
+//! id (byte order), an unknown rotation target is `UnknownCredential`,
+//! the install phase stamps `rotated_at` with the event's own instant,
+//! and a batch naming a `rotation_policy` the schema refuses lands
+//! nothing. The adapters-agree suite
+//! (`the_adapters_agree_on_the_credentials_registry_pg.rs`) holds both
+//! adapters to each of those.
 
 use async_trait::async_trait;
 use std::sync::Mutex;
@@ -10,7 +14,9 @@ use boss_core::event::Event;
 use boss_core::publisher::EventStamp;
 
 use super::port::{CredentialsError, CredentialsRegistry, declared_event};
-use super::types::{CredentialInput, CredentialRow, CredentialsBatchOutcome, RotationPhase};
+use super::types::{
+    CredentialInput, CredentialRow, CredentialsBatchOutcome, ROTATION_POLICIES, RotationPhase,
+};
 
 /// The registry row a declaration lands as: JSON arrays for the two
 /// list columns (the Pg adapter's `scopes`/`consumers` are JSONB),
@@ -77,6 +83,21 @@ impl CredentialsRegistry for InMemoryCredentials {
         declared: &[CredentialInput],
         stamp: &EventStamp,
     ) -> Result<CredentialsBatchOutcome, CredentialsError> {
+        // The schema's CHECK on `rotation_policy` runs on every declared
+        // row — a held id too, since a CHECK is met before the conflict
+        // is — and refuses the batch's whole transaction. Judged here
+        // before anything is written, so a refused batch lands nothing,
+        // as it lands nothing there; until backlog be459ab9's
+        // adapters-agree suite (2026-09-29) the double took any spelling.
+        if let Some(bad) = declared
+            .iter()
+            .find(|c| !ROTATION_POLICIES.contains(&c.rotation_policy.as_str()))
+        {
+            return Err(CredentialsError::Storage(format!(
+                "credential {}: rotation_policy {:?} is none of {ROTATION_POLICIES:?}",
+                bad.id, bad.rotation_policy
+            )));
+        }
         let mut rows = self.rows.lock().expect("rows lock");
         let mut events = self.events.lock().expect("events lock");
         let mut inserted = 0;

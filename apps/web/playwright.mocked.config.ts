@@ -12,9 +12,22 @@ import { cpus } from 'node:os';
 
 import { defineConfig } from '@playwright/test';
 
+import { TIMINGS_ENV, scaled } from './src/dev-load';
 import { MOCKED_FLAG } from './src/dev-mocked';
 import { DEFAULT_PORT } from './src/dev-tree';
 import { mockedWorkers, readCpuMax } from './src/dev-workers';
+
+/// The suite's four budgets for a QUIET run, stated once — the comment
+/// on `timeout` below says why each is what it is. Inside a loaded gate
+/// the gate-runner scales all four by the same factor (src/dev-load.ts,
+/// backlog ebb750cd), so what Playwright applies is `scaled(BUDGET.x)`;
+/// scripts/the-mocked-suite-states-its-budget.test.ts holds both, and
+/// holds every hand-written wait under tests/mocked to the gate's.
+export const BUDGET = { test: 60_000, expect: 15_000, action: 15_000, navigation: 30_000 } as const;
+
+/// Where the gate wants each test's duration (infra/gate.sh sets it for
+/// its web phase and puts the slowest on the receipt as `web_timings`).
+const TIMINGS_FILE = process.env[TIMINGS_ENV];
 
 // The port the runner chose. It is usually DEFAULT_PORT, but when the
 // preferred port is held by a server serving a DIFFERENT tree the runner
@@ -89,8 +102,14 @@ export default defineConfig({
   // #461 on 2026-09-18; _helpers.ts's mountPage 10 000; outage-crawl's
   // 20 000), five numbers in five files and none of them readable as this
   // suite's budget.
-  timeout: 60_000,
-  expect: { timeout: 15_000 },
+  //
+  // AND IN THE GATE, FOUR TIMES THAT (backlog ebb750cd). 15 000 ms held
+  // on the dev pod at 10x and still lost in a train gate on 2026-09-28:
+  // a Crew Board paint of 0.65 s quiet took 27.6 s beside two 20-wide
+  // cargo builds on one NVMe. The numbers here stay the quiet ones; the
+  // gate-runner says when a run is not quiet, and src/dev-load.ts scales.
+  timeout: scaled(BUDGET.test),
+  expect: { timeout: scaled(BUDGET.expect) },
   // Half the CPUs the cgroup lets this process use, not half the node's
   // (backlog 55ca0748): the default read w-1's 32 CPUs and ran 16 workers
   // in a pod whose quota is 16 (dev) or 20 (gate). See src/dev-workers.ts.
@@ -99,16 +118,22 @@ export default defineConfig({
   // receipt records `ci: false`), and docs/design/testing-strategy.md
   // names a flaky-test retry as an anti-pattern. Only forge CI gets one.
   retries: process.env['CI'] ? 1 : 0,
-  reporter: [['list']],
+  // The list reporter is what a person and the gate-runner's parser read.
+  // Inside the gate the timings reporter also appends every test's
+  // duration to the file the gate names, for the receipt's
+  // `web_timings` — a larger budget must not also hide the load.
+  reporter: TIMINGS_FILE
+    ? [['list'], ['./scripts/timings-reporter.ts', { outputFile: TIMINGS_FILE }]]
+    : [['list']],
   use: {
     // Bounded here rather than left to eat the test timeout, so a click on
     // a starved renderer reports as a click that waited 15 s and not as a
     // test that died somewhere.
-    actionTimeout: 15_000,
+    actionTimeout: scaled(BUDGET.action),
     // A goto also triggers the dev-server's on-the-fly bundle of the route
     // it lands on, which is the slowest thing in the suite under load —
     // hence twice the action budget.
-    navigationTimeout: 30_000,
+    navigationTimeout: scaled(BUDGET.navigation),
     baseURL: ORIGIN,
     headless: true,
     viewport: { width: 1280, height: 800 },

@@ -14,12 +14,21 @@
 //!
 //! THE SHAPE. The word list is the tenant's own (`examples/<tenant>/
 //! VOCABULARY`), the count is derived from the tree on every run, and the
-//! baseline (`infra/lint/tenant-vocabulary.baseline`, one line per tier)
-//! may only be REWRITTEN DOWN, in the same car that lowers the count
-//! (CLAUDE.md §9a). So there are four verdicts on a tier, and this file
-//! owns all four: above the baseline is refused naming the file; equal
-//! is clean; below is refused too, telling the author to lower the
-//! baseline — which is also what stops anyone raising it.
+//! baseline (`infra/lint/tenant-vocabulary.baseline`, one `<count>\t<path>`
+//! line per FILE that still carries a word) may only be REWRITTEN DOWN,
+//! in the same car that lowers the count (CLAUDE.md §9a). So there are
+//! three verdicts on a file, and this file owns all three: above its line
+//! (or any word in a file with no line) is refused naming the file; equal
+//! is clean; below is refused too, telling the author to lower the line
+//! or delete it — which is also what stops anyone raising one.
+//!
+//! WHY PER FILE (backlog e889cfa4, 2026-09-27). The baseline was one
+//! line per TIER, so every car that removed a demo word from
+//! `apps/web/src` rewrote the same integer: three cars did in one
+//! afternoon, and the first to land left the others conflicting with
+//! main on that line. Per file, two cars lowering two files touch two
+//! lines — and `two_files_lowering_their_counts_merge_without_a_conflict`
+//! runs git's own three-way merge to prove it rather than assert it.
 //!
 //! Fixtures live under `boss_testing::scratch`, which carries the uid
 //! and the pid. The fixture vocabulary is invented (`wibble`, `flurble`)
@@ -103,24 +112,45 @@ impl Tree {
         )
     }
 
-    /// A baseline with every tier at `n` except `crates/core` at `core`.
-    fn baseline(&self, core: usize, n: usize) -> &Tree {
+    /// A baseline naming exactly these files, one `<count>\t<path>` line
+    /// each — the shape the real file has. No entries is a baseline that
+    /// says every tier is clean.
+    fn baseline(&self, entries: &[(usize, &str)]) -> &Tree {
         let mut body = String::from("# fixture baseline\n");
-        for tier in TIERS {
-            let count = if tier == "crates/core" { core } else { n };
-            body.push_str(&format!("{tier} {count}\n"));
+        for (count, path) in entries {
+            body.push_str(&format!("{count}\t{path}\n"));
         }
         self.file(BASELINE, &body)
     }
 
     fn run(&self) -> Output {
+        self.run_with(&[])
+    }
+
+    fn run_with(&self, args: &[&str]) -> Output {
         Command::new("bash")
             .arg(self.0.join(LINT))
+            .args(args)
             .current_dir(&self.0)
             .output()
             .unwrap_or_else(|e| panic!("run the lint in {}: {e}", self.0.display()))
     }
+
+    /// The lint's own measurement of this tree, as a baseline body.
+    fn measure(&self) -> String {
+        let out = self.run_with(&["--measure"]);
+        assert!(
+            out.status.success(),
+            "--measure must exit 0 on a tree it can read; got {:?}:\n{}",
+            out.status.code(),
+            text(&out)
+        );
+        String::from_utf8(out.stdout).expect("--measure prints UTF-8")
+    }
 }
+
+/// The file every single-file case below writes its words into.
+const CORE_FILE: &str = "crates/core/boss-thing/src/lib.rs";
 
 impl Drop for Tree {
     fn drop(&mut self) {
@@ -136,14 +166,14 @@ fn text(out: &Output) -> String {
     )
 }
 
-/// ABOVE the baseline — the leak grew — is refused, and the refusal
-/// names the tier, the file, and the number, so nobody re-derives them
+/// ABOVE its line — the leak grew — is refused, and the refusal names
+/// the tier, the file, and both numbers, so nobody re-derives them
 /// (CLAUDE.md §Diagnosis).
 #[test]
-fn a_tier_above_its_baseline_is_refused_naming_the_file() {
+fn a_file_above_its_baseline_is_refused_naming_the_file() {
     let tree = Tree::new("above");
-    tree.vocabulary().baseline(1, 0).file(
-        "crates/core/boss-thing/src/lib.rs",
+    tree.vocabulary().baseline(&[(1, CORE_FILE)]).file(
+        CORE_FILE,
         "// a Wibbler and a wibble: two hits\nfn flurble() {}\n",
     );
     let out = tree.run();
@@ -171,10 +201,10 @@ fn a_tier_above_its_baseline_is_refused_naming_the_file() {
 /// occurrence-based (two on one line are two), and whole-word for a bare
 /// term: `flurbles` is not `flurble`, while `Wibbling` IS `wibble*`.
 #[test]
-fn a_tier_at_its_baseline_is_clean() {
+fn a_file_at_its_baseline_is_clean() {
     let tree = Tree::new("equal");
-    tree.vocabulary().baseline(3, 0).file(
-        "crates/core/boss-thing/src/lib.rs",
+    tree.vocabulary().baseline(&[(3, CORE_FILE)]).file(
+        CORE_FILE,
         "// Wibbling wibble — two; flurbles is not flurble, so one more\nfn flurble() {}\n",
     );
     let out = tree.run();
@@ -196,11 +226,11 @@ fn a_tier_at_its_baseline_is_clean() {
 /// ratchet — a baseline that may sit above the count is a baseline
 /// anyone can raise, and the number would stop meaning anything.
 #[test]
-fn a_tier_below_its_baseline_is_told_to_lower_it() {
+fn a_file_below_its_baseline_is_told_to_lower_it() {
     let tree = Tree::new("below");
     tree.vocabulary()
-        .baseline(5, 0)
-        .file("crates/core/boss-thing/src/lib.rs", "fn wibble() {}\n");
+        .baseline(&[(5, CORE_FILE)])
+        .file(CORE_FILE, "fn wibble() {}\n");
     let out = tree.run();
     assert_eq!(
         out.status.code(),
@@ -211,11 +241,11 @@ fn a_tier_below_its_baseline_is_told_to_lower_it() {
     let msg = text(&out);
     assert!(
         msg.contains("lower")
-            && msg.contains("crates/core")
-            && msg.contains("5")
-            && msg.contains("1"),
-        "the refusal must tell the author to LOWER the tier's line and \
-         name both numbers:\n{msg}"
+            && msg.contains(CORE_FILE)
+            && msg.contains("baseline 5")
+            && msg.contains("set its line to 1"),
+        "the refusal must tell the author to LOWER the file's line, naming \
+         the file and both numbers:\n{msg}"
     );
 }
 
@@ -228,10 +258,10 @@ fn a_tier_below_its_baseline_is_told_to_lower_it() {
 #[test]
 fn a_tenant_name_as_a_path_or_an_id_is_not_vocabulary() {
     let tree = Tree::new("name-as-path-or-id");
-    tree.vocabulary().baseline(1, 0).file(
-        "crates/core/boss-thing/src/lib.rs",
+    tree.vocabulary().baseline(&[(1, CORE_FILE)]).file(
+        CORE_FILE,
         "\
-// tenant = \"examples/wibble/seeds/tenant.toml\" names a path, not a word
+// tenant =\"examples/wibble/seeds/tenant.toml\" names a path, not a word
 // tenant_id = \"wibble\" names an id; TENANT_ID = \"Wibble\" too
 // /opt/boss/examples/wibble/data is the same path form, deeper
 // but a plain wibble here is the one hit that counts
@@ -249,9 +279,9 @@ fn a_tenant_name_as_a_path_or_an_id_is_not_vocabulary() {
     // And the exemption does not reach past its two forms: the name as a
     // bare word, or as a different key's value, still counts.
     let tree = Tree::new("name-as-word");
-    tree.vocabulary().baseline(0, 0).file(
-        "crates/core/boss-thing/src/lib.rs",
-        "// kind = \"wibble\" is not the tenant_id key, and Wibble alone is a word\n",
+    tree.vocabulary().baseline(&[]).file(
+        CORE_FILE,
+        "// kind =\"wibble\" is not the tenant_id key, and Wibble alone is a word\n",
     );
     let out = tree.run();
     assert_eq!(
@@ -280,7 +310,7 @@ fn a_tenant_name_as_a_path_or_an_id_is_not_vocabulary() {
 #[test]
 fn a_word_inside_a_migrations_delete_is_the_leak_leaving() {
     let tree = Tree::new("delete-statement");
-    tree.vocabulary().baseline(0, 0).file(
+    tree.vocabulary().baseline(&[]).file(
         "infra/postgres/schema/20260918000000-residue-goes.sql",
         "\
 -- a header that names no term
@@ -303,7 +333,7 @@ DELETE FROM some_rules d
     // And only the statement: an INSERT of the same name, or the word in
     // a comment outside the DELETE, is still the leak arriving.
     let tree = Tree::new("delete-statement-bounds");
-    tree.vocabulary().baseline(0, 0).file(
+    tree.vocabulary().baseline(&[]).file(
         "infra/postgres/schema/20260918000001-not-only-a-delete.sql",
         "\
 -- the wibble reactor, named in prose above the statement: one hit
@@ -332,7 +362,7 @@ INSERT INTO some_rules (name) VALUES ('spawn-wibble-return');
 fn test_files_are_not_counted() {
     let tree = Tree::new("tests");
     tree.vocabulary()
-        .baseline(0, 0)
+        .baseline(&[])
         .file("crates/core/boss-thing/tests/a.rs", "fn wibble() {}\n")
         .file("crates/core/boss-thing/src/a_test.rs", "fn wibble() {}\n")
         .file("apps/web/src/a/a.test.ts", "const flurble = 1;\n")
@@ -351,7 +381,7 @@ fn test_files_are_not_counted() {
 #[test]
 fn a_tree_with_no_vocabulary_is_refused() {
     let tree = Tree::new("no-vocabulary");
-    tree.baseline(0, 0);
+    tree.baseline(&[]);
     let out = tree.run();
     assert_eq!(
         out.status.code(),
@@ -366,7 +396,7 @@ fn a_tree_with_no_vocabulary_is_refused() {
     );
 }
 
-/// The real tree passes: every tier's count equals its baseline line.
+/// The real tree passes: every file's count equals its baseline line.
 /// This is the ratchet on the repository itself — a car that adds a
 /// brewery word to core, or removes one without lowering the baseline,
 /// reds here before it reds a train.
@@ -379,7 +409,184 @@ fn the_repository_itself_is_at_its_baseline() {
         .expect("run the lint against the repository");
     assert!(
         out.status.success(),
-        "every tier must sit exactly at its baseline; got {:?}:\n{}",
+        "every file must sit exactly at its baseline; got {:?}:\n{}",
+        out.status.code(),
+        text(&out)
+    );
+}
+
+/// A word in a file the baseline does not name is refused, naming that
+/// file — its baseline is 0. And it is refused even when the TIER's total
+/// is unchanged: a word moved from one file to another kept the old
+/// per-tier line equal and passed, while here both files are named, the
+/// one that gained and the one whose line must fall.
+#[test]
+fn a_word_in_a_file_the_baseline_does_not_name_is_refused() {
+    let listed = "apps/web/src/a/Listed.svelte";
+    let unlisted = "apps/web/src/b/Unlisted.svelte";
+    let tree = Tree::new("unlisted-file");
+    tree.vocabulary()
+        .baseline(&[(2, listed)])
+        .file(listed, "<p>one wibble</p>\n")
+        .file(unlisted, "<p>one flurble</p>\n");
+    let out = tree.run();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a word moved into an unlisted file must be refused even though the \
+         tier's total is still 2:\n{}",
+        text(&out)
+    );
+    let msg = text(&out);
+    assert!(
+        msg.contains(unlisted) && msg.contains("not in the baseline"),
+        "the refusal must name the unlisted file as not in the baseline:\n{msg}"
+    );
+    assert!(
+        msg.contains(listed) && msg.contains("set its line to 1"),
+        "and name the listed file's line to lower:\n{msg}"
+    );
+}
+
+/// A line for a file that no longer carries a word is refused until the
+/// line is deleted, in the same car — a stale line is a number nobody is
+/// ratcheting. So is a line of 0, a line naming a path under no tier the
+/// lint scans, a repeated path, and a line in the old per-tier shape:
+/// each would read as covering something while covering nothing.
+#[test]
+fn a_stale_or_malformed_baseline_line_is_refused() {
+    let tree = Tree::new("stale-line");
+    tree.vocabulary()
+        .baseline(&[(2, CORE_FILE)])
+        .file(CORE_FILE, "fn clean() {}\n");
+    let out = tree.run();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a line for a now-clean file must be refused:\n{}",
+        text(&out)
+    );
+    let msg = text(&out);
+    assert!(
+        msg.contains(CORE_FILE) && msg.contains("delete its line"),
+        "the refusal must name the file and say to delete its line:\n{msg}"
+    );
+
+    for (tag, body, expect) in [
+        ("zero", format!("0\t{CORE_FILE}\n"), "0"),
+        (
+            "untiered",
+            "1\texamples/wibble/seeds/a.toml\n".to_string(),
+            "examples/wibble/seeds/a.toml",
+        ),
+        (
+            "repeated",
+            format!("1\t{CORE_FILE}\n1\t{CORE_FILE}\n"),
+            "more than once",
+        ),
+        ("per-tier", "crates/core 1\n".to_string(), "crates/core 1"),
+    ] {
+        let tree = Tree::new(&format!("malformed-{tag}"));
+        tree.vocabulary()
+            .file(BASELINE, &body)
+            .file(CORE_FILE, "fn wibble() {}\n");
+        let out = tree.run();
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "a {tag} baseline line must be refused:\n{}",
+            text(&out)
+        );
+        let msg = text(&out);
+        assert!(
+            msg.contains(BASELINE) && msg.contains(expect),
+            "the {tag} refusal must name the baseline and {expect:?}:\n{msg}"
+        );
+    }
+}
+
+/// `--measure` prints the baseline the lint accepts: the per-file table,
+/// one `<count>\t<path>` entry per file carrying a word, in path order.
+/// The repository's baseline was written from it rather than typed.
+#[test]
+fn measure_prints_the_baseline_the_lint_accepts() {
+    let tree = Tree::new("measure");
+    tree.vocabulary()
+        .baseline(&[])
+        .file(CORE_FILE, "fn wibble() {} // flurble\n")
+        .file("apps/web/src/a/A.svelte", "<p>wibble</p>\n");
+    let measured = tree.measure();
+    let entries: Vec<&str> = measured.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        entries,
+        ["1\tapps/web/src/a/A.svelte", &format!("2\t{CORE_FILE}")],
+        "one entry per file, count then path, sorted by path:\n{measured}"
+    );
+    tree.file(BASELINE, &measured);
+    let out = tree.run();
+    assert!(
+        out.status.success(),
+        "the measured baseline must be clean; got {:?}:\n{}",
+        out.status.code(),
+        text(&out)
+    );
+}
+
+/// THE DEFECT THIS SHAPE EXISTS FOR (backlog e889cfa4). Two cars remove
+/// words from two NEIGHBOURING files of one tier — the adjacent pair is
+/// the hard case, because git's three-way merge refuses two edits to
+/// adjacent lines. Each car lowers its own file's line; git merges the
+/// two baselines with no conflict, and the assembled tree is clean.
+/// Under the per-tier shape both cars rewrote the one `apps/web/src`
+/// line and the second always conflicted.
+#[test]
+fn two_files_lowering_their_counts_merge_without_a_conflict() {
+    let a = "apps/web/src/a/A.svelte";
+    let b = "apps/web/src/a/B.svelte";
+    let c = "apps/web/src/a/C.svelte";
+    let two = "<p>wibble flurble</p>\n";
+    let one = "<p>wibble</p>\n";
+
+    let state = |tag: &str, b_body: &str, c_body: &str| -> (Tree, String) {
+        let tree = Tree::new(tag);
+        tree.vocabulary()
+            .baseline(&[])
+            .file(a, two)
+            .file(b, b_body)
+            .file(c, c_body);
+        let measured = tree.measure();
+        (tree, measured)
+    };
+    let (_base_tree, base) = state("merge-base", two, two);
+    let (_ours_tree, ours) = state("merge-ours", one, two);
+    let (_theirs_tree, theirs) = state("merge-theirs", two, one);
+    assert_ne!(base, ours, "car 1 must change the baseline");
+    assert_ne!(base, theirs, "car 2 must change the baseline");
+
+    let dir = scratch::scratch_dir("tenant-vocabulary-merge-files");
+    for (name, body) in [("base", &base), ("ours", &ours), ("theirs", &theirs)] {
+        scratch::write_file(&dir.join(name), body);
+    }
+    let merged = Command::new("git")
+        .args(["merge-file", "-p", "ours", "base", "theirs"])
+        .current_dir(&dir)
+        .output()
+        .expect("run git merge-file");
+    let _ = std::fs::remove_dir_all(&dir);
+    let merged_text = String::from_utf8_lossy(&merged.stdout).to_string();
+    assert_eq!(
+        merged.status.code(),
+        Some(0),
+        "two cars lowering two neighbouring files must merge with no \
+         conflict:\n--- base\n{base}--- ours\n{ours}--- theirs\n{theirs}--- merged\n{merged_text}"
+    );
+
+    let (assembled, _) = state("merge-assembled", one, one);
+    assembled.file(BASELINE, &merged_text);
+    let out = assembled.run();
+    assert!(
+        out.status.success(),
+        "the merged baseline must be clean on the assembled tree; got {:?}:\n{}",
         out.status.code(),
         text(&out)
     );
@@ -402,7 +609,7 @@ fn the_repository_itself_is_at_its_baseline() {
 fn a_phrase_the_tenant_disclaims_is_not_its_vocabulary() {
     let tree = Tree::new("disclaimed-phrase");
     tree.vocabulary_disclaiming("wibble sprocket")
-        .baseline(1, 0)
+        .baseline(&[(1, CORE_FILE)])
         .file(
             "crates/core/boss-thing/src/lib.rs",
             "\
@@ -422,7 +629,7 @@ fn a_phrase_the_tenant_disclaims_is_not_its_vocabulary() {
     // in any other company still counts.
     let tree = Tree::new("disclaimed-phrase-is-not-the-term");
     tree.vocabulary_disclaiming("wibble sprocket")
-        .baseline(0, 0)
+        .baseline(&[])
         .file(
             "crates/core/boss-thing/src/lib.rs",
             "// a wibble widget is not the disclaimed phrase\n",
@@ -447,8 +654,7 @@ fn a_phrase_the_tenant_disclaims_is_not_its_vocabulary() {
 #[test]
 fn a_disclaimed_phrase_carrying_no_term_is_refused() {
     let tree = Tree::new("disclaimed-phrase-without-a-term");
-    tree.vocabulary_disclaiming("sprocket widget")
-        .baseline(0, 0);
+    tree.vocabulary_disclaiming("sprocket widget").baseline(&[]);
     let out = tree.run();
     assert_eq!(
         out.status.code(),

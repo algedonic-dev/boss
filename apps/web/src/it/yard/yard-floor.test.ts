@@ -349,6 +349,43 @@ describe('the gate bays', () => {
     expect(scene(yardOf(), statusOf({ gates: { capacity: 3, active: [gate('feat/y', 'g9')], queued: [], typical_seconds: null } }), NOW).bays[0]?.progress).toBe(1);
   });
 
+  // A GATE-RUN'S AGE IS TWO AGES (backlog 4d088a7e): gate-run 6d5d85fb
+  // waited 46 minutes and ran 14, and the bay read "gating · 1h". The bay
+  // now reads the server's two ages and the median, and its bar runs from
+  // the Job against the MEASURED median rather than a drawing constant.
+  test('a bay reads queued and running apart beside the median, its bar running from its Job', () => {
+    const g = {
+      ...gate('feat/y', 'g9'),
+      since: '2026-09-07T22:34:00Z',
+      launched_at: '2026-09-07T23:14:00Z',
+      queued_seconds: 2400,
+      running_seconds: 360,
+      troubled: false,
+    };
+    const s = scene(yardOf(), statusOf({ gates: { capacity: 3, active: [g], queued: [], typical_seconds: 1200 } }), NOW);
+    expect(s.bays[0]).toMatchObject({ elapsed: '6m', times: 'queued 40m · running 6m · median 20m', troubled: false });
+    expect(s.bays[0]?.progress).toBeCloseTo(360 / 1200, 5);
+    expect(wagon(s, 'g9').status).toBe('gating · queued 40m · running 6m · median 20m');
+    expect(wagon(s, 'g9').tone).toBe('ok');
+  });
+
+  test('a bay running past twice the median is the troubled one, and looks it', () => {
+    const g = {
+      ...gate('feat/slow', 'g9'),
+      launched_at: '2026-09-07T22:39:00Z',
+      queued_seconds: 0,
+      running_seconds: 2460,
+      troubled: true,
+    };
+    const s = scene(yardOf(), statusOf({ gates: { capacity: 3, active: [g], queued: [], typical_seconds: 1200 } }), NOW);
+    expect(s.bays[0]?.troubled).toBe(true);
+    expect(wagon(s, 'g9').tone).toBe('warn');
+    expect(wagon(s, 'g9').lamp).toBe('warn');
+    expect(wagon(s, 'g9').status).toBe(
+      'gating · queued 0m · running 41m · median 20m · TROUBLED — running past 2× the median',
+    );
+  });
+
   test('a stale gate warns — a dead Job looks like a slow one from here, and the bay says so', () => {
     const s = scene(yardOf(), statusOf({ gates: { capacity: 3, active: [gate('feat/y', 'g9', true)], queued: [], typical_seconds: null } }), NOW);
     expect(wagon(s, 'g9').lamp).toBe('warn');

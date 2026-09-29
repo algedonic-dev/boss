@@ -267,9 +267,15 @@ mod postgres {
     #[async_trait]
     impl DepartmentRegistry for PgDepartments {
         async fn list(&self) -> Result<Vec<Department>, DepartmentsError> {
+            // The code in BYTE order, `COLLATE "C"`: a bare `ORDER BY id`
+            // broke a `sort_order` tie by the database's locale, which
+            // ignores `-` at first level, so `suite-ab` listed before
+            // `suite-a-z` here and after it in the double — one roster,
+            // two orders (backlog be459ab9, found by the adapters-agree
+            // suite, 2026-09-29).
             let rows = sqlx::query(
                 "SELECT id, label, function FROM departments \
-                 WHERE retired_at IS NULL ORDER BY sort_order, id",
+                 WHERE retired_at IS NULL ORDER BY sort_order, id COLLATE \"C\"",
             )
             .fetch_all(&self.pool)
             .await

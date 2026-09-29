@@ -4,6 +4,7 @@
   // tracks the actual state of the brewery rather than
   // hand-coded copy.
 
+  import ClassesReadFailed from '@boss/web-kit/ui/ClassesReadFailed.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { appNow } from '@boss/web-kit/sim-clock';
   import Section from '@boss/web-kit/ui/Section.svelte';
@@ -160,6 +161,7 @@
     title="Quality Assurance"
     subtitle={`${expiring30.length} certs expiring within 30 days · ${openQaJobs} QA jobs open`}
   />
+  <ClassesReadFailed subjectKind="employee" what="roles" fallback="Roles show by code, not by their registry names." />
 
   <nav class="tabs" role="tablist">
     {#each TABS as t (t.id)}

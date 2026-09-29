@@ -111,10 +111,18 @@ pub(crate) fn set_hash(clone: &str, pairs: &[(String, String)]) -> Result<String
 }
 
 /// The projection one car carries, pure given the measurements.
+///
+/// `head` is the car's own branch head the verdicts were measured
+/// against (backlog 43a7fc47). The parked-set hash already folds it in,
+/// but a digest cannot be compared with anything a reader holds; the
+/// head can — against the head the car's receipt vouches for NOW — so a
+/// reader can tell a verdict on the car from a verdict on a head a
+/// rerail has since moved it off.
 pub(crate) fn preview_payload(
     vs_main: &Verdict,
     conflicts_with: &[(String, Vec<String>)],
     main_sha: &str,
+    head: &str,
     set_hash: &str,
     checked_at: &str,
 ) -> Value {
@@ -129,7 +137,7 @@ pub(crate) fn preview_payload(
     json!({
         "vs_main": vs_main_v,
         "conflicts_with": co,
-        "anchored": { "main": main_sha, "parked_set": set_hash },
+        "anchored": { "main": main_sha, "head": head, "parked_set": set_hash },
         "checked_at": checked_at,
     })
 }
@@ -252,14 +260,34 @@ mod tests {
 
     #[test]
     fn only_a_fact_change_counts_as_changed() {
-        let fresh = preview_payload(&Verdict::Clean, &[], "m1", "s1", "T1");
-        let heartbeat = preview_payload(&Verdict::Clean, &[], "m1", "s1", "T2");
-        let moved = preview_payload(&Verdict::Clean, &[], "m2", "s1", "T2");
+        let fresh = preview_payload(&Verdict::Clean, &[], "m1", "h1", "s1", "T1");
+        let heartbeat = preview_payload(&Verdict::Clean, &[], "m1", "h1", "s1", "T2");
+        let moved = preview_payload(&Verdict::Clean, &[], "m2", "h1", "s1", "T2");
         assert!(changed(None, &fresh));
         assert!(
             !changed(Some(&fresh), &heartbeat),
             "checked_at alone is a heartbeat"
         );
         assert!(changed(Some(&fresh), &moved), "a moved anchor is a change");
+    }
+
+    /// THE PREVIEW NAMES THE HEAD IT MEASURED (backlog 43a7fc47). A
+    /// rerail repoints a car to a new head at once, while its preview is
+    /// rewritten only on the conductor's next tick; for up to ten minutes
+    /// the car carried a conflict verdict computed against a head it no
+    /// longer had, and nothing on the preview said which head that was.
+    /// Twice on 2026-09-27 an operator re-planned around it. The head is
+    /// part of the anchor, so a moved head is a change and is rewritten.
+    #[test]
+    fn the_preview_names_the_head_it_measured_and_a_moved_head_is_a_change() {
+        let conflict = Verdict::Conflicts(vec!["a.txt".to_string()]);
+        let fresh = preview_payload(&conflict, &[], "m1", "h1", "s1", "T1");
+        assert_eq!(fresh["anchored"]["head"], "h1", "{fresh}");
+        assert_eq!(fresh["anchored"]["main"], "m1", "{fresh}");
+        let repointed = preview_payload(&conflict, &[], "m1", "h2", "s1", "T2");
+        assert!(
+            changed(Some(&fresh), &repointed),
+            "a moved head is a change"
+        );
     }
 }

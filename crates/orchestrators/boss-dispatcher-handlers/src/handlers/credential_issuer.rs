@@ -105,6 +105,23 @@ pub trait SecretStore: Send + Sync {
         key: &str,
         value: &str,
     ) -> Result<(), String>;
+    /// Several keys of ONE Secret as one write, where the store can make
+    /// it one: the GitHub App handler installs a token beside its expiry
+    /// and provenance, and a reader must never see the new token under
+    /// the old expiry. The default writes key by key, in order — enough
+    /// for a store with no multi-key write; the k8s adapter overrides it
+    /// with a single merge-patch.
+    async fn write_keys(
+        &self,
+        namespace: &str,
+        name: &str,
+        entries: &[(&str, &str)],
+    ) -> Result<(), String> {
+        for (key, value) in entries {
+            self.write_key(namespace, name, key, value).await?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -448,17 +465,36 @@ impl SecretStore for KubeSecretStore {
         key: &str,
         value: &str,
     ) -> Result<(), String> {
+        self.write_keys(namespace, name, &[(key, value)]).await
+    }
+
+    /// One merge-patch carrying every key: the API server applies it
+    /// whole or not at all.
+    async fn write_keys(
+        &self,
+        namespace: &str,
+        name: &str,
+        entries: &[(&str, &str)],
+    ) -> Result<(), String> {
         let url = format!(
             "{}/api/v1/namespaces/{namespace}/secrets/{name}",
             self.base.trim_end_matches('/')
         );
-        let b64 = base64::engine::general_purpose::STANDARD.encode(value);
+        let data: serde_json::Map<String, JsonValue> = entries
+            .iter()
+            .map(|(k, v)| {
+                (
+                    (*k).to_string(),
+                    JsonValue::String(base64::engine::general_purpose::STANDARD.encode(v)),
+                )
+            })
+            .collect();
         let resp = self
             .client
             .patch(&url)
             .bearer_auth(&self.bearer)
             .header("Content-Type", "application/merge-patch+json")
-            .json(&json!({ "data": { key: b64 } }))
+            .json(&json!({ "data": data }))
             .send()
             .await
             .map_err(|e| format!("PATCH {url}: {e}"))?;
@@ -1519,6 +1555,494 @@ impl WorkloadRestarter for Unconfigured {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GitHub App port — the third issuer (design 76155676, backlog 81eb6d4d)
+// ---------------------------------------------------------------------------
+
+/// The three keys of Secret `boss/boss-credential-broker-root` that are
+/// the GitHub App root, each paired with the env var `boss.yaml` hands
+/// it to the dispatcher as (`optional: true`, the other roots' posture).
+/// Placed ONCE by David — root material the estate cannot mint — and
+/// read here EXACTLY: no fourth key, no fallback spelling.
+pub const GITHUB_APP_ROOT_KEYS: [(&str, &str); 3] = [
+    ("github-app.id", "BOSS_BROKER_GITHUB_APP_ID"),
+    (
+        "github-app.installation-id",
+        "BOSS_BROKER_GITHUB_APP_INSTALLATION_ID",
+    ),
+    (
+        "github-app.private-key.pem",
+        "BOSS_BROKER_GITHUB_APP_PRIVATE_KEY",
+    ),
+];
+
+/// The GitHub App root, whole or not at all. Holds the private key to
+/// sign App JWTs and nothing else; `Debug` names the ids and never the
+/// key.
+pub struct GitHubAppRoot {
+    app_id: u64,
+    installation_id: u64,
+    key: rsa::RsaPrivateKey,
+}
+
+impl std::fmt::Debug for GitHubAppRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitHubAppRoot")
+            .field("app_id", &self.app_id)
+            .field("installation_id", &self.installation_id)
+            .field("key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// ASCII digits, and a number — the only spelling an App or an
+/// installation id has. The installation id enters a URL path signed
+/// by the App's JWT, so nothing else reaches one.
+/// `what` names where the value came from (`root key github-app.id`, `rule
+/// arg installation_id`), so the refusal says which one to fix.
+pub fn github_id(what: &str, raw: &str) -> Result<u64, String> {
+    let raw = raw.trim();
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "{what} is not ASCII digits (a GitHub App or installation id)"
+        ));
+    }
+    raw.parse::<u64>()
+        .map_err(|_| format!("{what} is not a number GitHub could have issued"))
+}
+
+impl GitHubAppRoot {
+    /// Build the root from the three values as the env hands them over,
+    /// in [`GITHUB_APP_ROOT_KEYS`] order. EVERY absent or empty key is
+    /// named in one refusal — key and env var both — so the one human act
+    /// left (placing the root) is told everything it missed at once. A
+    /// PEM that is not an RSA private key (PKCS#1, as GitHub downloads
+    /// it, or PKCS#8) is refused WITHOUT quoting the parser, whose error
+    /// could echo what it read.
+    pub fn from_values(
+        app_id: Option<&str>,
+        installation_id: Option<&str>,
+        private_key_pem: Option<&str>,
+    ) -> Result<Self, String> {
+        let values = [app_id, installation_id, private_key_pem];
+        let missing: Vec<String> = GITHUB_APP_ROOT_KEYS
+            .iter()
+            .zip(values)
+            .filter(|(_, v)| v.is_none_or(|v| v.trim().is_empty()))
+            .map(|((key, env), _)| format!("{key} (env {env})"))
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "credential broker unconfigured: the GitHub App root is incomplete — Secret \
+                 boss/boss-credential-broker-root lacks {}. The root is placed once by David \
+                 (backlog 81eb6d4d, steps_for_david), and the boss pod reads it at start",
+                missing.join(", ")
+            ));
+        }
+        let (Some(app_id), Some(installation_id), Some(pem)) =
+            (app_id, installation_id, private_key_pem)
+        else {
+            return Err("the GitHub App root is incomplete".to_string());
+        };
+        let app_id = github_id(&format!("root key {}", GITHUB_APP_ROOT_KEYS[0].0), app_id)?;
+        let installation_id = github_id(
+            &format!("root key {}", GITHUB_APP_ROOT_KEYS[1].0),
+            installation_id,
+        )?;
+        use rsa::pkcs1::DecodeRsaPrivateKey as _;
+        use rsa::pkcs8::DecodePrivateKey as _;
+        let pem = pem.trim();
+        let key = rsa::RsaPrivateKey::from_pkcs1_pem(pem)
+            .or_else(|_| rsa::RsaPrivateKey::from_pkcs8_pem(pem))
+            .map_err(|_| {
+                format!(
+                    "root key {} is not an RSA private key in PEM (PKCS#1 as GitHub downloads \
+                     it, or PKCS#8); the parser's own error is not repeated, because it can \
+                     quote what it read",
+                    GITHUB_APP_ROOT_KEYS[2].0
+                )
+            })?;
+        Ok(Self {
+            app_id,
+            installation_id,
+            key,
+        })
+    }
+
+    pub fn app_id(&self) -> u64 {
+        self.app_id
+    }
+
+    pub fn installation_id(&self) -> u64 {
+        self.installation_id
+    }
+
+    /// An App JWT for `now` — see [`app_jwt`].
+    pub fn jwt(&self, now: chrono::DateTime<chrono::Utc>) -> Result<String, String> {
+        app_jwt(self.app_id, &self.key, now)
+    }
+}
+
+/// How far an App JWT's `iat` is backdated: GitHub's own advice, so a
+/// few seconds of clock drift between the broker and GitHub cannot make
+/// a fresh JWT read as issued in the future.
+pub const APP_JWT_BACKDATE_SECS: i64 = 60;
+
+/// An App JWT's lifetime from `now`. GitHub refuses one whose `exp` is
+/// more than ten minutes after its `iat`; `iat` is backdated one minute,
+/// so nine minutes forward keeps the span at exactly ten.
+pub const APP_JWT_TTL_SECS: i64 = 540;
+
+/// The App JWT GitHub's installation-token exchange authenticates:
+/// RS256 over `{"alg":"RS256","typ":"JWT"}` and `{iat, exp, iss}`, `iss`
+/// the App id (a number, as GitHub issues it), `iat` backdated
+/// [`APP_JWT_BACKDATE_SECS`], `exp` [`APP_JWT_TTL_SECS`] ahead — ten
+/// minutes end to end, GitHub's ceiling. It authenticates AS THE APP and
+/// can mint installation tokens for ten minutes, so it is a value like
+/// any other: never logged, never in an error, never kept.
+pub fn app_jwt(
+    app_id: u64,
+    key: &rsa::RsaPrivateKey,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<String, String> {
+    use rsa::signature::{SignatureEncoding as _, Signer as _};
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let header = b64(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let iat = now.timestamp() - APP_JWT_BACKDATE_SECS;
+    let claims = json!({
+        "iat": iat,
+        "exp": now.timestamp() + APP_JWT_TTL_SECS,
+        "iss": app_id,
+    });
+    let claims = b64(claims.to_string().as_bytes());
+    let signing_input = format!("{header}.{claims}");
+    let signer = rsa::pkcs1v15::SigningKey::<rsa::sha2::Sha256>::new(key.clone());
+    let signature = signer
+        .try_sign(signing_input.as_bytes())
+        .map_err(|_| "could not sign the GitHub App JWT with the root key".to_string())?;
+    Ok(format!("{signing_input}.{}", b64(&signature.to_bytes())))
+}
+
+/// What an installation token is minted FOR and narrowed to at the
+/// exchange — the consumer's declaration, as its rule row spells it.
+/// Empty narrowing means "everything the installation holds", which is
+/// GitHub's own default.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstallationScope {
+    /// WHICH installation of the App. The App (its id and private key) is
+    /// the one root; an installation is per organisation — algedonic-dev
+    /// today, a customer's org that installs the App on its own repos
+    /// later (David, 2026-09-27). `None` is the root's own
+    /// `github-app.installation-id`, the algedonic-dev installation; a
+    /// consumer on another org names its installation on its rule row.
+    pub installation: Option<u64>,
+    /// Repository NAMES (no owner — the installation's account is the
+    /// owner), as the exchange's `repositories` takes them.
+    pub repositories: Vec<String>,
+    /// `permission name -> read | write | admin`, as the exchange's
+    /// `permissions` takes them.
+    pub permissions: std::collections::BTreeMap<String, String>,
+}
+
+impl InstallationScope {
+    /// The exchange body: only what is declared, so an undeclared
+    /// narrowing is GitHub's default and never an empty list (which the
+    /// API would read as "no repositories").
+    pub fn body(&self) -> JsonValue {
+        let mut body = serde_json::Map::new();
+        if !self.repositories.is_empty() {
+            body.insert("repositories".into(), json!(self.repositories));
+        }
+        if !self.permissions.is_empty() {
+            body.insert("permissions".into(), json!(self.permissions));
+        }
+        JsonValue::Object(body)
+    }
+
+    /// `"contents:write,metadata:read"` — the scope as evidence.
+    pub fn permissions_text(&self) -> String {
+        self.permissions
+            .iter()
+            .map(|(k, v)| format!("{k}:{v}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+/// A repository name GitHub could hold: letters, digits, `-`, `.` and
+/// `_`, and never `.` or `..` — the one grammar a name must pass before
+/// it reaches a URL path or an exchange body (the `forge_username`
+/// precedent, backlog cd2745b2).
+pub fn github_repo_name(name: &str) -> Result<&str, String> {
+    let ok = !name.is_empty()
+        && name.len() <= 100
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'));
+    if ok {
+        Ok(name)
+    } else {
+        Err(format!(
+            "{name:?} is not a GitHub repository name (letters, digits and -._, not . or ..)"
+        ))
+    }
+}
+
+/// `owner/name`, each half judged by [`github_repo_name`] (an owner's
+/// grammar is narrower still; this one is enough to keep a path a path).
+pub fn github_repo(full: &str) -> Result<&str, String> {
+    match full.split_once('/') {
+        Some((owner, name))
+            if github_repo_name(owner).is_ok() && github_repo_name(name).is_ok() =>
+        {
+            Ok(full)
+        }
+        _ => Err(format!(
+            "{full:?} is not owner/name for a GitHub repository; it never enters a URL"
+        )),
+    }
+}
+
+/// The one moment an installation token exists outside its consumption
+/// point: the exchange's answer. It goes into the SecretStore and
+/// nowhere else — `Debug` prints its LENGTH.
+#[derive(Clone)]
+pub struct InstallationToken {
+    pub token: String,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    /// What GitHub says the token CARRIES (not what was asked): the
+    /// evidence the issue step records.
+    pub permissions: std::collections::BTreeMap<String, String>,
+    pub repositories: Vec<String>,
+}
+
+impl std::fmt::Debug for InstallationToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstallationToken")
+            .field("token_length", &self.token.len())
+            .field("expires_at", &self.expires_at)
+            .field("permissions", &self.permissions)
+            .field("repositories", &self.repositories)
+            .finish()
+    }
+}
+
+/// The GitHub App surface the broker needs, measured from GitHub's REST
+/// reference (api version 2022-11-28):
+/// ```text
+///   POST   /app/installations/{installation_id}/access_tokens  — App JWT; 201 → {token, expires_at, permissions, repositories?}
+///   GET    /repos/{owner}/{repo}                                 — the token proves it can read what it exists for
+///   DELETE /installation/token                                   — authenticated BY the token it ends; 204
+///   GET    /installation/repositories                            — 401 once a token is dead
+/// ```
+/// An installation token can be revoked only by presenting it: there is
+/// no revoke-by-id, so a value the broker no longer holds cannot be
+/// ended early, and simply expires (one hour after its mint).
+#[async_trait]
+pub trait GitHubAppIssuer: Send + Sync {
+    /// The DEFAULT installation — the one the root names — as an
+    /// identifier, for evidence when a declaration names none.
+    fn installation(&self) -> String;
+    /// Exchange an App JWT for an installation token narrowed to
+    /// `scope`. Anything but `201 Created` is refused, naming the status.
+    async fn mint_installation_token(
+        &self,
+        scope: &InstallationScope,
+    ) -> Result<InstallationToken, String>;
+    /// Verify by effect: `GET /repos/{repo}` authenticated with `token`.
+    async fn repo_readable_with(&self, token: &str, repo: &str) -> Result<bool, String>;
+    /// `Ok(true)` = ended now; `Ok(false)` = GitHub no longer accepts it
+    /// (expired or already revoked) — both leave it dead.
+    async fn revoke_installation_token(&self, token: &str) -> Result<bool, String>;
+    /// Confirm by effect that `token` authenticates nothing.
+    async fn installation_token_is_dead(&self, token: &str) -> Result<bool, String>;
+}
+
+/// The public GitHub REST API, or a stub standing in for it.
+pub struct GitHubApi {
+    client: reqwest::Client,
+    base: String,
+    root: GitHubAppRoot,
+}
+
+/// GitHub refuses a request without a User-Agent; this one names the
+/// broker so the App's audit log says who asked.
+const GITHUB_USER_AGENT: &str = "boss-credential-broker";
+
+impl GitHubApi {
+    pub fn new(base: impl Into<String>, root: GitHubAppRoot) -> Result<Arc<Self>, String> {
+        let client = reqwest::Client::builder()
+            .user_agent(GITHUB_USER_AGENT)
+            .build()
+            .map_err(|e| format!("http client: {e}"))?;
+        Ok(Arc::new(Self {
+            client,
+            base: base.into(),
+            root,
+        }))
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base.trim_end_matches('/'))
+    }
+
+    fn versioned(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        req.header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+    }
+}
+
+/// `{"contents": "write", ...}` as GitHub answers it; a non-string level
+/// is dropped rather than guessed.
+fn permissions_of(v: Option<&JsonValue>) -> std::collections::BTreeMap<String, String> {
+    v.and_then(JsonValue::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+        .collect()
+}
+
+#[async_trait]
+impl GitHubAppIssuer for GitHubApi {
+    fn installation(&self) -> String {
+        self.root.installation_id().to_string()
+    }
+
+    async fn mint_installation_token(
+        &self,
+        scope: &InstallationScope,
+    ) -> Result<InstallationToken, String> {
+        let url = self.url(&format!(
+            "/app/installations/{}/access_tokens",
+            scope
+                .installation
+                .unwrap_or_else(|| self.root.installation_id())
+        ));
+        let jwt = self.root.jwt(boss_clock_client::wall_now())?;
+        let resp = self
+            .versioned(self.client.post(&url))
+            .bearer_auth(&jwt)
+            .json(&scope.body())
+            .send()
+            .await
+            .map_err(|e| format!("POST {url}: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if status != reqwest::StatusCode::CREATED {
+            // An error body is GitHub's `{message, documentation_url}`
+            // and never echoes the JWT; a 2xx that is not 201 is refused
+            // WITHOUT its body, which could carry a token.
+            let body = if status.is_success() {
+                "body withheld: a success body can carry a token".to_string()
+            } else {
+                clip(&text)
+            };
+            return Err(format!(
+                "POST {url} returned {status}, not 201 Created — the exchange mints only on \
+                 201, so nothing was minted: {body}"
+            ));
+        }
+        // From here the body holds the token: no error below quotes it.
+        let body: JsonValue = serde_json::from_str(&text)
+            .map_err(|_| format!("POST {url}: 201 with a body that is not JSON"))?;
+        let token = body
+            .get("token")
+            .and_then(JsonValue::as_str)
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| format!("POST {url}: 201 with no token in its body"))?
+            .to_string();
+        let expires_at = body
+            .get("expires_at")
+            .and_then(JsonValue::as_str)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .ok_or_else(|| format!("POST {url}: 201 with no readable expires_at"))?;
+        let repositories = body
+            .get("repositories")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.get("name").and_then(JsonValue::as_str))
+            .map(str::to_string)
+            .collect();
+        Ok(InstallationToken {
+            token,
+            expires_at,
+            permissions: permissions_of(body.get("permissions")),
+            repositories,
+        })
+    }
+
+    async fn repo_readable_with(&self, token: &str, repo: &str) -> Result<bool, String> {
+        let url = self.url(&format!("/repos/{}", github_repo(repo)?));
+        let resp = self
+            .versioned(self.client.get(&url))
+            .header("Authorization", format!("token {token}"))
+            .send()
+            .await
+            .map_err(|e| format!("GET {url}: {e}"))?;
+        Ok(resp.status() == reqwest::StatusCode::OK)
+    }
+
+    async fn revoke_installation_token(&self, token: &str) -> Result<bool, String> {
+        let url = self.url("/installation/token");
+        let resp = self
+            .versioned(self.client.delete(&url))
+            .header("Authorization", format!("token {token}"))
+            .send()
+            .await
+            .map_err(|e| format!("DELETE {url}: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        match status {
+            s if s.is_success() => Ok(true),
+            reqwest::StatusCode::UNAUTHORIZED => Ok(false),
+            s => Err(format!("DELETE {url} returned {s}: {}", clip(&text))),
+        }
+    }
+
+    async fn installation_token_is_dead(&self, token: &str) -> Result<bool, String> {
+        let url = self.url("/installation/repositories?per_page=1");
+        let resp = self
+            .versioned(self.client.get(&url))
+            .header("Authorization", format!("token {token}"))
+            .send()
+            .await
+            .map_err(|e| format!("GET {url}: {e}"))?;
+        match resp.status() {
+            reqwest::StatusCode::UNAUTHORIZED => Ok(true),
+            s if s.is_success() => Ok(false),
+            s => Err(format!(
+                "GET {url} returned {s}; neither alive (2xx) nor dead (401)"
+            )),
+        }
+    }
+}
+
+#[async_trait]
+impl GitHubAppIssuer for Unconfigured {
+    fn installation(&self) -> String {
+        String::new()
+    }
+    async fn mint_installation_token(
+        &self,
+        _s: &InstallationScope,
+    ) -> Result<InstallationToken, String> {
+        Err(self.0.clone())
+    }
+    async fn repo_readable_with(&self, _t: &str, _r: &str) -> Result<bool, String> {
+        Err(self.0.clone())
+    }
+    async fn revoke_installation_token(&self, _t: &str) -> Result<bool, String> {
+        Err(self.0.clone())
+    }
+    async fn installation_token_is_dead(&self, _t: &str) -> Result<bool, String> {
+        Err(self.0.clone())
+    }
+}
+
 #[cfg(test)]
 mod forgejo_tests {
     use super::*;
@@ -1705,6 +2229,133 @@ mod forgejo_tests {
                 "/api/v1/admin/users/david/tokens/7".to_string(),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod github_tests {
+    use super::*;
+    use crate::handlers::github_stub::{self, APP_ID, APP_KEY, INSTALLATION_ID};
+
+    fn api(url: &str) -> Arc<GitHubApi> {
+        let root = GitHubAppRoot::from_values(
+            Some(&APP_ID.to_string()),
+            Some(&INSTALLATION_ID.to_string()),
+            Some(&github_stub::app_key_pem()),
+        )
+        .expect("root");
+        GitHubApi::new(url, root).expect("adapter")
+    }
+
+    /// The JWT is what GitHub's exchange checks: RS256 by the App key,
+    /// `iss` the App id as a number, ten minutes end to end with `iat`
+    /// backdated a minute for drift.
+    #[test]
+    fn the_app_jwt_is_rs256_by_the_app_key_and_lives_ten_minutes() {
+        let now = chrono::Utc::now();
+        let jwt = app_jwt(APP_ID, &APP_KEY, now).expect("signed");
+        github_stub::judge_jwt(&jwt).expect("the stub's GitHub checks accept it");
+        let claims: JsonValue = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(jwt.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claims["iss"], json!(APP_ID));
+        assert_eq!(claims["iat"], json!(now.timestamp() - 60));
+        assert_eq!(claims["exp"], json!(now.timestamp() + 540));
+        let other = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024).unwrap();
+        let forged = app_jwt(APP_ID, &other, now).unwrap();
+        assert!(
+            github_stub::judge_jwt(&forged).is_err(),
+            "a JWT signed by any other key is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_201_exchange_yields_a_token_its_expiry_and_what_it_carries() {
+        let gh = github_stub::serve(&["algedonic-dev/boss-dr"]).await;
+        let scope = InstallationScope {
+            installation: None,
+            repositories: vec!["boss-dr".into()],
+            permissions: [("contents".to_string(), "write".to_string())].into(),
+        };
+        let t = api(&gh.url)
+            .mint_installation_token(&scope)
+            .await
+            .expect("minted");
+        assert!(t.token.starts_with("ghs_"));
+        assert!(t.expires_at > chrono::Utc::now());
+        assert_eq!(t.repositories, vec!["boss-dr".to_string()]);
+        assert_eq!(
+            t.permissions.get("contents").map(String::as_str),
+            Some("write")
+        );
+        let debug = format!("{t:?}");
+        assert!(!debug.contains(&t.token), "Debug prints a length: {debug}");
+        assert_eq!(
+            gh.state.lock().unwrap().requests,
+            vec![format!(
+                "POST /app/installations/{INSTALLATION_ID}/access_tokens"
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_undeclared_narrowing_sends_an_empty_body_not_an_empty_list() {
+        assert_eq!(InstallationScope::default().body(), json!({}));
+    }
+
+    #[tokio::test]
+    async fn a_revoke_ends_the_token_and_the_death_is_read_back() {
+        let gh = github_stub::serve(&["algedonic-dev/boss-dr"]).await;
+        let a = api(&gh.url);
+        let t = a
+            .mint_installation_token(&InstallationScope::default())
+            .await
+            .unwrap()
+            .token;
+        assert!(
+            a.repo_readable_with(&t, "algedonic-dev/boss-dr")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !a.repo_readable_with(&t, "algedonic-dev/boss")
+                .await
+                .unwrap()
+        );
+        assert!(!a.installation_token_is_dead(&t).await.unwrap());
+        assert!(a.revoke_installation_token(&t).await.unwrap(), "ended now");
+        assert!(a.installation_token_is_dead(&t).await.unwrap());
+        assert!(
+            !a.revoke_installation_token(&t).await.unwrap(),
+            "a dead token answers 401: already dead, not an error"
+        );
+        assert!(
+            !a.repo_readable_with(&t, "algedonic-dev/boss-dr")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_repo_outside_the_grammar_never_becomes_a_path() {
+        for ok in ["algedonic-dev/boss-dr", "dauld/boss-mirror", "a/b.c_d"] {
+            assert_eq!(github_repo(ok), Ok(ok));
+        }
+        for bad in [
+            "boss-dr",
+            "algedonic-dev/../app",
+            "algedonic-dev/boss/extra",
+            "../x",
+            "a/b?c",
+            "a/b#c",
+            "a/.",
+            "",
+        ] {
+            assert!(github_repo(bad).is_err(), "{bad}");
+        }
     }
 }
 

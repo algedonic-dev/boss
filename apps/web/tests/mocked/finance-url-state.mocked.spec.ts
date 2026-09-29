@@ -12,7 +12,7 @@
 
 import { expect, test, type Page, type Route } from './_test';
 import { mountPage } from './_helpers';
-import { installSmokeMocks } from './_smokeMocks';
+import { installSmokeMocks, signInWithPolicy } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
 
 const PATH = '/ux/finance';
@@ -64,6 +64,8 @@ async function install(
   opts: Readonly<{ factEntries?: ((r: Route) => Promise<void>) | unknown }> = {},
 ): Promise<string[]> {
   await installSmokeMocks(page);
+  // A writer policy allows, so the create links render (9dad102c).
+  await signInWithPolicy(page);
   await page.route(/\/api\/commerce\/invoices/, (r) =>
     json(r, { data: [], total: 0, limit: 1000, offset: 0 }));
   await page.route(/\/api\/commerce\/summary$/, (r) => json(r, SUMMARY));

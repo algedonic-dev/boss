@@ -36,6 +36,7 @@
 use std::future::Future;
 
 use anyhow::{Context as _, Result};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
 use tracing::{error, warn};
@@ -144,17 +145,19 @@ impl LogTail {
     /// than kept to this struct, because the handler has to know a
     /// failure now is the last one the budget allows — that is the only
     /// moment it still holds the rule, the handler, the count and the
-    /// error together (`a9c498eb`).
+    /// error together (`a9c498eb`). The fifth argument is the row's own
+    /// `timestamp`, the instant the fact was recorded, which a handler
+    /// stamps instead of the dispatcher's clock (backlog eabc5943).
     pub async fn drain_once<F, Fut>(&mut self, batch: i64, handle: F) -> Result<DrainReport>
     where
-        F: Fn(String, String, Value, u32) -> Fut,
+        F: Fn(String, String, Value, u32, DateTime<Utc>) -> Fut,
         Fut: Future<Output = Settle>,
     {
         let mut report = DrainReport::default();
         let from = self.cursor().await?;
 
-        let rows: Vec<(i64, String, String, Value)> = sqlx::query_as(
-            "SELECT id, event_id::text, kind, payload FROM audit_log \
+        let rows: Vec<(i64, String, String, Value, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT id, event_id::text, kind, payload, timestamp FROM audit_log \
              WHERE id > $1 ORDER BY id LIMIT $2",
         )
         .bind(from)
@@ -163,7 +166,7 @@ impl LogTail {
         .await
         .context("reading audit tail")?;
 
-        for (id, event_id, kind, payload) in rows {
+        for (id, event_id, kind, payload, recorded_at) in rows {
             // Inherit the event's sim-ness so side effects on
             // simulated facts write simulated state — the same
             // task-local discipline as the JetStream loop.
@@ -180,7 +183,7 @@ impl LogTail {
             };
             let outcome = boss_core::sim_origin::with_sim_chain(
                 simulated,
-                handle(kind.clone(), event_id, payload, attempts),
+                handle(kind.clone(), event_id, payload, attempts, recorded_at),
             )
             .await;
 

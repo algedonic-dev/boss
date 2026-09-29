@@ -9,9 +9,14 @@ name = "boss"
 path = "src/main.rs"
 
 [dependencies]
-boss-core = { path = "../../core/boss-core" }
+# `blocking`: machine_token::BlockingClient, the stamping client the
+# tenant publish/export and estate declare walks send through.
+boss-core = { path = "../../core/boss-core", features = ["blocking"] }
 boss-ports = { path = "../../core/boss-ports" }
-boss-events = { path = "../../core/boss-events" }
+# `postgres`: `boss events redeliver`'s tests serve the REAL dead-letter
+# door (`boss_events::outbox_http`) over a TestDb (backlog e22b692e); the
+# shipped verb is an HTTP client of that door and opens no database.
+boss-events = { path = "../../core/boss-events", features = ["postgres"] }
 boss-nats = { path = "../../core/boss-nats" }
 # The station registry + its predicate evaluator. `boss packet
 # census` answers "which stations would present this packet?" by
@@ -45,7 +50,6 @@ boss-dispatcher = { path = "../../core/boss-dispatcher" }
 # ec40e269).
 boss-dispatcher-handlers = { path = "../boss-dispatcher-handlers" }
 toml = { workspace = true }
-boss-assets = { path = "../../modules/boss-assets", features = ["postgres"] }
 boss-clock-client = { path = "../../core/boss-clock-client" }
 boss-ledger = { path = "../../modules/boss-ledger", features = ["postgres"] }
 sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "json", "chrono"] }
@@ -89,6 +93,13 @@ percent-encoding = "2"
 # `boss ops` applies the allowlist's arg patterns at the terminal, the
 # same regexes ops-runner.sh applies on the host (3d6daea9).
 regex = "1"
+# `boss recovery sheet --pdf` prints the page through Chromium from a
+# private temporary directory, then reads the text back out of the PDF
+# it made — Chromium writes Flate-compressed streams (design 125d405d,
+# backlog fd6d6c08). Both were already in the lock (flate2 under
+# hdrhistogram); these name them.
+tempfile = "3"
+flate2 = "1"
 
 [dev-dependencies]
 # Paused time (backlog 034002b3): a jobs-API call against a dark SoR
@@ -119,6 +130,10 @@ axum = { workspace = true }
 # Test-only, like axum: the shipped binary never serves either.
 boss-people = { path = "../../modules/boss-people", features = ["postgres"] }
 boss-policy = { path = "../../core/boss-policy", features = ["postgres"] }
+# The same proof serves the REAL business-calendar door (backlog
+# 05f61acf), so the seed's calendar lands through the policy ladder and
+# leaves its fact signed by the publish's own identity.
+boss-calendar = { path = "../../core/boss-calendar", features = ["postgres"] }
 
 [lints]
 workspace = true

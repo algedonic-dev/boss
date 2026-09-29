@@ -1,24 +1,460 @@
 # tenant-vocabulary.baseline — the ratchet on tenant words above their
 # tier, read by infra/lint/no-tenant-vocabulary-above-its-tier.sh
-# (backlog be39298f). One line per tier: `<tier> <count>`.
+# (backlog be39298f). One line per FILE that still carries a word:
+# `<count><TAB><path>`, in path order, one blank line apart.
 #
-# Each number is the lint's OWN measurement of the tree on the day it
-# was written, and it only goes down: the lint refuses a tier whose
-# count is above its line (the leak grew) and a tier whose count is
-# below it (lower the line in the same car). Nobody raises one. The
-# target is zero in every tier, held there by the same refusal.
+# Each number is the lint's OWN measurement of that file, and it only
+# goes down: the lint refuses a file whose count is above its line (the
+# leak grew), a word in a file with no line (its baseline is 0), and a
+# file whose count is below its line (set the line to the count in the
+# same car — or delete it, at 0). Nobody raises one. The target is no
+# lines at all.
 #
-# Written 2026-09-16 from the lint's measurement of origin/main b4d7a0fd
-# plus this car — the brewery's and the used-device shop's VOCABULARY
-# together, 23 terms, with a tenant's name as a path or an id exempt.
-# Since 2026-09-24 (backlog a8991c86, car 7) the used-device shop and
-# its VOCABULARY are deleted, so the lines count the brewery's 20 terms
-# alone — re-measured with this lint on that car's tree.
-crates/core 303
-crates/modules 333
-crates/orchestrators 789
-apps/web/src 246
-apps/simulator 9
-infra/postgres/schema 175
-infra/platform 2
-infra/cluster 7
+# Per file since 2026-09-27 (backlog e889cfa4): it was one line per
+# tier, and every car lowering apps/web/src rewrote the same integer,
+# so parked cars conflicted with main on it after every train. A car
+# now edits only the lines of the files it touched. The blank line
+# between entries is load-bearing — git refuses two edits to adjacent
+# lines — and the lint header says why. Written from
+# `infra/lint/no-tenant-vocabulary-above-its-tier.sh --measure` on
+# origin/main 89f22971, whose per-tier sums it reproduces exactly
+# (crates/core 303, crates/modules 333, crates/orchestrators 789,
+# apps/web/src 246, apps/simulator 9, infra/postgres/schema 175,
+# infra/platform 2, infra/cluster 7). Regenerate the entries the same
+# way; never type one.
+
+1	apps/simulator/src/ActorCoveragePanel.svelte
+
+4	apps/simulator/src/CockpitPage.svelte
+
+1	apps/simulator/src/ControlsPanel.svelte
+
+1	apps/simulator/src/actor-coverage.ts
+
+1	apps/simulator/src/router.ts
+
+1	apps/simulator/src/types.ts
+
+4	apps/web/src/accounts/AccountPage.svelte
+
+2	apps/web/src/accounts/AccountsList.svelte
+
+1	apps/web/src/accounts/ActivityTimeline.svelte
+
+2	apps/web/src/catalog/DevicePage.svelte
+
+5	apps/web/src/catalog/schemas.ts
+
+1	apps/web/src/catalog/types.ts
+
+2	apps/web/src/data/parseResponse.ts
+
+3	apps/web/src/debug/DebugGear.svelte
+
+19	apps/web/src/debug/simulations.ts
+
+2	apps/web/src/dev-server.ts
+
+1	apps/web/src/exec/exec.ts
+
+2	apps/web/src/finance/types.ts
+
+1	apps/web/src/hr/HrPage.svelte
+
+1	apps/web/src/it/crew/CrewBoardPage.svelte
+
+3	apps/web/src/it/crew/crew.ts
+
+1	apps/web/src/it/marshalling/marshalling.ts
+
+2	apps/web/src/it/monitoring/AtlasPage.svelte
+
+1	apps/web/src/it/monitoring/EventsPage.svelte
+
+16	apps/web/src/jobs/JobsListPage.svelte
+
+1	apps/web/src/jobs/adHoc.ts
+
+4	apps/web/src/landing/LandingPage.svelte
+
+27	apps/web/src/landing/SystemModelLiveView.svelte
+
+9	apps/web/src/me/GuestHome.svelte
+
+1	apps/web/src/me/packetTrack.ts
+
+6	apps/web/src/parts/PartPage.svelte
+
+2	apps/web/src/parts/PartsList.svelte
+
+2	apps/web/src/parts/types.ts
+
+1	apps/web/src/policy/policyView.ts
+
+1	apps/web/src/products/ProductsList.svelte
+
+2	apps/web/src/products/types.ts
+
+14	apps/web/src/qa/QaPage.svelte
+
+1	apps/web/src/shell/nav-catalog.ts
+
+15	apps/web/src/shop/ShopHome.svelte
+
+20	apps/web/src/shop/ShopProductPage.svelte
+
+44	apps/web/src/shop/brewery-products.ts
+
+2	apps/web/src/steps/HandoffSurface.svelte
+
+4	apps/web/src/steps/IntakeSurface.svelte
+
+2	apps/web/src/steps/ProcurementSurface.svelte
+
+3	apps/web/src/steps/ProductionConsumeSurface.svelte
+
+5	apps/web/src/steps/SchedulingSurface.svelte
+
+4	apps/web/src/steps/ShipmentSurface.svelte
+
+1	apps/web/src/views/ViewsPage.svelte
+
+1	apps/web/src/warehouse/WarehousePage.svelte
+
+2	apps/web/src/workflows/StepDagEditor.svelte
+
+1	apps/web/src/workflows/StepInspector.svelte
+
+2	crates/core/boss-calendar-client/src/lib.rs
+
+8	crates/core/boss-classes-client/src/lib.rs
+
+17	crates/core/boss-classes/src/http.rs
+
+1	crates/core/boss-clock/src/bin/boss_clock_api.rs
+
+3	crates/core/boss-clock/src/http.rs
+
+1	crates/core/boss-clock/src/lib.rs
+
+5	crates/core/boss-clock/src/types.rs
+
+1	crates/core/boss-core/src/calendar.rs
+
+1	crates/core/boss-core/src/partition.rs
+
+2	crates/core/boss-core/src/primitives.rs
+
+3	crates/core/boss-core/src/tenant_manifest.rs
+
+1	crates/core/boss-dispatcher/src/config.rs
+
+19	crates/core/boss-dispatcher/src/dispatcher.rs
+
+1	crates/core/boss-dispatcher/src/http.rs
+
+1	crates/core/boss-dispatcher/src/lib.rs
+
+1	crates/core/boss-dispatcher/src/liveness.rs
+
+1	crates/core/boss-dispatcher/src/rules/jobs_spawn.rs
+
+5	crates/core/boss-dispatcher/src/rules/registry.rs
+
+1	crates/core/boss-events/seeds/audit_invariant_rules.toml
+
+3	crates/core/boss-events/src/integrity.rs
+
+9	crates/core/boss-gateway/src/api.rs
+
+2	crates/core/boss-gateway/src/main.rs
+
+1	crates/core/boss-gateway/src/role_headers.rs
+
+1	crates/core/boss-jobs/Cargo.toml
+
+25	crates/core/boss-jobs/seeds/step_types.toml
+
+1	crates/core/boss-jobs/src/agents/door.rs
+
+1	crates/core/boss-jobs/src/bootstrap.rs
+
+2	crates/core/boss-jobs/src/escalation.rs
+
+8	crates/core/boss-jobs/src/experiments.rs
+
+2	crates/core/boss-jobs/src/http/jobs.rs
+
+3	crates/core/boss-jobs/src/http/sim_clock.rs
+
+2	crates/core/boss-jobs/src/http/stations.rs
+
+1	crates/core/boss-jobs/src/http/steps.rs
+
+4	crates/core/boss-jobs/src/http/terminal_report.rs
+
+6	crates/core/boss-jobs/src/in_memory.rs
+
+13	crates/core/boss-jobs/src/owner_resolution.rs
+
+4	crates/core/boss-jobs/src/port.rs
+
+1	crates/core/boss-jobs/src/postgres.rs
+
+34	crates/core/boss-jobs/src/registry.rs
+
+48	crates/core/boss-jobs/src/seed_loader.rs
+
+2	crates/core/boss-jobs/src/station_flow.rs
+
+5	crates/core/boss-jobs/src/station_projection.rs
+
+1	crates/core/boss-jobs/src/station_queue.rs
+
+3	crates/core/boss-jobs/src/stations.rs
+
+2	crates/core/boss-jobs/src/step_registry.rs
+
+4	crates/core/boss-jobs/src/workflow_lint.rs
+
+3	crates/core/boss-policy-client/src/defaults.rs
+
+8	crates/core/boss-policy-client/src/seed_loader.rs
+
+4	crates/core/boss-policy-client/src/types.rs
+
+1	crates/core/boss-policy/src/bin/boss_policy_bootstrap.rs
+
+2	crates/core/boss-policy/src/bootstrap.rs
+
+1	crates/core/boss-ports/src/lib.rs
+
+4	crates/core/boss-search/src/query.rs
+
+2	crates/core/boss-subject-kinds/seeds/subject_identity_sources.toml
+
+1	crates/core/boss-subject-kinds/src/port.rs
+
+6	crates/core/boss-views/src/fleet.rs
+
+2	crates/core/boss-views/src/flow.rs
+
+4	crates/core/boss-views/src/pushdown.rs
+
+1	crates/core/boss-views/src/query.rs
+
+1	crates/modules/boss-accounts/src/accounts.rs
+
+1	crates/modules/boss-assets/src/asset_parts.rs
+
+1	crates/modules/boss-assets/src/postgres.rs
+
+5	crates/modules/boss-assets/src/project.rs
+
+1	crates/modules/boss-assets/src/types.rs
+
+1	crates/modules/boss-campaigns/src/types.rs
+
+1	crates/modules/boss-catalog/src/http.rs
+
+1	crates/modules/boss-catalog/src/lib.rs
+
+1	crates/modules/boss-catalog/src/port.rs
+
+1	crates/modules/boss-catalog/src/postgres.rs
+
+2	crates/modules/boss-catalog/src/types.rs
+
+1	crates/modules/boss-commerce/src/events.rs
+
+1	crates/modules/boss-commerce/src/http.rs
+
+1	crates/modules/boss-commerce/src/port.rs
+
+3	crates/modules/boss-commerce/src/postgres.rs
+
+2	crates/modules/boss-commerce/src/types.rs
+
+1	crates/modules/boss-inventory/src/events.rs
+
+4	crates/modules/boss-inventory/src/http/items.rs
+
+1	crates/modules/boss-inventory/src/port.rs
+
+2	crates/modules/boss-inventory/src/postgres.rs
+
+1	crates/modules/boss-inventory/src/procurement/http.rs
+
+1	crates/modules/boss-inventory/src/types.rs
+
+1	crates/modules/boss-ledger/Cargo.toml
+
+6	crates/modules/boss-ledger/src/events.rs
+
+34	crates/modules/boss-ledger/src/excise.rs
+
+6	crates/modules/boss-ledger/src/http.rs
+
+1	crates/modules/boss-ledger/src/http/bank_settlements.rs
+
+2	crates/modules/boss-ledger/src/http/facts.rs
+
+55	crates/modules/boss-ledger/src/http/keg_deposits.rs
+
+1	crates/modules/boss-ledger/src/http/payroll.rs
+
+53	crates/modules/boss-ledger/src/http/tax.rs
+
+3	crates/modules/boss-ledger/src/kani_proofs.rs
+
+1	crates/modules/boss-ledger/src/lib.rs
+
+2	crates/modules/boss-ledger/src/postgres.rs
+
+5	crates/modules/boss-ledger/src/rebuild_facts.rs
+
+1	crates/modules/boss-ledger/src/rebuild_tax_filings.rs
+
+1	crates/modules/boss-ledger/src/revenue_accounts.rs
+
+82	crates/modules/boss-ledger/src/rules.rs
+
+15	crates/modules/boss-people/src/http.rs
+
+5	crates/modules/boss-products/src/http.rs
+
+3	crates/modules/boss-products/src/lib.rs
+
+3	crates/modules/boss-products/src/port.rs
+
+4	crates/modules/boss-products/src/postgres.rs
+
+5	crates/modules/boss-products/src/types.rs
+
+1	crates/modules/boss-shipping/src/http.rs
+
+5	crates/modules/boss-shipping/src/in_memory.rs
+
+2	crates/modules/boss-shipping/src/rebuild.rs
+
+2	crates/modules/boss-shipping/src/types.rs
+
+3	crates/orchestrators/boss-cli/src/main.rs
+
+22	crates/orchestrators/boss-cli/src/tenant.rs
+
+3	crates/orchestrators/boss-dispatcher-handlers/src/bin/boss_dispatcher.rs
+
+3	crates/orchestrators/boss-dispatcher-handlers/src/cascade.rs
+
+1	crates/orchestrators/boss-dispatcher-handlers/src/handlers/commerce_invoice_issue.rs
+
+1	crates/orchestrators/boss-dispatcher-handlers/src/handlers/common.rs
+
+65	crates/orchestrators/boss-dispatcher-handlers/src/handlers/gate_resolve.rs
+
+27	crates/orchestrators/boss-dispatcher-handlers/src/handlers/inventory_overhead_absorb.rs
+
+1	crates/orchestrators/boss-dispatcher-handlers/src/handlers/inventory_parts_consume.rs
+
+4	crates/orchestrators/boss-dispatcher-handlers/src/handlers/inventory_po_place.rs
+
+36	crates/orchestrators/boss-dispatcher-handlers/src/handlers/ledger_keg_deposit_settle.rs
+
+30	crates/orchestrators/boss-dispatcher-handlers/src/handlers/ledger_tax_accrue.rs
+
+3	crates/orchestrators/boss-dispatcher-handlers/src/handlers/network_census.rs
+
+106	crates/orchestrators/boss-dispatcher-handlers/src/handlers/packaging_allocate.rs
+
+3	crates/orchestrators/boss-dispatcher-handlers/src/handlers/people_hire.rs
+
+9	crates/orchestrators/boss-dispatcher-handlers/src/handlers/products_consume_from_invoice.rs
+
+114	crates/orchestrators/boss-dispatcher-handlers/src/handlers/products_produce.rs
+
+1	crates/orchestrators/boss-dispatcher-handlers/src/handlers/shipping_create.rs
+
+2	crates/orchestrators/boss-dispatcher-handlers/src/handlers/webhook_notify.rs
+
+3	crates/orchestrators/boss-sim/Cargo.toml
+
+14	crates/orchestrators/boss-sim/src/actor_coverage.rs
+
+14	crates/orchestrators/boss-sim/src/api_activity.rs
+
+1	crates/orchestrators/boss-sim/src/engines/bus.rs
+
+4	crates/orchestrators/boss-sim/src/engines/counterparty.rs
+
+5	crates/orchestrators/boss-sim/src/engines/day_runner.rs
+
+2	crates/orchestrators/boss-sim/src/engines/periodic.rs
+
+15	crates/orchestrators/boss-sim/src/event_routes.rs
+
+1	crates/orchestrators/boss-sim/src/lib.rs
+
+16	crates/orchestrators/boss-sim/src/output.rs
+
+127	crates/orchestrators/boss-sim/src/shape_driven/engine.rs
+
+11	crates/orchestrators/boss-sim/src/shape_driven/sampler.rs
+
+1	crates/orchestrators/boss-sim/src/shape_driven/state.rs
+
+57	crates/orchestrators/boss-sim/src/shape_driven/tenant.rs
+
+83	crates/orchestrators/boss-sim/src/workforce.rs
+
+1	crates/orchestrators/boss-simulator/src/bin/boss_simulator.rs
+
+1	infra/cluster/export-log-copy.sh
+
+6	infra/cluster/manifests/boss.yaml
+
+1	infra/platform/workflows/learning.toml
+
+1	infra/platform/workflows/protocol-retro.toml
+
+39	infra/postgres/schema/01-registries.sql
+
+1	infra/postgres/schema/03-jobs.sql
+
+5	infra/postgres/schema/09-clock.sql
+
+1	infra/postgres/schema/108-event-kinds.sql
+
+1	infra/postgres/schema/116-stations.sql
+
+1	infra/postgres/schema/144-estate-subjects.sql
+
+15	infra/postgres/schema/153-excise-rate-schedules.sql
+
+1	infra/postgres/schema/20-catalog.sql
+
+38	infra/postgres/schema/202609021400-a-keg-deposit-is-a-liability.sql
+
+4	infra/postgres/schema/202609022300-event-kinds-ledger-control-plane.sql
+
+2	infra/postgres/schema/202609040000-event-kinds-emitted-vocabulary-backfill.sql
+
+20	infra/postgres/schema/20260910190000-every-live-rule-says-why-it-exists.sql
+
+2	infra/postgres/schema/21-assets.sql
+
+4	infra/postgres/schema/22-accounts.sql
+
+2	infra/postgres/schema/23-commerce.sql
+
+1	infra/postgres/schema/24-inventory.sql
+
+15	infra/postgres/schema/25-products.sql
+
+4	infra/postgres/schema/27-shipping.sql
+
+1	infra/postgres/schema/29-campaigns.sql
+
+14	infra/postgres/schema/40-ledger.sql
+
+4	infra/postgres/schema/41-dispatcher.sql

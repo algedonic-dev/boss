@@ -304,7 +304,7 @@ The **Workflow registry** (`boss-jobs`, backed by the `workflows` table) is appe
 - `steps` — a flat set of Steps; the DAG is implicit in each step's `ready_when` predicate (an edge A → B exists iff B's `ready_when` references A), not an author-drawn graph
 - `metadata_schema` + `entitlements` — typed fields and policy hooks on the Job itself
 
-**Adding a new workflow means adding a Workflow row**, not touching core code. New versions supersede old ones; in-flight Jobs stay pinned to the version they were opened under — never moved on publish. Moving one is an explicit, recorded act: `boss job convert <packet> [--to vN] [--dry-run]` (`POST /api/jobs/{id}/convert`, `publish` authority on `workflow`) refuses a move that would demand evidence retroactively or strand a step, re-projects the target's text onto steps not yet completed, creates the steps it inserts, leaves completed steps with what they ran under, and records a `jobs.job.repinned` event plus a `repins` entry on the packet (design 7cf202a9). Authoring lives at `/system/workflows`.
+**Adding a new workflow means adding a Workflow row**, not touching core code. New versions supersede old ones; in-flight Jobs stay pinned to the version they were opened under — never moved on publish. Moving one is an explicit, recorded act: `boss job convert <packet> [--to vN] [--dry-run]` (`POST /api/jobs/{id}/convert`, `publish` authority on `workflow`) refuses a move onto a version never published (a draft, ce8b7d66) or one that would demand evidence retroactively or strand a step, re-projects the target's text onto steps not yet completed, creates the steps it inserts, leaves completed steps with what they ran under, and records a `jobs.job.repinned` event plus a `repins` entry on the packet (design 7cf202a9). Authoring lives at `/system/workflows`.
 
 ### Steps
 A **Step** is the typed unit of work inside a Job. Each step has a `kind` (from the StepType registry), `status` (pending → ready → active → completed (+ skipped)), optional assignee, `blocked_by` (a predicate-derived denormalized edge list for DAG rendering — recovered from the step's `ready_when` references, not an author-specified gate), optional sign-off, and free-form `metadata`.
@@ -322,7 +322,7 @@ Every state change emits an immutable fact through NATS (`boss-nats`) and lands 
 
 These three hang off the four primitives. They are load-bearing infrastructure, not foundational vocabulary.
 
-- **Class registry** — typed reference data each Subject kind owns. One `classes` table keyed `(subject_kind, code)` carries every taxonomy in the system: roles (Classes of `employee` Subjects), AccountTypes (Classes of `account` Subjects), asset models, departments, account tiers. See [docs/design/class-registry.md](docs/design/class-registry.md).
+- **Class registry** — typed reference data each Subject kind owns. One `classes` table keyed `(subject_kind, code)` carries every taxonomy in the system: roles (Classes of `employee` Subjects), AccountTypes (Classes of `account` Subjects), asset models, account tiers, a department's function. Departments themselves are not Classes: they are Subjects with identity in the `departments` registry (`GET /api/departments`), which an employee's `department` validates against (backlog c87e3d6d). See [docs/design/class-registry.md](docs/design/class-registry.md).
 - **StepPlugins** — UX extensions on Steps. A plugin is a small JS bundle served by the gateway at `/plugins/<path>` that renders a custom surface for a step kind. Plugins ship as data (a row in `step_plugins`) + a static JS asset; authoring at `/system/step-plugins`. **New step surfaces do not require a core code change in `apps/web`.** Decision record: [docs/architecture-decisions.md](docs/architecture-decisions.md) §Step UX & frontend.
 - **Policy** — every write passes through `boss-policy` (via the `PolicyClient` port). Rules are row-level: a rule grants an `(action, resource)` within a `scope`; user-specific overrides take precedence; `policy_rule_audit` tracks every decision.
 
@@ -926,7 +926,14 @@ a door that stops being true is a defect worth a car.
   since 539cad85 the verb says it at launch: a gate with no park intent
   on a branch whose car is at the dock prints a WARNING naming the car,
   the head it still vouches for, and the `boss rerail <car> --finish`
-  that carries the green onto it. And
+  that carries the green onto it. **The probe is the half `--finish`
+  cannot supply**: a bare green states none, so the car keeps its first
+  gate's, and car bfb219b4 was proven FAILING on correct code after a
+  review fold rewrote the line it grepped (backlog 79a17c7a). So the
+  launch warning names the kept probe, `--finish` takes the probe from
+  a green that states one, and otherwise replays the kept probe's grep
+  strings against the new head and warns on each it no longer holds. A
+  head that changed a probed line is re-gated WITH its park flags. And
   **prose with backticks does not survive argv**, and that is not a
   `--park-*` rule — it belongs to EVERY flag that carries a sentence
   (`boss triage --evidence`, `boss fold --change`, `boss design
@@ -982,8 +989,12 @@ a door that stops being true is a defect worth a car.
   the dispatcher's `credential.rotate.*` handler mints the replacement
   with a root credential only it holds, PATCHes it into ONE named Secret,
   verifies it by effect, and only then revokes the old one — each phase
-  a step on the packet and a `credential.*` event. It rotates two today:
-  the dev pod's forge token and the Cloudflare tunnel credentials.
+  a step on the packet and a `credential.*` event. It rotates the dev
+  pod's forge token, the forge host's checkout token, the Cloudflare
+  tunnel credentials, and GitHub App installation tokens — minted from an
+  App root David places once, and re-minted by a fifteen-minute clock rule
+  because each lives one hour (design 76155676; the handler is
+  `credential.rotate.github-app-installation`).
   Consumers read Secret mounts; for the residue a mount cannot reach — a
   token file on a writable path, the git credential helper — `boss
   credential pull forge` reads the one Secret the dev session's Role

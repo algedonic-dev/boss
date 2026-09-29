@@ -928,29 +928,17 @@
       if (!r.ok) throw new Error(`step metadata merge HTTP ${r.status}: ${await r.text()}`);
     }
 
-    async function freshStep() {
-      // The metadata PATCH answers 204 with no body, so the post-merge
-      // row must be read back before completing: the completion PUT
-      // still replaces metadata wholesale, and completing with this
-      // page's snapshot would re-introduce the exact lost update the
-      // PATCH just avoided. There is no single-step GET; the job's
-      // steps list is the read the API offers.
-      const r = await fetch(`/api/jobs/${jobId}/steps`);
-      if (!r.ok) throw new Error(`step read-back HTTP ${r.status}: ${await r.text()}`);
-      const steps = await r.json();
-      const fresh = Array.isArray(steps) ? steps.find((s) => s.id === step.id) : null;
-      if (!fresh) throw new Error('step read-back: step missing from its own job');
-      return fresh;
-    }
-
-    async function putStep(base, status) {
-      // The step PUT overlays: any field the body omits keeps its
-      // current value, so a status-only body (base = {}) moves the
-      // status and touches nothing else — metadata included.
+    async function putStatus(status) {
+      // The status alone (backlog e39a9d2a, design 93d2bddb). The step
+      // PUT overlays — any field the body omits keeps its current
+      // value — so this moves the status and touches nothing else,
+      // metadata included. It used to read the merged row back and PUT
+      // it whole: correct, but a metadata body on the step PUT, and
+      // that PUT is closing to any metadata body.
       const r = await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...base, job_id: jobId, status }),
+        body: JSON.stringify({ status }),
       });
       if (!r.ok) throw new Error(`step save HTTP ${r.status}: ${await r.text()}`);
     }
@@ -981,12 +969,9 @@
         //    judged by that predicate from any open state.
 
         if (completing) {
-          // 3. Read the post-merge row back — the stamps and the
-          //    completion must attest the step's true final shape,
-          //    not this page's snapshot.
-          const fresh = await freshStep();
-          // 4. Stamp every required sign-off role in the step's now-
-          //    final shape. Policy gates each on `step-signoff:<role>`
+          // 3. Stamp every required sign-off role in the step's now-
+          //    final shape — the server stamps the row as it stands,
+          //    after the merge above. Policy gates each on `step-signoff:<role>`
           //    — a 403 here means the signed-in user lacks that
           //    authority, and we SAY so instead of silently dropping
           //    it (the pre-fix flow swallowed the completion 409 and
@@ -1006,9 +991,9 @@
               );
             }
           }
-          // 5. Complete with the identical metadata the stamps attest
-          //    — the fresh row verbatim.
-          await putStep(fresh, 'completed');
+          // 4. Complete. The status alone leaves the metadata the stamps
+          //    attest exactly as they found it.
+          await putStatus('completed');
         }
         onUpdate();
       } catch (e) {

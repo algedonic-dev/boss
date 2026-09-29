@@ -304,11 +304,21 @@ fi
 cat "$TMP/del.out"
 
 # Verified gone, because "the command exited 0" and "the object is gone"
-# are different claims.
-if "${KUBECTL[@]}" get "$KIND" "$NAME" -n "$NS" --request-timeout=10s >/dev/null 2>&1; then
+# are different claims. And gone is ONE answer, NotFound — not "the get
+# failed" (backlog 1058e686, car B): until this read-back took the
+# server's words, a timeout, an auth error or an unreachable API server
+# failed the get exactly as NotFound does and printed OK, a proof that
+# failed open. Any other failure is said as what it is: the delete ran,
+# and nothing has shown the object gone.
+if "${KUBECTL[@]}" get "$KIND" "$NAME" -n "$NS" --request-timeout=10s >/dev/null 2> "$TMP/gone.err"; then
     say "the delete returned success and $KIND/$NS/$NAME is STILL THERE — something is recreating it."
     say "  Look for a controller or a hand-run apply; this verb will not try again."
     exit 1
 fi
-say "OK — $KIND \`$NAME\` is gone from \`$NS\`, and no manifest declared it."
+if ! grep -qF 'Error from server (NotFound)' "$TMP/gone.err"; then
+    say "CANNOT ANSWER — deleted, not proven gone: the delete of $KIND/$NS/$NAME returned success, and the read-back answered something other than NotFound:"
+    sed 's/^/    /' "$TMP/gone.err" >&2
+    exit 1
+fi
+say "OK — $KIND \`$NAME\` is gone from \`$NS\` (read back: NotFound), and no manifest declared it."
 exit 0

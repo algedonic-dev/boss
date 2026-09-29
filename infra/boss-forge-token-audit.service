@@ -27,7 +27,7 @@ Type=oneshot
 # open and loud. Exit 0 only when the forge matches the declaration AND
 # the credentials registry AND every declared consumer is identified.
 Environment=RUST_LOG=info
-ExecStartPre=/opt/boss/infra/boss-maintenance-wrap.sh maintenance-forge-token-audit "Forge token audit"
+ExecStartPre=-/opt/boss/infra/boss-maintenance-wrap.sh maintenance-forge-token-audit "Forge token audit"
 ExecStart=/usr/bin/python3 /opt/boss/infra/maintenance/forge-token-audit.py \
     --declaration /opt/boss/infra/platform/forge-tokens.toml \
     --db /opt/forgejo/data/gitea/gitea.db \

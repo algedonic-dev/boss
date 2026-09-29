@@ -69,6 +69,17 @@ tempfile = "3"
 boss-testing = { path = "../boss-testing" }
 # oneshot() for the role-header middleware probe tests.
 tower = { version = "0.5", features = ["util"] }
+# The extractor boss-jobs reads `x-boss-user` with, so a role-header
+# test reads a session the way the operator doors do (backlog 3c92c5b8).
+boss-policy-client = { path = "../boss-policy-client" }
+# The input-lane vocabulary, so the break-glass boot alarm's one spelling
+# of its lane is held equal to it (CLAUDE.md §9a; backlog 5eb583c2).
+# Already in the test graph through boss-testing; nothing new compiles.
+boss-jobs = { path = "../boss-jobs" }
+# A software P-256 authenticator for the elevation's real-assertion
+# tests (review of car 0bde9b99, L3). Already in the tree through
+# webauthn-rs-core; no new crate is fetched.
+openssl = "0.10"
 
 [lints]
 workspace = true

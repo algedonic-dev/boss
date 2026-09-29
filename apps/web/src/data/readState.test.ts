@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test';
 import {
   blankMeaning,
   countLabel,
+  emptyLine,
+  emptyState,
   failedRead,
   failedWithReason,
   listView,
@@ -207,5 +209,76 @@ describe('a blank cell says which kind of nothing it is', () => {
   test('every state is one of the two — no third reading', () => {
     const states: ReadState[] = [okRead, failedRead('x'), loadingRead];
     expect(states.map(blankMeaning)).toEqual(['absent', 'unknown', 'unknown']);
+  });
+});
+
+// Backlog 0ef5e008. Seven list pages had ONE empty line, "No X match
+// those filters.", for two different facts: nothing exists, and the
+// filters hid everything that does. An empty list says which of three
+// things is true — the read failed, there is nothing, or the filters hid
+// it — and each page asks this one function rather than writing its own.
+describe('an empty list says which of three things is true', () => {
+  const read = (state: ReadState) => [{ source: '/api/things', state }];
+  const words = { what: 'things', noun: 'things' };
+
+  test('a failed read is the failure line, and it names the source', () => {
+    const v = emptyState(read(failedRead('Failed to fetch')), 0, 0);
+    expect(v).toEqual({ kind: 'failed', error: '/api/things: Failed to fetch' });
+    expect(emptyLine(v, words)).toEqual({
+      text: "Couldn't load things — /api/things: Failed to fetch",
+      alert: true,
+    });
+  });
+
+  test('an error that already names its source is not named twice', () => {
+    const v = emptyState(read(failedRead('/api/things?limit=9: HTTP 503')), 0, 0);
+    expect(v).toEqual({ kind: 'failed', error: '/api/things?limit=9: HTTP 503' });
+    // A list built from several reads names the one that failed.
+    const several = [{ source: 'the parts reads', state: failedRead('/api/catalog/parts: HTTP 502') }];
+    expect(emptyState(several, 0, 0)).toEqual({ kind: 'failed', error: '/api/catalog/parts: HTTP 502' });
+  });
+
+  test('a failure outranks rows: numbers from a failed read are not the list', () => {
+    expect(emptyState(read(failedRead('HTTP 500')), 4, 4).kind).toBe('failed');
+  });
+
+  test('a read in flight says nothing about the list', () => {
+    const v = emptyState(read(loadingRead), 0, 0);
+    expect(v).toEqual({ kind: 'loading' });
+    expect(emptyLine(v, words)).toEqual({ text: 'Loading…', alert: false });
+  });
+
+  test('an empty source is not the filters’ fault', () => {
+    const v = emptyState(read(okRead), 0, 0);
+    expect(v).toEqual({ kind: 'none' });
+    expect(emptyLine(v, words)).toEqual({ text: 'No things yet.', alert: false });
+    expect(emptyLine(v, { ...words, none: 'Nothing has been scored.' })?.text).toBe(
+      'Nothing has been scored.',
+    );
+  });
+
+  test('rows the filters hid everything of — the only case that blames them', () => {
+    const v = emptyState(read(okRead), 5, 0);
+    expect(v).toEqual({ kind: 'filtered' });
+    expect(emptyLine(v, words)).toEqual({
+      text: 'No things match those filters.',
+      alert: false,
+    });
+  });
+
+  test('visible rows need no empty line at all', () => {
+    const v = emptyState(read(okRead), 5, 2);
+    expect(v).toEqual({ kind: 'rows' });
+    expect(emptyLine(v, words)).toBeNull();
+  });
+
+  test('the four empty answers are four different lines', () => {
+    const lines = [
+      emptyState(read(failedRead('x')), 0, 0),
+      emptyState(read(loadingRead), 0, 0),
+      emptyState(read(okRead), 0, 0),
+      emptyState(read(okRead), 3, 0),
+    ].map((v) => emptyLine(v, words)?.text);
+    expect(new Set(lines).size).toBe(4);
   });
 });

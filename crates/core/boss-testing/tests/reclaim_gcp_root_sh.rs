@@ -29,6 +29,21 @@
 //! refusal; and, through `ops-runner.sh` with the shipped verb files,
 //! the plan verb is answered on boss-gcp while a path, or a hash with no
 //! approval, never reaches the write.
+//!
+//! THE ONE EXCEPTION UNDER /var/backups (backlog f44ca628, 2026-09-28).
+//! David: "Delete the second-stack capture, build it as a verb." The
+//! capture retire-second-stack took on 2026-09-15 (ops-request 7912c9ae)
+//! is 2.3 GB, and without it boss-gcp stays ~0.6 GB under its floor after
+//! every other reclaim. So the plan also names each capture in the
+//! scratch `var/backups/boss/second-stack` with its size and sha256 — the
+//! signature binds those bytes — and the write removes it LAST, re-hashed
+//! at the moment before `rm -f`. Pinned here: a symlinked capture or
+//! capture directory, a name retire-second-stack does not write (a
+//! 14-digit stamp, `second-stack-x.sql`), a directory by a capture's
+//! name, a capture a process holds open, and a capture whose bytes
+//! changed are each refused or left; a sibling cluster-pg dump, a
+//! compressed copy and a capture-named file in ANOTHER directory survive
+//! every run.
 
 use boss_testing::{repo_root, scratch_dir, write_exec, write_file};
 use std::path::{Path, PathBuf};
@@ -55,6 +70,19 @@ const BACKUPS: [&str; 4] = [
 /// Neighbours that must survive every run: the live trees, and names
 /// that only resemble a backup.
 const KEPT: [&str; 4] = ["boss", "boss-cli", "boss-dev-bak2", "boss-binbak"];
+
+/// The capture's real name, as retire-second-stack wrote it:
+/// `second-stack-$(date -u +%Y%m%dT%H%M%SZ).sql`.
+const CAPTURE: &str = "second-stack-20260915T211123Z.sql";
+const CAPTURE_BYTES: &str = "-- PostgreSQL database dump of the retired second stack\n";
+
+/// Beside the capture, under /var/backups, and never this verb's: the
+/// cluster-pg dumps (not decided), and a compressed copy of a capture —
+/// a name retire-second-stack never writes.
+const NOT_OURS: [&str; 2] = [
+    "boss-cluster-pg/boss-cluster-pg-20260920T030000Z.sql.gz",
+    "second-stack/second-stack-20260915T211123Z.sql.gz",
+];
 
 fn epoch_now() -> u64 {
     SystemTime::now()
@@ -108,6 +136,9 @@ struct Case {
     units: PathBuf,
     mountinfo: PathBuf,
     calls: PathBuf,
+    /// The scratch /var/backups/boss, canonical: the script refuses a
+    /// capture directory whose realpath is not its own spelling.
+    backups: PathBuf,
 }
 
 struct Run {
@@ -152,6 +183,28 @@ impl Case {
         std::os::unix::fs::symlink(opt.join("boss/bin/boss-jobs-api"), proc_dir.join("101/exe"))
             .unwrap();
         write_file(&proc_dir.join("101/comm"), "boss-jobs-api\n");
+        // Its open files: one, nothing under /var/backups.
+        std::fs::create_dir_all(proc_dir.join("101/fd")).unwrap();
+        std::os::unix::fs::symlink("/dev/null", proc_dir.join("101/fd/0")).unwrap();
+        // Init, whose fd table the capture bound requires it read: a
+        // process table without pid 1 is not a whole host's.
+        std::fs::create_dir_all(proc_dir.join("1/fd")).unwrap();
+        std::os::unix::fs::symlink("/dev/null", proc_dir.join("1/fd/0")).unwrap();
+        write_file(&proc_dir.join("1/comm"), "systemd\n");
+        // /var/backups/boss: the capture, and what is never this verb's.
+        // Modes set outright, not left to the umask: the bound refuses a
+        // group- or other-writable capture directory or parent.
+        let backups = root.join("var/backups/boss");
+        std::fs::create_dir_all(backups.join("second-stack")).unwrap();
+        let backups = std::fs::canonicalize(&backups).unwrap();
+        for d in [backups.clone(), backups.join("second-stack")] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap(); // mode-bits-ok: a fixture directory the capture bound reads the mode of, not a script
+        }
+        put(&backups.join("second-stack").join(CAPTURE), CAPTURE_BYTES);
+        for n in NOT_OURS {
+            put(&backups.join(n), "not this verb's\n");
+        }
         // A unit file on disk that runs from the live tree.
         write_file(
             &units.join("boss-jobs-api.service"),
@@ -195,10 +248,17 @@ esac
         write_exec(
             &bin.join("journalctl"),
             "#!/bin/sh\n# stub journalctl: records its argv. STUB_PLANT_GIT plants a .git\n\
-             # there on --disk-usage, which the write calls AFTER it re-renders the plan.\n\
+             # there on --disk-usage, which the write calls AFTER it re-renders the plan;\n\
+             # STUB_REWRITE rewrites that file's bytes at the same moment, STUB_HARDLINK\n\
+             # (\"<from> <to>\") hardlinks, STUB_FD (\"<fd path> <target>\") plants an open\n\
+             # fd, and STUB_SWAP_DIR moves a directory aside and links it back.\n\
              echo \"journalctl $*\" >> \"$STUB_CALLS\"\n\
              case \"$1\" in --disk-usage)\n\
                if [ -n \"${STUB_PLANT_GIT:-}\" ]; then mkdir -p \"$STUB_PLANT_GIT/.git\"; fi\n\
+               if [ -n \"${STUB_REWRITE:-}\" ]; then printf 'late bytes\\n' > \"$STUB_REWRITE\"; fi\n\
+               if [ -n \"${STUB_HARDLINK:-}\" ]; then set -- $STUB_HARDLINK; ln \"$1\" \"$2\"; fi\n\
+               if [ -n \"${STUB_FD:-}\" ]; then set -- $STUB_FD; mkdir -p \"${1%/*}\"; ln -s \"$2\" \"$1\"; fi\n\
+               if [ -n \"${STUB_SWAP_DIR:-}\" ]; then mv \"$STUB_SWAP_DIR\" \"$STUB_SWAP_DIR.moved\"; ln -s \"$STUB_SWAP_DIR.moved\" \"$STUB_SWAP_DIR\"; fi\n\
                echo 'Archived and active journals take up 4.1G in the file system.';; esac\n",
         );
         Self {
@@ -210,6 +270,42 @@ esac
             units,
             mountinfo,
             calls,
+            backups,
+        }
+    }
+
+    fn capture_dir(&self) -> PathBuf {
+        self.backups.join("second-stack")
+    }
+
+    /// The uid that owns the fixture's /var/backups/boss.
+    fn owner(&self) -> String {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&self.backups).unwrap().uid().to_string()
+    }
+
+    fn capture(&self) -> PathBuf {
+        self.capture_dir().join(CAPTURE)
+    }
+
+    /// The plan's line for a capture holding `bytes`.
+    fn capture_line(&self, path: &Path, bytes: &str) -> String {
+        format!(
+            "would remove {} ({} bytes, sha256 {})",
+            path.display(),
+            bytes.len(),
+            sha256(bytes)
+        )
+    }
+
+    /// Nothing under the scratch /var/backups that is not this verb's was
+    /// touched.
+    fn assert_not_ours_intact(&self, text: &str) {
+        for n in NOT_OURS {
+            assert!(
+                self.backups.join(n).is_file(),
+                "{n} under /var/backups was touched:\n{text}"
+            );
         }
     }
 
@@ -229,6 +325,10 @@ esac
             .env("BOSS_RECLAIM_MOUNTINFO", &self.mountinfo)
             .env("BOSS_RECLAIM_UNIT_DIRS", &self.units)
             .env("BOSS_RECLAIM_NOW", sixty_days_on())
+            .env("BOSS_RECLAIM_CAPTURE_DIR", self.capture_dir())
+            // The fixture's owner stands in for root: no test account can
+            // chown to uid 0 (the gate runs as 65534, the pod has no CAP_CHOWN).
+            .env("BOSS_RECLAIM_CAPTURE_OWNER", self.owner())
             .env(
                 "BOSS_RECLAIM_LINK_DIRS",
                 format!("{} {}", self.opt.display(), self.links.display()),
@@ -275,6 +375,11 @@ esac
                 "{b} was touched:\n{text}"
             );
         }
+        assert!(
+            self.capture().is_file() || self.capture().is_symlink(),
+            "the capture was removed:\n{text}"
+        );
+        self.assert_not_ours_intact(text);
         assert!(
             !self.calls().contains("--vacuum-size"),
             "the journal was vacuumed:\n{text}"
@@ -325,8 +430,19 @@ fn dry_run_renders_a_plan_naming_its_own_hash_and_removes_nothing() {
         &[
             "), holding:\n  VERSION\n  bin\n",
             "would vacuum the journal to 1G",
+            &c.capture_line(&c.capture(), CAPTURE_BYTES),
         ],
         "the plan",
+    );
+    // Nothing else under /var/backups is named, not even a capture's
+    // compressed copy.
+    for n in NOT_OURS {
+        assert!(!r.out.contains(n), "the plan names {n}:\n{text}");
+    }
+    contains_all(
+        &r.err,
+        &["1 second-stack capture(s) (56 bytes)"],
+        "the dry run's verdict",
     );
     for k in KEPT {
         assert!(
@@ -394,7 +510,33 @@ fn the_signed_plan_removes_exactly_the_backups_and_vacuums_to_1g() {
         "the journal was not vacuumed to 1G:\n{}",
         c.calls()
     );
-    contains_all(&text, &["OK — removed 4 backup directories"], "the verdict");
+    contains_all(
+        &text,
+        &[
+            "OK — removed 4 backup directories",
+            "and 1 second-stack capture(s) (56 bytes)",
+            &format!("removed {} (56 bytes, sha256 ", c.capture().display()),
+        ],
+        "the verdict",
+    );
+    // The capture went, LAST (after every backup directory), and nothing
+    // else under /var/backups did.
+    assert!(
+        !c.capture().exists(),
+        "the capture was not removed:\n{text}"
+    );
+    assert!(c.capture_dir().is_dir(), "the capture's directory went");
+    c.assert_not_ours_intact(&text);
+    let last_dir = text
+        .rfind(&format!("removed {}", c.opt.display()))
+        .expect("a removed directory");
+    let capture_at = text
+        .find(&format!("removed {}", c.capture().display()))
+        .expect("the removed capture");
+    assert!(
+        last_dir < capture_at,
+        "the capture was not removed last:\n{text}"
+    );
 
     // At most once: the applied plan's backups are gone, so it no longer
     // hashes to the signature and a second run removes nothing.
@@ -1169,6 +1311,354 @@ fn a_checkout_that_appears_after_the_render_is_not_removed() {
         "the late checkout was removed:\n{text}"
     );
     assert!(!c.calls().contains("--vacuum-size"));
+}
+
+// ---------------------------------------------------------------------------
+// The second-stack capture: the one exception under /var/backups (David,
+// 2026-09-28, backlog f44ca628).
+// ---------------------------------------------------------------------------
+
+/// The signature binds the capture's BYTES, not its name or size: the
+/// same length rewritten is a different plan, and a plan signed before
+/// the rewrite removes nothing.
+#[test]
+fn the_plan_hash_moves_with_the_captures_bytes_and_a_stale_signature_removes_nothing() {
+    let c = Case::new("capture-bytes");
+    let before = c.run(&["--dry-run"]);
+    assert_eq!(before.code, 0, "{}", before.text());
+    let rewritten = CAPTURE_BYTES.replace("retired", "RETIRED");
+    assert_eq!(
+        rewritten.len(),
+        CAPTURE_BYTES.len(),
+        "the fixture moved size"
+    );
+    write_file(&c.capture(), &rewritten);
+    let after = c.run(&["--dry-run"]);
+    assert_eq!(after.code, 0, "{}", after.text());
+    assert_ne!(
+        before.plan_sha(),
+        after.plan_sha(),
+        "a capture rewritten at the same size hashed to the same plan"
+    );
+    contains_all(
+        &after.out,
+        &[&c.capture_line(&c.capture(), &rewritten)],
+        "the re-rendered plan",
+    );
+
+    let r = c.run(&[&before.plan_sha()]);
+    let text = r.text();
+    assert_eq!(r.code, 2, "a stale signature was not refused:\n{text}");
+    contains_all(&text, &["not the approved"], "the refusal");
+    c.assert_nothing_removed(&text);
+}
+
+/// The last moment: the capture's bytes change AFTER the write re-rendered
+/// the plan and before its rm. The re-hash beside the rm refuses it, and
+/// the capture — removed last — is the thing still standing.
+#[test]
+fn a_capture_rewritten_after_the_render_is_not_removed() {
+    let c = Case::new("capture-late");
+    let sha = c.run(&["--dry-run"]).plan_sha();
+    let r = c.run_env(
+        &[&sha],
+        &[("STUB_REWRITE", c.capture().display().to_string())],
+    );
+    let text = r.text();
+    assert_eq!(r.code, 2, "a late rewrite was not refused:\n{text}");
+    contains_all(
+        &text,
+        &[
+            "hashes to",
+            "not the planned",
+            "already removed (4):",
+            "the journal was not vacuumed",
+        ],
+        "the refusal",
+    );
+    assert_eq!(
+        std::fs::read_to_string(c.capture()).unwrap(),
+        "late bytes\n",
+        "the rewritten capture was removed:\n{text}"
+    );
+    c.assert_not_ours_intact(&text);
+    assert!(!c.calls().contains("--vacuum-size"));
+}
+
+#[test]
+fn refuses_a_symlinked_capture_and_leaves_its_target() {
+    let c = Case::new("capture-symlink");
+    let target = c.backups.join("boss-cluster-pg/live.sql");
+    put(&target, "a dump somebody still wants\n");
+    std::fs::remove_file(c.capture()).unwrap();
+    std::os::unix::fs::symlink(&target, c.capture()).unwrap();
+    c.refused(&["--dry-run"], &[], &[CAPTURE, "is a symlink"]);
+    assert!(target.is_file(), "the link's target was touched");
+}
+
+/// The directory, too: a capture directory that is a link is somewhere
+/// else, and nothing is read through it.
+#[test]
+fn refuses_a_symlinked_capture_directory() {
+    let c = Case::new("capture-dir-symlink");
+    let elsewhere = c.root.join("elsewhere");
+    std::fs::rename(c.capture_dir(), &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, c.capture_dir()).unwrap();
+    c.refused(&["--dry-run"], &[], &["second-stack", "is a symlink"]);
+    assert!(elsewhere.join(CAPTURE).is_file());
+}
+
+/// A name retire-second-stack does not write is refused, loudly, with
+/// nothing removed — its stamp is `%Y%m%dT%H%M%SZ`, so a 14-digit stamp
+/// (the packet's first reading) is not a capture this verb was reviewed
+/// to remove.
+#[test]
+fn refuses_a_capture_name_retire_second_stack_does_not_write() {
+    for (case, name) in [
+        ("capture-14-digit", "second-stack-20260915211123.sql"),
+        ("capture-word", "second-stack-x.sql"),
+        ("capture-space", "second-stack-20260915T211123Z .sql"),
+    ] {
+        let c = Case::new(case);
+        put(&c.capture_dir().join(name), "odd\n");
+        c.refused(&["--dry-run"], &[], &[name, "not ^second-stack-"]);
+        assert!(c.capture_dir().join(name).is_file());
+    }
+}
+
+#[test]
+fn refuses_a_directory_by_a_captures_name() {
+    let c = Case::new("capture-is-dir");
+    let d = c.capture_dir().join("second-stack-20260916T000000Z.sql");
+    put(&d.join("inside"), "x\n");
+    c.refused(&["--dry-run"], &[], &["is not a regular file"]);
+    assert!(d.join("inside").is_file());
+}
+
+/// A capture a process holds open is refused: it is being written (a
+/// retire-second-stack run's pg_dump) or read (a restore), and removing
+/// it frees nothing while that process lives.
+#[test]
+fn refuses_a_capture_a_process_holds_open() {
+    let c = Case::new("capture-open");
+    std::fs::create_dir_all(c.proc_dir.join("303/fd")).unwrap();
+    std::os::unix::fs::symlink(c.capture(), c.proc_dir.join("303/fd/5")).unwrap();
+    write_file(&c.proc_dir.join("303/comm"), "pg_dump\n");
+    c.refused(&["--dry-run"], &[], &["process 303", "pg_dump", "open"]);
+}
+
+/// A process table that cannot be read is a bound that cannot be
+/// evaluated — a refusal, never a pass — for BOTH readers of it: bound
+/// 5(d), whether a backup is a running process's executable (it passed
+/// silently until the adversarial review of 7bca1fee), and bound 7,
+/// whether a process holds the capture open.
+#[test]
+fn a_process_table_that_cannot_be_read_is_a_refusal() {
+    let c = Case::new("no-proc-backups");
+    let gone = c.root.join("no-such-proc").display().to_string();
+    c.refused(
+        &["--dry-run"],
+        &[("BOSS_RECLAIM_PROC_DIR", gone.clone())],
+        &["running process", "cannot be read", "not passed"],
+    );
+    // With no backup directory to judge, the capture bound is the reader.
+    let c = Case::new("no-proc-capture");
+    for b in BACKUPS {
+        std::fs::remove_dir_all(c.opt.join(b)).unwrap();
+    }
+    let gone = c.root.join("no-such-proc").display().to_string();
+    let r = c.run_env(&["--dry-run"], &[("BOSS_RECLAIM_PROC_DIR", gone)]);
+    let text = r.text();
+    assert_eq!(r.code, 2, "an unreadable table passed the capture:\n{text}");
+    contains_all(
+        &text,
+        &["holds", "open cannot be judged", "cannot be read"],
+        "the refusal",
+    );
+    assert!(c.capture().is_file());
+}
+
+/// A partial process table — no pid 1 — is not the host's whole table,
+/// and a holder could be among the missing.
+#[test]
+fn a_process_table_without_init_is_a_refusal() {
+    let c = Case::new("capture-no-init");
+    std::fs::remove_dir_all(c.proc_dir.join("1")).unwrap();
+    c.refused(&["--dry-run"], &[], &["process 1", "not passed"]);
+}
+
+/// An fd that cannot be followed for any reason but "gone" (here a link
+/// loop; on a host, EIO or E2BIG) leaves the bound unread: a refusal.
+#[test]
+fn an_fd_that_cannot_be_followed_is_a_refusal() {
+    let c = Case::new("capture-fd-loop");
+    let fd = c.proc_dir.join("101/fd/9");
+    std::os::unix::fs::symlink(&fd, &fd).unwrap();
+    c.refused(
+        &["--dry-run"],
+        &[],
+        &["process 101", "cannot be followed", "not passed"],
+    );
+}
+
+/// The adversarial review's MUST-FIX 1: a boss-cluster-pg dump hardlinked
+/// in under a capture's name passed, the write removed the NAME, and the
+/// OK line claimed bytes freed that were not — a false record under
+/// David's passkey. A capture with more than one link is refused.
+#[test]
+fn refuses_a_hardlinked_capture() {
+    let c = Case::new("capture-hardlink");
+    let dump = c.backups.join(NOT_OURS[0]);
+    std::fs::remove_file(c.capture()).unwrap();
+    std::fs::hard_link(&dump, c.capture()).unwrap();
+    c.refused(&["--dry-run"], &[], &[CAPTURE, "2 links"]);
+    assert!(dump.is_file());
+}
+
+/// ...and at the last moment: a link made after the render is refused by
+/// the write's own count, with the capture standing.
+#[test]
+fn a_capture_hardlinked_after_the_render_is_not_removed() {
+    let c = Case::new("capture-late-hardlink");
+    let sha = c.run(&["--dry-run"]).plan_sha();
+    let twin = c.backups.join("boss-cluster-pg/twin.sql");
+    let r = c.run_env(
+        &[&sha],
+        &[(
+            "STUB_HARDLINK",
+            format!("{} {}", c.capture().display(), twin.display()),
+        )],
+    );
+    let text = r.text();
+    assert_eq!(r.code, 2, "a late hardlink was not refused:\n{text}");
+    contains_all(&text, &["2 links", "already removed (4):"], "the refusal");
+    assert!(c.capture().is_file() && twin.is_file());
+    assert!(!c.calls().contains("--vacuum-size"));
+}
+
+/// The write's own open-file check (review item 2): a process that opens
+/// the capture after the render is caught before the rm.
+#[test]
+fn a_capture_opened_after_the_render_is_not_removed() {
+    let c = Case::new("capture-late-open");
+    let sha = c.run(&["--dry-run"]).plan_sha();
+    let r = c.run_env(
+        &[&sha],
+        &[(
+            "STUB_FD",
+            format!(
+                "{} {}",
+                c.proc_dir.join("404/fd/3").display(),
+                c.capture().display()
+            ),
+        )],
+    );
+    let text = r.text();
+    assert_eq!(r.code, 2, "a late holder was not refused:\n{text}");
+    contains_all(
+        &text,
+        &["process 404", "open now", "already removed (4):"],
+        "the refusal",
+    );
+    assert!(c.capture().is_file());
+}
+
+/// The write's own realpath check (review item 2): a parent swapped for a
+/// link after the render leaves the capture directory a real directory
+/// and the capture a regular file, but not where the plan named it.
+#[test]
+fn a_capture_whose_path_moved_after_the_render_is_not_removed() {
+    let c = Case::new("capture-late-swap");
+    let sha = c.run(&["--dry-run"]).plan_sha();
+    let r = c.run_env(
+        &[&sha],
+        &[("STUB_SWAP_DIR", c.backups.display().to_string())],
+    );
+    let text = r.text();
+    assert_eq!(r.code, 2, "a moved capture was not refused:\n{text}");
+    contains_all(&text, &["resolves to", "now, not itself"], "the refusal");
+    assert!(
+        c.backups
+            .with_file_name("boss.moved")
+            .join("second-stack")
+            .join(CAPTURE)
+            .is_file()
+    );
+}
+
+/// Review item 3: the capture directory and its parent must be the
+/// owner's (root on the host) and writable by nobody else — or a file
+/// could be planted under the capture's name — and both facts ride in
+/// the signed bytes.
+#[test]
+fn refuses_a_capture_directory_another_account_owns_or_can_write() {
+    let c = Case::new("capture-owner");
+    let other = (c.owner().parse::<u32>().unwrap() + 1).to_string();
+    c.refused(
+        &["--dry-run"],
+        &[("BOSS_RECLAIM_CAPTURE_OWNER", other.clone())],
+        &["owned by uid", &format!("not uid {other}")],
+    );
+    use std::os::unix::fs::PermissionsExt;
+    for (dir, mode) in [(c.capture_dir(), 0o775), (c.backups.clone(), 0o757)] {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap(); // mode-bits-ok: a fixture directory made writable to prove the bound refuses it, not a script
+        c.refused(&["--dry-run"], &[], &["group- or other-writable"]);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap(); // mode-bits-ok: the fixture directory closed again, not a script
+    }
+    let plan = c.run(&["--dry-run"]);
+    assert_eq!(plan.code, 0, "{}", plan.text());
+    contains_all(
+        &plan.out,
+        &[&format!(
+            "  capture directory {}: owner uid {}, mode 755; its parent {}: owner uid {}, mode 755\n",
+            c.capture_dir().display(),
+            c.owner(),
+            c.backups.display(),
+            c.owner()
+        )],
+        "the plan",
+    );
+}
+
+/// Only the capture directory is in reach: a capture-named file anywhere
+/// else under /var/backups is neither planned nor removed.
+#[test]
+fn a_capture_named_file_outside_the_capture_directory_is_not_reached() {
+    let c = Case::new("capture-outside");
+    let outside = c.backups.join("boss-cluster-pg").join(CAPTURE);
+    put(&outside, CAPTURE_BYTES);
+    let plan = c.run(&["--dry-run"]);
+    let text = plan.text();
+    assert_eq!(plan.code, 0, "{text}");
+    assert!(
+        !plan.out.contains(&outside.display().to_string()),
+        "the plan names a capture outside its directory:\n{text}"
+    );
+    let r = c.run(&[&plan.plan_sha()]);
+    assert_eq!(r.code, 0, "{}", r.text());
+    assert!(
+        outside.is_file(),
+        "a file outside the capture directory went"
+    );
+    assert!(!c.capture().exists());
+    c.assert_not_ours_intact(&r.text());
+}
+
+/// After the capture is gone the verb still plans the rest; with no
+/// capture directory at all it plans no capture and says so.
+#[test]
+fn no_capture_directory_plans_no_capture() {
+    let c = Case::new("capture-none");
+    std::fs::remove_dir_all(c.capture_dir()).unwrap();
+    let plan = c.run(&["--dry-run"]);
+    let text = plan.text();
+    assert_eq!(plan.code, 0, "{text}");
+    assert!(!plan.out.contains("second-stack"), "{text}");
+    contains_all(
+        &plan.err,
+        &["no second-stack capture", "0 second-stack capture(s)"],
+        "the dry run",
+    );
 }
 
 // ---------------------------------------------------------------------------

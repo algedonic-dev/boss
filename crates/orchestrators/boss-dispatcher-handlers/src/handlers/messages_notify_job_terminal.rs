@@ -64,7 +64,7 @@ const DEFAULT_ID_PREFIX: &str = "terminal";
 const DEFAULT_EVIDENCE_KEY: &str = "arrived_from";
 
 pub struct MessagesNotifyJobTerminal {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
     messages_base: String,
 }
@@ -81,7 +81,7 @@ impl MessagesNotifyJobTerminal {
     /// Construct with a custom reqwest client (tests point it at
     /// local stand-ins for jobs-api and boss-messages).
     pub fn with_client(
-        client: reqwest::Client,
+        client: boss_core::machine_token::Client,
         jobs_base: impl Into<String>,
         messages_base: impl Into<String>,
     ) -> Arc<Self> {
@@ -306,6 +306,7 @@ mod tests {
 
     fn ctx(payload: serde_json::Value) -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "notify-filer-on-feedback-terminal".into(),
             triggering_event_id: "evt-close-1".into(),
             triggering_topic: "jobs.job.closed".into(),
@@ -386,7 +387,11 @@ mod tests {
     #[tokio::test]
     async fn the_filer_is_told_which_packet_which_terminal_and_what_satisfied_it() {
         let (jobs, messages, sent) = mock_services(packet_with_evidence()).await;
-        let h = MessagesNotifyJobTerminal::with_client(reqwest::Client::new(), jobs, messages);
+        let h = MessagesNotifyJobTerminal::with_client(
+            crate::handlers::common::api_client(),
+            jobs,
+            messages,
+        );
         h.invoke(&[], &ctx(marker(json!("completed"))))
             .await
             .expect("notifies");
@@ -427,7 +432,11 @@ mod tests {
     #[tokio::test]
     async fn a_rerun_posts_the_same_deterministic_id() {
         let (jobs, messages, sent) = mock_services(packet_with_evidence()).await;
-        let h = MessagesNotifyJobTerminal::with_client(reqwest::Client::new(), jobs, messages);
+        let h = MessagesNotifyJobTerminal::with_client(
+            crate::handlers::common::api_client(),
+            jobs,
+            messages,
+        );
         for _ in 0..2 {
             h.invoke(&[], &ctx(marker(json!("completed"))))
                 .await
@@ -453,7 +462,11 @@ mod tests {
               "metadata": { "disposition": "duplicate", "finding": "same as packet 8ac21f10" } },
         ]);
         let (jobs, messages, sent) = mock_services(packet).await;
-        let h = MessagesNotifyJobTerminal::with_client(reqwest::Client::new(), jobs, messages);
+        let h = MessagesNotifyJobTerminal::with_client(
+            crate::handlers::common::api_client(),
+            jobs,
+            messages,
+        );
         h.invoke(&[], &ctx(marker(json!("duplicate"))))
             .await
             .expect("notifies");
@@ -482,7 +495,11 @@ mod tests {
         let mut packet = packet_with_evidence();
         packet["metadata"] = json!({ "outcome": "completed" });
         let (jobs, messages, sent) = mock_services(packet).await;
-        let h = MessagesNotifyJobTerminal::with_client(reqwest::Client::new(), jobs, messages);
+        let h = MessagesNotifyJobTerminal::with_client(
+            crate::handlers::common::api_client(),
+            jobs,
+            messages,
+        );
         h.invoke(&[], &ctx(marker(json!("completed"))))
             .await
             .expect("notifies");
@@ -500,7 +517,11 @@ mod tests {
         packet["metadata"] = json!({});
         packet["owner_id"] = json!("");
         let (jobs, messages, sent) = mock_services(packet).await;
-        let h = MessagesNotifyJobTerminal::with_client(reqwest::Client::new(), jobs, messages);
+        let h = MessagesNotifyJobTerminal::with_client(
+            crate::handlers::common::api_client(),
+            jobs,
+            messages,
+        );
         h.invoke(&[], &ctx(marker(json!("completed"))))
             .await
             .expect("no-op");
@@ -516,7 +537,11 @@ mod tests {
             { "id": "s-triage", "spec_slug": "triage", "status": "completed", "metadata": {} },
         ]);
         let (jobs, messages, sent) = mock_services(packet).await;
-        let h = MessagesNotifyJobTerminal::with_client(reqwest::Client::new(), jobs, messages);
+        let h = MessagesNotifyJobTerminal::with_client(
+            crate::handlers::common::api_client(),
+            jobs,
+            messages,
+        );
         h.invoke(&[], &ctx(marker(json!("declined"))))
             .await
             .expect("notifies");
@@ -543,7 +568,11 @@ mod tests {
         let mut packet = packet_with_evidence();
         packet["metadata"] = json!({ "submitted_by": "emp-filer" });
         let (jobs, messages, sent) = mock_services(packet).await;
-        let h = MessagesNotifyJobTerminal::with_client(reqwest::Client::new(), jobs, messages);
+        let h = MessagesNotifyJobTerminal::with_client(
+            crate::handlers::common::api_client(),
+            jobs,
+            messages,
+        );
         h.invoke(&[], &ctx(marker(json!(null))))
             .await
             .expect("notifies");

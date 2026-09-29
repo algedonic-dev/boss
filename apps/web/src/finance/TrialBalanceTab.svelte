@@ -33,6 +33,8 @@
     type TrialBalanceRow,
   } from './ledger';
   import { session } from '@boss/web-kit/session/session.svelte';
+  import { financeOffersWrite } from './readOnly';
+  import { permission } from '@boss/web-kit/session/permission.svelte';
   import { listView, okRead, type ReadState } from '../data/readState';
   import AccountDrillDown from './AccountDrillDown.svelte';
   import EntryDetail from './EntryDetail.svelte';
@@ -93,9 +95,15 @@
   let tbTick = $state(0);
   let periodsTick = $state(0);
 
-  let readOnly = $derived(
-    session.value.kind === 'ready' && session.value.user.role === 'auditor',
-  );
+  // The read-only floor (backlog 432f0eb4) AND policy's answer for the
+  // session user on the ledger's own period questions (9dad102c): Lock
+  // is Close on `ledger-period`, Unlock is Update on it (boss-ledger
+  // http/periods.rs). Hidden until an Allow arrives; the server's 403
+  // stays the authority.
+  const mayLock = permission('close', 'ledger-period');
+  const mayUnlock = permission('update', 'ledger-period');
+  let offerLock = $derived(financeOffersWrite(session, mayLock.value));
+  let offerUnlock = $derived(financeOffersWrite(session, mayUnlock.value));
 
   $effect(() => {
     const a = asOf;
@@ -381,13 +389,11 @@
                   {shortChecksum(p) || '—'}
                 </td>
                 <td class="r">
-                  {#if readOnly}
-                    <span class="text-muted small">—</span>
-                  {:else if p.status === 'open'}
+                  {#if p.status === 'open' && offerLock}
                     <button type="button" disabled={periodBusy[p.id]} onclick={() => doLock(p)}>
                       Lock
                     </button>
-                  {:else}
+                  {:else if p.status !== 'open' && offerUnlock}
                     <button
                       type="button"
                       class="secondary"
@@ -396,6 +402,8 @@
                     >
                       Unlock
                     </button>
+                  {:else}
+                    <span class="text-muted small">—</span>
                   {/if}
                   {#if periodError[p.id]}
                     <div class="error small">{periodError[p.id]}</div>

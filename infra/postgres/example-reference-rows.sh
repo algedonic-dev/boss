@@ -43,12 +43,17 @@
 # departments.toml gives department codes; each tenant.toml's [meta]
 # tenant_id is its companies row. Whatever the platform needs must therefore NOT be in an
 # example's seeds — the `platform-admin` / `audit-readonly` / `owner`
-# / `smoke-tester` roles, the `it` department, employment types and
+# / `smoke-tester` roles, the `it` department (a `departments` row since
+# backlog c87e3d6d — the `it` department CLASS is residue now, and a
+# retired-examples candidate), employment types and
 # statuses, the `unspecified` account type, the `remote` / `hq` /
 # `field-region` kinds the platform's three default locations wear,
 # those three locations (loc-hq is where the operator baseline
 # hires), and the module-tier vocabularies (asset phases, shipment
-# carriers, PO statuses, …). crates/core/boss-testing/tests/
+# carriers, PO statuses, …). The marketing-asset kinds are not among
+# them since backlog 9b28f849 (decided 2026-09-28): the module is off
+# unless a tenant turns it on, so the tenant that does declares the
+# kinds it uses. crates/core/boss-testing/tests/
 # example_reference_rows_sql.rs holds that line: after an eviction on
 # the bare schema, what remains is exactly what the platform's own
 # baseline, workflows and schema defaults name.
@@ -103,7 +108,9 @@
 # metadata.department (the page march's page-audits, the retros), a Job
 # about it, a workflow row declaring it (backlog 7edf0e97 — the three
 # ways GET /api/jobs?department= and the readiness read find a
-# department's work). A child that is itself deletable does not
+# department's work), and an employee, agent or requisition sitting in
+# it (backlog c87e3d6d: those columns name a departments row since the
+# department Classes retired). A child that is itself deletable does not
 # keep its parent, and a tax kind that is itself deletable does not
 # keep its accounts (backlog 7f163e58: until 2026-09-18 the
 # migration's five kinds kept 2150 / 2300 / 2310 / 2320 / 6500 under
@@ -417,7 +424,9 @@ esac
 # asset_models.category and asset_documents.kind (20-catalog.sql),
 # vendors.category / payment_terms (24-inventory.sql),
 # products.product_kind / package_unit (25-products.sql),
-# invoice_line_items.revenue_category (23-commerce.sql), and the
+# invoice_line_items.revenue_category (23-commerce.sql),
+# marketing_assets.kind (20-catalog.sql; the kinds the example tenant declares
+# since backlog 9b28f849), and the
 # policy grant that names an employee role (04-policy.sql). A seed
 # attribute outside this map is a refusal to judge, above.
 CLASS_REFS=(
@@ -437,6 +446,7 @@ CLASS_REFS=(
     "product|product_kind|products|product_kind"
     "product|package_unit|products|package_unit"
     "invoice|revenue_category|invoice_line_items|revenue_category"
+    "marketing-asset|kind|marketing_assets|kind"
 )
 unmapped=$(printf '%s' "$SEED_JSON" | jq -r --arg map "$(printf '%s\n' "${CLASS_REFS[@]}")" '
     ($map | split("\n") | map(split("|") | "\(.[0])|\(.[1])")) as $known
@@ -496,7 +506,10 @@ dep_judged0 AS (
            array_remove(ARRAY[
                CASE WHEN EXISTS (SELECT 1 FROM jobs j WHERE j.subject_kind = 'department' AND j.subject_id = d.id) THEN 'jobs.subject_id' END,
                CASE WHEN EXISTS (SELECT 1 FROM jobs j WHERE j.metadata->>'department' = d.id) THEN 'jobs.metadata.department' END,
-               CASE WHEN EXISTS (SELECT 1 FROM workflows w WHERE w.metadata->>'department' = d.id) THEN 'workflows.metadata.department' END
+               CASE WHEN EXISTS (SELECT 1 FROM workflows w WHERE w.metadata->>'department' = d.id) THEN 'workflows.metadata.department' END,
+               CASE WHEN EXISTS (SELECT 1 FROM employees r WHERE r.department = d.id) THEN 'employees.department' END,
+               CASE WHEN EXISTS (SELECT 1 FROM agents r WHERE r.department = d.id) THEN 'agents.department' END,
+               CASE WHEN EXISTS (SELECT 1 FROM requisitions r WHERE r.department = d.id) THEN 'requisitions.department' END
            ], NULL) AS reasons
     FROM departments d WHERE d.id IN (SELECT id FROM dep_cand)
 ),

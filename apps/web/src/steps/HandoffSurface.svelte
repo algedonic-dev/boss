@@ -12,7 +12,7 @@
   import { claimedFor, startable } from './holder';
   import { loadPersonOrTeamNames, personIdsOf } from '../data/ownerNames';
   import { okRead, type ReadState } from '../data/readState';
-  import { putStep, startStep } from './stepWrite';
+  import { saveStep, startStep } from './stepWrite';
 
   type StepData = {
     id: string;
@@ -91,25 +91,26 @@
   /// when the gesture moves it, and never the snapshot's holder: both
   /// are how a stale page released a claim made after it was drawn
   /// (backlog 6ef4a36b).
+  ///
+  /// Only the four keys this surface owns go to the step merge door, then
+  /// the status alone to the PUT (backlog e39a9d2a, Stage 2): a spread of
+  /// the step's metadata re-sent whatever the page read, so a key written
+  /// since — a claim's stamp, a hook's — went back as it was.
   async function persist(status?: string, start = false): Promise<void> {
     saving = true;
     writeError = null;
     try {
-      const { status: _drawnStatus, assignee_id: _drawnHolder, ...drawn } = step;
       const body = {
-        ...drawn,
-        job_id: jobId,
         notes: notes || undefined,
         ...(status ? { status } : {}),
         metadata: {
-          ...step.metadata,
           from_id: fromId,
           to_id: toId,
           from_confirmed: fromConfirmed,
           to_confirmed: toConfirmed,
         },
       };
-      const res = await putStep(jobId, step.id, body);
+      const res = await saveStep(jobId, step.id, body);
       if (res.kind === 'failed') {
         writeError = res.error;
         // The checkmarks read as recorded facts, not as a form in

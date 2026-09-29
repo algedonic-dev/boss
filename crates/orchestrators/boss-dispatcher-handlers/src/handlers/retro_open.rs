@@ -80,11 +80,8 @@ use serde_json::{Value, json};
 use super::common::{api_client, empty_roster_refusal, get_json, owner_for_filing, post_json};
 
 pub struct RetroOpen {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
-    /// The firing day every window is judged against — the clock
-    /// service, like every other stamp the dispatcher makes.
-    clock: Arc<dyn boss_clock_client::ClockClient>,
     /// Who the retros are filed to: the platform owner through the port
     /// (backlog 3c23662d), never a literal person.
     owner: Arc<dyn boss_core::platform_owner::PlatformOwner>,
@@ -93,13 +90,11 @@ pub struct RetroOpen {
 impl RetroOpen {
     pub fn new(
         jobs_base: impl Into<String>,
-        clock_url: impl Into<String>,
         owner: Arc<dyn boss_core::platform_owner::PlatformOwner>,
     ) -> Arc<Self> {
         Arc::new(Self {
             client: api_client(),
             jobs_base: jobs_base.into(),
-            clock: Arc::new(boss_clock_client::ReqwestClockClient::new(clock_url)),
             owner,
         })
     }
@@ -385,7 +380,13 @@ impl Handler for RetroOpen {
                     .into(),
             ));
         }
-        let today = boss_clock_client::now_from(&self.clock).await.date_naive();
+        // THE FIRING'S DAY, DEFINED ON PURPOSE (backlog 2b03a2df). The
+        // weekly rule fires as `clock.day`, which carries `_day` and no
+        // instant (eabc5943), so the week this pass judges and stamps is
+        // the day the calendar fired — never the day the dispatcher got
+        // round to it, which a catch-up or redelivery moves into the
+        // next week. No day on the firing is refused, not guessed.
+        let today = ctx.firing_day()?;
         let owner = owner_for_filing(self.owner.as_ref(), &ctx.rule_name).await;
 
         // The list is read, never declared: a department the registry
@@ -550,6 +551,7 @@ mod tests {
 
     fn ctx() -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "department-retros-weekly".into(),
             triggering_event_id: "clock-day:2026-09-21".into(),
             triggering_topic: "clock.day".into(),
@@ -811,5 +813,75 @@ mod tests {
             "the platform is not a department"
         );
         assert_eq!(b["metadata"]["week"], "2026-W39");
+    }
+
+    /// THE WEEK IS THE FIRING'S DAY, NOT THE CONSUMER'S (backlog
+    /// 2b03a2df). A clock-day firing carries `_day` and no instant; the
+    /// handler read `today` off the clock service instead, so a catch-up
+    /// or redelivered Monday firing processed the following week filed
+    /// that week's retro — and wrote the wrong week onto the packet. The
+    /// firing's own day decides the window and the stamp now, and a
+    /// firing with no day is refused rather than dated by the dispatcher.
+    #[tokio::test]
+    async fn a_day_firing_files_the_retros_for_its_own_week() {
+        use crate::handlers::listing_stub::{empty_listing, serve};
+        let answers = || {
+            vec![
+                (
+                    "/api/departments",
+                    json!({ "data": [{"code": "eng", "display_name": "Engineering"}], "total": 1 }),
+                ),
+                (
+                    "/api/departments/eng/readiness",
+                    json!({ "protocols": { "has": true } }),
+                ),
+                ("/api/jobs", empty_listing()),
+            ]
+        };
+        let args = vec![
+            (
+                "department_kind".to_string(),
+                ExprValue::String("department-retro".into()),
+            ),
+            (
+                "platform_kind".to_string(),
+                ExprValue::String("protocol-retro".into()),
+            ),
+            (
+                "platform_subject".to_string(),
+                ExprValue::String("infra/protocol-retro".into()),
+            ),
+        ];
+        let owner = || Arc::new(boss_core::platform_owner::Fixed("emp-owner".into()));
+        let stub = serve(answers()).await;
+        RetroOpen::new(stub.base.clone(), owner())
+            .invoke(&args, &ctx())
+            .await
+            .expect("the week's retros open");
+        let posts: Vec<Value> = stub
+            .sent()
+            .into_iter()
+            .filter(|(w, _)| w == "POST /api/jobs")
+            .map(|(_, b)| b)
+            .collect();
+        assert_eq!(posts.len(), 2, "one department + the platform: {posts:?}");
+        for p in &posts {
+            assert_eq!(
+                p["metadata"]["week"], "2026-W39",
+                "the week of the firing's _day (2026-09-21): {p}"
+            );
+        }
+
+        let dark = serve(answers()).await;
+        let no_day = InvocationContext {
+            event_payload: json!({}),
+            ..ctx()
+        };
+        let err = RetroOpen::new(dark.base.clone(), owner())
+            .invoke(&args, &no_day)
+            .await
+            .expect_err("a firing with no day");
+        assert!(err.is_permanent(), "{err}");
+        assert_eq!(dark.writes(), Vec::<String>::new(), "nothing filed");
     }
 }

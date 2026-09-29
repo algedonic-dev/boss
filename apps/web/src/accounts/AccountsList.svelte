@@ -9,6 +9,7 @@
   // simplified: no canSeeWorkOf() port yet — the full scoping helper
   // is deferred to the session rewrite tracked in phase-1 trade-ins.
 
+  import ClassesReadFailed from '@boss/web-kit/ui/ClassesReadFailed.svelte';
   import { navigate, href } from '../router';
   import { rowLink } from '@boss/web-kit/ui/RowLink';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
@@ -22,9 +23,10 @@
   import TierChip from './TierChip.svelte';
   import type { Asset, Job, Account, AccountOpenAr } from './types';
   import { fetchPaged, isCapped, type Paged } from '../data/paginated';
-  import { fetchAccountsPage } from './api';
+  import { ACCOUNTS_LIST_URL, fetchAccountsPage } from './api';
   import { moduleEnabled } from '@boss/web-kit/session/manifest.svelte';
-  import { okRead, readStateOf, type ReadState } from '../data/readState';
+  import { emptyState, okRead, readStateOf, readStateOfLoad, type ReadState } from '../data/readState';
+  import ListEmpty from '../data/ListEmpty.svelte';
   import { loadClasses, classesFor } from '@boss/web-kit/session/classes.svelte';
   import { tierAdmits, tierBuckets, type TierFilter } from './tiers';
 
@@ -164,6 +166,16 @@
     }),
   );
 
+  // Read failed, no accounts, or the filters hid them — three lines, not
+  // one filters line for all three (backlogs 0ef5e008, bae9d7e1).
+  let listState = $derived(
+    emptyState(
+      [{ source: ACCOUNTS_LIST_URL, state: readStateOfLoad(loading, error) }],
+      accounts.length,
+      visible.length,
+    ),
+  );
+
   // Tenant-shaping: hide columns whose values are zero for every
   // row. The brewery has equipment assets, but none of them are
   // attached to a wholesale account (devices are owned by the
@@ -272,6 +284,7 @@
                 {b.label} ({b.count})
             </FilterButton>
           {/each}
+          <ClassesReadFailed subjectKind="account" what="account tiers" fallback="Tiers show by code, not by their registry names." />
       </FilterGroup>
 
       <FilterGroup label="State">
@@ -294,12 +307,8 @@
           </p>
         {/each}
       {/if}
-      {#if loading}
-        <p class="empty">Loading…</p>
-      {:else if error}
-        <p class="empty load-failed" role="alert">Couldn't load accounts: {error}</p>
-      {:else if visible.length === 0}
-        <p class="empty">No accounts match those filters.</p>
+      {#if listState.kind !== 'rows'}
+        <ListEmpty view={listState} words={{ what: 'accounts', noun: 'accounts' }} />
       {:else}
         <table class="data-table data-table-striped">
           <thead>

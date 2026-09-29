@@ -455,7 +455,7 @@ pub fn revoke_gate(
 // ---------------------------------------------------------------------------
 
 pub struct CredentialRotateForgejo {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
     issuer: Arc<dyn ForgeTokenIssuer>,
     secrets: Arc<dyn SecretStore>,
@@ -1714,6 +1714,7 @@ mod tests {
             metadata["old_token"] = json!(old);
         }
         InvocationContext {
+            event_timestamp: None,
             rule_name: "broker-rotates-the-boss-dev-forge-token".into(),
             triggering_event_id: "evt-rot-1".into(),
             triggering_topic: "step.done.credential-rotation".into(),
@@ -2176,6 +2177,7 @@ mod tests {
 
     fn off_host_ctx(kind: &str, metadata: JsonValue) -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "broker-rotates-the-forge-host-checkout-token".into(),
             triggering_event_id: "evt-fh-1".into(),
             triggering_topic: format!("step.done.{kind}"),

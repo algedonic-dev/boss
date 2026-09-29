@@ -62,6 +62,14 @@ const ALLOWANCE: &[(&str, &str)] = &[
         "the verb's `about` prose (registry data) naming the API path it reads",
     ),
     (
+        "infra/dispatcher/rules/broker-mints-the-algedonic-dev-admin-token-when-a-github-request-is-filed.toml",
+        "the broker's `verify_repo`, a rule-row literal the dispatcher reads in-cluster where no sor.env exists: the repository a fresh admin token must read before it is written (design 76c46869), named because the algedonic-dev installation holds it, not as the mirror's address",
+    ),
+    (
+        "infra/dispatcher/rules/broker-re-mints-the-algedonic-dev-admin-token-when-a-github-request-is-approved.toml",
+        "the same `verify_repo` as its filing twin, held equal to it word for word by boss-dispatcher's github_app_installation_token_rules.rs",
+    ),
+    (
         "infra/sim/boss-brewery-sim.service",
         "a systemd Documentation= URL: prose for `systemctl status`, read by no machine",
     ),
@@ -226,6 +234,43 @@ fn files_under(root: &Path, into: &mut Vec<PathBuf>) {
     }
 }
 
+/// Whether `line` names the repository `slug` itself — not a sibling
+/// whose name merely STARTS with it. `algedonic-dev/boss-dr` (the private
+/// DR copy, backlog 761bc8a9) is a different repository from the public
+/// mirror `algedonic-dev/boss`, and a substring match read it as the
+/// mirror. A repository name runs on through letters, digits, `-` and
+/// `_`; anything else after the slug (`.git`, `/`, a quote, the end)
+/// ends it.
+fn spells_repository(line: &str, slug: &str) -> bool {
+    line.match_indices(slug).any(|(at, _)| {
+        !line[at + slug.len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    })
+}
+
+#[test]
+fn a_sibling_repository_is_not_the_mirror() {
+    let slug = "algedonic-dev/boss";
+    for line in [
+        r#""remote": "https://github.com/algedonic-dev/boss-dr.git","#,
+        "https://github.com/algedonic-dev/boss_old",
+        "https://github.com/algedonic-dev/bossy",
+    ] {
+        assert!(!spells_repository(line, slug), "{line}");
+    }
+    for line in [
+        "https://github.com/algedonic-dev/boss",
+        "https://github.com/algedonic-dev/boss.git",
+        "https://github.com/algedonic-dev/boss/pulls",
+        r#"href="https://github.com/algedonic-dev/boss">"#,
+        "a boss-dr and https://github.com/algedonic-dev/boss on one line",
+    ] {
+        assert!(spells_repository(line, slug), "{line}");
+    }
+}
+
 #[test]
 fn nothing_but_the_source_spells_the_mirror_on_a_machine_read_line() {
     let slug = {
@@ -261,7 +306,7 @@ fn nothing_but_the_source_spells_the_mirror_on_a_machine_read_line() {
         let hits: Vec<(usize, &str)> = text
             .lines()
             .enumerate()
-            .filter(|(_, l)| l.contains(&slug))
+            .filter(|(_, l)| spells_repository(l, &slug))
             // A `#` or `//` line is prose, like the docs: it explains
             // history, it does not aim anything at a target.
             .filter(|(_, l)| {

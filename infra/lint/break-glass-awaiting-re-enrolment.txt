@@ -1,0 +1,26 @@
+# Break-glass records KNOWN to be bound to a relying party the door no
+# longer answers as, each awaiting re-enrolment through a
+# `break-glass-enrolment` packet (backlog 1c4c100a).
+#
+# Read by boss-gateway's the_break_glass_records_answer_the_door_they_serve,
+# which admits a record bound elsewhere only when a row here names it, and
+# fails on a row whose record has been replaced. Held by
+# break-glass-awaiting-re-enrolment-only-shrinks.sh, which refuses any row
+# the trunk does not already carry (backlog edf403aa): this list may only
+# SHRINK. The next cutover re-enrols its keys in the same breath; it never
+# adds a row here.
+#
+# When a key is re-enrolled, the car that commits its new record DELETES
+# its row below — that is the whole edit. An empty list keeps this header.
+#
+# One row per record, whitespace-separated:
+#   label  rp_id  cutover  incident
+# - label:    the record's label (the credentials ConfigMap key, minus .json)
+# - rp_id:    the relying party it was enrolled under
+# - cutover:  the commit that moved BOSS_PUBLIC_URL off that relying party
+# - incident: the backlog item that recorded the stranded key
+#
+# Both keys were enrolled 2026-09-07 under the playground host (b641f3ad);
+# the cutover to boss.algedonic.dev landed 2026-09-16 on train #398. Both
+# were re-enrolled for boss.algedonic.dev on 2026-09-28 (packets 3617735f
+# primary, ff65ac25 backup; backlog 5eb583c2) and their rows deleted.

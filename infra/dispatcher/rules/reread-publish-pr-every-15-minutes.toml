@@ -4,10 +4,13 @@
 # `reread-publish-checks-hourly`, and the seed retires that name).
 #
 # THE FIRST DEFECT (c6cb678b). `read-publish-checks-on-read-checks-ready`
-# files the read once, the moment open-pr completes; the verb waits for
-# the code-scanning checks (~13 minutes) and stops, because since
-# d167e7d7 it must not hold the forge's serial ops-runner for the
-# mirror's full Gate, whose own `timeout-minutes` is 180. Until this
+# files the read once, the moment open-pr completes; the verb then
+# waited for the code-scanning checks (~13 minutes) and stopped,
+# because since d167e7d7 it must not hold the forge's serial ops-runner
+# for the mirror's full Gate, whose own `timeout-minutes` is 180. (Since
+# backlog b81ff4ca it waits for nothing — that 13-minute wait held the
+# runner while eight requests queued — so this rule finishes the scan's
+# wait too.) Until this
 # rule the verb then COMPLETED the step with the Gate recorded
 # in_progress, and nothing ever read the Gate again: PR #243's Gate
 # concluded failure at 04:18Z, the publish packet closed `pr-opened` at

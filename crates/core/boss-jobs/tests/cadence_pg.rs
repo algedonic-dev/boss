@@ -13,7 +13,8 @@
 //! conductor no longer has a second opinion available to it, because it
 //! no longer has a second database.
 
-use boss_jobs::cadence::{CadenceRepository, NewFiring, PgCadence};
+use boss_jobs::board_decision::BoardDecision;
+use boss_jobs::cadence::{CadenceRepository, FiringOutcome, NewFiring, PgCadence};
 use boss_testing::TestDb;
 use chrono::{TimeZone, Utc};
 
@@ -177,84 +178,44 @@ async fn a_calendar_rule_is_served_whole() {
     assert_eq!(retro.business_calendar, None);
 }
 
-/// The dock's two registry facts (design 42279fb2): a boarding rule's
-/// `regate_hold_minutes` is SERVED, so the conductor reads the bound the
-/// registry declares rather than a number of its own; the `refresh` verb
-/// is a row the table accepts; and a hold on a verb that departs no train
-/// is refused by the table itself — a number nothing would read.
+/// The dock's registry fact (design 42279fb2): the `refresh` verb is a
+/// row the table accepts. Its twin — a boarding rule's departure hold —
+/// left the row with backlog d1d4275d, once the board stopped waiting on
+/// re-gates (96f02540).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_departure_hold_is_served_and_only_a_departure_may_carry_one() {
+async fn the_table_accepts_the_refresh_verb() {
     use boss_jobs::cadence::{CadenceRegistry, CadenceRuleRow, CadenceRuleSpec};
     let db = TestDb::new().await;
     let repo = PgCadence::new(db.pool.clone());
     let actor = boss_core::actor::ActorId::Automation("cadence-test".into());
     let now = Utc.with_ymd_and_hms(2026, 9, 25, 20, 0, 0).unwrap();
-    let row = |name: &str, verb: &str, basis: &str| CadenceRuleRow {
-        name: name.into(),
-        verb: verb.into(),
-        basis: basis.into(),
-        every_minutes: None,
+    let refresh = CadenceRuleRow {
+        name: "train-dock-refresh".into(),
+        verb: "refresh".into(),
+        basis: "wall".into(),
+        every_minutes: Some(2),
         at_times: None,
         min_dock_depth: None,
         cooldown_minutes: None,
         cadence: None,
         anchor_date: None,
         business_calendar: None,
-        regate_hold_minutes: None,
     };
-    let spec = |row: CadenceRuleRow, version: i32| CadenceRuleSpec {
-        version,
+    let spec = CadenceRuleSpec {
+        version: 1,
         status: boss_jobs::registry::WorkflowStatus::Active,
-        row,
+        row: refresh,
         created_at: now,
     };
-
-    let live = repo
-        .live_versions("train-board-on-dock-depth")
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|s| s.version)
-        .max()
-        .expect("the migrations seed the boarding rule");
-    let board = CadenceRuleRow {
-        min_dock_depth: Some(1),
-        cooldown_minutes: Some(30),
-        regate_hold_minutes: Some(15),
-        ..row("train-board-on-dock-depth", "board", "queue-depth")
-    };
-    repo.publish_declared(spec(board, live + 1), &actor, now)
-        .await
-        .expect("a boarding rule carrying a hold publishes");
-    let served = repo.active_rules().await.unwrap();
-    let board = served
-        .iter()
-        .find(|r| r.name == "train-board-on-dock-depth")
-        .expect("the boarding rule is served");
-    assert_eq!(
-        board.regate_hold_minutes,
-        Some(15),
-        "a hold the conductor cannot read is a hold that never holds"
-    );
-
-    let refresh = CadenceRuleRow {
-        every_minutes: Some(2),
-        ..row("train-dock-refresh", "refresh", "wall")
-    };
-    repo.publish_declared(spec(refresh, 1), &actor, now)
+    repo.publish_declared(spec, &actor, now)
         .await
         .expect("the table accepts the refresh verb");
-
-    let held_reconcile = CadenceRuleRow {
-        every_minutes: Some(10),
-        regate_hold_minutes: Some(15),
-        ..row("a-held-reconcile", "reconcile", "wall")
-    };
+    let served = repo.active_rules().await.unwrap();
     assert!(
-        repo.publish_declared(spec(held_reconcile, 1), &actor, now)
-            .await
-            .is_err(),
-        "a reconcile departs nothing, so a hold on it is refused by the table"
+        served
+            .iter()
+            .any(|r| r.name == "train-dock-refresh" && r.verb == "refresh"),
+        "the refresh rule is served: {served:?}"
     );
 }
 
@@ -327,7 +288,16 @@ async fn outcome_merges_and_preserves_why_the_rule_fired() {
         "train-board-on-dock-depth",
     );
     repo.claim_firing(&f).await.unwrap();
-    repo.record_outcome(&f.firing_id, 0, 37).await.unwrap();
+    repo.record_outcome(
+        &f.firing_id,
+        &FiringOutcome {
+            rc: 0,
+            runtime_secs: 37,
+            board_decision: None,
+        },
+    )
+    .await
+    .unwrap();
 
     let row: (serde_json::Value,) =
         sqlx::query_as("SELECT detail FROM cadence_firings WHERE firing_id = $1")
@@ -342,6 +312,40 @@ async fn outcome_merges_and_preserves_why_the_rule_fired() {
         "`detail || $2` merges; replacing would discard the dock depth \
          that triggered the firing, which is the measurement"
     );
+}
+
+/// Backlog 96f02540: a board's decision merges into `detail` with its
+/// outcome and is read back on the rule's last firing — the record the
+/// yard's boarding hold states instead of "nothing holds it".
+#[tokio::test(flavor = "multi_thread")]
+async fn a_boards_decision_is_merged_and_read_back_on_the_last_firing() {
+    let db = TestDb::new().await;
+    let repo = PgCadence::new(db.pool.clone());
+    let f = firing(
+        "cadence:board:2026-09-28T02:45Z",
+        "train-board-on-dock-depth",
+    );
+    repo.claim_firing(&f).await.unwrap();
+    let decision = BoardDecision::NoBoardableCar {
+        reason: "no train departed — every car on the dock is held".into(),
+    };
+    repo.record_outcome(
+        &f.firing_id,
+        &FiringOutcome {
+            rc: -2,
+            runtime_secs: 11,
+            board_decision: Some(decision.clone()),
+        },
+    )
+    .await
+    .unwrap();
+    let last = repo
+        .last_firing("train-board-on-dock-depth")
+        .await
+        .unwrap()
+        .expect("fired");
+    assert_eq!(last.rc, Some(-2));
+    assert_eq!(last.board_decision, Some(decision));
 }
 
 #[tokio::test(flavor = "multi_thread")]

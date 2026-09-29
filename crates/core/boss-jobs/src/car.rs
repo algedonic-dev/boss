@@ -199,6 +199,27 @@ pub fn step_fields(
 /// cancelled train can release the car by clearing the stamp).
 pub const REVIEW: &str = "Open for review";
 
+/// The review-step key a REVIEW hold records its judged car head under,
+/// beside `hold` (design 7cedfa29 D2, backlog b7b02024). Written by the
+/// doors that hold a car for its adversarial review — the gate's
+/// `--hold` through the auto-park handler, `boss rerail --finish`, and
+/// the conductor's re-judge — and read by the conductor at boarding: a
+/// car carrying it boards only on a `release` recorded at its current
+/// head. One spelling, because two crates write it and one reads it.
+pub const HOLD_SHA: &str = "hold_sha";
+
+/// The GATE-RUN key that says its `hold` is not a review's: the gate's
+/// judge could not READ the diff (a git blip), and no `--hold` was given.
+/// The auto-park handler then writes the hold WITHOUT [`HOLD_SHA`], so
+/// clearing it sends the car back to the dock's judge rather than to a
+/// reviewer (backlog b7b02024, review F1).
+pub const HOLD_UNBOUND: &str = "hold_unbound";
+
+/// The review-step key the release record lives under: `{sha, review,
+/// verdict, by, at, main_sha}` (design 7cedfa29 D3), written by `boss
+/// release --review`.
+pub const RELEASE: &str = "release";
+
 /// One step completion a car's filer owes: which step, the evidence to
 /// MERGE onto it, and the status-only body that then completes it.
 ///
@@ -445,6 +466,21 @@ pub fn proof_intent(
     put(PROOF_EXPECT, expect);
     put(PROOF_EVENT, event);
     m
+}
+
+/// The proof intent a gate-run's park keys state (`park_probe`,
+/// `park_expect`, `park_proof_event`), as the car carries it — empty
+/// for a bare re-gate. ONE reading for both doors that refresh a car
+/// from a green: the auto-park handler and `boss rerail --finish`.
+/// Until 2026-09-28 only the handler read it, so `--finish` kept the
+/// first gate's probe whatever the re-gate carried; car bfb219b4 was
+/// then proven FAILING on correct code, because the review's fold had
+/// changed the line its first probe grepped (backlog 79a17c7a).
+pub fn proof_intent_of_park(
+    gate_run_md: &serde_json::Map<String, Value>,
+) -> serde_json::Map<String, Value> {
+    let s = |k: &str| gate_run_md.get(k).and_then(Value::as_str);
+    proof_intent(s(PARK_PROBE), s(PARK_EXPECT), s(PARK_PROOF_EVENT))
 }
 
 /// THE NOT-YET STREAK (backlog adef5ddf). A car's `proof_attempt` is
@@ -1228,6 +1264,15 @@ pub fn landed_car_for<'a>(cars: &'a [Value], branch: &str) -> Option<&'a Value> 
     })
 }
 
+/// The job-metadata key of a car's count of consecutive CONFLICT
+/// refusals — assembly's, written beside `skip_reason` (backlog
+/// 94896e74), ended by boarding and by a re-park ([`regate_patch`]).
+/// Spelled once here (design b35456ac) because four readers and
+/// writers held it as a literal, and a dispatcher rule now reads it
+/// too: `rerail-a-car-left-behind-on-a-conflict` files the repair at
+/// exactly three, so a renamed key would silently retire the trigger.
+pub const SKIPS: &str = "skips";
+
 /// The job-metadata key of a car's count of consecutive departures the
 /// dock's conductor held it through (backlog 2fccbfd6). The conductor
 /// counts it; a re-park — this module's [`regate_patch`] — ends it.
@@ -1246,12 +1291,19 @@ pub const LEFT_BEHIND_ALARM: &str = "left_behind_alarm";
 /// like the gate step's copy: a rebuilt receipt once let a wrong head
 /// through. `skip_reason` is present-and-null on purpose — the metadata
 /// door deletes a null key, so the conductor's "left behind" reason
-/// goes with the stale receipt. One builder for `boss park`, the
+/// goes with the stale receipt, and `skips`, the count it headed, with
+/// it. One builder for `boss park`, the
 /// auto-park handler and `boss rerail`, so the write cannot drift.
 pub fn regate_patch(receipt: &Receipt, note: &str, delivery_channel: Option<&str>) -> Value {
     let mut patch = json!({
         "regate_receipt": receipt.raw,
         "skip_reason": Value::Null,
+        // And the count of consecutive refusals that reason headed
+        // (backlog 7e941603): a re-gate is the repair of the conflict it
+        // counted, so it ends it the way boarding does — null, which
+        // `next_skip_count` reads as none. Left behind, car d89bafeb read
+        // 13 skips with no reason through four conductor writes.
+        SKIPS: Value::Null,
         "regate_note": note,
         // A re-parked car's dock streak is over (backlog 2fccbfd6): it has
         // a fresh receipt, so the holds it was counted through have ended.
@@ -1699,6 +1751,27 @@ mod tests {
         assert_eq!(e[PROOF_EVENT], "event-bound — the next yard cancel");
     }
 
+    /// A GATE-RUN'S PARK KEYS BECOME THE CAR'S PROOF KEYS, one reading
+    /// for both doors that refresh a car (backlog 79a17c7a): the
+    /// auto-park handler and `boss rerail --finish`. A bare re-gate
+    /// states none, and so writes none — the car's own probe stands.
+    #[test]
+    fn a_gate_runs_park_keys_are_read_as_the_cars_proof_intent() {
+        let md = json!({
+            PARK_PROBE: "git show HEAD:x | grep -c 'y'",
+            PARK_EXPECT: "1",
+            PARK_SUMMARY: "not proof",
+        });
+        let p = proof_intent_of_park(md.as_object().unwrap());
+        assert_eq!(p.len(), 2, "{p:?}");
+        assert_eq!(p[PROOF_PROBE], "git show HEAD:x | grep -c 'y'");
+        assert_eq!(p[PROOF_EXPECT], "1");
+        let obj = |v: Value| v.as_object().cloned().unwrap();
+        let e = proof_intent_of_park(&obj(json!({ PARK_PROOF_EVENT: "event-bound" })));
+        assert_eq!(e[PROOF_EVENT], "event-bound");
+        assert!(proof_intent_of_park(&obj(json!({ "branch": "fix/x" }))).is_empty());
+    }
+
     /// THE TIER STAMPS ARE COPIED, NOT REBUILT (ba429e7f): the set rides
     /// as the gate-run wrote it, an empty set included (a root-only
     /// change touched no tier, and that is a reading); a headline that
@@ -2017,6 +2090,20 @@ mod regate_tests {
         // ...and its alarm stamp with it (round-2 re-review, N2): a stamp
         // that outlived its streak would make the next streak never alarm.
         assert!(p.get(LEFT_BEHIND_ALARM).is_some_and(Value::is_null), "{p}");
+    }
+
+    /// A re-parked car's count of consecutive assembly refusals ends with
+    /// the refusal's reason (backlog 7e941603). Measured on car d89bafeb,
+    /// 2026-09-28: `boss rerail --finish` landed a green `regate_receipt`
+    /// and nulled `skip_reason`, but `skips` stayed 13 through four more
+    /// conductor writes, so orient drew it SKIPPED REPEATEDLY with "no
+    /// reason recorded" until it boarded. Present-and-NULL, not zero —
+    /// boarding clears it the same way, and `next_skip_count` reads an
+    /// absent key as none, so the next refusal counts one again.
+    #[test]
+    fn the_regate_patch_clears_the_skip_count_with_the_skip_reason() {
+        let p = regate_patch(&receipt(), "why", None);
+        assert!(p.get("skips").is_some_and(Value::is_null), "{p}");
     }
 
     /// The re-gate's prose rides the job under `regate_*`, trimmed,

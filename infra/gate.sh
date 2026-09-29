@@ -611,12 +611,16 @@ require_headroom "to start"
 #            or renaming a lint reddens the conductor's consist check.
 #            The gate already compiles boss-testing for these paths;
 #            compiling the other reader too is the cheap half.
-#     infra/dispatcher/rules/*.toml -> boss-dispatcher, which owns
+#     infra/dispatcher/rules/*.toml -> every crate that calls
+#            `boss_testing::dispatcher_rules_dir()`, DERIVED by
+#            `rules_crates` below rather than listed on this line
+#            (backlog a6100e01) — boss-dispatcher, which owns
 #            dispatcher_rules_seed.rs. It compares the seeded registry
 #            against that directory in BOTH directions, and skipping the
 #            authored half is what reddened the 13-car train
 #            20260815-0621.
-#            AND boss-brewery-engine, decided with backlog 294bb7c9.
+#            AND boss-brewery-engine, decided with backlog 294bb7c9 —
+#            the one reader still on the shape line.
 #            protocol_holds_e2e.rs's `overhead_absorption_rules_agree`
 #            reads three NAMED rule files and asserts the three overhead
 #            drivers and their rates match the brewery's own table — a
@@ -628,6 +632,16 @@ require_headroom "to start"
 #            (`rules_dir.join(format!("{name}.toml"))`), so no scan of
 #            the source can see which rule files it reads; the derivation
 #            below finds literals, not format strings.
+#            AND boss-dispatcher-handlers (backlog 757a67bd): cascade.rs's
+#            `every_shipped_trigger_has_something_upstream` reads every
+#            rule through `boss_testing::dispatcher_rules_dir()`, a call
+#            no literal scan sees, so a rule whose trigger had nothing
+#            upstream gated green and landed main red (#770). That test
+#            is ALSO a tree-wide pin, so a train scoped off its consist
+#            runs it too; the derivation runs the crate's whole suite.
+#            AND boss-testing, whose four rule-reading script tests the
+#            hand list still missed after #770 — which is why the list
+#            became a derivation (backlog a6100e01).
 #     examples/<tenant>/seeds/* -> boss-jobs for workflows.toml (its
 #            seed_loader parses the brewery's bundle through the
 #            viability lint), boss-sim for tenant.toml (seven of its
@@ -908,19 +922,63 @@ GATE_FILE_INPUTS="$(file_input_index)"
 # `--quick` derives no scope and never reads it, but the cost is the
 # same either way and a conditional would be a second code path to
 # keep honest.
-schema_readers() {
+#
+# The member walk is ONE function taking the call to look for, because a
+# second registry read through a boss_testing call arrived with the same
+# shape (`dispatcher_rules_dir`, below) — one walk, two questions.
+GATE_CRATE_DIRS="$(cargo metadata --no-deps --format-version 1 2>/dev/null \
+    | grep -o '"manifest_path":"[^"]*/Cargo.toml"' \
+    | sed -e 's|^"manifest_path":"||' -e 's|/Cargo.toml"$||')"
+
+# The workspace crates whose src/ or tests/ name the fixed string $1,
+# space-separated, sorted, named once each.
+crates_calling() {
     local dir
-    cargo metadata --no-deps --format-version 1 2>/dev/null \
-        | grep -o '"manifest_path":"[^"]*/Cargo.toml"' \
-        | sed -e 's|^"manifest_path":"||' -e 's|/Cargo.toml"$||' \
-        | while read -r dir; do
-            if grep -rlq --include='*.rs' 'TestDb::new' "$dir/src" "$dir/tests" 2>/dev/null; then
-                basename "$dir"
-            fi
-        done | sort -u | tr '\n' ' '
+    printf '%s\n' "${GATE_CRATE_DIRS}" | while read -r dir; do
+        [ -n "$dir" ] || continue
+        if grep -rlqF --include='*.rs' "$1" "$dir/src" "$dir/tests" 2>/dev/null; then
+            basename "$dir"
+        fi
+    done | sort -u | tr '\n' ' '
+}
+
+schema_readers() {
+    crates_calling 'TestDb::new'
 }
 GATE_SCHEMA_READERS="$(schema_readers)"
 GATE_SCHEMA_READERS="${GATE_SCHEMA_READERS% }"
+
+# ---------------------------------------------------------------------
+# Crates that READ THE DISPATCHER RULES: derived, the same way
+# ---------------------------------------------------------------------
+# A rule file is read by every crate that calls
+# `boss_testing::dispatcher_rules_dir()` — the one definition of where
+# the rules live (backlog 94f150f9) — and that call names no rule file,
+# so the file-input index above cannot see it. The shape line for
+# infra/dispatcher/rules/ listed its readers by hand, and each was added
+# after a red: boss-dispatcher-handlers only once #770 had landed main
+# red (backlog 757a67bd). Measured the day that landed, boss-testing was
+# still outside the list — four of its tests (the judged-verb timeout,
+# prune-registry-versions, read-publish-checks and tag-release) read the
+# rules through the helper and are not tree-wide pins, so a car editing
+# the prune or publish-checks rule ran none of them (backlog a6100e01).
+# THE PREDICATE IS THE CALL, as with the schema's constructor: a crate
+# that names `dispatcher_rules_dir(` in src/ or tests/ reads the rules.
+# A doc comment naming it over-scopes by one crate at worst, which is
+# the safe direction. boss-brewery-engine stays on the shape line: it
+# reads NAMED rule files through a format string, which no scan sees.
+GATE_RULES_READERS="$(crates_calling 'dispatcher_rules_dir(')"
+GATE_RULES_READERS="${GATE_RULES_READERS% }"
+
+# The paths on stdin that are authored dispatcher rules, one per line.
+rules_paths() {
+    grep -E '^infra/dispatcher/rules/[^/]*\.toml$' || true
+}
+
+# The rules half of the map: a changed rule file implies every reader.
+rules_crates() {
+    if [ -n "$(rules_paths)" ]; then printf '%s\n' "${GATE_RULES_READERS}"; fi
+}
 
 # The paths on stdin that are migrations, one per line. Empty when the
 # change touches none.
@@ -961,14 +1019,15 @@ input_crates() {
 }
 
 path_map() {
-    # Stdin is read ONCE and handed to all three parts: the hand-written
+    # Stdin is read ONCE and handed to all four parts: the hand-written
     # shapes below, the file-input derivation above that reads the
-    # tree, and the schema readers.
+    # tree, the schema readers and the dispatcher-rule readers.
     local paths
     paths="$(cat)"
     { printf '%s\n' "$paths" | path_shapes
       printf '%s\n' "$paths" | input_crates
       printf '%s\n' "$paths" | schema_crates
+      printf '%s\n' "$paths" | rules_crates
     } | tr ' ' '\n' | sed '/^$/d' | sort -u | live_crates | tr '\n' ' '
 }
 
@@ -1002,7 +1061,7 @@ path_shapes() {
            -e 's|^infra/gate\.sh$|boss-testing|p' \
            -e 's|^infra/lint/.*|boss-cli boss-testing|p' \
            -e 's|^\.forgejo/workflows/ci\.yml$|boss-testing|p' \
-           -e 's|^infra/dispatcher/rules/[^/]*\.toml$|boss-brewery-engine boss-dispatcher|p' \
+           -e 's|^infra/dispatcher/rules/[^/]*\.toml$|boss-brewery-engine|p' \
            -e 's|^infra/platform/[^/]*/[^/]*\.toml$|boss-jobs|p' \
            -e 's|^examples/\([^/]*\)/seeds/workflows\.toml$|boss-jobs boss-\1-engine|p' \
            -e 's|^examples/\([^/]*\)/seeds/tenant\.toml$|boss-sim boss-\1-engine|p' \
@@ -1110,7 +1169,7 @@ run_tree_wide_pins() {
             case "$sel" in test:*) files+=(--test "${sel#test:}") ;; esac
         done
         if [ "${#files[@]}" -gt 0 ]; then
-            cargo test -p "$crate" "${files[@]}" --all-features || rc=1
+            cargo test -p "$crate" "${files[@]}" --all-features --no-fail-fast || rc=1
         fi
         for target in $(printf '%s\n' "${TREE_WIDE[@]}" | awk -v c="$crate" '$1 == c && $2 !~ /^test:/ { print $2 }' | sort -u); do
             names=()
@@ -1120,9 +1179,9 @@ run_tree_wide_pins() {
             done
             log="$(mktemp)" || { echo "gate.sh: tree-wide pins cannot make a temp file" >&2; return 1; }
             if [ "$target" = "lib" ]; then
-                cargo test -p "$crate" --lib --all-features -- "${names[@]}" > "$log" 2>&1 || rc=1
+                cargo test -p "$crate" --lib --all-features --no-fail-fast -- "${names[@]}" > "$log" 2>&1 || rc=1
             else
-                cargo test -p "$crate" --bin "${target#bin:}" --all-features -- "${names[@]}" > "$log" 2>&1 || rc=1
+                cargo test -p "$crate" --bin "${target#bin:}" --all-features --no-fail-fast -- "${names[@]}" > "$log" 2>&1 || rc=1
             fi
             cat "$log"
             missing=$(tree_wide_unreported "$log" "${names[@]}")
@@ -1235,7 +1294,11 @@ scope_self_test() {
     # index being right.
     _case "the gate's own files imply boss-testing" "boss-cli boss-jobs boss-testing" \
         "infra/gate.sh" ".forgejo/workflows/ci.yml" "infra/lint/no-secrets.sh"
-    _case "a dispatcher rule file implies boss-dispatcher" "boss-brewery-engine boss-dispatcher" \
+    # The readers are DERIVED (backlog a6100e01), so the want is read
+    # from the same derivation plus the one listed reader — this case
+    # pins the WIRING, and the checks near the end pin the derivation.
+    _case "a dispatcher rule file implies every crate that reads the rules" \
+        "$(printf '%s\n' "${GATE_RULES_READERS}" boss-brewery-engine | tr ' ' '\n' | sort -u | tr '\n' ' ' | sed 's/ $//')" \
         "infra/dispatcher/rules/converge-on-merge.toml"
     # A TENANT seed bundle is the same shape as the platform bundle one
     # case up, and it was missed for the same reason: the rule was
@@ -1297,15 +1360,18 @@ scope_self_test() {
     # "unmapped" has to be a fact about the tree, not a fact about which
     # paths nobody got round to listing.
     _case "other infra implies no crate" "" \
-        "infra/forge/locomotive.sh" "infra/forge/rollback-to.sh"
+        "infra/forge/locomotive.sh"
     # cluster-watchdog.sh left the case above on 2026-09-25 because the
     # answer for it CHANGED, correctly (design 6805c764, car 1):
     # boss-testing's every_service_mounts_the_machine_gate.rs reads it to
     # hold every path it curls from the jobs API to that service's
     # machine-gate exemptions, so editing the watchdog can redden
     # boss-testing. Derived, not listed — this case is the record of it.
+    # rollback-to.sh followed on 2026-09-28 for the same reason (backlog
+    # fb444bbb, car 1): the_watchdog_reads_the_admin_kubeconfig_david_placed.rs
+    # runs it to hold it to the one admin kubeconfig.
     _case "a script a pin reads implies that pin's crate" "boss-testing" \
-        "infra/forge/cluster-watchdog.sh"
+        "infra/forge/cluster-watchdog.sh" "infra/forge/rollback-to.sh"
     # THE RE-PIN (backlog 294bb7c9). Until that car, the case above also
     # asserted `infra/deploy-services.sh` implies no crate — and that
     # answer was WRONG, not merely incomplete: boss-ports `include_str!`d
@@ -1448,6 +1514,28 @@ scope_self_test() {
             *) echo "gate.sh scope self-test FAIL: ${rd_crate} stands up a TestDb and was not derived as a schema reader — a migration car would gate without the crate that reads it (backlog 4711828d)" >&2
                fails=1 ;;
         esac
+    done
+    # The rule readers the same way, named: the crate that owns the seed
+    # pin, the crate whose cascade test #770 slipped past, and the crate
+    # this derivation was written to catch (backlog a6100e01). A scan
+    # that loses any of them reds here by name rather than scoping a
+    # rule car without it.
+    for rd_crate in boss-dispatcher boss-dispatcher-handlers boss-testing; do
+        case " ${GATE_RULES_READERS} " in
+            *" ${rd_crate} "*) ;;
+            *) echo "gate.sh scope self-test FAIL: ${rd_crate} calls boss_testing::dispatcher_rules_dir() and was not derived as a rule reader — a rule-file car would gate without it (backlog a6100e01)" >&2
+               fails=1 ;;
+        esac
+    done
+    for rd_crate in ${GATE_RULES_READERS}; do
+        rd_found=0
+        for rd_manifest in crates/*/"$rd_crate"/Cargo.toml; do
+            [ -f "$rd_manifest" ] && rd_found=1
+        done
+        if [ "$rd_found" -eq 0 ]; then
+            echo "gate.sh scope self-test FAIL: ${rd_crate} was derived as a rule reader, which is not a crate — the map would demand a -p cargo cannot satisfy" >&2
+            fails=1
+        fi
     done
     if [ "$fails" -ne 0 ]; then
         echo "gate.sh: the scope check cannot be trusted — fix it before relying on -p" >&2
@@ -1746,6 +1834,130 @@ ran_name() { local e="$1"; printf '%s' "${e%:*:*}"; }
 ran_result() { local e="${1%:*}"; printf '%s' "${e##*:}"; }
 ran_secs() { printf '%s' "${1##*:}"; }
 
+# --- web evidence (begin) ---
+# WHAT THE PAGE SHOWED WHEN A SPEC FAILED, KEPT (backlog 4d928d0a).
+#
+# Dock re-gate 7b2acdc4 (2026-09-27) went red on ONE mocked spec at the
+# 1.0 m test timeout, on a tree that did not touch it. Playwright had
+# written what the page was showing to
+# apps/web/test-results/<test>/error-context.md — the page snapshot that
+# says what the spec was waiting on — and its list reporter printed only
+# that file's PATH. The file lived in the gate's workspace and died with
+# it, so the diagnosis rested on reproducing the red, which did not
+# reproduce, and it went down as unexplained. CLAUDE.md §Diagnosis:
+# capture to a file and print it on failure; a reduction made before the
+# record is stored throws away the only copy.
+#
+# So when the web suite fails, every error context Playwright wrote
+# DURING that check (newer than a marker taken before it: a local
+# test-results/ from an earlier run is not this run's evidence) is
+# copied whole, each under the path it came from, into ONE file beside
+# the receipt, printed whole in a `::group::gate-evidence: <check>` block
+# of its own — outside the check's group, so the gate-runner's excerpt
+# of the check keeps its budget for Playwright's verdict — and named on
+# the receipt as `evidence: {"<check>": "<absolute path>"}`. The
+# gate-runner copies it onto the durable record as `fails_context`
+# (bounded there, and saying so). A failure that left no context says
+# that instead, so silence is never the answer.
+#
+# ONLY THE PAGES OF SPECS THAT FAILED (backlog a766e20d). Playwright
+# writes an error context for a `test.fail` spec too — it failed as told
+# and is counted PASSED — and red gate-run 5b5a04d8 (2026-09-28) kept
+# four of them beside its two real timeouts, so they filled the evidence
+# file, the replay and the receipt's context budget ahead of a real
+# timeout's page. Playwright's own `N failed` roll-up lists exactly the
+# specs whose outcome was unexpected, as `[project] › file:line:col ›
+# title`, and each context names its spec as `- Location: file:line:col`.
+# So the call site tees the check's output to a file (`output_to`), and
+# a context whose Location the roll-up does not list is set aside — by
+# name, in the log, never in silence. With no roll-up to read (a run
+# killed before Playwright's epilogue, an output not captured) nothing
+# tells the two apart, and every context is kept, saying so.
+#
+# Bracketed so the_gate_keeps_a_failed_specs_error_context.rs can lift
+# the block and RUN it. Defined above write_receipt, which calls
+# `evidence_json` on every path — a refusal included.
+EVIDENCE=()
+output_to() { # <file, or empty> <cmd...>: run it, its output ALSO written to the file
+    local out="$1"
+    shift
+    if [ -z "$out" ]; then
+        "$@"
+        return
+    fi
+    "$@" 2>&1 | tee "$out"
+    return "${PIPESTATUS[0]}"
+}
+# The indented lines under each `N failed` line of Playwright's output.
+failed_rollup() { # <output file>
+    awk '
+        ind != "" {
+            match($0, /^ */)
+            if ($0 ~ /^[[:space:]]*$/ || RLENGTH <= ind) { ind = "" } else { print; next }
+        }
+        /^[[:space:]]*[0-9]+ failed([^[:alnum:]_]|$)/ { match($0, /^ */); ind = RLENGTH }
+    ' "$1" 2>/dev/null || true
+}
+keep_error_context() { # <check name> <marker file taken before the check> [<the check's output>]
+    local name="$1" since="$2" output="${3:-}" kept f loc n=0 aside=0 rollup=""
+    local -a found=()
+    kept="${GATE_RECEIPT%.json}.error-context.md"
+    case "$kept" in /*) ;; *) kept="$PWD/$kept" ;; esac
+    rm -f "$kept"
+    if [ -d apps/web/test-results ]; then
+        while IFS= read -r f; do
+            found+=("$f")
+        done < <(find apps/web/test-results -name error-context.md -newer "$since" 2>/dev/null | LC_ALL=C sort)
+    fi
+    if [ -n "$output" ] && [ -r "$output" ]; then rollup="$(failed_rollup "$output")"; fi
+    if [ "${#found[@]}" -gt 0 ] && [ -z "$rollup" ]; then
+        echo "gate: no Playwright roll-up of failed specs in ${name}'s output (the run ended before its summary, or the output was not captured), so an expected failure's error context cannot be told from a real one — every one is kept"
+    fi
+    for f in ${found[@]+"${found[@]}"}; do
+        loc="$(grep -m1 '^- Location: ' "$f" 2>/dev/null || true)"
+        loc="${loc#- Location: }"
+        if [ -n "$rollup" ] && [ -n "$loc" ]; then
+            case "$rollup" in
+                *" › ${loc} › "*) ;;
+                *)
+                    echo "gate: set aside ${f} — its spec (${loc}) is not in Playwright's roll-up of failed specs: an expected failure (test.fail, counted passed) or a flaky spec's failed attempt (counted flaky); the check's output above still names it"
+                    aside=$((aside + 1))
+                    continue
+                    ;;
+            esac
+        fi
+        { printf '===== %s =====\n' "$f"; cat "$f"; printf '\n'; } >> "$kept"
+        n=$((n + 1))
+    done
+    if [ "$n" -eq 0 ] && [ "$aside" -gt 0 ]; then
+        echo "gate: ${name} failed and Playwright wrote ${aside} error context(s) during it, every one for a spec its roll-up does not count failed — none kept; the check's own output above is the whole account"
+        return 0
+    fi
+    if [ "$n" -eq 0 ]; then
+        echo "gate: ${name} failed and Playwright wrote no error context during it — a unit-test, build or boot failure, or a crash before any spec failed; the check's own output above is the whole account"
+        return 0
+    fi
+    echo "::group::gate-evidence: ${name}"
+    local also=""
+    [ "$aside" -eq 0 ] || also=" (${aside} more set aside above)"
+    echo "gate: ${n} Playwright error context(s) for ${name}, kept whole at ${kept} and named on the receipt under evidence${also}:"
+    cat "$kept"
+    echo "::endgroup::"
+    EVIDENCE+=("${name}"$'\t'"${kept}")
+}
+# The receipt's `evidence` object: check name -> the file kept for it.
+# `{}` when nothing was kept. A path is made safe for a JSON string.
+evidence_json() {
+    local e name path out=""
+    for e in ${EVIDENCE[@]+"${EVIDENCE[@]}"}; do
+        name="${e%%$'\t'*}"
+        path="$(printf '%s' "${e#*$'\t'}" | tr -d '"\\' | tr '[:cntrl:]' ' ')"
+        out="${out:+${out},}\"${name}\":\"${path}\""
+    done
+    printf '{%s}' "$out"
+}
+# --- web evidence (end) ---
+
 # ---------------------------------------------------------------------
 # The receipt
 # ---------------------------------------------------------------------
@@ -1763,6 +1975,66 @@ ran_secs() { printf '%s' "${1##*:}"; }
 # today's reds were "passed on my machine, failed on the runner",
 # and neither prose field would have shown that.
 GATE_RECEIPT="${BOSS_GATE_RECEIPT:-.gate-receipt.json}"
+
+# --- web timings (begin) ---
+# WHAT THE WEB SUITES TOOK, ON THE RECEIPT (backlog ebb750cd).
+#
+# Two trains were disassembled on 2026-09-28 by web-suite reds that were
+# not code failures: a unit file at 30 155 ms against its 30 s budget
+# (5.0 s alone on the dev pod), and a mocked paint at 27.6 s against a
+# 15 s expect (0.65 s on the dev pod) — both beside two other gates
+# building cargo 20-wide on one NVMe. The receipt kept each failure and
+# not one duration, so the 40x was learned by reproducing it by hand.
+#
+# The gate-runner now declares its load and the web tree scales its
+# budgets (apps/web/src/dev-load.ts). A bigger budget also hides the
+# load, so the web phase names a file here — beside the receipt,
+# absolute because every web check cds into its package — the unit
+# runner appends one line per test file and the mocked suite's reporter
+# one per spec (ms, suite, result, name, tab-separated), and the receipt
+# carries each suite's WEB_SLOWEST_N slowest as `web_timings`, with the
+# load the runner declared. `null` means the web phase did not run;
+# `"suites": {}` means it ran and recorded nothing, which is the finding.
+#
+# Bracketed so the_gate_states_its_web_load.rs can lift the block and
+# RUN it; defined above write_receipt, which calls web_timings_json on
+# every path — a refusal included.
+WEB_TIMINGS=""
+WEB_SLOWEST_N=8
+web_timings_begin() {
+    WEB_TIMINGS="${GATE_RECEIPT%.json}.web-timings.tsv"
+    case "$WEB_TIMINGS" in /*) ;; *) WEB_TIMINGS="$PWD/$WEB_TIMINGS" ;; esac
+    # A file that cannot be made is said here and left unnamed, so no
+    # runner fails a web check over the gate's own bookkeeping; the
+    # receipt then reads `"suites": {}`.
+    if : > "$WEB_TIMINGS"; then
+        export BOSS_WEB_TIMINGS="$WEB_TIMINGS"
+    else
+        echo "gate: cannot create ${WEB_TIMINGS} — this receipt's web_timings will be empty"
+    fi
+}
+# A value made safe for a JSON string (the file is another program's).
+web_timings_safe() { printf '%s' "$1" | tr -d '"\\' | tr '[:cntrl:]' ' '; }
+web_timings_json() {
+    local suite suites="" rows count ms s result name
+    if [ -z "$WEB_TIMINGS" ]; then printf 'null'; return; fi
+    # Only lines whose time is a number are read at all.
+    local valid
+    valid="$(awk -F'\t' 'NF >= 4 && $1 ~ /^[0-9]+$/' "$WEB_TIMINGS" 2>/dev/null)"
+    for suite in $(printf '%s\n' "$valid" | awk -F'\t' 'NF >= 4 { print $2 }' | LC_ALL=C sort -u); do
+        rows=""
+        count=0
+        while IFS=$'\t' read -r ms s result name; do
+            rows="${rows:+${rows},}{\"ms\":${ms},\"result\":\"$(web_timings_safe "$result")\",\"test\":\"$(web_timings_safe "$name")\"}"
+        done < <(printf '%s\n' "$valid" | awk -F'\t' -v s="$suite" '$2 == s' \
+                   | LC_ALL=C sort -t$'\t' -k1,1nr | awk -v n="$WEB_SLOWEST_N" 'NR <= n')
+        count="$(printf '%s\n' "$valid" | awk -F'\t' -v s="$suite" '$2 == s { n++ } END { print n + 0 }')"
+        suites="${suites:+${suites},}\"$(web_timings_safe "$suite")\":{\"count\":${count},\"slowest\":[${rows}]}"
+    done
+    printf '{"gate_load":"%s","slowest_n":%s,"suites":{%s}}' \
+        "$(web_timings_safe "${BOSS_WEB_GATE_LOAD:-}")" "$WEB_SLOWEST_N" "$suites"
+}
+# --- web timings (end) ---
 
 write_receipt() {
     local verdict="$1" mode checks="" first=1 entry name result secs
@@ -1842,8 +2114,10 @@ write_receipt() {
   "host": "$(hostname 2>/dev/null || echo unknown)",
   "ci": ${in_ci},
   "free_gb": $(gate_avail_gb),
+  "web_timings": $(web_timings_json),
   "unverifiable": [${unver}],
   "schema_change": {"paths": [${schema_json}], "readers": "${GATE_SCHEMA_READERS}"},
+  "evidence": $(evidence_json),
   "checks": [${checks}]
 }
 RECEIPT
@@ -2777,7 +3051,7 @@ fi
 if [ "$AUTO_SKIP_FIXTURE" -eq 1 ]; then
     echo "gate: skipping fixture — no crate and no schema change to break it"
 else
-    check "fixture" cargo test -p boss-testing --features postgres --test fixture_smoke
+    check "fixture" cargo test -p boss-testing --features postgres --test fixture_smoke --no-fail-fast
 fi
 
 if [ "$AUTO_LINTS_ONLY" -eq 1 ]; then
@@ -2797,7 +3071,17 @@ elif [ "${#SCOPE[@]}" -eq 0 ]; then
     # gateway would refuse to boot from is the cheaper, louder
     # verdict, and the train's assembled-tree gate runs this branch.
     check "an-image-sourced-tenant-passes-its-check" infra/lint/an-image-sourced-tenant-passes-its-check.sh
-    check "test"    cargo test --all-features
+    # --no-fail-fast on EVERY cargo test here (backlog 3bef4198). Without
+    # it cargo stops at the first failing test binary, and every binary
+    # after it is never run: the public mirror's red on PR #246
+    # (2026-09-27) had seven tests failing on the runner, the annotation
+    # named one, and runner-only failures in later crates have never been
+    # reached. A red run now pays for its remaining binaries; what it
+    # NAMES stays capped (five annotations and a summary here, `fails`
+    # and `fails_excerpt` in infra/gate-runner/run.sh, which parses the
+    # whole check so an early failure is not lost under later passes).
+    # Pinned by gate_sh.rs `every_cargo_test_the_gate_runs_carries_no_fail_fast`.
+    check "test"    cargo test --all-features --no-fail-fast
     # Kept out of the pre-flight because it reads the built
     # boss-ports-list; the build above just produced it. This line was
     # missing from 2026-08-31 to 2026-09-12: the exclusion said "CI
@@ -2807,7 +3091,7 @@ elif [ "${#SCOPE[@]}" -eq 0 ]; then
 else
     check "clippy"  cargo clippy "${SCOPE[@]}" --all-features --all-targets -- -D warnings
     check "build (default features)" cargo build "${SCOPE[@]}"
-    check "test"    cargo test "${SCOPE[@]}" --all-features
+    check "test"    cargo test "${SCOPE[@]}" --all-features --no-fail-fast
     # A scoped car pays for the binary only when it could have moved
     # the answer: the registry crate, or a generated copy of it.
     if changed_paths | grep -qE '^(crates/core/boss-ports/|apps/(web|simulator)/src/_generated/ports\.ts$)'; then
@@ -2855,6 +3139,9 @@ simulator_touched() {
     if changed_paths | grep -qE '^(apps/simulator|libs/web-kit)/'; then echo yes; else echo no; fi
 }
 if [ "$AUTO" -eq 0 ] || [ "$(web_touched)" = "yes" ]; then
+    # Every web check below appends what it took (see "web timings").
+    web_timings_begin
+
     # A clean install FIRST, with puppeteer's postinstall skipped. bun
     # aborts the WHOLE install on a failed postinstall, and puppeteer's
     # browser download is the flaky one — the exact reason ci.yml's web
@@ -2880,7 +3167,16 @@ if [ "$AUTO" -eq 0 ] || [ "$(web_touched)" = "yes" ]; then
     if [ "$AUTO" -eq 0 ] || [ "$(simulator_touched)" = "yes" ]; then
         check "simulator (typecheck+unit+build)" bash -c 'cd apps/simulator && bun run typecheck && bun run test:unit && bun run build'
     fi
-    check "web-suite (unit+build+mocked)" bash -c 'cd apps/web && bun run test:unit && bun run build && bun run test:mocked'
+    # The check's own output, teed, so the keeper can read Playwright's
+    # roll-up of failed specs (see "web evidence"; backlog a766e20d).
+    web_out="$(mktemp)" || web_out=""
+    # The marker the error-context keeper reads (see "web evidence"):
+    # only what Playwright writes after this is this check's evidence.
+    web_since="$(mktemp)" || web_since=""
+    check "web-suite (unit+build+mocked)" output_to "$web_out" bash -c 'cd apps/web && bun run test:unit && bun run build && bun run test:mocked'
+    if [ "$CHECK_STATUS" -ne 0 ] && [ -n "$web_since" ]; then keep_error_context "web-suite (unit+build+mocked)" "$web_since" "$web_out"; fi
+    [ -z "$web_since" ] || rm -f "$web_since"
+    [ -z "$web_out" ] || rm -f "$web_out"
 fi
 
 run_preflight

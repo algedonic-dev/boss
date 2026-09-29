@@ -37,8 +37,9 @@
 # here too, which is the base check the same briefs ask for.
 #
 # WHAT IT DOES NOT CARRY: uncommitted work. A bundle holds commits. That
-# is not a limitation to route around — it is the builder order
-# (test, fmt, COMMIT AND PUSH, then any local check), so an uncommitted
+# is not a limitation to route around — builder rule 4 commits before
+# it checks (fmt, add, commit, then clippy, the suites and the
+# pre-flight, and only then push; backlog e30ac196), so an uncommitted
 # tracked change is refused by name rather than silently verified away.
 set -uo pipefail
 

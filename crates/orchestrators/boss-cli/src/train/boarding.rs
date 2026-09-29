@@ -34,102 +34,44 @@ use super::*;
 // train that had never left the yard.
 // ---------------------------------------------------------------------------
 
-/// Why a board attempt departed no train. Every one of these used to
-/// open a pr-train Job and immediately cancel it through the `empty`
-/// marker; none of them opens anything now.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum NoDeparture {
-    /// The CI host is short of what a run needs — an infrastructure
-    /// refusal, decided before a single car was collected.
-    HostShort { reason: String },
-    /// Nothing was parked and ready when the window opened.
-    NothingParked,
-    /// Every candidate conflicted on the assembled tree.
-    AllConflicted { branches: String },
-    /// The consist check refused the assembled tree. Nobody's car is at
-    /// fault — each was green on its own branch — so every car stays
-    /// boardable and unstruck.
-    ConsistRefused { reason: String, cars: usize },
-    /// Every car on the dock is held on a declared ordering edge
-    /// (`metadata.boards_after`) — see `boards_after_outcome`.
-    ///
-    /// TWO LISTS, BECAUSE THEY ASK DIFFERENT THINGS OF THE READER. A car
-    /// waiting on a predecessor that is still in flight needs nobody: the
-    /// next board is 60 seconds away and it departs on its own. A car
-    /// whose predecessor was abandoned, or whose edge names no Job at
-    /// all, can NEVER depart on the edge it declares, and the window will
-    /// refuse identically forever until a person clears it. An operator
-    /// reading this line is deciding whether the pipeline is stuck, so
-    /// the line has to answer that and not merely report a hold
-    /// (d3320278).
-    HeldOnEdges { cars: String, needs_human: String },
-    /// Cars were ready, and the departure WAITED for the dock's re-gate
-    /// round on the current main (D2 of design 42279fb2): `in_flight`
-    /// re-gates launched on `main`, the oldest `oldest_minutes` in,
-    /// against a hold of `hold_minutes` read from the cadence registry.
-    /// Bounded by construction — once the oldest reaches the hold, the
-    /// next board departs with what is green. `missed` of the round's cars
-    /// were already left behind by a departure mid-re-gate and are waited
-    /// for to their own verdict, up to twice the hold from their own
-    /// launch (backlog d9530df2); `more_minutes` is the most the wait can
-    /// still last.
-    AwaitingRegates {
-        cars: usize,
-        in_flight: usize,
-        main: String,
-        oldest_minutes: i64,
-        hold_minutes: u32,
-        missed: usize,
-        more_minutes: i64,
-    },
-}
+// THE REFUSAL ITSELF LIVES IN CORE since backlog 96f02540:
+// `boss_jobs::board_decision` holds `NoDeparture`, its line and whether it
+// clears itself, beside the `BoardDecision` every board tick records on its
+// cadence firing — so the yard and `boss orient` state the board's own
+// words instead of re-deriving them from the cadence rows (the measured
+// case: "nothing holds it" printed for half an hour while the board
+// refused every tick). The split between a refusal that clears itself and
+// one that repeats until a person acts (backlog 6baabd43) is documented
+// there, beside the match that makes it.
+pub(crate) use boss_jobs::board_decision::{
+    BoardDecision, NoDeparture, no_departure_line, refusal_persists,
+};
 
-/// Will this refusal still be here on the next window, unchanged?
-///
-/// WHY THE DISTINCTION IS THE WHOLE ALARM (backlog 6baabd43). From
-/// 04:27Z to 13:49Z on one day no train departed. The conductor never
-/// stopped and never failed: it fired every minute, took its lock, ran
-/// preflight, evaluated all three parked cars and logged in full —
-/// naming all three branches and the conflicting files for each. Nine
-/// and a half hours of perfect diagnosis with zero reach: no packet, no
-/// alarm, no surface. Meanwhile the yard rendered `3 cars parked — the
-/// boarding depth is met, a train is due`, which is exactly what it says
-/// two minutes after a healthy departure.
-///
-/// AND AN ALARM ON "NO TRAIN DEPARTED" ALONE WOULD BE NOISE. Most
-/// windows refuse for reasons that clear themselves within a minute —
-/// an idle dock, a car waiting on a predecessor still in flight. The
-/// packet is explicit that a dock-depth alarm "would fire on every
-/// healthy busy dock, which is how a check becomes noise and then
-/// becomes unread". So the signal is not "nothing departed"; it is
-/// "nothing departed FOR A REASON THAT WILL NOT CLEAR ITSELF".
-///
-/// The enum already carries that fact, which is why this is a total
-/// match and not a heuristic:
-///
-/// - `NothingParked` — an idle window. The next parked car departs.
-/// - `HeldOnEdges` with nobody needing a human — each car boards by
-///   itself once the car it named has landed.
-/// - `HostShort` — an infrastructure refusal that clears when the host
-///   does, and which says nothing about any branch.
-/// - `AwaitingRegates` — a departure waiting for the dock's re-gate
-///   round, bounded by `regate_hold_minutes` from the oldest re-gate.
-///
-/// against the three that repeat identically until a person acts:
-///
-/// - `AllConflicted` — every candidate conflicts on the assembled tree,
-///   and will again on the next window, and the next.
-/// - `ConsistRefused` — the assembled tree is refused; nobody's car is
-///   at fault and nothing on the dock can change it.
-/// - `HeldOnEdges` with `needs_human` — an edge that can never be
-///   satisfied; the window refuses identically forever.
-pub(crate) fn refusal_persists(refusal: &NoDeparture) -> bool {
-    match refusal {
-        NoDeparture::NothingParked
-        | NoDeparture::HostShort { .. }
-        | NoDeparture::AwaitingRegates { .. } => false,
-        NoDeparture::HeldOnEdges { needs_human, .. } => !needs_human.is_empty(),
-        NoDeparture::AllConflicted { .. } | NoDeparture::ConsistRefused { .. } => true,
+/// The environment variable naming the file a board writes its decision
+/// to — set by the cadence loop on the child it spawns (`cadence::run_verb`)
+/// and read back into the firing's outcome, where the yard reads it
+/// (backlog 96f02540). A board run by hand has none set, and its decision
+/// is the journal line alone, as before.
+pub(crate) const BOARD_DECISION_FILE_ENV: &str = "BOSS_BOARD_DECISION_FILE";
+
+/// Hand this tick's decision back to the cadence loop that spawned the
+/// board, when one did. BEST-EFFORT by signature: the decision is the
+/// yard's reading of the board, and a write that fails must never fail
+/// the board — it says so, and the loop records the exit instead
+/// (`cadence::firing_decision`).
+pub(crate) fn record_board_decision(decision: &BoardDecision) {
+    let Some(path) = std::env::var_os(BOARD_DECISION_FILE_ENV).filter(|p| !p.is_empty()) else {
+        return;
+    };
+    let written = serde_json::to_string(decision)
+        .map_err(anyhow::Error::from)
+        .and_then(|text| std::fs::write(&path, text).map_err(anyhow::Error::from));
+    if let Err(e) = written {
+        log(format!(
+            "the board's decision ({}) could not be handed to the cadence loop at {}: {e:#}",
+            decision.line(),
+            Path::new(&path).display()
+        ));
     }
 }
 
@@ -170,12 +112,14 @@ pub(crate) fn refusal_persists(refusal: &NoDeparture) -> bool {
 /// Read off the car's own `skips` stamp, which boarding CLEARS in the
 /// same write that clears `skip_reason` — so the count is consecutive by
 /// construction and a car that rides a train starts again at one. A
+/// re-park (`boss_jobs::car::regate_patch`) clears both the same way
+/// (backlog 7e941603), so a repaired car starts again at one too. A
 /// stamp that is not a non-negative integer reads as no stamp: a
 /// malformed value must not paint repetition that did not happen, the
 /// same reading `red_trains_of` gives the strike count (2bb0d014).
 pub(crate) fn next_skip_count(car: &Value) -> u64 {
     car.get("metadata")
-        .and_then(|m| m.get("skips"))
+        .and_then(|m| m.get(boss_jobs::car::SKIPS))
         .and_then(Value::as_u64)
         .unwrap_or(0)
         .saturating_add(1)
@@ -224,6 +168,8 @@ pub(crate) const LEFT_BEHIND_ALARM: &str = boss_jobs::car::LEFT_BEHIND_ALARM;
 /// review of car 5eb1967e, MEDIUM 3). Cleared when the car boards, when
 /// assembly refuses it (`conflict_skip_write`), and when it is re-parked
 /// (`boss_jobs::car::regate_patch`) — spelled once, in core, for that.
+/// The re-park clears `skips` too, beside it, as boarding does: a re-gate
+/// repairs the conflict that count measured (backlog 7e941603).
 pub(crate) const LEFT_BEHIND_TRAINS: &str = boss_jobs::car::LEFT_BEHIND_TRAINS;
 
 /// PURE: what assembly writes on a car it refused for a conflict — the
@@ -233,7 +179,7 @@ pub(crate) const LEFT_BEHIND_TRAINS: &str = boss_jobs::car::LEFT_BEHIND_TRAINS;
 pub(crate) fn conflict_skip_write(reason: &str, skips: u64) -> Vec<(&'static str, Value)> {
     vec![
         ("skip_reason", json!(reason)),
-        ("skips", json!(skips)),
+        (boss_jobs::car::SKIPS, json!(skips)),
         (LEFT_BEHIND_TRAINS, Value::Null),
         (LEFT_BEHIND_ALARM, Value::Null),
     ]
@@ -342,6 +288,110 @@ pub(crate) fn left_behind_alarm_body(
     })
 }
 
+/// The stamp a left-behind alarm leaves when the conductor closes it —
+/// a machine clear, told apart from a human's answer the way the
+/// stranded-green alarm's `cleared_by` is.
+pub(crate) const LEFT_BEHIND_CLEARED_BY: &str = "conductor.left-behind-alarm";
+
+/// Open left-behind alarms whose claim no longer holds, each with the
+/// branch it named and WHY it ended: `(alarm id, branch, why)`.
+///
+/// THE HALF THAT WAS MISSING (backlog 7919fdcc, item 6). Boarding, an
+/// assembly refusal and a re-park all end the streak on the CAR — the
+/// count and the alarm's id come off together — and nothing ended the
+/// alarm: the packet stayed open, urgent, naming a car that had long
+/// since boarded. The stranded-green alarm learned this on 2026-09-09
+/// (e60398dc); an alarm that cannot clear itself is a claim the system
+/// stops standing behind the instant it stops being true.
+///
+/// Judged off the car, read in the same pass: closed, boarded, or its
+/// dock streak below [`LEFT_BEHIND_ALARM_TRAINS`] — which it can reach
+/// again only by starting over, since the streak only grows until it
+/// ends. A car still at or past that count keeps its alarm even when its
+/// stamp is missing: that is the stamp that failed to land, which the
+/// next departure adopts. A car the list does not carry is left alone —
+/// unread is not ended.
+pub(crate) fn left_behind_alarms_to_clear(
+    open_alarms: &[Value],
+    cars: &[Value],
+) -> Vec<(String, String, String)> {
+    open_alarms
+        .iter()
+        .filter_map(|a| {
+            let car_id = a
+                .pointer("/metadata/left_behind_car")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())?;
+            let id = a.get("id").and_then(Value::as_str)?;
+            let car = cars
+                .iter()
+                .find(|c| c.get("id").and_then(Value::as_str) == Some(car_id))?;
+            let why = left_behind_ended(car)?;
+            let branch = car
+                .pointer("/metadata/branch")
+                .or_else(|| a.pointer("/metadata/left_behind_branch"))
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            Some((id.to_string(), branch.to_string(), why))
+        })
+        .collect()
+}
+
+/// PURE: why a car's left-behind streak has ended, named from the car —
+/// `None` while it stands.
+fn left_behind_ended(car: &Value) -> Option<String> {
+    let status = car.get("status").and_then(Value::as_str).unwrap_or("");
+    if status != "open" {
+        return Some(format!(
+            "the car is {} — it left the dock",
+            if status.is_empty() {
+                "unreadable as open"
+            } else {
+                status
+            }
+        ));
+    }
+    if let Some(train) = car
+        .pointer("/metadata/train")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+    {
+        return Some(format!("it boarded train {}", id8(train)));
+    }
+    let trains = car
+        .pointer(&format!("/metadata/{LEFT_BEHIND_TRAINS}"))
+        .and_then(Value::as_u64);
+    match trains {
+        Some(n) if n >= LEFT_BEHIND_ALARM_TRAINS => None,
+        Some(n) => Some(format!(
+            "its dock streak started over — `{LEFT_BEHIND_TRAINS}` is {n}, below the \
+             {LEFT_BEHIND_ALARM_TRAINS} that filed this alarm"
+        )),
+        None => Some(format!(
+            "its dock streak ended — `{LEFT_BEHIND_TRAINS}` is cleared (it boarded, assembly \
+             refused it, or it was re-parked)"
+        )),
+    }
+}
+
+/// The triage fields that CLOSE a left-behind alarm whose streak ended:
+/// the `stale` terminal ("Closed — the claim no longer holds"), landed
+/// through the step's merge door by `step_completion_writes`.
+pub(crate) fn left_behind_clear_writes(branch: &str, why: &str) -> Map<String, Value> {
+    let mut metadata = Map::new();
+    metadata.insert("disposition".into(), json!("stale"));
+    metadata.insert(
+        "evidence".into(),
+        json!(format!(
+            "The conductor re-read the car on `{branch}` and it is no longer being left behind: \
+             {why}. The claim this alarm carried no longer holds; closed by machine, not by \
+             judgement. A new streak that reaches the threshold files a new alarm."
+        )),
+    );
+    metadata.insert("cleared_by".into(), json!(LEFT_BEHIND_CLEARED_BY));
+    metadata
+}
+
 /// The escalation ladder for an open boarding-stall alarm, in minutes
 /// since it was filed. Three rungs, not a rung a minute: the packet is
 /// already `priority: urgent` when it is filed, so an escalation is
@@ -406,66 +456,6 @@ pub(crate) fn stall_escalation_message(escalation: &StallEscalation, line: &str)
          twin was filed, and the ladder is finite, so a stall costs at most {rungs} of \
          these however long it runs (backlog 94896e74)."
     )
-}
-
-/// The journal line a refused board leaves. It is the only record of
-/// the window now, so it carries the reason AND the fact that no packet
-/// was opened; a reader who greps `no train departed` gets every
-/// non-departure, whatever refused it.
-pub(crate) fn no_departure_line(refusal: &NoDeparture) -> String {
-    match refusal {
-        NoDeparture::HostShort { reason } => format!(
-            "no train departed — boarding refused before any car was collected: {reason}. \
-             No train packet opened, no PR, no CI spent."
-        ),
-        NoDeparture::NothingParked => "no train departed — no car was parked and ready when the \
-             window opened: an idle window, not a failure. No train packet opened."
-            .to_string(),
-        NoDeparture::AllConflicted { branches } => format!(
-            "no train departed — every candidate was skipped on merge conflicts: {branches}. \
-             No train packet opened, no PR, no CI spent; each car carries its own skip_reason."
-        ),
-        NoDeparture::ConsistRefused { reason, cars } => format!(
-            "no train departed — {reason}. No train packet opened, no PR, no CI spent — \
-             {cars} car(s) stay boardable and unstruck."
-        ),
-        NoDeparture::HeldOnEdges { cars, needs_human } if needs_human.is_empty() => format!(
-            "no train departed — every car on the dock is held on the ordering edge it \
-             declared: {cars}. No train packet opened. NOTHING NEEDS DOING: each boards by \
-             itself on a later window, once the car it named has landed."
-        ),
-        NoDeparture::HeldOnEdges { cars, needs_human } => format!(
-            "no train departed — every car on the dock is held, on the ordering edge it \
-             declared or garaged on a red dock re-gate: {cars}. No train packet opened. A \
-             HUMAN IS NEEDED for {needs_human}: that edge can never be satisfied, or that red \
-             is not re-gated again at its head, so this window will refuse identically until \
-             someone clears it — each car's own skip_reason names which."
-        ),
-        NoDeparture::AwaitingRegates {
-            cars,
-            in_flight,
-            main,
-            oldest_minutes,
-            hold_minutes,
-            missed,
-            more_minutes,
-        } => format!(
-            "BOARDING HELD — {in_flight} re-gate(s) on main {} in flight, oldest \
-             {oldest_minutes} min: {cars} car(s) are ready and wait for the round, up to \
-             {} more min (regate_hold_minutes={hold_minutes}{}), so one departure carries \
-             every car it turns green and main moves once. No train packet opened.",
-            &main[..8.min(main.len())],
-            (*more_minutes).max(0),
-            if *missed > 0 {
-                format!(
-                    "; {missed} car(s) already left behind mid-re-gate are waited for to \
-                     their own verdict, up to twice that from their own launch"
-                )
-            } else {
-                String::new()
-            },
-        ),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -871,67 +861,6 @@ mod persistence_tests {
         );
     }
 
-    /// D2 of design 42279fb2: a departure held for the dock's re-gate
-    /// round is BOUNDED by construction — it departs once the oldest
-    /// re-gate in the round reaches the hold — so it is never a stall,
-    /// and its line says what it waits for, on which main, and for how
-    /// much longer at most.
-    #[test]
-    fn a_departure_held_for_the_regate_round_clears_itself_and_says_how() {
-        let held = NoDeparture::AwaitingRegates {
-            cars: 2,
-            in_flight: 5,
-            main: "22c1a876aaaa".into(),
-            oldest_minutes: 6,
-            hold_minutes: 15,
-            missed: 0,
-            more_minutes: 9,
-        };
-        assert!(
-            !refusal_persists(&held),
-            "a bounded hold clears itself — alarming on it is noise"
-        );
-        let line = no_departure_line(&held);
-        for want in [
-            "BOARDING HELD",
-            "5 re-gate(s) on main 22c1a876 in flight",
-            "oldest 6 min",
-            "2 car(s)",
-            "up to 9 more min",
-            "No train packet opened",
-        ] {
-            assert!(line.contains(want), "{want}: {line}");
-        }
-        assert!(!line.contains("left behind"), "{line}");
-    }
-
-    /// Backlog d9530df2: a hold that waits past the oldest re-gate's bound
-    /// for a car a departure already left behind says so — otherwise the
-    /// line reads "oldest 18 min" against a hold of 15, which looks like a
-    /// broken bound. Still bounded, so still no alarm.
-    #[test]
-    fn a_hold_for_a_car_left_behind_mid_regate_says_whom_it_waits_for() {
-        let held = NoDeparture::AwaitingRegates {
-            cars: 3,
-            in_flight: 2,
-            main: "604ed86faaaa".into(),
-            oldest_minutes: 18,
-            hold_minutes: 15,
-            missed: 1,
-            more_minutes: 24,
-        };
-        assert!(!refusal_persists(&held));
-        let line = no_departure_line(&held);
-        for want in [
-            "oldest 18 min",
-            "up to 24 more min",
-            "1 car(s) already left behind mid-re-gate",
-            "their own verdict",
-        ] {
-            assert!(line.contains(want), "{want}: {line}");
-        }
-    }
-
     /// The same variant falls on BOTH sides depending on its content,
     /// which is the reason this is a function over the value rather
     /// than a list of variant names.
@@ -1022,6 +951,80 @@ mod repetition_tests {
         assert!(
             left_behind_alarm_due(&alarmed, 4),
             "a cleared stamp is no alarm"
+        );
+    }
+
+    /// THE ALARM CLOSES ITSELF WHEN ITS STREAK ENDS (backlog 7919fdcc,
+    /// item 6). Every way the streak ends is read off the car — closed,
+    /// boarded, the count cleared or started over — and each is named;
+    /// a car still at or past the threshold keeps its alarm even with
+    /// its stamp lost (the next departure adopts it), and an alarm whose
+    /// car the pass did not read is left alone.
+    #[test]
+    fn a_left_behind_alarm_clears_when_its_cars_streak_ends() {
+        let alarm = |id: &str, car: &str| {
+            json!({"id": id, "metadata": {"left_behind_car": car,
+                                          "left_behind_branch": "feat/from-alarm"}})
+        };
+        let car = |id: &str, status: &str, md: Value| {
+            let mut metadata = json!({"branch": format!("feat/{id}")});
+            for (k, v) in md.as_object().cloned().unwrap_or_default() {
+                metadata[k] = v;
+            }
+            json!({"id": id, "status": status, "metadata": metadata})
+        };
+        let cars = vec![
+            car("landed", "closed", json!({LEFT_BEHIND_TRAINS: 4})),
+            car("boarded", "open", json!({"train": "7a7a7a7a-train"})),
+            car("cleared", "open", json!({})),
+            car("restarted", "open", json!({LEFT_BEHIND_TRAINS: 1})),
+            car(
+                "standing",
+                "open",
+                json!({LEFT_BEHIND_TRAINS: 3, LEFT_BEHIND_ALARM: "a-standing"}),
+            ),
+            car("stamp-lost", "open", json!({LEFT_BEHIND_TRAINS: 5})),
+        ];
+        let open = vec![
+            alarm("a-landed", "landed"),
+            alarm("a-boarded", "boarded"),
+            alarm("a-cleared", "cleared"),
+            alarm("a-restarted", "restarted"),
+            alarm("a-standing", "standing"),
+            alarm("a-stamp-lost", "stamp-lost"),
+            alarm("a-unread", "not-in-this-pass"),
+            json!({"id": "a-stranded", "metadata": {"stranded_branch": "feat/x"}}),
+        ];
+        let got = left_behind_alarms_to_clear(&open, &cars);
+        let ids: Vec<&str> = got.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["a-landed", "a-boarded", "a-cleared", "a-restarted"],
+            "{got:?}"
+        );
+        let why = |id: &str| got.iter().find(|g| g.0 == id).expect(id).2.clone();
+        assert!(why("a-landed").contains("closed"), "{}", why("a-landed"));
+        assert!(
+            why("a-boarded").contains("7a7a7a7a"),
+            "{}",
+            why("a-boarded")
+        );
+        assert!(why("a-cleared").contains("cleared"), "{}", why("a-cleared"));
+        assert!(
+            why("a-restarted").contains("is 1"),
+            "{}",
+            why("a-restarted")
+        );
+        assert_eq!(got[0].1, "feat/landed", "the car's own branch");
+
+        let writes = left_behind_clear_writes("feat/landed", &why("a-landed"));
+        assert_eq!(writes["disposition"], "stale");
+        assert_eq!(writes["cleared_by"], LEFT_BEHIND_CLEARED_BY);
+        assert!(
+            writes["evidence"]
+                .as_str()
+                .is_some_and(|e| e.contains("feat/landed") && e.contains("closed")),
+            "{writes:?}"
         );
     }
 

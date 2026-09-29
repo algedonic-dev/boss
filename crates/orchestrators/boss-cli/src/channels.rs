@@ -285,7 +285,7 @@ pub async fn run(
     since: Option<chrono::NaiveDate>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
 
     let backlog = read_backlog(|path| {
         let http = http.clone();
@@ -832,7 +832,7 @@ const DIRECTION_LINE: &str = "  direction: OUTWARD — work moving from core to 
 /// closed train that merged and closed on or after `since`. Paged on
 /// `total`, because a limit is a page and not a filter.
 async fn landed_tier_reading(
-    http: &reqwest::Client,
+    http: &boss_core::machine_token::Client,
     since: chrono::NaiveDate,
 ) -> Result<TierReading> {
     let trains = crate::train::list_all_pages(|offset| {
@@ -884,7 +884,7 @@ pub async fn tiers(
 ) -> Result<()> {
     let since =
         since.unwrap_or_else(|| (now - chrono::Duration::days(TIER_WINDOW_DAYS)).date_naive());
-    let reading = landed_tier_reading(&reqwest::Client::new(), since).await?;
+    let reading = landed_tier_reading(&crate::gate::machine_client()?, since).await?;
     println!("boss channels --tiers — is the core settling while work moves outward");
     print_landed(since, &reading);
     Ok(())
@@ -1009,7 +1009,7 @@ fn print_tier_mix(mix: &BTreeMap<String, usize>, total: usize) {
 /// so the verb can be re-run after every convergence without
 /// rewriting what an arrival stamped live.
 pub async fn backfill_tiers(since: Option<chrono::NaiveDate>) -> Result<()> {
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     let trains = crate::train::list_all_pages(|offset| {
         let http = http.clone();
         async move {

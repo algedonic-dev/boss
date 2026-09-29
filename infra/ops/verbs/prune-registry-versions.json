@@ -29,5 +29,6 @@
       "optional": true
     }
   ],
-  "timeout": 1800
+  "timeout": 1800,
+  "effect": "^prune-registry-versions: (OK — deleted [0-9]+ of [0-9]+ planned version[(]s[)]|DRY RUN — would delete [0-9]+ version[(]s[)])"
 }

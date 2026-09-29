@@ -14,23 +14,35 @@ pub(super) fn gates(inputs: &RegionInputs<'_>, w: &Windows, out: &[OutRail]) -> 
     let g = &inputs.status.gates;
     let capacity = usize::try_from(g.capacity).unwrap_or(0);
     let active = g.active.len();
+    // A gate's duration is its RUNNING time, from its Job to its verdict
+    // (`yard::run_started`) — a wait in line is the line's, and counted
+    // here it taught the floor that gates were slow (backlog 4d088a7e).
     let durations = inputs.gate_runs.iter().filter_map(|run| {
-        let opened = meta_instant(&run.metadata, "opened_at")?;
+        let started = crate::yard::run_started(run)?;
         let closed = closed_at(run)?;
-        let d = (closed - opened).num_seconds();
+        let d = (closed - started).num_seconds();
         (d > 0).then_some((closed, d))
     });
     let (cur, prev) = split(w, durations);
     let trend = duration_trend("gate duration", "minutes", cur, prev);
+    // When a bay's run began: its Job, else its filing (a run filed
+    // before the launch stamp existed).
+    let started = |a: &crate::yard::ActiveGate| {
+        a.launched_at
+            .as_deref()
+            .and_then(stamp_instant)
+            .or_else(|| stamp_instant(&a.since))
+    };
     let stale: Vec<&crate::yard::ActiveGate> = g.active.iter().filter(|a| a.stale).collect();
     let mut findings = Vec::new();
     if !stale.is_empty() {
         findings.push(Finding::new(
             bands::GATES_CORPSE,
-            // A run became a corpse the moment it outlived the deadline.
+            // A run became a corpse the moment it outlived the deadline,
+            // which its Job's clock keeps, not its packet's.
             stale
                 .iter()
-                .filter_map(|a| stamp_instant(&a.since))
+                .filter_map(|a| started(a))
                 .min()
                 .map(|s| s + chrono::Duration::hours(crate::yard::GATE_MAX_ACTIVE_HOURS)),
             format!(
@@ -41,6 +53,33 @@ pub(super) fn gates(inputs: &RegionInputs<'_>, w: &Windows, out: &[OutRail]) -> 
             format!(
                 "{} active past the gate deadline — a corpse holding a bay",
                 plural(stale.len(), "run", "runs")
+            ),
+        ));
+    }
+    // THE BAY RUNNING PAST TWICE THE MEDIAN (backlog 4d088a7e) — the
+    // yard's own per-bay judgement (`ActiveGate::troubled`), read here
+    // rather than re-derived, dated from when the first such run crossed
+    // the line. Its RUNNING age, never the packet's: on 2026-09-28 a gate
+    // queued 46 minutes and running 14 read as "going for an hour".
+    let long: Vec<&crate::yard::ActiveGate> = g.active.iter().filter(|a| a.troubled).collect();
+    if let (Some(median), Some(longest)) = (
+        g.typical_seconds,
+        long.iter().filter_map(|a| a.running_seconds).max(),
+    ) {
+        let limit = chrono::Duration::seconds(median * bands::RUN_PAST_MEDIAN_TIMES);
+        findings.push(Finding::new(
+            bands::GATES_RUN_LONG,
+            long.iter()
+                .filter_map(|a| started(a))
+                .min()
+                .map(|s| s + limit),
+            format!("running {}", bands::duration_text(longest / 60)),
+            format!(
+                "{} running past {}× the {} minutes a gate runs, the longest for {}",
+                plural(long.len(), "run", "runs"),
+                bands::RUN_PAST_MEDIAN_TIMES,
+                number_text((median as f64 / 60.0).round()),
+                bands::duration_text(longest / 60)
             ),
         ));
     }
@@ -216,8 +255,12 @@ mod tests {
         );
         let out = regions(&inputs(&status, &[], &[], &[], &runs, Some(&[]), Some(&[])));
         let gates = by_name(&out, "gates");
+        // No policy in the inputs, so the bound is the compiled
+        // fallback — read off the constant, not retyped, because it
+        // moves with the policy (3 -> 4 on 2026-09-28, backlog 366c2ed5).
+        let bound = usize::try_from(crate::yard::COMPILED_GATE_MAX_CONCURRENT).unwrap();
         assert_eq!(gates.count, Some(1));
-        assert_eq!(gates.bound, Some(3));
+        assert_eq!(gates.bound, Some(bound));
         assert_eq!(gates.state, RegionState::Troubled, "{}", gates.why);
         assert!(gates.why.contains("corpse"), "{}", gates.why);
         // The run became a corpse when it outlived the deadline: opened
@@ -228,7 +271,7 @@ mod tests {
         assert_eq!(gates.trend.metric, "gate duration");
         assert_eq!(gates.trend.current, Some(30.0));
         assert_eq!(gates.trend.previous, Some(60.0));
-        assert_eq!(gates.kpi[0].text, "1 of 3 bays in use");
+        assert_eq!(gates.kpi[0].text, format!("1 of {bound} bays in use"));
         assert_eq!(gates.kpi[1].text, "gates take 30 minutes (median)");
         // The garage's trend: reds per day.
         let garage = by_name(&out, "garage");
@@ -270,6 +313,7 @@ mod tests {
             since: since.into(),
             stale: false,
             train: None,
+            ..Default::default()
         };
         let mut status = empty_status();
         status.gates.capacity = 3;
@@ -360,6 +404,54 @@ mod tests {
         let status = every_bay("2026-09-19T11:20:00Z", &["2026-09-19T11:30:00Z"]);
         let g = read_gates(&status, &verdicts_until("2026-09-19T11:55:00Z"));
         assert_eq!(g.state, RegionState::Full, "{}", g.why);
+    }
+
+    /// THE RUN, NOT THE PACKET (backlog 4d088a7e). The bay the yard calls
+    /// troubled is the one whose RUNNING age is past twice the median —
+    /// here 41 minutes against a 20-minute median, dated from when it
+    /// crossed (its launch at 11:14 + 40m). A run that waited an hour in
+    /// line and has run five minutes is not it: that wait is the line's,
+    /// and it outranks nothing.
+    #[test]
+    fn a_bay_running_past_twice_the_median_is_the_troubled_one() {
+        let mut status = every_bay("2026-09-19T11:20:00Z", &[]);
+        status.gates.typical_seconds = Some(1200);
+        status.gates.active[0].launched_at = Some("2026-09-19T11:14:00Z".into());
+        status.gates.active[0].running_seconds = Some(41 * 60);
+        status.gates.active[0].troubled = true;
+        status.gates.active[1].launched_at = Some("2026-09-19T11:50:00Z".into());
+        status.gates.active[1].queued_seconds = Some(3600);
+        status.gates.active[1].running_seconds = Some(5 * 60);
+        let g = read_gates(&status, &verdicts_until("2026-09-19T11:55:00Z"));
+        assert_eq!(g.state, RegionState::Troubled, "{}", g.why);
+        let band = g.band.as_ref().unwrap();
+        assert_eq!(band.id, "gates-run-long");
+        assert_eq!(band.reads, "running 41m > 2× the median gate running time");
+        assert_eq!(band.since.as_deref(), Some("2026-09-19T11:54:00+00:00"));
+        assert!(
+            g.why
+                .contains("1 run running past 2× the 20 minutes a gate runs"),
+            "{}",
+            g.why
+        );
+        // The same bays with nothing past the line read full, as before.
+        status.gates.active[0].troubled = false;
+        let g = read_gates(&status, &verdicts_until("2026-09-19T11:55:00Z"));
+        assert_eq!(g.state, RegionState::Full, "{}", g.why);
+    }
+
+    /// A corpse is dated from its JOB's deadline: a run that waited two
+    /// hours in line became a corpse three hours after it launched, not
+    /// three hours after it was filed.
+    #[test]
+    fn a_corpse_is_dated_from_its_launch() {
+        let mut status = every_bay("2026-09-19T11:20:00Z", &[]);
+        status.gates.active[0].stale = true;
+        status.gates.active[0].launched_at = Some("2026-09-19T07:00:00Z".into());
+        let g = read_gates(&status, &verdicts_until("2026-09-19T11:55:00Z"));
+        let band = g.band.as_ref().unwrap();
+        assert_eq!(band.id, "gates-corpse");
+        assert_eq!(band.since.as_deref(), Some("2026-09-19T10:00:00+00:00"));
     }
 
     /// Below the bound the rule says nothing: two of three bays in use is

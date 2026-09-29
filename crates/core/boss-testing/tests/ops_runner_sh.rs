@@ -80,7 +80,9 @@ fn stub_sor(root: &Path) -> PathBuf {
         "#!/bin/sh\n\
          m=GET; prev=; o=; w=; u=\n\
          for a in \"$@\"; do [ \"$prev\" = -X ] && m=\"$a\"; [ \"$prev\" = -o ] && o=\"$a\"; [ \"$prev\" = -w ] && w=1; case \"$a\" in http*) u=\"$a\";; esac; prev=\"$a\"; done\n\
-         for a in \"$@\"; do case \"$a\" in @*)\n\
+         if [ -n \"${STUB_ARGV_LOG:-}\" ]; then printf '%s\\n' \"$@\" >> \"$STUB_ARGV_LOG\"; fi\n\
+         p=\n\
+         for a in \"$@\"; do if [ \"$p\" = -H ]; then p=\"$a\"; case \"$a\" in @*) if [ -n \"${STUB_HEADER_LOG:-}\" ]; then cat \"${a#@}\" >> \"$STUB_HEADER_LOG\"; fi;; esac; continue; fi; p=\"$a\"; case \"$a\" in @*)\n\
              if [ -n \"${STUB_WRITE_ORDER:-}\" ]; then printf '%s %s\\n' \"$m\" \"$u\" >> \"$STUB_WRITE_ORDER\"; fi\n\
              case \"$m $u\" in \"PATCH \"*/steps/*/metadata)\n\
                  cp \"${a#@}\" \"$STUB_MERGE\"\n\
@@ -147,6 +149,24 @@ fn run(
     let _ = std::fs::remove_file(&merge);
     let _ = std::fs::remove_file(root.join("merge.json.first"));
     let _ = std::fs::remove_file(root.join("patch.json"));
+    let out = runner(root, verbs, extra_env)
+        .output()
+        .expect("ops-runner.sh runs");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload = std::fs::read_to_string(&merge)
+        .ok()
+        .map(|s| serde_json::from_str::<serde_json::Value>(&s).expect("merge payload is JSON"));
+    (text, payload)
+}
+
+/// The runner, one pass, pointed at the stub with `verbs` as its
+/// allowlist directory — not yet started, so a case can choose where its
+/// output goes.
+fn runner(root: &Path, verbs: &Path, extra_env: &[(&str, String)]) -> Command {
     let path = format!(
         "{}:{}",
         root.join("bin").display(),
@@ -160,23 +180,14 @@ fn run(
         .env("BOSS_JOBS_URL", "http://sor.invalid")
         .env("OPS_VERBS_DIR", verbs)
         .env("STUB_JOBS", root.join("jobs.json"))
-        .env("STUB_PUT", &put)
-        .env("STUB_MERGE", &merge)
+        .env("STUB_PUT", root.join("put.json"))
+        .env("STUB_MERGE", root.join("merge.json"))
         .env("STUB_PATCH", root.join("patch.json"))
         .env("STUB_GET", root.join("get.url"));
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    let out = cmd.output().expect("ops-runner.sh runs");
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let payload = std::fs::read_to_string(&merge)
-        .ok()
-        .map(|s| serde_json::from_str::<serde_json::Value>(&s).expect("merge payload is JSON"));
-    (text, payload)
+    cmd
 }
 
 /// The real allowlist, verbatim: `infra/ops/verbs/*.json` copied file
@@ -600,6 +611,151 @@ fn a_read_only_verb_answers_on_boss_gcp() {
     assert_eq!(md["exit_code"], "0", "{md} / {out}");
     assert_eq!(md["runner_host"], "boss-gcp", "{md}");
     assert!(out.contains("answered df"), "{out}");
+}
+
+/// THE MACHINE TOKEN NEVER RIDES IN curl's ARGV (backlog 5f3ad356,
+/// 2026-09-28). Every one of the runner's writes carried it as
+/// `-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"`, readable by every
+/// local user in ps while curl ran. Under /bin/sh — dash on the hosts —
+/// a whole pass now hands it over as `-H @<0600 file>`: the header still
+/// reaches every request, the value is in no argv, and the private
+/// directory is gone when the pass ends (its cleanup chained in front of
+/// the runner's own EXIT trap).
+#[test]
+fn the_machine_token_rides_in_a_header_file_never_in_argv() {
+    needs_jq!();
+    let root = scratch("token-file");
+    stub_sor(&root);
+    let verbs = real_verbs(&root);
+    packet_for(&root, "boss-gcp", "df", "[]");
+    let tmp = root.join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let argv_log = root.join("curl-argv.log");
+    let header_log = root.join("curl-headers.log");
+    let token = "stub-machine-token-5f3ad356";
+    let (out, payload) = run(
+        &root,
+        &verbs,
+        &[
+            ("HOST_ID", "boss-gcp".to_string()),
+            ("BOSS_MACHINE_TOKEN", token.to_string()),
+            ("TMPDIR", tmp.display().to_string()),
+            ("STUB_ARGV_LOG", argv_log.display().to_string()),
+            ("STUB_HEADER_LOG", header_log.display().to_string()),
+        ],
+    );
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert_eq!(md["disposition"], "answered", "{md} / {out}");
+    let argv = std::fs::read_to_string(&argv_log).unwrap_or_default();
+    assert!(!argv.is_empty(), "curl was never called: {out}");
+    assert!(
+        !argv.contains(token),
+        "the machine token must never be in curl's argv:\n{argv}"
+    );
+    let headers = std::fs::read_to_string(&header_log).unwrap_or_default();
+    assert!(
+        headers.contains(&format!("x-boss-machine-token: {token}")),
+        "the token must still reach the requests, as a header file:\n{headers}\n{out}"
+    );
+    let left: Vec<_> = std::fs::read_dir(&tmp)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the pass must leave nothing under TMPDIR: {left:?}"
+    );
+}
+
+/// THE RUNNER PRESENTS ITS CREDENTIAL (design f623e425 Q1, option A;
+/// backlog 6c9183de). The jobs API knows the runner by a credential it
+/// presents in `x-boss-runner-credential`, never by the id it types, so
+/// the runner reads its host's credential from a root-only FILE and
+/// sends it beside the machine token on every request to the system of
+/// record — as a header FILE, never in curl's argv, the machine token's
+/// own rule. Two refusals the runner must NOT make (DR rule 62dac114,
+/// no refusal on David's path): no file is a pass exactly as before,
+/// and a file it cannot send is said on its log and the pass goes on
+/// without it — the credential adds identity, it never stops an answer.
+#[test]
+fn the_runner_credential_rides_beside_the_machine_token_in_a_header_file() {
+    needs_jq!();
+    let root = scratch("runner-credential");
+    stub_sor(&root);
+    let verbs = real_verbs(&root);
+    packet_for(&root, "boss-gcp", "df", "[]");
+    let tmp = root.join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let argv_log = root.join("curl-argv.log");
+    let header_log = root.join("curl-headers.log");
+    let token = "stub-machine-token-6c9183de";
+    let credential = "stub-runner-credential-6c9183de-boss-gcp";
+    let file = root.join("runner.credential");
+    std::fs::write(&file, format!("{credential}\n")).unwrap();
+    let env = |file: &Path| {
+        vec![
+            ("HOST_ID", "boss-gcp".to_string()),
+            ("BOSS_MACHINE_TOKEN", token.to_string()),
+            ("BOSS_RUNNER_CREDENTIAL_FILE", file.display().to_string()),
+            ("TMPDIR", tmp.display().to_string()),
+            ("STUB_ARGV_LOG", argv_log.display().to_string()),
+            ("STUB_HEADER_LOG", header_log.display().to_string()),
+        ]
+    };
+    let (out, payload) = run(&root, &verbs, &env(&file));
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert_eq!(md["disposition"], "answered", "{md} / {out}");
+    let argv = std::fs::read_to_string(&argv_log).unwrap_or_default();
+    assert!(!argv.is_empty(), "curl was never called: {out}");
+    assert!(
+        !argv.contains(credential),
+        "the runner credential must never be in curl's argv:\n{argv}"
+    );
+    assert!(!out.contains(credential), "nor on the runner's log:\n{out}");
+    let headers = std::fs::read_to_string(&header_log).unwrap_or_default();
+    let count = |line: &str| headers.lines().filter(|l| *l == line).count();
+    let sent = count(&format!("x-boss-runner-credential: {credential}"));
+    assert!(
+        sent > 0,
+        "the credential must reach the requests:\n{headers}\n{out}"
+    );
+    assert_eq!(
+        sent,
+        count(&format!("x-boss-machine-token: {token}")),
+        "every request that carries the machine token carries the credential:\n{headers}"
+    );
+
+    // No file: the pass answers as it did before the door, and sends none.
+    std::fs::remove_file(&header_log).unwrap();
+    let (out, payload) = run(&root, &verbs, &env(&root.join("absent.credential")));
+    let md = payload.unwrap_or_else(|| panic!("no step completed without a file: {out}"));
+    assert_eq!(md["disposition"], "answered", "{md} / {out}");
+    let headers = std::fs::read_to_string(&header_log).unwrap_or_default();
+    assert!(!headers.contains("x-boss-runner-credential"), "{headers}");
+
+    // A file that cannot be one header: said, and the pass still answers.
+    std::fs::write(&file, format!("{credential}\nsecond-line\n")).unwrap();
+    std::fs::remove_file(&header_log).unwrap();
+    let (out, payload) = run(&root, &verbs, &env(&file));
+    let md = payload.unwrap_or_else(|| panic!("no step completed with a bad file: {out}"));
+    assert_eq!(md["disposition"], "answered", "{md} / {out}");
+    assert!(
+        out.contains("runner credential") && out.contains("NOT presented"),
+        "a credential the runner cannot send is said on its log: {out}"
+    );
+    assert!(!out.contains(credential), "{out}");
+    let headers = std::fs::read_to_string(&header_log).unwrap_or_default();
+    assert!(!headers.contains("x-boss-runner-credential"), "{headers}");
+    let left: Vec<_> = std::fs::read_dir(&tmp)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the pass must leave nothing under TMPDIR: {left:?}"
+    );
 }
 
 /// `disk-report` answers on boss-gcp too (backlog d3c7eada, 2026-09-26):
@@ -1039,6 +1195,91 @@ fn an_answered_verbs_duration_is_recorded_on_its_step() {
     assert_eq!(md.get("exit_code"), Some(&serde_json::Value::Null), "{md}");
 }
 
+/// A REQUEST IS LOGGED WHEN IT STARTS, not only when it ends (backlog
+/// b81ff4ca). On 2026-09-28 the forge runner's journal read `answered
+/// publish-github-pr` at 02:28:59 and then nothing for thirteen minutes
+/// while eight requests queued; the item was filed as a silent runner
+/// with three wrong hypotheses (a post-publish push, a lock, a blocked
+/// unit), and only the NEXT line — `answered read-publish-checks on
+/// 444d0f22 (exit 75, 2746B, 786285ms)`, printed when that run ended —
+/// showed the runner had been busy the whole time. A line at the start
+/// names what is running while it runs, so a silence is attributable
+/// from the journal without re-deriving it (CLAUDE.md §Diagnosis).
+///
+/// The verb itself is the witness: it reads the runner's own output
+/// WHILE it runs, so the line is proven to precede the run, not merely
+/// to be somewhere in the pass's output.
+#[test]
+fn a_request_is_logged_when_it_starts_running() {
+    needs_jq!();
+    let root = scratch("logged-at-start");
+    stub_sor(&root);
+    let journal = root.join("journal.log");
+    let witness = root.join("witness.sh");
+    write_exec(
+        &witness,
+        "#!/bin/sh\n\
+         if grep -q '^ops-runner: running witness on aaaaaaaa' \"$RUNNER_JOURNAL\"; then\n\
+             echo 'witness: the start line was in the journal before I ran'\n\
+         else\n\
+             echo 'witness: NO start line in the journal while I ran'\n\
+         fi\n",
+    );
+    let verbs = verbs_dir(
+        &root,
+        &[(
+            "witness",
+            &format!(
+                r#"{{"about":"a verb that reads the runner's journal","hosts":["forge"],"argv":["{}"],"params":[],"timeout":45}}"#,
+                witness.display()
+            ),
+        )],
+    );
+    packet(&root, "witness", "[]");
+    let status = runner(
+        &root,
+        &verbs,
+        &[("RUNNER_JOURNAL", journal.display().to_string())],
+    )
+    .stdout(std::fs::File::create(&journal).unwrap())
+    .stderr(std::process::Stdio::null())
+    .status()
+    .expect("ops-runner.sh runs");
+    let out = std::fs::read_to_string(&journal).unwrap_or_default();
+    assert!(status.success(), "{out}");
+    let md: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("merge.json"))
+            .unwrap_or_else(|_| panic!("no step completed: {out}")),
+    )
+    .unwrap();
+    assert_eq!(md["disposition"], "answered", "{md} / {out}");
+    assert!(
+        md["output"]
+            .as_str()
+            .unwrap_or("")
+            .contains("the start line was in the journal before I ran"),
+        "the start line must be written BEFORE the verb runs: {md} / {out}"
+    );
+    let start = out
+        .lines()
+        .find(|l| l.starts_with("ops-runner: running witness on aaaaaaaa"))
+        .unwrap_or_else(|| panic!("no start line: {out}"));
+    assert!(
+        start.contains("timeout 45s"),
+        "the start line says how long this request may hold the runner: {start}"
+    );
+    assert!(
+        start.contains("queued"),
+        "the start line says how long the request waited for the runner: {start}"
+    );
+    let (start_at, end_at) = (
+        out.find("ops-runner: running witness on aaaaaaaa").unwrap(),
+        out.find("ops-runner: answered witness on aaaaaaaa")
+            .unwrap_or_else(|| panic!("no answered line: {out}")),
+    );
+    assert!(start_at < end_at, "started before answered: {out}");
+}
+
 /// A REFUSED COMPLETION SAYS WHY, ON THE REQUEST (post-mortem
 /// 3c3b202c). On 2026-09-22 from 00:50 to 02:54 UTC both runners
 /// stalled together, the forge's oldest request waiting 7394 s, and
@@ -1281,6 +1522,31 @@ fn race_fixture(case: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let puts = root.join("puts.jsonl");
     let patches = root.join("patches.jsonl");
     (root, verbs, puts, patches)
+}
+
+/// A `date` on the fixture's PATH whose `-u +%s` answers the epoch this
+/// was called at, every time, so no try the runner times can cost it a
+/// second; any other form goes to the real `date`, found on PATH now.
+fn stop_the_clock(root: &Path) {
+    let real = std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .map(|d| Path::new(d).join("date"))
+        .find(|p| p.is_file())
+        .expect("a real date on PATH");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    write_exec(
+        &root.join("bin").join("date"),
+        &format!(
+            "#!/bin/sh\n\
+             if [ \"$#\" = 2 ] && [ \"$1\" = -u ] && [ \"$2\" = +%s ]; then echo {now}; exit 0; fi\n\
+             exec {} \"$@\"\n",
+            real.display()
+        ),
+    );
 }
 
 fn logged(path: &Path) -> Vec<serde_json::Value> {
@@ -1742,10 +2008,21 @@ fn a_merge_the_server_keeps_refusing_with_a_5xx_is_recorded_and_held() {
 /// whole pass stop when OPS_WRITE_RETRY_BUDGET seconds are spent, and
 /// the default sits below APPROVAL_TTL_S — a value at or above it is cut
 /// to half the window.
+///
+/// The runner charges a failed try's own time as `date -u +%s` before
+/// and after it, in whole seconds, so against a real clock a first try
+/// that straddled a second boundary cost 1s, the budget of 1 was spent
+/// before the first retry, and the case sent 1 PUT, not 2: red on
+/// gates a742109c and f9c83e8d, and 11 of 200 runs under 48 spinners
+/// on the dev pod (backlog 2f97de89). A tick decided it, not the budget. So
+/// the clock is stopped for this case: `date -u +%s` answers one fixed
+/// epoch and every other `date` goes to the real one, which leaves the
+/// sleeps as the only spend — the logic the case pins.
 #[test]
 fn a_pass_stops_retrying_when_its_budget_is_spent_and_the_budget_sits_below_the_approval_window() {
     needs_jq!();
     let (root, verbs, puts, patches) = race_fixture("retry-budget");
+    stop_the_clock(&root);
     let (out, _) = run(
         &root,
         &verbs,
@@ -1844,6 +2121,10 @@ fn a_completion_sends_its_keys_through_the_merge_door_and_the_status_alone() {
         "approved_plan_sha256",
         "approval_signed_at",
         "claimed_as",
+        // This fixture's verb declares no effect (backlog fdbb447e).
+        "effect",
+        "effect_unproven",
+        "effect_unread",
     ] {
         assert_eq!(
             md.get(cleared),
@@ -2412,4 +2693,201 @@ fn the_disk_verb_requires_approval_and_refuses_an_unstable_target() {
             assert!(text.contains(expected), "--plan {args:?} -> {text}");
         }
     }
+}
+
+/// AN EXIT 0 IS NOT AN EFFECT (backlog fdbb447e part 1, design
+/// 3036296f mechanism B). The runner judges a verb's declared `effect`
+/// once, on the run's own output, and records the verdict beside the
+/// exit — so a reader of the step never takes `answered, exit 0` for
+/// "it changed what it exists to change". The daily prune's proof read
+/// the outcome alone and counted a refused run as proof.
+///
+/// One fixture verb per case, judged against its own `effect`:
+///   - it printed its read-back line: `effect` is that line (the LAST
+///     one matching, since a verb says its result last);
+///   - it exited 0 and printed no such line: `effect_unproven` names the
+///     declared regex, and `effect` is cleared;
+///   - it FAILED: nothing is judged — the exit is already the verdict.
+fn effect_fixture(case: &str, body: &str, spec_extra: &str) -> (PathBuf, PathBuf) {
+    let root = scratch(case);
+    stub_sor(&root);
+    let verb = root.join("acts.sh");
+    write_exec(&verb, body);
+    let verbs = verbs_dir(
+        &root,
+        &[(
+            "acts",
+            &format!(
+                r#"{{"about":"MUTATING — a fixture verb","hosts":["forge"],"argv":["{}"],"params":[]{spec_extra}}}"#,
+                verb.display()
+            ),
+        )],
+    );
+    packet(&root, "acts", "[]");
+    (root, verbs)
+}
+
+const EFFECT_RE: &str =
+    r#","effect":"^acts: (deleted [0-9]+, re-listed [0-9]+ left|dry run: would delete [0-9]+)$""#;
+
+#[test]
+fn a_declared_effect_the_run_printed_is_recorded_beside_its_exit() {
+    needs_jq!();
+    let (root, verbs) = effect_fixture(
+        "effect-shown",
+        "#!/bin/sh\necho 'acts: deleted 2, re-listed 9 left'\necho 'acts: deleting'\necho 'acts: deleted 3, re-listed 7 left'\n",
+        EFFECT_RE,
+    );
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert_eq!(md["exit_code"], "0", "{md} / {out}");
+    assert_eq!(
+        md["effect"], "acts: deleted 3, re-listed 7 left",
+        "the LAST matching line is the effect: {md}"
+    );
+    assert_eq!(md["effect_unproven"], serde_json::Value::Null, "{md}");
+    assert_eq!(md["effect_unread"], serde_json::Value::Null, "{md}");
+}
+
+/// THE WHOLE OUTPUT IS JUDGED, NOT THE RECORDED COPY (the adversarial
+/// review of this car). The runner keeps only the first OPS_OUTPUT_CAP
+/// (100 KB) of a run's output, and a verb prints its read-back LAST —
+/// every prune-registry-versions run and sweep-archive-branches 54547b33
+/// (184 KB) were past the cap. Judged on the cut copy, each would have
+/// been recorded EFFECT NOT SHOWN: a false statement in an immutable
+/// record, for exactly the runs that did the most.
+#[test]
+fn an_effect_printed_past_the_output_cap_is_still_shown() {
+    needs_jq!();
+    let (root, verbs) = effect_fixture(
+        "effect-past-cap",
+        "#!/bin/sh\ni=0\nwhile [ $i -lt 1500 ]; do echo \"acts: deleting branch $i of a long list, padded so the listing outgrows the runner's output cap\"; i=$((i+1)); done\necho 'acts: deleted 1500, re-listed 0 left'\n",
+        EFFECT_RE,
+    );
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert_eq!(md["exit_code"], "0", "{out}");
+    let recorded = md["output"].as_str().unwrap_or_default();
+    assert!(
+        recorded.contains("[ops-runner: output truncated"),
+        "the fixture must outgrow the cap, or it proves nothing: {} bytes recorded",
+        recorded.len()
+    );
+    assert!(
+        !recorded.contains("acts: deleted 1500"),
+        "the effect line is past the cap in the recorded copy"
+    );
+    assert_eq!(
+        md["effect"], "acts: deleted 1500, re-listed 0 left",
+        "judged on the whole output: {}",
+        md["effect_unproven"]
+    );
+    assert_eq!(md["effect_unproven"], serde_json::Value::Null);
+}
+
+/// The one line kept is bounded, as the output is: a verb that printed a
+/// runaway line as its effect records 2,000 characters of it, not all.
+#[test]
+fn a_recorded_effect_line_is_capped() {
+    needs_jq!();
+    let (root, verbs) = effect_fixture(
+        "effect-long-line",
+        "#!/bin/sh\nprintf 'acts: dry run: would delete 3'\ni=0\nwhile [ $i -lt 500 ]; do printf '0123456789'; i=$((i+1)); done\necho\n",
+        r#","effect":"^acts: dry run: would delete [0-9]+""#,
+    );
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    let effect = md["effect"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the line matched: {md}"));
+    assert_eq!(effect.chars().count(), 2000, "{}", effect.len());
+    assert!(effect.starts_with("acts: dry run: would delete 3"));
+}
+
+#[test]
+fn an_exit_0_that_did_not_show_its_declared_effect_is_recorded_unproven() {
+    needs_jq!();
+    // The shape the prune's proof missed: the verb ran, said something,
+    // exited 0 — and never printed the line that reads its effect back.
+    let (root, verbs) = effect_fixture(
+        "effect-missing",
+        "#!/bin/sh\necho 'acts: REFUSED — the keep set could not be derived'\necho '  Nothing was written.'\nexit 0\n",
+        EFFECT_RE,
+    );
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert_eq!(md["disposition"], "answered", "{md} / {out}");
+    assert_eq!(md["exit_code"], "0", "{md} / {out}");
+    assert_eq!(md["effect"], serde_json::Value::Null, "{md}");
+    let why = md["effect_unproven"]
+        .as_str()
+        .unwrap_or_else(|| panic!("an exit 0 with no effect line must say so on the step: {md}"));
+    assert!(
+        why.contains("no line of the output matches") && why.contains("^acts: (deleted"),
+        "the record names the regex it looked for: {why}"
+    );
+}
+
+#[test]
+fn a_declared_effect_that_cannot_be_judged_is_unproven_not_proven() {
+    needs_jq!();
+    // No evidence is not a pass: a regex the runner's engine cannot
+    // compile is a run whose effect was NOT shown, never one that was.
+    let (root, verbs) = effect_fixture(
+        "effect-bad-regex",
+        "#!/bin/sh\necho 'acts: deleted 1, re-listed 1 left'\n",
+        r#","effect":"^acts: (deleted""#,
+    );
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert_eq!(md["exit_code"], "0", "{md} / {out}");
+    assert_eq!(md["effect"], serde_json::Value::Null, "{md}");
+    assert!(
+        md["effect_unproven"]
+            .as_str()
+            .is_some_and(|w| w.contains("could not be judged")),
+        "{md}"
+    );
+}
+
+#[test]
+fn a_failed_run_is_not_judged_for_its_effect() {
+    needs_jq!();
+    let (root, verbs) = effect_fixture(
+        "effect-failed",
+        "#!/bin/sh\necho 'acts: deleted 3, re-listed 7 left'\necho 'acts: FAILED — the re-list disagreed' >&2\nexit 1\n",
+        EFFECT_RE,
+    );
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert_eq!(md["exit_code"], "1", "{md} / {out}");
+    for key in ["effect", "effect_unproven", "effect_unread"] {
+        assert_eq!(
+            md[key],
+            serde_json::Value::Null,
+            "{key}: a failed run's exit is its verdict: {md}"
+        );
+    }
+}
+
+#[test]
+fn a_verb_that_declares_no_read_back_says_so_on_every_clean_run() {
+    needs_jq!();
+    // Loud, not refused (DR rule 62dac114): the verb still runs and
+    // still answers; its record says that exit 0 is all this run proves.
+    let (root, verbs) = effect_fixture(
+        "effect-unread",
+        "#!/bin/sh\necho 'acts: done'\n",
+        r#","effect_unread":"prints no re-list after it deletes (follow-up: re-list and print what is left)""#,
+    );
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert_eq!(md["exit_code"], "0", "{md} / {out}");
+    assert_eq!(
+        md["effect_unread"],
+        "prints no re-list after it deletes (follow-up: re-list and print what is left)",
+        "{md}"
+    );
+    assert_eq!(md["effect"], serde_json::Value::Null, "{md}");
+    assert_eq!(md["effect_unproven"], serde_json::Value::Null, "{md}");
 }

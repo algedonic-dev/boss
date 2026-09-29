@@ -1,0 +1,103 @@
+# confirm-recovery-sheet-kept — the 90-day check that the paper copy of
+# the recovery sheet still exists where it is kept (design 125d405d Q2,
+# answered by David 2026-09-28 as proposed: "reprint on every change,
+# plus a 90-day existence check", because a sheet nobody can find fails
+# exactly like a stale one; recorded in docs/architecture-decisions.md,
+# "The way back in is a printed sheet…").
+#
+# WHO FILES IT. The same daily check that files reprint-recovery-sheet
+# (`boss recovery reprint`, infra/cluster/manifests/
+# boss-recovery-sheet.yaml). When a version is on paper by record, the
+# tree still says that version, no reprint is owed, none of these is
+# open, and the newer of (the print's signature, the last `kept`
+# confirmation) is 90 or more days old, it files one. The number is
+# boss-cli's recovery::reprint::EXISTENCE_CHECK_DAYS, one constant.
+#
+# DAVID'S ACT: find the paper, and approve `confirm` with a passkey. The
+# statement names the version the record says is on paper, the packet
+# that signed for it and when — the machine filled it, so he types
+# nothing. Reject when the copy is not where it is kept: the packet
+# closes `missing`, and the next daily check files a reprint of the same
+# version, because an unfindable copy is no copy.
+#
+# THE KEYS ARE A CONTRACT with crates/orchestrators/boss-cli/src/
+# recovery/reprint.rs (KEPT_KIND, CONFIRM_STEP and the keys it reads),
+# pinned by crates/core/boss-jobs/tests/
+# platform_bundle_confirm_recovery_sheet_kept.rs.
+
+[[workflow]]
+kind = "confirm-recovery-sheet-kept"
+label = "Confirm the recovery sheet is kept"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "Every 90 days, confirm the printed recovery sheet still exists where it is kept (design 125d405d Q2). Filed by the daily recovery-sheet check, naming the version the record says is on paper and the print job that signed for it. The platform owner finds the paper and approves `confirm` with a passkey; a rejection closes it `missing`, and the next daily check files a reprint."
+metadata = { owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "due"
+kind = "trigger"
+ready_when = "true"
+title_template = "The recovery sheet's existence check is due"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "recovery-sheet-daily-check" }
+
+[[workflow.step]]
+title = "confirm"
+kind = "sign-off"
+ready_when = "steps.due.done"
+assurance_required = "presence"
+sign_offs_required = ["platform-admin"]
+title_template = "Find the printed recovery sheet and confirm it is where it is kept"
+authority_role = "platform-admin"
+metadata_defaults = { fact_hash = "{metadata.fact_hash}", version = "{metadata.version}", print_packet = "{metadata.print_packet}", printed_at = "{metadata.printed_at}", statement = "{metadata.statement}", procedure = "YOUR PASSKEY SIGNS THIS STEP'S CONTENT, and you type nothing. Find the paper copy of the recovery sheet where you keep it, and check its footer says the `version` below. Approve if it does. Reject if it is not there or says another version: the next daily check files a reprint." }
+
+[[workflow.step.fields]]
+name = "fact_hash"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "version"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "print_packet"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "printed_at"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "statement"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "decision"
+field_type = "approved|rejected"
+required = true
+
+[[workflow.step]]
+title = "kept"
+kind = "outcome"
+ready_when = "steps.confirm.done AND steps.confirm.metadata.decision = \"approved\""
+title_template = "Kept — the paper copy is where it belongs"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "kept" }
+
+[[workflow.step]]
+title = "missing"
+kind = "outcome"
+ready_when = "steps.confirm.done AND NOT (steps.confirm.metadata.decision = \"approved\")"
+title_template = "Missing — the next daily check files a reprint"
+metadata_defaults = { outcome_kind = "aborted" }
+terminal = { outcome = "missing" }

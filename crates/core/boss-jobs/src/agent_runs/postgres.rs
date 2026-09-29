@@ -387,11 +387,39 @@ impl AgentRunLog for PgAgentRuns {
         .bind(filter.branch.as_deref())
         .bind(filter.actor_id.as_deref())
         .bind(since)
-        .bind(filter.limit.unwrap_or(200).clamp(1, 1000))
+        // `LIMIT NULL` is no limit, which is what `None` means on the
+        // port and in the in-memory adapter; a limit of zero or below
+        // keeps nothing. This bound `unwrap_or(200).clamp(1, 1000)`
+        // until 2026-09-28, so the cost roll-up, which passes the
+        // caller's filter through, summed the newest 200 runs and
+        // called it the total (backlog be459ab9, found by
+        // `the_adapters_agree_on_the_agent_run_log_pg.rs`). A listing's
+        // page size is the listing handler's to choose, not the store's.
+        .bind(filter.limit.map(|n| n.max(0)))
         .fetch_all(&self.pool)
         .await
         .map_err(storage)?;
         rows.iter().map(row_to_run).collect()
+    }
+
+    async fn count_runs(&self, filter: &RunFilter) -> Result<u64, AgentRunError> {
+        // The listing's WHERE, word for word, and no LIMIT: the count is
+        // the filter's answer, which the page is a part of.
+        let n: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {READ_RELATION} \
+             WHERE ($1::uuid IS NULL OR job_id = $1) \
+               AND ($2::text IS NULL OR branch = $2) \
+               AND ($3::text IS NULL OR actor_id = $3) \
+               AND ($4::timestamptz IS NULL OR finished_at >= $4)"
+        ))
+        .bind(filter.job_id)
+        .bind(filter.branch.as_deref())
+        .bind(filter.actor_id.as_deref())
+        .bind(filter.since)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(storage)?;
+        Ok(u64::try_from(n).unwrap_or(0))
     }
 
     async fn rate_card(&self) -> Result<Vec<RateCardRow>, AgentRunError> {

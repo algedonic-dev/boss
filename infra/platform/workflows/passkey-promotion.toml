@@ -1,0 +1,168 @@
+# passkey-promotion — ONE ceremony promotes ONE stored passkey to the
+# operator tier (design 2cb6256f, David 2026-09-28, all three questions
+# accepted as proposed; built for backlog 2a228d0c).
+#
+# WHY THIS EXISTS. The gateway raises the platform owner's session to
+# operator only after an assertion from an OPERATOR-tier passkey
+# (crates/core/boss-gateway src/elevation.rs), and enrolment always
+# stores a `user`-tier key — otherwise a copied user-tier cookie could
+# enrol a software key and elevate with it (H1 of the review of car
+# 0bde9b99). So a key reaches operator only by a recorded act, and this
+# is that act's protocol. It mirrors break-glass-enrolment, the delivered
+# precedent (D2).
+#
+# ONE PACKET PER KEY, filed by the machine (D1). The gateway files one
+# from the /me button "Make this my operator key", naming the key from
+# its stored row: `employee_id`, `credential_id` (the WebAuthn id,
+# base64url), `label`, `registered_at` and `public_key_sha256` (the
+# fingerprint of the stored key material). They are bound into the
+# `authorise` step's metadata, so the approving passkey signs them —
+# step_shape_hash covers every key — and an edit after signing leaves no
+# live stamp. Filing grants nothing.
+#
+# THE FINISH (D3, D4, Q1). Once `authorise` is approved, the owner
+# touches two keys on /me: the key being promoted (possession: it is
+# his key) and a break-glass hardware key (the vouch: a factor a copied
+# cookie cannot reach, because break-glass records are committed to the
+# tree by a reviewed car). The gateway then checks, in order, naming the
+# first failure: the session's employee is the roster's platform owner
+# (RosterPlatformOwner, no env override); the session carries
+# platform-admin; the credential is that employee's; `authorise` is
+# approved with a live presence stamp by that same employee, re-judged
+# against the step's CURRENT content (Step::live_stamps); the packet is
+# open and `promote` unspent; both assertions verify.
+#
+# THE TICKET (car 2; review of car 293d5dc1). With both assertions
+# verified, the gateway signs a promotion ticket with the session key
+# (boss_core::passkey_promotion::PromotionTicket: packet, employee,
+# credential, the break-glass label that vouched, a single-use nonce, an
+# expiry) and people flips nothing without one — so a caller that merely
+# claims to be the gateway, holding an approved packet, promotes nothing.
+# The /me side is crates/core/boss-gateway src/promotion.rs.
+#
+# THE ONE WRITER (D5-D7). The flip is boss-people's
+# POST /api/people/{id}/webauthn-credentials/{credential_id}/promote,
+# which accepts `automation:gateway` alone and records
+# `auth.passkey.promoted` in the flip's own transaction. The gateway
+# promotes, THEN completes `promote`; a replay after a failed step write
+# re-asks promote on a key already operator, which answers 200 and
+# records nothing twice. Demotion is removal, through the existing
+# credential DELETE (D8).
+#
+# FILING BY HAND (an agent that needs one): `boss job file --kind
+# passkey-promotion --subject employee/<id> --meta employee_id=<id>
+# --meta credential_id=<b64url> --meta label=<label> --meta
+# registered_at=<rfc3339> --meta public_key_sha256=<hex>`.
+
+[[workflow]]
+kind = "passkey-promotion"
+label = "Passkey promotion"
+category = "platform"
+subject_kinds = ["employee"]
+owning_team = "platform"
+description = "Promote ONE of the platform owner's stored passkeys to the operator tier, the tier that can raise his session to operator (design 2cb6256f). The gateway files it from /me naming the key (owner, credential id, label, when enrolled); the owner approves `authorise` with a presence stamp over exactly that; then, on /me, he touches the key being promoted and a break-glass hardware key, and the gateway, re-judging owner, stamp and packet, asks boss-people to flip the row (which records auth.passkey.promoted) and completes `promote` with what it spent. `declined` is an authorisation the approver did not approve. Demotion is removing the key."
+metadata = { owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "filed"
+kind = "trigger"
+ready_when = "true"
+title_template = "Passkey promotion requested: {metadata.label} for {metadata.employee_id}"
+metadata_defaults = { trigger_kind = "operator", trigger_name = "owner-requests-a-passkey-promotion" }
+
+[[workflow.step]]
+title = "authorise"
+kind = "sign-off"
+ready_when = "steps.filed.done"
+assurance_required = "presence"
+sign_offs_required = ["platform-admin"]
+title_template = "Authorise making {metadata.label} an operator key"
+authority_role = "platform-admin"
+metadata_defaults = { employee_id = "{metadata.employee_id}", credential_id = "{metadata.credential_id}", label = "{metadata.label}", registered_at = "{metadata.registered_at}", public_key_sha256 = "{metadata.public_key_sha256}", procedure = "YOUR PASSKEY SIGNS THIS STEP'S CONTENT, and the gateway promotes exactly the key it names: the `label`, the `credential_id`, the `registered_at` and the `public_key_sha256` (the fingerprint of its stored public key) of one key on the account `employee_id`. An operator-tier key can raise your session to operator, so approve only a request you made, for a key you hold. After approving, open /me SIGNED IN AS YOURSELF and press Finish: touch the key being promoted, then a break-glass hardware key. The promotion is refused from anyone else's session, and for anyone but the platform owner." }
+
+[[workflow.step.fields]]
+name = "employee_id"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "credential_id"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "label"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "registered_at"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+# boss_core::presence::public_key_fingerprint of the row's stored
+# public_key. Signed with the rest, and compared with the row at the
+# flip, so a key deleted and re-registered under the same credential id
+# with other key material promotes nothing (review of car b3f6f5b4).
+[[workflow.step.fields]]
+name = "public_key_sha256"
+field_type = "string"
+required = true
+filled_by = "filer"
+
+[[workflow.step.fields]]
+name = "decision"
+field_type = "approved|rejected"
+required = true
+
+# Written by the gateway, never by hand: the key this authorisation was
+# spent on, when, and which break-glass key vouched. A role queue
+# (`claimable`), so the dispatcher nominates it to no agent — the only
+# executor is the gateway's promotion finish, as `automation:gateway`.
+[[workflow.step]]
+title = "promote"
+kind = "task"
+ready_when = "steps.authorise.done AND steps.authorise.metadata.decision = \"approved\""
+title_template = "Finish on /me: touch {metadata.label}, then a break-glass key"
+authority_role = "platform-admin"
+claimable = true
+metadata_defaults = { procedure = "Completed by the gateway when the owner finishes on /me: it records the key it promoted, when, and the break-glass key that vouched, which is what refuses a second use. Do not complete this step by hand - a hand-completed step promotes nothing, and spends the authorisation." }
+
+[[workflow.step.fields]]
+name = "credential_id"
+field_type = "string"
+required = true
+
+[[workflow.step.fields]]
+name = "promoted_at"
+field_type = "string"
+required = true
+
+[[workflow.step.fields]]
+name = "vouched_by"
+field_type = "string"
+required = true
+
+[[workflow.step]]
+title = "promoted"
+kind = "outcome"
+ready_when = "steps.promote.done"
+title_template = "Promoted — this key can raise the owner's session to operator"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "promoted" }
+
+# Led by `steps.authorise.done`, so it is false on a fresh packet and
+# the dispatcher's complete-on-ready rule cannot close one at open;
+# `NOT (… = "approved")` so an absent decision reads as not approved
+# (the ops-request `refused` shape).
+[[workflow.step]]
+title = "declined"
+kind = "outcome"
+ready_when = "steps.authorise.done AND NOT (steps.authorise.metadata.decision = \"approved\")"
+title_template = "Declined — nothing promoted"
+metadata_defaults = { outcome_kind = "aborted" }
+terminal = { outcome = "declined" }

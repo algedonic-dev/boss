@@ -63,18 +63,17 @@ fn run(cmd: &mut Command) -> (bool, String) {
 /// `git` in `dir`, with the simulated foreign owner and no config
 /// channel that could carry a `safe.directory` of its own.
 ///
-/// `GIT_CONFIG_COUNT=0` drops the env channel, and the two `/dev/null`
-/// config paths drop the global and system files — `safe.directory` is
-/// read from exactly those three places, so a repository blessed for
-/// this box by a previous operator cannot make the probe lie.
+/// `boss_testing::git_config_isolated` closes every channel git reads
+/// `safe.directory` from — the system and global files and both env
+/// channels — so neither a repository blessed for this box by a previous
+/// operator nor a GitHub runner's `[safe] directory = *` can make the
+/// probe lie (backlog 3bef4198).
 fn git_as_a_stranger(dir: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
-    cmd.args(args)
+    boss_testing::git_config_isolated(&mut cmd)
+        .args(args)
         .current_dir(dir)
-        .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
-        .env("GIT_CONFIG_COUNT", "0")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null");
+        .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1");
     cmd
 }
 
@@ -134,13 +133,13 @@ fn git_refuses_a_repository_it_is_told_another_user_owns() {
 fn the_gate_opens_for_a_uid_that_does_not_own_the_checkout() {
     let root = repo_root();
     let mut cmd = Command::new("bash");
-    cmd.arg(root.join("infra/gate.sh"))
+    // The gate appends its own scoped slot after GIT_CONFIG_COUNT, which
+    // the helper sets to 0 — the same start the old `env_remove` gave it.
+    boss_testing::git_config_isolated(&mut cmd)
+        .arg(root.join("infra/gate.sh"))
         .arg("--self-test")
         .current_dir(&root)
-        .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env_remove("GIT_CONFIG_COUNT");
+        .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1");
     let (ok, out) = run(&mut cmd);
     assert!(
         ok,

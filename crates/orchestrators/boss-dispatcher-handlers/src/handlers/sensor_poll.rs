@@ -593,23 +593,12 @@ pub fn recover_step_fields(
     fields
 }
 
-/// The instant a firing reads the world at: the tick's `_at` when the
-/// clock path fired it (provenance), else the one real clock.
-pub fn firing_instant(payload: &Json) -> DateTime<Utc> {
-    payload
-        .get("_at")
-        .and_then(Json::as_str)
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|t| t.with_timezone(&Utc))
-        .unwrap_or_else(boss_clock_client::wall_now)
-}
-
 // ---------------------------------------------------------------------------
 // The handler
 // ---------------------------------------------------------------------------
 
 pub struct SensorPoll {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     jobs_base: String,
     sources: HashMap<String, Arc<dyn SensorSource>>,
     credentials: CredentialValues,
@@ -1044,7 +1033,9 @@ impl Handler for SensorPoll {
         _args: &[(String, Value)],
         ctx: &InvocationContext,
     ) -> Result<(), HandlerError> {
-        let now = firing_instant(&ctx.event_payload);
+        // The tick's instant (`_at`); refused, never the wall clock,
+        // when the firing carries none (eabc5943).
+        let now = ctx.firing_instant()?;
         let listing = get_json(
             &self.client,
             &format!("{}/api/sensors", self.base()),
@@ -1290,16 +1281,6 @@ mod tests {
         assert!(c.value("x").unwrap_err().contains("X is empty"));
     }
 
-    #[test]
-    fn the_firing_instant_is_the_ticks_when_the_clock_fired_it() {
-        assert_eq!(
-            firing_instant(&json!({"_at": "2026-09-17T10:05:00+00:00"})),
-            at("2026-09-17T10:05:00Z")
-        );
-        let before = boss_clock_client::wall_now();
-        assert!(firing_instant(&json!({})) >= before);
-    }
-
     // ----- the stub jobs API: sensors door + jobs + alarms, in memory -----
 
     type Captured = Arc<Mutex<Vec<(String, Json)>>>;
@@ -1538,6 +1519,7 @@ mod tests {
 
     fn ctx() -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "sensors-poll-every-5-minutes".into(),
             triggering_event_id: "clock-tick:2026-09-17T10:05:00+00:00".into(),
             triggering_topic: "clock.tick".into(),

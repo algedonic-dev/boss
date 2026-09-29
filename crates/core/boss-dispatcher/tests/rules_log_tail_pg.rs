@@ -68,7 +68,7 @@ async fn new_only_init_then_per_item_advance() {
     let seen: Arc<Mutex<Vec<String>>> = Arc::default();
     let seen2 = seen.clone();
     let report = tail
-        .drain_once(200, move |topic, _event_id, payload, _attempt| {
+        .drain_once(200, move |topic, _event_id, payload, _attempt, _at| {
             let seen = seen2.clone();
             let label = format!("{topic}:{}", payload["n"].as_str().unwrap_or("?"));
             async move {
@@ -105,7 +105,7 @@ async fn retry_blocks_then_budget_dead_letters_and_advances() {
     // must NOT be reached while the budget lasts.
     for attempt in 1..MAX_ATTEMPTS {
         let report: DrainReport = tail
-            .drain_once(200, |_t, _e, payload, handed| async move {
+            .drain_once(200, |_t, _e, payload, handed, _at| async move {
                 if payload["n"] == "poison" {
                     // The handler is handed THIS presentation's count,
                     // which is what lets it know a failure is the last
@@ -132,7 +132,7 @@ async fn retry_blocks_then_budget_dead_letters_and_advances() {
     // The budget's final presentation: dead-letter, advance, and the
     // row behind flows.
     let report = tail
-        .drain_once(200, |_t, _e, payload, handed| async move {
+        .drain_once(200, |_t, _e, payload, handed, _at| async move {
             if payload["n"] == "poison" {
                 assert_eq!(
                     handed, MAX_ATTEMPTS,
@@ -150,6 +150,41 @@ async fn retry_blocks_then_budget_dead_letters_and_advances() {
     assert_eq!(cursor_of(pool, "test-rules").await, after);
 }
 
+/// The handler is handed the row's own `timestamp` — the instant the
+/// fact was recorded — so what it stamps is the record's time, not the
+/// moment the tail read it (backlog eabc5943).
+#[tokio::test]
+async fn the_handler_is_handed_the_rows_own_timestamp() {
+    let db = TestDb::new().await;
+    let pool = &db.pool;
+
+    let mut tail = LogTail::new(pool.clone(), "test-rules");
+    tail.ensure_cursor().await.expect("init");
+    let recorded: chrono::DateTime<chrono::Utc> = "2026-09-28T04:31:07Z".parse().unwrap();
+    sqlx::query(
+        "INSERT INTO audit_log (event_id, timestamp, source, kind, payload) \
+         VALUES ($1, $2, 'events', 'events.outbox.redelivered', '{}'::jsonb)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(recorded)
+    .execute(pool)
+    .await
+    .expect("audit insert");
+
+    let seen: Arc<Mutex<Vec<chrono::DateTime<chrono::Utc>>>> = Arc::default();
+    let seen2 = seen.clone();
+    tail.drain_once(200, move |_t, _e, _p, _attempt, at| {
+        let seen = seen2.clone();
+        async move {
+            seen.lock().unwrap().push(at);
+            Settle::Ack
+        }
+    })
+    .await
+    .expect("drain");
+    assert_eq!(*seen.lock().unwrap(), vec![recorded]);
+}
+
 #[tokio::test]
 async fn permanent_is_not_retried() {
     let db = TestDb::new().await;
@@ -160,7 +195,7 @@ async fn permanent_is_not_retried() {
     let bad = seed_audit(pool, "step.done.task", serde_json::json!({"n": "bad-data"})).await;
 
     let report = tail
-        .drain_once(200, |_t, _e, _p, _attempt| async move {
+        .drain_once(200, |_t, _e, _p, _attempt, _at| async move {
             Settle::Permanent("deterministic data error".into())
         })
         .await

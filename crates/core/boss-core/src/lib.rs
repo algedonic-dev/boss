@@ -14,6 +14,7 @@ pub mod machine_gate;
 pub mod machine_token;
 pub mod money;
 pub mod partition;
+pub mod passkey_promotion;
 pub mod platform_owner;
 pub mod port;
 pub mod presence;

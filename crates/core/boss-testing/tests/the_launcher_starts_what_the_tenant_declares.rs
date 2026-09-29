@@ -85,7 +85,7 @@ fn a_tenant_that_declares_no_module_gets_no_module_service() {
     assert_eq!(rc, 0, "{out}");
     for (svc, module) in [
         ("boss-simulator", "sim"),
-        ("boss-catalog-api", "equipment"),
+        ("boss-catalog-api", "equipment or marketing-assets"),
         ("boss-assets-api", "equipment"),
         ("boss-inventory-api", "warehouse"),
         ("boss-shipping-api", "shipping"),
@@ -165,6 +165,58 @@ fn a_tenant_that_declares_a_module_gets_its_service_and_the_sim_gets_its_loopbac
             "webhook BOSS_EVENT_WEBHOOK_URL=http://127.0.0.1:7099/callback BOSS_SIM_CALLBACK_BIND=127.0.0.1:7099"
         ),
         "the sim's loopback pair is derived, one from the other:\n{out}"
+    );
+}
+
+#[test]
+fn a_service_starts_when_any_module_that_needs_it_is_on() {
+    // Backlog c4dc7ea4, from page-audit 7cdb095b (/ux/marketing-assets),
+    // decided 2026-09-28. boss-catalog-api serves the Equipment KB's
+    // models AND the Marketing Asset KB (boss-catalog's
+    // marketing_assets::http router), but the launcher mapped it to
+    // `equipment` alone — so a tenant with marketing-assets on and
+    // equipment off got the page and no service behind it, and every
+    // visit read "Couldn't load marketing assets". The module that
+    // shows a surface and the module that starts its service are one
+    // fact (CLAUDE.md §9a).
+    let root = scratch_dir("launcher-starts-what-any-module-needs");
+
+    let marketing = tenant(&root, "marketing", &["marketing-assets"]);
+    let (rc, out) = plan(&[("BOSS_TENANT_DIR", &marketing.display().to_string())]);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(
+        line(&out, "start boss-catalog-api").as_deref(),
+        Some("start boss-catalog-api"),
+        "marketing-assets on, equipment off — its service still starts:\n{out}"
+    );
+    // The assets API is the Equipment KB's units alone; marketing-assets
+    // does not read it.
+    assert_eq!(
+        line(&out, "skip boss-assets-api ").as_deref(),
+        Some("skip boss-assets-api (module equipment is not on in the tenant manifest)"),
+        "{out}"
+    );
+
+    let equipment = tenant(&root, "equipment", &["equipment"]);
+    let (rc, out) = plan(&[("BOSS_TENANT_DIR", &equipment.display().to_string())]);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(
+        line(&out, "start boss-catalog-api").as_deref(),
+        Some("start boss-catalog-api"),
+        "equipment on, marketing-assets off:\n{out}"
+    );
+
+    // Both off: skipped, and the reason names every module that would
+    // have started it.
+    let neither = tenant(&root, "neither", &["sim"]);
+    let (rc, out) = plan(&[("BOSS_TENANT_DIR", &neither.display().to_string())]);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(
+        line(&out, "skip boss-catalog-api ").as_deref(),
+        Some(
+            "skip boss-catalog-api (module equipment or marketing-assets is not on in the tenant manifest)"
+        ),
+        "{out}"
     );
 }
 

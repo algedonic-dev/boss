@@ -3,8 +3,9 @@
 #
 # THE PROTOCOL EVERY CAR RUNS ON. The runner registers the packet at
 # launch, heartbeats while running, and closes it with the receipt; an
-# OVERDUE open packet is the alarm that the runner died. Three terminals
-# because `lost` is an honest verdict and must not be filed as a red: an
+# OVERDUE open packet is the alarm that the runner died. More terminals
+# than green and failed because `lost` is an honest verdict and must not
+# be filed as a red (nor `refused`, nor `withdrawn`, below): an
 # infrastructure refusal is not a consist failure (CLAUDE.md §Diagnosis),
 # and a pod replacement recorded as `failed` would strike every car
 # aboard for something the branch did not do.
@@ -42,7 +43,7 @@ ready_when = "steps.launched.done"
 title_template = "Record the receipt"
 metadata_defaults = { heartbeat_at = "" }
 fields = [
-  { name = "verdict", field_type = "green|failed|lost|refused", required = true },
+  { name = "verdict", field_type = "green|failed|lost|refused|withdrawn", required = true },
   { name = "receipt", field_type = "string" },
 ]
 
@@ -100,3 +101,45 @@ ready_when = "steps.record-verdict.done AND steps.record-verdict.metadata.verdic
 title_template = "Gate refused — it judged nothing about this branch"
 metadata_defaults = { outcome_kind = "aborted" }
 terminal = { outcome = "refused" }
+
+# A RUN WHOSE PURPOSE IS GONE BEFORE IT RAN IS WITHDRAWN, NOT LOST
+# (backlog 8d7d0a2b, with b1c82a82).
+#
+# Measured 2026-09-28 on gate-run 8c2f644a: an older gate on the same
+# branch had already gone green on the same head and parked car
+# 59e1f436, so the queued run had nothing left to decide. Every terminal
+# above is reached through a verdict, so the only way to close it was to
+# record one that did not happen — and the conductor's orphan settle
+# closed it `lost` at 00:40:22Z, a deliberate stand-down on the record
+# as a dead runner. `boss gate`'s twin-car guard refuses a re-gate of
+# that head, so the recovery `boss orient` printed for it was refused
+# too, and the packet had no exit that told the truth.
+#
+# REACHED ONLY BEFORE ANY RUNNER POD EXISTS. Two writers, one receipt:
+# the door, `boss gate --withdraw <gate-run> --reason <why>`, which
+# refuses once a pod exists for the packet's Job (and deletes a Job
+# whose pod never appeared); and the conductor's orphan settle, which
+# withdraws a run no Job carries INSTEAD of settling it lost when the
+# head it queued at already carries a CURRENT green held by a car — a
+# decision that needs no human. The receipt says why
+# (`withdrawn_because`) and, when it applies, the car and head it
+# defers to (`defers_to`), in the shape `refused_because` set, with an
+# empty `head`, because this run gated no tree.
+#
+# AN OUTCOME OF ITS OWN, like backlog-item's duplicate and page-audit's
+# withdrawal: it is not a verdict on the branch (failed), not an
+# environment that died (lost), and not a component that declined
+# (refused). Nothing ran.
+#
+# v3 of the live lineage — live v2 (read 2026-09-28) carries the four
+# terminals above. The seed is insert-if-missing, so this reaches the
+# live registry through `boss workflow publish gate-run`, a separate
+# act; until then the live row's enum refuses the door's write, and the
+# door says which version refused it.
+[[workflow.step]]
+title = "withdrawn"
+kind = "outcome"
+ready_when = "steps.record-verdict.done AND steps.record-verdict.metadata.verdict = \"withdrawn\""
+title_template = "Gate withdrawn before it ran — it judged nothing"
+metadata_defaults = { outcome_kind = "withdrawn" }
+terminal = { outcome = "withdrawn" }

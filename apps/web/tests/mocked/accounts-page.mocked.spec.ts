@@ -616,9 +616,10 @@ test.describe('/ux/accounts — a capped read says so', () => {
 // ── Empty, loading, and failed reads ────────────────────────────────
 
 test.describe('/ux/accounts — empty, loading, and a failed read', () => {
-  // UNFILED: an empty directory paints the filter-mismatch sentence,
-  // though no filter is set.
-  test('an empty backend paints the filters sentence and a zero header, not a failure', async ({ page }) => {
+  // Backlogs bae9d7e1 / 0ef5e008, answered: an empty directory painted
+  // the filter-mismatch sentence though no filter was set. It says there
+  // are none; the filters sentence is kept for rows the filters hid.
+  test('an empty backend says there are no accounts and a zero header, not a failure', async ({ page }) => {
     await installFleet(page);
     await page.route(ACCOUNTS, (r) => json(r, paged([], 1000)));
     await page.route(ASSETS, (r) => json(r, paged([], 1000)));
@@ -626,7 +627,8 @@ test.describe('/ux/accounts — empty, loading, and a failed read', () => {
     await page.route(OPEN_AR, (r) => json(r, paged([], 0)));
     await mountPage(page, PATH);
 
-    await expect(status(page)).toHaveText('No accounts match those filters.');
+    await expect(status(page)).toHaveText('No accounts yet.');
+    await expect(page.getByText('No accounts match those filters.')).toHaveCount(0);
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
     await expect(body(page).locator('table')).toHaveCount(0);
     await expect(title(page)).toHaveText('0 accounts');
@@ -664,11 +666,11 @@ test.describe('/ux/accounts — empty, loading, and a failed read', () => {
     await page.route(ACCOUNTS, (r) => json(r, { error: 'people down' }, 503));
     await mountPage(page, PATH);
 
-    await expect(status(page)).toHaveText(`Couldn't load accounts: ${ACCOUNTS_URL}: HTTP 503`);
+    await expect(status(page)).toHaveText(`Couldn't load accounts — ${ACCOUNTS_URL}: HTTP 503`);
     await expect(page.getByText('No accounts match those filters.')).toHaveCount(0);
     await expect(body(page).locator('table')).toHaveCount(0);
     await expect(body(page).locator(`${FAILURE_MARKER}[role=alert]`)).toHaveText(
-      `Couldn't load accounts: ${ACCOUNTS_URL}: HTTP 503`,
+      `Couldn't load accounts — ${ACCOUNTS_URL}: HTTP 503`,
     );
     await expect(title(page)).toHaveText('Accounts');
     await expect(subtitle(page)).toHaveText('Account count unknown — the read failed');
@@ -678,7 +680,22 @@ test.describe('/ux/accounts — empty, loading, and a failed read', () => {
     await installFleet(page);
     await page.route(ACCOUNTS, (r) => r.abort('failed'));
     await mountPage(page, PATH);
-    await expect(status(page)).toHaveText("Couldn't load accounts: Failed to fetch");
+    // The line names the read (backlog 0ef5e008): the browser's message
+    // alone does not say which read it was.
+    await expect(status(page)).toHaveText(`Couldn't load accounts — ${ACCOUNTS_URL}: Failed to fetch`);
+    await expect(body(page).locator('table')).toHaveCount(0);
+  });
+
+  // Backlog 0ef5e008: a 200 that is not the paged envelope was an empty
+  // page to `fetchPaged`, and the page said the directory was empty.
+  test('a 200 directory body that is not the envelope is a failed read, never an empty one', async ({ page }) => {
+    await installFleet(page);
+    await page.route(ACCOUNTS, (r) => json(r, FLEET));
+    await mountPage(page, PATH);
+    await expect(body(page).locator(`${FAILURE_MARKER}[role=alert]`)).toHaveText(
+      `Couldn't load accounts — ${ACCOUNTS_URL}: HTTP 200, but the body is a list, not a {data: [...]} envelope`,
+    );
+    await expect(page.getByText('No accounts yet.')).toHaveCount(0);
     await expect(body(page).locator('table')).toHaveCount(0);
   });
 

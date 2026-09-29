@@ -74,6 +74,51 @@ pub async fn require_reaching(
         .into_response())
 }
 
+/// A write to a registry row — a Class, a SubjectKind — asked of policy
+/// the one way (backlog 553cf479, 2026-09-28; the ladder is the
+/// SubjectKind metadata door's, abc2e9d5, lifted here so the two doors
+/// cannot answer it two ways — CLAUDE.md §9a). On an allow it returns
+/// the actor the write's fact is signed with, so no fallback author
+/// exists on any path through it. Answers, in this order:
+///
+/// - no resolvable caller → 401: there is no one to ask policy about,
+///   and the fact must name its author. It reads the resolved ACTOR and
+///   the role both — `is_anonymous()` tests the role while
+///   `ambient_actor()` is keyed on the id, so a header claiming the
+///   anonymous id with a platform role passed the first alone and was
+///   signed by the service's automation (review of car abc2e9d5, LOW-1).
+///   A blank id is no caller either: it parsed as a human named `""`
+///   and would have signed the fact with nothing (f5e0670d point 2);
+/// - policy denies `action` on `resource` → 403 with policy's reason;
+/// - a grant narrower than `all` → 403: a registry row belongs to no
+///   person and no department, so a narrower scope cannot be shown to
+///   reach it ([`require_reaching`] with no person);
+/// - policy cannot answer → its own 503: a gate that cannot be asked is
+///   not a gate that passed.
+pub async fn require_registry_write(
+    policy: &dyn PolicyClient,
+    user: &User,
+    action: Action,
+    resource: Resource,
+) -> Result<boss_core::actor::ActorId, Response> {
+    let Some(actor) = user
+        .ambient_actor()
+        .filter(|_| !user.is_anonymous() && !user.id.trim().is_empty())
+    else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            format!(
+                "a `{}` write is signed by its caller, and this request names no caller \
+                 (no x-boss-user identity)",
+                resource.as_str()
+            ),
+        )
+            .into_response());
+    };
+    require_reaching(policy, user, action, resource, None).await?;
+    Ok(actor)
+}
+
 /// The scope `policy` grants `user` for `action` on `resource`, or the
 /// response that refuses: 403 for a deny, the client's own 503/500 for a
 /// policy service that could not be asked.
@@ -312,6 +357,56 @@ mod tests {
             .await
             .is_ok()
         );
+    }
+
+    /// The registry-write ladder (backlog 553cf479): no resolvable
+    /// caller is 401 whatever role it claims; a deny is 403; a grant
+    /// that is not `all` is 403, because a registry row belongs to no
+    /// person and no department; a policy that cannot answer is its own
+    /// 503; an `all` grant answers the actor the fact is signed with.
+    #[tokio::test]
+    async fn a_registry_write_is_signed_by_its_caller_and_needs_an_all_grant() {
+        let policy = FakePolicyClient::builder()
+            .allow("editor", Action::Update, Resource::class(), Scope::All)
+            .allow(
+                "dept-lead",
+                Action::Update,
+                Resource::class(),
+                Scope::Department("service".into()),
+            )
+            .build();
+        let ask = |u: User| {
+            let policy = &policy;
+            async move { require_registry_write(policy, &u, Action::Update, Resource::class()).await }
+        };
+
+        let actor = ask(user("emp-7", "editor", &[])).await.unwrap();
+        assert_eq!(
+            actor,
+            boss_core::actor::ActorId::Human("emp-7".into()),
+            "the fact is signed with the caller, never a fallback"
+        );
+
+        for (who, want) in [
+            (
+                user(User::ANONYMOUS_ID, "editor", &[]),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                user("emp-8", User::ANONYMOUS_ROLE, &[]),
+                StatusCode::UNAUTHORIZED,
+            ),
+            // A blank id names nobody, whatever role rides with it: it
+            // parsed as a Human("") and would have signed the fact as
+            // the empty string (f5e0670d point 2, 2026-09-28).
+            (user("", "editor", &[]), StatusCode::UNAUTHORIZED),
+            (user("  ", "editor", &[]), StatusCode::UNAUTHORIZED),
+            (user("emp-9", "dept-lead", &[]), StatusCode::FORBIDDEN),
+            (user("emp-10", "nobody", &[]), StatusCode::FORBIDDEN),
+        ] {
+            let got = ask(who.clone()).await.unwrap_err().status();
+            assert_eq!(got, want, "{} / {}", who.id, who.role);
+        }
     }
 
     #[test]

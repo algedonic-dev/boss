@@ -1,6 +1,7 @@
 <script lang="ts">
   // Full churn watchlist — port of apps/web/src/accounts/WatchlistPage.tsx.
 
+  import ClassesReadFailed from '@boss/web-kit/ui/ClassesReadFailed.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { RiskScoreListSchema } from './schemas';
   import FilterGroup from '@boss/web-kit/ui/FilterGroup.svelte';
@@ -13,7 +14,8 @@
   import type { Account } from './types';
   import { fetchAccountsPage } from './api';
   import { isCapped, type Paged } from '../data/paginated';
-  import { loadingRead, readStateOf, type ReadState } from '../data/readState';
+  import { emptyState, loadingRead, readStateOf, type ReadState } from '../data/readState';
+  import ListEmpty from '../data/ListEmpty.svelte';
   import { loadClasses, classesFor } from '@boss/web-kit/session/classes.svelte';
   import { tierAdmits, tierBuckets, type TierFilter } from './tiers';
   import { formatDateTime } from '@boss/web-kit/ui/date';
@@ -219,6 +221,11 @@
     }),
   );
 
+  // Nothing scored, or the filters hid it. The scores read's failure and
+  // loading are the page's own states above the list (loadState), so no
+  // read is declared here (backlog 0ef5e008).
+  let listState = $derived(emptyState([], rows.length, sorted.length));
+
   // The Tier buttons come from the (account, tier) Classes, plus No
   // tier when an account has none (backlog 1be37454; page audit
   // 08b0c4f8 GAP 11). A hand-written Platinum / Gold / Silver trio hid
@@ -340,6 +347,7 @@
                 </FilterButton>
               {/each}
             {/if}
+            <ClassesReadFailed subjectKind="account" what="account tiers" fallback="Tiers show by code, not by their registry names." />
         </FilterGroup>
       </aside>
 
@@ -350,17 +358,21 @@
             the Tier filter shows All alone and search matches account and factor only.
           </p>
         {/if}
-        {#if rows.length === 0}
+        {#if listState.kind !== 'rows'}
           <!-- Nothing scored is not a filter's doing: with no rows there
-               is nothing a filter could hide, and "No accounts match
-               those filters." blamed the operator's filters for an empty
-               source (backlog 9289e682; page audit 08b0c4f8 GAP 6 — the
-               live render on 2026-09-23, every filter at All). -->
-          <p class="empty">
-            No accounts have been scored yet — the churn-risk model has written no predictions.
-          </p>
-        {:else if sorted.length === 0}
-          <p class="empty">No accounts match those filters.</p>
+               is nothing a filter could hide, and the filters line
+               blamed the operator's filters for an empty source (backlog
+               9289e682; page audit 08b0c4f8 GAP 6 — the live render on
+               2026-09-23, every filter at All). The helper decides it
+               now, as on every list page (0ef5e008). -->
+          <ListEmpty
+            view={listState}
+            words={{
+              what: 'the watchlist',
+              noun: 'accounts',
+              none: 'No accounts have been scored yet — the churn-risk model has written no predictions.',
+            }}
+          />
         {:else}
           <table class="data-table data-table-striped risk-table">
             <thead>

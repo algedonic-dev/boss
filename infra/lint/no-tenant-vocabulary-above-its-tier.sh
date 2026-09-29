@@ -26,23 +26,53 @@
 # --------------------
 # For every tenant that declares `examples/<tenant>/VOCABULARY` — one
 # term per line, the tenant's own words, `*` for a word-start prefix —
-# count the case-insensitive occurrences of every term in each TIER
-# (the roots below), over .rs .ts .svelte .toml .sql .sh .yaml, and
-# compare each tier's count to infra/lint/tenant-vocabulary.baseline
-# (one `<tier> <count>` line per tier). Then, per tier:
+# count the case-insensitive occurrences of every term in every FILE
+# under each TIER (the roots below), over .rs .ts .svelte .toml .sql .sh
+# .yaml, and compare each file's count to its line in
+# infra/lint/tenant-vocabulary.baseline (one `<count>\t<path>` line per
+# file that still carries a word; a file with no line has a baseline of
+# 0). Then, per file:
 #
-#   count > baseline  -> REFUSED, naming the files: the leak grew.
+#   count > baseline  -> REFUSED, naming the file and both numbers:
+#                        the leak grew (or reached a file it was not in).
 #   count = baseline  -> clean.
-#   count < baseline  -> REFUSED, telling the author to lower that
-#                        tier's line in the same car. The ratchet only
-#                        goes down, and refusing a baseline ABOVE the
-#                        count is what stops anyone raising it.
+#   count < baseline  -> REFUSED, telling the author to set that file's
+#                        line to the count — or delete it at 0 — in the
+#                        same car. The ratchet only goes down, and
+#                        refusing a baseline ABOVE the count is what
+#                        stops anyone raising it.
 #
 # The count is derived from the tree on every run; the baseline is the
 # one fact that lives twice, and the equality above is its test
-# (CLAUDE.md §9a). It was written from this lint's own measurement
-# when it landed, not from the packet's approximate grep — this file
-# is the definition.
+# (CLAUDE.md §9a). It is written from this lint's own measurement
+# (`--measure`), never typed — this file is the definition.
+#
+# WHY PER FILE, NOT PER TIER (backlog e889cfa4, 2026-09-27). Until then
+# the baseline was one `<tier> <count>` line per tier, and every car
+# that removed a demo word from apps/web/src rewrote the one
+# `apps/web/src` integer. Three cars did in one afternoon (254 to 249,
+# 251 and 253); the first to land left the others CONFLICTING WITH MAIN
+# on that line, a rerail made one boardable for sixteen minutes before
+# the next train moved the number again, and at the worst point six
+# dock cars could not board beside each other. That is the contended
+# tail line of CLAUDE.md §9a — manifest.txt, PREFLIGHT_LINTS, the
+# rules.toml BASELINE — in a new file: an authoritative copy everyone
+# has to EDIT, holding one number that is a sum of numbers each car
+# already owns. Per file, a car edits the lines of the files it touched
+# and no other, the shape infra/lint/svelte-check.sh keeps its warning
+# ratchet in. The tier table the lint prints is still per tier; the
+# tiers scanned did not change.
+#
+# The entries are kept one BLANK LINE apart, and that is load-bearing.
+# git's three-way merge refuses two edits to ADJACENT lines, so with
+# the entries packed, two cars lowering two neighbouring files — two
+# pages in one directory, the usual shape of a burn-down — still
+# conflicted. Measured with `git merge-file` the day this changed: two
+# neighbouring edits conflict packed and merge clean blank-separated
+# (the test two_files_lowering_their_counts_merge_without_a_conflict
+# pins that). What still meets is one car DELETING a line beside a line
+# another car changes; that needs the two cars to empty and touch
+# alphabetically neighbouring files at once.
 #
 # WHAT IS NOT COUNTED, and why
 #   - the tenant's own homes: examples/<tenant>/ and
@@ -93,21 +123,30 @@
 #
 # A wrong path answers 0 instead of erroring (CLAUDE.md §Doors), so a
 # missing tier root, a missing VOCABULARY, a malformed term, and a
-# baseline that names a tier this lint does not (or misses one it does)
-# are all refusals, never a smaller count.
+# baseline line naming a path under no tier this lint scans (or a path
+# twice, or a count of 0) are all refusals, never a smaller count.
 #
 # Usage:  infra/lint/no-tenant-vocabulary-above-its-tier.sh
+#         infra/lint/no-tenant-vocabulary-above-its-tier.sh --measure
+#             print the per-file table as baseline entries and judge
+#             nothing — what the baseline was written from.
 set -uo pipefail
 
 LINT=no-tenant-vocabulary-above-its-tier
+MEASURE=0
+case "${1:-}" in
+    '') ;;
+    --measure) MEASURE=1 ;;
+    *) printf 'usage: %s [--measure]\n' "$0" >&2; exit 2 ;;
+esac
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
 # shellcheck source=infra/lint/lib/scanned.sh
 . infra/lint/lib/scanned.sh || exit 3
 
 BASELINE="infra/lint/tenant-vocabulary.baseline"
 
-# The tiers above a tenant. Order is the report's order; the baseline
-# file may list them in any order but must list each exactly once.
+# The tiers above a tenant. Order is the report's order; every baseline
+# line names a file under one of them.
 TIERS=(
     crates/core
     crates/modules
@@ -280,62 +319,95 @@ EOF
 exempt_weighted="${exempt_weighted}
 ${delete_exempt}"
 
-# `<count> <file>` per file, descending — raw hits minus the exempt
+# `<count>\t<file>` per file, descending — raw hits minus the exempt
 # weight, files at zero dropped — and `<count> <tier>` per tier.
 per_file=$(
     {
         printf '%s\n' "$hits" | sed '/^$/d' | cut -d: -f1 | awk '{ print $1, 1 }'
         printf '%s\n' "$exempt_weighted" | sed '/^$/d' | awk '{ print $1, -$2 }'
-    } | awk '{ n[$1] += $2 } END { for (f in n) if (n[f] > 0) print n[f], f }' \
-      | LC_ALL=C sort -k1,1nr -k2,2
+    } | awk '{ n[$1] += $2 } END { for (f in n) if (n[f] > 0) print n[f] "\t" f }' \
+      | LC_ALL=C sort -t "$(printf '\t')" -k1,1nr -k2,2
 )
 
-count_of() {
-    # Hits under one tier root, summed from the per-file list.
-    local root="$1"
-    printf '%s\n' "$per_file" | awk -v r="$root/" '
-        index($2, r) == 1 { n += $1 }
-        END { print n + 0 }'
-}
+# --measure: the same table as baseline entries, in PATH order and one
+# blank line apart — the shape the baseline is kept in, for the reason
+# its header gives (two cars lowering neighbouring files must not edit
+# adjacent lines). A reading, not a verdict: it judges nothing.
+if [ "$MEASURE" -eq 1 ]; then
+    [ -n "$per_file" ] || exit 0
+    LC_ALL=C sort -t "$(printf '\t')" -k2,2 <<< "$per_file" \
+        | awk 'NR > 1 { print "" } { print }'
+    exit 0
+fi
 
 # ---- the baseline ---------------------------------------------------
-[ -f "$BASELINE" ] || refuse "$BASELINE is missing — write one line per tier, '<tier> <count>', from this lint's own table"
+# One `<count>\t<path>` line per FILE (backlog e889cfa4) — see the
+# header for why it is not one line per tier any longer. `#` lines and
+# blank lines are skipped; the blank line between entries is deliberate.
+[ -f "$BASELINE" ] || refuse "$BASELINE is missing — write one '<count><TAB><path>' line per file, from $0 --measure"
 
-baseline_of() {
-    local tier="$1" n
-    n=$(sed -e 's/#.*//' "$BASELINE" | awk -v t="$tier" '$1 == t { print $2 }')
-    case "${n:-empty}" in
-        empty)        refuse "$BASELINE has no line for tier $tier — add '$tier <count>' from the table this lint prints" ;;
-        *[!0-9]*)     refuse "$BASELINE: tier $tier has a non-numeric or repeated count ('$n')" ;;
-    esac
-    printf '%s\n' "$n"
+# A line that cannot be ratcheted is refused before any count is
+# judged, because each of these would read as covering something while
+# covering nothing: a malformed line (the old per-tier shape among
+# them), a count of 0 (a clean file has no line), a path the lint does
+# not scan, and a path named twice.
+bad_lines=$(awk -F'\t' -v tiers="${TIERS[*]}" '
+    BEGIN { nt = split(tiers, T, " ") }
+    /^[ \t]*(#|$)/ { next }
+    NF != 2 || $1 !~ /^[0-9]+$/ || $2 == "" || $2 ~ /[ \t]/ {
+        printf "  line %d: %s — not <count><TAB><path>\n", FNR, $0; next
+    }
+    $1 + 0 == 0 {
+        printf "  line %d: %s — a count of 0; a file with no words has no line\n", FNR, $2; next
+    }
+    {
+        under = 0
+        for (i = 1; i <= nt; i++) if (index($2, T[i] "/") == 1) under = 1
+        if (!under) { printf "  line %d: %s — under no tier this lint scans\n", FNR, $2; next }
+        if ($2 in seen) { printf "  line %d: %s — named more than once (first on line %d)\n", FNR, $2, seen[$2]; next }
+        seen[$2] = FNR
+    }
+' "$BASELINE")
+if [ -n "$bad_lines" ]; then
+    printf '%s: REFUSED — %s has lines nobody can ratchet:\n%s\n' "$LINT" "$BASELINE" "$bad_lines" >&2
+    printf '  Each line is <count><TAB><path> for one file under a tier, count above 0;\n' >&2
+    printf '  %s --measure prints the table they are written from.\n' "$0" >&2
+    exit 1
+fi
+
+# `<count>\t<path>` per baseline entry — validated above.
+base_file=$(awk -F'\t' '!/^[ \t]*(#|$)/ { print $1 "\t" $2 }' "$BASELINE")
+
+# The per-file verdicts: `GREW <count> <baseline> <path>` for a file
+# above its line (an unlisted file's line is 0), `FELL …` for one below
+# it (a listed file with no words is 0). Everything else is equal.
+verdicts=$(awk -F'\t' '
+    FNR == NR { if (NF == 2) base[$2] = $1 + 0; next }
+    NF == 2 { cur[$2] = $1 + 0 }
+    END {
+        for (f in cur) { b = (f in base) ? base[f] : 0; if (cur[f] > b) print "GREW", cur[f], b, f }
+        for (f in base) { c = (f in cur) ? cur[f] : 0; if (c < base[f]) print "FELL", c, base[f], f }
+    }
+' <(printf '%s\n' "$base_file") <(printf '%s\n' "$per_file") | LC_ALL=C sort -k4,4)
+
+sum_under() { # <root> <table>: the counts of the table's paths under one tier
+    awk -F'\t' -v r="$1/" 'index($2, r) == 1 { n += $1 } END { print n + 0 }' <<< "$2"
+}
+off_under() { # <root> <verdict>: how many files under one tier carry it
+    awk -v r="$1/" -v v="$2" '$1 == v && index($4, r) == 1 { n++ } END { print n + 0 }' <<< "$verdicts"
 }
 
-# A tier named in the baseline that this lint does not scan is a line
-# nobody is ratcheting — refused, so a renamed tier cannot leave a stale
-# number behind that reads as covered.
-while read -r name _; do
-    [ -n "$name" ] || continue
-    case " ${TIERS[*]} " in
-        *" $name "*) ;;
-        *) refuse "$BASELINE names tier '$name', which this lint does not scan — remove the line or add the tier to TIERS" ;;
-    esac
-done < <(sed -e 's/#.*//' "$BASELINE")
-
-# ---- the verdict, one line per tier ---------------------------------
+# ---- the verdict: a table per tier, judged per file -----------------
 echo "$LINT: tenant words above their tier ($tenants; $terms terms)"
 echo
 printf '  %-24s %7s %9s\n' tier count baseline
-grew=0; fell=0
 for tier in "${TIERS[@]}"; do
-    count=$(count_of "$tier")
-    base=$(baseline_of "$tier") || exit 1
-    if [ "$count" -gt "$base" ]; then
-        note="GREW by $((count - base))"; grew=$((grew + 1))
-    elif [ "$count" -lt "$base" ]; then
-        note="fell by $((base - count)) — lower the baseline"; fell=$((fell + 1))
-    else
-        note="at baseline"
+    count=$(sum_under "$tier" "$per_file")
+    base=$(sum_under "$tier" "$base_file")
+    grew=$(off_under "$tier" GREW); fell=$(off_under "$tier" FELL)
+    note="at baseline"
+    if [ "$grew" -gt 0 ] || [ "$fell" -gt 0 ]; then
+        note="$grew file(s) above their line, $fell below"
     fi
     printf '  %-24s %7s %9s  %s\n' "$tier" "$count" "$base" "$note"
 done
@@ -344,32 +416,36 @@ echo "  top 10 files:"
 # The limit lives in awk, never in a `| head` after a multi-line
 # writer: under pipefail a reader that exits early SIGPIPEs the writer
 # and the script reports 141 for a list that IS there (backlog 28af807c).
-awk 'NR <= 10 { printf "  %6s  %s\n", $1, $2 }' <<< "$per_file"
+awk -F'\t' 'NR <= 10 { printf "  %6s  %s\n", $1, $2 }' <<< "$per_file"
+
+grew=$(awk '$1 == "GREW" { n++ } END { print n + 0 }' <<< "$verdicts")
+fell=$(awk '$1 == "FELL" { n++ } END { print n + 0 }' <<< "$verdicts")
 
 if [ "$grew" -gt 0 ]; then
     echo >&2
-    echo "$LINT: REFUSED — $grew tier(s) carry more tenant vocabulary than their baseline." >&2
+    echo "$LINT: REFUSED — $grew file(s) carry more tenant vocabulary than their baseline line." >&2
     echo "  A tenant's words in a tier above it are a tenant assumption in core" >&2
     echo "  (CLAUDE.md §10). Move the code to crates/tenants/<engine> or to" >&2
     echo "  tenant data under examples/<tenant>/, or express it as a registry" >&2
-    echo "  row the tenant seeds. The files that carry the growth, per tier:" >&2
-    for tier in "${TIERS[@]}"; do
-        count=$(count_of "$tier"); base=$(baseline_of "$tier")
-        [ "$count" -gt "$base" ] || continue
-        awk -v r="$tier/" 'index($2, r) == 1 && n++ < 10 { printf "    %6s  %s\n", $1, $2 }' <<< "$per_file" >&2
-    done
+    echo "  row the tenant seeds. The files that grew:" >&2
+    awk '$1 == "GREW" {
+        printf "    %s: %d word(s), baseline %d%s\n", $4, $2, $3, ($3 == 0 ? " — not in the baseline" : "")
+    }' <<< "$verdicts" >&2
     echo "  The baseline in $BASELINE is never raised." >&2
-    exit 1
 fi
 
 if [ "$fell" -gt 0 ]; then
     echo >&2
-    echo "$LINT: REFUSED — $fell tier(s) sit BELOW their baseline. Good: the leak" >&2
-    echo "  shrank. Now lower each tier's line in $BASELINE to the count in the" >&2
-    echo "  table above, in this same car, so the ratchet holds the new number." >&2
+    echo "$LINT: REFUSED — $fell file(s) sit BELOW their baseline line. Good: the" >&2
+    echo "  leak shrank. Now lower each file's line in $BASELINE, in this same" >&2
+    echo "  car, so the ratchet holds the new number:" >&2
+    awk '$1 == "FELL" {
+        printf "    %s: %d word(s), baseline %d — %s\n", $4, $2, $3, ($2 == 0 ? "delete its line" : "set its line to " $2)
+    }' <<< "$verdicts" >&2
     echo "  (A baseline above the count is refused so that nobody can raise one.)" >&2
-    exit 1
 fi
+
+[ "$grew" -eq 0 ] && [ "$fell" -eq 0 ] || exit 1
 
 echo
 # The files the greps above read — the same seven extensions under the
@@ -377,4 +453,4 @@ echo
 # as the count comment says). Files LOOKED AT, not files carrying a hit:
 # a clean tree has none of the second and that is not a zero scan.
 lint_scanned "$LINT" "$(find "${TIERS[@]}" -type f \( -name '*.rs' -o -name '*.ts' -o -name '*.svelte' -o -name '*.toml' -o -name '*.sql' -o -name '*.sh' -o -name '*.yaml' \) 2>/dev/null | wc -l | tr -d ' ')" "file(s) read across ${#TIERS[@]} tier(s)"
-echo "$LINT: clean (every tier at its baseline)"
+echo "$LINT: clean (every file at its baseline line)"

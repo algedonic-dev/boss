@@ -12,13 +12,36 @@
 //! the only legitimate caller. They cannot rely on that being true —
 //! the gateway also proxies `/api/people/{*rest}` for the SPA, so any
 //! session could reach these paths — and a credential row planted for
-//! someone else is an account takeover. So every handler requires a
-//! `platform-admin` actor: the gateway's server-side ceremony calls
-//! identify as `automation:gateway` with that role, operator tooling
-//! (boss-api) already carries it, and every ordinary proxied session
-//! is refused. Humans never call these directly; they go through the
-//! gateway's `/api/auth/passkey/*` ceremony, which enforces
-//! session-to-employee binding before it ever gets here.
+//! someone else is an account takeover. So every handler admits ONE
+//! caller id, the gateway's own actor
+//! ([`boss_core::actor::GATEWAY_ACTOR_ID`], which
+//! `boss_gateway::passkey::sign_as_gateway` signs every ceremony
+//! storage call with), and refuses every other id whatever its role —
+//! the rule the promote door (`passkey_promotion.rs`) already keeps.
+//! Humans reach this storage only through the gateway's
+//! `/api/auth/passkey/*` ceremony, which binds the session to its
+//! employee before it gets here; that includes removing a lost key
+//! (`DELETE /api/auth/passkey/credentials/{id}`).
+//!
+//! The gate used to be the `platform-admin` ROLE, and this doc said
+//! every ordinary proxied session was refused. That was false: the
+//! proxy forwards the session's own role, so the owner's user-tier
+//! browser cookie — and every agent, which signs as platform-admin —
+//! could store, remove or rekey a passkey and mint or spend challenges
+//! around the ceremony (backlog e199c02d, 2026-09-28).
+//!
+//! What the id check does NOT close: `strip_boss_headers` stops a
+//! browser from claiming the gateway's id, but a caller on the LAN
+//! machine door can still assert it, because nothing behind the
+//! gateway verifies an `x-boss-user` header until the machine token is
+//! enforced (backlog 2710c8fc) — the same residual the promote door
+//! names. And a storage write still emits no event of its own
+//! (backlog 4b97bc20).
+//!
+//! ONE READ IS NOT THE GATEWAY'S: the key counts by tier
+//! (`boss_policy_client::coverage::TIER_COUNTS_PATH`, design 1c4e42e1),
+//! which the policy service's coverage read needs and which carries no
+//! key material — see `machinery_read_gate`.
 //!
 //! Bytes (credential ids, public keys, challenges) travel as
 //! base64url-no-pad strings — the same alphabet the browser's
@@ -47,21 +70,51 @@ pub struct WebauthnState {
     pub clock: Arc<dyn ClockClient>,
 }
 
-/// Platform machinery only — see the module doc for why this cannot
-/// be open to ordinary sessions even behind the gateway.
 /// Small error value for helper Results (clippy::result_large_err —
 /// Response is a big payload and refusals are cold paths); converted
 /// at the handler boundary.
 type ErrResp = (StatusCode, &'static str);
 
-fn operator_gate(user: &boss_policy::User) -> Result<(), ErrResp> {
-    if user.role == "platform-admin" {
+/// The gateway's ceremony only — judged by caller ID, never role (see
+/// the module doc; backlog e199c02d).
+fn gateway_gate(user: &boss_policy::User) -> Result<(), ErrResp> {
+    if user.id == boss_core::actor::GATEWAY_ACTOR_ID {
         Ok(())
     } else {
         Err((
             StatusCode::FORBIDDEN,
-            "webauthn storage is platform machinery — enrolment and assertions go \
-             through the gateway's /api/auth/passkey ceremony",
+            "only the gateway reads or writes passkey storage, inside its \
+             /api/auth/passkey ceremony — no session may, whatever its role",
+        ))
+    }
+}
+
+/// The one read of this storage that is NOT the gateway's: how many
+/// keys each employee holds at each tier, and nothing else (design
+/// 1c4e42e1, backlog 47aed706). The policy service's coverage read asks
+/// it, because "a real person is an active employee with a bound
+/// passkey" and "the operator tier is a platform-admin with an
+/// operator-tier key" are both facts of this table — and every other
+/// handler here answers only the gateway (e199c02d). No credential id,
+/// public key, label or timestamp leaves: a count cannot plant, rekey
+/// or replay a key. Machinery reads it, as machinery reads the other
+/// registries (`boss-jobs` `trust::can_read`): a caller at the operator
+/// or auditor tier. Two callers besides machinery pass, and both are
+/// named so this reads true (review of this car, L4): the platform
+/// owner's ELEVATED session, which the gateway's `/api/people/*` proxy
+/// signs at `access_tier=operator` — harmless, since only the owner can
+/// elevate and these are counts; and, until the machine token is
+/// enforced (2710c8fc), any caller on the network that can reach the
+/// port and simply claims operator in its `x-boss-user` header — the
+/// same residual the gateway gate names for the gateway's id.
+fn machinery_read_gate(user: &boss_policy::User) -> Result<(), ErrResp> {
+    use boss_policy_client::AccessTier;
+    if matches!(user.access_tier, AccessTier::Operator | AccessTier::Auditor) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            "the passkey tier counts are read by machinery at the operator or auditor tier",
         ))
     }
 }
@@ -84,6 +137,11 @@ pub fn webauthn_router(pool: PgPool, clock: Arc<dyn ClockClient>) -> Router {
             "/api/people/webauthn-credentials/used",
             post(record_credential_use),
         )
+        // A literal, because the read pin reads paths from this source;
+        // it is `boss_policy_client::coverage::TIER_COUNTS_PATH`, the
+        // spelling the policy service reads, and the ceremony test asks
+        // it by that const — a drift answers 404 there.
+        .route("/api/people/webauthn-credentials/tiers", get(tier_counts))
         .route("/api/people/presence-challenges", post(mint_challenge))
         .route(
             "/api/people/presence-challenges/{id}/consume",
@@ -109,21 +167,28 @@ fn unb64(field: &str, s: &str) -> Result<Vec<u8>, (StatusCode, String)> {
 // Credentials
 // ---------------------------------------------------------------------------
 
+/// The body names no tier, and a body that tries is refused (422).
+/// It used to carry `access_tier`, and the handler stored whatever
+/// `operator|user` it was sent — while its only gate was the
+/// platform-admin ROLE, which the owner's user-tier browser session
+/// carries through the gateway's `/api/people` proxy. So that cookie
+/// could store an operator-tier key of its own and elevate with it
+/// (backlog 1d9970d1: H1 of car 0bde9b99's review, one layer below the
+/// ceremony). Every credential this door stores is `user`; an operator
+/// key is a separate, recorded promotion, never a field here.
+/// `deny_unknown_fields` makes the refusal loud, so a caller that still
+/// believes it can choose finds out rather than being quietly ignored.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RegisterCredentialBody {
     credential_id: String,
     public_key: String,
     #[serde(default = "default_label")]
     label: String,
-    #[serde(default = "default_tier")]
-    access_tier: String,
 }
 
 fn default_label() -> String {
     "default".into()
-}
-fn default_tier() -> String {
-    "user".into()
 }
 
 #[derive(Serialize)]
@@ -137,12 +202,56 @@ struct CredentialOut {
     last_used_at: Option<DateTime<Utc>>,
 }
 
+/// One employee's key counts by tier.
+#[derive(Serialize)]
+struct TierCounts {
+    employee_id: String,
+    user: i64,
+    operator: i64,
+}
+
+/// Every employee holding at least one key, with its keys counted by
+/// tier — `{data, total}`, in employee order.
+async fn tier_counts(
+    State(state): State<WebauthnState>,
+    CurrentUser(user): CurrentUser,
+) -> Response {
+    if let Err(r) = machinery_read_gate(&user) {
+        return r.into_response();
+    }
+    let rows = sqlx::query(
+        "SELECT employee_id,
+                count(*) FILTER (WHERE access_tier = 'user') AS user_keys,
+                count(*) FILTER (WHERE access_tier = 'operator') AS operator_keys
+           FROM webauthn_credentials
+          GROUP BY employee_id
+          ORDER BY employee_id",
+    )
+    .fetch_all(state.pool.as_ref())
+    .await;
+    match rows {
+        Ok(rows) => {
+            let out: Vec<TierCounts> = rows
+                .iter()
+                .map(|r| TierCounts {
+                    employee_id: r.get("employee_id"),
+                    user: r.get("user_keys"),
+                    operator: r.get("operator_keys"),
+                })
+                .collect();
+            let total = out.len();
+            Json(serde_json::json!({ "data": out, "total": total })).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 async fn list_credentials(
     State(state): State<WebauthnState>,
     CurrentUser(user): CurrentUser,
     Path(employee_id): Path<String>,
 ) -> Response {
-    if let Err(r) = operator_gate(&user) {
+    if let Err(r) = gateway_gate(&user) {
         return r.into_response();
     }
     let rows = sqlx::query(
@@ -181,11 +290,8 @@ async fn register_credential(
     Path(employee_id): Path<String>,
     Json(body): Json<RegisterCredentialBody>,
 ) -> Response {
-    if let Err(r) = operator_gate(&user) {
+    if let Err(r) = gateway_gate(&user) {
         return r.into_response();
-    }
-    if !["operator", "user"].contains(&body.access_tier.as_str()) {
-        return (StatusCode::BAD_REQUEST, "access_tier must be operator|user").into_response();
     }
     let cred_id = match unb64("credential_id", &body.credential_id) {
         Ok(v) => v,
@@ -196,16 +302,17 @@ async fn register_credential(
         Err(r) => return r.into_response(),
     };
     let now = now_from(&state.clock).await;
+    // The tier is a literal in the statement, not a bind: nothing a
+    // caller sends can reach the column (backlog 1d9970d1).
     let res = sqlx::query(
         "INSERT INTO webauthn_credentials
            (employee_id, credential_id, public_key, label, access_tier, registered_at)
-         VALUES ($1, $2, $3, $4, $5, $6)",
+         VALUES ($1, $2, $3, $4, 'user', $5)",
     )
     .bind(&employee_id)
     .bind(&cred_id)
     .bind(&pub_key)
     .bind(&body.label)
-    .bind(&body.access_tier)
     .bind(now)
     .execute(state.pool.as_ref())
     .await;
@@ -243,7 +350,7 @@ async fn remove_credential(
     CurrentUser(user): CurrentUser,
     Path((employee_id, credential_id)): Path<(String, String)>,
 ) -> Response {
-    if let Err(r) = operator_gate(&user) {
+    if let Err(r) = gateway_gate(&user) {
         return r.into_response();
     }
     let cred = match unb64("credential_id", &credential_id) {
@@ -291,7 +398,7 @@ async fn record_credential_use(
     CurrentUser(user): CurrentUser,
     Json(body): Json<CredentialUsedBody>,
 ) -> Response {
-    if let Err(r) = operator_gate(&user) {
+    if let Err(r) = gateway_gate(&user) {
         return r.into_response();
     }
     let cred_id = match unb64("credential_id", &body.credential_id) {
@@ -355,7 +462,7 @@ async fn mint_challenge(
     CurrentUser(user): CurrentUser,
     Json(body): Json<MintChallengeBody>,
 ) -> Response {
-    if let Err(r) = operator_gate(&user) {
+    if let Err(r) = gateway_gate(&user) {
         return r.into_response();
     }
     if !["register", "authenticate", "presence"].contains(&body.flow.as_str()) {
@@ -407,7 +514,7 @@ async fn consume_challenge(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = operator_gate(&user) {
+    if let Err(r) = gateway_gate(&user) {
         return r.into_response();
     }
     let now = now_from(&state.clock).await;

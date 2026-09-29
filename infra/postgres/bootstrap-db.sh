@@ -285,18 +285,11 @@ if $RUN_REBUILD; then
         "$REBUILD_BIN" --database-url "$BUILD_URL"
     fi
 
-    # boss-rebuild-all projects audit_log -> per-service tables + ledger
-    # facts, but the journal-entry projection (financial_facts ->
-    # gl_journal_entries) is a separate function exposed via the boss
-    # CLI's `ledger rebuild` subcommand. Without this step the GL stays
-    # empty after a fresh bootstrap and the trial balance shows zero
-    # activity even though the audit_log has every event.
-    if BOSS_BIN="$(find_boss_bin boss)"; then
-        echo "  rebuilding gl_journal_entries from financial_facts"
-        "$BOSS_BIN" ledger rebuild --postgres-url "$BUILD_URL" 2>&1 | tail -3 ||             echo "    (ledger rebuild failed — trial balance may stay empty until manually rebuilt)" >&2
-    else
-        echo "  WARN: boss CLI not found — skipping ledger rebuild; trial balance will be empty" >&2
-    fi
+    # The journal-entry projection (financial_facts -> gl_journal_entries)
+    # is boss-rebuild-all's `ledger-journal` step, which ran above. A
+    # second pass through `boss ledger rebuild` used to follow here; that
+    # verb repeated the same function against a defaulted database and
+    # is gone (backlog 05cd6572).
 
     # Post-rebuild integrity check. Verifies the audit_log hash chain
     # plus dangling-FK rules so a silent drop during seed-load or

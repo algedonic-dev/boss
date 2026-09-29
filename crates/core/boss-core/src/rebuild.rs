@@ -75,9 +75,15 @@ pub fn resolve_database_url(
 
 /// Stable, collision-free advisory-lock key for a projection rebuild.
 ///
-/// Every projection rebuilder takes a `pg_advisory_xact_lock` so two
-/// rebuilds of the same projection never interleave (and the ledger's
-/// replay-verifier serializes against the ledger rebuild the same way).
+/// Every projection rebuilder takes an advisory lock under this key so
+/// two rebuilds of the same projection never interleave (and the
+/// ledger's replay-verifier serializes against the ledger rebuild the
+/// same way) — a `pg_advisory_xact_lock` held for the rebuild's one
+/// transaction, or, for a projection windowed across many statements
+/// (`event-facts`), a session `pg_advisory_lock` held for the whole run
+/// by every writer of it. It is a rebuild-vs-rebuild lock: no live
+/// writer takes it. Six `boss-rebuild-all` steps took none until
+/// backlog 8d5ac7c5, while this said "every".
 /// The key is derived from the projection name rather than hand-numbered:
 /// distinct names get distinct keys (no accidental collisions that
 /// needlessly serialize unrelated rebuilders), the same name yields the

@@ -41,7 +41,8 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import ts from 'typescript';
 
-import config from '../playwright.mocked.config';
+import config, { BUDGET } from '../playwright.mocked.config';
+import { GATE_LOAD_ENV, GATE_LOAD_SCALE, loadScale } from '../src/dev-load';
 
 // Playwright's own defaults, the ones an unstated budget falls back
 // to. Spelled here so the assertion below can say WHICH number it is
@@ -85,6 +86,30 @@ test('the per-test budget leaves room for the assertions inside it', () => {
       + `(${perExpect} ms) — otherwise the test dies before its second `
       + 'assertion can report what it was waiting for',
   ).toBeGreaterThan(perExpect * 2);
+});
+
+test('every budget the config applies is its quiet budget times the load this run is under', () => {
+  // Backlog ebb750cd: a Crew Board paint that takes 0.65 s quiet took
+  // 27.6 s in a train gate beside two 20-wide cargo builds, against a
+  // 15 s expect. The quiet numbers are stated once, in BUDGET; the gate
+  // scales all four together (src/dev-load.ts), so their ratios — the
+  // per-test cap above twice the expect budget — hold in both.
+  const scale = loadScale();
+  expect({
+    test: config.timeout,
+    expect: config.expect?.timeout,
+    action: config.use?.actionTimeout,
+    navigation: config.use?.navigationTimeout,
+  }).toEqual({
+    test: BUDGET.test * scale,
+    expect: BUDGET.expect * scale,
+    action: BUDGET.action * scale,
+    navigation: BUDGET.navigation * scale,
+  });
+  expect(
+    scale === 1 || process.env[GATE_LOAD_ENV] === '1',
+    `the budgets are scaled x${scale} with ${GATE_LOAD_ENV} unset — only the gate-runner scales them`,
+  ).toBe(true);
 });
 
 test('the shared mount waits under the stated budget, not a number of its own', () => {
@@ -143,6 +168,19 @@ test('the shared mount waits under the stated budget, not a number of its own', 
 // slower. Such a line says so, with its reason, on the line itself or
 // the line above: `short on purpose: <why>`. The pin reads the words,
 // so the exception is written where the next reader of the wait is.
+//
+// HELD TO THE GATE'S BUDGET, NOT THE QUIET ONE (backlog ebb750cd). The
+// gate-runner scales every stated budget by GATE_LOAD_SCALE
+// (src/dev-load.ts), so a bare `timeout: 20_000` that clears the quiet
+// 15 000 ms expect budget is a 20 s cap under a 60 s one in the gate —
+// tighter than it inherits, in exactly the place load lives. So each
+// wait is compared with what its call inherits IN THE GATE, whatever
+// this run's own load: a hand-written budget states itself through
+// `scaled(<quiet ms>)`, which the pin reads as that number times the
+// gate's scale, and a bare number passes only if it already clears the
+// gate's budget. `test.setTimeout(...)` is read the same way against
+// the per-test budget, because a spec that sets its own cap sets it for
+// every assertion inside.
 const MOCKED_DIR = join(import.meta.dir, '../tests/mocked');
 const NAVIGATIONS = new Set([
   'goto', 'goBack', 'goForward', 'reload', 'waitForURL', 'waitForLoadState', 'waitForNavigation',
@@ -152,13 +190,23 @@ const SHORT_ON_PURPOSE = /short on purpose:\s*\S/;
 type Wait = Readonly<{ file: string; line: number; call: string; value: number | null; budget: number }>;
 
 function inheritedBudget(call: string): number {
-  if (NAVIGATIONS.has(call)) return config.use?.navigationTimeout ?? 0;
-  if (call === 'poll' || /^to[A-Z]/.test(call)) return config.expect?.timeout ?? PLAYWRIGHT_DEFAULT_EXPECT_MS;
-  return config.use?.actionTimeout ?? 0;
+  if (call === 'setTimeout') return BUDGET.test * GATE_LOAD_SCALE;
+  if (NAVIGATIONS.has(call)) return BUDGET.navigation * GATE_LOAD_SCALE;
+  if (call === 'poll' || /^to[A-Z]/.test(call)) return BUDGET.expect * GATE_LOAD_SCALE;
+  return BUDGET.action * GATE_LOAD_SCALE;
+}
+
+/// `test.setTimeout(x)` or `test.info().setTimeout(x)`: the spec's own
+/// per-test cap.
+function isTestSetTimeout(n: ts.CallExpression, sf: ts.SourceFile): boolean {
+  if (!ts.isPropertyAccessExpression(n.expression) || n.expression.name.text !== 'setTimeout') return false;
+  const on = n.expression.expression.getText(sf);
+  return on === 'test' || on === 'test.info()';
 }
 
 /// Every hand-written `timeout:` in one source file, with the call it
-/// is passed to and each value it can take (both arms of a ternary).
+/// is passed to and each value it can take (both arms of a ternary),
+/// and every `test.setTimeout(...)`.
 function handWrittenWaits(file: string, source: string): ReadonlyArray<Wait> {
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true);
   const lines = source.split('\n');
@@ -172,22 +220,31 @@ function handWrittenWaits(file: string, source: string): ReadonlyArray<Wait> {
     if (ts.isNumericLiteral(e)) return [Number(e.text.replace(/_/g, ''))];
     if (ts.isParenthesizedExpression(e)) return values(e.expression, seen);
     if (ts.isConditionalExpression(e)) return [...values(e.whenTrue, seen), ...values(e.whenFalse, seen)];
+    // `scaled(<quiet ms>)` — what it comes to in the gate.
+    if (ts.isCallExpression(e) && e.expression.getText(sf) === 'scaled' && e.arguments.length === 1) {
+      return values(e.arguments[0]!, seen).map((v) => (v === null ? null : v * GATE_LOAD_SCALE));
+    }
     const bound = ts.isIdentifier(e) ? consts.get(e.text) : undefined;
     return bound && seen < 8 ? values(bound, seen + 1) : [null];
   };
   const found: Wait[] = [];
+  const record = (at: ts.Node, call: string, value: ts.Expression): void => {
+    const line = sf.getLineAndCharacterOfPosition(at.getStart(sf)).line;
+    const exempt = SHORT_ON_PURPOSE.test(lines[line] ?? '') || SHORT_ON_PURPOSE.test(lines[line - 1] ?? '');
+    if (exempt) return;
+    for (const v of values(value, 0)) {
+      found.push({ file, line: line + 1, call, value: v, budget: inheritedBudget(call) });
+    }
+  };
   const visit = (n: ts.Node): void => {
     if (ts.isPropertyAssignment(n) && n.name.getText(sf) === 'timeout') {
-      const line = sf.getLineAndCharacterOfPosition(n.getStart(sf)).line;
-      const exempt = SHORT_ON_PURPOSE.test(lines[line] ?? '') || SHORT_ON_PURPOSE.test(lines[line - 1] ?? '');
       const holder = n.parent.parent;
       const callee = holder && ts.isCallExpression(holder) ? holder.expression : undefined;
       const call = callee && ts.isPropertyAccessExpression(callee) ? callee.name.text : callee?.getText(sf) ?? '(an options object)';
-      if (!exempt) {
-        for (const value of values(n.initializer, 0)) {
-          found.push({ file, line: line + 1, call, value, budget: inheritedBudget(call) });
-        }
-      }
+      record(n, call, n.initializer);
+    }
+    if (ts.isCallExpression(n) && isTestSetTimeout(n, sf) && n.arguments.length === 1) {
+      record(n, 'setTimeout', n.arguments[0]!);
     }
     ts.forEachChild(n, visit);
   };
@@ -203,9 +260,10 @@ test('no mocked spec hand-writes a wait shorter than the budget its call inherit
     .map((w) => `${w.file}:${w.line} ${w.call} ${w.value ?? '(unreadable)'} ms < ${w.budget} ms`);
   expect(
     short,
-    'a mocked spec caps a wait below the budget playwright.mocked.config.ts states for it. '
-      + 'Drop the number and inherit the budget; if timing out IS the answer the wait '
-      + 'looks for, say so on the line: `short on purpose: <why>`',
+    'a mocked spec caps a wait below the budget playwright.mocked.config.ts states for it '
+      + `in the gate (x${GATE_LOAD_SCALE}, src/dev-load.ts). Drop the number and inherit the `
+      + 'budget, or state it as `scaled(<quiet ms>)` so it grows with the gate\'s; if timing '
+      + 'out IS the answer the wait looks for, say so on the line: `short on purpose: <why>`',
   ).toEqual([]);
 });
 
@@ -288,8 +346,10 @@ test('the sleep floor reads what a spec actually writes', () => {
 test('the floor reads what a spec actually writes', () => {
   // The scanner itself, on the shapes it must see: a literal, a named
   // constant, both arms of a ternary, a navigation's larger budget, and
-  // the one written exception. A scanner that reads nothing passes the
-  // test above on any tree.
+  // the one written exception — and `scaled(...)`, directly and through
+  // a constant, read as what it comes to in the gate, and a spec's own
+  // `test.setTimeout`. A scanner that reads nothing passes the test
+  // above on any tree.
   const src = [
     'const SETTLE = 250;',
     "await expect(a).toHaveText('x', { timeout: 10_000 });",
@@ -298,15 +358,22 @@ test('the floor reads what a spec actually writes', () => {
     '// short on purpose: a race the click may lose',
     'await page.waitForURL(f, { timeout: SETTLE });',
     'await expect.poll(() => n, { timeout: 12_000 }).toBe(1);',
+    "await expect(s).toBeVisible({ timeout: scaled(20_000) });",
+    'const CAP = scaled(15_000);',
+    'await m.waitFor({ state: \'attached\', timeout: CAP });',
+    'test.setTimeout(120_000);',
+    'test.setTimeout(scaled(120_000));',
   ].join('\n');
   const got = handWrittenWaits('fixture.ts', src).map((w) => [w.line, w.call, w.value, w.budget]);
   const nav = inheritedBudget('goto');
   const exp = inheritedBudget('toHaveText');
   const act = inheritedBudget('click');
-  expect([nav, exp, act], 'the config states each of the three budgets').toEqual([
-    config.use?.navigationTimeout as number,
-    config.expect?.timeout as number,
-    config.use?.actionTimeout as number,
+  const per = inheritedBudget('setTimeout');
+  expect([nav, exp, act, per], 'each call is held to the budget it inherits in the gate').toEqual([
+    BUDGET.navigation * GATE_LOAD_SCALE,
+    BUDGET.expect * GATE_LOAD_SCALE,
+    BUDGET.action * GATE_LOAD_SCALE,
+    BUDGET.test * GATE_LOAD_SCALE,
   ]);
   expect(got).toEqual([
     [2, 'toHaveText', 10_000, exp],
@@ -314,5 +381,9 @@ test('the floor reads what a spec actually writes', () => {
     [4, 'click', null, act],
     [4, 'click', 3_000, act],
     [7, 'poll', 12_000, exp],
+    [8, 'toBeVisible', 20_000 * GATE_LOAD_SCALE, exp],
+    [10, 'waitFor', 15_000 * GATE_LOAD_SCALE, act],
+    [11, 'setTimeout', 120_000, per],
+    [12, 'setTimeout', 120_000 * GATE_LOAD_SCALE, per],
   ]);
 });

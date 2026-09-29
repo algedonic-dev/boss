@@ -210,6 +210,26 @@ pub fn claim_conflict_error(status: &str) -> &'static str {
     }
 }
 
+/// The error line of a claim that met a READY step whose holder moved
+/// between the claim's read and its CAS (backlog ce8b7d66, the review of
+/// car eb2f9b0f, finding 2). A claim for someone else may displace only
+/// the holder it read, so a step handed on in that gap is refused — and
+/// the holder it met may be the caller's own login or the declared
+/// executor, whom "held by someone else" would misname. It is a race,
+/// and a re-sent claim is judged on the step as it now stands.
+pub const HOLDER_MOVED: &str =
+    "the step's holder changed while this claim was judged — send it again";
+
+/// The claim door's 409 line: [`HOLDER_MOVED`] for a Ready step whose
+/// holder is not the one the claim read, else [`claim_conflict_error`].
+pub fn claim_conflict_line(status: &str, holder_moved: bool) -> &'static str {
+    if status == "ready" && holder_moved {
+        HOLDER_MOVED
+    } else {
+        claim_conflict_error(status)
+    }
+}
+
 /// The 409's body, in the terminal freeze's shape (`step_status` +
 /// `refused_fields`), naming who holds the step.
 pub fn refusal_body(step_id: &str, holder: &str) -> Value {
@@ -225,7 +245,31 @@ pub fn refusal_body(step_id: &str, holder: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_conflict_error, declared_executor, nominee, refuses, stored};
+    use super::{
+        HOLDER_MOVED, claim_conflict_error, claim_conflict_line, declared_executor, nominee,
+        refuses, stored,
+    };
+
+    /// A Ready step whose holder moved between the claim's read and its
+    /// CAS is a race to send again, not someone else's hold (backlog
+    /// ce8b7d66, the review of car eb2f9b0f, finding 2) — the holder it
+    /// met may be the caller's own login or the declared executor.
+    #[test]
+    fn a_holder_that_moved_under_the_claim_reads_as_a_retry() {
+        let line = claim_conflict_line("ready", true);
+        assert_eq!(line, HOLDER_MOVED);
+        assert!(line.contains("send it again"), "{line}");
+        assert!(!line.contains("someone else"), "{line}");
+        assert_eq!(
+            claim_conflict_line("ready", false),
+            claim_conflict_error("ready")
+        );
+        // An active step was claimed, whenever it moved.
+        assert_eq!(
+            claim_conflict_line("active", true),
+            claim_conflict_error("active")
+        );
+    }
 
     #[test]
     fn only_an_active_step_is_called_already_claimed() {

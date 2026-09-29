@@ -1,35 +1,59 @@
 //! In-memory `SubjectKindRepository` for tests + dev fallback.
 
-use async_trait::async_trait;
+use std::sync::{RwLock, RwLockReadGuard};
 
-use crate::port::{SubjectKind, SubjectKindError, SubjectKindRepository};
+use async_trait::async_trait;
+use boss_core::event::Event;
+use boss_core::publisher::EventStamp;
+use serde_json::{Map, Value};
+
+use crate::port::{
+    SubjectKind, SubjectKindError, SubjectKindRepository, apply_change, metadata_change,
+    updated_event,
+};
 
 pub struct InMemorySubjectKinds {
-    rows: Vec<SubjectKind>,
+    rows: RwLock<Vec<SubjectKind>>,
+    events: RwLock<Vec<Event>>,
 }
 
 impl InMemorySubjectKinds {
     pub fn new(rows: Vec<SubjectKind>) -> Self {
-        Self { rows }
+        Self {
+            rows: RwLock::new(rows),
+            events: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// Every event recorded through this adapter, in order — what a Pg
+    /// deployment would find on the outbox (the `InMemoryClasses` shape).
+    pub fn recorded_events(&self) -> Vec<Event> {
+        self.events.read().map(|e| e.clone()).unwrap_or_default()
+    }
+
+    fn rows(&self) -> Result<RwLockReadGuard<'_, Vec<SubjectKind>>, SubjectKindError> {
+        self.rows
+            .read()
+            .map_err(|_| SubjectKindError::Storage("rows lock poisoned".into()))
     }
 }
 
 #[async_trait]
 impl SubjectKindRepository for InMemorySubjectKinds {
     async fn get(&self, kind: &str) -> Result<Option<SubjectKind>, SubjectKindError> {
-        Ok(self.rows.iter().find(|r| r.kind == kind).cloned())
+        Ok(self.rows()?.iter().find(|r| r.kind == kind).cloned())
     }
 
     async fn exists_active(&self, kind: &str) -> Result<bool, SubjectKindError> {
         Ok(self
-            .rows
+            .rows()?
             .iter()
             .any(|r| r.kind == kind && r.retired_at.is_none()))
     }
 
     async fn list_active(&self) -> Result<Vec<SubjectKind>, SubjectKindError> {
         let mut out: Vec<SubjectKind> = self
-            .rows
+            .rows()?
             .iter()
             .filter(|r| r.retired_at.is_none())
             .cloned()
@@ -44,13 +68,39 @@ impl SubjectKindRepository for InMemorySubjectKinds {
 
     async fn children_of(&self, parent_kind: &str) -> Result<Vec<SubjectKind>, SubjectKindError> {
         let mut out: Vec<SubjectKind> = self
-            .rows
+            .rows()?
             .iter()
             .filter(|r| r.retired_at.is_none() && r.parent_kind.as_deref() == Some(parent_kind))
             .cloned()
             .collect();
         out.sort_by(|a, b| a.kind.cmp(&b.kind));
         Ok(out)
+    }
+
+    async fn patch_metadata(
+        &self,
+        kind: &str,
+        patch: &Map<String, Value>,
+        stamp: &EventStamp,
+    ) -> Result<Option<SubjectKind>, SubjectKindError> {
+        let mut rows = self
+            .rows
+            .write()
+            .map_err(|_| SubjectKindError::Storage("rows lock poisoned".into()))?;
+        let mut events = self
+            .events
+            .write()
+            .map_err(|_| SubjectKindError::Storage("events lock poisoned".into()))?;
+        let Some(row) = rows.iter_mut().find(|r| r.kind == kind) else {
+            return Ok(None);
+        };
+        // The Pg adapter's shape: no change, no write, no fact.
+        let change = metadata_change(&row.metadata, patch)?;
+        if let Some(event) = updated_event(stamp, kind, &change)? {
+            row.metadata = apply_change(&row.metadata, &change);
+            events.push(event);
+        }
+        Ok(Some(row.clone()))
     }
 }
 

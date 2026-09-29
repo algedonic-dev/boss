@@ -95,12 +95,18 @@ async fn health() -> Json<boss_core::startup::HealthResponse> {
 // `/check` takes the same bound WHENEVER the request is signed (backlog
 // 5a914364 S1): the gateway always sets `x-boss-user` on a session's
 // request, so a session asking about someone else is judged like the
-// list. An UNSIGNED `/check` stays open, because every service asks it
-// through `ReqwestPolicyClient` with no `x-boss-user` of its own, and a
-// bound there would deny every policy check in the estate. That arm
-// closes when callers sign their policy calls (e84de48e, and the
-// machine token of design 6805c764); until then a caller reaching the
-// port directly is the gap, pinned by
+// list. An UNSIGNED `/check` stays open for now. Every service asked it
+// through `ReqwestPolicyClient` with no `x-boss-user` of its own, so a
+// bound there would have denied every policy check in the estate; since
+// 2026-09-29 the client signs every check as its service
+// (`User::service`, at platform-admin, which the signed arm admits —
+// `a_check_signed_as_a_service_is_answered_about_anyone` — and which,
+// should that grant be retired, is still answered, logged, rather than
+// refused: `a_retired_policy_read_does_not_lock_the_services_out`,
+// hold F1 of review b8e7). Closing the
+// unsigned arm is a REFUSAL, so it is its own car (F7 of b8e75382),
+// after the DR readiness of 62dac114; until then a caller reaching the
+// port directly with no header is the gap, pinned by
 // `an_unsigned_check_still_answers_about_anyone_until_callers_sign`.
 //
 // The rule table (`GET /api/policy/rules`, `/rules/{id}`) is read only by
@@ -153,10 +159,28 @@ struct CheckBody {
     resource: Resource,
 }
 
-/// A signed caller is judged by [`may_read_for`]; an unsigned one — every
-/// service's `ReqwestPolicyClient` today — is answered, until callers
-/// sign (e84de48e). Presence of the header is the test, not the id the
-/// extractor defaults to, because a signed request may carry any id.
+/// A signed caller is judged by [`may_read_for`] — a service's
+/// `ReqwestPolicyClient` among them, signed as `User::service` since
+/// 2026-09-29; an unsigned one is still answered, until the car that
+/// closes that arm (F7 of b8e75382). Presence of the header is the test,
+/// not the id the extractor defaults to, because a signed request may
+/// carry any id.
+///
+/// A SERVICE'S SIGNATURE IS ATTRIBUTION, NOT A GATE — until F7 (hold F1
+/// of the review of this car, b8e7, 2026-09-29). Every service's every
+/// check now arrives signed, so refusing a service that lacks Read on
+/// `policy-rule` would hang the whole estate on one mutable grant:
+/// retire `platform-admin:policy-rule:read`, or narrow `automation:<svc>`
+/// with a scope-none override, and every request of every user — the
+/// operator's included — is refused, where the unsigned check answered.
+/// That is a new lockout path, which DR rule 62dac114 forbids before DR
+/// readiness. So a service identity the bound refuses is answered about
+/// its subject exactly as an unsigned check is, and the gap is logged
+/// loudly for the operator to restore. A SESSION caller is still refused
+/// (5a914364 S1): the gateway replaces `x-boss-user` from the session,
+/// so no session presents an `automation:` id, and a caller on the port
+/// that claims one gets only what an unsigned caller already gets. F7
+/// turns this arm into a refusal once DR readiness is proven.
 async fn check<R: PolicyRepository + 'static>(
     State(state): State<Arc<PolicyApiState<R>>>,
     headers: HeaderMap,
@@ -167,7 +191,18 @@ async fn check<R: PolicyRepository + 'static>(
         && let Err(refused) =
             may_read_for(&state, &caller, &body.user.id, Some(&body.user.role)).await
     {
-        return refused;
+        if !caller.is_service() {
+            return refused;
+        }
+        tracing::warn!(
+            caller = %caller.id,
+            role = %caller.role,
+            subject = %body.user.id,
+            refused = %refused.status(),
+            "a signed service check lacks Read on policy-rule at scope all; answered as an \
+             unsigned check until F7 of backlog b8e75382 (restore the grant: \
+             platform-admin:policy-rule:read, and no scope-none override on the service id)"
+        );
     }
     match state
         .engine
@@ -197,14 +232,24 @@ async fn may_read_rules<R: PolicyRepository + 'static>(
     state: &PolicyApiState<R>,
     caller: &User,
 ) -> Result<(), Response> {
+    may_read_rule_table(&state.engine, caller).await
+}
+
+/// [`may_read_rules`] over the engine alone — the one judgement of who
+/// reads the authority map, shared with the coverage read, whose holder
+/// lists are that same map by person (review of design 1c4e42e1 car 1,
+/// M1).
+pub(crate) async fn may_read_rule_table<R: PolicyRepository + 'static>(
+    engine: &PolicyEngine<R>,
+    caller: &User,
+) -> Result<(), Response> {
     if boss_core::roles::ANONYMOUS_VISITOR_IDS.contains(&caller.id.as_str()) {
         return Err(forbidden(format!(
             "{} may not read the policy rules: an anonymous visitor reads only its own authority",
             caller.id
         )));
     }
-    let decision = state
-        .engine
+    let decision = engine
         .check(caller, Action::Read, Resource::policy_rule())
         .await
         .map_err(err_response)?;
@@ -1659,29 +1704,108 @@ mod tests {
     }
 
     /// The control for every service in the estate: `ReqwestPolicyClient`
-    /// asks `/check` about the user it is serving and sends no
-    /// `x-boss-user` of its own, so an unsigned question is answered —
-    /// a bound on it would deny every policy check there is.
+    /// asks `/check` about the user it is serving, SIGNED as the service
+    /// itself — [`User::service`], the identity the client presents on
+    /// every check (backlog b8e75382 F7 / e84de48e). The signed arm
+    /// judges that caller like any other, and it is answered, deny reason
+    /// and all, about any user: a service asking policy about the person
+    /// in front of it is the whole point of the port. Until this car the
+    /// client sent no `x-boss-user`, and this control asked unsigned.
     #[tokio::test]
-    async fn an_unsigned_service_check_is_still_answered() {
+    async fn a_check_signed_as_a_service_is_answered_about_anyone() {
         let repo = reads_repo().await;
-        let body = serde_json::json!({
-            "user": {"id": "emp-founder", "role": "platform-admin", "access_tier": "operator"},
-            "action": "create",
-            "resource": "job",
-        });
-        let (status, text) = ask(&repo, Method::POST, "/api/policy/check", Some(&body), None).await;
-        assert_eq!(status, StatusCode::OK, "{text}");
-        assert!(text.contains("allow"), "{text}");
+        let service = serde_json::to_string(&User::service("jobs")).expect("identity");
+        for (id, role, expect) in [
+            ("emp-founder", "platform-admin", "allow"),
+            ("emp-cover", "reviewer", DENY_REASON),
+        ] {
+            let body = serde_json::json!({
+                "user": {"id": id, "role": role, "access_tier": "user"},
+                "action": "read",
+                "resource": "ledger",
+            });
+            let (status, text) = ask(
+                &repo,
+                Method::POST,
+                "/api/policy/check",
+                Some(&body),
+                Some(&service),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{id}: {text}");
+            assert!(text.contains(expect), "{id}: {text}");
+        }
+    }
+
+    /// HOLD F1 of the review of this car (b8e7, 2026-09-29): once services
+    /// sign, every check in the estate hangs on ONE mutable grant — the
+    /// service identity's Read on `policy-rule`. Retire
+    /// `platform-admin:policy-rule:read`, or put a scope-none override on
+    /// `automation:<svc>`, and the signed arm refused every service's
+    /// every check (403), which the client read as a Deny: every request
+    /// of every user, the operator's included, refused by one policy
+    /// edit, where the unsigned check had answered. Until F7, a service's
+    /// signature is ATTRIBUTION, not a gate: a service lacking the grant
+    /// is answered about its subject exactly as an unsigned check is, and
+    /// the gap is logged. Both edits, and the answer for a permitted and
+    /// a denied subject after each.
+    #[tokio::test]
+    async fn a_retired_policy_read_does_not_lock_the_services_out() {
+        let retired = reads_repo().await;
+        retired
+            .inner
+            .deactivate_rule("platform-admin:policy-rule:read", "seed")
+            .await
+            .expect("retire the grant");
+        let narrowed = reads_repo().await;
+        narrowed
+            .inner
+            .upsert_user_override(
+                &grant(
+                    "automation:jobs",
+                    Resource::policy_rule(),
+                    Action::Read,
+                    Scope::None,
+                ),
+                "seed",
+            )
+            .await
+            .expect("seed the scope-none override");
+        let service = serde_json::to_string(&User::service("jobs")).expect("identity");
+        for (edit, repo) in [("retired", &retired), ("narrowed", &narrowed)] {
+            for (id, role, expect) in [
+                ("emp-founder", "platform-admin", "allow"),
+                ("emp-cover", "reviewer", DENY_REASON),
+            ] {
+                let body = serde_json::json!({
+                    "user": {"id": id, "role": role, "access_tier": "user"},
+                    "action": "read",
+                    "resource": "ledger",
+                });
+                let (status, text) = ask(
+                    repo,
+                    Method::POST,
+                    "/api/policy/check",
+                    Some(&body),
+                    Some(&service),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{edit}: {id}: {text}");
+                assert!(text.contains(expect), "{edit}: {id}: {text}");
+            }
+        }
     }
 
     /// THE GAP, PINNED (5a914364 S4): an unsigned `/check` still answers
     /// about anyone, reason and all. Every browser session reaches this
-    /// port through the gateway, which always signs, so the gap is a
-    /// caller that reaches the port directly — the machine door with
-    /// its gate mode off (2710c8fc/6805c764). This test is meant to go
-    /// RED when services sign their policy calls (e84de48e) and the
-    /// unsigned arm is closed; invert it then, do not delete it.
+    /// port through the gateway, which always signs, and since backlog
+    /// b8e75382's service-identity car every `ReqwestPolicyClient` signs
+    /// too, so the gap is only a caller that reaches the port directly
+    /// with no header — the machine door with its gate mode off
+    /// (2710c8fc/6805c764). This test is meant to go RED in the car that
+    /// closes the unsigned arm (F7 of b8e75382, which waits on the DR
+    /// readiness of 62dac114 because it adds a refusal); invert it then,
+    /// do not delete it.
     #[tokio::test]
     async fn an_unsigned_check_still_answers_about_anyone_until_callers_sign() {
         let repo = reads_repo().await;

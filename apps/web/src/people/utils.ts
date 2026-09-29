@@ -64,8 +64,9 @@ export type DepartmentBucket = Readonly<{ code: string | null; label: string; co
 /// has none, so every row sits in exactly one bucket. The `selected`
 /// department keeps its button at zero when the rows hold none of it,
 /// so a Status change never hides the filter that empties the table.
-/// Each button is labelled from its (employee, department) Class's
-/// display_name, humanizing only a code the registry lacks (backlog
+/// Each button is labelled from its departments-registry display name
+/// (`departmentNames`; an `(employee, department)` Class's until
+/// c87e3d6d), humanizing only a code the registry lacks (backlog
 /// 8a331c9b: `operations` printed Operations for Operations / IT).
 export function departmentBuckets(
   rows: ReadonlyArray<Employee>,

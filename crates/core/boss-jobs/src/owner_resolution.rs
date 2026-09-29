@@ -153,7 +153,9 @@ fn fxhash(s: &str) -> u64 {
 /// HTTP-backed roster over boss-people, with a short TTL cache so a
 /// sim burst of creates doesn't turn into a people-api hammer.
 pub struct ReqwestRosterLookup {
-    client: reqwest::Client,
+    /// Stamped with the machine token, redirects off (review S2 of
+    /// design 6805c764 car 2: this roster read sent none).
+    client: boss_core::machine_token::Client,
     people_base: String,
     cache: Mutex<HashMap<String, (Instant, Vec<String>)>>,
     ttl: Duration,
@@ -171,10 +173,10 @@ struct EmployeeRow {
 impl ReqwestRosterLookup {
     pub fn new(people_base: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .expect("reqwest client"),
+            client: boss_core::machine_token::Client::build(
+                reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)),
+            )
+            .expect("reqwest client"),
             people_base: people_base.into(),
             cache: Mutex::new(HashMap::new()),
             ttl: Duration::from_secs(60),

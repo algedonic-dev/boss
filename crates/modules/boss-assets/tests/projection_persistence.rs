@@ -1,5 +1,6 @@
-//! Integration tests proving `PgAssets::append` keeps the `devices`
-//! projection in lockstep with the `device_events` log.
+//! Integration tests proving `PgAssets::append` keeps the `assets`
+//! projection in lockstep with the `asset_events` log (both were named
+//! `devices` / `device_events` when this file was written).
 //!
 //! Background: before this work, `PgAssets::append` only inserted into
 //! `device_events`. The `devices` table was populated by an old TS
@@ -387,11 +388,13 @@ async fn rebuild_projection_recreates_rows_from_event_log() {
         .unwrap();
     assert_eq!(before, 0, "wipe should leave devices empty");
 
-    let written = assets.rebuild_projection().await.expect("rebuild");
+    let report = assets.rebuild_projection().await.expect("rebuild");
     assert_eq!(
-        written, 2,
+        report.assets_written, 2,
         "rebuild should write one row per distinct serial"
     );
+    assert_eq!(report.events_processed, 3);
+    assert_eq!(report.events_skipped, 0);
 
     let (after,): (i64,) = sqlx::query_as("SELECT count(*) FROM assets")
         .fetch_one(&db.pool)
@@ -409,6 +412,262 @@ async fn rebuild_projection_recreates_rows_from_event_log() {
     assert_eq!(sku, TEST_SKU);
     assert_eq!(phase, "installed");
     assert_eq!(account, Some("account-1".to_string()));
+}
+
+/// Write an `asset_events` row the way an older build wrote it — raw,
+/// because this build's `AssetEventKind` can no longer express a
+/// retired kind. `asset_events` is a no-fact store
+/// (`boss-events/writes-without-a-fact.txt`), so the migration that
+/// retired the refurb kinds measured the audit log and never this table.
+async fn insert_raw_event(
+    pool: &PgPool,
+    id: &str,
+    serial: &str,
+    day: u32,
+    payload: serde_json::Value,
+) {
+    let kind = payload["kind"].as_str().expect("payload carries its kind");
+    sqlx::query(
+        "INSERT INTO asset_events (id, asset_id, ts, actor_id, kind, payload) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(id)
+    .bind(serial)
+    .bind(NaiveDate::from_ymd_opt(2026, 1, day).unwrap())
+    .bind("automation:test")
+    .bind(kind)
+    .bind(&payload)
+    .execute(pool)
+    .await
+    .expect("insert raw asset_events row");
+}
+
+/// One row of a kind this build retired (TriageCompleted, the
+/// used-device shop's refurb pipeline, backlog a8991c86) must not fail
+/// the `assets` step of `boss-rebuild-all` — and with it every caller
+/// that gates on rebuild-all (the demo epoch restart, the log-copy
+/// restore). It is skipped and COUNTED under `events_skipped`, the field
+/// rebuild-all's tally reads off the report's Debug (backlog df6aedb4).
+#[tokio::test(flavor = "multi_thread")]
+async fn rebuild_projection_skips_and_counts_a_retired_kind_row() {
+    let db = TestDb::new().await;
+    seed_device_model(&db.pool, TEST_SKU).await;
+    let assets = PgAssets::new(db.pool.clone());
+
+    for e in [
+        evt(
+            "r1",
+            "SN-RET-1",
+            1,
+            AssetEventKind::Received {
+                sku: Some(TEST_SKU.into()),
+                source: IntakeSource::new("buyback"),
+                oem_serial: None,
+            },
+        ),
+        evt(
+            "r3",
+            "SN-RET-1",
+            5,
+            AssetEventKind::Installed {
+                holder_kind: "account".into(),
+                holder_id: "account-R".into(),
+            },
+        ),
+    ] {
+        assets.append(e).await.unwrap();
+    }
+    insert_raw_event(
+        &db.pool,
+        "r2-retired",
+        "SN-RET-1",
+        3,
+        serde_json::json!({"kind": "TriageCompleted", "notes": "grade B"}),
+    )
+    .await;
+    sqlx::query("DELETE FROM assets")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let report = assets
+        .rebuild_projection()
+        .await
+        .expect("a retired kind is skipped, not a failed rebuild");
+    assert_eq!(report.assets_written, 1);
+    assert_eq!(report.events_processed, 2);
+    assert_eq!(report.events_skipped, 1);
+    assert!(
+        format!("{report:?}").contains("events_skipped: 1"),
+        "rebuild-all's tally reads `events_skipped: N` off the Debug: {report:?}"
+    );
+
+    let (phase, holder): (String, Option<String>) =
+        sqlx::query_as("SELECT phase, holder_id FROM assets WHERE asset_id = $1")
+            .bind("SN-RET-1")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(phase, "installed");
+    assert_eq!(holder.as_deref(), Some("account-R"));
+}
+
+/// The skip is for a kind this build does not know — NOT for a row of a
+/// kind it does know whose payload will not decode. That is corruption,
+/// and the rebuild still refuses it rather than project around it.
+#[tokio::test(flavor = "multi_thread")]
+async fn rebuild_projection_still_refuses_a_known_kind_with_a_bad_payload() {
+    let db = TestDb::new().await;
+    seed_device_model(&db.pool, TEST_SKU).await;
+    let assets = PgAssets::new(db.pool.clone());
+
+    insert_raw_event(
+        &db.pool,
+        "bad-1",
+        "SN-BAD-1",
+        1,
+        serde_json::json!({"kind": "Installed"}),
+    )
+    .await;
+
+    let err = assets
+        .rebuild_projection()
+        .await
+        .expect_err("a known kind missing its fields is corruption");
+    assert!(
+        err.to_string().contains("bad event payload"),
+        "the refusal names the decode: {err}"
+    );
+}
+
+/// The READ path agrees with the rebuild (backlog 8d5ac7c5): a serial
+/// whose history holds a row of a retired kind is read back as the
+/// history this build still knows, the retired row left out — rather
+/// than a 500 on a serial the rebuild projects without complaint.
+#[tokio::test(flavor = "multi_thread")]
+async fn events_for_and_current_state_skip_a_retired_kind_row() {
+    let db = TestDb::new().await;
+    seed_device_model(&db.pool, TEST_SKU).await;
+    let assets = PgAssets::new(db.pool.clone());
+
+    for e in [
+        evt(
+            "rr1",
+            "SN-READ-RET-1",
+            1,
+            AssetEventKind::Received {
+                sku: Some(TEST_SKU.into()),
+                source: IntakeSource::new("buyback"),
+                oem_serial: None,
+            },
+        ),
+        evt(
+            "rr3",
+            "SN-READ-RET-1",
+            5,
+            AssetEventKind::Installed {
+                holder_kind: "account".into(),
+                holder_id: "account-R".into(),
+            },
+        ),
+    ] {
+        assets.append(e).await.unwrap();
+    }
+    insert_raw_event(
+        &db.pool,
+        "rr2-retired",
+        "SN-READ-RET-1",
+        3,
+        serde_json::json!({"kind": "RefurbStarted", "technician": "emp-1"}),
+    )
+    .await;
+
+    let serial = AssetId::new("SN-READ-RET-1".to_string());
+    let events = assets
+        .events_for(&serial)
+        .await
+        .expect("a retired kind is skipped on read, not a failed read");
+    let ids: Vec<&str> = events.iter().map(|e| e.id.0.as_str()).collect();
+    assert_eq!(ids, ["rr1", "rr3"]);
+
+    let state = assets
+        .current_state(&serial)
+        .await
+        .expect("current_state reads through the same tolerant decode")
+        .expect("the serial has a state");
+    assert_eq!(state.phase.as_str(), AssetLifecyclePhase::INSTALLED);
+}
+
+/// The read skips a kind this build does not know — never a KNOWN kind
+/// whose payload will not decode, which stays an error on read exactly
+/// as it does in the rebuild.
+#[tokio::test(flavor = "multi_thread")]
+async fn events_for_still_refuses_a_known_kind_with_a_bad_payload() {
+    let db = TestDb::new().await;
+    let assets = PgAssets::new(db.pool.clone());
+    insert_raw_event(
+        &db.pool,
+        "bad-read-1",
+        "SN-BAD-READ-1",
+        1,
+        serde_json::json!({"kind": "Installed"}),
+    )
+    .await;
+
+    let err = assets
+        .events_for(&AssetId::new("SN-BAD-READ-1".to_string()))
+        .await
+        .expect_err("a known kind missing its fields is corruption");
+    assert!(
+        err.to_string().contains("bad event payload"),
+        "the refusal names the decode: {err}"
+    );
+}
+
+/// `boss-rebuild-all` says every rebuilder holds its own
+/// `pg_advisory_xact_lock` under a stable per-service key; the `assets`
+/// step took none (backlog df6aedb4). Holding `lock_key("assets")` on
+/// another connection must hold the rebuild back until it is released.
+#[tokio::test(flavor = "multi_thread")]
+async fn rebuild_projection_waits_on_the_assets_advisory_lock() {
+    let db = TestDb::new().await;
+    seed_device_model(&db.pool, TEST_SKU).await;
+    let assets = PgAssets::new(db.pool.clone());
+    assets
+        .append(evt(
+            "l1",
+            "SN-LOCK-1",
+            1,
+            AssetEventKind::Received {
+                sku: Some(TEST_SKU.into()),
+                source: IntakeSource::new("oem-new"),
+                oem_serial: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+    let mut holder = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(boss_core::rebuild::lock_key("assets"))
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let rebuild = tokio::spawn(async move { assets.rebuild_projection().await });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !rebuild.is_finished(),
+        "the rebuild ran while another session held the assets rebuild lock"
+    );
+
+    holder.rollback().await.unwrap();
+    let report = tokio::time::timeout(std::time::Duration::from_secs(30), rebuild)
+        .await
+        .expect("the rebuild finishes once the lock is released")
+        .unwrap()
+        .expect("rebuild");
+    assert_eq!(report.assets_written, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

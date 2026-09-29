@@ -32,7 +32,7 @@ use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 use std::sync::Arc;
 
 pub struct MessagesExpireNotices {
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     messages_base: String,
 }
 
@@ -44,7 +44,10 @@ impl MessagesExpireNotices {
         })
     }
 
-    pub fn with_client(client: reqwest::Client, messages_base: impl Into<String>) -> Arc<Self> {
+    pub fn with_client(
+        client: boss_core::machine_token::Client,
+        messages_base: impl Into<String>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client,
             messages_base: messages_base.into(),
@@ -138,6 +141,7 @@ mod tests {
 
     fn ctx(topic: &str, payload: serde_json::Value) -> InvocationContext {
         InvocationContext {
+            event_timestamp: None,
             rule_name: "expire-notices-on-step-ended".into(),
             triggering_event_id: "evt-1".into(),
             triggering_topic: topic.into(),
@@ -149,7 +153,7 @@ mod tests {
     #[tokio::test]
     async fn a_step_event_retires_that_steps_notices() {
         let (base, captured) = mock_messages().await;
-        let h = MessagesExpireNotices::with_client(reqwest::Client::new(), base);
+        let h = MessagesExpireNotices::with_client(crate::handlers::common::api_client(), base);
         h.invoke(
             &[],
             &ctx(
@@ -171,7 +175,7 @@ mod tests {
     #[tokio::test]
     async fn a_job_closed_event_retires_every_notice_under_the_job() {
         let (base, captured) = mock_messages().await;
-        let h = MessagesExpireNotices::with_client(reqwest::Client::new(), base);
+        let h = MessagesExpireNotices::with_client(crate::handlers::common::api_client(), base);
         h.invoke(
             &[],
             &ctx(
@@ -188,7 +192,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_payload_naming_nothing_is_permanent() {
-        let h = MessagesExpireNotices::with_client(reqwest::Client::new(), "http://127.0.0.1:1");
+        let h = MessagesExpireNotices::with_client(
+            crate::handlers::common::api_client(),
+            "http://127.0.0.1:1",
+        );
         let err = h
             .invoke(&[], &ctx("jobs.step.updated", serde_json::json!({})))
             .await

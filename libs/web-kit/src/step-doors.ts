@@ -1,0 +1,279 @@
+// The step doors: the one file in the web that builds a step's own URL
+// (backlog e39a9d2a, design 93d2bddb — Stage 2, car 2).
+//
+// Moved here from apps/web/src/steps/stepWrite.ts, which re-exports all
+// of it, so the chrome in this kit (FeedbackControl's auto-triage) writes
+// a step through the same door the step surfaces do rather than a copy.
+// `a-step-put-carries-no-metadata.test.ts` in apps/web pins it: no other
+// file under apps/web/src or libs/web-kit/src may spell a step's URL.
+//
+// Two rules live here and nowhere else:
+//   * metadata goes to the step MERGE door (`PATCH …/steps/{id}/metadata`),
+//     which changes only the keys it is sent, against the row as it
+//     stands — never to the step PUT, which replaces metadata wholesale
+//     and so drops whatever was written since the page read the step;
+//   * every write comes back as a discriminated result the caller must
+//     branch on (packet cc9d7fc6), retried across a deploy roll only
+//     where resending is safe (packet 04cc82ab).
+
+/// `presenceRequired` is set only on a 422 whose body says
+/// `required: "presence"` — the one refusal a surface answers with a
+/// passkey tap rather than showing (backlog 3ce3c15f). A 422 is also a
+/// malformed body, so the status alone cannot say which it was.
+export type StepWriteResult =
+  | { kind: 'ok'; response: Response }
+  | { kind: 'failed'; error: string; presenceRequired?: true };
+
+function refusedForPresence(status: number, bodyText: string): boolean {
+  if (status !== 422) return false;
+  try {
+    const parsed: unknown = JSON.parse(bodyText);
+    return (
+      !!parsed &&
+      typeof parsed === 'object' &&
+      (parsed as Record<string, unknown>)['required'] === 'presence'
+    );
+  } catch {
+    return false;
+  }
+}
+
+const MAX_BODY_CHARS = 200;
+
+/// One human-readable line for a refused write. Prefers the server's
+/// own words: the `{error|message|detail}` JSON fields the BOSS APIs
+/// use, and the 409 sign-off conflict shape (`missing_or_stale_roles`)
+/// gets the same wording ApprovalSurface always rendered for it.
+export function describeWriteFailure(status: number, bodyText: string): string {
+  const clip = (s: string): string =>
+    s.length > MAX_BODY_CHARS ? `${s.slice(0, MAX_BODY_CHARS)}…` : s;
+  try {
+    const parsed: unknown = JSON.parse(bodyText);
+    if (typeof parsed === 'string' && parsed.trim()) {
+      return `HTTP ${status} — ${clip(parsed.trim())}`;
+    }
+    if (parsed && typeof parsed === 'object') {
+      const rec = parsed as Record<string, unknown>;
+      const roles = rec['missing_or_stale_roles'];
+      if (Array.isArray(roles) && roles.length > 0) {
+        return `sign-offs outstanding: ${roles.join(', ')}`;
+      }
+      for (const key of ['error', 'message', 'detail']) {
+        const v = rec[key];
+        if (typeof v === 'string' && v.trim()) {
+          return `HTTP ${status} — ${clip(v.trim())}`;
+        }
+      }
+    }
+  } catch {
+    // Not JSON — fall through to plain text.
+  }
+  const text = bodyText.trim();
+  return text ? `HTTP ${status} — ${clip(text)}` : `HTTP ${status}`;
+}
+
+/// The bounded retry that rides out a deploy roll (packet 04cc82ab).
+///
+/// A scheduled Recreate roll of the SoR pod leaves a seconds-long
+/// window where a write gets a refused connection or a 5xx from a pod
+/// that is seconds old. `boss` the CLI already survives this — a
+/// reconcile that hit `Connection refused` mid-converge used to fail
+/// the whole verb until a bounded retry was added (train.rs
+/// `retryable`/`JOBS_API_RETRY`). The web had no such tolerance, so a
+/// completed design review submitted DURING a roll surfaced an error
+/// and the operator's typed resolutions were lost. This is that same
+/// tolerance on the web write path, deliberately the SAME budget: a
+/// pod roll is over inside 3 attempts at 2s then 4s, and a SoR still
+/// refusing after it is an outage to surface, not to paper over.
+type RetryPolicy = { attempts: number; baseMs: number };
+export const WRITE_RETRY: RetryPolicy = { attempts: 3, baseMs: 2000 };
+
+const realSleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+/// Options only the tests set — a no-wait sleep so the retry semantics
+/// are pinned without spending the backoff, mirroring the CLI's
+/// `no_wait` test policy.
+export type WriteOpts = {
+  policy?: RetryPolicy;
+  sleep?: (ms: number) => Promise<void>;
+  /// Resend through an ambiguous failure even though the METHOD is not
+  /// on the idempotent list. Set only by a caller that knows its call
+  /// is: [`saveStep`]'s merge PATCH sets the same keys to the same
+  /// values however many times it lands.
+  idempotent?: boolean;
+};
+
+/// Whether a method may be resent after an AMBIGUOUS failure — one
+/// where the request may already have been applied. The same list the
+/// CLI draws (train.rs): re-sending an ambiguous POST is how one blip
+/// becomes two creates, so only idempotent methods retry through it.
+function isIdempotent(method: string | undefined): boolean {
+  switch ((method ?? 'GET').toUpperCase()) {
+    case 'GET':
+    case 'PUT':
+    case 'DELETE':
+    case 'HEAD':
+      return true;
+    default:
+      return false;
+  }
+}
+
+/// fetch that can only come back as a StepWriteResult: non-ok statuses
+/// and thrown network errors both land in `failed` with a message fit
+/// for inline rendering. It cannot be ignored by accident — the caller
+/// has to branch to get anything out of it. Transient failures during
+/// a deploy roll are retried, bounded, per [`WRITE_RETRY`].
+export async function writeStep(
+  url: string,
+  init: RequestInit,
+  opts?: WriteOpts,
+): Promise<StepWriteResult> {
+  const policy = opts?.policy ?? WRITE_RETRY;
+  const sleep = opts?.sleep ?? realSleep;
+  const idempotent = opts?.idempotent ?? isIdempotent(init.method);
+
+  for (let attempt = 1; ; attempt += 1) {
+    let result: StepWriteResult;
+    let retriable: boolean;
+    try {
+      const response = await fetch(url, init);
+      if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        const error = describeWriteFailure(response.status, text);
+        result = refusedForPresence(response.status, text)
+          ? { kind: 'failed', error, presenceRequired: true }
+          : { kind: 'failed', error };
+        // A 4xx is an ANSWER and is never retried. Nor is a 500: the app
+        // RAN and returned an error (`db down`, `registry unavailable`),
+        // which the operator must see now, not after a backoff. A deploy
+        // roll instead takes the pod out from under the GATEWAY, which
+        // answers 502/503/504 (a refused connection is handled in the
+        // catch) — those are the blips, and only an idempotent call may
+        // be re-sent through one. This is where the web policy diverges
+        // from the CLI's blanket-5xx (train.rs `retryable`): the CLI
+        // talks straight to the jobs API, the browser talks through the
+        // gateway, so the roll looks different on the wire.
+        retriable = idempotent && [502, 503, 504].includes(response.status);
+      } else {
+        return { kind: 'ok', response };
+      }
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      result = { kind: 'failed', error: `network error — ${detail}` };
+      // A browser fetch rejection is opaque: it cannot distinguish
+      // "refused, nothing sent" (safe to resend) from "sent, no reply"
+      // (ambiguous). Treat it as ambiguous — resend only when the call
+      // is idempotent, so a roll never turns one POST into two creates.
+      retriable = idempotent;
+    }
+    if (retriable && attempt < policy.attempts) {
+      await sleep(policy.baseMs * 2 ** (attempt - 1));
+      continue;
+    }
+    return result;
+  }
+}
+
+/// The step's merge door: `PATCH …/steps/{id}/metadata`. Top-level keys
+/// are merged into the row as it stands; a key sent as `null` is deleted.
+/// Idempotent, so it is resent through a deploy roll like the PUT.
+export function mergeStepMetadata(
+  jobId: string,
+  stepId: string,
+  patch: Readonly<Record<string, unknown>>,
+  opts?: WriteOpts,
+): Promise<StepWriteResult> {
+  return writeStep(
+    `/api/jobs/${jobId}/steps/${stepId}/metadata`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    },
+    { ...opts, idempotent: true },
+  );
+}
+
+/// A step write that carries METADATA, through the two doors (backlog
+/// e39a9d2a): the metadata keys through the step merge door
+/// ([`mergeStepMetadata`]), then everything else — status, notes,
+/// assignee — through the step PUT, which then carries no metadata.
+///
+/// WHY NOT ONE PUT. The step PUT replaces `metadata` wholesale. The
+/// surfaces built it as `{...step.metadata, key: x || undefined}`, and
+/// JSON drops an undefined key, so emptying a field cleared it BY
+/// OMISSION — and anything written to the step since the surface read
+/// it (a claim, a hook's stamp) was dropped the same way, silently. The
+/// merge door changes only the keys it is sent, in one transaction
+/// against the row as it stands. So: send only the keys the surface
+/// owns, never a spread of the step's metadata; an emptied field goes
+/// as an explicit `null`, which the door deletes.
+///
+/// Merge FIRST: the step's required-at-done fields are validated when
+/// it flips to completed, so they must already be there. A refused
+/// merge stops the chain — no status flips on top of a write the
+/// server rejected. An empty metadata object sends no merge, and a
+/// body with nothing but metadata sends no PUT.
+export async function saveStep(
+  jobId: string,
+  stepId: string,
+  body: Readonly<{ metadata?: Readonly<Record<string, unknown>> } & Record<string, unknown>>,
+  opts?: WriteOpts,
+): Promise<StepWriteResult> {
+  const { metadata, ...rest } = body;
+  const patch = Object.fromEntries(
+    Object.entries(metadata ?? {}).map(([k, v]) => [k, v === undefined ? null : v]),
+  );
+  let result: StepWriteResult | null = null;
+  if (Object.keys(patch).length > 0) {
+    result = await mergeStepMetadata(jobId, stepId, patch, opts);
+    if (result.kind === 'failed') return result;
+  }
+  if (result === null || Object.keys(rest).length > 0) {
+    return putStep(jobId, stepId, rest, undefined, opts);
+  }
+  return result;
+}
+
+/// A step PUT body: every top-level field but `metadata`, which the type
+/// refuses so a surface cannot compile one that sends it.
+export type StepPutBody = Readonly<Record<string, unknown>> & { readonly metadata?: never };
+
+/// The step PUT (PATCH semantics server-side) — status, notes, assignee.
+/// It carries NO metadata: a body with a `metadata` key is refused here,
+/// before anything is sent, naming [`saveStep`]. The type refuses it too;
+/// this is the half that holds for a body built as `unknown` or cast.
+///
+/// `presenceTicket` is the ticket a passkey ceremony on THIS step just
+/// issued, handed over by the surface that ran it (backlog b568044a,
+/// 2026-09-25). The jobs API judges a presence-gated step again on the
+/// request that completes it, from that request's own header, so a
+/// completion sent bare after a presence stamp answered 422 and the step
+/// stayed ready. This function mints nothing and widens nothing: the
+/// gateway verifies the ticket and the jobs API re-checks its step,
+/// person, shape and expiry on this PUT exactly as on the stamp.
+export async function putStep(
+  jobId: string,
+  stepId: string,
+  body: StepPutBody,
+  presenceTicket?: string,
+  opts?: WriteOpts,
+): Promise<StepWriteResult> {
+  if (Object.prototype.hasOwnProperty.call(body, 'metadata')) {
+    return {
+      kind: 'failed',
+      error:
+        'a step PUT carries no metadata — write the keys through saveStep, which sends ' +
+        'them to the step merge door (PATCH …/steps/{id}/metadata) and the status alone to the PUT',
+    };
+  }
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (presenceTicket) headers['x-presence-ticket'] = presenceTicket;
+  return writeStep(
+    `/api/jobs/${jobId}/steps/${stepId}`,
+    { method: 'PUT', headers, body: JSON.stringify(body) },
+    opts,
+  );
+}

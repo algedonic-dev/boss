@@ -65,6 +65,7 @@ use steps::*;
 use terminal_report::*;
 use yard::*;
 
+pub use jobs::FAILED_VERB_KEYS;
 pub use moves::{MOVER_ACTOR, run_mover};
 pub use presence::PresenceKey;
 
@@ -285,6 +286,10 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
         )
         .route("/api/jobs/summary", get(jobs_summary::<R, B>))
         .route("/api/jobs/live", get(jobs_live::<R, B>))
+        // Per kind: packets ever, open by version, newest terminal —
+        // scoped to the caller, unlike the public window above
+        // (backlogs 112c0535, 5eacf6db; 9274e151).
+        .route("/api/jobs/kinds", get(jobs_kinds::<R, B>))
         .route("/api/jobs/sim-clock/pause", post(sim_clock_pause::<R, B>))
         .route("/api/jobs/sim-clock/resume", post(sim_clock_resume::<R, B>))
         .route(

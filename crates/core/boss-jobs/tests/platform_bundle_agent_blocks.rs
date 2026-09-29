@@ -124,6 +124,10 @@ fn the_steps_agents_execute_today_declare_their_agent_block() {
         "doc-flatten/fold builder $5.00 high",
         "doc-flatten/curate builder $3.00 medium",
         "doc-flatten/verify analyst $2.00 medium",
+        // The machine-filed conflict repair (design b35456ac, decision
+        // 3): a scoped resolve-and-regate car, not a design — the same
+        // setting as doc-flatten's `curate`.
+        "rerail-a-car/rerail builder $3.00 medium",
     ]
     .into_iter()
     .map(str::to_string)

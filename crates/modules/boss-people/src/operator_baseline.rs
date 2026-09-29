@@ -619,7 +619,7 @@ password_hash = "y"
 
     const FOUNDER_ROSTER: &str = r#"[{"id": "emp-david", "name": "David Auld",
   "email": "David@Algedonic.dev", "github_username": "dauld", "role": "founder",
-  "department": "operations", "skill_level": null, "hire_date": "2026-09-16",
+  "department": "executive", "skill_level": null, "hire_date": "2026-09-16",
   "location": "loc-algedonic-hq", "manager_id": null, "employment_type": "full-time",
   "status": "active", "skills": [], "certifications": [], "annual_salary_cents": 0}]"#;
 

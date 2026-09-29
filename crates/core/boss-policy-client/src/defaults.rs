@@ -69,6 +69,11 @@ pub fn shipped_resources() -> Vec<Resource> {
         // audit-readonly gets Read from the loops below; tenants grant
         // it to their finance roles.
         Resource::ledger(),
+        // The estate registry and its readings (backlog e5f7b51e).
+        // Shipped, so the deploy superuser (David's session) and every
+        // machine reader (audit-readonly) read it; break-glass is
+        // granted it below, by name.
+        Resource::estate(),
     ]
 }
 
@@ -146,6 +151,72 @@ pub fn default_rules() -> Vec<Rule> {
         ));
     }
 
+    // The SubjectKind registry's metadata door (backlog abc2e9d5,
+    // 2026-09-28): PATCH /api/subject-kinds/{kind}/metadata is Update on
+    // `subject-kind`. The vocabulary every Subject is typed by is the
+    // operating model's machinery, so it is the deploy superuser's. Not
+    // shipped, so the read-only roles inherit none of it.
+    rules.push(Rule::new(
+        "platform-admin",
+        Resource::subject_kind(),
+        Update,
+        Scope::All,
+    ));
+
+    // The Class registry's write doors (backlog 553cf479, 2026-09-28):
+    // declare (Create, POST /api/classes/batch), edit (Update, PUT), and
+    // withdraw (Retire). Roles, account types and asset models are the
+    // vocabulary every write validates against, so by default they are
+    // the deploy superuser's — which is also what every seed path and
+    // `boss tenant publish` sign as. A tenant grants its taxonomy editors
+    // as policy rows. Not shipped, so the read-only roles inherit none.
+    for action in [Create, Update, Retire] {
+        rules.push(Rule::new(
+            "platform-admin",
+            Resource::class(),
+            action,
+            Scope::All,
+        ));
+    }
+
+    // Four more registries' write doors (backlog 59deda40, 2026-09-28),
+    // which checked the Operator tier alone until then: declaring a
+    // Location, a business calendar (Create; `?mode=take` overwriting a
+    // held one is Update), a GL account, or the tax regime. Each is the
+    // operating model's reference data — the deploy superuser's, which is
+    // what `boss tenant publish` and a tenant engine's prepare sign as. Not
+    // shipped, so the read-only roles inherit none.
+    for (resource, actions) in [
+        (Resource::location(), &[Create][..]),
+        (Resource::business_calendar(), &[Create, Update][..]),
+        (Resource::ledger_account(), &[Create][..]),
+        (Resource::tax_regime(), &[Create][..]),
+    ] {
+        for action in actions {
+            rules.push(Rule::new(
+                "platform-admin",
+                resource.clone(),
+                *action,
+                Scope::All,
+            ));
+        }
+    }
+
+    // The posting-rule registry (backlog 432f0eb4, 2026-09-28): publishing
+    // a posting or projection rule is Create on `posting-rule`. It rode
+    // `ledger` Create until then — the grant a tenant gives its finance
+    // leads to post entries — and the newest rule version is the one
+    // every later fact posts by, so a finance lead could redirect the
+    // automated postings without writing an entry. The deploy
+    // superuser's, which is what `boss tenant publish` signs as. Not
+    // shipped, so the read-only roles inherit none.
+    rules.push(Rule::new(
+        "platform-admin",
+        Resource::posting_rule(),
+        Create,
+        Scope::All,
+    ));
+
     // Pay (backlog c7484d0e, 2026-09-23). Not a shipped resource, so
     // none of the read-only roles below inherit it — the auditor role
     // is also what an anonymous visitor carries. The deploy superuser
@@ -183,6 +254,25 @@ pub fn default_rules() -> Vec<Rule> {
         rules.push(Rule::new(
             "platform-admin",
             Resource::schedule(),
+            action,
+            Scope::All,
+        ));
+    }
+
+    // Accounting periods (backlog 25a4f7f9, 2026-09-28): closing a month
+    // (`POST /api/ledger/periods/{id}/lock`) is Close, reopening one
+    // (`/unlock`) is Update. Both doors asked for nothing past the
+    // `ledger` READ grant until then. The deploy superuser holds both so
+    // the doors are not dead on an install that has written no finance
+    // grants; tenants grant their controllers in their own seed. Not
+    // shipped, so the read-only roles — the auditor's among them —
+    // inherit neither. Creating a fiscal year (`POST /api/ledger/periods`)
+    // is Create on the same resource (backlog 34f0a954), so one grant
+    // covers a year's whole life.
+    for action in [Create, Close, Update] {
+        rules.push(Rule::new(
+            "platform-admin",
+            Resource::ledger_period(),
             action,
             Scope::All,
         ));
@@ -281,9 +371,12 @@ pub fn default_rules() -> Vec<Rule> {
     // Reads are the working set for those three verbs and nothing
     // more: job/step (the packets being driven), workflow (what the
     // packets instantiate), event (the audit trail during an
-    // incident), policy-rule (what auth administration edits). No
-    // ledger, no accounts, no employees — an emergency key is a door
-    // key, not a data key.
+    // incident), policy-rule (what auth administration edits), estate
+    // (which machines are declared and what the loop last saw of them —
+    // the map a recovery works from; it was guest-readable until backlog
+    // e5f7b51e made it ask, and DR rule 62dac114 allows no new refusal
+    // on this path). No ledger, no accounts, no employees, no `subject`
+    // — an emergency key is a door key, not a data key.
     // ------------------------------------------------------------------
     for r in [
         Resource::job(),
@@ -291,6 +384,7 @@ pub fn default_rules() -> Vec<Rule> {
         Resource::workflow(),
         Resource::event(),
         Resource::policy_rule(),
+        Resource::estate(),
     ] {
         rules.push(Rule::new("break-glass", r, Read, Scope::All));
     }
@@ -436,6 +530,67 @@ mod tests {
         }
     }
 
+    /// Writing the books (backlog 34f0a954, 2026-09-28): every ledger
+    /// write door asks Create (a door that adds a row) or Update (one
+    /// that changes a row) on `ledger`. Until then they asked nothing past
+    /// the `ledger` READ grant, which `smoke-tester` holds by these
+    /// defaults — so its sessions wrote the ledger. An equality pin, for
+    /// the dispatcher-rule reason: a second writer sneaking in here is a
+    /// widening, and a tenant grants its finance leads in its own seed.
+    /// The read holders are pinned too, because `ledger` ships and every
+    /// read-only role inherits Read from `shipped_resources`.
+    #[test]
+    fn only_platform_admin_writes_the_ledger_by_default() {
+        let holders = |action: Action| -> Vec<(String, Scope)> {
+            let mut got: Vec<_> = default_rules()
+                .into_iter()
+                .filter(|r| r.resource == Resource::ledger() && r.action == action)
+                .map(|r| (r.role, r.scope))
+                .collect();
+            got.sort_by(|a, b| a.0.cmp(&b.0));
+            got
+        };
+        let admin = vec![("platform-admin".to_string(), Scope::All)];
+        assert_eq!(holders(Action::Create), admin, "ledger create");
+        assert_eq!(holders(Action::Update), admin, "ledger update");
+        assert_eq!(
+            holders(Action::Read),
+            vec![
+                ("audit-readonly".to_string(), Scope::All),
+                ("platform-admin".to_string(), Scope::All),
+                ("smoke-tester".to_string(), Scope::All),
+            ],
+            "ledger read"
+        );
+    }
+
+    /// Who reads the estate by default (backlog e5f7b51e; DR rule
+    /// 62dac114). An equality pin: the deploy superuser (David's
+    /// session), the machine readers' role and its test mirror, and the
+    /// break-glass session — whose hardware-key recovery reads the
+    /// machines — and nobody else. The landing guest and the basic
+    /// visitor are absent on purpose: the reads carry every host's LAN
+    /// address, roles and capacity.
+    #[test]
+    fn the_estate_is_read_by_the_operator_the_readers_and_break_glass() {
+        let mut got: Vec<(String, Scope)> = default_rules()
+            .into_iter()
+            .filter(|r| r.resource == Resource::estate() && r.action == Action::Read)
+            .map(|r| (r.role, r.scope))
+            .collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![
+                ("audit-readonly".to_string(), Scope::All),
+                ("break-glass".to_string(), Scope::All),
+                ("platform-admin".to_string(), Scope::All),
+                ("smoke-tester".to_string(), Scope::All),
+            ],
+            "estate read"
+        );
+    }
+
     /// Q4 (break-glass-is-a-key-you-hold): the emergency role's grant
     /// set is EXACTLY the three levers plus their working-set reads.
     /// This is an equality pin, not a floor — a new grant sneaking in
@@ -457,6 +612,8 @@ mod tests {
             "workflow:read".to_string(),
             "event:read".to_string(),
             "policy-rule:read".to_string(),
+            // the machines a recovery works from (e5f7b51e, DR 62dac114)
+            "estate:read".to_string(),
             // deploy rollback
             "job:create".to_string(),
             "job:update".to_string(),
@@ -588,6 +745,31 @@ mod tests {
         assert!(!shipped_resources().contains(&Resource::schedule()));
     }
 
+    /// Creating a fiscal year (backlog 34f0a954), closing and reopening an
+    /// accounting period (backlog 25a4f7f9) are the deploy superuser's
+    /// alone in core — an equality pin, because a second holder here is
+    /// a widening, and the finance roles that do this work are tenant
+    /// roles, granted in the tenant's own seed. Not shipped: the
+    /// read-only roles, the auditor's among them, must not inherit a
+    /// write.
+    #[test]
+    fn only_platform_admin_closes_and_reopens_periods_by_default() {
+        let holders: Vec<_> = default_rules()
+            .into_iter()
+            .filter(|r| r.resource == Resource::ledger_period())
+            .map(|r| (r.role, r.action, r.scope))
+            .collect();
+        assert_eq!(
+            holders,
+            vec![
+                ("platform-admin".to_string(), Action::Create, Scope::All),
+                ("platform-admin".to_string(), Action::Close, Scope::All),
+                ("platform-admin".to_string(), Action::Update, Scope::All),
+            ]
+        );
+        assert!(!shipped_resources().contains(&Resource::ledger_period()));
+    }
+
     /// The dispatcher's rule registry is written by the deploy superuser
     /// alone (backlog 847af5c7): an equality pin, because a rule drives
     /// side effects and a second holder sneaking in here is exactly the
@@ -609,5 +791,101 @@ mod tests {
             ]
         );
         assert!(!shipped_resources().contains(&Resource::dispatcher_rule()));
+    }
+
+    /// The SubjectKind registry's metadata door (backlog abc2e9d5) is
+    /// the deploy superuser's alone by default — an equality pin for the
+    /// dispatcher-rule reason: the vocabulary every Subject is typed by
+    /// is the operating model's machinery, and a second holder here is a
+    /// widening. Not shipped, so no read-only role inherits it (reads of
+    /// the registry ask no one).
+    #[test]
+    fn only_platform_admin_updates_subject_kinds_by_default() {
+        let holders: Vec<_> = default_rules()
+            .into_iter()
+            .filter(|r| r.resource == Resource::subject_kind())
+            .map(|r| (r.role, r.action, r.scope))
+            .collect();
+        assert_eq!(
+            holders,
+            vec![("platform-admin".to_string(), Action::Update, Scope::All)]
+        );
+        assert!(!shipped_resources().contains(&Resource::subject_kind()));
+    }
+
+    /// The Class registry's three write doors (backlog 553cf479) are the
+    /// deploy superuser's alone by default — an equality pin for the
+    /// dispatcher-rule reason: roles, account types and asset models are
+    /// the vocabulary every write validates against, and a second holder
+    /// here is a widening. A tenant grants its own taxonomy editors as
+    /// policy rows. Not shipped, so no read-only role inherits it.
+    #[test]
+    fn only_platform_admin_writes_classes_by_default() {
+        let holders: Vec<_> = default_rules()
+            .into_iter()
+            .filter(|r| r.resource == Resource::class())
+            .map(|r| (r.role, r.action, r.scope))
+            .collect();
+        assert_eq!(
+            holders,
+            vec![
+                ("platform-admin".to_string(), Action::Create, Scope::All),
+                ("platform-admin".to_string(), Action::Update, Scope::All),
+                ("platform-admin".to_string(), Action::Retire, Scope::All),
+            ]
+        );
+        assert!(!shipped_resources().contains(&Resource::class()));
+    }
+
+    /// The four registries whose write doors checked the Operator tier
+    /// alone until backlog 59deda40 — locations, business calendars, the
+    /// chart of accounts and the tax regime — are the deploy superuser's
+    /// alone by default: an equality pin per resource, for the
+    /// dispatcher-rule reason (a second holder is a widening), and none
+    /// shipped, so no read-only role inherits a write. A tenant grants
+    /// its own editors as policy rows.
+    #[test]
+    fn only_platform_admin_writes_the_four_seed_registries_by_default() {
+        let admin = |a: Action| ("platform-admin".to_string(), a, Scope::All);
+        for (resource, want) in [
+            (Resource::location(), vec![admin(Action::Create)]),
+            (
+                Resource::business_calendar(),
+                vec![admin(Action::Create), admin(Action::Update)],
+            ),
+            (Resource::ledger_account(), vec![admin(Action::Create)]),
+            (Resource::tax_regime(), vec![admin(Action::Create)]),
+        ] {
+            let holders: Vec<_> = default_rules()
+                .into_iter()
+                .filter(|r| r.resource == resource)
+                .map(|r| (r.role, r.action, r.scope))
+                .collect();
+            assert_eq!(holders, want, "{resource}");
+            assert!(!shipped_resources().contains(&resource), "{resource}");
+        }
+    }
+
+    /// The posting-rule registry — `gl_posting_rules` and
+    /// `gl_fact_projection_rules`, the two batch doors `boss tenant
+    /// publish` lands a tenant's rule files through — is the deploy
+    /// superuser's alone by default (backlog 432f0eb4): an equality pin
+    /// for the dispatcher-rule reason. The posting path takes the NEWEST
+    /// version of a fact kind's rule, so a second holder here could
+    /// publish version N+1 and redirect every later automated posting
+    /// without writing one journal entry. Not shipped, so no read-only
+    /// role inherits it.
+    #[test]
+    fn only_platform_admin_publishes_posting_rules_by_default() {
+        let holders: Vec<_> = default_rules()
+            .into_iter()
+            .filter(|r| r.resource == Resource::posting_rule())
+            .map(|r| (r.role, r.action, r.scope))
+            .collect();
+        assert_eq!(
+            holders,
+            vec![("platform-admin".to_string(), Action::Create, Scope::All)]
+        );
+        assert!(!shipped_resources().contains(&Resource::posting_rule()));
     }
 }

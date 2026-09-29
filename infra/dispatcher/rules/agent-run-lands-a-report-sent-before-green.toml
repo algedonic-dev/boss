@@ -1,0 +1,62 @@
+# A builder's report sent before its gate is green lands on the green
+# (backlog b951c00a, 2026-09-28).
+#
+# THE ORDER THE PIPELINE ACTUALLY RUNS IN. Builders run `boss dispatch
+# <run> --report` at handback, and the harness backgrounds `boss gate
+# --wait` at ten minutes, so the report usually arrives BEFORE the
+# verdict. `--report` writes it onto the run packet at once
+# (`metadata.report`, with `spend_usd` and `tokens`), then completes
+# `reported` only if that step is open — and it is not, because
+# `reported` opens only when `building` closes `gated` or `delivered`.
+# So the handback was on the record and the step the run lands on was
+# never completed by anything.
+#
+# MEASURED, NOT INFERRED. On 2026-09-28 the shop floor read TROUBLED at
+# "7 runs finished and not reported — each holds a slot" and dispatch
+# refused at the 12-run cap. Six runs were re-reported by hand, each 32
+# to 113 minutes after its green (20be3787, 6f247773, 3376d04f,
+# 11de920c, 03a5527d, 8a228dce), and run e737a54f — its report on the
+# packet the whole time — was aged out at 19:00Z by
+# `agent-run-ends-unreported-when-the-handback-never-arrives` as
+# `handback = absent`, a false record. The median gap from `building`
+# to `reported` across the day's other runs was under a minute.
+#
+# WHAT IT WRITES, AND THE INVARIANT IT KEEPS. When `reported` goes
+# ready, `jobs.complete_step_from_record` reads the run packet; if it
+# holds `report`, the step is completed with the agent's OWN words as
+# `summary`, `spend_usd` and `tokens` copied as the step's text fields
+# (exactly as `boss dispatch --report` writes them), `handback =
+# recorded`, and a `from_record` object naming this rule and the event.
+# "No rule ever writes the report, because a summary the machine
+# invents is not the agent's" still holds: nothing here authors a word.
+# A packet with no report is left alone — the step waits for a hand, and
+# the clock's `unreported` ending stays true of it. Every key fills
+# absent ones only, so a hand that completed the step first keeps its
+# record, and a completed step is not open, so a redelivery writes
+# nothing.
+#
+# WHAT IT DOES NOT DO. It records no `agent_runs` row. The finish record
+# is insert-once and needs the run's outcome, so a pre-green `--report`
+# writes none (dispatch.rs `run_outcome`); this rule makes the run LAND,
+# and a `--report` made after the terminal still writes the cost row.
+[[rule]]
+name = "agent-run-lands-a-report-sent-before-green"
+why = """
+A CROSS-PROTOCOL REACTOR, the last hop of one: a `gate-run`'s green
+(or an analyst's completed step) completes the run's `building`
+through the two landing rules, which opens `reported`; this
+completes `reported` from the
+handback the builder already put on the packet. The Workflow row can
+require a summary at done; it cannot copy a value from its packet's
+metadata onto a step, and its `ready_when` cannot complete anything.
+Measured 2026-09-28 (backlog b951c00a): six runs re-reported by hand
+after their green and one recorded `unreported` with its report on the
+packet — each holding a slot against the cap while its record said
+nothing was owed.
+"""
+version = 1
+on_event = "step.ready.task"
+when = 'workflow_kind = "agent-run" AND spec_slug = "reported"'
+[[rule.do]]
+handler = "jobs.complete_step_from_record"
+args = { kind = "\"agent-run\"", step = "\"reported\"", requires = "\"report\"", record = '"{\"summary\": \"report\", \"spend_usd\": \"spend_usd\", \"tokens\": \"tokens\"}"', done_metadata = '"{\"handback\": \"recorded\"}"' }

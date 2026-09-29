@@ -136,7 +136,7 @@ pub async fn run(branch: &str, clone: Option<String>, remote: Option<String>) ->
     // Going through gate.rs's client also inherits the rule that
     // BOSS_JOBS_URL has no default: a wrong instance does not error
     // here, it answers, which is worse.
-    let http = reqwest::Client::new();
+    let http = crate::gate::machine_client()?;
     // Read EVERY open car, not just page one. A limit is not a filter
     // (a-limit-is-not-a-filter): with more than a page of open cars, the
     // one we want can sit past the cap, and reading only page one called

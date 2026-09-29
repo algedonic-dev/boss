@@ -22,9 +22,12 @@ append-only history); what changed is that
 `infra/lint/migrations-declare-schema-only.sh` refuses `INSERT INTO
 delivery_policy` in any migration newer than its cutover stamp, and
 `the_delivery_policy_bundle_is_the_migrations_pg.rs` holds this
-directory equal, column for column, to the active row those migrations
-produce — and proves the seed can rebuild an emptied table from this
-directory alone.
+directory at or AHEAD of the active row those migrations produce —
+column for column where the versions match — and proves the seed can
+rebuild an emptied table from this directory alone. It leads them since
+2026-09-28: `train-conductor` v3 (gate_max_concurrent 4, backlog
+366c2ed5) is declared here and nowhere else, the edit path this move
+created.
 
 **One row is the whole policy** — the `workflows` shape, not the
 `cadence_rules` shape. A Job pins one workflow version; a train pins

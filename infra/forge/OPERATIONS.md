@@ -147,19 +147,20 @@ No ssh from the pod. Three doors, all read-only:
   `/etc/boss-publish/github.token`, credentials registry
   `dauld-github-token`, and refuses loudly without it; `--check`
   validates its inputs with no network), `read-publish-checks` (the
-  second machine step of publish-to-github v7: waits for the mirror
-  PR's code-scanning check-runs (CodeQL and its Analyze jobs, backlog
-  d167e7d7) and then completes the step only once EVERY check has
-  completed — a check still running, the mirror's own gate among them,
-  is `not yet` (exit 75, the runner not held), re-read every fifteen minutes by
+  second machine step of publish-to-github v7: takes ONE reading of the
+  mirror PR's check-runs per run and never waits (backlog b81ff4ca), and
+  completes the step only once EVERY check has completed — a check
+  still running, the scan (CodeQL and its Analyze jobs, backlog
+  d167e7d7) or the mirror's own gate, is `not yet` (exit 75, the runner not held), re-read every fifteen minutes by
   `reread-publish-pr-every-15-minutes`, `unfinished` four hours after the PR
   opened, and a failing one makes the reading red and is named, backlog
   c6cb678b) over the PUBLIC API — no token —
   reads the CodeQL
   annotations and writes the reading onto the publish packet as
   `code_scanning`, so the `judge-checks` step and David's merge follow a
-  judged reading instead of a red badge; the wait blocks this runner
-  for up to 25 minutes once per publish, stated in the script header;
+  judged reading instead of a red badge; it held this serial runner
+  786 s on 2026-09-28 while it still waited in-verb, so its timeout is
+  now 120 s, one reading;
   `--check` validates with no network), and `run-car-probe <car-uuid>`
   (the machine half of `boss prove`: runs the probe a landed car
   recorded at park time — `boss gate --park-probe/--park-expect` — as
@@ -408,8 +409,12 @@ things went wrong at once, and each now has its own guard:
   packet step (`boss-maintenance-wrap.sh` as ExecStartPre) failed on the
   unreachable API and systemd never started it — the loop that would
   have restored the system of record was waiting on it. Now the wrap
-  exits 0 with a loud UNREACHABLE line; the work runs, one run's
-  visibility is lost.
+  exits 0 with a loud UNRECORDED RUN line; the work runs, one run's
+  visibility is lost. Since 2026-09-27 (backlog 9fd7f51e) the same holds
+  for an API that ANSWERS badly — a 503 from a policy outage stopped the
+  converge until then — every unit's wrap line carries `-`, and each
+  miss is kept in `~/.boss-maintenance-unrecorded/` and replayed onto
+  the kind's next packet as `unrecorded_runs`.
 
 The lever, by name, if it is ever needed by hand again:
 `rollback-to <sha>` as an ops verb, or on this host
@@ -433,6 +438,25 @@ either `cluster ok: api answers on <sha>, deployment serves <sha>, last
 converged <sha>` or why not; `hands needed` means the converged build
 itself is dark. Read it over the journal gateway when the API is down —
 that is the point of it.
+
+Its kubectl runs in the forge registry's mirror of alpine/k8s
+(`ops_image` in `infra/estate/ops-credentials.sh`), kept on the system
+daemon by a stopped container, `boss-ops-image-pin`, so the disk sweep's
+`image prune -af` cannot take it; each tick records `ops_image` on its
+packet, and a pin it cannot make fails the run. If the image is gone AND
+the forge registry cannot serve it (Forgejo down), the watchdog is blind
+and says `hands needed — the watchdog cannot read the cluster`, and
+`rollback-to` is refused the same way. The hand fallback, on this host,
+is the upstream tag retagged as the mirror name:
+`sudo docker pull docker.io/alpine/k8s:1.33.3 && sudo docker tag
+docker.io/alpine/k8s:1.33.3 <forge_registry>/david/alpine-k8s:1.33.3`
+(`forge_registry` from `infra/estate/estate.toml`; the alert prints the
+command with it filled in). The next tick pins it again.
+
+`dark_count: UNWRITABLE … will NEVER roll` on the watchdog's packet, or
+`CANNOT COUNT, WILL NEVER ROLL` in its journal, means the count under
+`$HOME` could not be written — usually a full root volume — and the
+watchdog cannot reach its threshold until it can; free the disk first.
 
 ### 7. Landed but never installed
 

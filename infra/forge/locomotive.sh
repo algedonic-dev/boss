@@ -189,7 +189,12 @@ if [ "$fail" -ne 0 ] && [ -n "$refusal" ]; then
     body=$(printf '{"state":"failure","context":"CI / locomotive refusal","description":%s,"target_url":%s}' \
       "$(printf '%s' "$desc" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || printf '"%s"' "refused: see the locomotive log")" \
       "$(printf '"%s"' "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID:-}")")
-    if curl -fsS -o /dev/null -X POST -H "Authorization: token $FORGE_TOKEN" -H 'Content-Type: application/json' \
+    # The forge token rides to curl in a 0600 file, never in its argv,
+    # where every process on the runner reads it (backlog 5f3ad356).
+    # shellcheck source=infra/lib/secret-header.sh
+    if . "$(dirname "${BASH_SOURCE[0]}")/../lib/secret-header.sh" \
+       && secret_header FORGE_HDR "Authorization: token $FORGE_TOKEN" \
+       && curl -fsS -o /dev/null -X POST -H "$FORGE_HDR" -H 'Content-Type: application/json' \
          "$api/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -d "$body"; then
       say "locomotive: refusal posted as a commit status (context 'CI / locomotive refusal') — the conductor will spare the cars"
     else

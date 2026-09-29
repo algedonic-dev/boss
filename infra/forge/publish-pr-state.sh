@@ -43,11 +43,18 @@
 # is NAMED and left unread — the region then says "never read", not
 # "open". A write the jobs API refuses is a failure.
 #
-# Inputs: BASE (the jobs API), BOSS_USER, BOSS_MACHINE_TOKEN (optional),
+# Inputs: BASE (the jobs API), BOSS_USER, MT_HDR (the caller's
+# `secret_header MT_HDR …` of the optional BOSS_MACHINE_TOKEN — the token
+# rides to curl as a 0600 file, never in its argv, backlog 5f3ad356),
 # GITHUB_API, MIRROR_SLUG, workdir; and the caller's say / fail.
 
 publish_pr_states() {
     local read_by="$1" listed listed_total row pr_job pr_url pr_number head
+    # A caller that holds a token and made no header file would send the
+    # writes below unsigned; say so rather than be refused unexplained.
+    if [ -n "${BOSS_MACHINE_TOKEN:-}" ] && [ -z "${MT_HDR:-}" ]; then
+        fail "BOSS_MACHINE_TOKEN is set but the caller made no MT_HDR header file (infra/lib/secret-header.sh) — the pr-state writes would go out without it"
+    fi
     if ! curl -fsS -H "x-boss-user: $BOSS_USER" \
             "$BASE/api/jobs?kind=publish-to-github&limit=60&full=true" > "$workdir/prs-published" 2>"$workdir/prs-err"; then
         fail "jobs API unreachable at $BASE — $(cat "$workdir/prs-err")"
@@ -146,7 +153,7 @@ publish_pr_states() {
             continue
         fi
         if ! curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
-                ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+                ${MT_HDR:+-H "$MT_HDR"} \
                 --data-binary @"$workdir/prs-state" \
                 "$BASE/api/jobs/$pr_job/metadata" > /dev/null 2>"$workdir/prs-err"; then
             fail "annotating ${pr_job:0:8} with the state of $pr_url failed — $(head -c 300 "$workdir/prs-err" | tr '\n' ' ')"

@@ -45,8 +45,14 @@ impl InMemoryPolicy {
 #[async_trait]
 impl PolicyRepository for InMemoryPolicy {
     async fn list_rules(&self) -> Result<Vec<PolicyRule>, PolicyError> {
+        // Active rules only, as the port says and postgres answers
+        // (`WHERE active = TRUE`). Until the adapters-agree suite
+        // (backlog be459ab9) this answered retired rules too, so every
+        // listing read through this double — the coverage report, the
+        // /rules door's tests — measured grants production no longer
+        // lists.
         let state = self.inner.lock().expect("poisoned lock");
-        Ok(state.rules.values().cloned().collect())
+        Ok(state.rules.values().filter(|r| r.active).cloned().collect())
     }
 
     async fn rule_for(&self, id: &str) -> Result<Option<PolicyRule>, PolicyError> {
@@ -73,11 +79,22 @@ impl PolicyRepository for InMemoryPolicy {
         Ok(())
     }
 
-    async fn deactivate_rule(&self, id: &str, _changed_by: &str) -> Result<(), PolicyError> {
+    async fn deactivate_rule(&self, id: &str, changed_by: &str) -> Result<(), PolicyError> {
         let mut state = self.inner.lock().expect("poisoned lock");
         match state.rules.get_mut(id) {
             Some(r) => {
                 r.active = false;
+                // A retirement is an edit: postgres stamps `updated_by`
+                // with its author, so an operator's retirement of a
+                // bootstrap rule makes the row theirs and the next
+                // reconcile preserves it. This double kept the bootstrap
+                // mark, so its reconcile revived the retired grant
+                // (backlog be459ab9, found by the adapters-agree suite).
+                if changed_by == "bootstrap" {
+                    state.bootstrap_owned.insert(id.to_string());
+                } else {
+                    state.bootstrap_owned.remove(id);
+                }
                 Ok(())
             }
             None => Err(PolicyError::NotFound(id.to_string())),

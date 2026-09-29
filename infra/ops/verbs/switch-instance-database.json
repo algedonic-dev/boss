@@ -26,5 +26,6 @@
       "pattern": "^[a-z][a-z0-9_]{0,62}$"
     }
   ],
-  "timeout": 900
+  "timeout": 900,
+  "effect": "^switch-instance-database: (OK — Secret .+ now names .+ [(]read back[)]|DRY RUN — every bound passed: would snapshot )"
 }

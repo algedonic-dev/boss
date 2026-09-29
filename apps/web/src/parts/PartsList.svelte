@@ -19,8 +19,10 @@
     type PurchaseOrder,
     type StockStatus,
   } from './types';
-  import { partsHeader } from './stock-counts';
-  import { countLabel, readStateOfLoad } from '../data/readState';
+  import { partsHeader, unstockedSkus } from './stock-counts';
+  import { countLabel, emptyState, readStateOfLoad } from '../data/readState';
+  import { readRows } from '../data/shape';
+  import ListEmpty from '../data/ListEmpty.svelte';
   import { rowLink } from '@boss/web-kit/ui/RowLink';
   import { href, navigate } from '../router';
   import { getLabel } from '@boss/web-kit/session/manifest.svelte';
@@ -38,7 +40,12 @@
   const departmentName = $derived(departmentLabel(department, departments()));
 
   type RowKind = 'ingredient' | 'packaging' | 'spare' | 'consumable';
-  type Filter = 'all' | 'needs-attention' | RowKind | StockStatus;
+  // A catalogued part with no inventory row has no stock to judge, so
+  // it is not out, low or healthy: it is never stocked (backlog
+  // 4cb8c06a). It needs no attention by the reorder arithmetic — there
+  // is no reorder point — so it has its own button and sorts last.
+  type RowStatus = StockStatus | 'never-stocked';
+  type Filter = 'all' | 'needs-attention' | RowKind | RowStatus;
 
   let models = $state<DeviceModel[]>([]);
   let inventory = $state<InventoryItem[]>([]);
@@ -49,6 +56,20 @@
   // device-asset shape (collectParts) for tenants that DO use
   // satellite linkage.
   let catalogParts = $state<CatalogPart[]>([]);
+
+  const MODELS_URL = '/api/catalog/models';
+  const ITEMS_URL = '/api/inventory/items';
+  const CATALOG_PARTS_URL = '/api/catalog/parts';
+  const ORDERS_URL = '/api/inventory/orders';
+
+  /// A row-source failure names its read: three reads stand behind the
+  /// list, and "Failed to fetch" alone cannot say which (0ef5e008).
+  function namedAs(url: string): (e: unknown) => never {
+    return (e) => {
+      throw new Error(`${url}: ${e instanceof Error ? e.message : String(e)}`);
+    };
+  }
+  const fetchNamed = (url: string): Promise<Response> => fetch(url).catch(namedAs(url));
   /// Non-null when a row-source load failed — rendered instead of the
   /// empty state, so an outage never reads as "no parts" (packet
   /// 3fba9c35, the false-empty sweep).
@@ -67,25 +88,39 @@
     (async () => {
       try {
         const [mResp, iResp, pResp, cpResp] = await Promise.all([
-          fetch('/api/catalog/models'),
-          fetch('/api/inventory/items'),
-          fetch('/api/inventory/orders'),
-          fetch('/api/catalog/parts'),
+          fetchNamed(MODELS_URL),
+          fetchNamed(ITEMS_URL),
+          fetch(ORDERS_URL),
+          fetchNamed(CATALOG_PARTS_URL),
         ]);
         // The row sources (models, inventory, catalog parts) are the
-        // page's primary data — any of them failing fails the list.
+        // page's primary data — any of them failing fails the list, and
+        // the line names WHICH (backlog 0ef5e008: it said "HTTP 503" with
+        // three reads behind it). A 200 that is not a list shape fails it
+        // too: each was coerced to no rows, which read as no parts.
         // The PO list only feeds "on order" counts and degrades.
-        const primaryDown = [mResp, iResp, cpResp].find((r) => !r.ok);
-        const mBody = mResp.ok ? await mResp.json() : [];
-        const iBody = iResp.ok ? await iResp.json() : [];
+        const primary = [
+          [MODELS_URL, mResp],
+          [ITEMS_URL, iResp],
+          [CATALOG_PARTS_URL, cpResp],
+        ] as const;
+        const down = primary.find(([, r]) => !r.ok);
+        if (down) throw new Error(`${down[0]}: HTTP ${down[1].status}`);
+        const [mRows, iRows, cpRows] = await Promise.all(
+          primary.map(async ([url, r]) => readRows(url, await r.json().catch(namedAs(url)))),
+        );
         const pBody = pResp.ok ? await pResp.json() : [];
-        const cpBody = cpResp.ok ? await cpResp.json() : [];
+        // A refused PO read degrades to no "on order" counts (gap 4,
+        // 61c16b17); a 200 that is not a list shape is a contract break,
+        // not an outage, and fails the page by name like the three above
+        // (backlog b6b74115). `[]` from the refused arm reads as itself.
+        const pRows = readRows(ORDERS_URL, pBody);
         if (!cancelled) {
-          models = Array.isArray(mBody) ? mBody : (mBody.data ?? []);
-          inventory = Array.isArray(iBody) ? iBody : (iBody.data ?? []);
-          pos = Array.isArray(pBody) ? pBody : (pBody.data ?? []);
-          catalogParts = Array.isArray(cpBody) ? cpBody : (cpBody.data ?? []);
-          loadFailed = primaryDown ? `HTTP ${primaryDown.status}` : null;
+          models = mRows as DeviceModel[];
+          inventory = iRows as InventoryItem[];
+          pos = pRows as PurchaseOrder[];
+          catalogParts = cpRows as CatalogPart[];
+          loadFailed = null;
           loading = false;
         }
       } catch (e) {
@@ -118,32 +153,46 @@
   });
 
   type Row = {
-    item: InventoryItem;
+    sku: string;
+    /// Null for a catalogued part that was never stocked (4cb8c06a).
+    item: InventoryItem | null;
     name: string;
     description: string;
     kind: RowKind;
     used_by: number;
-    status: StockStatus;
+    status: RowStatus;
     on_order: number;
   };
 
+  // Every stocked part, then every catalogued part with no inventory
+  // row. Until backlog 4cb8c06a the rows were `inventory.map(...)`, so
+  // a part that exists and was never stocked never appeared while the
+  // title counted the rest as the page's parts.
   let rows = $derived<Row[]>(
-    inventory.map((item) => {
+    [
+      ...inventory.map((item) => ({ sku: item.part_sku, item })),
+      ...unstockedSkus(
+        inventory,
+        catalogParts.map((p) => p.part_sku),
+        parts.map((p) => p.sku),
+      ).map((sku) => ({ sku, item: null })),
+    ].map(({ sku, item }) => {
       // Prefer the device-catalog satellite linkage when it
       // exists (used-device-shop shape — gives the "used by N
       // models" count). Fall back to /api/catalog/parts when
       // the part isn't linked to a system_model (brewery
       // shape — ingredients + packaging).
-      const meta = parts.find((p) => p.sku === item.part_sku);
-      const flat = catalogPartBySku.get(item.part_sku);
+      const meta = parts.find((p) => p.sku === sku);
+      const flat = catalogPartBySku.get(sku);
       return {
+        sku,
         item,
-        name: meta?.part.name ?? flat?.name ?? item.part_sku,
+        name: meta?.part.name ?? flat?.name ?? sku,
         description: meta?.part.description ?? flat?.description ?? '',
-        kind: meta?.kind ?? kindFromSku(item.part_sku),
+        kind: meta?.kind ?? kindFromSku(sku),
         used_by: meta?.used_by.length ?? 0,
-        status: stockStatus(item),
-        on_order: onOrder.get(item.part_sku) ?? 0,
+        status: item ? stockStatus(item) : 'never-stocked',
+        on_order: onOrder.get(sku) ?? 0,
       };
     }),
   );
@@ -154,6 +203,7 @@
     critical: rows.filter((r) => r.status === 'critical').length,
     low: rows.filter((r) => r.status === 'low').length,
     healthy: rows.filter((r) => r.status === 'healthy').length,
+    never: rows.filter((r) => r.status === 'never-stocked').length,
     spare: rows.filter((r) => r.kind === 'spare').length,
     consumable: rows.filter((r) => r.kind === 'consumable').length,
     ingredient: rows.filter((r) => r.kind === 'ingredient').length,
@@ -177,7 +227,9 @@
 
   let visible = $derived(
     rows.filter((r) => {
-      if (filter === 'needs-attention' && r.status === 'healthy') return false;
+      if (filter === 'needs-attention' && (r.status === 'healthy' || r.status === 'never-stocked')) {
+        return false;
+      }
       if (
         (filter === 'spare' ||
           filter === 'consumable' ||
@@ -186,12 +238,16 @@
         r.kind !== filter
       ) return false;
       if (
-        (filter === 'out' || filter === 'critical' || filter === 'low' || filter === 'healthy') &&
+        (filter === 'out' ||
+          filter === 'critical' ||
+          filter === 'low' ||
+          filter === 'healthy' ||
+          filter === 'never-stocked') &&
         r.status !== filter
       ) return false;
       if (query) {
         const q = query.toLowerCase();
-        if (!`${r.item.part_sku} ${r.name} ${r.description}`.toLowerCase().includes(q)) {
+        if (!`${r.sku} ${r.name} ${r.description}`.toLowerCase().includes(q)) {
           return false;
         }
       }
@@ -199,8 +255,16 @@
     }),
   );
 
+  // Read failed, no parts, or the filters hid them — an empty inventory
+  // is not an over-narrow filter (backlogs 0ef5e008, bc38daa8).
+  let listState = $derived(
+    emptyState([{ source: 'the parts reads', state: read }], rows.length, visible.length),
+  );
+
   let sortedVisible = $derived.by(() => {
-    const rank: Record<StockStatus, number> = { out: 0, critical: 1, low: 2, healthy: 3 };
+    const rank: Record<RowStatus, number> = {
+      out: 0, critical: 1, low: 2, healthy: 3, 'never-stocked': 4,
+    };
     return [...visible].sort((a, b) => rank[a.status] - rank[b.status]);
   });
 </script>
@@ -237,6 +301,11 @@
           <FilterButton active={filter === 'healthy'} onclick={() => (filter = 'healthy')}>
             {countLabel('Healthy', read, counts.healthy)}
           </FilterButton>
+          {#if counts.never > 0}
+            <FilterButton active={filter === 'never-stocked'} onclick={() => (filter = 'never-stocked')}>
+              {countLabel('Never stocked', read, counts.never)}
+            </FilterButton>
+          {/if}
       </FilterGroup>
 
       <FilterGroup label="Kind">
@@ -264,14 +333,8 @@
     </aside>
 
     <section class="list-section">
-      {#if loading}
-        <p class="empty">Loading…</p>
-      {:else if loadFailed}
-        <p class="empty load-failed" role="alert">
-          Couldn't load parts — {loadFailed}
-        </p>
-      {:else if visible.length === 0}
-        <p class="empty">No parts match those filters.</p>
+      {#if listState.kind !== 'rows'}
+        <ListEmpty view={listState} words={{ what: 'parts', noun: 'parts' }} />
       {:else}
         <table class="data-table data-table-striped">
           <thead>
@@ -289,29 +352,36 @@
             </tr>
           </thead>
           <tbody>
-            {#each sortedVisible as r (r.item.part_sku)}
+            {#each sortedVisible as r (r.sku)}
               <tr
                 use:rowLink={{
-                  onActivate: () => navigate(entityHref('part', r.item.part_sku)),
-                  label: `${r.name} (${r.item.part_sku})`,
+                  onActivate: () => navigate(entityHref('part', r.sku)),
+                  label: `${r.name} (${r.sku})`,
                 }}
               >
                 <td class="mono">
-                  <Link to={entityHref('part', r.item.part_sku)}>
-                    {r.item.part_sku}
+                  <Link to={entityHref('part', r.sku)}>
+                    {r.sku}
                   </Link>
                 </td>
                 <td>{r.name}</td>
                 <td>{r.kind}</td>
-                <td class="num">{r.item.on_hand}</td>
-                <td class="num">{r.item.allocated}</td>
-                <td class="num">{r.item.reorder_point}</td>
+                <!-- A never-stocked part has no inventory row: "—", not a
+                     0 the record does not hold (4cb8c06a). -->
+                <td class="num">{r.item ? r.item.on_hand : '—'}</td>
+                <td class="num">{r.item ? r.item.allocated : '—'}</td>
+                <td class="num">{r.item ? r.item.reorder_point : '—'}</td>
                 <td class="num">{r.on_order > 0 ? r.on_order : '—'}</td>
-                <td><StatusChip value={r.status} tone={stockTone(r.status)} /></td>
-                <td class="num">
-                  {catalogSkuSet.has(r.item.part_sku) ? '—' : r.used_by}
+                <td>
+                  <StatusChip
+                    value={r.status}
+                    tone={r.status === 'never-stocked' ? 'muted' : stockTone(r.status)}
+                  />
                 </td>
-                <td class="mono">{r.item.bin}</td>
+                <td class="num">
+                  {catalogSkuSet.has(r.sku) ? '—' : r.used_by}
+                </td>
+                <td class="mono">{r.item ? r.item.bin : '—'}</td>
               </tr>
             {/each}
           </tbody>

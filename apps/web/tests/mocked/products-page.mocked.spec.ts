@@ -152,15 +152,15 @@ test.describe('/ux/products — State A, the parts module off (the live instance
       // `module`. The manifest has no `products` key.
       await expect(notice.locator('strong')).toHaveText('Products');
       await expect(notice).toContainText(
-        "The Products module is turned off in this tenant's tenant.toml. The page exists in the platform — the active tenant just doesn't surface it.",
+        "The Products module is turned off in this tenant's manifest. The page exists in the platform — the active tenant just doesn't surface it.",
       );
-      // fa838818: the one instruction names examples/<tenant>, and this
-      // instance's tenant is not in examples/.
+      // fa838818 (fixed): the instruction names the manifest by what it
+      // is, not an examples/<tenant> path this instance does not have.
       await expect(notice).toContainText(
-        'To enable: set parts = true in examples/<tenant>/seeds/tenant.toml under [modules], redeploy, and the page comes back.',
+        "To enable: set parts = true in the [modules] section of the tenant's manifest, redeploy, and the page comes back.",
       );
-      await expect(notice.locator('code').first()).toHaveText('tenant.toml');
-      await expect(notice.locator('code').nth(1)).toHaveText('parts = true');
+      await expect(notice.locator('code').first()).toHaveText('parts = true');
+      await expect(notice.locator('code').nth(1)).toHaveText('[modules]');
       await expect(notice.getByRole('button')).toHaveCount(1);
       await expect(notice.locator('a')).toHaveCount(0);
       await expect(notice.locator('input, form')).toHaveCount(0);
@@ -437,15 +437,31 @@ test.describe('/ux/products — State B: empty, loading, and a failed read', () 
     await expect(list(page).locator('table')).toHaveCount(0);
   });
 
-  // Gap 4 (35e95b89): a failed detail read — refused or thrown — is
-  // painted as "0" on hand, the paint of "no stock", with no marker.
-  test('a failed detail read is swallowed: that row reads Total on hand 0', async ({ page }) => {
+  // Gap 4 (35e95b89): a failed detail read — refused or thrown — was
+  // painted as "0" on hand, the paint of "no stock", with no marker. A
+  // stock figure the page could not read is now drawn as unknown, and
+  // the page says how many it could not read and why.
+  test('a failed detail read is said, never drawn as Total on hand 0', async ({ page }) => {
     await installProducts(page);
     await page.route(detailRoute('KEG-IPA-HALF'), (r) => json(r, { error: 'down' }, 503));
     await page.route(detailRoute('CAN-LAGER-6PK'), (r) => r.abort('failed'));
     await mountProducts(page);
 
-    await expect(list(page).locator('tbody tr td:nth-child(5)')).toHaveText(['0', '7', '0', '30']);
+    const onHand = list(page).locator('tbody tr td:nth-child(5)');
+    await expect(onHand).toHaveText(['—', '7', '—', '30']);
+    await expect(onHand.nth(0)).toHaveAttribute('title', "Couldn't read stock — Failed to fetch");
+    await expect(onHand.nth(2)).toHaveAttribute('title', "Couldn't read stock — HTTP 503");
+    const failed = page.locator(FAILURE_MARKER);
+    await expect(failed).toHaveText("Couldn't read stock for 2 of 4 products — their Total on hand shows —, not 0.");
+    await expect(failed).toHaveAttribute('role', 'alert');
+    // The rows the page could read still draw; one failure never blanks the table.
+    await expect(skuColumn(page)).toHaveText(SKUS);
+  });
+
+  test('every detail read answering draws no stock warning', async ({ page }) => {
+    await installProducts(page);
+    await mountProducts(page);
+    await expect(list(page).locator('tbody tr td:nth-child(5)')).toHaveText(['240', '7', '12', '30']);
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
     await expect(list(page).locator('[role=alert]')).toHaveCount(0);
   });

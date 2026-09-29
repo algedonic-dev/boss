@@ -5,6 +5,7 @@
 //! See `docs/design/projection-rebuilders.md`.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use boss_core::rebuild::resolve_database_url;
@@ -26,6 +27,10 @@ struct Cli {
     database_url: Option<String>,
     #[arg(short, long, default_value = "/etc/boss-shipping-api.toml")]
     config: PathBuf,
+    /// Seconds to wait, unlocked, for the event relay to drain before
+    /// the rebuild's locked log check decides (design b046f510).
+    #[arg(long, default_value_t = boss_events::outbox::DEFAULT_DRAIN_TIMEOUT_SECS)]
+    drain_timeout: u64,
 }
 
 #[tokio::main]
@@ -56,6 +61,9 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| "connecting to Postgres")?;
 
+    boss_events::outbox::wait_for_drain(&pool, Duration::from_secs(cli.drain_timeout))
+        .await
+        .map_err(anyhow::Error::msg)?;
     let report = rebuild_shipping(&pool)
         .await
         .with_context(|| "rebuilding shipping projections")?;

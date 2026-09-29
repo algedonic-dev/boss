@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 #
-# reclaim-gcp-root — free boss-gcp's 48 GB root by removing exactly two
+# reclaim-gcp-root — free boss-gcp's 48 GB root by removing exactly three
 # kinds of thing, and nothing else, ever: the obsolete binary backup
-# directories /opt/boss-binbak-* and /opt/boss-dev-bak, and the systemd
-# journal beyond a fixed 1G — through a rendered plan a passkey signs.
+# directories /opt/boss-binbak-* and /opt/boss-dev-bak, the retired second
+# stack's database capture /var/backups/boss/second-stack/
+# second-stack-<stamp>.sql, and the systemd journal beyond a fixed 1G —
+# through a rendered plan a passkey signs.
 #
 #   reclaim-gcp-root.sh --dry-run          render the plan; removes nothing
 #   reclaim-gcp-root.sh <plan-sha256>      remove what the SIGNED plan names
@@ -20,9 +22,20 @@
 # (536M), ~2.3 GB that no commit in the tree names — and a 4.1 GB
 # journal. Everything else the reading named is DATA and David's call
 # (retention policy), so it is out of this verb's reach by construction:
-# /var/backups/* (the cluster-pg dumps and the second-stack capture),
-# every home directory, /usr/local, and the live /opt/boss and
-# /opt/boss-cli.
+# /var/backups/* — with ONE named exception, below — every home
+# directory, /usr/local, and the live /opt/boss and /opt/boss-cli.
+#
+# THE ONE EXCEPTION: THE SECOND-STACK CAPTURE (backlog f44ca628,
+# 2026-09-28). David made the retention call on this one file: "Delete
+# the second-stack capture, build it as a verb." retire-second-stack took
+# it on 2026-09-15 (ops-request 7912c9ae) as
+# second-stack-20260915T211123Z.sql, 2.3 GB; the /opt backups and the
+# journal free ~4.6 GB, which leaves boss-gcp ~16.4 GB free against its
+# 17 GB floor, so disk_tight:boss-gcp never cleared without it. Only
+# files retire-second-stack's own naming writes, directly in its own
+# directory, are in reach (bound 7); the cluster-pg dumps beside it are
+# not decided and stay out of reach, as does every other name under
+# /var/backups.
 #
 # THE LASTING GAIN IS THE ~2.3 GB OF BACKUPS. The journal has no
 # SystemMaxUse drop-in on this host, so journald grows it back toward
@@ -92,16 +105,47 @@
 #   6. THE JOURNAL. `journalctl --vacuum-size=1G` — a fixed bound, not a
 #      param, so no request can ask for 0 and throw away the host's
 #      diagnosis. The newest 1G stays.
+#   7. THE CAPTURE. Candidates are what ONE glob matches in ONE fixed
+#      directory — /var/backups/boss/second-stack/second-stack-*.sql,
+#      where retire-second-stack writes (its BACKUP_DIR default) — and
+#      nothing else under /var/backups is listed at all. The directory
+#      must be a real directory whose realpath is its own spelling (no
+#      link anywhere on the way), and it and its parent must be owned by
+#      root and writable by no group and no other account (their owner
+#      and mode ride in the plan). Each match must be named
+#      ^second-stack-[0-9]{8}T[0-9]{6}Z\.sql$ — retire-second-stack's
+#      `date -u +%Y%m%dT%H%M%SZ` stamp; any other name the glob matches
+#      refuses the run — must be a REGULAR file (a symlink, a directory
+#      or a device by that name is refused) with exactly ONE link (a
+#      hardlinked dump under a capture's name is refused: removing the
+#      name would free nothing and the record would claim it had),
+#      whose realpath is <dir>/<its own name>, must not be a mount
+#      point, and must not be held open by any process (/proc/*/fd,
+#      compared by device and inode, so a process in another mount
+#      namespace is seen too): a pg_dump still writing it, or a restore
+#      reading it. The fd scan refuses on any fd it cannot follow for a
+#      reason but "gone", and on a table without init's (pid 1) fds. The
+#      adversarial review of 7bca1fee added the link count, the owner
+#      and mode, and the stricter fd scan. There is NO age
+#      bound: bound 4's 30 days is for the /opt backups, and the capture
+#      David decided on was 13 days old. Its size in bytes and its
+#      sha256 ride in the plan, so the passkey signs those exact bytes;
+#      the write re-hashes each capture just before its `rm -f` and
+#      removes nothing that no longer matches. The capture goes LAST,
+#      after every backup directory, so a run that stops part-way stops
+#      with the data still standing.
 #
 # THE PLAN'S BYTES ARE DETERMINISTIC: each candidate's path, its size
-# in MiB and its top-level entries, sorted, then each kept checkout with
-# its evidence, then the fixed journal line.
+# in MiB and its top-level entries, sorted, then each capture's path,
+# size in bytes and sha256, then each kept checkout with its evidence,
+# then the fixed journal line.
 # No clock, no free space, no journal usage — those move on their own
 # and ride stderr, where the hash does not reach.
 #
 # WHAT IT DOES NOT SEE. It reads units, unit files, mounts and
 # processes, not every script on the host: a cron line or a shell script
-# naming a backup directory by path would not stop it.
+# naming a backup directory by path would not stop it. A capture held
+# open only through a memory map (not an fd) is not seen either.
 #
 # EXIT
 #   0  done (or, with --dry-run, every bound passed and this is the plan)
@@ -113,6 +157,9 @@
 # only an argv built from the allowlist, so a packet cannot set these)
 #   BOSS_RECLAIM_OPT_DIR     where the candidates and live trees live (/opt)
 #   BOSS_RECLAIM_PROC_DIR    the process table (/proc)
+#   BOSS_RECLAIM_CAPTURE_DIR where the second-stack capture lives
+#                            (/var/backups/boss/second-stack)
+#   BOSS_RECLAIM_CAPTURE_OWNER the uid that must own it and its parent (0)
 #   BOSS_RECLAIM_MOUNTINFO   the mount table (/proc/self/mountinfo)
 #   BOSS_RECLAIM_LINK_DIRS   directories scanned for symlinks into a candidate
 #   BOSS_RECLAIM_UNIT_DIRS   directories of unit files grepped for a candidate
@@ -128,9 +175,13 @@ OPT="${BOSS_RECLAIM_OPT_DIR:-/opt}"
 PROC="${BOSS_RECLAIM_PROC_DIR:-/proc}"
 MOUNTINFO="${BOSS_RECLAIM_MOUNTINFO:-/proc/self/mountinfo}"
 UNIT_DIRS="${BOSS_RECLAIM_UNIT_DIRS:-/etc/systemd/system /lib/systemd/system /usr/lib/systemd/system}"
+CAPTURE_DIR="${BOSS_RECLAIM_CAPTURE_DIR:-/var/backups/boss/second-stack}"
+CAPTURE_OWNER="${BOSS_RECLAIM_CAPTURE_OWNER:-0}"
 JOURNAL_KEEP="1G"
 MIN_AGE_DAYS=30
 NAME_RE='^boss-binbak-[A-Za-z0-9._-]+$'
+# retire-second-stack.sh: DUMP=$BACKUP_DIR/second-stack-$(date -u +%Y%m%dT%H%M%SZ).sql
+CAPTURE_RE='^second-stack-[0-9]{8}T[0-9]{6}Z\.sql$'
 
 # --- bound 1: the argument -------------------------------------------------
 usage() {
@@ -422,7 +473,11 @@ if [ "${#CANDS[@]}" -gt 0 ]; then
             done
         done < "$TMP/links"
     done
-    # (d) running processes.
+    # (d) running processes. A table that cannot be read passed silently
+    # here until the adversarial review of 7bca1fee (f44ca628): the glob
+    # matched nothing and the loop ran zero times.
+    { [ -d "$PROC" ] && [ -r "$PROC" ] && [ -x "$PROC" ]; } \
+        || refuse "$PROC cannot be read, so whether a running process executes from a backup cannot be judged — a bound that cannot be evaluated is not passed"
     for exe in "$PROC"/[0-9]*/exe; do
         t=$(readlink -- "$exe" 2>/dev/null) || continue
         t="${t% (deleted)}"
@@ -466,6 +521,141 @@ if [ "${#CANDS[@]}" -gt 0 ]; then
     done
 fi
 
+# --- bound 7: the second-stack capture ------------------------------------
+# capture_holder <file> — the first process holding <file> open, as
+# "<pid> (<comm>)" on stdout. Exit 0 when one does, 1 when none does, 2
+# (the reason in $TMP/holder.err) when the table cannot be read — which
+# the caller refuses. Compared by device:inode through `stat -L` on each
+# /proc/<pid>/fd entry, one stat per process: the kernel follows the fd to
+# the open file itself, so neither a rename nor another mount namespace's
+# spelling of the path hides it.
+capture_holder() {
+    local id p init=0
+    id=$(LC_ALL=C stat -c '%d:%i' -- "$1" 2> "$TMP/holder.err") || return 2
+    if ! [ -d "$PROC" ] || ! [ -r "$PROC" ] || ! [ -x "$PROC" ]; then
+        echo "$PROC cannot be read" > "$TMP/holder.err"; return 2
+    fi
+    for p in "$PROC"/[0-9]*; do
+        [ -e "$p/fd" ] || continue # it exited (or, in a fixture, has no fd table)
+        if ! [ -r "$p/fd" ] || ! [ -x "$p/fd" ]; then
+            [ -e "$p/fd" ] || continue
+            echo "the open files of process ${p##*/} ($p/fd) cannot be read" > "$TMP/holder.err"; return 2
+        fi
+        # An fd closed, or a process gone, between the glob and the stat
+        # says "No such file or directory", and so does an empty table's
+        # unexpanded glob. ANY other complaint — a denial, EIO, E2BIG, a
+        # link loop — means an fd went unread, so the bound was not
+        # evaluated (adversarial review of 7bca1fee: only EACCES refused).
+        LC_ALL=C stat -L -c '%d:%i' -- "$p/fd"/* > "$TMP/fds" 2> "$TMP/fds.err"
+        grep -vF 'No such file or directory' "$TMP/fds.err" > "$TMP/fds.bad"
+        case $? in
+            0) echo "the open files of process ${p##*/} cannot be followed: $(head -n 1 "$TMP/fds.bad")" > "$TMP/holder.err"; return 2 ;;
+            1) ;;
+            *) echo "could not read stat's complaints about process ${p##*/}" > "$TMP/holder.err"; return 2 ;;
+        esac
+        [ "${p##*/}" = 1 ] && init=1
+        if grep -qxF -- "$id" "$TMP/fds"; then
+            echo "${p##*/} ($(cat "$p/comm" 2>/dev/null || echo '?'))"
+            return 0
+        fi
+    done
+    # A table without init's open files is not the host's whole table
+    # (a partial or foreign /proc): a holder could be among the missing.
+    [ "$init" = 1 ] || { echo "the open files of process 1 (init) were not read from $PROC, so the table is not the whole host's" > "$TMP/holder.err"; return 2; }
+    return 1
+}
+
+# capture_links <file> — its hard-link count, or exit 2 (reason in
+# $TMP/links.err). A capture with a second name is not freed by removing
+# this one, and a boss-cluster-pg dump hardlinked in under a capture's
+# name would otherwise pass every other bound (adversarial review of
+# 7bca1fee, MUST-FIX 1: the write removed the name and the OK line
+# claimed bytes that were never freed).
+capture_links() {
+    local n
+    n=$(LC_ALL=C stat -c %h -- "$1" 2> "$TMP/links.err") || return 2
+    [[ "$n" =~ ^[0-9]+$ ]] || { echo "stat counted '$n' links" > "$TMP/links.err"; return 2; }
+    echo "$n"
+}
+
+# dir_sound <dir> — "owner uid <u>, mode <m>" on stdout when <dir> is
+# owned by CAPTURE_OWNER and writable by no group and no other account;
+# exit 2 with the reason in $TMP/dir.err otherwise. Anyone who can write
+# the capture directory or its parent can put a file under a capture's
+# name (review of 7bca1fee, item 3).
+dir_sound() {
+    local s u m
+    s=$(LC_ALL=C stat -c '%u %a' -- "$1" 2> "$TMP/stat.err") \
+        || { echo "could not read the owner and mode of \`$1\` ($(head -c 300 "$TMP/stat.err"))" > "$TMP/dir.err"; return 2; }
+    read -r u m <<< "$s"
+    [[ "$u" =~ ^[0-9]+$ && "$m" =~ ^[0-7]+$ ]] \
+        || { echo "stat answered owner '$u' mode '$m' for \`$1\`" > "$TMP/dir.err"; return 2; }
+    [ "$u" = "$CAPTURE_OWNER" ] \
+        || { echo "\`$1\` is owned by uid $u, not uid $CAPTURE_OWNER — a directory another account owns can be given any file" > "$TMP/dir.err"; return 2; }
+    [ $(( 8#$m & 8#022 )) -eq 0 ] \
+        || { echo "\`$1\` is group- or other-writable (mode $m) — another account could put a file there under a capture's name" > "$TMP/dir.err"; return 2; }
+    echo "owner uid $u, mode $m"
+}
+
+# The plan's line for each capture: "<bytes> <sha256> <path>"; the
+# directory's owner and mode, once, in $TMP/capdir.
+: > "$TMP/captures"
+: > "$TMP/capdir"
+if [ -e "$CAPTURE_DIR" ] || [ -L "$CAPTURE_DIR" ]; then
+    [ -L "$CAPTURE_DIR" ] \
+        && refuse "\`$CAPTURE_DIR\` is a symlink (to $(readlink -- "$CAPTURE_DIR")) — the capture is removed only from the directory retire-second-stack wrote it to, never through a link"
+    [ -d "$CAPTURE_DIR" ] || refuse "\`$CAPTURE_DIR\` is not a directory"
+    cap_real=$(realpath -e -- "$CAPTURE_DIR" 2>/dev/null) \
+        || refuse "\`$CAPTURE_DIR\` does not resolve"
+    [ "$cap_real" = "$CAPTURE_DIR" ] \
+        || refuse "\`$CAPTURE_DIR\` resolves to $cap_real — a link on the way means it is not the directory retire-second-stack wrote its capture to"
+    { [ -r "$CAPTURE_DIR" ] && [ -x "$CAPTURE_DIR" ]; } \
+        || refuse "\`$CAPTURE_DIR\` cannot be listed, so what it holds cannot be judged — a bound that cannot be evaluated is not passed"
+    # Owned by root and writable by nobody else, the directory and its
+    # parent both; the two facts ride in the plan's bytes.
+    cap_parent="${CAPTURE_DIR%/*}"
+    dir_note=$(dir_sound "$CAPTURE_DIR") || refuse "$(cat "$TMP/dir.err")"
+    parent_note=$(dir_sound "$cap_parent") || refuse "$(cat "$TMP/dir.err")"
+    echo "  capture directory $CAPTURE_DIR: $dir_note; its parent $cap_parent: $parent_note" > "$TMP/capdir"
+    for f in "$CAPTURE_DIR"/second-stack-*.sql; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        name="${f##*/}"
+        [[ "$name" =~ $CAPTURE_RE ]] \
+            || refuse "\`$f\` matched the glob but its name is not ^second-stack-[0-9]{8}T[0-9]{6}Z\\.sql\$ — retire-second-stack names its capture second-stack-<date -u +%Y%m%dT%H%M%SZ>.sql, and this verb was reviewed to remove that and nothing else"
+        [ -L "$f" ] \
+            && refuse "\`$f\` is a symlink (to $(readlink -- "$f")) — this verb removes the capture itself, never what a link points at"
+        [ -f "$f" ] || refuse "\`$f\` is not a regular file — the capture retire-second-stack writes is one"
+        links=$(capture_links "$f") \
+            || refuse "could not count the links to \`$f\` ($(head -c 300 "$TMP/links.err")) — a bound that cannot be evaluated is not passed"
+        [ "$links" = 1 ] \
+            || refuse "\`$f\` has $links links — another name holds the same bytes, so removing this one frees nothing, and it may be a dump that is not the capture"
+        real=$(realpath -e -- "$f" 2>/dev/null) || refuse "\`$f\` does not resolve"
+        [ "$real" = "$CAPTURE_DIR/$name" ] \
+            || refuse "\`$f\` resolves to $real, not $CAPTURE_DIR/$name — it is not the file its name says"
+        [ -r "$MOUNTINFO" ] || refuse "$MOUNTINFO cannot be read, so whether a capture is a mount point cannot be judged"
+        while read -r _ _ _ _ mp _; do
+            [ "$(printf '%b' "$mp")" = "$f" ] \
+                && refuse "\`$f\` is a mount point — rm would not remove what is mounted there"
+        done < "$MOUNTINFO"
+        holder=$(capture_holder "$f")
+        case $? in
+            0) refuse "process $holder holds \`$f\` open — a capture being written (pg_dump) or read (a restore) is in use, and removing it frees nothing while that process lives" ;;
+            1) ;;
+            *) refuse "whether a process holds \`$f\` open cannot be judged ($(head -c 300 "$TMP/holder.err")) — a bound that cannot be evaluated is not passed" ;;
+        esac
+        bytes=$(LC_ALL=C stat -c %s -- "$f" 2> "$TMP/stat.err") \
+            || refuse "could not size \`$f\` ($(head -c 300 "$TMP/stat.err"))"
+        sha256sum -- "$f" > "$TMP/sha" 2> "$TMP/sha.err" \
+            || refuse "could not hash \`$f\` ($(head -c 300 "$TMP/sha.err"))"
+        sha=$(cut -c1-64 "$TMP/sha")
+        [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || refuse "sha256sum answered '$sha' for \`$f\`"
+        echo "$bytes $sha $f" >> "$TMP/captures"
+    done
+fi
+CAP_N=$(wc -l < "$TMP/captures")
+CAP_BYTES=$(awk '{ s += $1 } END { print s + 0 }' "$TMP/captures")
+[ "$CAP_N" -gt 0 ] || say "no second-stack capture in $CAPTURE_DIR on this host — no capture to remove"
+
 # --- the plan: deterministic bytes ---------------------------------------
 : > "$TMP/cands"
 for c in "${CANDS[@]+"${CANDS[@]}"}"; do
@@ -479,6 +669,11 @@ render() {
         echo "would remove $c ($mib MiB), holding:"
         find "$c" -mindepth 1 -maxdepth 1 -printf '  %f\n' | LC_ALL=C sort
     done < "$TMP/cands"
+    local bytes sha f
+    while read -r bytes sha f; do
+        echo "would remove $f ($bytes bytes, sha256 $sha) — the retired second stack's database capture (retire-second-stack, ops-request 7912c9ae), which David decided on 2026-09-28 to delete (backlog f44ca628)"
+    done < "$TMP/captures"
+    [ -s "$TMP/captures" ] && cat "$TMP/capdir"
     cat "$TMP/kept"
     echo "would vacuum the journal to $JOURNAL_KEEP (journalctl --vacuum-size=$JOURNAL_KEEP)"
 }
@@ -495,7 +690,7 @@ say "journal: $(journalctl --disk-usage 2>&1)"
 
 if [ "$DRY" = 1 ]; then
     cat "$TMP/plan"
-    say "DRY RUN — every bound passed: ${#CANDS[@]} backup directories (${TOTAL} MiB) and the journal beyond $JOURNAL_KEEP would go; $KEPT_NOTE. Nothing was removed."
+    say "DRY RUN — every bound passed: ${#CANDS[@]} backup directories (${TOTAL} MiB), $CAP_N second-stack capture(s) ($CAP_BYTES bytes) and the journal beyond $JOURNAL_KEEP would go; $KEPT_NOTE. Nothing was removed."
     echo "plan-sha256: $HASH" >&2
     exit 0
 fi
@@ -509,7 +704,18 @@ fi
 cat "$TMP/plan"
 echo "$ME: plan $APPROVED still holds"
 
+# Every path removed, in order — backup directories and captures alike —
+# so a run that stops part-way leaves an exact record.
 DONE=()
+DIRS_DONE=0
+CAP_DONE=0
+# stop <exit> <what stopped it> — the record, then the exit.
+stop() {
+    say "$2"
+    say "  already removed (${#DONE[@]}): ${DONE[*]:-none}"
+    say "  not removed: $((CAP_N - CAP_DONE)) second-stack capture(s) (the capture goes last); the journal was not vacuumed."
+    exit "$1"
+}
 while read -r c mib; do
     # The internal guard: no path through this loop removes anything but
     # a real /opt/boss-binbak-* or /opt/boss-dev-bak directory — even if
@@ -517,41 +723,74 @@ while read -r c mib; do
     name="${c##*/}"
     if [ "${c%/*}" != "$OPT_REAL" ] || [ -L "$c" ] || ! [ -d "$c" ] \
         || { [ "$name" != "boss-dev-bak" ] && ! [[ "$name" =~ $NAME_RE ]]; }; then
-        say "REFUSED — \`$c\` is not a backup directory this verb may remove; the loop was handed a path it must not touch."
-        say "  already removed: ${DONE[*]:-none}"
-        exit 2
+        stop 2 "REFUSED — \`$c\` is not a backup directory this verb may remove; the loop was handed a path it must not touch."
     fi
     # Bound 3 again, at the last moment: the re-render above keeps any
     # candidate holding a .git, but a checkout could appear between that
     # render and this rm. This verb never removes a checkout.
     if ! late_git=$(find "$c" -xdev -name .git -print -quit 2> "$TMP/find.err"); then
-        say "REFUSED — could not search \`$c\` for a .git just before removing it ($(head -c 300 "$TMP/find.err" | ascii)); a bound that cannot be evaluated is not passed."
-        say "  already removed: ${DONE[*]:-none}"
-        exit 2
+        stop 2 "REFUSED — could not search \`$c\` for a .git just before removing it ($(head -c 300 "$TMP/find.err" | ascii)); a bound that cannot be evaluated is not passed."
     fi
     if [ -n "$late_git" ]; then
-        say "REFUSED — \`$c\` holds \`$late_git\` now, a checkout that appeared after the plan was rendered; this verb never removes a checkout."
-        say "  already removed: ${DONE[*]:-none}"
-        exit 2
+        stop 2 "REFUSED — \`$c\` holds \`$late_git\` now, a checkout that appeared after the plan was rendered; this verb never removes a checkout."
     fi
     if ! rm -rf --one-file-system -- "$c" 2> "$TMP/rm.err" || [ -e "$c" ]; then
         sed 's/^/    /' "$TMP/rm.err" >&2
-        say "FAILED at \`$c\` — rm did not remove it."
-        say "  already removed (${#DONE[@]}): ${DONE[*]:-none}"
-        say "  the journal was not vacuumed."
-        exit 1
+        stop 1 "FAILED at \`$c\` — rm did not remove it."
     fi
     DONE+=("$c")
+    DIRS_DONE=$((DIRS_DONE + 1))
     echo "removed $c ($mib MiB)"
 done < "$TMP/cands"
 
+# The capture, LAST (bound 7). Its own loop, with its own internal guard
+# — the directory loop's guard refuses anything outside /opt, correctly —
+# and every bound again at the moment before rm: a regular file, not a
+# link, named as retire-second-stack names it, directly in the capture
+# directory, held open by no process, and holding the bytes the signed
+# plan named. `rm -f`, never -r: a capture is one file.
+while read -r bytes sha f; do
+    name="${f##*/}"
+    if [ "${f%/*}" != "$CAPTURE_DIR" ] || ! [[ "$name" =~ $CAPTURE_RE ]] \
+        || [ -L "$CAPTURE_DIR" ] || [ -L "$f" ] || ! [ -f "$f" ]; then
+        stop 2 "REFUSED — \`$f\` is not a second-stack capture this verb may remove (a regular file named second-stack-<stamp>.sql directly in $CAPTURE_DIR); it changed since the render, or the loop was handed a path it must not touch."
+    fi
+    links=$(capture_links "$f") \
+        || stop 2 "REFUSED — could not count the links to \`$f\` just before removing it ($(head -c 300 "$TMP/links.err")); a bound that cannot be evaluated is not passed."
+    [ "$links" = 1 ] \
+        || stop 2 "REFUSED — \`$f\` has $links links now: another name holds the same bytes, so removing this one would free nothing the record could claim."
+    real=$(realpath -e -- "$f" 2>/dev/null) \
+        || stop 2 "REFUSED — \`$f\` does not resolve now; a bound that cannot be evaluated is not passed."
+    [ "$real" = "$f" ] \
+        || stop 2 "REFUSED — \`$f\` resolves to $real now, not itself; it is not the file the plan named."
+    holder=$(capture_holder "$f")
+    case $? in
+        0) stop 2 "REFUSED — process $holder holds \`$f\` open now; a capture in use is not removed." ;;
+        1) ;;
+        *) stop 2 "REFUSED — whether a process holds \`$f\` open cannot be judged now ($(head -c 300 "$TMP/holder.err")); a bound that cannot be evaluated is not passed." ;;
+    esac
+    if ! sha256sum -- "$f" > "$TMP/sha" 2> "$TMP/sha.err"; then
+        stop 2 "REFUSED — could not re-hash \`$f\` just before removing it ($(head -c 300 "$TMP/sha.err")); a bound that cannot be evaluated is not passed."
+    fi
+    now_sha=$(cut -c1-64 "$TMP/sha")
+    [ "$now_sha" = "$sha" ] \
+        || stop 2 "REFUSED — \`$f\` hashes to $now_sha now, not the planned $sha: its bytes changed after the plan was rendered, and the signature does not cover them."
+    if ! rm -f -- "$f" 2> "$TMP/rm.err" || [ -e "$f" ] || [ -L "$f" ]; then
+        sed 's/^/    /' "$TMP/rm.err" >&2
+        stop 1 "FAILED at \`$f\` — rm did not remove it."
+    fi
+    DONE+=("$f")
+    CAP_DONE=$((CAP_DONE + 1))
+    echo "removed $f ($bytes bytes, sha256 $sha)"
+done < "$TMP/captures"
+
 if ! journalctl --vacuum-size="$JOURNAL_KEEP" > "$TMP/vacuum" 2>&1; then
     sed 's/^/    /' "$TMP/vacuum" >&2
-    say "FAILED — journalctl --vacuum-size=$JOURNAL_KEEP exited non-zero; the ${#DONE[@]} backup directories above are removed."
+    say "FAILED — journalctl --vacuum-size=$JOURNAL_KEEP exited non-zero; the $DIRS_DONE backup directories and $CAP_DONE second-stack capture(s) above are removed."
     exit 1
 fi
 sed 's/^/  /' "$TMP/vacuum"
 echo "vacuumed the journal to $JOURNAL_KEEP: $(journalctl --disk-usage 2>&1)"
 FREE_AFTER=$(free_mib)
-say "OK — removed ${#DONE[@]} backup directories (${TOTAL} MiB) and vacuumed the journal to $JOURNAL_KEEP; root free ${FREE_BEFORE:-unknown} → ${FREE_AFTER:-unknown} MiB; $KEPT_NOTE. /var/backups, homes, /usr/local, $OPT/boss and $OPT/boss-cli are untouched. The journal grows back without a SystemMaxUse bound; the lasting gain is the backups."
+say "OK — removed $DIRS_DONE backup directories (${TOTAL} MiB) and $CAP_DONE second-stack capture(s) ($CAP_BYTES bytes), and vacuumed the journal to $JOURNAL_KEEP; root free ${FREE_BEFORE:-unknown} → ${FREE_AFTER:-unknown} MiB; $KEPT_NOTE. Everything else under /var/backups (the cluster-pg dumps included), homes, /usr/local, $OPT/boss and $OPT/boss-cli are untouched. The journal grows back without a SystemMaxUse bound; the lasting gain is the backups and the capture."
 exit 0

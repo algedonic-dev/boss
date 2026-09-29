@@ -15,7 +15,10 @@ use tracing::{debug, info, warn};
 pub struct DispatcherCtx {
     pub jobs_api_url: String,
     pub people_api_url: String,
-    pub client: reqwest::Client,
+    /// Stamps the machine token per request (design 6805c764 car 2,
+    /// review S1): a value baked into default headers at boot would
+    /// outlive the broker's rotation.
+    pub client: boss_core::machine_token::Client,
     /// StepType registry — used to look up `required_roles` for the
     /// step's kind, the fallback role source when a step carries no
     /// per-step `authority_role` in its metadata. Without any role match
@@ -58,7 +61,7 @@ struct RosterCache {
 
 impl DispatcherCtx {
     pub fn new(jobs_api_url: String, people_api_url: String, strategy: AssignmentStrategy) -> Self {
-        let client = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             // Dispatcher acts as a system-tier actor; its x-boss-user
             // names that identity so audit_log entries from its PUTs
@@ -78,11 +81,12 @@ impl DispatcherCtx {
                 if let Ok(v) = reqwest::header::HeaderValue::from_str(&actor) {
                     h.insert("x-boss-user", v);
                 }
-                boss_core::machine_token::attach(&mut h);
                 h
-            })
-            .build()
-            .expect("reqwest client always builds");
+            });
+        // Redirects off: a 3xx must not carry the token elsewhere
+        // (review of 6fbc7fc7, finding 1).
+        let client =
+            boss_core::machine_token::Client::build(builder).expect("reqwest client always builds");
         Self {
             jobs_api_url,
             people_api_url,

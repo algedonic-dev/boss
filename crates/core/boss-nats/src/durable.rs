@@ -105,6 +105,14 @@ pub fn stream_subjects() -> Vec<String> {
         // buffer until the age cap expires them, and a subject the
         // stream no longer lists is a message nothing can replay.
         "docs.>",
+        // `events.>` joined 2026-09-28 (backlog e4019cbc): the outbox
+        // relay's `events.outbox.dead_lettered` alarm is read by the
+        // dispatcher rule that files its backlog-item, and a rule
+        // topic the stream does not capture is delivered to nobody.
+        // Adding a subject is the safe direction of the live
+        // reconcile — the risk the `docs.>` note above describes is
+        // dropping one.
+        "events.>",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -439,7 +447,8 @@ mod tests {
                 "commerce.>",
                 "ledger.>",
                 "asset.>",
-                "docs.>"
+                "docs.>",
+                "events.>"
             ]
         );
         assert_eq!(c.retention, stream::RetentionPolicy::Limits);

@@ -46,6 +46,10 @@ pub async fn rebuild_search(pool: &PgPool) -> Result<RebuildSearchReport, Search
         .await
         .map_err(SearchError::storage)?;
 
+    // No log-complete check (design b046f510): search_index has no live
+    // writer, so an undrained fact lands one ten-minute reindex late,
+    // never lost — and locking event_outbox every ten minutes would
+    // stall every writer for nothing.
     sqlx::query("TRUNCATE search_index")
         .execute(&mut *tx)
         .await

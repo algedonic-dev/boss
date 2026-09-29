@@ -105,6 +105,16 @@ const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
          operator's cadence, not this one's.",
     ),
     (
+        "broker-refreshes-the-github-dr-push-token",
+        "runs `credential.rotate.github-app-installation` with phase = refresh, which \
+         re-mints the one Secret's installation token when its recorded expiry is inside \
+         the window and otherwise does nothing (design 76155676, backlog 81eb6d4d). It \
+         files no packet: its trace is `credential.installed` on the credential's own \
+         registry row (rotated_at), and a refusal — a root not yet placed, a repository \
+         the App cannot see — is on the dispatcher's firing record, so a sweep keyed by \
+         packet kind has nothing of it to count.",
+    ),
+    (
         "sensors-poll-every-5-minutes",
         "runs `sensor.poll`, which reads every declared sensor's SOURCE and opens a packet \
          of the kind the SENSOR ROW declares only when the source recorded something new \
@@ -162,6 +172,15 @@ const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
          step it produces NOTHING, and that zero is the healthy reading; what it files is an \
          alarm keyed by step, not a packet of a kind a sweep could count. It is itself the \
          watch on work no event reports as late.",
+    ),
+    (
+        "every-control-has-a-real-person-hourly",
+        "runs `policy.coverage.alarm`, which reads the policy service's coverage and files one \
+         urgent backlog-item alarm per control no real person holds (design 1c4e42e1, backlog \
+         47aed706), and withdraws it once the control is held. On an hour with every control \
+         held it produces NOTHING, and that zero is the healthy reading; what it files is an \
+         alarm keyed by control, not a packet of a kind a sweep could count. It is itself the \
+         watch on a state no event reports.",
     ),
     (
         "a-flight-past-its-period-is-an-alarm",

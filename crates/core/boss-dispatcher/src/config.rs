@@ -145,6 +145,31 @@ pub struct DispatcherConfig {
     /// The Stripe API origin the adapter reads (`BOSS_STRIPE_API_BASE`);
     /// a stub stands in for the tests, the real endpoint is the default.
     pub stripe_api_base: String,
+    /// The GitHub REST API the `credential.rotate.github-app-installation`
+    /// handler speaks (design 76155676). Overridable for a stub.
+    pub broker_github_api_url: String,
+    /// The GitHub App root (design 76155676, backlog 81eb6d4d): the App
+    /// id, the installation id on the algedonic-dev organisation, and
+    /// the App private key (PEM), placed once by David into the same
+    /// `boss-credential-broker-root` Secret under keys `github-app.id`,
+    /// `github-app.installation-id` and `github-app.private-key.pem`.
+    /// Each `None` when its env var is unset or empty; the binary builds
+    /// the root only when all three are present and otherwise registers
+    /// the handler unconfigured, naming every missing key. Never logged.
+    #[serde(skip)]
+    pub broker_github_app_id: Option<String>,
+    #[serde(skip)]
+    pub broker_github_app_installation_id: Option<String>,
+    #[serde(skip)]
+    pub broker_github_app_private_key: Option<String>,
+}
+
+/// An env var's value, `None` when unset or blank.
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
 }
 
 impl Default for DispatcherConfig {
@@ -210,6 +235,11 @@ impl Default for DispatcherConfig {
                 .filter(|t| !t.is_empty()),
             stripe_api_base: std::env::var("BOSS_STRIPE_API_BASE")
                 .unwrap_or_else(|_| "https://api.stripe.com".to_string()),
+            broker_github_api_url: std::env::var("BOSS_BROKER_GITHUB_API_URL")
+                .unwrap_or_else(|_| "https://api.github.com".to_string()),
+            broker_github_app_id: env_value("BOSS_BROKER_GITHUB_APP_ID"),
+            broker_github_app_installation_id: env_value("BOSS_BROKER_GITHUB_APP_INSTALLATION_ID"),
+            broker_github_app_private_key: env_value("BOSS_BROKER_GITHUB_APP_PRIVATE_KEY"),
         }
     }
 }

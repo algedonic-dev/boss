@@ -1071,6 +1071,17 @@ async fn a_work_profile_survives_a_rebuild_and_a_re_report_replaces_it() {
         .await
         .expect("a re-report replaces the reading");
 
+    // Move the run's event across as the relay would: a rebuild refuses
+    // to replay past a committed write the log does not hold yet
+    // (design b046f510).
+    sqlx::query(
+        "INSERT INTO audit_log (event_id, kind, source, timestamp, payload) \
+         SELECT event_id, kind, source, timestamp, payload FROM event_outbox \
+         WHERE kind = 'agents.run.recorded'",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("relay the event");
     rebuild_agent_runs(&db.pool).await.expect("rebuilds");
 
     let window = |from, to| log.list_profiles(from, to);

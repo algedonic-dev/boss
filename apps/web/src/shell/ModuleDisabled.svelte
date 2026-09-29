@@ -4,6 +4,13 @@
   // page (looks broken) or 404 (looks like a bug). Says clearly
   // that the module is off for this tenant + offers a return-home
   // link.
+  //
+  // It names the manifest by what it is — the tenant's manifest, its
+  // `[modules]` section, the module's key — and no path. It used to
+  // say `examples/<tenant>/seeds/tenant.toml`, which is true of the one
+  // demo tenant in this tree and false of every other instance,
+  // including the live one, whose manifest is not in this repo
+  // (backlog fa838818; wording decided on cbe6bc94, 2026-09-28).
 
   import { navigate } from '../router';
 
@@ -19,13 +26,13 @@
     <h1>Not enabled for this tenant</h1>
     <p>
       The <strong>{label ?? module}</strong> module is turned off in
-      this tenant's <code>tenant.toml</code>. The page exists in the
-      platform — the active tenant just doesn't surface it.
+      this tenant's manifest. The page exists in the platform — the
+      active tenant just doesn't surface it.
     </p>
     <p class="muted">
-      To enable: set <code>{module} = true</code> in
-      <code>examples/&lt;tenant&gt;/seeds/tenant.toml</code> under
-      <code>[modules]</code>, redeploy, and the page comes back.
+      To enable: set <code>{module} = true</code> in the
+      <code>[modules]</code> section of the tenant's manifest, redeploy,
+      and the page comes back.
     </p>
     <button
       type="button"

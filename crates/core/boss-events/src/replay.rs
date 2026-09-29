@@ -62,6 +62,11 @@ pub struct ReplayStats {
 ///    transaction, so concurrent domain writes briefly queue and two
 ///    rebuilds of the same projection never interleave. Derive `lock_key`
 ///    from [`boss_core::rebuild::lock_key`].
+/// 2a. When `wipe` clears anything, prove the log holds every committed
+///    write — lock the wiped tables and `event_outbox`, count what the
+///    relay has not copied yet, and refuse on any
+///    ([`crate::outbox::lock_and_assert_log_complete`], design
+///    b046f510). The tables are read off the wipe statements.
 /// 3. Run each statement in `wipe` (a `TRUNCATE … CASCADE`, a single
 ///    `DELETE`, or a list of `DELETE`s — whatever clears this projection).
 /// 4. Stream every `audit_log` row matching `kind_filter`, in `id` order,
@@ -94,6 +99,19 @@ where
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
+
+    // A wipe deletes live rows, so it may run only against a log that
+    // holds every committed write (design b046f510). A replay that
+    // wipes nothing folds onto what is there and cannot lose a row, so
+    // it takes no lock and stalls no writer.
+    if !wipe.is_empty() {
+        let tables = wipe
+            .iter()
+            .map(|stmt| wiped_tables(stmt))
+            .collect::<Result<Vec<_>, _>>()?
+            .concat();
+        crate::outbox::lock_and_assert_log_complete(&mut tx, &tables).await?;
+    }
 
     for stmt in wipe {
         sqlx::query(stmt)
@@ -129,4 +147,74 @@ where
 
     tx.commit().await.map_err(|e| e.to_string())?;
     Ok(stats)
+}
+
+/// The tables a wipe statement clears, read off the statement itself so
+/// the tables the log check locks cannot drift from the tables the wipe
+/// deletes (CLAUDE.md §9a). Two shapes, the two every caller uses:
+/// `DELETE FROM <table>` and `TRUNCATE <table>[, <table>…] [CASCADE]`.
+/// Anything else — a `WHERE`, a schema-qualified name — is refused
+/// rather than guessed at.
+fn wiped_tables(stmt: &str) -> Result<Vec<&str>, String> {
+    let list = stmt.strip_prefix("DELETE FROM ").or_else(|| {
+        stmt.strip_prefix("TRUNCATE ")
+            .map(|rest| rest.strip_suffix(" CASCADE").unwrap_or(rest))
+    });
+    let tables: Vec<&str> = list
+        .map(|l| l.split(',').map(str::trim).collect())
+        .unwrap_or_default();
+    let readable = !tables.is_empty()
+        && tables.iter().all(|t| {
+            !t.is_empty()
+                && t.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        });
+    if readable {
+        Ok(tables)
+    } else {
+        Err(format!(
+            "cannot read the tables a wipe clears from {stmt:?}: a replay wipe is \
+             `DELETE FROM <table>` or `TRUNCATE <table>[, <table>…] [CASCADE]`"
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wiped_tables;
+
+    /// Every shape a rebuilder passes today, read to the tables it clears.
+    #[test]
+    fn a_wipe_names_the_tables_it_clears() {
+        assert_eq!(wiped_tables("DELETE FROM messages"), Ok(vec!["messages"]));
+        assert_eq!(wiped_tables("TRUNCATE subjects"), Ok(vec!["subjects"]));
+        assert_eq!(
+            wiped_tables(
+                "TRUNCATE employees, employee_skills, employee_certifications, requisitions CASCADE"
+            ),
+            Ok(vec![
+                "employees",
+                "employee_skills",
+                "employee_certifications",
+                "requisitions"
+            ])
+        );
+    }
+
+    /// A statement the reader cannot name every table of is refused,
+    /// never half-read: a lock on fewer tables than the wipe clears is
+    /// the drift the reading exists to prevent.
+    #[test]
+    fn a_wipe_that_cannot_be_read_is_refused() {
+        for stmt in [
+            "DELETE FROM jobs WHERE id = $1",
+            "DELETE FROM public.jobs",
+            "UPDATE jobs SET x = 1",
+            "TRUNCATE ",
+            "TRUNCATE a,, b",
+        ] {
+            let err = wiped_tables(stmt).expect_err(stmt);
+            assert!(err.contains("cannot read the tables"), "{stmt}: {err}");
+        }
+    }
 }

@@ -7,7 +7,12 @@ use boss_core::primitives::{Class, ClassRef};
 use boss_core::publisher::EventStamp;
 use std::sync::RwLock;
 
-use crate::port::{ClassError, ClassRepository, declared_event, retired_event, updated_event};
+use crate::port::{
+    Backfill, BirthPlan, ClassError, ClassFact, ClassRepository, NamedBirth, apply_change,
+    backfill_birth, backfill_edit, backfilled_declared_event, backfilled_edit_events, birth_plan,
+    class_change, declared_event, facts_in_replay_order, observed_birth, observed_declared_event,
+    retired_event, undeclared_birth, updated_event,
+};
 
 /// Trivial in-memory store. Holds a snapshot of `Class` rows; lookups
 /// are linear scans because the registry is tiny (≤ 100 rows in
@@ -71,13 +76,20 @@ impl ClassRepository for InMemoryClasses {
             .find(|c| c.subject_kind == class.subject_kind && c.code == class.code)
         {
             Some(existing) => {
-                // Key and retirement are not part of the editable body.
-                let mut next = class.clone();
-                next.retired_at = existing.retired_at;
-                // The Pg adapter's shape: no change, no write, no fact.
-                if let Some(event) = updated_event(stamp, existing, &next)? {
-                    *existing = next;
+                // The Pg adapter's shape: no change, no write, no fact;
+                // and the row written is the held row with the logged
+                // change applied — the function a replay runs (backlog
+                // 3c6d0186), which keeps the key and the retirement.
+                let change = class_change(existing, class)?;
+                if let Some(event) = updated_event(stamp, existing, &change)? {
+                    // An undeclared Class is declared first (backlog
+                    // 6c2aa86c). Every fallible step runs before anything
+                    // is pushed, so a refusal writes nothing.
+                    let born = birth_before_a_door_fact(existing, &events, stamp)?;
+                    let edited = apply_change(existing, &change)?;
+                    events.extend(born);
                     events.push(event);
+                    *existing = edited;
                 }
                 Ok(true)
             }
@@ -95,10 +107,17 @@ impl ClassRepository for InMemoryClasses {
             Some(existing) => {
                 // Keep the original stamp on a repeat call — when it
                 // was withdrawn is a fact, not a counter — and record
-                // the fact only for the call that set it.
+                // the fact only for the call that set it, after the
+                // birth of an undeclared Class (backlog 6c2aa86c).
                 if existing.retired_at.is_none() {
-                    existing.retired_at = Some(chrono::Utc::now());
-                    events.push(retired_event(stamp, existing));
+                    let born = birth_before_a_door_fact(existing, &events, stamp)?;
+                    let retired = Class {
+                        retired_at: Some(chrono::Utc::now()),
+                        ..existing.clone()
+                    };
+                    events.extend(born);
+                    events.push(retired_event(stamp, &retired));
+                    *existing = retired;
                 }
                 Ok(true)
             }
@@ -131,6 +150,136 @@ impl ClassRepository for InMemoryClasses {
         }
         Ok(inserted)
     }
+
+    async fn backfill_declared(
+        &self,
+        class_ref: &ClassRef,
+        stamp: &EventStamp,
+    ) -> Result<Backfill, ClassError> {
+        // The Pg adapter's shape, over this adapter's own record: the
+        // Class's facts are the events recorded here for its key.
+        let rows = self.rows.read().expect("rwlock poisoned");
+        let mut events = self.events.write().expect("rwlock poisoned");
+        let Some(live) = rows
+            .iter()
+            .find(|c| c.subject_kind == class_ref.subject_kind && c.code == class_ref.code)
+        else {
+            return Ok(Backfill::NotFound);
+        };
+        let log = facts_of(&events, class_ref)?;
+        match backfill_birth(live, &log)? {
+            None => Ok(Backfill::AlreadyDeclared),
+            Some(born) => {
+                events.push(backfilled_declared_event(stamp, &born)?);
+                Ok(Backfill::Recorded(born))
+            }
+        }
+    }
+
+    async fn backfill_edited(
+        &self,
+        class_ref: &ClassRef,
+        named: &NamedBirth,
+        stamp: &EventStamp,
+    ) -> Result<Backfill, ClassError> {
+        // The Pg adapter's shape minus its stamps: this adapter holds no
+        // `created_at` / `updated_at`, so the proof is the whole check and
+        // the facts say `born_at` / `edited_at` are unknown (null).
+        let rows = self.rows.read().expect("rwlock poisoned");
+        let mut events = self.events.write().expect("rwlock poisoned");
+        let Some(live) = rows
+            .iter()
+            .find(|c| c.subject_kind == class_ref.subject_kind && c.code == class_ref.code)
+        else {
+            return Ok(Backfill::NotFound);
+        };
+        let log = facts_of(&events, class_ref)?;
+        let Some(change) = backfill_edit(live, &log, named)? else {
+            return Ok(Backfill::AlreadyDeclared);
+        };
+        let born = Class {
+            retired_at: None,
+            ..named.born.clone()
+        };
+        events.extend(backfilled_edit_events(
+            stamp,
+            &born,
+            &change,
+            &named.source,
+            None,
+            None,
+        )?);
+        Ok(Backfill::RecordedWithEdit { born, change })
+    }
+
+    async fn backfill_observed(
+        &self,
+        class_ref: &ClassRef,
+        source: &str,
+        stamp: &EventStamp,
+    ) -> Result<Backfill, ClassError> {
+        // The Pg adapter's shape minus its stamps: no `created_at` /
+        // `updated_at` here, so the fact carries them as null, and no
+        // drift a stamp could show.
+        let rows = self.rows.read().expect("rwlock poisoned");
+        let mut events = self.events.write().expect("rwlock poisoned");
+        let Some(live) = rows
+            .iter()
+            .find(|c| c.subject_kind == class_ref.subject_kind && c.code == class_ref.code)
+        else {
+            return Ok(Backfill::NotFound);
+        };
+        let log = facts_of(&events, class_ref)?;
+        let Some(born) = observed_birth(live, &log)? else {
+            return Ok(Backfill::AlreadyDeclared);
+        };
+        events.push(observed_declared_event(
+            stamp, &born, source, None, None, None,
+        )?);
+        Ok(Backfill::Observed(born))
+    }
+
+    async fn birth_plans(&self, subject_kind: Option<&str>) -> Result<Vec<BirthPlan>, ClassError> {
+        let rows = self.rows.read().expect("rwlock poisoned");
+        let events = self.events.read().expect("rwlock poisoned");
+        let mut held: Vec<&Class> = rows
+            .iter()
+            .filter(|c| subject_kind.is_none_or(|k| c.subject_kind == k))
+            .collect();
+        held.sort_by(|a, b| (&a.subject_kind, &a.code).cmp(&(&b.subject_kind, &b.code)));
+        held.into_iter()
+            .map(|c| {
+                let log = facts_of(&events, &ClassRef::new(&c.subject_kind, &c.code))?;
+                Ok(birth_plan(c, &log, None))
+            })
+            .collect()
+    }
+}
+
+/// One Class's facts, in replay order: the events recorded here for its
+/// key — this adapter's own log.
+fn facts_of(events: &[Event], class_ref: &ClassRef) -> Result<Vec<ClassFact>, ClassError> {
+    let mine = events.iter().filter(|e| {
+        ClassFact::from_logged(&e.kind, &e.payload).is_ok_and(|(key, _)| key == *class_ref)
+    });
+    facts_in_replay_order(mine.map(|e| (e.kind.as_str(), &e.payload)))
+}
+
+/// The backfilled `class.declared` a door stages before its own fact on
+/// a Class this log does not declare ([`undeclared_birth`], backlog
+/// 6c2aa86c), or `None` when it declares it. This double has no stamps
+/// and no path that writes a row outside its doors — a seeded row is a
+/// migration's — so nothing here can show a change outside them; the Pg
+/// adapter asks its row's stamps.
+fn birth_before_a_door_fact(
+    held: &Class,
+    events: &[Event],
+    stamp: &EventStamp,
+) -> Result<Option<Event>, ClassError> {
+    let log = facts_of(events, &ClassRef::new(&held.subject_kind, &held.code))?;
+    undeclared_birth(held, &log, None)?
+        .map(|born| backfilled_declared_event(stamp, &born))
+        .transpose()
 }
 
 #[cfg(test)]
@@ -206,6 +355,67 @@ mod tests {
             .unwrap();
         assert!(r.is_some());
         assert!(r.unwrap().retired_at.is_some());
+    }
+
+    /// Backlog 6c2aa86c: a seeded row (a migration's, or one the batch
+    /// door inserted before it staged facts) has no birth in the log. Its
+    /// first door fact records the birth first — the row as it stood
+    /// before that fact, marked as a backfill — then the fact itself, so
+    /// no door fact lands on an undeclared Class. A restatement records
+    /// nothing, and a Class the log declares gets no second birth.
+    #[tokio::test]
+    async fn a_door_fact_on_a_seeded_row_records_its_birth_first() {
+        let stamp = EventStamp::new(
+            "classes",
+            boss_core::actor::ActorId::Automation("tenant-seed".into()),
+        );
+        let seeded = employee("clerk", 3, false);
+        let repo = InMemoryClasses::new(vec![seeded.clone(), employee("cook", 4, false)]);
+
+        assert!(repo.update(&seeded, &stamp).await.unwrap());
+        assert!(repo.recorded_events().is_empty(), "a restatement: no fact");
+
+        let mut edited = seeded.clone();
+        edited.display_name = "Clerk of works".into();
+        assert!(repo.update(&edited, &stamp).await.unwrap());
+        assert!(
+            repo.retire(&ClassRef::new("employee", "cook"), &stamp)
+                .await
+                .unwrap()
+        );
+        let mut again = edited.clone();
+        again.sort_order = 9;
+        assert!(repo.update(&again, &stamp).await.unwrap());
+
+        let events = repo.recorded_events();
+        let seen: Vec<(&str, &str)> = events
+            .iter()
+            .map(|e| (e.kind.as_str(), e.payload["code"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (crate::port::CLASS_DECLARED, "clerk"),
+                (crate::port::CLASS_UPDATED, "clerk"),
+                (crate::port::CLASS_DECLARED, "cook"),
+                (crate::port::CLASS_RETIRED, "cook"),
+                (crate::port::CLASS_UPDATED, "clerk"),
+            ],
+            "{events:?}"
+        );
+        assert!(crate::port::is_backfill(&events[0].payload));
+        assert_eq!(events[0].payload["display_name"], json!("CLERK"));
+        assert_eq!(events[2].payload["retired_at"], serde_json::Value::Null);
+        for key in [
+            ClassRef::new("employee", "clerk"),
+            ClassRef::new("employee", "cook"),
+        ] {
+            assert_eq!(
+                repo.backfill_declared(&key, &stamp).await.unwrap(),
+                Backfill::AlreadyDeclared,
+                "{key:?}: the log declares it and replays to the row"
+            );
+        }
     }
 
     #[tokio::test]

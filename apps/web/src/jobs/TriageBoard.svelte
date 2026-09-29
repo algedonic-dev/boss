@@ -41,6 +41,7 @@
   import { formatActor } from '../data/actor';
   import { loadOwnerNames, personIdsOf } from '../data/ownerNames';
   import { okRead, type ReadState } from '../data/readState';
+  import { saveStep } from '../steps/stepWrite';
 
   type Props = Readonly<{
     /// Which queue this board shows. One Workflow today because that is
@@ -296,14 +297,15 @@
     }
   }
 
-  /// PUT semantics on a step are read-overlay-write, and top-level
-  /// metadata is replaced wholesale — so merge with what is already
-  /// there or the other keys are wiped.
+  /// The keys go to the step merge door and the status to a PUT carrying
+  /// no metadata (backlog e39a9d2a, Stage 2) — `saveStep` does both.
   ///
   /// The merge is load-bearing, not hygiene: `authority_role` lives in
   /// this same metadata and is how the fork step is found at all. A
   /// write that replaced metadata would make the card vanish on its
-  /// first hand-off.
+  /// first hand-off. This used to re-send the whole read metadata on the
+  /// PUT to keep it; the merge door keeps it by touching only the keys
+  /// it is sent, and deletes the ones sent as null (a recall).
   async function patchStep(
     j: Job,
     patch: Record<string, unknown>,
@@ -313,14 +315,8 @@
     if (!step || busy[j.id]) return;
     busy = { ...busy, [j.id]: true };
     try {
-      const body: Record<string, unknown> = { ...patch };
-      if (metadata) body.metadata = { ...(step.metadata ?? {}), ...metadata };
-      const r = await fetch(`/api/jobs/${j.id}/steps/${step.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+      const r = await saveStep(j.id, step.id, { ...patch, ...(metadata ? { metadata } : {}) });
+      if (r.kind === 'failed') throw new Error(r.error);
       await load();
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);

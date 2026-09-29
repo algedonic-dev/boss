@@ -39,6 +39,7 @@ import { test, expect, type Page, type Request } from './_test';
 import { EMPLOYEE_DETAIL, SHELL_ENDPOINTS, installSmokeMocks } from './_smokeMocks';
 import { FAILURE_MARKER, ROUTES } from './_routes';
 import { nextFrame } from './_helpers';
+import { scaled } from '../../src/dev-load';
 
 /// The endpoints that stay up — SHELL_ENDPOINTS, defined beside the
 /// fixtures in _smokeMocks.ts since the interaction crawl's empty leg
@@ -76,11 +77,13 @@ const HEALTHY = SHELL_ENDPOINTS;
 /// so no entry left is a page that swallows a read the crawl breaks —
 /// each is a read that never fires here, one HEALTHY keeps up, or no
 /// read at all.
+///
+/// 2026-09-28, backlog 0ca34ab5 (with d4b08eca, fd7f4ab8): 8 → 4. The
+/// four that were silent only because the crawl's session was empty —
+/// /, /ux/me, /ux/inbox, /ux/calendar/me — are crawled SIGNED_IN below,
+/// their identity-keyed reads fire into the outage, and each page's own
+/// failure line is asserted by the first test.
 const SILENT: ReadonlyMap<string, string> = new Map([
-  ['/', 'My Day (the bare alias): same as /ux/me'],
-  ['/ux/me', 'My Day: identity-keyed reads never fire under the empty mocked session (its two failure lines wear the marker)'],
-  ['/ux/inbox', 'inbox: /api/messages/inbox/{id} never fires under the empty mocked session'],
-  ['/ux/calendar/me', 'my calendar: identity-keyed reads never fire under the empty mocked session'],
   ['/ux/hr', 'HR: its one load-time read, /api/people, is a shell read HEALTHY keeps up (its /hr alias breaks it, in ALSO_BROKEN); the workflow + step reads fire on the Workflows tab (false-empty.mocked.spec.ts fails each one)'],
   ['/it/kb', 'KB: its search reads fire on a query, not on load'],
   ['/it/auth-admin', 'auth admin: its reads fire behind a tab'],
@@ -136,8 +139,15 @@ const ALSO_BROKEN: ReadonlyMap<string, ReadonlyArray<RegExp>> = new Map([
 /// reason alone. On these routes the probe names the fixture operator and
 /// that operator's people row stays up, so the session resolves and the
 /// page's own reads fire into the outage like any other route's.
-/// /ux/views was the first: its list read waits for a viewer.
-const SIGNED_IN: ReadonlySet<string> = new Set(['/ux/views']);
+/// /ux/views was the first: its list read waits for a viewer. My Day (/
+/// and /ux/me), the inbox (/api/messages/inbox/emp-001) and my calendar
+/// followed (backlog 0ca34ab5): each keys its reads on the viewer and sat
+/// on SILENT for that alone. The viewer's row is the one read kept up,
+/// so the chrome's own "Couldn't load your employee record" line cannot
+/// stand in for the page's — measured: with the marker class stripped
+/// from MePage, InboxPage and MyCalendarPage, the first test names
+/// exactly these four routes and no other.
+const SIGNED_IN: ReadonlySet<string> = new Set(['/ux/views', '/', '/ux/me', '/ux/inbox', '/ux/calendar/me']);
 const SIGNED_IN_PROBE = { username: 'ceo', employee_id: 'emp-001', role: 'ceo' };
 
 /// How late a route's OWN read is issued — the manual-page fix's figure
@@ -242,7 +252,7 @@ function watchReads(page: Page): Reads {
 /// normal path leaves in a few hundred ms, FASTER than the sleep it
 /// replaces, because it leaves when the work is done rather than when
 /// the clock says it should be.
-const SETTLE_BUDGET_MS = 15_000;
+const SETTLE_BUDGET_MS = scaled(15_000);
 /// A mount can fire a second read once the first answers, so an empty
 /// in-flight set is only quiescence if it STAYS empty this long.
 const QUIET_MS = 250;
@@ -299,7 +309,7 @@ async function crawl(page: Page, routes: ReadonlyArray<string>, until: Await): P
         reads.inFlight.clear();
         reads.issued = 0;
         await page.goto(route, { waitUntil: 'commit' });
-        await expect(page.locator('.app-shell')).toBeVisible({ timeout: 20_000 });
+        await expect(page.locator('.app-shell')).toBeVisible({ timeout: scaled(20_000) });
         shell = true;
       } catch {
         // Recorded as shell:false below if the retry also misses.

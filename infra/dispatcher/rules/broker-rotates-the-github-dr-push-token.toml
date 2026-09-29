@@ -1,0 +1,64 @@
+# ---------------------------------------------------------------------
+# The credential broker rotates the disaster-recovery push token for
+# algedonic-dev/boss-dr (design 76155676, David 2026-09-27; backlog
+# 81eb6d4d). THIS RULE IS THE CREDENTIAL'S CONSUMER DECLARATION, the
+# convention of `broker-rotates-the-boss-dev-forge-token`: registry id
+# `github-dr-push-token`, Secret boss/github-dr-push-token key `token`,
+# minted from the GitHub App root as a one-hour INSTALLATION TOKEN
+# narrowed to the one repository and the two permissions a push needs,
+# proven by reading algedonic-dev/boss-dr.
+#
+# THE ROOT is the GitHub App on the algedonic-dev organisation — its App
+# id, installation id and private key, placed ONCE by David in Secret
+# boss/boss-credential-broker-root (keys github-app.id,
+# github-app.installation-id, github-app.private-key.pem), reaching the
+# dispatcher as env (boss.yaml). Until all three are there, a firing
+# refuses naming the keys it lacks. No personal access token is minted
+# for BOSS again (design 76155676, decision 1).
+#
+# WHICH INSTALLATION. The App (its id and key) is the one root; an
+# installation is per organisation (David, 2026-09-27: a repository per
+# hosting customer, and customers who bring their own repository install
+# the App on their org). This row names no `installation_id`, so it mints
+# for the root's own — github-app.installation-id, the algedonic-dev
+# installation. A consumer on another org is another pair of rule files
+# carrying `installation_id = "\"<its id>\""` beside its own Secret, a
+# resourceNames entry for that Secret in boss-credential-broker.yaml, and
+# its registry row — data, no code.
+#
+# TWO FIRINGS, ONE DECLARATION. This rule is the EXPOSURE path: a
+# rotate-a-credential packet's scope step, after which the handler mints,
+# verifies, revokes the value the Secret holds (an installation token can
+# be ended only by presenting it, so it is revoked before it is
+# overwritten), installs, and records each phase on the packet. The
+# ROUTINE path is `broker-refreshes-the-github-dr-push-token`, a clock
+# rule that re-mints before the hour runs out; it hands the handler these
+# same args plus its phase, pinned equal by
+# crates/core/boss-dispatcher/tests/github_app_installation_token_rules.rs
+# (CLAUDE.md §9a).
+#
+# THE CONSUMER is off the cluster: infra/forge/offsite-push.sh pushes
+# forge main to algedonic-dev/boss-dr with the token file
+# /etc/boss-publish/github-dr.token, which the forge converge renders from
+# this Secret (the deposit half is a separate car). The Secret is created
+# EMPTY by the cluster converge from this file's secret_namespace /
+# secret_name (cluster-deploy-lib.sh ensure_declared_secrets); the
+# broker's name-scoped grant on it is `credential-broker-github-app` in
+# infra/cluster/manifests/boss-credential-broker.yaml.
+[[rule]]
+name = "broker-rotates-the-github-dr-push-token"
+why = """
+EXTERNAL GLUE, the census class for reactions whose effect lives outside
+the system: the broker speaks to GITHUB's App API (the installation-token
+exchange, the token revoke) and the k8s Secret store, neither of which a
+Workflow definition can address. The rotate-a-credential protocol row
+declares the ORDER; this rule is the machine executor for ONE credential,
+and its args are that credential's declaration — Secret, narrowing,
+proving repository. It adds no routing: it advances the very packet that
+fired it and spawns nothing. Design 76155676 (2026-09-27).
+"""
+on_event = "step.done.credential-rotation"
+when = 'subject_id = "github-dr-push-token" OR metadata.credential = "github-dr-push-token"'
+[[rule.do]]
+handler = "credential.rotate.github-app-installation"
+args = { secret_namespace = "\"boss\"", secret_name = "\"github-dr-push-token\"", secret_key = "\"token\"", credential_id = "\"github-dr-push-token\"", verify_repo = "\"algedonic-dev/boss-dr\"", repositories = "\"boss-dr\"", permissions = "\"contents:write,metadata:read\"" }

@@ -105,10 +105,12 @@ fn a_review_with_a_question_unanswered_is_refused_naming_the_anchor() {
         .message
         .clone();
     assert!(msg.contains("acts") && !msg.contains("host"), "{msg}");
-    // All three: the review may complete.
+    // All three: the review may complete. `doc_path` is the kind's
+    // required field, declared on the step since backlog a14f04b3 —
+    // `boss design` writes it (empty for a packet-borne design).
     StepRegistry::validate_authored_fields(
         &review.fields,
-        &json!({ "title": "t", "markdown": "m", "questions": questions(), "resolutions": [
+        &json!({ "title": "t", "markdown": "m", "doc_path": "", "questions": questions(), "resolutions": [
             {"anchor": "host", "decision": "forge now"},
             {"anchor": "credentials", "decision": "/etc/boss-ops root 0600"},
             {"anchor": "acts", "decision": "reads now; node-converge bounded"}

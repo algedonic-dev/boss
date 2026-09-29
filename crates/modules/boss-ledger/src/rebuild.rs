@@ -146,6 +146,9 @@ pub async fn rebuild(pool: &PgPool) -> Result<RebuildReport, LedgerError> {
 async fn rebuild_account_daily(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<(), LedgerError> {
+    // No log-complete check (design b046f510): this re-aggregates
+    // gl_journal_lines, a committed table, not audit_log — nothing
+    // staged in event_outbox is missing from its source.
     sqlx::query("TRUNCATE gl_account_daily")
         .execute(&mut **tx)
         .await

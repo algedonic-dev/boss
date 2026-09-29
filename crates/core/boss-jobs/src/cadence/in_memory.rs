@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 
 use super::port::{CadenceError, CadenceRegistry, CadenceRepository};
-use super::types::{CadenceRuleRow, CadenceRuleSpec, LastFiring, NewFiring};
+use super::types::{CadenceRuleRow, CadenceRuleSpec, FiringOutcome, LastFiring, NewFiring};
 use crate::registry::WorkflowStatus;
 
 #[derive(Default)]
@@ -120,37 +120,45 @@ impl CadenceRepository for InMemoryCadence {
                     .get("rc")
                     .and_then(serde_json::Value::as_i64)
                     .map(|v| v as i32),
+                board_decision: crate::board_decision::BoardDecision::of_detail(&f.detail),
             }))
     }
 
     async fn claim_firing(&self, new: &NewFiring) -> Result<bool, CadenceError> {
+        // The detail both adapters land (`types::claim_detail`): a null
+        // is `{}`, a non-object is refused before anything is claimed.
+        let detail = super::types::claim_detail(&new.detail).map_err(CadenceError::BadRequest)?;
         let mut guard = self.firings.write().await;
         if guard.contains_key(&new.firing_id) {
             // Mirrors ON CONFLICT (firing_id) DO NOTHING.
             return Ok(false);
         }
-        guard.insert(new.firing_id.clone(), new.clone());
+        guard.insert(
+            new.firing_id.clone(),
+            NewFiring {
+                detail,
+                ..new.clone()
+            },
+        );
         Ok(true)
     }
 
     async fn record_outcome(
         &self,
         firing_id: &str,
-        rc: i32,
-        runtime_secs: u64,
+        outcome: &FiringOutcome,
     ) -> Result<(), CadenceError> {
         let mut guard = self.firings.write().await;
         if let Some(f) = guard.get_mut(firing_id) {
             // Mirrors `detail || $2` — merge, don't replace.
-            let obj = f.detail.as_object_mut();
-            match obj {
-                Some(map) => {
-                    map.insert("rc".into(), serde_json::json!(rc));
-                    map.insert("runtime_secs".into(), serde_json::json!(runtime_secs));
+            let patch = outcome.detail_patch();
+            match (f.detail.as_object_mut(), patch.as_object()) {
+                (Some(map), Some(p)) => {
+                    map.extend(p.iter().map(|(k, v)| (k.clone(), v.clone())));
                 }
-                None => {
-                    f.detail = serde_json::json!({ "rc": rc, "runtime_secs": runtime_secs });
-                }
+                // Unreachable through a claim — `claim_detail` lands only
+                // objects — but a merge into nothing is the patch.
+                _ => f.detail = patch,
             }
         }
         Ok(())
@@ -178,6 +186,9 @@ impl CadenceRegistry for InMemoryCadence {
         actor: &boss_core::actor::ActorId,
         now: DateTime<Utc>,
     ) -> Result<CadenceRuleSpec, CadenceError> {
+        // The table's CHECKs, which Postgres enforces and this double
+        // did not until the adapters-agree suite (backlog be459ab9).
+        super::types::check_rule(&spec.row).map_err(CadenceError::BadRequest)?;
         let mut rules = self.rules.write().await;
         let newest = newest_version(
             rules
@@ -263,7 +274,16 @@ mod tests {
         let repo = InMemoryCadence::default();
         let f = firing("cadence:board:2026-08-14T12:00Z", "board");
         repo.claim_firing(&f).await.unwrap();
-        repo.record_outcome(&f.firing_id, 0, 42).await.unwrap();
+        repo.record_outcome(
+            &f.firing_id,
+            &FiringOutcome {
+                rc: 0,
+                runtime_secs: 42,
+                board_decision: None,
+            },
+        )
+        .await
+        .unwrap();
 
         let got = repo.firing(&f.firing_id).await.unwrap();
         assert_eq!(got.detail["rc"], 0);
@@ -271,6 +291,49 @@ mod tests {
         // The dock depth that TRIGGERED the firing survives the merge;
         // replacing detail would lose why the rule fired at all.
         assert_eq!(got.detail["dock_depth"], 8);
+        assert!(
+            got.detail.get(crate::board_decision::FIRING_KEY).is_none(),
+            "no decision, no key"
+        );
+    }
+
+    /// Backlog 96f02540: a board's decision is merged in with its outcome
+    /// and read back on the rule's last firing, where the yard reads it.
+    #[tokio::test]
+    async fn a_boards_decision_rides_its_outcome_to_the_last_firing() {
+        use crate::board_decision::BoardDecision;
+        let repo = InMemoryCadence::default();
+        let f = firing("cadence:board:2026-09-28T02:45Z", "board");
+        repo.claim_firing(&f).await.unwrap();
+        assert_eq!(
+            repo.last_firing("board")
+                .await
+                .unwrap()
+                .unwrap()
+                .board_decision,
+            None,
+            "no outcome yet, no decision"
+        );
+        let decision = BoardDecision::NoBoardableCar {
+            reason: "no train departed — every car on the dock is held".into(),
+        };
+        repo.record_outcome(
+            &f.firing_id,
+            &FiringOutcome {
+                rc: -2,
+                runtime_secs: 9,
+                board_decision: Some(decision.clone()),
+            },
+        )
+        .await
+        .unwrap();
+        let last = repo.last_firing("board").await.unwrap().unwrap();
+        assert_eq!(last.rc, Some(-2));
+        assert_eq!(last.board_decision, Some(decision));
+        assert_eq!(
+            repo.firing(&f.firing_id).await.unwrap().detail["dock_depth"],
+            8
+        );
     }
 
     #[tokio::test]
@@ -323,7 +386,6 @@ mod tests {
                 cadence: None,
                 anchor_date: None,
                 business_calendar: None,
-                regate_hold_minutes: None,
             },
             created_at: DateTime::<Utc>::UNIX_EPOCH,
         }

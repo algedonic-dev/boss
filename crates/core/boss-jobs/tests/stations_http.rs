@@ -444,6 +444,37 @@ async fn the_load_states_how_many_distinct_packets_its_depths_hold() {
     assert_eq!(row("my-watchlist")["also_elsewhere"], 0);
 }
 
+/// Each load row names the Workflow kind its station's predicate holds,
+/// apart from the station's own kind — so the Department Map can link a
+/// siding to the per-kind drill-down at /it/operate/bottlenecks
+/// (backlog c7c5c1de). The row's `kind` is the STATION kind (batch,
+/// constraint, actor): the page audit read it as the Workflow kind, and
+/// a link built on it would have opened the Bottlenecks page on
+/// `?kind=batch`, which is no kind at all. A station whose predicate
+/// spans kinds names none — `null`, not a guess.
+#[tokio::test]
+async fn a_load_row_names_the_workflow_kind_its_station_holds() {
+    let (app, _jobs) = app();
+    let (status, v) = get_json(&app, "/api/stations/load", "emp-ceo", "ceo").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let row = |name: &str| {
+        v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["station"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {name} row in {v}"))
+    };
+    assert_eq!(row("test-dock")["kind"], "batch", "the station's own kind");
+    assert_eq!(row("test-dock")["workflow_kind"], "car-kind", "{v}");
+    assert_eq!(row("brewer-gate")["workflow_kind"], "car-kind");
+    assert!(
+        row("my-watchlist")["workflow_kind"].is_null(),
+        "a predicate naming no kind names none: {v}"
+    );
+}
+
 /// Past one page, the load and the queue still count every packet.
 ///
 /// Both read the open packets through one `list_jobs` call of

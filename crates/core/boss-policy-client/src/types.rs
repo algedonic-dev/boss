@@ -127,6 +127,16 @@ impl Resource {
     pub fn event() -> Self {
         Self::new("event")
     }
+    /// The estate: the machines BOSS declares it runs on and the loop's
+    /// readings of them — `GET /api/estate/nodes`, `/observations` and
+    /// `/comparisons` (backlog e5f7b51e). Its own resource rather than
+    /// `subject` + `event`, which those reads asked at first, because
+    /// the break-glass session must read it during a recovery and must
+    /// NOT gain `subject` (a door key, not a data key): one grant opens
+    /// exactly these three reads and nothing else.
+    pub fn estate() -> Self {
+        Self::new("estate")
+    }
 
     /// The general ledger as a readable surface: accounts, the trial
     /// balance, the three statements, journal entries, tax liability,
@@ -139,6 +149,21 @@ impl Resource {
     /// company's finances at all.
     pub fn ledger() -> Self {
         Self::new("ledger")
+    }
+
+    /// Closing an accounting period (`POST /api/ledger/periods/{id}/lock`)
+    /// is Close, and reopening one (`/unlock`) is Update (backlog
+    /// 25a4f7f9, 2026-09-28: both doors asked for nothing past the
+    /// `ledger` READ grant, so every finance reader could freeze a month
+    /// or reopen one). Two actions so a tenant can let one role close
+    /// months while reopening — which lets a closed month's history be
+    /// rewritten — stays with another. Not a shipped resource, so the
+    /// read-only roles inherit none of it; the deploy superuser holds both
+    /// in `default_rules`, and tenants grant their finance leads. Creating
+    /// a fiscal year (`POST /api/ledger/periods`) is Create here too
+    /// (backlog 34f0a954).
+    pub fn ledger_period() -> Self {
+        Self::new("ledger-period")
     }
 
     /// Identity rows — the `subjects` table, across every kind.
@@ -176,6 +201,78 @@ impl Resource {
     /// role inherits it; the deploy superuser holds it in `default_rules`.
     pub fn dispatcher_rule() -> Self {
         Self::new("dispatcher-rule")
+    }
+
+    /// Writing the SubjectKind registry — today its one write, a kind's
+    /// metadata merge, which is Update (backlog abc2e9d5, 2026-09-28:
+    /// until then the registry had no write door, so a migration UPDATE
+    /// with no event was the only way to set a kind's `module`). Not a
+    /// shipped resource, for the dispatcher-rule reason; the deploy
+    /// superuser holds it in `default_rules`.
+    pub fn subject_kind() -> Self {
+        Self::new("subject-kind")
+    }
+
+    /// Writing the Class registry: declaring rows (`POST
+    /// /api/classes/batch`) is Create, editing one is Update, withdrawing
+    /// one is Retire (backlog 553cf479, 2026-09-28: the three doors
+    /// checked the caller's access tier and never asked policy, so no
+    /// rule could narrow or widen who edits a taxonomy). Not a shipped
+    /// resource, for the dispatcher-rule reason; the deploy superuser
+    /// holds it in `default_rules`, and reads of the registry ask no one.
+    pub fn class() -> Self {
+        Self::new("class")
+    }
+
+    /// Writing the Locations registry — today its one write, the
+    /// declaration batch (`POST /api/locations/batch`), which is Create
+    /// (backlog 59deda40, 2026-09-28: the door checked the caller's
+    /// access tier and never asked policy, the classes doors' shape
+    /// before 553cf479). Not a shipped resource, for the dispatcher-rule
+    /// reason; the deploy superuser holds it in `default_rules`, and
+    /// reads of the registry ask no one.
+    pub fn location() -> Self {
+        Self::new("location")
+    }
+
+    /// Writing the business-calendar registry (`POST
+    /// /api/calendar/business-calendars/batch`): declaring a code the
+    /// registry does not hold is Create, and `?mode=take` — which
+    /// replaces a held code's closed set wholesale — is Update (backlog
+    /// 59deda40). A reservation on a calendar is `schedule`, not this.
+    /// Not shipped; the deploy superuser holds it in `default_rules`.
+    pub fn business_calendar() -> Self {
+        Self::new("business-calendar")
+    }
+
+    /// Writing the chart of accounts (`POST /api/ledger/accounts/batch`,
+    /// Create; backlog 59deda40). Neither `account` — a customer
+    /// Subject, which tenants grant to their sales roles — nor `ledger`,
+    /// the finance READ surface every finance role holds: declaring a GL
+    /// account is the operating model's machinery. Not shipped; the
+    /// deploy superuser holds it in `default_rules`.
+    pub fn ledger_account() -> Self {
+        Self::new("ledger-account")
+    }
+
+    /// Writing the tenant's tax regime — its filing kinds and sales-tax
+    /// rates, one door (`POST /api/ledger/tax/batch`, Create; backlog
+    /// 59deda40). Named for the regime rather than for rates alone,
+    /// because the door writes both tables. Not shipped; the deploy
+    /// superuser holds it in `default_rules`.
+    pub fn tax_regime() -> Self {
+        Self::new("tax-regime")
+    }
+
+    /// Publishing the ledger's posting and projection rules (`POST
+    /// /api/ledger/posting-rules/batch` and `/fact-projection-rules/batch`,
+    /// Create; backlog 432f0eb4). Not `ledger`, the grant a tenant gives
+    /// its finance leads to post and settle: the posting path takes the
+    /// newest version of a fact kind's rule, so publishing one rewrites
+    /// how every later fact posts. Not shipped; the deploy superuser
+    /// holds it in `default_rules`.
+    pub fn posting_rule() -> Self {
+        Self::new("posting-rule")
     }
 
     // ---- Module-tier shorthands ------------------------------------
@@ -435,6 +532,37 @@ impl User {
             direct_report_ids: vec![],
             department: None,
         }
+    }
+
+    /// The identity a service presents when it asks policy on its own
+    /// account: `automation:<service>` (its `boss-ports` name, the one
+    /// `machine_gate::mount` takes), at operator tier — the shape the
+    /// dispatcher, the escalation router and the gateway's own writes
+    /// already sign with. [`crate::ReqwestPolicyClient`] sends it as
+    /// `x-boss-user` on every `/check` (backlog b8e75382 F7 / e84de48e):
+    /// until 2026-09-29 it sent none, so the policy service could not tell
+    /// a service asking about the person in front of it from a stranger
+    /// on its port asking about anyone. The policy service judges it on
+    /// its signed arm, which admits a holder of Read on `policy-rule` at
+    /// scope all — hence `platform-admin`.
+    pub fn service(service: &str) -> User {
+        User {
+            id: format!("automation:{service}"),
+            role: boss_core::roles::PLATFORM_ADMIN_ROLE.to_string(),
+            access_tier: AccessTier::Operator,
+            territory_account_ids: vec![],
+            direct_report_ids: vec![],
+            department: Some("platform".to_string()),
+        }
+    }
+
+    /// Whether this caller presents a service's identity — the
+    /// `automation:` id [`User::service`] makes. ASSERTED, not proven:
+    /// behind the gateway (which replaces `x-boss-user` from the session)
+    /// nothing verifies it until the machine token enforces, so a door
+    /// may use it to decide how to ANSWER, never to grant.
+    pub fn is_service(&self) -> bool {
+        self.id.starts_with("automation:")
     }
 
     /// Whether this is the [`User::anonymous`] caller — or one whose

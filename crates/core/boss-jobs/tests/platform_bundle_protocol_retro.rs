@@ -136,3 +136,36 @@ fn the_retro_collect_step_requires_the_core_changes_reading() {
         );
     }
 }
+
+/// The gate-run verdict split is read off a LIST, and since backlog
+/// ea80b5fd a list row's steps are slim unless the read asks
+/// `full=true`. The verdict and receipt are `record-verdict` step
+/// METADATA (gate-run.toml), and the job's own `outcome` is only
+/// completed/failed, which cannot tell `lost` from `failed` — so the
+/// procedure counts the terminal step each packet completed, which a
+/// slim row keeps, and names the flag for the rest.
+#[test]
+fn the_retro_reads_the_gate_verdict_split_from_what_a_slim_row_keeps() {
+    let wf = protocol_retro();
+    let collect = wf
+        .steps
+        .iter()
+        .find(|s| s.title == "collect")
+        .expect("protocol-retro has a collect step");
+    let procedure = collect
+        .metadata_defaults
+        .get("procedure")
+        .and_then(|v| v.as_str())
+        .expect("collect carries a procedure");
+    for phrase in [
+        "GET /api/jobs?kind=gate-run",
+        "green / failed / lost / refused",
+        "a slim list row keeps",
+        "&full=true",
+    ] {
+        assert!(
+            procedure.contains(phrase),
+            "collect's procedure names `{phrase}`"
+        );
+    }
+}

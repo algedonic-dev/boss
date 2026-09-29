@@ -206,6 +206,16 @@ fn board_rows(b: &BoardingPredicate, trains: &[TrainStatus], now: DateTime<Utc>)
                         SOURCE_CADENCE,
                         crate::yard::FIRING_UNREAD.to_string(),
                     )
+                } else if b.hold.cooldown_remaining_minutes.is_none()
+                    && b.hold.held_because.is_some()
+                {
+                    // The board's own last tick refused (backlog 96f02540):
+                    // the block states that decision, and there is no time
+                    // to give until the board decides otherwise.
+                    NextEvent {
+                        basis: b.hold.next_board.clone(),
+                        ..base
+                    }
                 } else {
                     let (at, basis) = match b.hold.cooldown_remaining_minutes {
                         Some(m) => (
@@ -660,6 +670,68 @@ mod tests {
         assert_eq!(rows[1].kind, NextKind::TrainWindow);
     }
 
+    /// Backlog 96f02540, the measured case end to end: the board refused
+    /// on its last tick (every car held), recorded that on its firing, and
+    /// the boarding block built from the cadence rows and that firing says
+    /// so — so NEXT UP, and `boss orient` which prints it, never says
+    /// "nothing holds it" while the board is refusing. Built through
+    /// `yard::boarding_predicate`, the path the regions handler takes, not
+    /// a hand-made block.
+    #[test]
+    fn a_board_that_refused_on_its_last_tick_is_never_nothing_holds_it() {
+        use crate::board_decision::{BoardDecision, NoDeparture};
+        use crate::cadence::{CadenceRuleRow, LastFiring};
+        use crate::yard::{BoardFirings, BoardingReadings};
+        let rule = CadenceRuleRow {
+            name: "train-board-on-dock-depth".into(),
+            verb: "board".into(),
+            basis: "queue-depth".into(),
+            every_minutes: None,
+            at_times: None,
+            min_dock_depth: Some(1),
+            cooldown_minutes: Some(30),
+            cadence: None,
+            anchor_date: None,
+            business_calendar: None,
+        };
+        let refusal = NoDeparture::HeldOnEdges {
+            cars: "5a1b2c3d, 6e7f8a9b".into(),
+            needs_human: String::new(),
+        };
+        let decision = BoardDecision::from(&refusal);
+        let last = LastFiring {
+            firing_id: "cadence:train-board-on-dock-depth:2026-09-27T17:07Z".into(),
+            fired_at: t("2026-09-27T17:07:00Z"),
+            rc: Some(-2),
+            board_decision: Some(decision.clone()),
+        };
+        let b = crate::yard::boarding_predicate(
+            &[rule],
+            Some(7),
+            BoardFirings {
+                depth: Some(&last),
+                clock: None,
+            },
+            0,
+            Some(t(NOW)),
+            BoardingReadings::default(),
+        );
+        let rows = run(&yard(b), Ok(vec![]), Ok(vec![]));
+        let board = of(&rows, NextKind::TrainBoard);
+        assert_eq!(board.len(), 1, "{rows:#?}");
+        assert_eq!(board[0].at, None, "a refusing board has no time to promise");
+        assert!(
+            !board[0].basis.contains("nothing holds it"),
+            "{}",
+            board[0].basis
+        );
+        assert!(
+            board[0].basis.contains(&decision.line()),
+            "the board's own words: {}",
+            board[0].basis
+        );
+    }
+
     /// Past the last window of the day, the next is tomorrow's first.
     #[test]
     fn the_window_after_the_last_of_the_day_is_tomorrows_first() {
@@ -750,6 +822,7 @@ mod tests {
                     since: "2026-09-27T17:00:00Z".into(),
                     stale: false,
                     train: None,
+                    ..Default::default()
                 },
                 ActiveGate {
                     branch: "feat/b".into(),
@@ -757,6 +830,7 @@ mod tests {
                     since: "2026-09-27T17:05:00Z".into(),
                     stale: false,
                     train: None,
+                    ..Default::default()
                 },
             ],
             queued: vec![

@@ -124,21 +124,29 @@ impl DeliveryPolicyRegistry for PgDeliveryPolicy {
         _actor: &boss_core::actor::ActorId,
         now: DateTime<Utc>,
     ) -> Result<DeliveryPolicySpec, DeliveryPolicyError> {
+        // The table's CHECKs, judged before the write so a refused
+        // declaration is a BadRequest naming its column, the double's
+        // answer, rather than a storage error naming a constraint
+        // (backlog be459ab9, found by the adapters-agree suite).
+        super::types::check_policy(&spec.row).map_err(DeliveryPolicyError::BadRequest)?;
         let mut tx = self.pool.begin().await.map_err(storage)?;
 
-        let exists: Option<(i32,)> =
-            sqlx::query_as("SELECT version FROM delivery_policy WHERE name = $1 AND version = $2")
-                .bind(spec.name())
-                .bind(spec.version())
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(storage)?;
-        if exists.is_some() {
-            return Err(DeliveryPolicyError::Conflict(format!(
-                "row already exists: {}@{}",
-                spec.name(),
-                spec.version()
-            )));
+        // THE FLOOR, inside the write (backlog df793bd7): the newest
+        // version of the name, any status, read after every other
+        // declared write of it has committed or waits behind this one
+        // (`crate::declared_version`).
+        let newest = crate::declared_version::lock_and_read_newest(
+            &mut tx,
+            "delivery_policy",
+            "name",
+            spec.name(),
+        )
+        .await
+        .map_err(storage)?;
+        if spec.version() <= newest {
+            return Err(DeliveryPolicyError::Conflict(
+                crate::declared_version::not_above(spec.name(), spec.version(), newest),
+            ));
         }
 
         // RETIRE BY NAME, THEN INSERT — the order 202609050500 used, and

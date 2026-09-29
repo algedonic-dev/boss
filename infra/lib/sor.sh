@@ -54,6 +54,12 @@ if [ -r "$SOR_ENV" ]; then
     unset _sor_line _sor_key _sor_val
 fi
 
+# sor_reader_header ID — who a machine READ of the record signs as. One
+# definition, in a file with no side effects so a lint can take it too
+# (backlog e5f7b51e; see the file).
+# shellcheck source=infra/lib/sor-reader.sh
+. "$(dirname "${BASH_SOURCE[0]}")/sor-reader.sh"
+
 # sor_require NAME... — exit 1, naming the first NAME still unset.
 sor_require() {
     local n

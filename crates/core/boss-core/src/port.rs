@@ -37,8 +37,18 @@ pub trait EventStore: Send + Sync {
 
 #[derive(Debug, thiserror::Error)]
 pub enum EventBusError {
+    /// A transport failure: says nothing about the event, so the same
+    /// event may publish on a retry.
     #[error("failed to publish event: {0}")]
     PublishFailed(String),
+    /// The bus refused THIS event, deterministically — its encoding is
+    /// over the server's max_payload, or its kind is not a valid
+    /// subject. The same event is refused on every retry, so a caller
+    /// that retries it in order stalls everything behind it (the
+    /// outbox relay did, backlog e4019cbc); it must be set aside with
+    /// this reason instead.
+    #[error("bus refused event: {0}")]
+    Refused(String),
     #[error("failed to subscribe: {0}")]
     SubscribeFailed(String),
     #[error("connection lost: {0}")]

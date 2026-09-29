@@ -300,6 +300,35 @@ pub(crate) fn fork_head(clone: &str, branch: &str) -> Result<Option<String>> {
     Ok((!sha.is_empty()).then_some(sha))
 }
 
+/// The head assembly merges for car `jid`: the one the dock JUDGED this
+/// pass — `Ok(sha)` when the fork still carries it, `Err(reason)` when
+/// the fork head moved since (or the car was never judged), and the car
+/// waits for the next walk, which judges the new head.
+///
+/// WHAT RIDES IS WHAT WAS JUDGED (backlog b7b02024, review F4). The dock
+/// judged — and a review may have released — one sha; the branch NAME
+/// can resolve to another by the time the consist is assembled.
+pub(crate) fn judged_head(
+    clone: &str,
+    judged: &std::collections::HashMap<String, String>,
+    jid: &str,
+    branch: &str,
+) -> Result<std::result::Result<String, String>> {
+    let head = fork_head(clone, branch)?.unwrap_or_default();
+    Ok(match judged.get(jid) {
+        Some(j) if !head.is_empty() && *j == head => Ok(head),
+        j => Err(format!(
+            "its fork head {} is not the head the dock judged ({}) — judged again next window",
+            if head.is_empty() {
+                "(none)"
+            } else {
+                &head[..8.min(head.len())]
+            },
+            j.map(|h| &h[..8.min(h.len())]).unwrap_or("none")
+        )),
+    })
+}
+
 /// The skip reason for a car parked at review whose branch was never
 /// pushed to the fork.
 pub(crate) fn skip_reason_branch_missing(branch: &str) -> String {
@@ -1179,6 +1208,43 @@ mod tests {
         assert_eq!(
             skip_reason_conflict(&[], policy().skip_reason_file_budget),
             "conflict: unresolved (merge died before conflict markers)"
+        );
+    }
+
+    /// The dispatcher's conflict trigger (design b35456ac) files a repair
+    /// only for a skip reason that starts with the prefix its `when`
+    /// names, so the reason this function writes and the prefix that file
+    /// reads are one fact in two places, pinned here (CLAUDE.md §9a): a
+    /// reworded reason would otherwise retire the trigger in silence. The
+    /// prefix is read OUT of the rule file, not retyped.
+    #[test]
+    fn the_conflict_trigger_reads_the_prefix_the_conductor_writes() {
+        let path = boss_testing::dispatcher_rules_dir()
+            .join("rerail-a-car-left-behind-on-a-conflict.toml");
+        let rule = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let call = r#"starts_with(metadata.skip_reason, \""#;
+        let start = rule.find(call).map(|i| i + call.len()).unwrap_or_else(|| {
+            panic!(
+                "the trigger reads skip_reason by prefix: {}",
+                path.display()
+            )
+        });
+        let prefix = &rule[start..start + rule[start..].find(r#"\""#).expect("closing quote")];
+        assert!(!prefix.is_empty());
+        let budget = policy().skip_reason_file_budget;
+        for reason in [
+            skip_reason_conflict(&["src/a.rs".to_string()], budget),
+            skip_reason_conflict(&[], budget),
+        ] {
+            assert!(
+                reason.starts_with(prefix),
+                "the trigger reads `{prefix}`, the conductor wrote `{reason}`"
+            );
+        }
+        assert!(
+            !skip_reason_branch_missing("feat/x").starts_with(prefix),
+            "a missing branch is not a conflict to author a way out of"
         );
     }
 

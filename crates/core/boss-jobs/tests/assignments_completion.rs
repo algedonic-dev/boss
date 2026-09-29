@@ -74,9 +74,45 @@ fn mixed_kind() -> WorkflowSpec {
     )
 }
 
+/// Three `checklist` steps — one kind, one `completion` (human) — that
+/// differ ONLY in what the step itself declares: an agent block with
+/// `human_only = false` (the publish review step of 246d597a), an
+/// agent block the protocol still marks human-only, and no block.
+fn agent_blocks() -> WorkflowSpec {
+    let step = |title: &str, agent: bool, human_only: Option<serde_json::Value>| StepSpec {
+        title: title.into(),
+        kind: "checklist".into(),
+        ready_when: "true".into(),
+        title_template: format!("{title} it"),
+        authority_role: Some("platform-admin".into()),
+        agent: agent.then(|| boss_jobs::agent_spec::AgentSpec {
+            profile: "analyst".into(),
+            model: "opus-5[1m]".into(),
+            budget_usd: 2.0,
+            effort: boss_jobs::agent_spec::Effort::Medium,
+        }),
+        metadata_defaults: human_only
+            .map(|h| serde_json::json!({ "human_only": h }))
+            .unwrap_or(serde_json::Value::Null),
+        ..Default::default()
+    };
+    WorkflowSpec::platform_seed(
+        "agent-blocks",
+        "Agent blocks",
+        "test",
+        vec!["custom".into()],
+        vec![
+            step("review", true, Some(serde_json::json!("False"))),
+            step("sign", true, Some(serde_json::json!(true))),
+            step("tick", false, None),
+        ],
+    )
+}
+
 fn app() -> axum::Router {
     let kinds = Arc::new(InMemoryWorkflows::new());
     kinds.seed(mixed_kind()).expect("seed");
+    kinds.seed(agent_blocks()).expect("seed");
     let policy: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()
             .allow("ceo", Action::Create, Resource::job(), Scope::All)
@@ -98,8 +134,12 @@ fn app() -> axum::Router {
 }
 
 async fn open_packet(app: &axum::Router) {
+    open_packet_of(app, "mixed").await;
+}
+
+async fn open_packet_of(app: &axum::Router, kind: &str) {
     let body = serde_json::json!({
-        "kind": "mixed",
+        "kind": kind,
         "subject": { "subject_kind": "custom", "id": "s1" },
         "title": "a mixed packet",
         "owner_id": "emp-ceo",
@@ -222,4 +262,45 @@ async fn every_row_carries_the_field() {
             "`{kind}` reported {completion:?} — expected a string or null"
         );
     }
+}
+
+/// The row says when the STEP'S OWN agent block hands it to an agent
+/// (backlog 1dd6d7ad). David, 2026-09-27: the publish review step of
+/// 246d597a — kind `checklist`, so `completion = human` by kind, but
+/// carrying an agent block and `human_only = false` — sat in his queue,
+/// and he opened it expecting it to be his: "I thought you were ready
+/// for me because it was in my backlog." The kind's contract cannot
+/// tell those apart, because all three steps below share one kind; only
+/// the step's own declaration can.
+#[tokio::test]
+async fn the_row_says_when_the_steps_own_agent_block_hands_it_to_an_agent() {
+    let app = app();
+    open_packet_of(&app, "agent-blocks").await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/jobs/assignments?roles=platform-admin")
+                .header("x-boss-user", user_header())
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    let rows = v["data"].as_array().expect("data array");
+    let takes = |title: &str| {
+        rows.iter()
+            .find(|r| r["step"]["title"] == format!("{title} it"))
+            .unwrap_or_else(|| panic!("no `{title}` row in {rows:#?}"))["step"]["agent_takes"]
+            .clone()
+    };
+    // An agent block and `human_only = false` (the live spelling,
+    // "False"): an agent takes it, whatever the kind's contract says.
+    assert_eq!(takes("review"), serde_json::json!(true));
+    // The protocol still requires a person: the block does not win.
+    assert_eq!(takes("sign"), serde_json::json!(false));
+    // No block: a person's, as before — one shape on the wire.
+    assert_eq!(takes("tick"), serde_json::json!(false));
 }

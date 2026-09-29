@@ -148,13 +148,15 @@ async fn a_refused_presence_ceremony_logs_its_reason_and_no_credential_material(
     let origin = Url::parse("https://boss.test").unwrap();
     let state = Arc::new(PasskeyState {
         session_key: KEY.to_vec(),
-        http: reqwest::Client::new(),
+        http: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+            .unwrap(),
         people_base: base.clone(),
         jobs_base: base,
         webauthn: WebauthnBuilder::new("boss.test", &origin)
             .unwrap()
             .build()
             .unwrap(),
+        audit: boss_gateway::audit::AuthAudit::disabled(),
     });
     let router = passkey_router(state);
 

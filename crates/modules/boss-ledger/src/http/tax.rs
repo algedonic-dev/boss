@@ -4,7 +4,6 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use boss_policy_client::CurrentUser;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -71,13 +70,9 @@ impl From<crate::tax_filings::TaxFiling> for TaxFilingView {
 
 pub(super) async fn create_tax_filing(
     State(state): State<Arc<LedgerApiState>>,
-    CurrentUser(user): CurrentUser,
+    LedgerCreate(user): LedgerCreate,
     Json(body): Json<CreateTaxFilingBody>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
-    }
-
     // Upsert-idempotent on (kind, jurisdiction, period). If the filing
     // already exists we short-circuit without re-posting the accrual
     // entry — the fact's unique (kind, source_table, source_id) index
@@ -584,13 +579,9 @@ struct ResolvedAmount {
 /// own id so a NAK redelivery recomputes the identical amount.
 pub(super) async fn create_tax_accrual(
     State(state): State<Arc<LedgerApiState>>,
-    CurrentUser(user): CurrentUser,
+    LedgerCreate(user): LedgerCreate,
     Json(body): Json<CreateTaxAccrualBody>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
-    }
-
     let stamp = super::event_stamp(&state, &user).await;
     let mut tx = match state.pool.begin().await {
         Ok(t) => t,
@@ -865,14 +856,16 @@ pub(super) struct UpsertExciseRateScheduleBody {
     tiers: Vec<crate::excise::RateTier>,
 }
 
+/// Create on `tax-regime` ([`super::TaxRegimeCreate`], backlog
+/// 432f0eb4): the rates the tax accrual reads are the tenant's tax
+/// regime, platform-admin's alone in the core defaults — the role a
+/// tenant engine's prepare signs as. Create rather than Update, because the
+/// upsert adds a row.
 pub(super) async fn upsert_excise_rate_schedule(
     State(state): State<Arc<LedgerApiState>>,
-    CurrentUser(user): CurrentUser,
+    TaxRegimeCreate(user): TaxRegimeCreate,
     Json(body): Json<UpsertExciseRateScheduleBody>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
-    }
     if body.jurisdiction.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "jurisdiction must be non-empty").into_response();
     }
@@ -983,13 +976,10 @@ pub(super) struct RemitTaxBody {
 /// returns the existing row without double-posting.
 pub(super) async fn remit_tax_filing(
     State(state): State<Arc<LedgerApiState>>,
-    CurrentUser(user): CurrentUser,
+    LedgerUpdate(user): LedgerUpdate,
     Path(id): Path<String>,
     Json(body): Json<RemitTaxBody>,
 ) -> Response {
-    if let Some(r) = reject_if_auditor(&user) {
-        return r;
-    }
     let existing = match crate::tax_filings::get(&state.pool, &id).await {
         Ok(Some(f)) => f,
         Ok(None) => return (StatusCode::NOT_FOUND, "filing not found").into_response(),

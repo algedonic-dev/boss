@@ -79,6 +79,8 @@ fn stub_curl(root: &Path) -> PathBuf {
             "    case \"$1\" in\n",
             "        -X) method=$2; shift ;;\n",
             "        -d) body=$(printf '%s' \"$2\" | jq -c . 2>/dev/null || printf '%s' \"$2\"); shift ;;\n",
+            // The wrap sends its packet from a file (backlog 9fd7f51e).
+            "        --data-binary) body=$(jq -c . \"${2#@}\" 2>/dev/null || cat \"${2#@}\"); shift ;;\n",
             "        -H) shift ;;\n",
             "        http*) url=$1 ;;\n",
             "    esac\n",
@@ -2524,6 +2526,102 @@ fn a_worktree_whose_run_finished_or_whose_car_merged_on_record_is_landed() {
                 !curl_log(&root).contains("metadata="),
                 "inside the landed window nothing is asked of the record\n{}\n{text}",
                 curl_log(&root)
+            );
+        }
+    }
+}
+
+/// A worktree this pass cannot SEE is not a worktree that is gone
+/// (backlog 52fefc45). The sidecar mounts only /work and /scratch
+/// (boss-dev.yaml); a reviewer's scratch worktree under the session
+/// scratchpad in /tmp is the dev container's own overlay, invisible to
+/// it, and a bare `git worktree prune` read every such entry as
+/// "gitdir file points to non-existent location" and dropped it —
+/// measured 2026-09-28 by run ff5ff31c: `pruned: Removing worktrees/rv`,
+/// `wt`, `rr`, `wt` at 16:58, 17:59 and 18:59Z, inside the window in
+/// which three live reviewers each lost their tree's metadata.
+///
+/// SHAPE: the outside tree is a real `git worktree add` in a directory
+/// that is not under WORKTREES_DIR, WORK_MOUNT or SCRATCH_MOUNT, then
+/// deleted — which is exactly what the sidecar's view of /tmp is. The
+/// control is the same shape under WORKTREES_DIR, and it must be pruned,
+/// or the fixture proves nothing. Run above the /work floor (the gone-
+/// worktree pass's prune) and under it (the floor pass's two), so each
+/// of the three prune sites meets the entry.
+#[test]
+fn an_entry_outside_the_mounts_this_pass_can_see_is_kept_and_a_gone_one_inside_is_pruned() {
+    for floor in [false, true] {
+        let root = boss_testing::scratch_dir("boss-dsr-unseen");
+        let _guard = Scratch(root.clone());
+        let yard = Yard::new(&root);
+        // The session scratchpad: a root of its own, under none of the
+        // mounts the run below names.
+        let overlay = boss_testing::scratch_dir("boss-dsr-unseen-overlay");
+        let _overlay_guard = Scratch(overlay.clone());
+        let unseen = overlay.join("rv");
+        git(
+            &yard.repo,
+            0,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                unseen.to_str().expect("utf8"),
+                "main",
+            ],
+        );
+        std::fs::remove_dir_all(&unseen).expect("rm the unseen worktree");
+
+        // The control: gone, under WORKTREES_DIR — an operator's rm -rf.
+        let control = yard.worktree("agent-control", Some("feat/control"), 30);
+        std::fs::remove_dir_all(&control).expect("rm the control worktree");
+        // Gone, under WORKTREES_DIR, but LOCKED: git's own prune honours
+        // the lock, and so does this pass.
+        let locked = yard.worktree("agent-locked", Some("feat/locked"), 30);
+        git(
+            &yard.repo,
+            0,
+            &["worktree", "lock", path_str(&locked).as_str()],
+        );
+        std::fs::remove_dir_all(&locked).expect("rm the locked worktree");
+
+        let floor_gb = under_the_work_floor();
+        let extra: Vec<(&str, &str)> = if floor {
+            vec![("STUB_DF_WORK_GB", floor_gb.as_str())]
+        } else {
+            vec![]
+        };
+        let out = run(&root, &extra);
+        let text = format!("under the floor: {floor}\n{}", say(&out));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+
+        let admin = yard.repo.join(".git").join("worktrees");
+        assert!(
+            admin.join("rv").is_dir(),
+            "an entry whose worktree lies outside every mount this pass can see is KEPT\n{text}"
+        );
+        assert!(
+            !admin.join("agent-control").exists(),
+            "the control — gone, under WORKTREES_DIR — is pruned, so the fixture is strong enough\n{text}"
+        );
+        assert!(
+            admin.join("agent-locked").is_dir(),
+            "a locked entry is untouched even with its directory gone\n{text}"
+        );
+        assert!(
+            stdout.contains("kept worktrees/rv") && stdout.contains(&path_str(&unseen)),
+            "the kept entry is named with the path the pass could not see\n{text}"
+        );
+        let put = run_step_put(&root, &text);
+        for field in [
+            "\"worktrees_pruned\":\"1\"",
+            "\"worktrees_kept_unseen\":\"1\"",
+            "\"worktrees_kept_unseen_names\":\"rv\"",
+        ] {
+            assert!(
+                put.contains(field),
+                "the run step carries {field}\n{put}\n{text}"
             );
         }
     }

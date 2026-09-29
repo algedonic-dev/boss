@@ -2566,6 +2566,27 @@ pub(super) async fn patch_step_metadata<R: JobsRepository + 'static, B: EventBus
         ) {
             return refusal;
         }
+        // Judged against `old`, applied to the row as it stands: an
+        // unchanged re-send of a reserved key could put back a value the
+        // writer replaced in between (review S3). It changes nothing by
+        // this door's own judgement, so it is dropped, and a patch that
+        // was nothing else is the no-op it is — unless the caller IS the
+        // key's writer, whose own write is the record and lands as sent
+        // (follow-up a of the review of car f3365343).
+        let job_host = job
+            .as_ref()
+            .and_then(|j| j.metadata.get(crate::field_writer::HOST_KEY))
+            .and_then(|v| v.as_str());
+        if crate::field_writer::strip_unchanged_reserved(
+            &old.fields,
+            &old.metadata,
+            &mut patch,
+            caller.as_ref().map(|axum::Extension(c)| c),
+            job_host,
+        ) && patch.is_empty()
+        {
+            return StatusCode::NO_CONTENT.into_response();
+        }
     }
     let refusals =
         crate::step_registry::StepRegistry::standing_refusals(&old.fields, &merged_view, |k| {
@@ -2889,6 +2910,9 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     // this the executor's claim-for met its own hold and 409'd on every
     // real step. Empty for a claim for oneself.
     let mut displaceable: Vec<String> = Vec::new();
+    // The one holder in `displaceable`, when the claim takes the step
+    // from someone: what the claim-for marker names (backlog ce8b7d66).
+    let mut displaced: Option<String> = None;
     // RESOLVED BEFORE IT IS JUDGED (backlog 5d1c0b7a): `nominee` sees
     // only the raw spelling, so a caller naming its own login was judged
     // a claim for someone else. The resolution's refusal is held until
@@ -2963,7 +2987,43 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
         // Authorised: the step's declared executor and the caller are
         // the holders this claim may take a Ready step from — no one
         // else's hold is displaced, and no active step is.
-        displaceable = declared.into_iter().chain([user.id.clone()]).collect();
+        //
+        // THE CALLER IN EVERY SPELLING (backlog ce8b7d66, S4 of the
+        // review of car 5d1c0b7a): a step nominated before the lane
+        // resolved aliases holds the caller's LOGIN, and both CASes
+        // compare this list by exact spelling, so the caller's own hold
+        // was refused as "held by someone else". The agents registry
+        // names its logins. A registry that cannot answer lists the id
+        // alone — the claim is then judged as it was before this line,
+        // never wider.
+        let caller_logins = match state.agent_budget.as_ref() {
+            Some(door) => match door.agent_row(&user.id).await {
+                Ok(row) => row.map(|r| r.aliases).unwrap_or_default(),
+                Err(e) => {
+                    tracing::warn!(
+                        actor = %user.id,
+                        "agents registry could not name the caller's logins; the claim may \
+                         displace its id alone: {e}"
+                    );
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        let authorised: Vec<String> = declared
+            .into_iter()
+            .chain([user.id.clone()])
+            .chain(caller_logins)
+            .collect();
+        // THE ONE HOLDER IT TAKES, NAMED (S3 of that review): the list
+        // the CAS may displace is narrowed to the holder this claim READ,
+        // when that holder is one it may take the step from — so the CAS
+        // can end no other hold than the one the marker below names.
+        displaced = old
+            .assignee_id
+            .clone()
+            .filter(|h| authorised.contains(h) && nominee.as_deref() != Some(h.as_str()));
+        displaceable = displaced.iter().cloned().collect();
     }
     let nominee = nominee.as_deref();
     let holder: String = nominee.unwrap_or(user.id.as_str()).to_string();
@@ -3338,6 +3398,12 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
         if let (Some(nominee), Some(obj)) = (nominee, marker.as_object_mut()) {
             obj.insert("claimed_by".into(), serde_json::json!(user.id));
             obj.insert("claimed_for".into(), serde_json::json!(nominee));
+            // Whose hold this claim ended (backlog ce8b7d66, S3): the
+            // holder it read, and the only one the CAS may displace. Left
+            // out when the step was free or already the nominee's.
+            if let Some(from) = displaced.as_deref() {
+                obj.insert("displaced".into(), serde_json::json!(from));
+            }
         }
         claim_events.push(stamp.event(&format!("step.assigned.{}", claimed.kind), marker));
     }
@@ -3372,15 +3438,22 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     .await;
     match claimed_row {
         Ok(step) => Json(step).into_response(),
-        Err(crate::port::JobsError::ClaimConflict { holder, status }) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": crate::active_holder::claim_conflict_error(&status),
-                "holder": holder,
-                "status": status,
-            })),
-        )
-            .into_response(),
+        Err(crate::port::JobsError::ClaimConflict { holder, status }) => {
+            // The holder the CAS met is not the one this claim read: it
+            // moved in the gap, and the claim may be sent again (the
+            // review of car eb2f9b0f, finding 2).
+            let moved = holder != old.assignee_id;
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": crate::active_holder::claim_conflict_line(&status, moved),
+                    "holder": holder,
+                    "status": status,
+                    "retryable": moved && status == "ready",
+                })),
+            )
+                .into_response()
+        }
         Err(crate::port::JobsError::StepNotFound(_)) => {
             (StatusCode::NOT_FOUND, "step not found").into_response()
         }

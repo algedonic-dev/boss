@@ -18,8 +18,9 @@ this runbook applies to a host running services outside the image.
 Audience: whoever holds the operator role on the cluster. Assumes the
 [CLI](../../crates/orchestrators/boss-cli/README.md) is on PATH with
 `BOSS_JOBS_URL` and `BOSS_ACTOR` set (CLAUDE.md §Doors), and — for
-the kubectl lines — a kubeconfig for the cluster
-(`docs/runbooks/dev-pod-access.md`).
+the kubectl lines — a kubeconfig for the cluster (where it lives is
+the cluster-admin road of the recovery sheet,
+`infra/recovery/re-entry.toml`, rendered by `boss recovery sheet`).
 
 ## Quick reference
 
@@ -172,7 +173,10 @@ once moved between two revisions carrying the same broken image and
 read as a rollback that was not one (CLAUDE.md §Diagnosis). The
 lever is the `rollback-to` ops verb: it rolls `deploy/boss` to the
 image built for a named sha and refuses to report success until the
-pod is Ready on it.
+pod is Ready on it and it has READ THE IMAGE BACK — deploy/boss's
+template and every Ready pod on `<sha>`. A read-back that disagrees
+exits nonzero after the roll was applied, and says so: the rollback
+itself is never held up by it.
 
 ```sh
 boss ops forge rollback-to <sha> --wait

@@ -118,10 +118,10 @@ export type Step = {
     shape_hash: string;
   }[];
   completed_on: string | null;
-  /// ABSENT on a step read off `GET /api/jobs?…` with `full=false` —
-  /// and, once the list's default flips to slim, whenever the read does
-  /// not ask `full=true` (backlog 9b473d4a). The one-packet GET always
-  /// carries both. A board reading this off a listed row asks `full`.
+  /// ABSENT on a step read off `GET /api/jobs?…` unless the read asks
+  /// `full=true` (backlog 9b473d4a; the default since ea80b5fd) — such
+  /// a step is a [`ListedStep`]. The one-packet GET always carries both.
+  /// A board reading this off a listed row asks `full=true`.
   metadata: Record<string, unknown>;
   /// The job's corrections that target this step, attached by the job
   /// GET (design 4105b020); absent when there are none. Read only
@@ -149,6 +149,24 @@ export type Job = {
   tags: string[];
   steps?: Step[];
 };
+
+/// A step as `GET /api/jobs?…` lists it WITHOUT `full=true`, which is
+/// the default since backlog ea80b5fd: no `metadata`, no `fields`, and
+/// `slim: true` on the wire (a typed Rust `Step` parse refuses it). A
+/// whole [`Step`] is assignable to it, so a reader typed on this —
+/// status, slug, holder, stamps — takes either shape, and a reader that
+/// reaches for `metadata` does not type-check until it reads `Step`,
+/// off a `full=true` read or the one-packet GET.
+export type ListedStep = Omit<Step, 'metadata' | 'fields'> & {
+  slim?: true;
+  /// The FAILED-verb note, lifted off the step's metadata by the server
+  /// when the read asks `failed_verbs=true`; read through
+  /// `steps/failedVerb.ts`.
+  failed_verb?: Record<string, unknown>;
+};
+
+/// A job row off an unflagged `GET /api/jobs?…` read: its steps listed.
+export type ListedJob = Omit<Job, 'steps'> & { steps?: ListedStep[] };
 
 /// The body of a Job read from `url`, or a throw naming what it lacks.
 ///

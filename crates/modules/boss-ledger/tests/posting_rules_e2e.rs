@@ -32,7 +32,10 @@ fn make_router(db: &TestDb) -> axum::Router {
 }
 
 const OPERATOR: &str = r#"{"id":"automation:tenant-seed","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}"#;
-const AUDITOR: &str = r#"{"id":"emp-audit","role":"auditor","access_tier":"auditor","territory_account_ids":[],"direct_report_ids":[],"department":null}"#;
+/// The external auditor as the platform names it (`audit-readonly`):
+/// the role string "auditor" the old write check refused is held by no
+/// one (backlog 34f0a954).
+const AUDITOR: &str = r#"{"id":"emp-audit","role":"audit-readonly","access_tier":"auditor","territory_account_ids":[],"direct_report_ids":[],"department":null}"#;
 
 async fn send(
     app: axum::Router,
@@ -280,9 +283,20 @@ async fn an_unbalanced_rule_is_refused_at_the_door_naming_the_rule() {
         .unwrap();
     assert_eq!(n, 0);
 
-    // The write gate: an auditor session cannot publish.
+    // The write gate, judged against the grants that ship: an auditor
+    // session reads the ledger and cannot publish to it.
+    let shipped = router(LedgerApiState {
+        policy: Arc::new(
+            boss_policy_client::FakePolicyClient::builder()
+                .with_default_rules()
+                .build(),
+        ),
+        pool: db.pool.clone(),
+        publisher: None,
+        clock: Arc::new(boss_clock_client::WallClockClient),
+    });
     let (status, _) = send(
-        make_router(&db),
+        shipped,
         "POST",
         "/api/ledger/posting-rules/batch",
         json!({"rules": [sponsorship_rule()]}),
@@ -364,6 +378,9 @@ async fn a_projection_with_when_fires_on_one_workflows_step_only() {
         .await
         .unwrap();
     }
+    // The publish staged its declaration in event_outbox; a rebuild
+    // refuses to replay past an undrained write (design b046f510).
+    drain(&db).await;
     let report = rebuild_facts(&db.pool).await.unwrap();
     assert_eq!(report.events_scanned, 3);
     assert_eq!(report.facts_written, 1, "{report:?}");

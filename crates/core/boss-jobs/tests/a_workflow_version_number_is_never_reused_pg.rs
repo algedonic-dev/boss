@@ -15,7 +15,7 @@ use boss_core::actor::ActorId;
 use boss_core::job::{Job, JobStatus, Priority, Subject};
 use boss_jobs::port::JobsRepository;
 use boss_jobs::registry::{
-    PgWorkflows, StepSpec, Terminal, WorkflowRegistry, WorkflowSpec, WorkflowStatus,
+    PgWorkflows, StepSpec, Terminal, WorkflowError, WorkflowRegistry, WorkflowSpec, WorkflowStatus,
 };
 use boss_testing::TestDb;
 use chrono::NaiveDate;
@@ -153,13 +153,60 @@ async fn pg_the_pin_count_names_every_packet_on_the_pair() {
     assert!(none.first.is_none());
 }
 
-/// TODAY'S BEHAVIOUR, pinned on purpose — not endorsed: the Pg
-/// `get_version` serves a DRAFT row, which is how an experiment's
-/// candidate and `boss job convert --to vN` can pin a packet to one.
-/// Whether they should is the experiments design's decision (d8771dec,
-/// recorded on ce8b7d66); this test is the one that changes with it.
+/// THE PIN CHECK DECIDES INSIDE THE DISCARD (backlog ce8b7d66). The
+/// route asked the jobs port first and the registry deleted in a
+/// transaction of its own, so a packet pinned between the two was
+/// orphaned. The adapter now counts the pinned packets in the
+/// discard's own transaction, under a lock on the draft row, so a
+/// caller that reaches the registry without the route — as this test
+/// does — is refused the same way, and nothing is spent.
 #[tokio::test(flavor = "multi_thread")]
-async fn pg_get_version_serves_a_draft_today() {
+async fn pg_the_discard_itself_refuses_a_draft_a_packet_is_pinned_to() {
+    let db = TestDb::new().await;
+    let registry = PgWorkflows::new(db.pool.clone());
+    let repo = boss_jobs::PgJobs::new(db.pool.clone());
+    let now = chrono::Utc::now();
+    let d = registry
+        .create_draft(spec("intake-review"), &author(), now)
+        .await
+        .expect("draft");
+    let pinned = packet("intake-review", d.version, JobStatus::Open);
+    repo.create_job(&pinned).await.expect("pinned packet");
+
+    match registry
+        .discard_draft("intake-review", d.version, &author(), now)
+        .await
+    {
+        Err(WorkflowError::Conflict(m)) => {
+            assert!(m.contains("1 packet is pinned"), "names the count: {m}");
+            assert!(m.contains(&pinned.id.to_string()), "names it: {m}");
+        }
+        other => panic!("a pinned draft must refuse its discard, got {other:?}"),
+    }
+    let kept = registry
+        .get_version("intake-review", d.version)
+        .await
+        .expect("a refused discard removes nothing");
+    assert_eq!(kept.status, WorkflowStatus::Draft);
+    let next = registry
+        .create_draft(spec("intake-review"), &author(), now)
+        .await
+        .expect("next draft");
+    assert_eq!(
+        next.version,
+        d.version + 1,
+        "a refused discard spends nothing either"
+    );
+}
+
+/// BY DECISION (backlog ce8b7d66, an engineering call on the build): the
+/// Pg `get_version` serves a DRAFT row, because an experiment's
+/// candidate is a draft until a promote publishes it and admission
+/// reads it here. The guard is at the doors that pin: a split onto an
+/// unpublished version takes Publish on `workflow`, and `boss job
+/// convert` refuses a draft target.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_get_version_serves_a_draft() {
     let db = TestDb::new().await;
     let registry = PgWorkflows::new(db.pool.clone());
     let d = registry
@@ -171,4 +218,125 @@ async fn pg_get_version_serves_a_draft_today() {
         .await
         .expect("draft is served");
     assert_eq!(served.status, WorkflowStatus::Draft);
+}
+
+/// How many `jobs.kind.published` facts the outbox holds.
+async fn published_events(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM event_outbox WHERE kind = 'jobs.kind.published'")
+        .fetch_one(pool)
+        .await
+        .expect("count published events")
+}
+
+/// Wait until some session of this database is blocked on a row lock —
+/// the moment the racing writer has reached the lock the test holds.
+async fn until_a_session_waits_on_a_lock(pool: &sqlx::PgPool) {
+    for _ in 0..500 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the racing publish never reached the draft row's lock");
+}
+
+/// A PUBLISH THAT LOSES ITS DRAFT TO A DISCARD REFUSES, AND RECORDS
+/// NOTHING (the review of car 06973644, 2026-09-28, finding A). The
+/// publish read its draft WITHOUT a lock, retired the active row, then
+/// flipped the draft by `(kind, version)` without counting what the
+/// flip touched. A discard holding the draft's row lock deleted it
+/// underneath: the flip updated 0 rows, the publish committed anyway,
+/// and the kind was left with NO active version — beside a
+/// `jobs.kind.published` fact for a row that no longer exists.
+///
+/// The discard is played here by a transaction of the test's own that
+/// does what `discard_draft` does to the row — `FOR UPDATE`, then
+/// DELETE, then the spent number — because the real one cannot be
+/// paused between its lock and its delete. The publish starts while
+/// that lock is held and is observed WAITING on it before the delete
+/// commits, so the interleaving is the one the review walked, every
+/// run, not a timing hope.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_a_publish_that_loses_its_draft_to_a_discard_refuses_and_records_nothing() {
+    let db = TestDb::new().await;
+    let registry = PgWorkflows::new(db.pool.clone());
+    let now = chrono::Utc::now();
+
+    let v1 = registry
+        .create_draft(spec("intake-review"), &author(), now)
+        .await
+        .expect("draft v1");
+    registry
+        .publish("intake-review", &author(), now)
+        .await
+        .expect("publish v1");
+    let v2 = registry
+        .create_draft(spec("intake-review"), &author(), now)
+        .await
+        .expect("draft v2");
+    let published_before = published_events(&db.pool).await;
+
+    // The discard takes the draft's row lock.
+    let mut discard = db.pool.begin().await.expect("discard tx");
+    sqlx::query("SELECT version FROM workflows WHERE kind = $1 AND version = $2 FOR UPDATE")
+        .bind("intake-review")
+        .bind(v2.version)
+        .fetch_one(&mut *discard)
+        .await
+        .expect("lock the draft");
+
+    // The publish races it, and reaches that lock.
+    let racing = PgWorkflows::new(db.pool.clone());
+    let publish =
+        tokio::spawn(async move { racing.publish("intake-review", &author(), now).await });
+    until_a_session_waits_on_a_lock(&db.pool).await;
+
+    // The discard deletes the draft, spends its number, and commits.
+    sqlx::query("DELETE FROM workflows WHERE kind = $1 AND version = $2 AND status = 'draft'")
+        .bind("intake-review")
+        .bind(v2.version)
+        .execute(&mut *discard)
+        .await
+        .expect("delete the draft");
+    sqlx::query(
+        "INSERT INTO workflow_discarded_versions (kind, version, discarded_at, discarded_by)
+         VALUES ($1, $2, $3, 'emp-cto')",
+    )
+    .bind("intake-review")
+    .bind(v2.version)
+    .bind(now)
+    .execute(&mut *discard)
+    .await
+    .expect("spend the number");
+    discard.commit().await.expect("discard commits");
+
+    // NotFound, and only NotFound: the publish's FOR UPDATE waited on
+    // the discard and then read the draft as the discard left it — gone.
+    // A Conflict here would mean the lock was lost and only the one-row
+    // flip check (the documented backstop) caught the race.
+    let answer = publish.await.expect("publish task");
+    assert!(
+        matches!(answer, Err(WorkflowError::NotFound(_))),
+        "a publish whose draft was discarded under it must find nothing to publish, got {answer:?}"
+    );
+    let active = registry
+        .get_active("intake-review")
+        .await
+        .expect("the kind still has an active version");
+    assert_eq!(
+        active.version, v1.version,
+        "the refused publish retired nothing: v1 is still the live protocol"
+    );
+    assert_eq!(
+        published_events(&db.pool).await,
+        published_before,
+        "no jobs.kind.published fact for a row that does not exist"
+    );
 }

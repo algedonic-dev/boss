@@ -270,11 +270,16 @@ async fn a_trains_ci_verdict_tells_the_trains_owner_the_wait_is_over() {
     assert_eq!(invocation.handler, "messages.notify");
 
     let (people, messages, sent) = mock_services().await;
-    let handler = MessagesNotify::with_client(reqwest::Client::new(), people, messages);
+    let handler = MessagesNotify::with_client(
+        boss_dispatcher_handlers::handlers::common::api_client(),
+        people,
+        messages,
+    );
     handler
         .invoke(
             &invocation.args,
             &InvocationContext {
+                event_timestamp: None,
                 rule_name: RULE.into(),
                 triggering_event_id: ci_done.id.to_string(),
                 triggering_topic: "step.done.task".into(),

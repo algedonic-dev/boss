@@ -8,7 +8,7 @@ After=postgresql.service
 EnvironmentFile=/etc/boss/sor.env
 Type=oneshot
 Environment=RUST_LOG=info
-ExecStartPre=/opt/boss/infra/boss-maintenance-wrap.sh maintenance-files-gc "file_refs garbage collection"
+ExecStartPre=-/opt/boss/infra/boss-maintenance-wrap.sh maintenance-files-gc "file_refs garbage collection"
 ExecStart=/usr/local/bin/boss-files-gc --config /etc/boss-content-api.toml
 ExecStopPost=-/opt/boss/infra/boss-step.sh maintenance-files-gc run
 # Inherits the same elevated-on-bare-metal posture as the other

@@ -585,6 +585,7 @@ mod tests {
                 since: "2026-09-19T11:30:00Z".into(),
                 stale: false,
                 train: None,
+                ..Default::default()
             },
             crate::yard::ActiveGate {
                 branch: "train/2026-09-19-1101".into(),
@@ -592,6 +593,7 @@ mod tests {
                 since: "2026-09-19T11:02:00Z".into(),
                 stale: false,
                 train: Some(under_test_id.clone()),
+                ..Default::default()
             },
         ];
         let cars = vec![boarded_car.clone()];
@@ -779,6 +781,7 @@ mod tests {
             since: "2026-09-19T11:30:00Z".into(),
             stale: false,
             train: None,
+            ..Default::default()
         }];
         status.held = vec![crate::yard::HeldGreen {
             branch: "feat/held".into(),

@@ -91,6 +91,12 @@ pub async fn rebuild_tax_filings(pool: &PgPool) -> Result<RebuildTaxFilingsRepor
         .await
         .map_err(|e| LedgerError::Storage(e.to_string()))?;
 
+    // The truncate may run only against a log that holds every
+    // committed write (design b046f510).
+    boss_events::outbox::lock_and_assert_log_complete(&mut tx, &["tax_filings"])
+        .await
+        .map_err(LedgerError::Storage)?;
+
     let report = rebuild_tax_filings_in_tx(&mut tx).await?;
 
     tx.commit()
