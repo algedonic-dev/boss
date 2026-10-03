@@ -62,10 +62,9 @@
 //! the platform retro this same firing opens ([`platform_packet`]'s
 //! `departments_skipped`). That packet is where it belongs: the
 //! protocol-retro reviews the platform's protocols, this rule among
-//! them, and a skip nobody can read is the silent kind. The rule's
-//! `open_without_protocol` names the one exemption, IT, whose protocols
-//! carry no department until a8458043 lands and whose retro reads the
-//! agent work profile (2f23f4c6); drop the arg when that lands. A
+//! them, and a skip nobody can read is the silent kind. No department
+//! is exempt: IT was, by an `open_without_protocol` arg, until a8458043
+//! gave it protocols (backlog ab6861a1 deleted the arg). A
 //! retired department is not in the roster at all, so it is neither
 //! opened nor skipped — the list read already refuses it.
 
@@ -106,12 +105,7 @@ impl RetroOpen {
     /// The department's skip reason from its readiness read, or `None`
     /// when its retro opens. `Err` is a read that could not decide —
     /// neither an open nor a skip.
-    async fn skip_for(
-        &self,
-        code: &str,
-        exempt: Option<&str>,
-        rule_name: &str,
-    ) -> Result<Option<String>, String> {
+    async fn skip_for(&self, code: &str, rule_name: &str) -> Result<Option<String>, String> {
         let readiness = get_json(
             &self.client,
             &format!("{}/api/departments/{code}/readiness", self.base()),
@@ -120,7 +114,7 @@ impl RetroOpen {
         .await
         .map_err(|e| format!("readiness read failed: {e}"))?;
         let declares = declares_a_protocol(&readiness)?;
-        Ok(skip_reason(code, declares, exempt))
+        Ok(skip_reason(code, declares))
     }
 }
 
@@ -229,13 +223,12 @@ pub fn declares_a_protocol(readiness: &Value) -> Result<bool, String> {
 }
 
 /// Why a department is skipped, or `None` when its retro opens. A
-/// department declaring a protocol opens; so does the rule's one
-/// `open_without_protocol` exemption (IT, whose protocols carry no
-/// department until a8458043 — and whose retro reads the agent work
-/// profile, 2f23f4c6). Every other department with no protocol is a
-/// retro that would spend an analyst run to report zero.
-pub fn skip_reason(code: &str, declares: bool, exempt: Option<&str>) -> Option<String> {
-    if declares || exempt == Some(code) {
+/// department declaring a protocol opens; one with no protocol is a
+/// retro that would spend an analyst run to report zero. No department
+/// is exempt — IT was until a8458043 gave it protocols (backlog
+/// ab6861a1).
+pub fn skip_reason(code: &str, declares: bool) -> Option<String> {
+    if declares {
         return None;
     }
     Some(format!(
@@ -372,7 +365,6 @@ impl Handler for RetroOpen {
         let department_kind = arg_string(args, "department_kind")?;
         let platform_kind = optional_string(args, "platform_kind")?;
         let platform_subject = optional_string(args, "platform_subject")?;
-        let exempt = optional_string(args, "open_without_protocol")?;
         if platform_kind.is_some() != platform_subject.is_some() {
             return Err(HandlerError::Permanent(
                 "retro.open: `platform_kind` and `platform_subject` are declared together or \
@@ -439,10 +431,7 @@ impl Handler for RetroOpen {
                     // Only a department that declares a protocol has a
                     // week to review (a4fda30b). Read AFTER the week
                     // window, so a retry re-reads nothing it settled.
-                    match self
-                        .skip_for(&d.code, exempt.as_deref(), &ctx.rule_name)
-                        .await
-                    {
+                    match self.skip_for(&d.code, &ctx.rule_name).await {
                         Err(e) => {
                             errors.push(format!("{}: {e}", d.code));
                             continue;
@@ -738,22 +727,19 @@ mod tests {
         );
     }
 
-    /// A department with no protocol is skipped WITH its reason, and the
-    /// one exemption the rule declares (IT, until a8458043) opens anyway.
+    /// A department with no protocol is skipped WITH its reason, and IT
+    /// is judged like every other department: its exemption went when
+    /// a8458043 gave it protocols (backlog ab6861a1).
     #[test]
     fn a_department_without_a_protocol_is_skipped_by_name() {
-        assert_eq!(skip_reason("sales", true, None), None);
-        let why = skip_reason("support", false, None).expect("skipped");
+        assert_eq!(skip_reason("sales", true), None);
+        let why = skip_reason("support", false).expect("skipped");
         assert!(why.contains("support"), "{why}");
         assert!(why.contains("protocols.has = false"), "{why}");
-        assert_eq!(
-            skip_reason("it", false, Some("it")),
-            None,
-            "the exemption opens IT's retro"
-        );
+        assert_eq!(skip_reason("it", true), None, "IT declares protocols");
         assert!(
-            skip_reason("support", false, Some("it")).is_some(),
-            "the exemption names one department, not all of them"
+            skip_reason("it", false).is_some(),
+            "IT reading no protocol is skipped like any department"
         );
     }
 

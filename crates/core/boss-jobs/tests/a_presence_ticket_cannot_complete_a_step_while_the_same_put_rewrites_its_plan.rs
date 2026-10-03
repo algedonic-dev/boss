@@ -67,13 +67,24 @@ async fn a_presence_ticket_cannot_complete_a_step_while_the_same_put_rewrites_it
     assert_eq!(stored(&jobs, SIGNED).await.status, StepStatus::Ready);
 
     // Scope control: a step that asks only for a session is not judged
-    // by this rule, so a completion PUT may still carry its metadata.
-    let (status, body) = put(
+    // by this rule, so its plan may be rewritten and the step completed
+    // with no ticket at all. Since e39a9d2a (Stage 2's last car) no step
+    // PUT writes metadata — the two bodies above now meet that refusal
+    // before the presence rule, which still guards title, notes and
+    // holder — so the rewrite goes through the merge door and the
+    // completion is the status alone.
+    let (status, body) = send(
         &app,
-        ORDINARY,
+        "PATCH",
+        format!("/api/jobs/{JOB}/steps/{ORDINARY}/metadata"),
         None,
-        r#"{"status":"completed","metadata":{"plan":"rewritten at completion"}}"#,
+        r#"{"plan":"rewritten at completion"}"#,
     )
     .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, body) = put(&app, ORDINARY, None, r#"{"status":"completed"}"#).await;
     assert!(status.is_success(), "{status}: {body}");
+    let done = stored(&jobs, ORDINARY).await;
+    assert_eq!(done.status, StepStatus::Completed);
+    assert_eq!(done.metadata["plan"], "rewritten at completion");
 }

@@ -3,9 +3,9 @@
 # offsite-push — push forge main to the PRIVATE disaster-recovery copy
 # (algedonic-dev/boss-dr) with its OWN credential slot, with a PLAIN push
 # (no force, no --mirror, no prune), read it back, and only then remove
-# Forgejo's own push mirror. The public fork (dauld/boss-mirror) is
-# declared with NO branch (see NOTHING DECLARED below): nothing reaches
-# it from here.
+# Forgejo's own push mirror. Every target is a repository of the
+# algedonic-dev organisation and declares at least one branch (see
+# EVERY TARGET IS THE ORGANISATION'S below).
 #
 #   offsite-push.sh
 #
@@ -14,32 +14,42 @@
 # file is declared in infra/forge/offsite-push.json — a list of targets,
 # each {remote, branches, credential, token_file}.
 #
-# NEVER MAIN ON THE FORK (backlog 67931115, design 1f35a3e8, David
-# 2026-09-27). dauld/boss-mirror is a fork of the public
-# algedonic-dev/boss, so it is public and cannot be made private: until
-# that date this push put forge main — every train, unsigned, never
-# secrets-scanned — on public GitHub within one tick, while the publish
-# flow's scan and passkey gated only the PR. Car 1 of that item took
-# main off the list; until the DR copy below landed, forge main had no
-# off-site copy.
+# NEVER MAIN ON A PUBLIC FORK (backlog 67931115, design 1f35a3e8, David
+# 2026-09-27). This push used to carry forge main to a fork of the public
+# algedonic-dev/boss in David's personal account — public, because a fork
+# of a public repository cannot be made private — so every train,
+# unsigned and never secrets-scanned, reached public GitHub within one
+# tick, while the publish flow's scan and passkey gated only the PR.
+# Car 1 of that item took main off the list, backlog a2b58aab took
+# publish/* off it, and backlog d2b7c947 (David 2026-09-30: all GitHub
+# work runs through the algedonic-dev organisation, as the GitHub App)
+# removed the fork's target and its personal token slot altogether: the
+# publish verb opens its PR from a branch inside the organisation's own
+# repository, and David deletes the fork in GitHub.
 #
 # MAIN RIDES ALONE TO A PRIVATE DR COPY (backlog 761bc8a9, car 2; design
 # 76155676, David 2026-09-27: algedonic-dev/boss-dr — org-owned, private,
-# not a fork). Main goes to the private repository outside the fork
-# network. The declaration is refused (exit 2) unless main is declared on
-# exactly one target and that target declares nothing else, so main
-# cannot come back to the fork by a one-word edit; and no two targets may
-# share a remote or a token file, so each target has its own credential
-# slot. The tests the_public_fork_receives_nothing_from_the_converge and
-# the_dr_copy_is_declared_main_only pin which remote carries which
-# branches.
+# not a fork). The declaration is refused (exit 2) unless main is declared
+# on exactly one target, that target is the DR copy, and it declares
+# nothing else; and no two targets may share a remote or a token file, so
+# each target has its own credential slot. The test
+# the_dr_copy_is_declared_main_only pins the declaration as it stands.
+#
+# EVERY TARGET IS THE ORGANISATION'S, AND PUSHES SOMETHING (backlog
+# d2b7c947). A remote outside github.com/algedonic-dev/ is refused (exit
+# 2) before anything is read, so a personal repository cannot come back as
+# a target by a one-line edit — infra/lint/no-github-path-outside-the-org.sh
+# refuses the same line at pre-flight, and this is the refusal that holds
+# on the host. A target with an empty branch list is refused too: the only
+# one there ever was, the fork's, existed to say "nothing goes here", and a
+# target that pushes nothing is a credential slot kept for nothing.
 #
 # WHY IT EXISTS (backlog 21d54f4a, parent f9256445, design d812f1b7)
 # ------------------------------------------------------------------
 # On 2026-09-25 at 20:10:42Z forge main went back from c85941b4 (train
 # #687's merge, one second old) to 777a5888, written by Forgejo itself
 # (`Gitea <gitea@fake.local> update by push`). The writer was the forge's
-# push mirror to github.com/dauld/boss-fork: Forgejo 16.0.2 adds a push
+# push mirror to the personal fork above: Forgejo 16.0.2 adds a push
 # mirror with `git remote add --mirror` (services/mirror/mirror_push.go),
 # whose fetch refspec `+refs/*:refs/*` makes every sync write the values
 # it just pushed back onto the forge's OWN refs/heads/* — so a sync that
@@ -77,32 +87,16 @@
 # forge-repo-path.sh, the one definition both share).
 #
 # WHAT READS IT: algedonic-dev/boss-dr is the disaster-recovery copy of
-# main.
-# dauld/boss-mirror (canonical name; GitHub 301-redirects boss-fork
-# there) is the fork publish-github-pr.sh opens its PRs from
-# (measured_2026-09-26_mirror_consumers on packet 21d54f4a). Each publish
-# branch, publish/<date>-<snapshot> since backlog 1f0aa60d, is pushed to
-# the forge FIRST by that verb (ce5339d6) and to the fork by the verb
-# itself. Until backlog a2b58aab this push carried publish/* too, which
-# was the only thing it added: an exit to the public fork for any forge
-# branch so named, scanned or not. It carries nothing there now. The verb
-# also DELETES a publish branch once its PR reads closed — forge first,
-# then fork (backlog 1a2bcf11).
-#
-# NOTHING DECLARED FOR THE FORK (backlog a2b58aab). The fork's target
-# declares an empty branch list, and
-# the_public_fork_receives_nothing_from_the_converge (offsite_push_sh.rs)
-# refuses any branch in it. A forge branch NAME vouches for nothing:
-# every holder of a forge write credential for user david can push
-# refs/heads/publish/<anything>, and the forge protects main alone, so
-# carrying publish/* put any such branch on the public fork within one
-# tick, never scanned, never approved. publish-github-pr.sh pushes each
-# snapshot to the fork itself, after its secrets scan and the passkey
-# check, so the only way onto the fork is that verb. A target that
-# declares nothing needs no token — a converge must not go red for a
-# credential it does not use — and is named in the verdict as receiving
-# nothing. An empty list never reaches `git push`, which with no refspec
-# falls back to push.default rather than refusing.
+# main, and the only target. The public mirror, algedonic-dev/boss, gets
+# nothing from here: publish-github-pr.sh pushes each snapshot to a
+# publish/<date>-<snapshot> branch of that repository itself, as the
+# GitHub App, after its secrets scan and the passkey check, and deletes
+# the branch once its PR reads closed — forge first (backlog 1a2bcf11).
+# A forge branch NAME vouches for nothing: every holder of a forge write
+# credential for user david can push refs/heads/publish/<anything>, and
+# the forge protects main alone, so a target carrying publish/* would be
+# an exit to public GitHub for any branch so named, scanned or not
+# (backlog a2b58aab). The verb is the only way a publish branch leaves.
 #
 # NO REFUSAL IS EXPECTED. The only branch pushed is main, to the DR copy,
 # and forge main only ever moves forward (protect-main.sh). A
@@ -120,8 +114,8 @@
 # read-back that fails: each is recorded, nothing more is pushed, and the
 # mirror half STILL runs; the run then exits with the worse of the two
 # codes and a verdict naming both (adversarial review of fcf6042f, F1).
-# That mirror is `git push -f --mirror`: aimed at the public fork it is
-# the exposure 67931115 removed, aimed at boss-dr it is the wipe
+# That mirror is `git push -f --mirror`: aimed at a public repository it
+# is the exposure 67931115 removed, aimed at boss-dr it is the wipe
 # 21d54f4a removed, so keeping it is never the safe side of a failure.
 # Until this car a failed DR push kept it — a rule left over from when
 # the mirror WAS the off-site copy. Only two things skip the removal,
@@ -145,18 +139,14 @@
 #
 # CREDENTIALS — all read from files, none ever on an argv or printed
 #   GitHub: ONE token file per target, named by the target's
-#     `token_file` (and its registry id by `credential`). Each target that
-#     declares a branch needs its file to exist, be non-empty, 0600/0400,
-#     and owned by root; a target that declares none (the fork, today) is
-#     never pushed, so its file is not read or checked. Each reaches git through
-#     its own credential helper that reads the file when git asks, and
-#     answers only https://github.com AND only its own target's path
-#     (credential.useHttpPath) — so the DR token can never be handed to
-#     the fork and the fork's token can never write the DR copy. Nothing
-#     here mints or places a credential.
-#     * dauld-github-token, /etc/boss-publish/github.token — the fork's,
-#       the same file publish-github-pr.sh reads (pinned equal by
-#       offsite_push_sh.rs). Unused while the fork declares no branch.
+#     `token_file` (and its registry id by `credential`). Each needs its
+#     file to exist, be non-empty, 0600/0400, and owned by root. Each
+#     reaches git through its own credential helper that reads the file
+#     when git asks, and answers only https://github.com AND only its own
+#     target's path (credential.useHttpPath) — so no target's token can
+#     be handed to another repository. Nothing here mints or places a
+#     credential. The personal token the fork's target named
+#     (dauld-github-token) was retired with it (backlog d2b7c947).
 #     * github-dr-push-token, /etc/boss-publish/github-dr.token — the DR
 #       copy's: a one-hour INSTALLATION TOKEN of the GitHub App installed
 #       on the algedonic-dev organisation (design 76155676). The App's
@@ -198,9 +188,11 @@
 #      what was left as it was. A push-side failure still lets the mirror
 #      go; the exit is the worse of the two halves (4 > 2 > 1).
 #   2  the declaration is unreadable, names a branch that could force,
-#      rename or match more than a branch pattern should, declares main on
-#      no target or on two, lets main ride with another branch, or has two
-#      targets share a remote or a token file — nothing was fetched or
+#      rename or match more than a branch pattern should, names a remote
+#      outside the algedonic-dev organisation or a target with no branch,
+#      declares main on no target, on two or anywhere but the DR copy, lets
+#      main ride with another branch, or has two targets share a remote or
+#      a token file — nothing was fetched or
 #      pushed, and the Forgejo push mirror was still removed (a failure of
 #      that removal is exit 1 or 4, as below, and the verdict still names
 #      the refused declaration)
@@ -261,9 +253,11 @@ LOW_SPEED_TIME=60
 
 say() { echo "$ME: $*" >&2; }
 verdict() { run_summary_field offsite_push "$1"; }
-# The one DR copy (backlog 761bc8a9, design 76155676): the only remote
+# The organisation every target belongs to (backlog d2b7c947), and the
+# one DR copy in it (backlog 761bc8a9, design 76155676): the only remote
 # main may be declared for, normalised as the judgement below compares.
-DR_REMOTE="https://github.com/algedonic-dev/boss-dr"
+GITHUB_ORG="algedonic-dev"
+DR_REMOTE="https://github.com/$GITHUB_ORG/boss-dr"
 
 # WHAT WENT WRONG BEFORE THE MIRROR HALF, carried to it (F1). A refused
 # declaration and a push-side failure each push nothing more and still
@@ -351,11 +345,15 @@ if ! jq_doc_file "$DECL" \
         "$DECL" >/dev/null 2>&1; then
     refuse_decl "not an object with a non-empty list of targets, each naming a remote, a credential id, an absolute token file, and a list of plain branch names (a name, or a name ending in /*)"
 fi
-# Main has exactly one off-site home and rides there alone (761bc8a9):
-# the fork is public, so the shapes that would put main back on it — the
-# old single target carrying main and publish/*, or main added to the
-# fork beside the DR copy — are refused here, before anything is read.
-# So are two targets sharing a token file (each has its own credential
+# Every target is the organisation's and pushes something (d2b7c947),
+# and main has exactly one off-site home and rides there alone
+# (761bc8a9): a remote that is not exactly github.com/algedonic-dev/<name>
+# — matched whole, never as a prefix, and a <name> that begins with a dot
+# refused, so `algedonic-dev/..` cannot walk out of the organisation (git
+# follows it; review b0607d1d, N1) — a target with
+# no branch, main on a second target or on one that is not the DR copy,
+# and main riding with another branch are refused here, before anything
+# is read. So are two targets sharing a token file (each has its own credential
 # slot) or a remote — compared NORMALISED, because GitHub answers
 # Algedonic-Dev/Boss-DR, boss-dr and boss-dr.git as one repository, and a
 # path with a doubled or trailing slash is the same file: two spellings of
@@ -368,10 +366,16 @@ T_TOKEN=()
 T_BRANCHES=()
 ALL_BRANCHES=()
 if [ -z "$decl_refused" ]; then
-    why="$(jq -r --arg dr "$DR_REMOTE" '
+    why="$(jq -r --arg dr "$DR_REMOTE" --arg org "$GITHUB_ORG" '
         def norm: ascii_downcase | gsub("/+"; "/") | sub("/$"; "") | sub("\\.git$"; "");
-        [.targets[] | select(any(.branches[]; . == "main"))] as $m
-        | if ($m | length) != 1 then
+        [.targets[] | select(.remote | test("^https://github\\.com/\($org)/[A-Za-z0-9_-][A-Za-z0-9._-]*\\z"; "i") | not) | .remote] as $out
+        | [.targets[] | select(.branches | length == 0) | .remote] as $empty
+        | [.targets[] | select(any(.branches[]; . == "main"))] as $m
+        | if ($out | length) > 0 then
+            "\($out | join(", ")) is outside the \($org) organisation — every off-site target is a repository of the organisation the GitHub App is installed on, never a personal account (backlog d2b7c947)"
+          elif ($empty | length) > 0 then
+            "\($empty | join(", ")) declares no branch — a target that pushes nothing is a credential slot kept for nothing (backlog d2b7c947)"
+          elif ($m | length) != 1 then
             "main is declared on \($m | length) targets — it must be on exactly one target, the private DR copy (backlog 761bc8a9)"
           elif ($m[0].remote | norm) != ($dr | norm) then
             "main is declared for \($m[0].remote) — main goes to the private DR copy \($dr) and nowhere else (backlog 761bc8a9)"
@@ -428,11 +432,9 @@ WORK="$(mktemp -d -t offsite-push.XXXXXX)" || cannot_answer "mktemp failed"
 
 # --- every push precondition, before anything is pushed ----------------------
 # Every target's credential slot is checked before ANY target is pushed:
-# an empty slot is a refusal, not a skip. A tick that pushed the fork and
-# quietly passed over an empty DR slot would read green while no off-site
-# copy of main was being kept (761bc8a9). A target that declares no
-# branch is never pushed, so its slot is not read: a converge must not go
-# red for a credential it does not use (backlog a2b58aab). A failure here
+# an empty slot is a refusal, not a skip. A tick that pushed another
+# target and quietly passed over an empty DR slot would read green while
+# no off-site copy of main was being kept (761bc8a9). A failure here
 # pushes nothing and still lets the mirror half run (F1).
 #
 # The test seam first: it is a LOCAL stand-in and nothing else. Set on
@@ -446,7 +448,6 @@ if [ -n "${BOSS_OFFSITE_GITHUB_BASE:-}" ] && [ ! -d "$BOSS_OFFSITE_GITHUB_BASE" 
 fi
 for i in "${!T_REMOTE[@]}"; do
     [ -z "$held" ] || break
-    [ -n "${T_BRANCHES[$i]}" ] || continue
     f="${T_TOKEN[$i]}"
     slot="the credential slot $f (${T_CRED[$i]}, for ${T_BRANCHES[$i]} to ${T_REMOTE[$i]})"
     hint="infra/forge/offsite-push.sh CREDENTIALS says what fills this slot and what the token must be allowed to do"
@@ -526,8 +527,8 @@ push_targets() {
     # repository path it was made for — git hands it protocol, host and (with
     # credential.useHttpPath) path on stdin — so a redirect, an insteadOf or
     # a changed declaration can never carry a token to another host
-    # (b176fd60 S5), and the DR token and the fork's can never be handed to
-    # each other's repository (761bc8a9).
+    # (b176fd60 S5), and no target's token can be handed to another
+    # target's repository (761bc8a9).
     helper_for() {
         local tf="$1" hp="$2"
         HELPER="!f() { test \"\$1\" = get || exit 0; p=; h=; pa=; while IFS= read -r l && [ -n \"\$l\" ]; do case \"\$l\" in protocol=*) p=\${l#protocol=} ;; host=*) h=\${l#host=} ;; path=*) pa=\${l#path=} ;; esac; done; test \"\$p\" = https && test \"\$h\" = github.com && test \"\$pa\" = '$hp' || exit 0; echo username=x-access-token; echo \"password=\$(cat '$tf')\"; }; f"
@@ -546,14 +547,6 @@ push_targets() {
         url="$remote"
         [ -z "${BOSS_OFFSITE_GITHUB_BASE:-}" ] \
             || url="${BOSS_OFFSITE_GITHUB_BASE%/}/${remote#https://github.com/}"
-        # A target that declares nothing (the public fork, backlog a2b58aab)
-        # is named and never pushed: an empty list must not reach `git push`.
-        if [ -z "${T_BRANCHES[$i]}" ]; then
-            seg="nothing declared for $remote, so nothing fetched or pushed to it — the public fork receives publish branches only from publish-github-pr.sh, after its secrets scan and passkey check (backlog a2b58aab)"
-            echo "$ME: $seg"
-            SEGS+=("$seg")
-            continue
-        fi
         read -r -a tb <<<"${T_BRANCHES[$i]}"
         # The forge's refs THIS target declares: a name exactly, a `name/*`
         # by prefix (a refspec's `*` spans slashes).
@@ -656,7 +649,7 @@ push_targets() {
     # --- a target not reached still lets the mirror go (F1) ------------------
     # A push or read-back that FAILED is named, exit 1 at least, and the
     # mirror half still runs: that mirror force-pushes every forge branch,
-    # main among them, to the public fork.
+    # main among them, to wherever it points.
     if [ -n "$unreached" ]; then
         say "a target was not reached — nothing more is pushed, and the Forgejo push mirror is still removed"
         [ "$held_rc" -ge 1 ] || held_rc=1

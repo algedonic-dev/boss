@@ -290,16 +290,19 @@ pub(crate) fn answer_of(job: &Value) -> Option<Answer> {
     // `execute` still waited behind the approve step — a verb that
     // cannot carry an approval, or a plan verb that refused — answers
     // there, with the reason on that step.
-    let closed_refused = || {
-        let s = step_of("refused")?;
+    // So does one it closed through `nothing-to-do` (backlog b2f78bb9):
+    // the plan it rendered named no change, so nothing ran and nobody was
+    // asked, and the plan is the answer.
+    let closed_terminal = |slug: &str, disposition: &str, text_key: &str| {
+        let s = step_of(slug)?;
         if s.get("status").and_then(Value::as_str) != Some("completed") {
             return None;
         }
         let md = s.get("metadata")?;
         Some(Answer {
-            disposition: "refused".to_string(),
+            disposition: disposition.to_string(),
             exit_code: None,
-            output: md.get("reason").and_then(Value::as_str)?.to_string(),
+            output: md.get(text_key).and_then(Value::as_str)?.to_string(),
             runner_host: md
                 .get("runner_host")
                 .and_then(Value::as_str)
@@ -309,6 +312,10 @@ pub(crate) fn answer_of(job: &Value) -> Option<Answer> {
             effect_unproven: None,
             effect_unread: None,
         })
+    };
+    let closed_refused = || {
+        closed_terminal("refused", "refused", "reason")
+            .or_else(|| closed_terminal("nothing-to-do", "nothing-to-do", "plan"))
     };
     // Only a COMPLETED execute answers (the review of car 24eb9471). The
     // runner lands its keys through the merge door BEFORE the status
@@ -383,6 +390,15 @@ pub(crate) fn verdict_line(id8: &str, v: &Validated, a: &Answer) -> (String, boo
                 code.unwrap_or("?")
             ),
             false,
+        ),
+        // The plan named no change, so nothing ran and nobody was asked
+        // (backlog b2f78bb9): the request's answer is that it needed none.
+        ("nothing-to-do", _) => (
+            format!(
+                "boss ops: nothing to do — {} on {} (packet {id8}): the plan names no change, so nothing ran and no passkey was asked",
+                v.verb, a.runner_host
+            ),
+            true,
         ),
         (d, _) => (
             format!("boss ops: {d} — {} on {} (packet {id8})", v.verb, v.host),
@@ -808,6 +824,36 @@ mod tests {
             {"spec_slug": "refused", "status": "pending", "metadata": {"outcome_kind": "aborted"}}
         ]});
         assert!(answer_of(&open).is_none());
+    }
+
+    /// A request the runner closed through its `nothing-to-do` terminal
+    /// (backlog b2f78bb9) answers there with the plan that named no
+    /// change, and `--wait` ends on it as a success — nothing needed
+    /// doing, and nobody was asked — instead of waiting fifteen minutes
+    /// on an execute that will never run.
+    #[test]
+    fn a_request_closed_with_nothing_to_do_answers_with_its_plan() {
+        let v = validate(&fixture(), "forge", "uptime", &[]).unwrap();
+        let job = json!({"steps": [
+            {"spec_slug": "execute", "status": "skipped", "metadata": {}},
+            {"spec_slug": "refused", "status": "skipped", "metadata": {"outcome_kind": "aborted"}},
+            {"spec_slug": "nothing-to-do", "status": "completed",
+             "metadata": {"outcome_kind": "skipped", "runner_host": "forge",
+                          "plan": "would vacuum the journal to 1G\n"}}
+        ]});
+        let a = answer_of(&job).expect("the nothing-to-do terminal is an answer");
+        assert_eq!(a.disposition, "nothing-to-do");
+        assert_eq!(a.output, "would vacuum the journal to 1G\n");
+        let (line, ok) = verdict_line("abcd1234", &v, &a);
+        assert!(ok && line.starts_with("boss ops: nothing to do"), "{line}");
+        let open = json!({"steps": [
+            {"spec_slug": "execute", "status": "pending", "metadata": {}},
+            {"spec_slug": "nothing-to-do", "status": "ready", "metadata": {}}
+        ]});
+        assert!(
+            answer_of(&open).is_none(),
+            "a terminal not yet completed is no answer"
+        );
     }
 
     /// `unit-list` takes one glob of unit-name characters and nothing a

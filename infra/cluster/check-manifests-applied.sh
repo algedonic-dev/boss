@@ -45,6 +45,21 @@
 # So RBAC objects are compared by content: `rules` for Roles, and
 # `roleRef` + `subjects` for bindings. A missing rule is invisible and a
 # spurious one is a privilege the tree never granted; both now fail.
+#
+# ADMISSION POLICIES ARE PRIVILEGE TOO (backlog e4a9a9b3; reviews
+# 89c716e0 and 87fc0e0c, N3). The break-glass operator's `patch` is
+# narrowed by a ValidatingAdmissionPolicy, and whether that policy
+# REPORTS or REFUSES is one field of its binding. Existence-only, a
+# binding hand-flipped to Deny — or back from Deny to Warn — a
+# `repositories` map edited to admit a foreign image, or a binding-level
+# matchResources that judges nothing, all read present. So both kinds
+# are compared on their whole `spec`, named down to the field that
+# differs. The API server DEFAULTS a few fields the tree may omit
+# (failurePolicy Fail, matchPolicy Equivalent, a rule's scope `*`, the
+# empty selectors), so each is dropped from BOTH sides at its default
+# value: a round-trip is not drift, and a value moved OFF its default —
+# failurePolicy Ignore, which fails open — still is.
+#
 # Other kinds stay existence-only — a full drift diff is `kubectl diff`
 # and needs write-shaped permission this credential does not have.
 #
@@ -63,13 +78,19 @@
 # reason), not `missing`. A skipped instance's object that IS present
 # counts present: the skip explains an absence, it does not excuse a
 # read. A skip the converge did not declare is still a miss, and a miss
-# in an applied instance still fails beside the skip.
+# in an applied instance still fails beside the skip. And an absence is
+# only what kubectl calls NotFound: a read that timed out or answered
+# 5xx is unreadable in a skipped instance as in any other (7c023eaf).
 #
 # EXIT CODES
 #   0  every object present — or absent only in an instance the converge
-#      declared skipped — and every RBAC object matches the tree
+#      declared skipped — and every RBAC and admission object matches
+#      the tree
 #   1  something in the tree is not in the cluster, or differs from it
-#   2  cannot reach the cluster (no credential, no kubectl) — NOT
+#   2  cannot reach the cluster (no credential, no kubectl), or an
+#      object's existence read failed with anything but NotFound (a
+#      timeout, a refused connection, a 5xx — in a skipped instance
+#      too), or an object that exists could not be READ for content — NOT
 #      confused with "nothing is applied", because reporting a missing
 #      credential as missing infrastructure is the same class of error
 #      this script was written about.
@@ -141,11 +162,24 @@ inventory=$(
 # round-trip is not drift. Both sides are normalised — inner lists
 # sorted, then the outer list sorted by its serialisation — so only a
 # real difference in what is GRANTED can fail this.
-rbac_drift() { # kind name ns file  -> prints a diff summary, or nothing
+content_drift() { # kind name ns file  -> prints a diff summary, or nothing
     python3 - "$1" "$2" "${3:-}" "$4" <<'PY'
 import json, subprocess, sys
 kind, name, ns, path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+ADMISSION = kind.startswith("ValidatingAdmissionPolicy")
 FIELDS = ["rules"] if kind.endswith("Role") else ["roleRef", "subjects"]
+
+# What the API server fills in on an admission object the tree may leave
+# out, as (key, default value). Dropped from both sides only AT that
+# value, so a live value moved off it is still read.
+DEFAULTS = [("failurePolicy", "Fail"), ("matchPolicy", "Equivalent"), ("scope", "*")]
+
+def undefault(v):
+    if isinstance(v, dict):
+        return {k: undefault(x) for k, x in v.items() if (k, x) not in DEFAULTS}
+    if isinstance(v, list):
+        return [undefault(x) for x in v]
+    return v
 
 def norm(v):
     if isinstance(v, dict):
@@ -154,35 +188,71 @@ def norm(v):
         return sorted((norm(x) for x in v), key=lambda y: json.dumps(y, sort_keys=True))
     return v
 
-def run(args):
-    p = subprocess.run(args, capture_output=True, text=True)
-    return p.stdout if p.returncode == 0 else None
+# NOTHING READ IS NEVER CLEAN (review d133e704, M1). The existence read
+# has already SUCCEEDED when this runs, so nothing after it will count a
+# failure here: until 2026-09-30 an unreadable live or declared object
+# exited 0 with a comment saying the existence pass handled it, a body
+# that was not JSON died with a traceback and an empty stdout, and the
+# caller ignored the status — so a content read that timed out on a
+# binding moved Deny->Warn recorded "0 drifted, 0 unreadable". Every way
+# this cannot compare now prints `UNREADABLE <why>` and exits 3, and the
+# caller counts that object unreadable, which exits the run 2.
+def unreadable(why):
+    print("UNREADABLE " + " ".join(str(why).split())[:300])
+    sys.exit(3)
 
-nsargs = ["-n", ns] if ns else []
-live = run(["kubectl", "get", kind, name, *nsargs, "-o", "json", "--request-timeout=10s"])
-want = run(["kubectl", "create", "--dry-run=client", "-o", "json", "-f", path])
-if live is None or want is None:
-    sys.exit(0)  # unreadable is handled by the existence pass, not here
-live = json.loads(live)
-# The file may hold several documents; kubectl prints them concatenated.
-docs, dec = [], json.JSONDecoder()
-i, s = 0, want.strip()
-while i < len(s):
-    obj, end = dec.raw_decode(s, i)
-    docs.append(obj)
-    i = end
-    while i < len(s) and s[i] in " \n\r\t":
-        i += 1
-want = next(
-    (d for d in docs
-     if d.get("kind") == kind and (d.get("metadata") or {}).get("name") == name),
-    None,
-)
-if want is None:
-    sys.exit(0)
-for f in FIELDS:
-    if norm(live.get(f)) != norm(want.get(f)):
-        print(f"{f} differs")
+def run(args, what):
+    p = subprocess.run(args, capture_output=True, text=True)
+    if p.returncode != 0:
+        said = (p.stderr.strip().splitlines() or [f"exit {p.returncode}"])[-1]
+        unreadable(f"{what}: {said}")
+    if not p.stdout.strip():
+        unreadable(f"{what}: an empty body")
+    return p.stdout
+
+def main():
+    nsargs = ["-n", ns] if ns else []
+    live = json.loads(run(["kubectl", "get", kind, name, *nsargs, "-o", "json",
+                           "--request-timeout=10s"], "the live read"))
+    want = run(["kubectl", "create", "--dry-run=client", "-o", "json", "-f", path],
+               "the tree's dry run")
+    if not isinstance(live, dict):
+        unreadable("the live read: not an object")
+    # The file may hold several documents; kubectl prints them concatenated.
+    docs, dec = [], json.JSONDecoder()
+    i, s = 0, want.strip()
+    while i < len(s):
+        obj, end = dec.raw_decode(s, i)
+        docs.append(obj)
+        i = end
+        while i < len(s) and s[i] in " \n\r\t":
+            i += 1
+    want = next(
+        (d for d in docs
+         if isinstance(d, dict) and d.get("kind") == kind
+         and (d.get("metadata") or {}).get("name") == name),
+        None,
+    )
+    if want is None:
+        unreadable(f"the tree's dry run holds no {kind}/{name}")
+    if ADMISSION:
+        # Field by field under spec, so the verdict names what moved.
+        live_spec = undefault(live.get("spec") or {})
+        want_spec = undefault(want.get("spec") or {})
+        pairs = [(f"spec.{k}", live_spec.get(k), want_spec.get(k))
+                 for k in sorted(set(live_spec) | set(want_spec))]
+    else:
+        pairs = [(f, live.get(f), want.get(f)) for f in FIELDS]
+    differs = [f for f, a, b in pairs if norm(a) != norm(b)]
+    if differs:
+        print(", ".join(differs) + " differs")
+
+try:
+    main()
+except SystemExit:
+    raise
+except Exception as e:  # a body that is not JSON, a shape nobody expected
+    unreadable(f"{type(e).__name__}: {e}")
 PY
 }
 
@@ -216,19 +286,40 @@ while IFS=$'\t' read -r file kind name ns; do
     out=$(kubectl get "$kind" "$name" "${args[@]}" --request-timeout=10s 2>&1)
     rc=$?
     if [ "$rc" -eq 0 ]; then
-        present=$((present + 1))
+        read_ok=1
         case "$kind" in
-            Role|ClusterRole|RoleBinding|ClusterRoleBinding)
-                why=$(rbac_drift "$kind" "$name" "$ns" "$file")
-                if [ -n "$why" ]; then
+            Role|ClusterRole|RoleBinding|ClusterRoleBinding|ValidatingAdmissionPolicy|ValidatingAdmissionPolicyBinding)
+                # The helper's STATUS is the verdict on whether it read
+                # anything; its output alone is not (review d133e704).
+                why=$(content_drift "$kind" "$name" "$ns" "$file")
+                crc=$?
+                if [ "$crc" -ne 0 ]; then
+                    reason="${why#UNREADABLE }"
+                    echo "  skip    $kind/$name${ns:+ (ns $ns)} — present, but its content could not be read: ${reason:-the content check died (exit $crc)}"
+                    unreadable=$((unreadable + 1))
+                    read_ok=0
+                elif [ -n "$why" ]; then
                     echo "  DRIFT   $kind/$name${ns:+ (ns $ns)} — $why from $DIR/${file##*/} (rendered for ${file%/*})" >&2
                     drifted=$((drifted + 1))
                 fi
                 ;;
         esac
+        [ "$read_ok" -eq 0 ] || present=$((present + 1))
     elif grep -qiE 'forbidden|cannot list|cannot get' <<<"$out"; then
         # Not visible to THIS credential. Say so; never count it green.
         echo "  skip    $kind/$name${ns:+ (ns $ns)} — not readable by this credential"
+        unreadable=$((unreadable + 1))
+    elif ! grep -qE '^Error from server \(NotFound\):' <<<"$out"; then
+        # ONLY NotFound SAYS ABSENT (backlog 7c023eaf; review 6b7032f5,
+        # N1). A timeout, a refused connection or a 5xx read nothing, so
+        # it is unknown, not missing — and in a skipped instance it is
+        # not the skip either: until 2026-09-30 it fell through to the
+        # branches below, MISSING (exit 1) in an applied instance and
+        # `skipped` (exit 0) in a skipped one, where a read that never
+        # happened hid as the converge's own expected absence. kubectl's
+        # last line is the reason, in its own words.
+        said=$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -n 1)
+        echo "  skip    $kind/$name${ns:+ (ns $ns)} — its existence could not be read: ${said:-kubectl exit $rc}"
         unreadable=$((unreadable + 1))
     elif why=$(skip_reason "$instance") && [ -n "$why" ]; then
         # Absent from an instance the converge did not apply — expected,
@@ -253,10 +344,11 @@ if [ "$missing" -gt 0 ]; then
     exit 1
 fi
 if [ "$drifted" -gt 0 ]; then
-    echo "  An RBAC object in the cluster does not grant what the tree declares." >&2
-    echo "  Either direction is a defect: a rule the cluster is MISSING is a" >&2
-    echo "  capability about to vanish at the next converge, and a rule it has" >&2
-    echo "  EXTRA is a privilege nobody declared and nobody owns." >&2
+    echo "  An RBAC or admission object in the cluster does not say what the tree" >&2
+    echo "  declares. Either direction is a defect: a rule the cluster is MISSING is" >&2
+    echo "  a capability about to vanish at the next converge, and a rule it has" >&2
+    echo "  EXTRA — or a policy judging, or refusing, other than the tree says — is" >&2
+    echo "  a privilege nobody declared and nobody owns." >&2
     exit 1
 fi
 # UNREADABLE IS NOT CLEAN. The namespace-scoped session credential can
@@ -266,9 +358,10 @@ fi
 # result must mean verified, so a partial view exits 2 (unknown) and
 # names the number.
 if [ "$unreadable" -gt 0 ]; then
-    echo "  $unreadable of $total objects were not readable by this credential, so this" >&2
-    echo "  run verified $present. That is 'unknown', not 'clean' — rerun with a" >&2
-    echo "  credential that can read them before believing the cluster matches." >&2
+    echo "  $unreadable of $total objects were not readable — by this credential, or" >&2
+    echo "  their existence or content read failed (each is named above) — so this run verified" >&2
+    echo "  $present. That is 'unknown', not 'clean' — rerun, with a credential that" >&2
+    echo "  can read them, before believing the cluster matches." >&2
     exit 2
 fi
 exit 0

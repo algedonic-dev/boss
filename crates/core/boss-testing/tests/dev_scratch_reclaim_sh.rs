@@ -87,14 +87,13 @@ fn stub_curl(root: &Path) -> PathBuf {
             "    shift\n",
             "done\n",
             "printf '%s %s %s\\n' \"$method\" \"$url\" \"$body\" >> \"$STUB_LOG\"\n",
-            // The fast-forward pass asks ONE question of the system of
-            // record — is a gate LAUNCHING right now — and a test
-            // decides the answer: none open by default; one open with
-            // STUB_OPEN_GATE, aged by STUB_GATE_AGE_SECS (default 0, a
-            // gate opened this second); a page that reports more open
-            // runs than it returns with STUB_GATE_TOTAL; and an API
-            // that ANSWERS an error (curl's 22 under -f) with
-            // STUB_GATE_RC.
+            // The fast-forward pass asked the system of record whether a
+            // gate was LAUNCHING until backlog af27db95 (2026-10-01)
+            // deleted the question; the answers stay, so a pin can hand
+            // the pass the two readings that once held the checkout and
+            // see that nothing holds it now: one gate opened THIS SECOND
+            // with STUB_OPEN_GATE, and an API that ANSWERS an error
+            // (curl's 22 under -f) with STUB_GATE_RC.
             "case \"$url\" in\n",
             // The worktree pass's RECORD reads (backlog 9a044141): the
             // gate-runs launched from a worktree, the cars on a branch
@@ -125,16 +124,19 @@ fn stub_curl(root: &Path) -> PathBuf {
             "    *kind=gate-run*)\n",
             "        if [ -n \"${STUB_GATE_RC:-}\" ]; then exit \"$STUB_GATE_RC\"; fi\n",
             "        if [ -n \"${STUB_OPEN_GATE:-}\" ]; then\n",
-            "            now=$(date -u +%s)\n",
-            "            at=$(date -u -d \"@$((now - ${STUB_GATE_AGE_SECS:-0}))\" +%Y-%m-%dT%H:%M:%S.000000000+00:00)\n",
-            "            jq -nc --arg at \"$at\" --argjson total \"${STUB_GATE_TOTAL:-1}\" \\\n",
-            "               '{total: $total, data: [{id: \"gate-1\", status: \"open\", metadata: {opened_at: $at}}]}'\n",
+            "            at=$(date -u +%Y-%m-%dT%H:%M:%S.000000000+00:00)\n",
+            "            jq -nc --arg at \"$at\" \\\n",
+            "               '{total: 1, data: [{id: \"gate-1\", status: \"open\", metadata: {opened_at: $at}}]}'\n",
             "        else echo '{\"total\":0,\"data\":[]}'; fi\n",
             "        exit 0 ;;\n",
             "esac\n",
             "case \"$method\" in\n",
             "    POST) touch \"$STUB_LOG.opened\"; echo '{\"id\":\"job-1\"}' ;;\n",
-            "    PUT) echo '{}' ;;\n",
+            // The step PUT carries the status alone (backlog e39a9d2a):
+            // a metadata body is refused, as the server's end state
+            // refuses it; the keys ride the merge door's PATCH.
+            "    PUT) case \"$body\" in *'\"metadata\"'*) exit 22 ;; esac; echo '{}' ;;\n",
+            "    PATCH) echo '{}' ;;\n",
             "    GET) if [ -e \"$STUB_LOG.opened\" ]; then\n",
             "             echo '{\"data\":[{\"id\":\"job-1\",\"status\":\"open\",\"steps\":[",
             "{\"id\":\"step-run\",\"spec_slug\":\"run\",\"status\":\"ready\",\"metadata\":{}}]}]}'\n",
@@ -242,6 +244,13 @@ fn run_with(scratch: &Path, args: &[&str], extra: &[(&str, &str)]) -> Output {
 }
 
 /// What the stub curl saw, one `METHOD URL BODY` line per call.
+/// The run step's keys, as boss-step.sh writes them: through the step
+/// merge door, followed by a PUT carrying the status alone (backlog
+/// e39a9d2a, Stage 2). The stub refuses a step PUT with a metadata body.
+fn is_run_step_merge(line: &str) -> bool {
+    line.starts_with("PATCH ") && line.contains("/steps/") && line.contains("/metadata ")
+}
+
 fn curl_log(scratch: &Path) -> String {
     std::fs::read_to_string(scratch.join("curl-log.txt")).unwrap_or_default()
 }
@@ -701,7 +710,7 @@ fn a_clean_worktree_whose_branch_is_gone_from_the_forge_is_removed_with_its_targ
     );
     let put = log
         .lines()
-        .find(|l| l.starts_with("PUT "))
+        .find(|l| is_run_step_merge(l))
         .unwrap_or_else(|| panic!("the run step is completed\n{log}\n{text}"));
     let main_ts = git(
         &yard.repo,
@@ -769,7 +778,7 @@ fn a_checkout_without_origin_main_skips_the_pass_and_records_why() {
     );
     let put = log
         .lines()
-        .find(|l| l.starts_with("PUT "))
+        .find(|l| is_run_step_merge(l))
         .unwrap_or_else(|| panic!("the run step is completed\n{log}\n{text}"));
     assert!(
         put.contains("\"worktree_pass\":\"skipped\"")
@@ -907,7 +916,7 @@ fn a_detached_worktree_whose_head_no_ref_holds_is_kept_and_named() {
     let log = curl_log(&root);
     let put = log
         .lines()
-        .find(|l| l.starts_with("PUT "))
+        .find(|l| is_run_step_merge(l))
         .unwrap_or_else(|| panic!("the run step is completed\n{log}\n{text}"));
     assert!(
         put.contains("\"worktrees_kept_unreferenced\":\"1\"")
@@ -960,7 +969,7 @@ fn under_the_work_floor_a_detached_worktree_whose_head_no_ref_holds_is_kept_and_
     let log = curl_log(&root);
     let put = log
         .lines()
-        .find(|l| l.starts_with("PUT "))
+        .find(|l| is_run_step_merge(l))
         .unwrap_or_else(|| panic!("the run step is completed\n{log}\n{text}"));
     assert!(
         put.contains("\"floor_worktrees_removed\":\"1\"")
@@ -1108,7 +1117,7 @@ fn a_lock_whose_process_is_gone_or_restarted_is_stale_and_a_live_lock_is_kept() 
     let log = curl_log(&root);
     let put = log
         .lines()
-        .find(|l| l.starts_with("PUT "))
+        .find(|l| is_run_step_merge(l))
         .unwrap_or_else(|| panic!("the run step is completed\n{log}\n{text}"));
     assert!(
         put.contains("\"worktrees_kept_locked\":\"2\"")
@@ -1304,7 +1313,7 @@ fn each_pass_installs_the_trees_cli_from_the_image_through_the_estate_installer(
     let log = curl_log(&root);
     let put = log
         .lines()
-        .find(|l| l.starts_with("PUT "))
+        .find(|l| is_run_step_merge(l))
         .unwrap_or_else(|| panic!("the run step is completed\n{log}\n{text}"));
     assert!(
         put.contains(&format!("\"cli_sha\":\"{main}\""))
@@ -1410,29 +1419,20 @@ fn a_checkout_without_origin_main_installs_no_cli() {
 // copy stale in the window where this pass can repair it, and the
 // sidecar's missing forge credential (b50a65ef) never comes into it.
 //
-// THE HAZARD IT MUST NOT CAUSE: `boss gate` renders its runner from the
-// tree AT LAUNCH, and mutating the tree under a LAUNCHING gate is the
-// never-stash-while-a-gate-runs fault. The quiet is read from the
-// SYSTEM OF RECORD — a recently-opened `gate-run` packet — rather than
-// from a lock file, because the gate-runs are already in the record. A
-// reading it cannot take is a DEFER, never a fast-forward taken blind.
-//
-// AND LAUNCHING IS NOT RUNNING (backlog 475fbd10, 2026-09-22). `boss
-// gate` takes everything it will ever take from a tree in ONE
-// `read_to_string` of the runner manifest — the first statement of
-// `gate::run`, before the gate-run packet is filed — so a packet older
-// than the launch window belongs to a gate that has already rendered.
-// Deferring on "any open gate-run" was true for 251 of the last 300
-// minutes (84%, measured on the packet; 73% re-measured here from the
-// gate-run history), against 15% for a 120-second launch window, and an
-// hourly pass against an 84%-busy condition lands about one time in
-// six. The checkout sat five commits behind and every door warned.
-//
-// AND THE DEFERRAL HAS AN UPPER BOUND, because one that can repeat
-// forever never errors — it just stops being true, which is the silent
-// -failure class CLAUDE.md names. Past the deadline a deferral stops
-// being a wait and becomes a finding: a problem, a red pass, and the
-// reason on the packet where the refused fast-forward already lands.
+// NO GATE HOLDS IT (backlog af27db95, 2026-10-01). The pass deferred
+// while a `gate-run` packet was open — narrowed to one opened in the
+// last 120 s by backlog 475fbd10 — on the theory that `boss gate`
+// renders its runner from the tree as it launches. It guarded nothing:
+// `boss gate` takes everything it will ever take from a tree in ONE
+// `read_to_string` of the runner manifest, the first statement of
+// `gate::run`, BEFORE its packet is filed, so the window the deferral
+// watched opened only after the read it named; and the runner Job
+// clones from the forge and mounts no /work. Measured on the live
+// record from 2026-09-23: 16 deferrals, every one for a gate that had
+// already read its manifest, from a builder's own worktree, or from the
+// in-cluster conductor — and three passes red past a deadline that
+// existed only to bound that deferral. Both are gone; the fast-forward
+// asks the system of record nothing and owes nothing to it.
 // ---------------------------------------------------------------------
 
 /// The checkout's own HEAD — what the doors run from.
@@ -1451,8 +1451,17 @@ fn behind_by_one(root: &Path) -> Yard {
     yard
 }
 
+/// Did the pass ask the system of record about OPEN gate-runs — the
+/// question the deleted deferral asked? The worktree pass's own gate-run
+/// read is narrowed by `metadata=` to one tree and is a different
+/// question, so it does not count.
+fn asked_about_open_gates(log: &str) -> bool {
+    log.lines()
+        .any(|l| l.contains("kind=gate-run") && !l.contains("metadata="))
+}
+
 #[test]
-fn a_checkout_behind_origin_main_is_fast_forwarded_when_no_gate_is_reading_the_tree() {
+fn a_checkout_behind_origin_main_is_fast_forwarded_and_asks_the_record_nothing() {
     let root = boss_testing::scratch_dir("boss-dsr-ff");
     let _guard = Scratch(root.clone());
     let yard = behind_by_one(&root);
@@ -1473,8 +1482,9 @@ fn a_checkout_behind_origin_main_is_fast_forwarded_when_no_gate_is_reading_the_t
     );
     let log = curl_log(&root);
     assert!(
-        log.contains("kind=gate-run") && log.contains("status=open"),
-        "the quiet is read from the system of record, not from a lock file\n{log}\n{text}"
+        !asked_about_open_gates(&log),
+        "no gate reads /work/boss after its packet exists, so the fast-forward asks \
+         the system of record nothing about gates (backlog af27db95)\n{log}\n{text}"
     );
     // A routine fast-forward is maintenance that worked, like the CLI
     // install beside it: it rides the log, not a packet (David
@@ -1483,168 +1493,58 @@ fn a_checkout_behind_origin_main_is_fast_forwarded_when_no_gate_is_reading_the_t
         !log.contains("POST"),
         "a fast-forward that worked files no packet\n{log}\n{text}"
     );
-    // And the checkout already standing on origin/main is a no-op that
-    // asks the system of record nothing at all.
-    std::fs::remove_file(root.join("curl-log.txt")).expect("reset the curl log");
-    let out = run(&root, &[]);
-    assert!(
-        !curl_log(&root).contains("kind=gate-run"),
-        "a checkout that is already current asks nothing\n{}\n{}",
-        curl_log(&root),
-        say(&out)
-    );
 }
 
+/// The reading that USED to hold the checkout: a gate-run opened this
+/// second. That gate read its runner manifest before it filed the
+/// packet, and its runner clones from the forge, so moving /work/boss
+/// now cannot reach it (backlog af27db95).
 #[test]
-fn a_gate_run_opened_this_second_defers_the_fast_forward() {
+fn a_gate_run_opened_this_second_does_not_hold_the_fast_forward() {
     let root = boss_testing::scratch_dir("boss-dsr-ff-gate");
     let _guard = Scratch(root.clone());
     let yard = behind_by_one(&root);
-    let before = head_sha(&yard.repo);
+    let main = yard.origin_main();
 
     let out = run(&root, &[("STUB_OPEN_GATE", "1")]);
     let text = say(&out);
     assert_eq!(
         head_sha(&yard.repo),
-        before,
-        "a gate is reading a tree — the pass must not move one\n{text}"
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains("gate-run"),
-        "and it says which reading held it back\n{text}"
+        main,
+        "a launching gate has already taken everything it will take from a tree\n{text}"
     );
     assert!(
         out.status.success(),
-        "waiting for the next hour is not a fault\n{text}"
+        "and moving the checkout beside it is the pass working\n{text}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("deferred")
+            && !String::from_utf8_lossy(&out.stderr).contains("fast-forward deferred"),
+        "nothing defers the fast-forward any more\n{text}"
     );
 }
 
-/// A gate that opened its packet an hour ago read the runner manifest
-/// an hour ago too — `gate::run`'s one `read_to_string` runs BEFORE the
-/// packet is filed. Holding the checkout for it buys nothing and costs
-/// the 84% of the day at least one gate is open (backlog 475fbd10).
+/// An arm that acts owes nothing to what it watches (CLAUDE.md
+/// §Diagnosis): with the deferral gone, a dark system of record no
+/// longer leaves every door here answering from an old tree.
 #[test]
-fn a_gate_that_has_already_rendered_its_runner_does_not_defer_the_fast_forward() {
-    let root = boss_testing::scratch_dir("boss-dsr-ff-running");
+fn a_system_of_record_that_cannot_be_read_does_not_hold_the_fast_forward() {
+    let root = boss_testing::scratch_dir("boss-dsr-ff-dark");
     let _guard = Scratch(root.clone());
     let yard = behind_by_one(&root);
     let main = yard.origin_main();
 
-    let out = run(
-        &root,
-        &[("STUB_OPEN_GATE", "1"), ("STUB_GATE_AGE_SECS", "3600")],
-    );
+    // curl exit 22 on every read: the API ANSWERED an error.
+    let out = run(&root, &[("STUB_GATE_RC", "22"), ("STUB_RECORD_RC", "22")]);
     let text = say(&out);
     assert_eq!(
         head_sha(&yard.repo),
         main,
-        "an hour-old gate has taken everything it will ever take from a tree\n{text}"
+        "the fast-forward needs nothing from the system of record\n{text}"
     );
     assert!(
-        out.status.success(),
-        "and moving the checkout for it is the pass working\n{text}"
-    );
-}
-
-/// A page that reports more open gate-runs than it returns answers a
-/// smaller question (CLAUDE.md — a limit is not a filter): the launch
-/// window cannot be judged from rows that were never sent, so the pass
-/// defers the way it does on any unread check.
-#[test]
-fn a_truncated_gate_run_page_is_a_reading_the_pass_cannot_take() {
-    let root = boss_testing::scratch_dir("boss-dsr-ff-truncated");
-    let _guard = Scratch(root.clone());
-    let yard = behind_by_one(&root);
-    let before = head_sha(&yard.repo);
-
-    // One row returned, three said to be open, and the two unseen ones
-    // could each have launched a second ago.
-    let out = run(
-        &root,
-        &[
-            ("STUB_OPEN_GATE", "1"),
-            ("STUB_GATE_AGE_SECS", "3600"),
-            ("STUB_GATE_TOTAL", "3"),
-        ],
-    );
-    let text = say(&out);
-    assert_eq!(
-        head_sha(&yard.repo),
-        before,
-        "a fast-forward is never taken on a page that answered a smaller question\n{text}"
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("fast-forward deferred"),
-        "the defer and its reason are loud\n{text}"
-    );
-}
-
-/// THE UPPER BOUND. A deferral that can repeat forever never errors; it
-/// just stops being true, and the checkout starves while every door
-/// warns and every write is refused at exit 78. How long it has been
-/// behind is read from GIT ALONE — the committer time of the oldest
-/// commit the checkout is missing — so there is no counter file and no
-/// second copy of a fact (CLAUDE.md §9a).
-#[test]
-fn a_deferral_that_outlives_its_deadline_is_a_problem_on_the_packet() {
-    let root = boss_testing::scratch_dir("boss-dsr-ff-deadline");
-    let _guard = Scratch(root.clone());
-    let yard = behind_by_one(&root);
-    let before = head_sha(&yard.repo);
-
-    let out = run(
-        &root,
-        &[("STUB_OPEN_GATE", "1"), ("BOSS_FF_DEADLINE_SECS", "0")],
-    );
-    let text = say(&out);
-    assert_eq!(
-        head_sha(&yard.repo),
-        before,
-        "the deadline makes a stuck deferral LOUD; it never overrides the hazard\n{text}"
-    );
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "and reds the pass, like every other problem here\n{text}"
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("DEFERRED PAST ITS DEADLINE"),
-        "a deferral nobody can see is the failure this bound exists to end\n{text}"
-    );
-    let log = curl_log(&root);
-    let put = log
-        .lines()
-        .find(|l| l.starts_with("PUT "))
-        .unwrap_or_else(|| panic!("the run step is completed\n{log}\n{text}"));
-    assert!(
-        put.contains("\"result\":\"incomplete\"") && put.contains("past its"),
-        "the packet says the checkout stopped catching up\n{put}\n{text}"
-    );
-    assert!(
-        put.contains("\"ff_detail\":\"") && put.contains("behind origin/main for"),
-        "and names how long and what held it — not an exit code to go re-derive\n{put}\n{text}"
-    );
-}
-
-#[test]
-fn a_system_of_record_that_cannot_be_read_defers_the_fast_forward() {
-    let root = boss_testing::scratch_dir("boss-dsr-ff-dark");
-    let _guard = Scratch(root.clone());
-    let yard = behind_by_one(&root);
-    let before = head_sha(&yard.repo);
-
-    // curl exit 22: the API ANSWERED an error. A safety check that did
-    // not run is not a safety check — the tree stays where it is.
-    let out = run(&root, &[("STUB_GATE_RC", "22")]);
-    let text = say(&out);
-    assert_eq!(
-        head_sha(&yard.repo),
-        before,
-        "a fast-forward is never taken on an unread gate check\n{text}"
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("fast-forward deferred"),
-        "the defer and its reason are loud\n{text}"
+        !String::from_utf8_lossy(&out.stderr).contains("fast-forward deferred"),
+        "and a dark record defers nothing\n{text}"
     );
 }
 
@@ -1717,7 +1617,7 @@ fn a_fast_forward_git_refuses_is_loud_and_lands_on_the_packet() {
     let log = curl_log(&root);
     let put = log
         .lines()
-        .find(|l| l.starts_with("PUT "))
+        .find(|l| is_run_step_merge(l))
         .unwrap_or_else(|| panic!("the run step is completed\n{log}\n{text}"));
     assert!(
         put.contains("\"ff_result\":\"failed: exit")
@@ -1876,7 +1776,7 @@ fn under_the_floor_idle_sibling_targets_go_oldest_first_until_it_is_met() {
     let log = curl_log(&root);
     let put = log
         .lines()
-        .find(|l| l.starts_with("PUT "))
+        .find(|l| is_run_step_merge(l))
         .unwrap_or_else(|| panic!("an acting pass records itself\n{log}\n{text}"));
     assert!(
         put.contains("\"floor_targets_reclaimed\":\"2\""),
@@ -1975,7 +1875,7 @@ fn the_scratch_floor_mode_takes_idle_siblings_and_runs_no_other_pass() {
     let log = curl_log(&root);
     let put = log
         .lines()
-        .find(|l| l.starts_with("PUT "))
+        .find(|l| is_run_step_merge(l))
         .unwrap_or_else(|| panic!("an acting floor pass records itself\n{log}\n{text}"));
     assert!(
         put.contains("\"floor_targets_reclaimed\":\"2\""),
@@ -2217,7 +2117,7 @@ fn a_worktree_whose_work_landed_by_a_rebase_and_a_squash_is_landed_and_unlanded_
             let log = curl_log(&root);
             let put = log
                 .lines()
-                .find(|l| l.starts_with("PUT "))
+                .find(|l| is_run_step_merge(l))
                 .unwrap_or_else(|| panic!("the run step is completed\n{log}\n{text}"));
             assert!(
                 put.contains("\"worktrees_removed_by_content\":\"2\""),
@@ -2276,7 +2176,7 @@ fn abandoned_tree(yard: &Yard) -> PathBuf {
 fn run_step_put(root: &Path, text: &str) -> String {
     let log = curl_log(root);
     log.lines()
-        .find(|l| l.starts_with("PUT "))
+        .find(|l| is_run_step_merge(l))
         .unwrap_or_else(|| panic!("the run step is completed\n{log}\n{text}"))
         .to_string()
 }

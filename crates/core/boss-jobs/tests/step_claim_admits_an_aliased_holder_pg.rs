@@ -32,20 +32,16 @@ async fn seeded_step(repo: &boss_jobs::PgJobs, holder: &str) -> StepId {
     let job_id = JobId::from_uuid(Uuid::new_v4());
     let job = Job {
         id: job_id,
-        kind: "backlog-item".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "/it/backlog"),
-        title: "Nominated before the lane resolved aliases".into(),
-        owner_id: "emp-owner".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 19).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "backlog-item",
+            Subject::new("custom", "/it/backlog"),
+            "Nominated before the lane resolved aliases",
+            "emp-owner",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 19).unwrap(),
+        )
     };
     let mut step = Step::new(job_id, "task", "Build it", 0).with_assignee(holder);
     step.spec_slug = Some("build".into());

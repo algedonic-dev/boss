@@ -265,6 +265,32 @@ describe('NEXT UP — a departures board, each time in the viewer’s timezone w
     expect(board.lines[2]).toMatchObject({ state: 'unread', time: null, why: 'the dispatcher did not answer', source: 'dispatcher schedule' });
   });
 
+  // Backlog bd506215: a source the server WITHHELD from a narrowed scope
+  // (0964ba80 — `withheld_rows` in next_up.rs) is a refusal, not a dark
+  // source: its own state, not the unread `?` a failure wears.
+  it('a source withheld by policy scope is its own neutral line, never the unread ?', () => {
+    const why = "withheld: this caller's policy scope does not read every packet, and this source is not scoped by packet";
+    const board = nextUpBoard(
+      ready({
+        next_up: [
+          ev('gates', 'a bay frees', '2026-09-27T12:10:04Z'),
+          ev('scheduled', 'scheduled rules', null, { unread: why, withheld: true, basis: 'the dispatcher schedule is withheld from this caller', source: 'dispatcher schedule' }),
+          ev('scheduled', 'dispatcher schedule', null, { unread: 'the dispatcher did not answer', basis: '', source: 'dispatcher schedule' }),
+          // The refusal's words WITHOUT the server's flag (1805bac0): the
+          // words decide nothing, so this is a source that did not answer.
+          ev('rotation-due', 'credential rotations', null, { unread: why, basis: '', source: 'credentials registry' }),
+        ],
+      }),
+      NOW,
+      ZONE,
+    );
+    if (board.kind !== 'rows') throw new Error(board.kind);
+    expect(board.lines[1]).toMatchObject({ state: 'withheld', title: 'scheduled rules', time: null, countdown: null, why });
+    // The control: a source that failed is still unread.
+    expect(board.lines[2]?.state).toBe('unread');
+    expect(board.lines[3]?.state).toBe('unread');
+  });
+
   it('null from the server is unread, not empty', () => {
     const b = nextUpBoard(ready({ next_up: null }), NOW, ZONE);
     expect(b.kind).toBe('unread');

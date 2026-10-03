@@ -1197,7 +1197,7 @@ mod tests {
             store,
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
-            machine: crate::machine_client::MachineClient::build(reqwest::Client::builder())
+            machine: crate::machine_client::MachineClient::unstamped(reqwest::Client::builder())
                 .unwrap(),
             audit: crate::audit::AuthAudit::disabled(),
             guest_access: GuestAccess::Off,
@@ -1305,7 +1305,7 @@ mod tests {
             store,
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
-            machine: crate::machine_client::MachineClient::build(reqwest::Client::builder())
+            machine: crate::machine_client::MachineClient::unstamped(reqwest::Client::builder())
                 .unwrap(),
             audit: crate::audit::AuthAudit::disabled(),
             guest_access: access,
@@ -1337,7 +1337,7 @@ mod tests {
             store,
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
-            machine: crate::machine_client::MachineClient::build(reqwest::Client::builder())
+            machine: crate::machine_client::MachineClient::unstamped(reqwest::Client::builder())
                 .unwrap(),
             audit: crate::audit::AuthAudit::spawn(cap.clone()),
             guest_access: GuestAccess::Off,
@@ -1411,7 +1411,7 @@ mod tests {
             store,
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
-            machine: crate::machine_client::MachineClient::build(reqwest::Client::builder())
+            machine: crate::machine_client::MachineClient::unstamped(reqwest::Client::builder())
                 .unwrap(),
             audit: crate::audit::AuthAudit::spawn(cap.clone()),
             guest_access: GuestAccess::Off,
@@ -1553,7 +1553,7 @@ mod tests {
             store,
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
-            machine: crate::machine_client::MachineClient::build(reqwest::Client::builder())
+            machine: crate::machine_client::MachineClient::unstamped(reqwest::Client::builder())
                 .unwrap(),
             audit: crate::audit::AuthAudit::spawn(cap.clone()),
             guest_access: GuestAccess::Basic,
@@ -1847,7 +1847,7 @@ mod tests {
             store,
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
-            machine: crate::machine_client::MachineClient::build(reqwest::Client::builder())
+            machine: crate::machine_client::MachineClient::unstamped(reqwest::Client::builder())
                 .unwrap(),
             audit: crate::audit::AuthAudit::disabled(),
             guest_access: access,
@@ -2028,7 +2028,7 @@ mod tests {
             store,
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
-            machine: crate::machine_client::MachineClient::build(reqwest::Client::builder())
+            machine: crate::machine_client::MachineClient::unstamped(reqwest::Client::builder())
                 .unwrap(),
             audit: crate::audit::AuthAudit::spawn(rec.clone()),
             guest_access: GuestAccess::Off,

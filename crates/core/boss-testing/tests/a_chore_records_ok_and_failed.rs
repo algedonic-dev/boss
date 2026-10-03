@@ -54,6 +54,8 @@ const CHORE: &str = "infra/boss-chore.sh";
 const MANIFESTS: &str = "infra/cluster/manifests";
 const DOCKERFILE: &str = "infra/oss-quickstart/Dockerfile";
 const BOSS_IMAGE: &str = "10.20.0.15:3000/david/boss:";
+/// The one env var that lets a chore's exit 75 close `not-yet`.
+const NOT_YET_OPT_IN: &str = "BOSS_CHORE_NOT_YET_ON_75";
 
 fn read(rel: &str) -> String {
     std::fs::read_to_string(repo_root().join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
@@ -137,7 +139,8 @@ fn run_chore(bin: &Path, env: &[(&str, &str)], args: &[&str]) -> Run {
         .env("BOSS_JOBS_URL", "http://boss-jobs-internal.test:7900")
         .env("TMPDIR", bin)
         .env_remove("BOSS_TEST_WRAP_RC")
-        .env_remove("BOSS_TEST_STEP_RC");
+        .env_remove("BOSS_TEST_STEP_RC")
+        .env_remove(NOT_YET_OPT_IN);
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -248,6 +251,85 @@ fn a_failing_check_records_failed_with_its_exit_status_and_output() {
         "and the container log still has it, in order:\n{}",
         r.stdout
     );
+}
+
+const WAITS: &[&str] = &[
+    "maintenance-selftest",
+    "Self test",
+    "--",
+    "sh",
+    "-c",
+    "echo 'not yet: the policy only reports'; exit 75",
+];
+
+#[test]
+fn a_check_that_opts_in_and_cannot_judge_yet_records_not_yet_and_its_job_does_not_fail() {
+    // Backlog 17a7bd18 (red_until_deny): 75 is the estate's not-yet
+    // (EX_TEMPFAIL — a recorded probe's, the sweep judge's); a kind whose
+    // protocol declares a `not-yet` outcome closes there, and a wait is
+    // not a failed Kubernetes Job — for a chore whose manifest says so.
+    let bin = planted("chore-not-yet");
+    let r = run_chore(&bin, &[(NOT_YET_OPT_IN, "1")], WAITS);
+    assert_eq!(r.rc, 0, "a wait is not a failed Job:\n{}", r.stderr);
+    let closes = r.closes();
+    assert_eq!(closes.len(), 1, "{closes:?}");
+    assert_eq!(Run::pair(&closes[0], "result"), Some("not-yet"));
+    assert_eq!(Run::pair(&closes[0], "exit_status"), Some("75"));
+    assert!(
+        Run::pair(&closes[0], "output")
+            .unwrap_or_default()
+            .contains("not yet: the policy only reports"),
+        "the check's own words say why it waits: {closes:?}"
+    );
+}
+
+#[test]
+fn a_75_from_a_chore_that_did_not_opt_in_is_a_failed_run() {
+    // Review 0d3019f0 (the chore note, backlog e4a9a9b3): mapping 75 to
+    // not-yet for EVERY chore made any check that happened to exit 75 —
+    // a helper's EX_TEMPFAIL leaking through `set -e` — close quietly as
+    // a wait. The mapping is the chore's own declaration now, and the
+    // default is the loud one.
+    for value in [None, Some(""), Some("0"), Some("yes")] {
+        let bin = planted("chore-75-not-opted");
+        let env: Vec<(&str, &str)> = value.map(|v| (NOT_YET_OPT_IN, v)).into_iter().collect();
+        let r = run_chore(&bin, &env, WAITS);
+        assert_eq!(r.rc, 75, "{value:?}: the Job shows Failed:\n{}", r.stderr);
+        let closes = r.closes();
+        assert_eq!(closes.len(), 1, "{value:?}: {closes:?}");
+        assert_eq!(
+            Run::pair(&closes[0], "result"),
+            Some("failed"),
+            "{value:?}: only an explicit opt-in reads 75 as a wait"
+        );
+        assert_eq!(Run::pair(&closes[0], "exit_status"), Some("75"));
+    }
+}
+
+#[test]
+fn a_chore_opts_into_not_yet_only_where_its_protocol_declares_the_ending() {
+    // The opt-in and the protocol's `not-yet` terminal are one fact in
+    // two files (CLAUDE.md §9a): a manifest that opts in names a kind
+    // whose Workflow closes `not-yet`, or its waits would close nowhere.
+    let dir = repo_root().join(MANIFESTS);
+    for entry in std::fs::read_dir(&dir).expect("manifests") {
+        let path = entry.expect("entry").path();
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        if !text.contains(&format!("name: {NOT_YET_OPT_IN}")) {
+            continue;
+        }
+        let kind = text
+            .split("/usr/local/bin/boss-chore.sh ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap_or_else(|| panic!("{}: opts in but runs no chore", path.display()));
+        let workflow = read(&format!("infra/platform/workflows/{kind}.toml"));
+        assert!(
+            workflow.contains("terminal = { outcome = \"not-yet\" }"),
+            "{}: opts {kind} into not-yet, and its protocol declares no such ending",
+            path.display()
+        );
+    }
 }
 
 #[test]

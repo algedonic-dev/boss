@@ -1,0 +1,46 @@
+# One create-only reservation and its native executor observations (2f7b8c00,
+# design 59459712). Printing an agent-run brief does not start an executor.
+# Only the launcher receiving the first HTTP201 may start; uncertain answers
+# and repeat admissions never authorize a second process. This packet records
+# execution observations, not the underlying step's delivery or spend.
+[[workflow]]
+kind = "agent-execution"
+label = "Executor observation"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "A registered run's single launch reservation and copied native executor outcome. Submitted controls are distinct from observed execution; a lost launcher remains unobserved and cannot be retried as another execution."
+metadata = { department = "it", owner_role = "platform-admin" }
+metadata_schema = { type = "object", required = ["agent_run", "agent", "harness", "requested", "status"], properties = { agent_run = { type = "string" }, agent = { type = "string" }, harness = { type = "string" }, requested = { type = "object" }, status = { type = "string" }, observation = { type = "object" } } }
+
+[[workflow.step]]
+title = "observing"
+kind = "task"
+ready_when = "true"
+title_template = "Observe the executor"
+authority_role = "platform-admin"
+fields = [{ name = "result", field_type = "completed|failed|unknown", required = true }]
+
+[[workflow.step]]
+title = "completed"
+kind = "outcome"
+ready_when = "steps.observing.done AND steps.observing.metadata.result = \"completed\""
+title_template = "Native execution completed"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "completed" }
+
+[[workflow.step]]
+title = "failed"
+kind = "outcome"
+ready_when = "steps.observing.done AND steps.observing.metadata.result = \"failed\""
+title_template = "Native execution failed"
+metadata_defaults = { outcome_kind = "aborted" }
+terminal = { outcome = "failed" }
+
+[[workflow.step]]
+title = "unknown"
+kind = "outcome"
+ready_when = "steps.observing.done AND steps.observing.metadata.result = \"unknown\""
+title_template = "Execution could not be attested"
+metadata_defaults = { outcome_kind = "aborted" }
+terminal = { outcome = "unknown" }

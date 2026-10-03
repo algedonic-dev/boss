@@ -20,7 +20,10 @@
 //! exactly the backups and leaves every neighbour intact; a plan that
 //! moved, and a second run of an applied one, remove nothing; a checkout
 //! is KEPT with its unpushed state in the plan while the backups beside
-//! it still plan (2026-09-27 — it used to refuse the whole run); a path
+//! it still plan (2026-09-27 — it used to refuse the whole run), except
+//! /opt/boss-dev-bak proven to hold nothing unpushed, which is REMOVED
+//! first and re-proved before its rm, a change refusing with exit 78
+//! (David, 2026-09-30); a path
 //! handed to the script, a symlinked candidate, a backup
 //! COPIED today with its old mtimes (the adversarial review's H1), and a
 //! backup that a live tree, a mount, a symlink, a running process, a
@@ -41,9 +44,24 @@
 //! capture directory, a name retire-second-stack does not write (a
 //! 14-digit stamp, `second-stack-x.sql`), a directory by a capture's
 //! name, a capture a process holds open, and a capture whose bytes
-//! changed are each refused or left; a sibling cluster-pg dump, a
-//! compressed copy and a capture-named file in ANOTHER directory survive
-//! every run.
+//! changed are each refused or left; a dump-named file in another
+//! directory, a compressed copy and a capture-named file in ANOTHER
+//! directory survive every run.
+//!
+//! THE SECOND EXCEPTION: THE CLUSTER-PG DUMPS (backlog 4bf7bdd1,
+//! 2026-10-01). David: "boss-gcp doesn't need to be storage backup" — the
+//! GCS bucket is the off-site copy, and boss-backup.yaml no longer ships
+//! to boss-gcp. The 9.5 GB the retired leg left in
+//! /var/backups/boss-cluster-pg is removed through this verb, never by
+//! hand: only `boss-*.sql.gz` in that ONE fixed directory, each named
+//! ^boss-[A-Za-z0-9._:+-]+\.sql\.gz$, a regular file with one link, no
+//! mount point, held open by no process, its size, inode, mtime and ctime
+//! in the plan (the signature binds that identity; the write reads it
+//! again just before `rm -f`). Pinned here: the plan and the signed write,
+//! the neighbours in that directory that are not dumps, a name outside the
+//! pattern, a symlinked dump or dump directory, a directory by a dump's
+//! name, a hardlinked or held-open dump, a directory others can write,
+//! and a dump that changed — before the signature or during the write.
 
 use boss_testing::{repo_root, scratch_dir, write_exec, write_file};
 use std::path::{Path, PathBuf};
@@ -76,12 +94,31 @@ const KEPT: [&str; 4] = ["boss", "boss-cli", "boss-dev-bak2", "boss-binbak"];
 const CAPTURE: &str = "second-stack-20260915T211123Z.sql";
 const CAPTURE_BYTES: &str = "-- PostgreSQL database dump of the retired second stack\n";
 
-/// Beside the capture, under /var/backups, and never this verb's: the
-/// cluster-pg dumps (not decided), and a compressed copy of a capture —
-/// a name retire-second-stack never writes.
+/// Beside the capture, under /var/backups/boss, and never this verb's: a
+/// dump-named file in a directory that is not the dumps' own, and a
+/// compressed copy of a capture — a name retire-second-stack never writes.
 const NOT_OURS: [&str; 2] = [
     "boss-cluster-pg/boss-cluster-pg-20260920T030000Z.sql.gz",
     "second-stack/second-stack-20260915T211123Z.sql.gz",
+];
+
+/// The dumps the retired boss-gcp leg deposited in
+/// /var/backups/boss-cluster-pg: one named as the cluster's dump leg names
+/// it (`boss-$(date -u +%Y%m%d-%H%M%S).sql.gz`), one in a server-side
+/// stamp's shape — the receiver's script was never in the tree, so the
+/// bound is the `boss-*.sql.gz` shape both share.
+const DUMPS: [&str; 2] = [
+    "boss-20260930-091012.sql.gz",
+    "boss-cluster-pg-20260920T030000Z.sql.gz",
+];
+const DUMP_BYTES: &str = "-- a cluster-pg dump the retired boss-gcp leg deposited\n";
+
+/// In the dumps' own directory, and never this verb's: what the glob does
+/// not match.
+const DUMP_DIR_NOT_OURS: [&str; 3] = [
+    "README",
+    "boss-20260930-091012.sql",
+    ".incoming-boss-20261001-091000.sql.gz",
 ];
 
 fn epoch_now() -> u64 {
@@ -139,6 +176,8 @@ struct Case {
     /// The scratch /var/backups/boss, canonical: the script refuses a
     /// capture directory whose realpath is not its own spelling.
     backups: PathBuf,
+    /// The scratch /var/backups/boss-cluster-pg, canonical, beside it.
+    dumps: PathBuf,
 }
 
 struct Run {
@@ -204,6 +243,21 @@ impl Case {
         put(&backups.join("second-stack").join(CAPTURE), CAPTURE_BYTES);
         for n in NOT_OURS {
             put(&backups.join(n), "not this verb's\n");
+        }
+        // /var/backups/boss-cluster-pg, beside /var/backups/boss: the
+        // dumps, and what the glob does not match. Its parent (the scratch
+        // /var/backups) is held to the owner bound, so its mode is set too.
+        let dumps = backups.with_file_name("boss-cluster-pg");
+        std::fs::create_dir_all(&dumps).unwrap();
+        for d in [dumps.clone(), backups.parent().unwrap().to_path_buf()] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap(); // mode-bits-ok: a fixture directory the dump bound reads the mode of, not a script
+        }
+        for n in DUMPS {
+            put(&dumps.join(n), DUMP_BYTES);
+        }
+        for n in DUMP_DIR_NOT_OURS {
+            put(&dumps.join(n), "not this verb's\n");
         }
         // A unit file on disk that runs from the live tree.
         write_file(
@@ -271,7 +325,22 @@ esac
             mountinfo,
             calls,
             backups,
+            dumps,
         }
+    }
+
+    fn dump(&self, i: usize) -> PathBuf {
+        self.dumps.join(DUMPS[i])
+    }
+
+    /// The opening of the plan's line for a dump holding `bytes`; the
+    /// identity after it (inode, mtime, ctime) is the file's own.
+    fn dump_line(&self, path: &Path, bytes: &str) -> String {
+        format!(
+            "would remove {} ({} bytes, inode ",
+            path.display(),
+            bytes.len()
+        )
     }
 
     fn capture_dir(&self) -> PathBuf {
@@ -307,6 +376,23 @@ esac
                 "{n} under /var/backups was touched:\n{text}"
             );
         }
+        for n in DUMP_DIR_NOT_OURS {
+            assert!(
+                self.dumps.join(n).is_file(),
+                "{n} beside the dumps was touched:\n{text}"
+            );
+        }
+    }
+
+    /// Every dump still standing.
+    fn assert_dumps_intact(&self, text: &str) {
+        for n in DUMPS {
+            let p = self.dumps.join(n);
+            assert!(
+                p.is_file() || p.is_symlink(),
+                "the dump {n} was removed:\n{text}"
+            );
+        }
     }
 
     fn env(&self, cmd: &mut Command) {
@@ -326,6 +412,7 @@ esac
             .env("BOSS_RECLAIM_UNIT_DIRS", &self.units)
             .env("BOSS_RECLAIM_NOW", sixty_days_on())
             .env("BOSS_RECLAIM_CAPTURE_DIR", self.capture_dir())
+            .env("BOSS_RECLAIM_DUMP_DIR", &self.dumps)
             // The fixture's owner stands in for root: no test account can
             // chown to uid 0 (the gate runs as 65534, the pod has no CAP_CHOWN).
             .env("BOSS_RECLAIM_CAPTURE_OWNER", self.owner())
@@ -379,6 +466,7 @@ esac
             self.capture().is_file() || self.capture().is_symlink(),
             "the capture was removed:\n{text}"
         );
+        self.assert_dumps_intact(text);
         self.assert_not_ours_intact(text);
         assert!(
             !self.calls().contains("--vacuum-size"),
@@ -435,9 +523,10 @@ fn dry_run_renders_a_plan_naming_its_own_hash_and_removes_nothing() {
         "the plan",
     );
     // Nothing else under /var/backups is named, not even a capture's
-    // compressed copy.
+    // compressed copy, nor a dump's name in another directory.
     for n in NOT_OURS {
-        assert!(!r.out.contains(n), "the plan names {n}:\n{text}");
+        let p = c.backups.join(n).display().to_string();
+        assert!(!r.out.contains(&p), "the plan names {p}:\n{text}");
     }
     contains_all(
         &r.err,
@@ -537,6 +626,16 @@ fn the_signed_plan_removes_exactly_the_backups_and_vacuums_to_1g() {
         last_dir < capture_at,
         "the capture was not removed last:\n{text}"
     );
+    // The cluster-pg dumps went too, after the capture (backlog 4bf7bdd1).
+    for n in DUMPS {
+        let p = c.dumps.join(n);
+        assert!(!p.exists(), "{n} was not removed:\n{text}");
+        let at = text
+            .find(&format!("removed {} (", p.display()))
+            .unwrap_or_else(|| panic!("no record of {n}:\n{text}"));
+        assert!(capture_at < at, "a dump went before the capture:\n{text}");
+    }
+    assert!(c.dumps.is_dir(), "the dumps' directory went");
 
     // At most once: the applied plan's backups are gone, so it no longer
     // hashes to the signature and a second run removes nothing.
@@ -685,6 +784,22 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// Name `origin` in the checkout's config and point `origin/main` at HEAD,
+/// as a fetch would: only the refs of a remote the config NAMES count as
+/// pushed (review 2435f065, R3), so a bare update-ref is not enough.
+fn publish(r: &Path) {
+    git(
+        r,
+        &[
+            "config",
+            "remote.origin.url",
+            "https://forge.invalid/boss.git",
+        ],
+    );
+    let tip = git(r, &["rev-parse", "HEAD"]);
+    git(r, &["update-ref", "refs/remotes/origin/main", &tip]);
+}
+
 /// Make /opt/boss-dev-bak a checkout carrying, measured against its own
 /// remote-tracking refs: `main` two commits past `origin/main`, `feature`
 /// one commit on no remote, `pushed` wholly on the remote, one modified
@@ -696,7 +811,7 @@ fn make_checkout(c: &Case, clean: bool) -> PathBuf {
     git(&r, &["add", "-A"]);
     git(&r, &["commit", "-q", "-m", "july"]);
     let base = git(&r, &["rev-parse", "HEAD"]);
-    git(&r, &["update-ref", "refs/remotes/origin/main", &base]);
+    publish(&r);
     git(&r, &["branch", "pushed"]);
     if !clean {
         for n in ["one", "two"] {
@@ -761,7 +876,7 @@ fn a_checkout_is_kept_with_its_reason_and_the_backups_still_plan() {
         &plan.out,
         &[
             &format!("would keep {} — it holds a git checkout", r.display()),
-            "this plan removes no checkout",
+            "could not prove holds nothing unpushed",
             &format!("  checkout {}:\n", r.display()),
             "    branches with commits on no remote: 2\n",
             "      feature: 1 commit(s)\n",
@@ -771,7 +886,13 @@ fn a_checkout_is_kept_with_its_reason_and_the_backups_still_plan() {
             "    tracked files whose bytes differ from the index (read without filters): 1\n",
             "    untracked files (ignored ones not counted): 2\n",
             "    stashes: 1\n",
-            "    not measured: tags, reflogs, ignored files and submodules; a branch squash-merged upstream still counts as unpushed. This plan removes no checkout.\n",
+            REMOTES_HEAD,
+            ORIGIN_LINE,
+            &not_network_line(0),
+            "    commits reachable from any ref (tags, notes, stashes, other refs and linked worktrees' HEADs included) and on no configured remote: 5\n",
+            "    linked worktrees (their HEADs and indexes live in this repository and are not read): 0\n",
+            "    submodule repositories under .git/modules (not read): 0\n",
+            "    not measured: reflogs, ignored files (what .gitignore and .git/info/exclude hide), and any repository elsewhere that borrows this one's objects (objects/info/alternates); a branch squash-merged upstream still counts as unpushed, and a remote-tracking ref is trusted as of the last fetch.\n",
         ],
         "the plan's evidence",
     );
@@ -809,31 +930,681 @@ fn a_checkout_is_kept_with_its_reason_and_the_backups_still_plan() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// A checkout PROVEN to hold nothing unpushed is removed (David, 2026-09-30
+// ~20:16Z, recorded on backlog d3c7eada as decided_2026_09_30: "drop
+// /opt/boss-dev-bak; it is disposable"). Plan f57448bc read it as a checkout
+// with 0 unpushed commits, 0 staged/modified/untracked and 0 stashes, and the
+// verb kept it anyway, because it removed no checkout at all — so boss-gcp
+// stayed ~1 GB under its floor. Only /opt/boss-dev-bak can be such a
+// candidate; the proof rides in the plan's bytes, so the passkey signs it;
+// the write re-proves it just before the rm, and any change refuses the
+// whole run with exit 78, removing nothing.
+// ---------------------------------------------------------------------------
+
+/// The remotes block's head line, and origin as `publish` names it: the
+/// URL a signer reads to see where "pushed" means (review d83b2898, B2).
+const REMOTES_HEAD: &str = "    remotes its config names, with their URLs (userinfo removed; only a network remote's refs count as pushed):\n";
+const ORIGIN_LINE: &str = "      origin: https://forge.invalid/boss.git\n";
+
+/// The count of remotes whose URL is not a network URL.
+fn not_network_line(n: u32) -> String {
+    format!(
+        "    remotes whose URL is not a network URL (a local path, file:// or anything else; their refs count as nothing pushed, and any keeps the checkout): {n}\n"
+    )
+}
+
+/// The proof, as the plan states it for a checkout with nothing unpushed.
+const CLEAN_PROOF: [&str; 12] = [
+    REMOTES_HEAD,
+    ORIGIN_LINE,
+    "    remotes whose URL is not a network URL (a local path, file:// or anything else; their refs count as nothing pushed, and any keeps the checkout): 0\n",
+    "    branches with commits on no remote: 0\n",
+    "    commits at HEAD on no branch and no remote: 0\n",
+    "    commits reachable from any ref (tags, notes, stashes, other refs and linked worktrees' HEADs included) and on no configured remote: 0\n",
+    "    linked worktrees (their HEADs and indexes live in this repository and are not read): 0\n",
+    "    submodule repositories under .git/modules (not read): 0\n",
+    "    staged changes not committed: 0\n",
+    "    tracked files whose bytes differ from the index (read without filters): 0\n",
+    "    untracked files (ignored ones not counted): 0\n",
+    "    stashes: 0\n",
+];
+
+/// The line the any-ref count prints at `n`.
+fn any_ref_line(n: u32) -> String {
+    format!(
+        "    commits reachable from any ref (tags, notes, stashes, other refs and linked worktrees' HEADs included) and on no configured remote: {n}\n"
+    )
+}
+
+/// The plan KEEPS `r`, the three binbak backups still plan, and the signed
+/// write leaves `r` exactly as it was while removing them.
+fn assert_kept_through_the_signed_write(c: &Case, r: &Path, what: &str) {
+    let plan = c.run(&["--dry-run"]);
+    let text = plan.text();
+    assert_eq!(plan.code, 0, "{what}: the dry run failed:\n{text}");
+    contains_all(
+        &plan.out,
+        &[&format!(
+            "would keep {} — it holds a git checkout",
+            r.display()
+        )],
+        what,
+    );
+    assert!(
+        !plan
+            .out
+            .contains(&format!("would remove {} (", r.display())),
+        "{what}: the plan removes the checkout:\n{text}"
+    );
+    let w = c.run(&[&plan.plan_sha()]);
+    let t2 = w.text();
+    assert_eq!(w.code, 0, "{what}: the signed run failed:\n{t2}");
+    assert!(
+        r.join(".git/HEAD").is_file() && r.join("VERSION").exists(),
+        "{what}: the checkout was touched:\n{t2}"
+    );
+    for b in &BACKUPS[..3] {
+        assert!(
+            !c.opt.join(b).exists(),
+            "{what}: {b} was not removed:\n{t2}"
+        );
+    }
+    contains_all(&t2, &["OK — removed 3 backup directories"], what);
+}
+
 #[test]
-fn a_checkout_with_nothing_unpushed_is_still_kept_and_says_so() {
+fn a_clean_checkout_is_removed_by_the_signed_plan_that_states_its_proof() {
     let c = Case::new("git-clean");
     let r = make_checkout(&c, true);
+    let plan = c.run(&["--dry-run"]);
+    let text = plan.text();
+    assert_eq!(plan.code, 0, "{text}");
+    // The proof is in the signed bytes, under the removal line.
+    let at = plan
+        .out
+        .find(&format!("would remove {} (", r.display()))
+        .unwrap_or_else(|| panic!("a clean checkout is not planned for removal:\n{text}"));
+    let proof = &plan.out[at..];
+    contains_all(
+        proof,
+        &[
+            "it holds a git checkout, removed because this plan proves it holds nothing unpushed",
+            "exit 78",
+            &format!("  checkout {}:\n", r.display()),
+        ],
+        "the removal's proof",
+    );
+    contains_all(proof, &CLEAN_PROOF, "the removal's proof");
+    assert!(
+        !plan.out.contains("would keep"),
+        "a clean checkout was kept:\n{text}"
+    );
+    // The checkout goes FIRST, so a refused re-proof has removed nothing.
+    let first = plan.out.find("would remove ").unwrap();
+    assert_eq!(first, at, "the checkout is not the first removal:\n{text}");
+    assert_eq!(
+        plan.out,
+        c.run(&["--dry-run"]).out,
+        "two renders of one clean checkout differ"
+    );
+
+    let w = c.run(&[&plan.plan_sha()]);
+    let t2 = w.text();
+    assert_eq!(w.code, 0, "the signed run failed:\n{t2}");
+    assert!(!r.exists(), "the proven checkout was not removed:\n{t2}");
+    for b in BACKUPS {
+        assert!(!c.opt.join(b).exists(), "{b} was not removed:\n{t2}");
+    }
+    contains_all(
+        &t2,
+        &[
+            &format!("re-proved {} holds nothing unpushed", r.display()),
+            &format!("removed {} (", r.display()),
+            "OK — removed 4 backup directories",
+        ],
+        "the record",
+    );
+    let mut kept: Vec<String> = KEPT.iter().map(|s| s.to_string()).collect();
+    kept.sort();
+    assert_eq!(c.present(), kept, "the survivors are wrong:\n{t2}");
+}
+
+/// Each part of the proof, broken alone, keeps the checkout — and the
+/// signed plan still removes the backups beside it.
+#[test]
+fn a_checkout_with_any_one_unpushed_thing_is_kept() {
+    type Dirt = fn(&Path);
+    let any1 = any_ref_line(1);
+    let cases: [(&str, Dirt, &str); 10] = [
+        // Review 2435f065, R1: what the five parts cannot see, one count
+        // over every ref catches.
+        (
+            "a tag on a commit on no branch and no remote",
+            |r| {
+                git(r, &["checkout", "-q", "--detach"]);
+                git(r, &["commit", "-q", "--allow-empty", "-m", "tagged"]);
+                git(r, &["tag", "v-local"]);
+                git(r, &["checkout", "-q", "main"]);
+            },
+            any1.as_str(),
+        ),
+        (
+            "a note",
+            |r| {
+                git(r, &["notes", "add", "-m", "a note", "HEAD"]);
+            },
+            any1.as_str(),
+        ),
+        (
+            "a commit on a custom ref",
+            |r| {
+                let tree = git(r, &["rev-parse", "HEAD^{tree}"]);
+                let w = git(r, &["commit-tree", "-p", "HEAD", "-m", "wip", &tree]);
+                git(r, &["update-ref", "refs/wip/main", &w]);
+            },
+            any1.as_str(),
+        ),
+        // R3: a remote-tracking ref of a remote the config does not name
+        // is not a remote holding the commit.
+        (
+            "a commit under refs/remotes/fake, a remote the config does not name",
+            |r| {
+                git(r, &["commit", "-q", "--allow-empty", "-m", "never pushed"]);
+                git(r, &["update-ref", "refs/remotes/fake/main", "HEAD"]);
+            },
+            "    branches with commits on no remote: 1\n",
+        ),
+        (
+            "an unpushed commit",
+            |r| {
+                put(&r.join("notes"), "wip\n");
+                git(r, &["add", "-A"]);
+                git(r, &["commit", "-q", "-m", "wip"]);
+            },
+            "    branches with commits on no remote: 1\n",
+        ),
+        (
+            "a detached commit",
+            |r| {
+                git(r, &["checkout", "-q", "--detach"]);
+                git(r, &["commit", "-q", "--allow-empty", "-m", "detached"]);
+            },
+            "    commits at HEAD on no branch and no remote: 1\n",
+        ),
+        (
+            "a staged change",
+            |r| {
+                put(&r.join("VERSION"), "staged\n");
+                git(r, &["add", "VERSION"]);
+            },
+            "    staged changes not committed: 1\n",
+        ),
+        (
+            "a modified tracked file",
+            |r| put(&r.join("VERSION"), "edited\n"),
+            "    tracked files whose bytes differ from the index (read without filters): 1\n",
+        ),
+        (
+            "an untracked file",
+            |r| put(&r.join("scratch"), "wip\n"),
+            "    untracked files (ignored ones not counted): 1\n",
+        ),
+        (
+            "a stash",
+            |r| {
+                put(&r.join("VERSION"), "stashed\n");
+                git(r, &["stash", "push", "-q"]);
+            },
+            "    stashes: 1\n",
+        ),
+    ];
+    for (i, (what, dirty, line)) in cases.iter().enumerate() {
+        let c = Case::new(&format!("git-dirt-{i}"));
+        let r = make_checkout(&c, true);
+        dirty(&r);
+        let plan = c.run(&["--dry-run"]);
+        contains_all(&plan.out, &[line], what);
+        assert_kept_through_the_signed_write(&c, &r, what);
+    }
+}
+
+/// A state that cannot be read keeps the checkout through the signed write
+/// too, not only in the plan.
+#[test]
+fn a_checkout_whose_state_cannot_be_read_is_not_removed() {
+    let c = Case::new("git-unreadable-write");
+    let r = make_checkout(&c, true);
+    // A .git that is not a repository, nested in the clean checkout.
+    put(&r.join("vendor/.git/HEAD"), "ref: refs/heads/main\n");
+    put(&r.join(".gitignore"), "vendor/\n");
+    git(&r, &["add", ".gitignore"]);
+    git(&r, &["commit", "-q", "-m", "ignore vendor"]);
+    publish(&r);
+    let plan = c.run(&["--dry-run"]);
+    contains_all(
+        &plan.out,
+        &[
+            &format!("  checkout {}:\n", r.join("vendor").display()),
+            "    its unpushed state could not be read:",
+        ],
+        "an unreadable nested checkout",
+    );
+    assert_kept_through_the_signed_write(&c, &r, "an unreadable nested checkout");
+}
+
+/// Every nested checkout must be clean, or the candidate is kept: a clean
+/// outer checkout ignoring a nested one that carries an unpushed commit.
+#[test]
+fn a_clean_checkout_holding_a_dirty_nested_one_is_kept() {
+    let c = Case::new("git-nested");
+    put(&c.opt.join("boss-dev-bak/.gitignore"), "sub/\n");
+    let r = make_checkout(&c, true);
+    let sub = r.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    put(&sub.join("README"), "nested\n");
+    git(&sub, &["init", "-q"]);
+    git(&sub, &["add", "-A"]);
+    git(&sub, &["commit", "-q", "-m", "nested"]);
+    publish(&sub);
+    // Clean first: the nested checkout is part of the proof, and removed.
     let plan = c.run(&["--dry-run"]);
     let text = plan.text();
     assert_eq!(plan.code, 0, "{text}");
     contains_all(
         &plan.out,
         &[
-            &format!("would keep {}", r.display()),
-            "    branches with commits on no remote: 0\n",
-            "    commits at HEAD on no branch and no remote: 0\n",
-            "    staged changes not committed: 0\n",
-            "    tracked files whose bytes differ from the index (read without filters): 0\n",
-            "    untracked files (ignored ones not counted): 0\n",
-            "    stashes: 0\n",
+            &format!("would remove {} (", r.display()),
+            &format!("  checkout {}:\n", r.display()),
+            &format!("  checkout {}:\n", sub.display()),
         ],
-        "a clean checkout's evidence",
+        "a clean nested checkout's proof",
     );
+    // Then an unpushed commit in the nested one keeps the whole candidate.
+    git(&sub, &["commit", "-q", "--allow-empty", "-m", "unpushed"]);
+    assert_kept_through_the_signed_write(&c, &r, "a dirty nested checkout");
+}
+
+/// Review 2435f065, B1 (blocking), reproduced: a LINKED WORKTREE made
+/// elsewhere with `git worktree add` keeps its HEAD and index inside
+/// boss-dev-bak/.git/worktrees, so removing the candidate destroyed a
+/// detached commit and a staged change OUTSIDE /opt while the plan read
+/// six zeros. Any entry under .git/worktrees keeps the checkout, and the
+/// worktree elsewhere still works after the signed write.
+#[test]
+fn a_checkout_with_a_linked_worktree_elsewhere_is_kept() {
+    let c = Case::new("git-linked-wt");
+    let r = make_checkout(&c, true);
+    let wt = c.root.join("home-wt");
+    git(
+        &r,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            &wt.display().to_string(),
+        ],
+    );
+    git(
+        &wt,
+        &[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "work only in the linked worktree",
+        ],
+    );
+    put(&wt.join("new"), "staged\n");
+    git(&wt, &["add", "new"]);
+    let plan = c.run(&["--dry-run"]);
+    contains_all(
+        &plan.out,
+        &[
+            "    linked worktrees (their HEADs and indexes live in this repository and are not read): 1\n",
+        ],
+        "a linked worktree",
+    );
+    assert_kept_through_the_signed_write(&c, &r, "a linked worktree elsewhere");
+    contains_all(
+        &git(&wt, &["log", "-1", "--format=%s"]),
+        &["work only in the linked worktree"],
+        "the linked worktree after the write",
+    );
+    contains_all(
+        &git(&wt, &["diff", "--cached", "--name-only"]),
+        &["new"],
+        "the linked worktree's staged change after the write",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review d83b2898, B2 (blocking), reproduced: a NAMED remote whose URL is a
+// local path counted as pushed, so a plan that deletes that path deleted the
+// only copy. Only a NETWORK remote counts (the coordinator's call,
+// 2026-09-30): `scheme://host/…` for a network scheme, or scp-style
+// `host:path`. Anything else — file://, a path, `~`, unparsable — counts
+// as nothing pushed and keeps the checkout, and every remote's URL is in the
+// plan with its userinfo stripped, so the signer sees where "pushed" means.
+// ---------------------------------------------------------------------------
+
+/// A commit only the checkout holds, then a remote named `name` at `url`
+/// that received it (push, then fetch — as the reviewer's fixtures did).
+fn push_only_copy_to(r: &Path, name: &str, url: &str) -> String {
+    git(r, &["commit", "-q", "--allow-empty", "-m", "the only copy"]);
+    let tip = git(r, &["rev-parse", "HEAD"]);
+    git(r, &["remote", "add", name, url]);
+    if url != r.display().to_string() {
+        git(r, &["push", "-q", name, "main"]);
+    }
+    git(r, &["fetch", "-q", name]);
+    tip
+}
+
+#[test]
+fn a_remote_that_is_the_checkout_itself_counts_as_nothing_pushed() {
+    let c = Case::new("git-remote-self");
+    let r = make_checkout(&c, true);
+    let url = r.display().to_string();
+    let tip = push_only_copy_to(&r, "self", &url);
+    let plan = c.run(&["--dry-run"]);
+    contains_all(
+        &plan.out,
+        &[
+            &format!("      self: {url} — not a network URL\n"),
+            &not_network_line(1),
+        ],
+        "a remote at the checkout's own path",
+    );
+    assert_kept_through_the_signed_write(&c, &r, "a remote at the checkout's own path");
+    assert_eq!(git(&r, &["rev-parse", "HEAD"]), tip, "the only copy went");
+}
+
+#[test]
+fn a_remote_that_is_an_ignored_bare_repo_inside_the_checkout_counts_as_nothing_pushed() {
+    let c = Case::new("git-remote-inside");
+    put(&c.opt.join("boss-dev-bak/.gitignore"), "archive.git/\n");
+    let r = make_checkout(&c, true);
+    let archive = r.join("archive.git");
+    std::fs::create_dir_all(&archive).unwrap();
+    git(&archive, &["init", "-q", "--bare"]);
+    push_only_copy_to(&r, "archive", &archive.display().to_string());
+    age(&c.opt);
+    let plan = c.run(&["--dry-run"]);
+    contains_all(
+        &plan.out,
+        &[
+            &format!("      archive: {} — not a network URL\n", archive.display()),
+            &not_network_line(1),
+        ],
+        "a remote inside the candidate",
+    );
+    assert_kept_through_the_signed_write(&c, &r, "a remote inside the candidate");
+}
+
+#[test]
+fn a_remote_that_is_a_bare_repo_in_a_sibling_backup_counts_as_nothing_pushed() {
+    let c = Case::new("git-remote-sibling");
+    let r = make_checkout(&c, true);
+    let sib = c.opt.join(BACKUPS[1]).join("repo.git");
+    std::fs::create_dir_all(&sib).unwrap();
+    git(&sib, &["init", "-q", "--bare"]);
+    push_only_copy_to(&r, "sib", &sib.display().to_string());
+    age(&c.opt);
+    let plan = c.run(&["--dry-run"]);
+    contains_all(
+        &plan.out,
+        &[
+            &format!("      sib: {} — not a network URL\n", sib.display()),
+            &not_network_line(1),
+        ],
+        "a remote in a sibling backup",
+    );
+    // The sibling backup itself still plans (it holds no .git), and the
+    // checkout that pushed there is kept.
+    assert_kept_through_the_signed_write(&c, &r, "a remote in a sibling backup");
+}
+
+/// Every network URL form counts, every other form does not, and no
+/// credential in a URL reaches the signed bytes.
+#[test]
+fn remote_urls_are_classified_and_printed_without_their_userinfo() {
+    let c = Case::new("git-remote-urls");
+    let r = make_checkout(&c, true);
+    git(
+        &r,
+        &[
+            "config",
+            "remote.origin.url",
+            "https://fixture:s3cr3t-t0ken@forge.invalid/boss.git?access=q#frag",
+        ],
+    );
+    git(
+        &r,
+        &[
+            "remote",
+            "add",
+            "mirror",
+            "git@forge.invalid:david/boss.git",
+        ],
+    );
+    let plan = c.run(&["--dry-run"]);
+    let text = plan.text();
+    assert_eq!(plan.code, 0, "{text}");
+    for secret in [
+        "s3cr3t", "t0ken", "fixture:", "fixture@", "git@", "access=q",
+    ] {
+        assert!(
+            !plan.out.contains(secret) && !plan.err.contains(secret),
+            "`{secret}` from a remote URL reached the plan:\n{text}"
+        );
+    }
+    contains_all(
+        &plan.out,
+        &[
+            "      mirror: forge.invalid:david/boss.git\n",
+            "      origin: https://forge.invalid/boss.git\n",
+            &not_network_line(0),
+            &format!("would remove {} (", r.display()),
+        ],
+        "network remotes, userinfo removed",
+    );
+    // Each form a network remote is not, alone, keeps the checkout.
+    for (i, url) in [
+        "file:///srv/boss.git",
+        "/srv/boss.git",
+        "../boss.git",
+        "~/boss.git",
+        "ext::sh -c cat",
+        "ssh://localhost/srv/boss.git",
+        "https:///boss.git",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let c = Case::new(&format!("git-remote-form-{i}"));
+        let r = make_checkout(&c, true);
+        git(&r, &["remote", "add", "other", url]);
+        let plan = c.run(&["--dry-run"]);
+        contains_all(
+            &plan.out,
+            &[&not_network_line(1), "      other: "],
+            &format!("the remote url `{url}`"),
+        );
+        assert!(
+            !plan
+                .out
+                .contains(&format!("would remove {} (", r.display())),
+            "a checkout with remote `{url}` plans for removal:\n{}",
+            plan.text()
+        );
+    }
+}
+
+/// Review 2435f065, R2: a deinit'd submodule keeps its repository only
+/// in .git/modules/<name>, which the nested search never enters and the
+/// index lists only as a gitlink. A non-empty .git/modules keeps the
+/// checkout.
+#[test]
+fn a_checkout_with_a_submodule_repository_under_git_modules_is_kept() {
+    let c = Case::new("git-modules");
+    let up = c.root.join("up");
+    std::fs::create_dir_all(&up).unwrap();
+    put(&up.join("f"), "s\n");
+    git(&up, &["init", "-q"]);
+    git(&up, &["add", "-A"]);
+    git(&up, &["commit", "-q", "-m", "up"]);
+    let r = make_checkout(&c, true);
+    git(
+        &r,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &up.display().to_string(),
+            "sub",
+        ],
+    );
+    git(&r, &["commit", "-q", "-m", "sub"]);
+    publish(&r);
+    git(
+        &r.join("sub"),
+        &[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "unpushed in the submodule",
+        ],
+    );
+    git(&r, &["submodule", "deinit", "-q", "-f", "sub"]);
+    age(&c.opt);
+    let plan = c.run(&["--dry-run"]);
+    contains_all(
+        &plan.out,
+        &["    submodule repositories under .git/modules (not read): 1\n"],
+        "a deinit'd submodule",
+    );
+    assert_kept_through_the_signed_write(&c, &r, "a deinit'd submodule");
+    assert!(
+        r.join(".git/modules/sub/HEAD").is_file(),
+        "the submodule's repository went"
+    );
+}
+
+/// Only /opt/boss-dev-bak's checkout is ever removed: a clean checkout
+/// under a boss-binbak-* name is kept, as before.
+#[test]
+fn a_clean_checkout_under_a_binbak_name_is_kept() {
+    let c = Case::new("git-binbak");
+    let r = c.opt.join(BACKUPS[0]);
+    git(&r, &["init", "-q"]);
+    git(&r, &["add", "-A"]);
+    git(&r, &["commit", "-q", "-m", "july"]);
+    publish(&r);
+    age(&c.opt);
+    let plan = c.run(&["--dry-run"]);
+    let text = plan.text();
+    assert_eq!(plan.code, 0, "{text}");
+    contains_all(
+        &plan.out,
+        &[
+            &format!("would keep {} — it holds a git checkout", r.display()),
+            "only",
+            "boss-dev-bak",
+        ],
+        "a binbak checkout",
+    );
+    contains_all(&plan.out, &CLEAN_PROOF, "a binbak checkout's evidence");
     assert!(
         !plan
             .out
-            .contains(&format!("would remove {} (", r.display()))
+            .contains(&format!("would remove {} (", r.display())),
+        "a binbak checkout is planned for removal:\n{text}"
     );
+}
+
+/// The age bound still applies to a proven checkout: one changed (ctime)
+/// within 30 days is refused, however clean.
+#[test]
+fn a_clean_checkout_changed_within_thirty_days_is_refused() {
+    let c = Case::new("git-young");
+    // Only the checkout: every fixture is young at today's clock.
+    for b in &BACKUPS[..3] {
+        std::fs::remove_dir_all(c.opt.join(b)).unwrap();
+    }
+    make_checkout(&c, true);
+    // The control: sixty days on, the same checkout is planned.
+    let later = c.run(&["--dry-run"]);
+    assert_eq!(later.code, 0, "{}", later.text());
+    assert!(later.out.contains("boss-dev-bak ("), "{}", later.text());
+    let r = c.run_env(
+        &["--dry-run"],
+        &[("BOSS_RECLAIM_NOW", epoch_now().to_string())],
+    );
+    let text = r.text();
+    assert_eq!(r.code, 2, "a young clean checkout passed:\n{text}");
+    contains_all(
+        &text,
+        &["boss-dev-bak", "changed (ctime) in the last 30 days"],
+        "the refusal",
+    );
+    assert!(c.opt.join("boss-dev-bak/.git/HEAD").is_file());
+}
+
+/// Changed between the plan and the write: the re-rendered plan no longer
+/// hashes to the signature (the proof is in the bytes), so nothing goes.
+#[test]
+fn a_checkout_changed_after_the_plan_was_signed_removes_nothing() {
+    let c = Case::new("git-moved");
+    let r = make_checkout(&c, true);
+    let sha = c.run(&["--dry-run"]).plan_sha();
+    put(&r.join("late-work"), "unpushed\n");
+    let w = c.run(&[&sha]);
+    let text = w.text();
+    assert_eq!(w.code, 2, "a changed checkout was not refused:\n{text}");
+    contains_all(&text, &["not the approved"], "the refusal");
+    assert!(r.join("late-work").is_file(), "the checkout went:\n{text}");
+    c.assert_nothing_removed(&text);
+}
+
+/// Changed INSIDE the write, after the re-render matched the signature and
+/// before the rm: the re-proof refuses the whole run with exit 78, and
+/// nothing is removed — not the checkout, not a backup beside it.
+#[test]
+fn a_checkout_changed_during_the_write_refuses_the_whole_run_with_78() {
+    for (i, (what, key, rel)) in [
+        ("an untracked file", "STUB_REWRITE", "late-work"),
+        ("a nested checkout", "STUB_PLANT_GIT", "vendor"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let c = Case::new(&format!("git-late-change-{i}"));
+        let r = make_checkout(&c, true);
+        let sha = c.run(&["--dry-run"]).plan_sha();
+        let w = c.run_env(&[&sha], &[(key, r.join(rel).display().to_string())]);
+        let text = w.text();
+        assert_eq!(
+            w.code, 78,
+            "{what}: the late change was not refused:\n{text}"
+        );
+        contains_all(
+            &text,
+            &[
+                "REFUSED",
+                &r.display().to_string(),
+                "changed since",
+                "already removed (0): none",
+            ],
+            what,
+        );
+        assert!(r.join(".git/HEAD").is_file(), "{what}: the checkout went");
+        c.assert_nothing_removed(&text);
+    }
 }
 
 /// The first reading's own fixture: a `.git` that is not a repository.
@@ -1662,6 +2433,259 @@ fn no_capture_directory_plans_no_capture() {
 }
 
 // ---------------------------------------------------------------------------
+// The cluster-pg dumps the retired boss-gcp off-site leg deposited (David,
+// 2026-10-01, backlog 4bf7bdd1: the GCS bucket is the off-site copy).
+// ---------------------------------------------------------------------------
+
+/// The plan names every dump in the one directory, with its identity, and
+/// the directory's owner and mode; nothing the glob does not match is
+/// named; the signed write removes the dumps and only the dumps.
+#[test]
+fn the_plan_names_each_cluster_pg_dump_and_the_signed_write_removes_only_them() {
+    let c = Case::new("dumps");
+    let plan = c.run(&["--dry-run"]);
+    let text = plan.text();
+    assert_eq!(plan.code, 0, "{text}");
+    c.assert_nothing_removed(&text);
+    for n in DUMPS {
+        contains_all(
+            &plan.out,
+            &[&c.dump_line(&c.dumps.join(n), DUMP_BYTES)],
+            "the plan",
+        );
+    }
+    contains_all(
+        &plan.out,
+        &[
+            ", modified ",
+            ", changed ",
+            "the GCS bucket is the off-site copy",
+            &format!(
+                "  dump directory {}: owner uid {}, mode 755; its parent {}: owner uid {}, mode 755\n",
+                c.dumps.display(),
+                c.owner(),
+                c.dumps.parent().unwrap().display(),
+                c.owner()
+            ),
+        ],
+        "the plan",
+    );
+    for n in DUMP_DIR_NOT_OURS {
+        assert!(
+            !plan
+                .out
+                .contains(&format!("would remove {} (", c.dumps.join(n).display())),
+            "the plan names {n}:\n{text}"
+        );
+    }
+    contains_all(
+        &plan.err,
+        &[&format!(
+            "{} cluster-pg dump(s) ({} bytes)",
+            DUMPS.len(),
+            DUMPS.len() * DUMP_BYTES.len()
+        )],
+        "the dry run's verdict",
+    );
+
+    let r = c.run(&[&plan.plan_sha()]);
+    let text = r.text();
+    assert_eq!(r.code, 0, "the signed run failed:\n{text}");
+    for n in DUMPS {
+        assert!(!c.dumps.join(n).exists(), "{n} was not removed:\n{text}");
+    }
+    c.assert_not_ours_intact(&text);
+    contains_all(
+        &text,
+        &[&format!("{} cluster-pg dump(s)", DUMPS.len())],
+        "the verdict",
+    );
+}
+
+/// The signature binds a dump's identity: the same bytes rewritten at the
+/// same size are a new ctime, so a new plan, and a plan signed before the
+/// rewrite removes nothing.
+#[test]
+fn the_plan_hash_moves_with_a_dumps_identity_and_a_stale_signature_removes_nothing() {
+    let c = Case::new("dump-identity");
+    let before = c.run(&["--dry-run"]);
+    assert_eq!(before.code, 0, "{}", before.text());
+    write_file(&c.dump(0), DUMP_BYTES);
+    let after = c.run(&["--dry-run"]);
+    assert_eq!(after.code, 0, "{}", after.text());
+    assert_ne!(
+        before.plan_sha(),
+        after.plan_sha(),
+        "a dump rewritten in place hashed to the same plan"
+    );
+    let r = c.run(&[&before.plan_sha()]);
+    let text = r.text();
+    assert_eq!(r.code, 2, "a stale signature was not refused:\n{text}");
+    contains_all(&text, &["not the approved"], "the refusal");
+    c.assert_nothing_removed(&text);
+}
+
+/// The last moment: a dump rewritten AFTER the write re-rendered the plan
+/// and before its rm is refused by the identity read beside the rm, and it
+/// still stands.
+#[test]
+fn a_dump_rewritten_after_the_render_is_not_removed() {
+    let c = Case::new("dump-late");
+    let sha = c.run(&["--dry-run"]).plan_sha();
+    let r = c.run_env(
+        &[&sha],
+        &[("STUB_REWRITE", c.dump(0).display().to_string())],
+    );
+    let text = r.text();
+    assert_eq!(r.code, 2, "a late rewrite was not refused:\n{text}");
+    contains_all(
+        &text,
+        &[
+            "not the planned",
+            "already removed (5):",
+            "the journal was not vacuumed",
+        ],
+        "the refusal",
+    );
+    assert_eq!(
+        std::fs::read_to_string(c.dump(0)).unwrap(),
+        "late bytes\n",
+        "the rewritten dump was removed:\n{text}"
+    );
+    assert!(c.dump(1).is_file(), "the dump after it went:\n{text}");
+    assert!(!c.calls().contains("--vacuum-size"));
+}
+
+/// A name the glob matches and the bound does not: refused, loudly, with
+/// nothing removed.
+#[test]
+fn refuses_a_dump_name_outside_the_pattern() {
+    for (case, name) in [
+        ("dump-space", "boss-2026 0930.sql.gz"),
+        ("dump-empty-stamp", "boss-.sql.gz"),
+        ("dump-semicolon", "boss-x;y.sql.gz"),
+    ] {
+        let c = Case::new(case);
+        put(&c.dumps.join(name), "odd\n");
+        c.refused(&["--dry-run"], &[], &[name, "not ^boss-"]);
+        assert!(c.dumps.join(name).is_file());
+    }
+}
+
+#[test]
+fn refuses_a_symlinked_dump_and_leaves_its_target() {
+    let c = Case::new("dump-symlink");
+    let target = c.backups.join("boss-cluster-pg/live.sql.gz");
+    put(&target, "a dump somebody still wants\n");
+    std::os::unix::fs::symlink(&target, c.dumps.join("boss-20261001-091000.sql.gz")).unwrap();
+    c.refused(
+        &["--dry-run"],
+        &[],
+        &["boss-20261001-091000.sql.gz", "is a symlink"],
+    );
+    assert!(target.is_file(), "the link's target was touched");
+}
+
+#[test]
+fn refuses_a_symlinked_dump_directory() {
+    let c = Case::new("dump-dir-symlink");
+    let elsewhere = c.root.join("elsewhere-dumps");
+    std::fs::rename(&c.dumps, &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &c.dumps).unwrap();
+    let r = c.run(&["--dry-run"]);
+    let text = r.text();
+    assert_eq!(r.code, 2, "a symlinked dump directory passed:\n{text}");
+    contains_all(&text, &["boss-cluster-pg", "is a symlink"], "the refusal");
+    assert!(elsewhere.join(DUMPS[0]).is_file());
+}
+
+#[test]
+fn refuses_a_directory_by_a_dumps_name() {
+    let c = Case::new("dump-is-dir");
+    let d = c.dumps.join("boss-20261001-091000.sql.gz");
+    put(&d.join("inside"), "x\n");
+    c.refused(&["--dry-run"], &[], &["is not a regular file"]);
+    assert!(d.join("inside").is_file());
+}
+
+/// A second name for a dump's bytes: removing this one frees nothing, so
+/// the record would claim bytes it never freed.
+#[test]
+fn refuses_a_hardlinked_dump() {
+    let c = Case::new("dump-hardlink");
+    let twin = c.dumps.join("README.twin");
+    std::fs::hard_link(c.dump(0), &twin).unwrap();
+    c.refused(&["--dry-run"], &[], &[DUMPS[0], "2 links"]);
+    assert!(twin.is_file());
+}
+
+/// A dump a process holds open — a receiver still writing it, a restore
+/// reading it — is refused.
+#[test]
+fn refuses_a_dump_a_process_holds_open() {
+    let c = Case::new("dump-open");
+    std::fs::create_dir_all(c.proc_dir.join("505/fd")).unwrap();
+    std::os::unix::fs::symlink(c.dump(1), c.proc_dir.join("505/fd/4")).unwrap();
+    write_file(&c.proc_dir.join("505/comm"), "gunzip\n");
+    c.refused(&["--dry-run"], &[], &["process 505", "gunzip", "open"]);
+}
+
+/// The dumps' directory may be the deposit account's own, but no group
+/// and no other account may write it, and its parent is root's and
+/// closed — or a file could be planted, or the directory swapped, under
+/// a dump's name.
+#[test]
+fn refuses_a_dump_directory_others_can_write_or_a_parent_another_account_owns() {
+    let c = Case::new("dump-owner");
+    // The capture bound reads its own parent's owner first; without a
+    // capture directory, the dump bound is the reader.
+    std::fs::remove_dir_all(c.capture_dir()).unwrap();
+    let other = (c.owner().parse::<u32>().unwrap() + 1).to_string();
+    let refused = |extra: &[(&str, String)], needles: &[&str]| {
+        let r = c.run_env(&["--dry-run"], extra);
+        let text = r.text();
+        assert_eq!(r.code, 2, "the dump directory passed:\n{text}");
+        contains_all(&text, needles, "the refusal");
+        assert!(
+            !r.err.contains("plan-sha256:"),
+            "a refusal rendered a plan:\n{text}"
+        );
+        c.assert_dumps_intact(&text);
+    };
+    refused(
+        &[("BOSS_RECLAIM_CAPTURE_OWNER", other.clone())],
+        &[
+            &c.dumps.parent().unwrap().display().to_string(),
+            "owned by uid",
+            &format!("not uid {other}"),
+        ],
+    );
+    use std::os::unix::fs::PermissionsExt;
+    let parent = c.dumps.parent().unwrap().to_path_buf();
+    for (dir, mode) in [(c.dumps.clone(), 0o775), (parent, 0o757)] {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap(); // mode-bits-ok: a fixture directory made writable to prove the bound refuses it, not a script
+        refused(&[], &["group- or other-writable"]);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap(); // mode-bits-ok: the fixture directory closed again, not a script
+    }
+}
+
+/// With no dumps' directory the verb plans no dump and says so.
+#[test]
+fn no_dump_directory_plans_no_dump() {
+    let c = Case::new("dump-none");
+    std::fs::remove_dir_all(&c.dumps).unwrap();
+    let plan = c.run(&["--dry-run"]);
+    let text = plan.text();
+    assert_eq!(plan.code, 0, "{text}");
+    assert!(!plan.out.contains("boss-cluster-pg"), "{text}");
+    contains_all(
+        &plan.err,
+        &["no cluster-pg dump", "0 cluster-pg dump(s)"],
+        "the dry run",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // THROUGH THE RUNNER, with the real allowlist, as boss-gcp.
 // ---------------------------------------------------------------------------
 
@@ -1767,7 +2791,12 @@ fn the_runner_on_boss_gcp_answers_the_plan_verb() {
     let output = meta["output"].as_str().unwrap_or_default();
     contains_all(
         output,
-        &["would remove", "boss-dev-bak", "plan-sha256:"],
+        &[
+            "would remove",
+            "boss-dev-bak",
+            &c.dump_line(&c.dump(0), DUMP_BYTES),
+            "plan-sha256:",
+        ],
         "the packet's output",
     );
     c.assert_nothing_removed(&text);

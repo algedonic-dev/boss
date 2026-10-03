@@ -49,7 +49,7 @@ pub(super) async fn workflow_terminal_report<R: JobsRepository + 'static, B: Eve
     Path(kind): Path<String>,
     Query(q): Query<TerminalReportQuery>,
 ) -> Response {
-    if let Err(r) = policy_check(&state, &user, Action::Read).await {
+    if let Err(r) = policy_check(&state, &user, controls::READ_WORKFLOW).await {
         return r;
     }
     let legacy = match q.simulated.as_deref() {

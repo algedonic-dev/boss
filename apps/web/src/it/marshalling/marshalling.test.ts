@@ -12,6 +12,8 @@ import {
   parseStationLoadEnvelope,
   waitText,
   waitsCountLine,
+  waitsStatusLine,
+  waitStatusText,
   whyNotMoving,
   windowLine,
   type Siding,
@@ -458,6 +460,27 @@ describe('waitsCountLine', () => {
   test('the count agrees with what longestWaits shows', () => {
     const shown = longestWaits(waits, 1).length;
     expect(waitsCountLine(waits, 1).startsWith(`${shown} of `)).toBe(true);
+  });
+});
+
+describe('obligation status', () => {
+  test('full real counts include rows beyond the display cap and exclude simulated and shadow packets', () => {
+    const waits = parseQueueAge({ data: [
+      ...QUEUE_AGE.data,
+      { ...QUEUE_AGE.data[0], job_id: 'working', status: 'active' },
+      { ...QUEUE_AGE.data[0], job_id: 'unknown', status: 'paused' },
+      { ...QUEUE_AGE.data[0], job_id: 'missing', status: null },
+      { ...QUEUE_AGE.data[0], job_id: 'shadow', status: 'active', partition: 'shadow' },
+    ] }).waits;
+    expect(longestWaits(waits, 1)).toHaveLength(1);
+    expect(waitsStatusLine(waits)).toBe('2 READY · 1 WORKING (ACTIVE) · 2 status unknown');
+    expect(waits.map(waitStatusText)).toEqual(['READY', 'READY', 'READY', 'WORKING (ACTIVE)', 'Unknown (paused)', 'Unknown', 'WORKING (ACTIVE)']);
+  });
+
+  test('zero and wholly working queues are counted without inventing readiness', () => {
+    expect(waitsStatusLine([])).toBe('0 READY · 0 WORKING (ACTIVE)');
+    const one = { ...parseQueueAge(QUEUE_AGE).waits[0]!, status: 'active' };
+    expect(waitsStatusLine([one])).toBe('0 READY · 1 WORKING (ACTIVE)');
   });
 });
 

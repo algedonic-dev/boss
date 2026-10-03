@@ -6,7 +6,9 @@ use sqlx::{PgPool, Row, postgres::PgRow};
 use crate::error::ViewsError;
 use crate::filter;
 use crate::port::ViewsRepo;
-use crate::types::{View, ViewInput, ViewLayout, ViewSource, Visibility};
+use crate::types::{
+    View, ViewInput, ViewLayout, ViewSource, Visibility, refuse_unstorable, storable,
+};
 
 pub struct PgViewsRepo {
     pool: PgPool,
@@ -20,6 +22,15 @@ impl PgViewsRepo {
 
 const COLS: &str = "id, owner_id, title, source, filter, columns, layout, visibility, \
                     created_at, updated_at";
+
+/// A lookup key as bound: `None` (SQL NULL, which equals nothing) when
+/// it holds a NUL byte. No stored id or owner can hold one, so such a
+/// key is a miss — and bound as text it answered Postgres's encoding
+/// error as `Storage`, a 500, where the in-memory adapter answered the
+/// miss (backlog be459ab9, found by the adapters-agree suite).
+fn key(s: &str) -> Option<&str> {
+    storable(s).then_some(s)
+}
 
 fn storage(e: sqlx::Error) -> ViewsError {
     ViewsError::Storage(e.to_string())
@@ -54,13 +65,21 @@ fn row_to_view(r: &PgRow) -> Result<View, ViewsError> {
 #[async_trait]
 impl ViewsRepo for PgViewsRepo {
     async fn list_for_viewer(&self, viewer_id: &str) -> Result<Vec<View>, ViewsError> {
+        // The id tie-break is byte-wise (`COLLATE "C"`), the order the
+        // in-memory adapter's `String` compare gives; the list stopped
+        // at `updated_at` until the adapters-agree suite, so two Views
+        // stamped in one microsecond answered in plan order (backlog
+        // be459ab9). A viewer id holding a NUL byte owns nothing — no
+        // stored owner can hold one — and binding it would answer
+        // Postgres's encoding error, so it is bound as NULL, which
+        // matches no owner and leaves the shared Views.
         let sql = format!(
             "SELECT {COLS} FROM views \
              WHERE owner_id = $1 OR visibility = 'shared' \
-             ORDER BY updated_at DESC"
+             ORDER BY updated_at DESC, id COLLATE \"C\""
         );
         let rows = sqlx::query(&sql)
-            .bind(viewer_id)
+            .bind(key(viewer_id))
             .fetch_all(&self.pool)
             .await
             .map_err(storage)?;
@@ -76,8 +95,8 @@ impl ViewsRepo for PgViewsRepo {
              WHERE id = $1 AND (owner_id = $2 OR visibility = 'shared')"
         );
         let row = sqlx::query(&sql)
-            .bind(id)
-            .bind(viewer_id)
+            .bind(key(id))
+            .bind(key(viewer_id))
             .fetch_optional(&self.pool)
             .await
             .map_err(storage)?
@@ -88,6 +107,7 @@ impl ViewsRepo for PgViewsRepo {
     async fn create(&self, owner_id: &str, input: &ViewInput) -> Result<View, ViewsError> {
         // Reject a malformed filter before it reaches storage, so it
         // fails for its author rather than for whoever opens it later.
+        refuse_unstorable(Some(owner_id), input)?;
         filter::compile(&input.filter)?;
         let sql = format!(
             "INSERT INTO views (id, owner_id, title, source, filter, columns, layout, visibility) \
@@ -113,6 +133,7 @@ impl ViewsRepo for PgViewsRepo {
         owner_id: &str,
         input: &ViewInput,
     ) -> Result<View, ViewsError> {
+        refuse_unstorable(None, input)?;
         filter::compile(&input.filter)?;
         // `owner_id` is a WHERE term, never a SET term: it scopes the
         // update to a View this caller owns and cannot transfer
@@ -123,8 +144,8 @@ impl ViewsRepo for PgViewsRepo {
              WHERE id = $1 AND owner_id = $2 RETURNING {COLS}"
         );
         let row = sqlx::query(&sql)
-            .bind(id)
-            .bind(owner_id)
+            .bind(key(id))
+            .bind(key(owner_id))
             .bind(&input.title)
             .bind(input.source.as_str())
             .bind(&input.filter)
@@ -140,8 +161,8 @@ impl ViewsRepo for PgViewsRepo {
 
     async fn delete(&self, id: &str, owner_id: &str) -> Result<(), ViewsError> {
         let res = sqlx::query("DELETE FROM views WHERE id = $1 AND owner_id = $2")
-            .bind(id)
-            .bind(owner_id)
+            .bind(key(id))
+            .bind(key(owner_id))
             .execute(&self.pool)
             .await
             .map_err(storage)?;

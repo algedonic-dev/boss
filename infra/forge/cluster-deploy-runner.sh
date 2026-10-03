@@ -415,6 +415,16 @@ SOURCE_NS=$("$REPO/infra/cluster/render-instance.sh" --source)
 # The source instance's row — its name and its tenant source — read
 # off the same list every other instance is read from.
 SOURCE_NAME=""; SOURCE_TENANT_REPO=""; SOURCE_TENANT_REF=""; SOURCE_TENANT_DIR=""; SOURCE_SITE=""
+# The deposit template is generic; the deployment's existing ConfigMap
+# and CronJob are its authoritative nonsecret inputs (877ad378). Resolve
+# both before image staging or ANY apply. Record immutable read identities
+# and complete-body hashes through this converge's existing durable door.
+STAGE="deposit configuration"
+deposit_config_render "$K" "$SOURCE_NS" \
+    "$RENDER_DIR/$SOURCE_NS/boss-break-glass-deposit.yaml" \
+    "$RENDER_DIR/$SOURCE_NS/boss-break-glass-deposit.yaml" \
+    "$REPO/infra/cluster/render-deposit-config.sh" "$APPLY_DIR/deposit-config.json"
+run_summary_json deposit_config "$(cat "$APPLY_DIR/deposit-config.json")"
 # The applied copy carries the build that is ALREADY converged (the
 # stamp), not the manifest's placeholder tag: the apply must never
 # change what runs. Rolling to $HEAD is roll_deployment's job below.
@@ -426,6 +436,19 @@ while IFS="$IFS_ROW" read -r iname ins_ns tdir _s _h _share trepo tref site; do
 done <<< "$(instance_rows "$INSTANCES")"
 rm -rf "$RENDER_DIR"
 KM=$(kubectl_seeing "$APPLY_DIR")
+# Client-only conversion of the image-pinned, reviewed source. No live
+# Secret values are read, and this is not an API create. Both config
+# writes then use explicit UID/resourceVersion tests. Ordinary apply
+# receives neither document after success; a conflict stops beforehand.
+KAPPLY="sudo docker run --rm -i --network host -v $KUBECONFIG_PATH:/kc:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
+$KM create --dry-run=client --validate=false -f "/manifests/$SOURCE_NS/boss-break-glass-deposit.yaml" -o json > "$APPLY_DIR/deposit-template-documents.json"
+deposit_config_source "$APPLY_DIR/$SOURCE_NS/boss-break-glass-deposit.yaml" \
+    "$APPLY_DIR/deposit-template-documents.json" "$APPLY_DIR/deposit-template.json"
+deposit_apply_rc=0
+deposit_config_apply "$KAPPLY" "$SOURCE_NS" "$APPLY_DIR/$SOURCE_NS/boss-break-glass-deposit.yaml" \
+    "$APPLY_DIR/deposit-template.json" "$APPLY_DIR/deposit-config.json" || deposit_apply_rc=$?
+run_summary_json deposit_config "$(cat "$APPLY_DIR/deposit-config.json")"
+[ "$deposit_apply_rc" -eq 0 ] || exit "$deposit_apply_rc"
 # apply_instance NAMESPACE — the rendered directory for one instance.
 # The files that declare a Namespace go FIRST: `kubectl apply -f DIR`
 # walks files alphabetically, so on a namespace's first converge every
@@ -461,7 +484,7 @@ apply_instance() {
 # runs it has not been validated. I checked the kubectl invocation
 # against my own kubectl and never against the docker wrapper it
 # actually runs through.
-KAPPLY="sudo docker run --rm -i --network host -v $KUBECONFIG_PATH:/kc:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
+# KAPPLY is defined above, before conditional deposit configuration.
 
 # THE TENANT SOURCE PER INSTANCE (backlog f4f5c387, car 2 of fcc1d57b;
 # David 2026-09-16 'Let's do it'). An instance's tenant is a directory

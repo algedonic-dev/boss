@@ -47,20 +47,16 @@ async fn known_identity_passes_unknown_fails_every_kind() {
 fn job_about(id: &str, kind: &str, subject: Subject) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
-        kind: kind.to_string(),
-        workflow_version: 1,
-        subject,
-        title: "t".into(),
-        owner_id: "emp-1".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 7, 15).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::Value::Null,
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            kind.to_string(),
+            subject,
+            "t",
+            "emp-1",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 7, 15).unwrap(),
+        )
     }
 }
 

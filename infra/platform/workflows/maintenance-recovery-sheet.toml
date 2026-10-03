@@ -32,7 +32,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "The daily comparison of the recovery sheet the tree renders with the version signed onto paper (design 125d405d): files or refreshes ONE reprint-recovery-sheet print job when they differ, and the 90-day confirm-recovery-sheet-kept check when it is due. Its output's verdict line carries both hashes."
-metadata = { owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "scheduled"

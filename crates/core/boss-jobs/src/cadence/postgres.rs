@@ -183,26 +183,29 @@ impl CadenceRegistry for PgCadence {
         super::types::check_rule(&spec.row).map_err(CadenceError::BadRequest)?;
         let mut tx = self.pool.begin().await.map_err(storage)?;
 
-        // The newest version the lineage holds, any status — the same
-        // question the in-memory adapter asks, so a publish at or below
-        // it is the same 409 over either. Locked for the transaction:
-        // two publishes of one name racing past this read would both
-        // pass the bound and the second insert would trip the (name,
-        // version) key as a 500 instead of the 409 it is.
-        let newest: Option<i32> = sqlx::query_scalar(
-            "SELECT MAX(version) FROM (SELECT version FROM cadence_rules WHERE name = $1 FOR UPDATE) v",
+        // THE FLOOR, inside the write: the newest version the lineage
+        // holds, any status, read after every other declared write of
+        // the name has committed or waits behind this one
+        // (`crate::declared_version`). It was `MAX(version)` over rows
+        // locked `FOR UPDATE` in one statement, which waited on the live
+        // row and re-read it alone — a `v5` the other writer INSERTED
+        // was outside that snapshot, so an overtaken `v4` passed and
+        // retired it (backlog 4541d511,
+        // `pg_an_older_publish_waiting_on_a_newer_one_is_refused`).
+        let newest = crate::declared_version::lock_and_read_newest(
+            &mut tx,
+            "cadence_rules",
+            "name",
+            spec.name(),
         )
-        .bind(spec.name())
-        .fetch_one(&mut *tx)
         .await
         .map_err(storage)?;
-        let newest = super::in_memory::newest_version(newest.into_iter());
         if spec.version <= newest {
-            return Err(super::in_memory::not_above(
+            return Err(CadenceError::Conflict(crate::declared_version::not_above(
                 spec.name(),
                 spec.version,
                 newest,
-            ));
+            )));
         }
 
         // RETIRE BY NAME, THEN INSERT — the safe supersede idiom

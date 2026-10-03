@@ -1,0 +1,72 @@
+# An estate finding files the passkey-gated request of every verb whose
+# file declares it remedies that finding, so David's only act is the
+# passkey on the plan the runner renders (backlog 3df309bf, car 2 of the
+# operator's plan: the generalisation of car 1).
+#
+# WHAT IT RETIRES. `file-reclaim-gcp-root-while-disk-tight-boss-gcp`
+# (car 1, proven live: the boss-gcp below-floor reading filed
+# reclaim-gcp-root and David signed its rendered plan with his passkey,
+# nothing typed). That rule spelled the pairing — this finding, that
+# verb, that host — in its own `when` and `jobs.spawn` args, so every
+# further remedy would have been another hand-written rule, and the verb
+# file, which IS the runner's reviewed allowlist, said nothing of the
+# finding it exists to relieve. Now the verb declares it:
+# `"remedies": ["disk_tight:boss-gcp"]` in
+# infra/ops/verbs/reclaim-gcp-root.json, and this one rule files for any
+# finding any verb declares. A new remedy is a verb-file edit.
+#
+# NO `when`, deliberately, as `estate-alarm-on-comparison` has none: the
+# declarations are compiled into the handler from the verb files, and a
+# rule predicate cannot iterate them. The handler reads the comparison's
+# HARD finding keys with the alarm's own function (`hard_finding_keys`),
+# so a declaration names a finding exactly as the alarm packet does, and
+# a comparison with no hard finding costs no read at all.
+#
+# NEVER WITHOUT THE PASSKEY. The handler indexes only a verb that
+# declares `requires_approval`, a `plan_verb`, named `approvers`, and
+# `plan_sha256` as its only param; any other declaration is refused
+# (and the tree is pinned to carry none — handler test
+# `every_declared_remedy_is_a_passkey_gated_verb`). The request it files
+# is the one `boss ops <host> <verb>` files for an approval verb: `args`
+# an empty list, `requires_approval` true — ROUTING, never authority
+# (ops-request.toml). The write runs only after a presence stamp by a
+# named approver on the plan bytes the runner rendered (design 17835005,
+# ops-runner.sh `verify_approval`), unchanged by this rule.
+#
+# DEDUPED PER VERB AND HOST, on the request's own subject
+# `<verb>@<host>` — the subject car 1 filed under, so the request signed
+# before this landed still holds the window: at most one OPEN request,
+# however old; and none refiled while one was OPENED within
+# `refile_after_hours`, whatever became of it, because a remedy that ran
+# need not clear its finding (the reclaim leaves boss-gcp at ~16.4 GB
+# against a 17 GB floor — review of car 4d80316f), and a refile per
+# comparison would be a passkey prompt a day. A week, as car 1. A request
+# its approver DECLINED stops the asking until the estate observes the
+# finding clear (its alarm closed by the recover rule after the decline);
+# and the request's id is derived from the request it succeeds, so two
+# firings that read the same board post ONE packet (backlog b2f78bb9,
+# review 63bafc11 LOWs 2a, 2b and 2d).
+[[rule]]
+name = "file-the-remedy-a-verb-declares-for-an-estate-finding"
+why = """
+A THRESHOLD, and a CROSS-PROTOCOL REACTOR over EXTERNAL INGRESS: what
+files is a LEVEL — a hard estate finding, read off
+`jobs.estate.compared`, the compare handler's reading of a host or the
+cluster, which is not a packet; and the effect is a packet of a
+different protocol (ops-request) that no estate protocol can name. It
+is the remedy half of the algedonic loop `estate-alarm-on-comparison`
+raises and `estate-recover-on-comparison` closes: the alarm says where
+it hurts, and this files the request the verb file says relieves it, so
+the pain reaches a person as a rendered plan to sign rather than a
+command to type (backlog 3df309bf).
+
+It widens no authority. Filing is the act `boss ops` performs, it files
+only a verb that runs under the passkey of an employee its file names,
+on the plan bytes the runner rendered (design 17835005), and it is
+deduped on the request's own subject within a week, because a remedy
+that ran need not clear its finding.
+"""
+on_event = "jobs.estate.compared"
+[[rule.do]]
+handler = "ops.file_remedies"
+args = { refile_after_hours = "168" }

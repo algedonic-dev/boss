@@ -50,7 +50,7 @@ use boss_core::calendar::{BusinessCalendar, ReservationId, ReservationRequest, T
 use boss_core::job::Subject;
 use boss_core::publish::ModeQuery;
 use boss_policy_client::writes::{recorded_author, require_reaching, require_reaching_row};
-use boss_policy_client::{Action, CurrentUser, PolicyClient, Resource};
+use boss_policy_client::{CurrentUser, PolicyClient, controls};
 
 use crate::port::{CalendarClient, CalendarError};
 
@@ -133,8 +133,7 @@ async fn create_reservation(
     if let Err(refused) = require_reaching(
         state.policy.as_ref(),
         &user,
-        Action::Create,
-        Resource::schedule(),
+        controls::CREATE_SCHEDULE,
         person_of(&req.subject),
     )
     .await
@@ -254,8 +253,7 @@ async fn cancel_reservation(
     if let Err(refused) = require_reaching_row(
         state.policy.as_ref(),
         &user,
-        Action::Delete,
-        Resource::schedule(),
+        controls::DELETE_SCHEDULE,
         subject.as_ref().and_then(person_of),
     )
     .await
@@ -300,8 +298,7 @@ async fn cancel_by_reason(
     if let Err(refused) = require_reaching(
         state.policy.as_ref(),
         &user,
-        Action::Delete,
-        Resource::schedule(),
+        controls::DELETE_SCHEDULE,
         None,
     )
     .await
@@ -360,22 +357,17 @@ async fn batch_business_calendars(
     Query(ModeQuery { mode }): Query<ModeQuery>,
     Json(calendars): Json<Vec<BusinessCalendar>>,
 ) -> Response {
-    let ask = |action: Action| {
-        boss_policy_client::writes::require_registry_write(
-            state.policy.as_ref(),
-            &user,
-            action,
-            Resource::business_calendar(),
-        )
+    let ask = |control| {
+        boss_policy_client::writes::require_registry_write(state.policy.as_ref(), &user, control)
     };
     // The actor the ladder resolves is the one every fact this batch
     // stages is signed with (backlog 05f61acf: it was discarded here).
-    let actor = match ask(Action::Create).await {
+    let actor = match ask(controls::CREATE_BUSINESS_CALENDAR).await {
         Ok(actor) => actor,
         Err(refusal) => return refusal,
     };
     if mode.is_take()
-        && let Err(refusal) = ask(Action::Update).await
+        && let Err(refusal) = ask(controls::UPDATE_BUSINESS_CALENDAR).await
     {
         return refusal;
     }

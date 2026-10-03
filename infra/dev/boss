@@ -137,6 +137,38 @@ if [ -z "${BOSS_JOBS_URL:-}" ]; then
 fi
 export BOSS_JOBS_URL
 
+# The machine token's host list (backlog 2ee29275). The pod's record is
+# a Service name, and boss-core stamps a Service only when its host or
+# namespace is listed — another instance in the same cluster holds a
+# token of its own (review of 54d9a23a, MEDIUM-1). Nothing on the pod
+# renders /etc/boss/sor.env, so the list is the host of sor-url, the
+# same default infra/dev/boss-api takes. A caller's list, even empty,
+# is kept.
+if [ -z "${BOSS_MACHINE_TOKEN_HOSTS+set}" ] && [ -s "$here/sor-url" ]; then
+  token_host="$(tr -d '[:space:]' < "$here/sor-url")"
+  token_host="${token_host#*://}"
+  token_host="${token_host%%[/?#]*}"
+  token_host="${token_host##*@}"
+  token_host="${token_host%%:*}"
+  export BOSS_MACHINE_TOKEN_HOSTS="$token_host"
+fi
+
+# The machine token's directory (design 6805c764 car 4; backlog 1876bbdb,
+# INFO-5). The dev pod mounts the broker's copy of the token at the one
+# directory ./machine-token-dir names — NOT at boss-core's default
+# /etc/boss/machine-token, because builders run handler tests on this
+# pod and every stamping client a test builds reads the default; a
+# failing test that prints its request would put the live token in a
+# transcript. So the doors name the directory, and only to what they
+# run: this shim to the CLI, infra/dev/boss-api to its own curl. The CLI
+# strips it from every child that runs tree or car code — a probe, the
+# consist lints (boss-cli src/door_env.rs; review ef2da426 F1). A
+# caller's own directory is kept.
+if [ -z "${BOSS_MACHINE_TOKEN_DIR:-}" ] && [ -s "$here/machine-token-dir" ]; then
+  BOSS_MACHINE_TOKEN_DIR="$(tr -d '[:space:]' < "$here/machine-token-dir")"
+  export BOSS_MACHINE_TOKEN_DIR
+fi
+
 prefer=image
 if [ "${1:-}" = "--built" ]; then prefer=build; shift; fi
 [ -n "${BOSS_SHIM_BUILT:-}" ] && prefer=build

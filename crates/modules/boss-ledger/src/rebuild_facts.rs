@@ -305,15 +305,19 @@ pub async fn rebuild_facts_in_tx(
     // GL-inert reprojection pass — kept OFF the `gl_fact_projection_rules`
     // registry on purpose. The registry exists to drive the GL: every
     // fact kind it reconstructs is also posted to a journal by the active
-    // RuleSet. `finance.inventory.received` is the lone fact that must be
-    // reconstructable from the log AND post nothing — the goods-receipt's
-    // DR-1300 rides the idempotent bill-approval path, so a GL entry here
-    // would double-post it. Registering it would force exactly that. So
-    // its reprojection lives here, hardcoded, and the journal-posting
-    // stage (`post_fact_in_tx`) skips the inert kind. The result is
-    // symmetric with consume's INVENTORY_TRANSFERRED reconstruction
-    // (emit event → rebuild the fact from it), minus the GL leg.
-    facts_written += rebuild_inert_received_facts_in_tx(tx).await?;
+    // RuleSet. `finance.inventory.received` must be reconstructable from
+    // the log AND post nothing — the goods-receipt's DR-1300 rides the
+    // idempotent bill-approval path, so a GL entry here would double-post
+    // it. Registering it would force exactly that. So its reprojection
+    // lives here, hardcoded, and the journal-posting stage
+    // (`post_fact_in_tx`) skips the inert kind. The result is symmetric
+    // with consume's INVENTORY_TRANSFERRED reconstruction (emit event →
+    // rebuild the fact from it), minus the GL leg. A valueless consume's
+    // `finance.inventory.consumed` marker is the second such fact
+    // (backlog 55f69172).
+    for inert in INERT_REPROJECTIONS {
+        facts_written += rebuild_inert_facts_in_tx(tx, inert).await?;
+    }
 
     // After projection, re-apply every recorded supersede so the
     // rebuilt set matches the live state. Without this pass, a
@@ -331,30 +335,54 @@ pub async fn rebuild_facts_in_tx(
     })
 }
 
-/// Audit-log kind the inert receive reprojection consumes.
-const RECEIVE_EVENT_KIND: &str = "inventory.item.received";
-/// The GL-inert dedup-fact kind it reconstructs. Deliberately absent
-/// from `gl_fact_projection_rules` AND from the RuleSet match in
-/// `rules.rs`, so the journal-posting path (`post_fact_in_tx`) skips it
-/// via `crate::rules::is_gl_inert`.
-const RECEIVE_FACT_KIND: &str = "finance.inventory.received";
-/// `source_table` written verbatim — matches the in-tx
-/// `insert_dedup_fact` call in boss-inventory so the live fact and the
-/// rebuilt fact share a natural key and the replay-check diff is clean.
-const RECEIVE_SOURCE_TABLE: &str = "inventory_receipt";
+/// One GL-inert dedup-fact the rebuild reprojects from the audit log:
+/// the event that carries it, the fact kind (deliberately absent from
+/// `gl_fact_projection_rules` AND from the RuleSet match in `rules.rs`,
+/// so the journal-posting path skips it via `crate::rules::is_gl_inert`),
+/// the `source_table` boss-inventory's in-tx `insert_dedup_fact` writes
+/// verbatim — so the live and the rebuilt fact share a natural key and
+/// the replay-check diff is clean — and the payload field that carries
+/// the fact's `happened_on`.
+struct InertReprojection {
+    event_kind: &'static str,
+    fact_kind: &'static str,
+    source_table: &'static str,
+    happened_on_pointer: &'static str,
+}
 
-/// Reproject `inventory.item.received` audit events into the GL-inert
-/// `finance.inventory.received` dedup-fact. Mirrors the registry pass
-/// (`record_fact_in_tx`, idempotent on the natural key, deterministic
-/// `fact_id`) but stays hardcoded here precisely BECAUSE it must not be
-/// in `gl_fact_projection_rules` — see the call site for why. The fact's
+const INERT_REPROJECTIONS: &[InertReprojection] = &[
+    // The goods-receipt proof (see the call site).
+    InertReprojection {
+        event_kind: "inventory.item.received",
+        fact_kind: "finance.inventory.received",
+        source_table: "inventory_receipt",
+        happened_on_pointer: "/received_on",
+    },
+    // A valueless consume's proof of delivery: it moved no cents, so
+    // its only fact is the guard a redelivery is refused by (backlog
+    // 55f69172). Shares `inventory_consume` with the valued consume's
+    // transfer fact; the kind keeps the two keys apart.
+    InertReprojection {
+        event_kind: "inventory.item.consume_recorded",
+        fact_kind: "finance.inventory.consumed",
+        source_table: "inventory_consume",
+        happened_on_pointer: "/consumed_on",
+    },
+];
+
+/// Reproject one inert event kind's audit events into its GL-inert
+/// dedup-fact. Mirrors the registry pass (`record_fact_in_tx`,
+/// idempotent on the natural key, deterministic `fact_id`) but stays
+/// hardcoded here precisely BECAUSE it must not be in
+/// `gl_fact_projection_rules` — see the call site for why. The fact's
 /// `(source_table, source_id, happened_on, payload, created_by)` are
-/// reproduced byte-for-byte from what boss-inventory wrote in-tx
-/// (`inventory_receipt` / `/source_id` / `/received_on` / payload
-/// verbatim / `inventory`), so a live receive and a rebuilt receive land
-/// the identical row. Returns the number of facts written.
-async fn rebuild_inert_received_facts_in_tx(
+/// reproduced byte-for-byte from what boss-inventory wrote in-tx (the
+/// table / `/source_id` / the date field / payload verbatim /
+/// `inventory`), so a live write and a rebuilt one land the identical
+/// row. Returns the number of facts written.
+async fn rebuild_inert_facts_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    inert: &InertReprojection,
 ) -> Result<u64, LedgerError> {
     // `ORDER BY id` = commit order — same reasoning as the registry
     // pass above; timestamp order is incoherent across the sim-to-
@@ -365,7 +393,7 @@ async fn rebuild_inert_received_facts_in_tx(
          WHERE kind = $1 \
          ORDER BY id",
     )
-    .bind(RECEIVE_EVENT_KIND)
+    .bind(inert.event_kind)
     .fetch_all(&mut **tx)
     .await
     .map_err(|e| LedgerError::Storage(e.to_string()))?;
@@ -381,10 +409,10 @@ async fn rebuild_inert_received_facts_in_tx(
         let Some(source_id) = pointer_string(&payload, "/source_id") else {
             continue;
         };
-        // `received_on` carries the dedup-fact's happened_on. Fall back to
-        // the event date if (impossibly) absent, mirroring the registry's
-        // NULL-happened_on_path behavior.
-        let happened_on = pointer_string(&payload, "/received_on")
+        // The date field carries the dedup-fact's happened_on. Fall back
+        // to the event date if (impossibly) absent, mirroring the
+        // registry's NULL-happened_on_path behavior.
+        let happened_on = pointer_string(&payload, inert.happened_on_pointer)
             .and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
             .unwrap_or_else(|| timestamp.date_naive());
 
@@ -395,10 +423,10 @@ async fn rebuild_inert_received_facts_in_tx(
         record_fact_in_tx(
             tx,
             FactWrite {
-                kind: RECEIVE_FACT_KIND,
+                kind: inert.fact_kind,
                 happened_on,
                 payload: &fact_payload,
-                source_table: Some(RECEIVE_SOURCE_TABLE),
+                source_table: Some(inert.source_table),
                 source_id: Some(&source_id),
                 // Matches the `created_by` the in-tx `insert_dedup_fact`
                 // stamps ('inventory'); keeps the replay-check diff clean.

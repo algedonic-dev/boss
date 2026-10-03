@@ -18,8 +18,10 @@
   import type { Node, Edge } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
   import dagre from '@dagrejs/dagre';
-  import { buildCascade, describeTrigger, filterCascadeFromEvents, invokedEmits, triggerTopics, type Cascade } from './cascadeToGraph';
+  import { buildCascade, describeTrigger, filterCascadeFrom, filterStarts, invokedEmits, type Cascade } from './cascadeToGraph';
   import type { DispatcherRules } from './types';
+  import { ruleProvenance } from './ruleProvenance';
+  import Link from '@boss/web-kit/ui/Link.svelte';
   import { href, navigate } from '../router';
   import CascadeNode from './CascadeNode.svelte';
 
@@ -30,8 +32,9 @@
   let loading = $state(true);
   /** selected node id (`evt:` / `rule:` / `hdl:`), for the detail panel. */
   let selected = $state<string | null>(null);
-  /** Selected trigger events (on_event topics) to narrow the diagram to
-   *  their forward cascade. Empty = the full view. */
+  /** Selected filter starts (node ids: an on_event topic's event node, or
+   *  a scheduled rule's own node) to narrow the diagram to their forward
+   *  cascade. Empty = the full view. */
   let selectedTriggers = $state<string[]>([]);
 
   const NODE_W = 240;
@@ -60,12 +63,16 @@
     data && !data.error ? buildCascade(data) : { nodes: [], edges: [] },
   );
   // Narrow to the selected triggers' forward cascade; empty = the full view.
-  const cascade = $derived<Cascade>(filterCascadeFromEvents(fullCascade, selectedTriggers));
+  const cascade = $derived<Cascade>(filterCascadeFrom(fullCascade, selectedTriggers));
 
-  /** Distinct trigger events (topics rules listen for), sorted — the filter
-   *  selector's options. Scheduled rules have none and are not listed. */
-  const allTriggers = $derived(triggerTopics(data?.rules ?? []));
-  const availableTriggers = $derived(allTriggers.filter((t) => !selectedTriggers.includes(t)));
+  /** The filter selector's options: the topics rules listen for, then each
+   *  rule a clock fires. Scheduled rules used to have no option, so no
+   *  filtered view could reach them (backlog d3734028). */
+  const allTriggers = $derived(filterStarts(data?.rules ?? []));
+  const labelOf = $derived(new Map(allTriggers.map((s) => [s.id, s.label])));
+  const availableTriggers = $derived(allTriggers.filter((s) => !selectedTriggers.includes(s.id)));
+  const availableEvents = $derived(availableTriggers.filter((s) => s.group === 'event'));
+  const availableScheduled = $derived(availableTriggers.filter((s) => s.group === 'schedule'));
 
   function addTrigger(e: Event): void {
     const sel = e.currentTarget as HTMLSelectElement;
@@ -201,25 +208,46 @@
     <span class="dx-key dx-event">event</span>
     <span class="dx-key dx-rule">rule</span>
     <span class="dx-key dx-handler">handler</span>
+    <span class="dx-edgekey"><i style="background:var(--border-strong)"></i>trigger</span>
+    <span class="dx-edgekey"><i style="background:var(--signal)"></i>do</span>
     <span class="dx-edgekey"><i style="background:var(--clear)"></i>emits</span>
     <span class="dx-edgekey"><i style="background:var(--busy)"></i>system (jobs-api / external)</span>
+    <span class="dx-edgekey"><i style="background:repeating-linear-gradient(90deg,var(--hairline) 0 2px,transparent 2px 5px)"></i>match</span>
     <span class="dx-edgekey"><i style="background:var(--troubled)"></i>feedback cycle</span>
   </div>
+
+  {#if data && !error && data.authored_registry?.error}
+    <p class="dx-registry-unread" role="status">
+      The authored registry could not be read ({data.authored_registry.dir ?? 'no directory set'}):
+      {data.authored_registry.error} — no rule's why or file can be shown.
+    </p>
+  {/if}
 
   {#if data && !error && allTriggers.length}
     <div class="dx-filter">
       <label class="dx-filter-label">
         Trigger
         <select class="dx-filter-select" onchange={addTrigger}>
-          <option value="">filter cascade by trigger event…</option>
-          {#each availableTriggers as t (t)}
-            <option value={t}>{t}</option>
-          {/each}
+          <option value="">filter cascade by trigger…</option>
+          {#if availableEvents.length}
+            <optgroup label="on event">
+              {#each availableEvents as s (s.id)}
+                <option value={s.id}>{s.label}</option>
+              {/each}
+            </optgroup>
+          {/if}
+          {#if availableScheduled.length}
+            <optgroup label="on schedule">
+              {#each availableScheduled as s (s.id)}
+                <option value={s.id}>{s.label}</option>
+              {/each}
+            </optgroup>
+          {/if}
         </select>
       </label>
       {#each selectedTriggers as t (t)}
         <span class="dx-chip">
-          {t}
+          {labelOf.get(t) ?? t}
           <button type="button" class="dx-chip-x" title="remove" onclick={() => removeTrigger(t)}>×</button>
         </span>
       {/each}
@@ -270,6 +298,7 @@
     {#if detail}
       <aside class="dx-panel">
         {#if detail.kind === 'rule'}
+          {@const provenance = ruleProvenance(detail.rule, data?.authored_registry ?? null)}
           <h2>rule · {detail.rule.name}</h2>
           <dl>
             {#if detail.rule.on_event}
@@ -302,7 +331,20 @@
                 {/each}
               </ol>
             </dd>
+            <dt>why</dt>
+            <dd class="dx-why">
+              {data?.authored_registry?.error
+                ? 'Unavailable — the authored registry could not be read'
+                : detail.rule.why?.trim() || 'Not recorded in this read'}
+            </dd>
+            <dt>source</dt>
+            <dd>{detail.rule.source?.trim() || 'unknown'}</dd>
+            <dt>authored</dt>
+            <dd title={provenance.why}>{provenance.label}</dd>
+            <dt>version</dt>
+            <dd>{detail.rule.version}</dd>
           </dl>
+          <Link to={href(`/it/registry/rules/${encodeURIComponent(detail.rule.name)}`)}>Open rule →</Link>
         {:else if detail.kind === 'handler'}
           <h2>handler · {detail.handler}</h2>
           <dt>emits</dt>
@@ -334,6 +376,12 @@
 </div>
 
 <style>
+  .dx-registry-unread {
+    color: var(--warn);
+  }
+  .dx-why {
+    white-space: pre-line;
+  }
   .dx {
     display: flex;
     flex-direction: column;

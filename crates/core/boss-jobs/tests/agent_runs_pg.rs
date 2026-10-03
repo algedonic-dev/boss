@@ -914,8 +914,14 @@ async fn opus_5_5_is_priced_at_its_own_published_rates() {
 /// 2026-09-25 (input, output, cache hits and refreshes, 5m cache writes,
 /// in micro-USD per MTok) — not derived by a multiplier — and every row's
 /// note names that read date.
+///
+/// The card stopped being one vendor's page on 2026-10-01 (backlog
+/// 5840c068): `gpt-6.1-sol` was read off
+/// https://developers.openai.com/api/docs/pricing and `gemini-2.5-pro`
+/// off https://ai.google.dev/gemini-api/docs/pricing that day, so each
+/// row below is held to ITS page's read date, not to one date for all.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_rate_card_is_the_published_page_as_read_2026_09_25() {
+async fn the_rate_card_is_each_published_page_as_read() {
     let db = TestDb::new().await;
     let card: Vec<(String, i64, i64, Option<i64>, Option<i64>, String)> = sqlx::query_as(
         "SELECT model, input_usd_micros_per_mtok, output_usd_micros_per_mtok, \
@@ -996,6 +1002,25 @@ async fn the_rate_card_is_the_published_page_as_read_2026_09_25() {
             Some(200_000),
             Some(2_500_000),
         ),
+        // Standard tier, short context: input / cached input / output /
+        // cache writes, as the page's own columns read.
+        (
+            "gpt-6.1-sol",
+            2_000_000,
+            10_000_000,
+            Some(100_000),
+            Some(2_500_000),
+        ),
+        // Paid tier, prompts <= 200k. The page publishes no cache-write
+        // price; a token that misses the implicit cache is input, so the
+        // write rate is the input rate (the migration says why).
+        (
+            "gemini-2.5-pro",
+            1_250_000,
+            10_000_000,
+            Some(125_000),
+            Some(1_250_000),
+        ),
     ];
     let mut got: Vec<(&str, i64, i64, Option<i64>, Option<i64>)> = card
         .iter()
@@ -1007,9 +1032,13 @@ async fn the_rate_card_is_the_published_page_as_read_2026_09_25() {
     read.sort();
     assert_eq!(got, read, "the card, row by row, against the page");
     for (model, .., note) in &card {
+        let read_on = match model.as_str() {
+            "gpt-6.1-sol" | "gemini-2.5-pro" => "read 2026-10-01",
+            _ => "read 2026-09-25",
+        };
         assert!(
-            note.contains("read 2026-09-25"),
-            "{model}'s note names no read date: {note}"
+            note.contains(read_on),
+            "{model}'s note does not name its page's read date ({read_on}): {note}"
         );
     }
 

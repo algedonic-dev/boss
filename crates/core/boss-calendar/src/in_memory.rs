@@ -24,6 +24,28 @@ use crate::port::{
     BusinessCalendarsOutcome, CalendarClient, CalendarError, account_for, published_fact,
 };
 
+/// The subject kinds the double lets hold a reservation — the set the
+/// migration flags `calendar_reservable` on the subject_kinds registry
+/// (`01-registries.sql`), which is where `PgCalendar` reads it.
+///
+/// WHY (backlog be459ab9, found by the adapters-agree suite,
+/// 2026-09-30): the double reserved ANY kind, so a door test could
+/// reserve a `location` production refuses. A fact that lives twice
+/// (CLAUDE.md §9a) — the migration's UPDATE and this list — held equal
+/// by `only_a_reservable_kind_can_be_reserved` in
+/// `tests/the_adapters_agree_on_the_calendar_pg.rs`, which runs the
+/// same kinds against both.
+pub const RESERVABLE_KINDS: [&str; 3] = ["employee", "asset", "account"];
+
+/// The order both adapters answer reservations in: by start, then by id
+/// (two soft rows may share a start) — `PgCalendar`'s `ORDER BY
+/// start_ts, id`, which compares a uuid byte for byte as `Uuid::cmp`
+/// does. Until 2026-09-30 the double answered insertion order (backlog
+/// be459ab9, found by the adapters-agree suite).
+fn by_start_then_id(rows: &mut [Reservation]) {
+    rows.sort_by_key(|r| (r.window.start, *r.id.inner().as_uuid()));
+}
+
 #[derive(Default)]
 pub struct InMemoryCalendar {
     rows: RwLock<Vec<Reservation>>,
@@ -75,12 +97,18 @@ impl CalendarClient for InMemoryCalendar {
                 "window end must be after start".into(),
             ));
         }
+        if !RESERVABLE_KINDS.contains(&req.subject.kind.as_str()) {
+            return Err(CalendarError::Invalid(format!(
+                "subject kind `{}` is not calendar-reservable",
+                req.subject.kind
+            )));
+        }
         let mut rows = self.rows.write().unwrap();
 
         if matches!(req.strength, ReservationStrength::Hard) {
             // Mirror the SQL exclusion: only hard, only non-cancelled,
             // only the same resource.
-            let existing: Vec<Reservation> = rows
+            let mut existing: Vec<Reservation> = rows
                 .iter()
                 .filter(|r| {
                     r.cancelled_at.is_none()
@@ -91,6 +119,7 @@ impl CalendarClient for InMemoryCalendar {
                 .cloned()
                 .collect();
             if !existing.is_empty() {
+                by_start_then_id(&mut existing);
                 return Err(CalendarError::Conflict { existing });
             }
         }
@@ -123,14 +152,18 @@ impl CalendarClient for InMemoryCalendar {
         subject: &Subject,
         window: TimeWindow,
     ) -> Result<Vec<Reservation>, CalendarError> {
-        let rows = self.rows.read().unwrap();
-        Ok(rows
+        let mut rows: Vec<Reservation> = self
+            .rows
+            .read()
+            .unwrap()
             .iter()
             .filter(|r| {
                 r.cancelled_at.is_none() && &r.subject == subject && r.window.overlaps(&window)
             })
             .cloned()
-            .collect())
+            .collect();
+        by_start_then_id(&mut rows);
+        Ok(rows)
     }
 
     async fn get(&self, id: ReservationId) -> Result<Option<Reservation>, CalendarError> {

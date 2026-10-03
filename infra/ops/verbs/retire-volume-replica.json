@@ -1,0 +1,33 @@
+{
+  "about": "MUTATING — retire ONE named replica of ONE Longhorn volume through the forge ops_kubectl door (infra/forge/retire-volume-replica.sh <volume> <replica> <plan_sha256>). David chose this for the database volume's growth-blocking w-2 copy (2026-10-01, d3c0a67c, 5ef9d2d9); it also backs down a stalled replica move and resumes a stopped retirement (077adeb3). AUTHORISED PER RUN BY DAVID'S PASSKEY, design 17835005: the read-only plan-a-volume-replica-retirement renders bytes onto the approve step, an allowed passkey signs them, and the runner hands this write sha256 of that SIGNED plan. The script re-renders current state and refuses a different hash before mutation. A stop after lowering requires a NEW signed resume plan; old authorization never continues. THE BOUND IS THE SCRIPT'S: one attached pvc-<uuid> volume Longhorn holds, one of ITS replicas, N replicas with declared count N, none deleting, every retained copy healthy+active on N-1 distinct nodes; either the named copy healthy on an N-th node and robustness healthy (retirement), or the sole unhealthy copy and robustness degraded (back-down). Resume accepts only declared count N-1 with all N copies healthy+active on N distinct nodes and robustness healthy. N-1 must be at least BOSS_RETIRE_FLOOR (default 3, never below 2). Data locality and effective replica auto-balance must be disabled, with no eviction on any replica, node or disk, so Longhorn v1.11.3 does not choose the removal. Retirement and resume also require every remaining disk to admit the next GiB of growth in its scheduling ledger AND live space, by ValidateDiskAvailableForExpansion and IsSchedulableToDisk with requiredStorage 0 (infra/lib/longhorn-ledger.sh); back-down does not require growth room. Its unhealthy copy may rebuild healthy during the wait and then deleting it costs a healthy copy. THE WRITE: (1) a compare-and-set lowers N to N-1, or a resume test-only patch verifies N-1 without replacing it; (2) watch 30 s, stopping before delete on another copy gone/unwell, a new copy, or any unreadable judgement; immediately before delete re-read the actual declared count, retained node/disk identities and distinct healthy copies, locality, effective auto-balance, replica/node/disk evictions and robustness (healthy for retirement/resume; healthy or degraded for back-down). If the named copy has already gone or is terminating, delete nothing else. Otherwise delete exactly its name. A failure in the instant after the final read can still cost another copy; kubectl cannot prevent that race, and read-back reports it. THE EFFECT: for up to 180 s wait for the named copy to vanish, declared count N-1, exactly the retained named copies on their planned nodes/disks, all healthy+active on N-1 distinct nodes, robustness healthy, and for retirement/resume every remaining disk still admitting the next GiB. Only that complete read-back prints the declared effect; otherwise exit 1 with the observed cause. Initial refusals exit 78 without writes. Every signed plan includes current declared count and all replica identities, so applying it spends that approval. Timeout 600 is the runner's bound; if it kills a run after lowering, finish only through a new signed resume plan.",
+  "hosts": [
+    "forge"
+  ],
+  "requires_approval": true,
+  "plan_verb": "plan-a-volume-replica-retirement",
+  "approvers": [
+    "emp-david"
+  ],
+  "argv": [
+    "infra/forge/retire-volume-replica.sh",
+    "{1}",
+    "{2}",
+    "{3}"
+  ],
+  "params": [
+    {
+      "name": "volume",
+      "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    {
+      "name": "replica",
+      "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-r-[0-9a-f]{8}$"
+    },
+    {
+      "name": "plan_sha256",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  ],
+  "timeout": 600,
+  "effect": "^retire-volume-replica: pvc-[0-9a-f-]{36} has [0-9]+ healthy replicas on [0-9]+ distinct nodes \\([a-z0-9-]+(, [a-z0-9-]+)*\\) — [0-9a-z-]+-r-[0-9a-f]{8} is gone — read back: spec\\.numberOfReplicas=[0-9]+, robustness healthy"
+}

@@ -48,20 +48,16 @@ fn tech(id: &str) -> User {
 fn open_job(id: &str, owner: &str) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
-        kind: "user-feedback".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "/ux/jobs"),
-        title: "A packet whose step gets annotated".into(),
-        owner_id: owner.to_string(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "user-feedback",
+            Subject::new("custom", "/ux/jobs"),
+            "A packet whose step gets annotated",
+            owner.to_string(),
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+        )
     }
 }
 
@@ -802,28 +798,18 @@ fn exhibit_fields() -> Vec<boss_core::job::StepField> {
     use boss_core::job::{FilledBy, StepField};
     vec![
         StepField {
-            name: "questions".into(),
-            field_type: "array".into(),
             required: true,
             filled_by: FilledBy::Filer,
             item_keys: vec!["anchor".into(), "title".into(), "proposal".into()],
-            covers: None,
             binds: Some("exhibits".into()),
-            item_value_max_bytes: None,
-            item_one_of: Vec::new(),
-            writer: None,
+            ..StepField::new("questions", "array")
         },
         StepField {
-            name: "exhibits".into(),
-            field_type: "array".into(),
-            required: false,
             filled_by: FilledBy::Filer,
             item_keys: vec!["anchor".into(), "title".into()],
-            covers: None,
-            binds: None,
             item_value_max_bytes: Some(16),
             item_one_of: vec!["html".into(), "file_ref".into()],
-            writer: None,
+            ..StepField::new("exhibits", "array")
         },
     ]
 }
@@ -932,17 +918,21 @@ async fn put_step(
     (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// THE PUT HOLDS THE STANDING REFUSALS TOO (car 1 of backlog 73ef81fa
-/// left this open). A step PUT that carries metadata and does NOT
-/// complete the step used to be judged by nothing — required-at-done
-/// runs only at done — so the merge door's refusals could be walked
-/// around by sending the whole bag through the PUT instead. Now the
-/// same three hold: a binding to an exhibit the step lacks, an exhibit
-/// carrying both `html` and `file_ref`, and a value over the bound are
-/// each refused 422 and land nothing; a PUT that changes neither field
-/// is not judged by them, exactly as at the merge door.
+/// THE STANDING REFUSALS HAVE ONE DOOR TO HOLD (car 1 of backlog
+/// 73ef81fa left the PUT open; backlog e39a9d2a, Stage 2's last car,
+/// closed it). A step PUT that carried metadata and did NOT complete the
+/// step used to be judged by nothing, so the merge door's refusals could
+/// be walked around by sending the whole bag through the PUT; the PUT
+/// then held the same three itself. Now the PUT writes no metadata at
+/// all: every such body — bad, whole, or a reviewer's save — is refused
+/// 409 before any judgement, naming the merge door, and lands nothing.
+/// The three refusals are pinned where the write now lands: a binding
+/// to an exhibit the step lacks, an exhibit carrying both `html` and
+/// `file_ref`, and a value over the bound are each refused 422 by the
+/// merge door and land nothing; a write that changes neither field is
+/// not judged by them, even on a row that already breaks one.
 #[tokio::test]
-async fn a_non_completing_put_with_metadata_holds_the_standing_refusals() {
+async fn the_put_writes_no_metadata_and_the_merge_door_holds_the_standing_refusals() {
     let (app, jobs) = build_app(allow_step_update());
     let user = tech("emp-1");
     let job = open_job("00000000-0000-0000-0000-0000000000e2", "emp-1");
@@ -958,7 +948,7 @@ async fn a_non_completing_put_with_metadata_holds_the_standing_refusals() {
     });
     jobs.add_step(&step).await.unwrap();
     let (jid, sid) = (job.id.to_string(), step.id.to_string());
-    let with = |patch: serde_json::Value| {
+    let with = |patch: &serde_json::Value| {
         let mut md = step.metadata.clone();
         for (k, v) in patch.as_object().unwrap() {
             md[k] = v.clone();
@@ -966,28 +956,67 @@ async fn a_non_completing_put_with_metadata_holds_the_standing_refusals() {
         serde_json::json!({ "metadata": md })
     };
 
-    for (why, bad) in [
+    let bad = [
         (
             "a binding to an exhibit the step lacks",
-            with(serde_json::json!({
+            serde_json::json!({
                 "questions": [{"anchor": "Q1", "title": "t", "proposal": "p", "exhibits": ["E9"]}],
-            })),
+            }),
         ),
         (
             "an exhibit carrying both html and file_ref",
-            with(serde_json::json!({
+            serde_json::json!({
                 "exhibits": [{"anchor": "E1", "title": "board", "html": "<p>x</p>", "file_ref": "f-1"}],
-            })),
+            }),
         ),
         (
             "a value over the inline bound",
-            with(serde_json::json!({
+            serde_json::json!({
                 "exhibits": [{"anchor": "E1", "title": "board", "html": "<p>seventeen b</p>"}],
-            })),
+            }),
         ),
-    ] {
-        let (status, body) = put_step(&app, &user, &jid, &sid, &bad).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{why}: {body}");
+    ];
+    // A file_ref exhibit alone is whole.
+    let good = serde_json::json!({
+        "exhibits": [{"anchor": "E1", "title": "board", "file_ref": "f-1"}],
+    });
+
+    // THE PUT: every metadata body is the merge-door refusal, whatever
+    // the standing refusals would have said of it, and nothing lands.
+    for (why, keys) in bad.iter().chain([("a whole exhibit", good.clone())].iter()) {
+        let (status, body) = put_step(&app, &user, &jid, &sid, &with(keys)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{why}: {body}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            body["merge_door"],
+            format!("/api/jobs/{jid}/steps/{sid}/metadata"),
+            "{why}: the refusal names the step's door: {body}"
+        );
+        assert_eq!(
+            body["hint"],
+            boss_jobs::step_metadata_write::METADATA_BODY_HINT,
+            "{why}: {body}"
+        );
+        let after = jobs.get_step(&step.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.metadata, step.metadata,
+            "{why}: a refused write lands nothing"
+        );
+    }
+
+    // THE MERGE DOOR: the same three, sent as just the keys they change.
+    for (why, keys) in &bad {
+        let resp = patch_step_metadata(&app, &user, &jid, &sid, &keys.to_string()).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{why}");
+        let body = String::from_utf8(
+            resp.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
         assert!(body.contains("invalid step metadata"), "{why}: {body}");
         let after = jobs.get_step(&step.id).await.unwrap().unwrap();
         assert_eq!(
@@ -996,12 +1025,8 @@ async fn a_non_completing_put_with_metadata_holds_the_standing_refusals() {
         );
     }
 
-    // A file_ref exhibit alone is whole, and lands.
-    let good = with(serde_json::json!({
-        "exhibits": [{"anchor": "E1", "title": "board", "file_ref": "f-1"}],
-    }));
-    let (status, body) = put_step(&app, &user, &jid, &sid, &good).await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let resp = patch_step_metadata(&app, &user, &jid, &sid, &good.to_string()).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     let after = jobs.get_step(&step.id).await.unwrap().unwrap();
     assert_eq!(after.metadata["exhibits"][0]["file_ref"], "f-1");
 
@@ -1014,15 +1039,15 @@ async fn a_non_completing_put_with_metadata_holds_the_standing_refusals() {
         {"anchor": "E1", "title": "again", "file_ref": "f-2"},
     ]);
     jobs.update_step(&legacy).await.unwrap();
-    let mut md = legacy.metadata.clone();
-    md["resolutions"] = serde_json::json!([{"anchor": "Q1", "decision": "warm"}]);
-    let (status, body) = put_step(
+    let resp = patch_step_metadata(
         &app,
         &user,
         &jid,
         &sid,
-        &serde_json::json!({ "metadata": md }),
+        r#"{"resolutions":[{"anchor":"Q1","decision":"warm"}]}"#,
     )
     .await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let after = jobs.get_step(&step.id).await.unwrap().unwrap();
+    assert_eq!(after.metadata["resolutions"][0]["decision"], "warm");
 }

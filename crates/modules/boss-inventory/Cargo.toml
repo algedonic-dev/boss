@@ -59,6 +59,10 @@ name = "audit_log_e2e"
 required-features = ["postgres"]
 
 [[test]]
+name = "concurrent_redelivery_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "consume_idempotency_pg"
 required-features = ["postgres"]
 
@@ -100,4 +104,8 @@ required-features = ["postgres"]
 
 [[test]]
 name = "value_conservation_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_inventory_store_pg"
 required-features = ["postgres"]

@@ -146,7 +146,7 @@ pub(super) async fn create_vendor<R: InventoryRepository + 'static>(
         )
             .into_response(),
         Err(InventoryError::Conflict(msg)) => (StatusCode::CONFLICT, msg).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => super::error_response(e),
     }
 }
 
@@ -187,7 +187,7 @@ pub(super) async fn update_vendor<R: InventoryRepository + 'static>(
     match state.inventory.update_vendor(&id, &vendor, &stamp).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(InventoryError::NotFound(msg)) => (StatusCode::NOT_FOUND, msg).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => super::error_response(e),
     }
 }
 
@@ -200,6 +200,6 @@ pub(super) async fn delete_vendor<R: InventoryRepository + 'static>(
     match state.inventory.delete_vendor(&id, &stamp).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(InventoryError::NotFound(msg)) => (StatusCode::NOT_FOUND, msg).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => super::error_response(e),
     }
 }

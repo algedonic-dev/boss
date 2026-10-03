@@ -33,20 +33,16 @@ const UNSERVED: &str = "a-kind-no-plugin-serves";
 fn job(id: JobId) -> Job {
     Job {
         id,
-        kind: "field-service".into(),
-        workflow_version: 1,
-        subject: Subject::new("asset", "SYS-1"),
-        title: "Inspect".into(),
-        owner_id: "emp-owner".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "field-service",
+            Subject::new("asset", "SYS-1"),
+            "Inspect",
+            "emp-owner",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
+        )
     }
 }
 

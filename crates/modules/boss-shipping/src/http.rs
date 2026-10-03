@@ -480,6 +480,7 @@ fn shipping_error_response(e: ShippingError) -> Response {
     match e {
         ShippingError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
         ShippingError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
+        ShippingError::Invalid(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
         ShippingError::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
     }
 }

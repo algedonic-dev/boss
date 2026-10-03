@@ -39,12 +39,70 @@ pub enum ProductsError {
     Invalid(String),
 }
 
+/// Refuse text Postgres cannot store: a NUL byte in any of `fields`
+/// (TEXT rejects one). Both adapters call this before writing, so the
+/// refusal is `Invalid` naming the field on each — until the
+/// adapters-agree suite (backlog be459ab9) Postgres answered with its
+/// encoding error as `Storage` (a 500) and the double stored the byte.
+pub fn refuse_nul(fields: &[(&str, &str)]) -> Result<(), ProductsError> {
+    match fields.iter().find(|(_, v)| v.contains('\0')) {
+        Some((f, _)) => Err(ProductsError::Invalid(format!(
+            "{f} holds a NUL byte, which cannot be stored"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// `refuse_nul` over a catalog row, its metadata searched whole (JSONB
+/// rejects a NUL in any string or key).
+pub fn refuse_nul_in_product(p: &Product) -> Result<(), ProductsError> {
+    fn json_holds_nul(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::String(s) => s.contains('\0'),
+            serde_json::Value::Array(a) => a.iter().any(json_holds_nul),
+            serde_json::Value::Object(o) => {
+                o.iter().any(|(k, v)| k.contains('\0') || json_holds_nul(v))
+            }
+            _ => false,
+        }
+    }
+    refuse_nul(&[
+        ("sku", &p.sku),
+        ("name", &p.name),
+        ("product_kind", &p.product_kind),
+        ("package_unit", &p.package_unit),
+        ("description", p.description.as_deref().unwrap_or("")),
+    ])?;
+    if json_holds_nul(&p.metadata) {
+        return Err(ProductsError::Invalid(
+            "metadata holds a NUL byte, which cannot be stored".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The refusal of an inventory write naming a SKU nobody registered —
+/// one wording for both adapters (backlog be459ab9: Postgres answered
+/// its foreign-key error as `Storage`, a 500, and the double stored the
+/// row).
+pub fn unregistered(sku: &str) -> ProductsError {
+    ProductsError::NotFound(format!("product {sku} is not registered"))
+}
+
+/// Every port method is held to one statement across both adapters by
+/// `tests/the_adapters_agree_on_the_products_store_pg.rs` (backlog
+/// be459ab9). Common to every method: a NUL byte in a written text
+/// argument or field is refused `Invalid` naming it, and a read keyed
+/// by one is a miss; lists are in BYTE order (never the database's
+/// locale, backlog 2987fb2d); a stored instant is kept to the
+/// microsecond.
 #[async_trait]
 pub trait ProductsRepository: Send + Sync {
-    /// All catalog rows. `active_only=true` filters out retired SKUs.
+    /// All catalog rows, in byte order of SKU. `active_only=true`
+    /// filters out retired SKUs.
     async fn list_products(&self, active_only: bool) -> Result<Vec<Product>, ProductsError>;
 
-    /// One catalog row. Returns NotFound if the SKU isn't registered.
+    /// One catalog row; `None` for a SKU nobody registered.
     async fn get_product(&self, sku: &str) -> Result<Option<Product>, ProductsError>;
 
     /// Upsert by SKU (idempotent on the natural key). Used by the
@@ -57,12 +115,15 @@ pub trait ProductsRepository: Send + Sync {
         stamp: &EventStamp,
     ) -> Result<(), ProductsError>;
 
-    /// Per-location rows for one SKU.
+    /// Per-location rows for one SKU, in byte order of location.
     async fn inventory_for(&self, sku: &str) -> Result<Vec<ProductInventory>, ProductsError>;
 
     /// Upsert one (sku, location) row. Production / sale side-effect
     /// handlers call this with delta-applied counts; the table holds
-    /// absolute state, last-write-wins.
+    /// absolute state, last-write-wins. The stored row's
+    /// `production_cost_cents` is derived (what was sent is ignored)
+    /// and its `updated_at` is the stamp's instant. A SKU nobody
+    /// registered is refused `NotFound` (so is a produce naming one).
     /// OUTBOX (phase 2): records `products.inventory.upserted` in
     /// the same transaction as the row.
     async fn upsert_inventory(
@@ -81,7 +142,9 @@ pub trait ProductsRepository: Send + Sync {
     /// shape so cross-adapter callers stay consistent.
     /// Idempotent on the `(kind, source_table, source_id)`
     /// unique key, so the same opening row re-applied is a
-    /// no-op. Returns the canonical fact_id.
+    /// no-op (`inserted: false`). Returns the canonical fact_id
+    /// (`boss_ledger::deterministic_fact_id`). A total of zero or
+    /// fewer cents is refused `Invalid`.
     /// OUTBOX (phase 2): when THIS call inserts the fact, the
     /// matching `ledger.inventory.transferred` event records in the
     /// same transaction — the emit-once-on-`inserted` contract the
@@ -113,6 +176,10 @@ pub trait ProductsRepository: Send + Sync {
     /// (PR 6a). `None` leaves value unchanged — callers that don't
     /// carry cost data move units only. The display
     /// `production_cost_cents` is derived (value / on_hand).
+    /// A costed produce replayed with the same `source_id` (a
+    /// redelivered step effect) answers the current row unchanged, no
+    /// GL move, and records nothing — its fact is the proof of
+    /// application; the same holds for a costed `consume`.
     /// OUTBOX (phase 2): records `products.inventory.upserted`
     /// (post-delta row) and, when a GL move happened,
     /// `products.produced` (the fact payload verbatim) in the same

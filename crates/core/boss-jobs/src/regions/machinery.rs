@@ -128,6 +128,11 @@ fn conductor_machine(h: Option<&ConductorHealth>) -> Machine {
             "the conductor's firing record was not read".to_string(),
         );
     };
+    // Withheld from this caller by scope (backlog d0058c92): no state
+    // can be judged, and the reason is the refusal's, not a failure's.
+    if let Some(why) = &h.withheld {
+        return machine(id, name, MachineState::Withheld, format!("withheld: {why}"));
+    }
     if h.silent {
         let since = match h.silent_for_minutes {
             Some(m) => format!("{m}m since it last fired"),
@@ -616,7 +621,7 @@ mod tests {
         // The region's own reading is kept behind the machine's, not
         // overwritten — a verdict adds to the record, it does not
         // replace it.
-        assert!(track.why.contains("in transit"), "{}", track.why);
+        assert!(track.why.contains("no train on the track"), "{}", track.why);
     }
 
     /// The runner machine reports the RUNNER, not the verb's verdict:

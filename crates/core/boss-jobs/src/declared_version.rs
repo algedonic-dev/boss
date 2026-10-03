@@ -1,10 +1,10 @@
 //! The version floor a registry's `publish_declared` enforces — ONE
-//! rule for the step-plugin, station and delivery-policy registries and
-//! both adapters of each. The cadence registry states the same rule in
-//! `cadence::in_memory::not_above` and reads it under the one-statement
-//! lock the paragraph below measures as short; it was left out of this
-//! change only because another car was editing both of its adapters
-//! the same day.
+//! rule for the step-plugin, station, delivery-policy and cadence
+//! registries and both adapters of each. The cadence registry kept its
+//! own copy, read under the one-statement lock the paragraph below
+//! measures as short, until backlog 4541d511 moved it here
+//! (`pg_an_older_publish_waiting_on_a_newer_one_is_refused` in its
+//! adapters-agree suite).
 //!
 //! WHY (backlog 1cd85e94, and df793bd7 for the station and
 //! delivery-policy twins, 2026-09-29). A bundle write publishes at the
@@ -44,8 +44,7 @@ pub fn newest(lineage: impl Iterator<Item = i32>) -> i32 {
 
 /// The refusal a declared version at or below the newest answers —
 /// worded once, so every registry's conflict reads the same over
-/// either adapter (the cadence registry's own copy says the same
-/// words).
+/// either adapter.
 pub fn not_above(name: &str, version: i32, newest: i32) -> String {
     format!(
         "{name}@{version} is not above the newest version of its lineage (v{newest}); \

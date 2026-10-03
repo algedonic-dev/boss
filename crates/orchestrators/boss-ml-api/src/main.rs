@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
     );
     info!(%clock_url, "clock client wired");
 
-    let mut dispatcher = InferenceDispatcher::new(pool, repo.clone(), clock);
+    let mut dispatcher = InferenceDispatcher::new(pool.clone(), repo.clone(), clock);
     // Canonical plugin set. Tenant binaries can layer their own
     // plugins here before the dispatcher is wrapped in Arc below.
     dispatcher.register_plugin(Arc::new(AccountChurnRiskV1::new()));
@@ -93,7 +93,12 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding HTTP listener on {http_addr}"))?;
     info!(addr = %http_addr, "boss-ml-api listening");
-    let app = boss_core::machine_gate::mount(app, "ml", &["/api/ml/health"]);
+    let app = boss_core::machine_gate::mount(
+        app,
+        "ml",
+        &["/api/ml/health"],
+        Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }

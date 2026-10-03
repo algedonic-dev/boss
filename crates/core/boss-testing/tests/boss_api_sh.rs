@@ -25,8 +25,10 @@
 //!   * the default base URL is the one line in `infra/dev/sor-url`,
 //!     read from beside the script, so the system-of-record address is
 //!     spelled once in infra/dev (CLAUDE.md §9a);
-//!   * the machine token rides as `X-Boss-Machine-Token` only when its
-//!     file exists (the stub records the header NAME, never a value),
+//!   * the machine token rides as `X-Boss-Machine-Token` only when the
+//!     `current` slot of its mounted directory holds one — the directory
+//!     boss-core reads, not the FILE this door read until backlog
+//!     1876bbdb INFO-6 (the stub records the header NAME, never a value),
 //!     and in a 0600 header file handed over as `-H @file`, never in
 //!     curl's argv (backlog 5f3ad356, `infra/lib/secret-header.sh`);
 //!   * a bad method or a missing path is refused with exit 2 before
@@ -118,7 +120,7 @@ impl Fixture {
                  h=$a\n\
                  if [ \"$prev\" = -H ]; then case \"$a\" in @*) h=$(cat \"${a#@}\") ;; esac; fi\n\
                  case \"$h\" in\n\
-                     X-Boss-Machine-Token:*) echo 'X-Boss-Machine-Token: <present>' ;;\n\
+                     [Xx]-[Bb]oss-[Mm]achine-[Tt]oken:*) echo 'X-Boss-Machine-Token: <present>' ;;\n\
                      *) printf '%s\\n' \"$h\" ;;\n\
                  esac >> \"$STUB_ARGV\"\n\
                  prev=$a\n\
@@ -157,20 +159,26 @@ impl Fixture {
             .env("HOME", &self.home)
             .env("STUB_ARGV", &self.argv)
             .env_remove("BOSS_JOBS_URL")
-            // A token file that does not exist, so the pod's real
-            // /etc/boss/machine-token is never read by a test.
+            // A token directory that does not exist, so neither the
+            // pod's doors' copy (infra/dev/machine-token-dir) nor
+            // /etc/boss/machine-token is ever read by a test.
             .env(
-                "BOSS_MACHINE_TOKEN_FILE",
-                self.root.join("no-such-token-file"),
+                "BOSS_MACHINE_TOKEN_DIR",
+                self.root.join("no-such-token-dir"),
             )
             .env_remove("BOSS_ACTOR")
             .env_remove("BOSS_ACTOR_FILE")
+            // Nor the machine token's host list (backlog 2ee29275).
+            .env_remove("BOSS_MACHINE_TOKEN_HOSTS")
             // The port table comes from the tree's file unless a test
             // sets it — never from the caller's shell. Nor does the
             // named-service override leak in from the shell that ran
             // the suite.
             .env_remove("BOSS_SOR_PORTS")
             .env_remove("BOSS_SOR_SERVICE")
+            // Nor the read-only rows or their host (backlog 9a440539).
+            .env_remove("BOSS_SOR_READ_PORTS")
+            .env_remove("BOSS_SOR_READ_URL")
             // Nor the roll wait's window (backlog 034002b3).
             .env_remove("BOSS_SOR_WAIT_SECONDS")
             .env_remove("STUB_BODY")
@@ -230,7 +238,12 @@ fn the_script_is_in_the_tree_and_executable() {
     );
     assert!(
         !text.contains("cat /etc/boss/machine-token"),
-        "the token path is a default behind BOSS_MACHINE_TOKEN_FILE, not a literal read"
+        "the token is read through infra/lib's machine_token_header, not a literal read"
+    );
+    assert!(
+        !text.contains("BOSS_MACHINE_TOKEN_FILE"),
+        "the token is the `current` slot of BOSS_MACHINE_TOKEN_DIR, the directory boss-core \
+         reads — never a FILE (backlog 1876bbdb, INFO-6)"
     );
 }
 
@@ -569,23 +582,25 @@ fn the_default_url_is_the_one_line_in_sor_url() {
     );
 }
 
-/// The machine token rides only when its file exists, and the file's
-/// location is a default behind `BOSS_MACHINE_TOKEN_FILE`. The stub
-/// records the header's presence, not its value.
+/// The machine token rides only when the `current` slot of its directory
+/// holds one, and the directory is `BOSS_MACHINE_TOKEN_DIR` — the name
+/// boss-core reads (backlog 1876bbdb, INFO-6). The stub records the
+/// header's presence, not its value.
 #[test]
 fn the_machine_token_header_rides_only_when_its_file_exists() {
     let f = Fixture::new("token");
     let token_file = f.root.join("machine-token");
-    write_file(&token_file, "stub-token-for-the-test\n");
+    create_dir(&token_file);
+    write_file(&token_file.join("current"), "stub-token-for-the-test\n");
 
     let r = f.run(
         &["GET", "/api/jobs"],
         &[
-            (
-                "BOSS_MACHINE_TOKEN_FILE",
-                token_file.to_str().expect("utf8"),
-            ),
+            ("BOSS_MACHINE_TOKEN_DIR", token_file.to_str().expect("utf8")),
             ("BOSS_ACTOR", "emp-reader"),
+            // The fixture's record is `sor.test`: listed, as the
+            // estate's own record host is (backlog 2ee29275).
+            ("BOSS_MACHINE_TOKEN_HOSTS", "sor.test"),
         ],
     );
     assert_eq!(r.code, 0, "{}", r.stderr);
@@ -610,6 +625,382 @@ fn the_machine_token_header_rides_only_when_its_file_exists() {
             .any(|w| w[0] == "-H" && w[1].starts_with('@')),
         "the token header is handed over as -H @<file>:\n{raw}"
     );
+}
+
+/// THE OLD FILE LAYOUT sends nothing, and says so (backlog 1876bbdb,
+/// INFO-6). This door read `/etc/boss/machine-token` as a FILE while
+/// boss-core reads it as a DIRECTORY holding `current`; the day car 4
+/// mounted the directory, every door write would have gone out
+/// unstamped in silence. A file where the directory belongs is now named
+/// on stderr, and the call still goes out — a gate in `report` admits it.
+#[test]
+fn a_token_file_where_the_directory_belongs_is_said_and_not_sent() {
+    let f = Fixture::new("token-old-layout");
+    let token_file = f.root.join("machine-token");
+    write_file(&token_file, "stub-token-for-the-test\n");
+    let r = f.run(
+        &["GET", "/api/jobs"],
+        &[
+            ("BOSS_MACHINE_TOKEN_DIR", token_file.to_str().expect("utf8")),
+            ("BOSS_ACTOR", "emp-reader"),
+            ("BOSS_MACHINE_TOKEN_HOSTS", "sor.test"),
+        ],
+    );
+    assert_eq!(r.code, 0, "the call still goes out: {}", r.stderr);
+    assert!(f.header("X-Boss-Machine-Token").is_none(), "{}", r.stderr);
+    assert!(
+        r.stderr.contains("not a directory"),
+        "the wrong layout is named: {}",
+        r.stderr
+    );
+    assert!(!r.stderr.contains("stub-token-for-the-test"));
+}
+
+/// THE DOORS' COPY LIVES OFF THE DEFAULT PATH (backlog 1876bbdb, INFO-5).
+/// The broker copies the live token into boss-dev, and the dev pod is
+/// where builders run handler tests: mounted at boss-core's default
+/// `/etc/boss/machine-token`, every stamping client a test built —
+/// `common::api_client()` among them, which the name-scan pin cannot see
+/// — would stamp the live token onto a loopback mock, and a failing test
+/// that prints its request would put it in a transcript. So the pod
+/// mounts it at the one directory `infra/dev/machine-token-dir` names,
+/// and only the doors read that file: with `BOSS_MACHINE_TOKEN_DIR`
+/// unset, this door takes its line, never the core default.
+#[test]
+fn unnamed_the_door_reads_the_directory_its_machine_token_dir_names() {
+    const DIR_FILE: &str = "infra/dev/machine-token-dir";
+    let named = std::fs::read_to_string(repo_root().join(DIR_FILE)).expect("machine-token-dir");
+    let named = named.trim();
+    assert!(named.starts_with('/'), "{DIR_FILE}: an absolute path");
+    assert_ne!(
+        named,
+        boss_core::machine_token::DEFAULT_TOKEN_DIR,
+        "{DIR_FILE} must not be boss-core's default, which every test process reads"
+    );
+
+    let f = Fixture::new("token-door-default");
+    let dev = f.root.join("tree/infra/dev");
+    create_dir(&dev);
+    let script_text = std::fs::read_to_string(repo_root().join(SCRIPT)).expect("read boss-api");
+    write_exec(&dev.join("boss-api"), &script_text);
+    write_file(&dev.join("sor-url"), "http://lone.test:7900\n");
+    lay_roll_lib_beside(&dev);
+    write_file(
+        &f.root.join("tree/infra/lib/secret-header.sh"),
+        &std::fs::read_to_string(repo_root().join("infra/lib/secret-header.sh")).expect("lib"),
+    );
+    let mount = f.root.join("doors-mount");
+    create_dir(&mount);
+    write_file(&mount.join("current"), "stub-token-for-the-test\n");
+    write_file(
+        &dev.join("machine-token-dir"),
+        &format!("{}\n", mount.display()),
+    );
+    let mut cmd = f.command(&dev.join("boss-api"));
+    cmd.env_remove("BOSS_MACHINE_TOKEN_DIR");
+    let r = Fixture::finish(cmd, &["GET", "/api/jobs"], &[("BOSS_ACTOR", "agent-x")]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(
+        f.header("X-Boss-Machine-Token").as_deref(),
+        Some("<present>"),
+        "the door read the directory beside it names: {}",
+        r.stderr
+    );
+}
+
+/// The door stamps the machine token only on the estate's own hosts —
+/// the rule boss-core's clients take (backlog 2ee29275, F1): loopback,
+/// and the hosts and `.namespace` suffixes `BOSS_MACHINE_TOKEN_HOSTS`
+/// lists. A base the operator pointed elsewhere
+/// (`BOSS_JOBS_URL=https://boss.algedonic.dev`, the edge that 302s to
+/// Access; another instance's namespace) goes out unstamped with one
+/// line on stderr naming the scheme and host, never the path or query.
+/// The rule lives twice — here in shell, in `machine_token::Hosts` in
+/// Rust — so every case is held to what boss-core answers for the same
+/// host (CLAUDE.md §9a), including the `?`/`#`-before-`@` shapes the
+/// review of 54d9a23a (MEDIUM-2) showed the shell reading as loopback
+/// while curl and Rust both read the host before them.
+#[test]
+fn the_machine_token_rides_only_to_an_estate_host_the_way_boss_core_decides() {
+    const PATH: &str = "/api/jobs?state=q-secret";
+    let f = Fixture::new("token-hosts");
+    let token_file = f.root.join("machine-token");
+    create_dir(&token_file);
+    write_file(&token_file.join("current"), "stub-token-for-the-test\n");
+    let token = token_file.to_str().expect("utf8");
+    let list = "record.example.net, 192.0.2.34";
+    let prod = ".boss.svc.cluster.local";
+    for (base, listed) in [
+        ("http://127.0.0.1:7900", ""),
+        ("http://localhost:7900", ""),
+        ("http://[::1]:7900", ""),
+        ("http://boss-jobs-internal.boss.svc.cluster.local:7900", ""),
+        (
+            "http://boss-jobs-internal.boss.svc.cluster.local:7900",
+            prod,
+        ),
+        ("http://BOSS-JOBS.boss.svc.cluster.local.:7900", prod),
+        // Another instance's namespace: prod's token never reaches it.
+        (
+            "http://boss-jobs-internal.boss-playground.svc.cluster.local:7900",
+            prod,
+        ),
+        (
+            "http://boss-gateway.boss-playground.svc.cluster.local",
+            prod,
+        ),
+        ("http://boss.svc.cluster.local", prod),
+        ("http://192.0.2.34:7900", list),
+        ("http://Record.Example.Net", list),
+        ("http://192.0.2.34:7900", ""),
+        ("https://boss.algedonic.dev", list),
+        ("http://127.foo.example:7900", ""),
+        ("http://svc.cluster.local.example.com", prod),
+        ("http://operator@198.51.100.7:7900", list),
+        // MEDIUM-2: a `?` or `#` before an `@` ends the authority.
+        ("http://evil.com#@127.0.0.1", ""),
+        ("http://evil.com?@127.0.0.1:7900", ""),
+        (
+            "http://evil.com?x=@boss-jobs-internal.boss.svc.cluster.local",
+            prod,
+        ),
+        // Delta review of ddfa1032 (N1): a dotted quad is loopback only
+        // when every octet is 0-255. Url::parse refuses 127.0.0.999, and
+        // curl hands it to DNS and the search list.
+        ("http://127.0.0.999:7900", ""),
+        ("http://127.0.0.256:7900", ""),
+        ("http://127.1000.0.1:7900", ""),
+        ("http://127.255.255.255:7900", ""),
+        ("http://127.0.0.1.evil.example:7900", ""),
+    ] {
+        f.clear_argv();
+        let r = f.run(
+            &["GET", PATH],
+            &[
+                ("BOSS_JOBS_URL", base),
+                ("BOSS_MACHINE_TOKEN_DIR", token),
+                ("BOSS_MACHINE_TOKEN_HOSTS", listed),
+                ("BOSS_ACTOR", "emp-reader"),
+                // A port table would move the jobs path nowhere, but a
+                // copy with none keeps the case to the host alone.
+                ("BOSS_SOR_PORTS", "jobs=7900"),
+            ],
+        );
+        assert_eq!(r.code, 0, "{base}: {}", r.stderr);
+        // Held to the URL curl is SENT, base and path together — the
+        // door once judged the base alone (delta review of ddfa1032, B1).
+        let rust =
+            boss_core::machine_token::Hosts::parse(listed).allows_url(&format!("{base}{PATH}"));
+        let door = f.header("X-Boss-Machine-Token").is_some();
+        assert_eq!(
+            door, rust,
+            "{base} (list {listed:?}): the door stamped={door}, boss-core allows={rust}"
+        );
+        if door {
+            assert!(
+                !r.stderr.contains("withheld"),
+                "{base}: a stamped call says nothing: {}",
+                r.stderr
+            );
+        } else {
+            let scheme = base.split("://").next().unwrap();
+            assert!(
+                r.stderr.contains("machine token withheld")
+                    && r.stderr.contains(&format!("{scheme}://")),
+                "{base}: an unstamped call says so, naming the scheme: {}",
+                r.stderr
+            );
+            assert!(
+                !r.stderr.contains("q-secret") && !r.stderr.contains("/api/jobs"),
+                "{base}: never the path or the query: {}",
+                r.stderr
+            );
+            assert!(
+                !r.stderr.contains("operator@"),
+                "{base}: never the userinfo: {}",
+                r.stderr
+            );
+        }
+    }
+}
+
+/// The door judged the host of the BASE, and curl is sent BASE+PATH, so
+/// a path that does not start with `/` continued the authority:
+/// `boss-api GET '@evil.invalid/api/jobs'` against a loopback base sent
+/// the token on a URL whose base became the userinfo of evil.invalid,
+/// which curl and Url::parse both send to evil.invalid (delta review of
+/// ddfa1032, B1). Every real path starts with `/`, so anything else is
+/// usage — refused before curl and before the token is looked at.
+#[test]
+fn a_path_that_does_not_start_with_a_slash_is_refused_before_curl_and_the_token() {
+    let f = Fixture::new("token-path");
+    let token_file = f.root.join("machine-token");
+    create_dir(&token_file);
+    write_file(&token_file.join("current"), "stub-token-for-the-test\n");
+    let token = token_file.to_str().expect("utf8");
+    let sor = std::fs::read_to_string(repo_root().join(SOR_URL_FILE)).expect("sor-url");
+    let sor = sor.trim();
+    for (base, listed) in [
+        ("http://127.0.0.1:7900", ""),
+        (sor, ".boss.svc.cluster.local"),
+    ] {
+        for path in ["@evil.invalid/x", ":1@evil.invalid/x", "api/jobs"] {
+            f.clear_argv();
+            let r = f.run(
+                &["GET", path],
+                &[
+                    ("BOSS_JOBS_URL", base),
+                    ("BOSS_MACHINE_TOKEN_DIR", token),
+                    ("BOSS_MACHINE_TOKEN_HOSTS", listed),
+                    ("BOSS_ACTOR", "emp-reader"),
+                    ("BOSS_SOR_PORTS", "jobs=7900"),
+                ],
+            );
+            assert_eq!(r.code, 2, "{base} + {path}: usage, {}", r.stderr);
+            assert!(r.stderr.contains("usage:"), "{base} + {path}: {}", r.stderr);
+            assert!(
+                f.curl_argv().is_empty(),
+                "{base} + {path}: curl must not run"
+            );
+            assert!(
+                !r.stderr.contains("withheld"),
+                "{base} + {path}: refused before the token decision: {}",
+                r.stderr
+            );
+        }
+        // What the refusal prevents: boss-core, reading the URL curl
+        // would have been sent, withholds the token from both.
+        let hosts = boss_core::machine_token::Hosts::parse(listed);
+        for path in ["@evil.invalid/x", ":1@evil.invalid/x"] {
+            assert!(
+                !hosts.allows_url(&format!("{base}{path}")),
+                "{base}{path} is not an estate host"
+            );
+        }
+    }
+}
+
+/// Where the door and boss-core still answer differently, named one by
+/// one with why each is harmless (delta review of ddfa1032, N2), so
+/// "held equal case by case" stays true of everything not listed here.
+/// Each row asserts BOTH answers as they stand: a row where the two
+/// have come to agree fails, and belongs in the equality test instead.
+#[test]
+fn the_door_and_boss_core_disagree_only_where_it_is_named_and_harmless() {
+    const PATH: &str = "/api/jobs";
+    let f = Fixture::new("token-exceptions");
+    let token_file = f.root.join("machine-token");
+    create_dir(&token_file);
+    write_file(&token_file.join("current"), "stub-token-for-the-test\n");
+    let token = token_file.to_str().expect("utf8");
+    // (base, door stamps, boss-core stamps, why it is harmless)
+    for (base, door_stamps, core_stamps, why) in [
+        (
+            "http://evil.com\\@127.0.0.1:7900",
+            true,
+            false,
+            "WHATWG reads the backslash as a path separator (host evil.com); curl connects to 127.0.0.1, so the token goes to loopback",
+        ),
+        (
+            "http://[0:0:0:0:0:0:0:1]:7900",
+            false,
+            true,
+            "the door knows ::1 only as spelled; withholding costs a stamp, never a leak",
+        ),
+        (
+            "http://localhost..:7900",
+            false,
+            true,
+            "the door drops one trailing dot, boss-core every one; withholding fails closed",
+        ),
+        (
+            "http://%31%32%37.0.0.1:7900",
+            false,
+            true,
+            "Url::parse percent-decodes the host to 127.0.0.1; the door does not decode, and fails closed",
+        ),
+        (
+            "http://127.1:7900",
+            false,
+            true,
+            "Url::parse expands the short IPv4 form to 127.0.0.1; the door takes only a full dotted quad, and fails closed",
+        ),
+    ] {
+        f.clear_argv();
+        let r = f.run(
+            &["GET", PATH],
+            &[
+                ("BOSS_JOBS_URL", base),
+                ("BOSS_MACHINE_TOKEN_DIR", token),
+                ("BOSS_MACHINE_TOKEN_HOSTS", ""),
+                ("BOSS_ACTOR", "emp-reader"),
+                ("BOSS_SOR_PORTS", "jobs=7900"),
+            ],
+        );
+        assert_eq!(r.code, 0, "{base}: {}", r.stderr);
+        let door = f.header("X-Boss-Machine-Token").is_some();
+        let core = boss_core::machine_token::Hosts::parse("").allows_url(&format!("{base}{PATH}"));
+        assert_eq!(door, door_stamps, "{base}: the door stamped={door} ({why})");
+        assert_eq!(core, core_stamps, "{base}: boss-core allows={core} ({why})");
+        assert_ne!(
+            door, core,
+            "{base}: the two now agree — move it to the equality test"
+        );
+    }
+}
+
+/// On the dev pod nothing sets `BOSS_MACHINE_TOKEN_HOSTS`, and the pod's
+/// record is `infra/dev/sor-url` — a Service name, which is no longer
+/// allowed by default (review of 54d9a23a, MEDIUM-1). So an UNSET list
+/// is the host of that file's line: the door's own record is stamped,
+/// and another namespace is not. Set (even empty), the variable wins.
+#[test]
+fn an_unset_list_is_the_host_of_the_doors_own_sor_url() {
+    let f = Fixture::new("token-hosts-default");
+    let token_file = f.root.join("machine-token");
+    create_dir(&token_file);
+    write_file(&token_file.join("current"), "stub-token-for-the-test\n");
+    let token = token_file.to_str().expect("utf8");
+    let sor = std::fs::read_to_string(repo_root().join(SOR_URL_FILE)).expect("sor-url");
+    let sor = sor.trim();
+    let playground = sor.replace(".boss.svc.", ".boss-playground.svc.");
+    assert_ne!(
+        playground, sor,
+        "the pod's record is a Service in namespace boss: {sor}"
+    );
+    for (base, want) in [(sor, true), (playground.as_str(), false)] {
+        f.clear_argv();
+        let r = f.run(
+            &["GET", "/api/jobs"],
+            &[
+                ("BOSS_JOBS_URL", base),
+                ("BOSS_MACHINE_TOKEN_DIR", token),
+                ("BOSS_ACTOR", "emp-reader"),
+                ("BOSS_SOR_PORTS", "jobs=7900"),
+            ],
+        );
+        assert_eq!(r.code, 0, "{base}: {}", r.stderr);
+        assert_eq!(
+            f.header("X-Boss-Machine-Token").is_some(),
+            want,
+            "{base}: stamped should be {want}: {}",
+            r.stderr
+        );
+    }
+    // Set and empty is a list: loopback only, the record withheld.
+    f.clear_argv();
+    let r = f.run(
+        &["GET", "/api/jobs"],
+        &[
+            ("BOSS_JOBS_URL", sor),
+            ("BOSS_MACHINE_TOKEN_DIR", token),
+            ("BOSS_MACHINE_TOKEN_HOSTS", ""),
+            ("BOSS_ACTOR", "emp-reader"),
+            ("BOSS_SOR_PORTS", "jobs=7900"),
+        ],
+    );
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(f.header("X-Boss-Machine-Token").is_none(), "{}", r.stderr);
 }
 
 /// Refusals happen before curl: a method outside the five, or a
@@ -896,6 +1287,176 @@ fn a_named_service_the_table_cannot_place_is_refused_before_curl() {
         "the refusal names the service and where a table comes from: {}",
         r.stderr
     );
+}
+
+// =====================================================================
+// THE READ-ONLY ROWS (backlog 9a440539, 2026-10-01). Measured twice that
+// day: `BOSS_SOR_SERVICE=assets` was refused (no assets row), and
+// `GET /api/customers` answered 404 on the jobs port — so a read-only
+// production count before a customer-data migration could not be made
+// through any door, and the car carrying the migration sat HELD. Every
+// boss-ports service the LAN door does not carry is now a row of
+// infra/dev/sor-read-ports.env, read on the in-cluster read Service
+// named by infra/dev/sor-read-url — GET only.
+// =====================================================================
+
+/// The host the tree's read rows are read on: the one line of
+/// infra/dev/sor-read-url.
+fn tree_read_url() -> String {
+    std::fs::read_to_string(repo_root().join("infra/dev/sor-read-url"))
+        .expect("infra/dev/sor-read-url is readable")
+        .trim()
+        .to_string()
+}
+
+/// The two measured reads now leave: the customers path by its prefix,
+/// the assets service by its name — each on the read Service's host at
+/// boss-ports' port, with the query string and the actor intact. The
+/// LAN rows are untouched: an accounts path still leaves on the base.
+#[test]
+fn a_read_of_a_module_service_leaves_on_the_read_door_at_its_port() {
+    let f = Fixture::new("route-read-only");
+    let read = tree_read_url();
+
+    let r = f.run(
+        &["GET", "/api/customers?limit=1"],
+        &[("BOSS_ACTOR", "agent-x")],
+    );
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(
+        f.curl_argv().last().map(String::as_str),
+        Some(
+            format!(
+                "{read}:{}/api/customers?limit=1",
+                boss_ports::prod("customers")
+            )
+            .as_str()
+        ),
+        "the customers path is read on the read door at the customers port"
+    );
+    assert!(
+        f.header("X-Boss-User")
+            .is_some_and(|u| u.contains(r#""id":"agent-x""#)),
+        "the read is still signed"
+    );
+
+    let r = f.run(
+        &["GET", "/api/assets/health"],
+        &[("BOSS_ACTOR", "agent-x"), ("BOSS_SOR_SERVICE", "assets")],
+    );
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(
+        f.curl_argv().last().map(String::as_str),
+        Some(format!("{read}:{}/api/assets/health", boss_ports::prod("assets")).as_str()),
+        "BOSS_SOR_SERVICE=assets is placed, not refused"
+    );
+
+    let r = f.run(
+        &["GET", "/api/people/accounts"],
+        &[("BOSS_ACTOR", "agent-x")],
+    );
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(
+        f.curl_argv().last().map(String::as_str),
+        Some(
+            format!(
+                "http://sor.test:{}/api/people/accounts",
+                boss_ports::prod("accounts")
+            )
+            .as_str()
+        ),
+        "a LAN row stays on the system of record's host"
+    );
+
+    // The overrides are the tables, as BOSS_SOR_PORTS is for the LAN rows.
+    let r = f.run(
+        &["GET", "/api/customers"],
+        &[
+            ("BOSS_ACTOR", "agent-x"),
+            ("BOSS_SOR_READ_PORTS", "customers=9855"),
+            ("BOSS_SOR_READ_URL", "http://read.test"),
+        ],
+    );
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(
+        f.curl_argv().last().map(String::as_str),
+        Some("http://read.test:9855/api/customers")
+    );
+}
+
+/// THE READ DOOR IS STAMPED (review 1d893c98 B1). Every service behind
+/// boss-read-internal mounts the machine gate, and in report mode an
+/// unstamped read is tallied as a miss against the window enforcement
+/// must earn. So a read-row GET on the host ./sor-read-url names carries
+/// the token, while one aimed elsewhere by BOSS_SOR_READ_URL does not —
+/// the rule a BOSS_JOBS_URL override already lives under.
+#[test]
+fn a_read_row_is_stamped_on_the_read_doors_host_and_not_on_an_override() {
+    let f = Fixture::new("route-read-only-token");
+    let token_dir = f.root.join("machine-token");
+    create_dir(&token_dir);
+    write_file(&token_dir.join("current"), "stub-token-for-the-test\n");
+    let token = token_dir.to_str().expect("utf8");
+    let read = tree_read_url();
+
+    for (override_url, want) in [(None, true), (Some("http://read.test"), false)] {
+        f.clear_argv();
+        let mut env = vec![("BOSS_ACTOR", "agent-x"), ("BOSS_MACHINE_TOKEN_DIR", token)];
+        if let Some(u) = override_url {
+            env.push(("BOSS_SOR_READ_URL", u));
+        }
+        let r = f.run(&["GET", "/api/customers?limit=1"], &env);
+        assert_eq!(r.code, 0, "{override_url:?}: {}", r.stderr);
+        let host = override_url.unwrap_or(&read);
+        assert_eq!(
+            f.curl_argv().last().map(String::as_str),
+            Some(
+                format!(
+                    "{host}:{}/api/customers?limit=1",
+                    boss_ports::prod("customers")
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            f.header("X-Boss-Machine-Token").is_some(),
+            want,
+            "{host}: stamped should be {want}: {}",
+            r.stderr
+        );
+    }
+}
+
+/// READS ONLY. The operator's bound on this change: a read-only row
+/// does not widen what a WRITE may reach. Every write method to one is
+/// refused with exit 2 before curl, saying why and where a write row is
+/// decided — by path and by name alike.
+#[test]
+fn a_write_to_a_read_only_row_is_refused_before_curl() {
+    let f = Fixture::new("route-read-only-write");
+    let body = f.root.join("customer.json");
+    write_file(&body, r#"{"email":"x@example.test"}"#);
+    let body = body.to_str().expect("utf8");
+    for method in ["POST", "PUT", "PATCH", "DELETE"] {
+        for (path, named) in [("/api/customers/c-1", ""), ("/api/assets/a-1", "assets")] {
+            f.clear_argv();
+            let r = f.run(
+                &[method, path, body],
+                &[("BOSS_ACTOR", "agent-x"), ("BOSS_SOR_SERVICE", named)],
+            );
+            assert_eq!(r.code, 2, "{method} {path}: {}", r.stderr);
+            assert!(
+                f.curl_argv().is_empty(),
+                "{method} {path}: curl must not run"
+            );
+            assert!(
+                r.stderr.contains("READS only") && r.stderr.contains("sor-ports.env"),
+                "{method} {path}: the refusal says reads only and where a write row is decided: {}",
+                r.stderr
+            );
+            assert!(!r.stderr.contains("HTTP:"), "no request: {}", r.stderr);
+        }
+    }
 }
 
 /// NO TABLE, NO ROUTING. A copy of the script with sor-url beside it

@@ -1554,6 +1554,10 @@ pub const EDGE_HOLD_WAITING: &str = "waiting";
 /// The edge can never be satisfied as declared — a person must act.
 pub const EDGE_HOLD_NEEDS_HUMAN: &str = "needs_human";
 
+/// How a hold names a predecessor outside the reader's policy scope
+/// ([`Predecessor::Unscoped`]) — the whole of what it says about it.
+pub const UNSCOPED_PREDECESSOR: &str = "a predecessor outside this caller's policy scope";
+
 /// What a reader managed to learn about a car's declared predecessor.
 /// `Unreadable` is a first-class answer, not an error: "I could not ask"
 /// must be distinguishable from "it is not there".
@@ -1563,6 +1567,13 @@ pub enum Predecessor {
     /// judged by this file's own predicates so no reader can disagree with
     /// the rest of the system about what "landed" means.
     Found(Value),
+    /// The Job came back, but outside the READER's policy scope (backlog
+    /// 0964ba80) — a narrowed caller's own car declaring another owner's
+    /// car as its predecessor. It is judged by the same predicates, so
+    /// the dock still says the car cannot board, but the refusal names
+    /// nothing about it: no branch, no title, no state. The conductor
+    /// reads at full scope and never builds one.
+    Unscoped(Value),
     /// The jobs API answered that there is no such Job.
     Absent,
     /// The read itself failed — a blip, an outage, a malformed body.
@@ -1700,7 +1711,21 @@ pub fn boards_after_outcome(declared: &str, pred: &Predecessor) -> EdgeOutcome {
             kind: EDGE_HOLD_NEEDS_HUMAN,
             behind: predecessor_name(declared, None),
         }),
-        Predecessor::Found(p) if is_landed(p) => EdgeOutcome::Board,
+        Predecessor::Found(p) | Predecessor::Unscoped(p) if is_landed(p) => EdgeOutcome::Board,
+        // OUTSIDE THE READER'S SCOPE (backlog 0964ba80): that it holds
+        // the car, and nothing else. In flight or abandoned is the
+        // predecessor's state, so both are one hold of one kind here —
+        // the waiting kind, which claims no person must act — and the
+        // full scope, which the conductor and the operator read at, sees
+        // which.
+        Predecessor::Unscoped(_) => EdgeOutcome::Hold(EdgeHold {
+            reason: format!(
+                "boards after {UNSCOPED_PREDECESSOR}, which holds it — what that car is and \
+                 where it stands are not read for this caller's scope"
+            ),
+            kind: EDGE_HOLD_WAITING,
+            behind: UNSCOPED_PREDECESSOR.to_string(),
+        }),
         Predecessor::Found(p) if is_open(p) => EdgeOutcome::Hold(EdgeHold {
             reason: format!(
                 "boards after {}, which is STILL IN FLIGHT ({}) — no action needed; this \
@@ -3389,8 +3414,8 @@ mod waits_on_tests {
 #[cfg(test)]
 mod boards_after_tests {
     use super::{
-        EDGE_HOLD_NEEDS_HUMAN, EDGE_HOLD_WAITING, EdgeOutcome, Predecessor, boards_after_of,
-        boards_after_outcome, declared_predecessor,
+        EDGE_HOLD_NEEDS_HUMAN, EDGE_HOLD_WAITING, EdgeOutcome, Predecessor, UNSCOPED_PREDECESSOR,
+        boards_after_of, boards_after_outcome, declared_predecessor,
     };
     use serde_json::{Value, json};
 
@@ -3552,6 +3577,55 @@ mod boards_after_tests {
             "fix the reference, do not break the edge: {r}"
         );
         assert!(r.contains("ref-checked"), "say why this is surprising: {r}");
+    }
+
+    /// A PREDECESSOR OUTSIDE THE READER'S SCOPE (backlog 0964ba80) is
+    /// judged like any other — landed boards, anything else holds — but
+    /// in flight and abandoned read IDENTICALLY, and neither names the
+    /// branch, the id or where it stands: telling them apart would hand
+    /// the reader the state its scope does not read.
+    #[test]
+    fn a_predecessor_outside_the_scope_holds_without_being_described() {
+        let landed = boards_after_outcome(
+            PRED,
+            &Predecessor::Unscoped(pred("closed", json!({"outcome": "merged"}), json!([]))),
+        );
+        assert_eq!(landed, EdgeOutcome::Board);
+        let in_flight = boards_after_outcome(
+            PRED,
+            &Predecessor::Unscoped(pred("open", json!({}), review("ready"))),
+        );
+        let abandoned = boards_after_outcome(
+            PRED,
+            &Predecessor::Unscoped(pred("closed", json!({"outcome": "abandoned"}), json!([]))),
+        );
+        assert_eq!(in_flight, abandoned, "the two states read alike");
+        let EdgeOutcome::Hold(h) = in_flight else {
+            panic!("an unlanded predecessor holds the car: {in_flight:?}");
+        };
+        assert_eq!(h.kind, EDGE_HOLD_WAITING);
+        assert_eq!(h.behind, UNSCOPED_PREDECESSOR);
+        for leak in [
+            "fix/the-predecessor",
+            &PRED[..8],
+            "IN FLIGHT",
+            "ABANDONED",
+            "parked",
+        ] {
+            assert!(!h.reason.contains(leak), "{leak} in: {}", h.reason);
+        }
+        assert!(
+            h.reason.contains("outside this caller's policy scope"),
+            "{}",
+            h.reason
+        );
+
+        // The control: the same packet read IN scope is described.
+        let named = hold_reason(
+            PRED,
+            &Predecessor::Found(pred("open", json!({}), review("ready"))),
+        );
+        assert!(named.contains("fix/the-predecessor"), "{named}");
     }
 
     /// THE ASSERTION THE FEATURE IS TRUSTED ON: no two of the four read

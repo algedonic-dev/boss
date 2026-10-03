@@ -84,7 +84,26 @@ case "$method" in
         mv "$store.new" "$store"
         jq -c --arg id "$id" '.[] | select(.id == $id)' "$store"
         ;;
+    PATCH)
+        # The step merge door: top-level keys merge, a null deletes.
+        case "$path" in
+            /api/jobs/*/steps/*/metadata)
+                jid=$(printf '%s' "$path" | sed -n 's#^/api/jobs/\([^/]*\)/steps/.*#\1#p')
+                jq -c --arg j "$jid" --argjson p "$data" \
+                    'map(if .id == $j then .steps[0].metadata = ((.steps[0].metadata // {}) + $p | with_entries(select(.value != null))) else . end)' \
+                    "$store" > "$store.new"
+                mv "$store.new" "$store"
+                ;;
+        esac
+        ;;
     PUT)
+        # The step PUT carries the status alone (backlog e39a9d2a,
+        # design 93d2bddb): a metadata body is refused, as the server's
+        # end state refuses it, so a script still sending one fails here.
+        if printf '%s' "$data" | jq -e 'has("metadata")' >/dev/null; then
+            echo 'stub: 409 a step PUT carries no metadata body — PATCH .../steps/{id}/metadata' >&2
+            exit 22
+        fi
         jid=$(printf '%s' "$path" | sed -n 's#^/api/jobs/\([^/]*\)/steps/.*#\1#p')
         jq -c --arg j "$jid" --argjson p "$data" \
             'map(if .id == $j then .steps[0] += $p | .status = "closed" else . end)' \

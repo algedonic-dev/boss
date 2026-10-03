@@ -211,45 +211,26 @@ async fn door(app: &Router, method: &str) -> RepairReport {
 fn job(id: &str) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
-        kind: "ad-hoc".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "bosspipeline"),
-        title: "a step whose log lost its plugin version".into(),
-        owner_id: "emp-cto".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "ad-hoc",
+            Subject::new("custom", "bosspipeline"),
+            "a step whose log lost its plugin version",
+            "emp-cto",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
+        )
     }
 }
 
 fn step(id: &str, job_id: JobId, slug: &str) -> Step {
     Step {
         id: StepId::from_uuid(Uuid::parse_str(id).unwrap()),
-        job_id,
-        kind: SERVED.into(),
-        title: slug.into(),
         spec_slug: Some(slug.into()),
-        assignee_id: None,
         status: StepStatus::Pending,
-        sort_order: 7,
-        blocked_by: vec![],
-        sign_offs_required: Vec::new(),
-        assurance_required: None,
-        sign_offs: Vec::new(),
-        fields: Vec::new(),
-        completed_on: None,
-        completed_by: None,
-        completed_at: None,
         metadata: serde_json::json!({ "question": slug }),
-        notes: None,
-        step_plugin_version: 0,
-        embedded_job: None,
+        ..Step::new(job_id, SERVED, slug, 7)
     }
 }
 

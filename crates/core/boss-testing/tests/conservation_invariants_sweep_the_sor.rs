@@ -392,7 +392,10 @@ fn the_cronjob_is_the_audit_integrity_chores_shape_on_every_instance() {
         "- name: BOSS_JOBS_URL\n                  value: http://boss-jobs-internal.boss.svc.cluster.local:7900",
         "- name: LEDGER_BASE\n                  value: http://boss-jobs-internal.boss.svc.cluster.local:7080",
         "- name: BOSS_TENANT_DIR\n                  value: /opt/boss/tenant",
-        "- name: BOSS_MACHINE_TOKEN\n                  valueFrom:\n                    secretKeyRef:\n                      name: boss-secrets\n                      key: machine-token",
+        // The estate machine token is the mounted Secret's directory,
+        // not an env var (design 6805c764 car 4; the roster and its shape
+        // are pinned by the_machine_gate_reports_and_refuses_nothing.rs).
+        "- {name: machine-token, mountPath: /etc/boss/machine-token, readOnly: true}",
     ] {
         assert!(yaml.contains(env), "{MANIFEST} carries:\n{env}");
     }

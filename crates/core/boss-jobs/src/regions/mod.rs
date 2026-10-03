@@ -74,6 +74,7 @@ mod marshalling;
 mod partition;
 mod publish;
 mod receiving;
+pub(crate) mod sensors;
 mod shed;
 mod shop_floor;
 mod stale_proof;
@@ -123,15 +124,17 @@ pub use self::stuck::{THIRDS, ThirdStuck, stuck};
 pub use self::track::{TRAIN_GATE_FALLBACK, TRAIN_GATE_WAIT_REASON, train_gate_troubled};
 use self::track::{track, train_findings};
 
-/// The ten regions, in map order. The count and the order are the
-/// decision (0524fc95 Q2); a reader that finds an eleventh name has an
+/// The regions, in map order. The count and the order are the
+/// decision (0524fc95 Q2); a reader that finds another name has an
 /// older or newer server than it expects. `shop-floor` is the ninth
 /// (backlog 94c6ffd0): the region UPSTREAM of the dock, where a car is
 /// still being built. `publish` is the tenth (design cb38d806, backlog
 /// eee42416): the crossing OUT of the world, where what landed on main
 /// is proposed to the public GitHub mirror. Both were appended rather
 /// than inserted, so the names a client already knows keep their place.
-pub const REGIONS: [&str; 10] = [
+/// Sensors follows approved design eb008249 D1-D3; its telemetry port
+/// is independent of the packet counts and is unread until wired.
+pub const REGIONS: [&str; 11] = [
     "dock",
     "gates",
     "track",
@@ -142,6 +145,7 @@ pub const REGIONS: [&str; 10] = [
     "marshalling",
     "shop-floor",
     "publish",
+    "sensors",
 ];
 
 /// The trend window when the caller names none: a day, the shortest
@@ -307,6 +311,12 @@ pub enum MachineState {
     Failed,
     /// Nothing in the record says which. Drawn distinctly from idle.
     Unknown,
+    /// The record that would say is WITHHELD from this caller by policy
+    /// scope (backlog 1805bac0). Not trouble and not unknown: the policy
+    /// working. Until then such a machine arrived as `Unknown` beside a
+    /// "withheld:" reason, and the HUD's summary counted it among the
+    /// failed-or-unknown — a refusal drawn as a finding.
+    Withheld,
 }
 
 /// One machine standing in a region.
@@ -638,6 +648,7 @@ pub fn regions(inputs: &RegionInputs<'_>) -> Regions {
         marshalling(inputs, &w),
         shop_floor(inputs, &w, &out("shop-floor")),
         publish(inputs, &w),
+        sensors::unread(inputs.now, "sensor registry and readings could not be read"),
     ]
     .into_iter()
     .map(|r| {
@@ -703,6 +714,11 @@ mod tests {
         let names: Vec<&str> = out.regions.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, REGIONS);
         for r in &out.regions {
+            if r.name == "sensors" {
+                assert_eq!(r.state, RegionState::Troubled);
+                assert_eq!(r.count, None);
+                continue;
+            }
             assert_eq!(r.state, RegionState::Clear, "{}: {}", r.name, r.why);
             assert_eq!(r.count, Some(0), "{}", r.name);
         }

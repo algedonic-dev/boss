@@ -207,7 +207,7 @@ impl CalendarClient for PgCalendar {
                AND resource_id = $2
                AND start_ts < $4
                AND end_ts > $3
-             ORDER BY start_ts",
+             ORDER BY start_ts, id",
         )
         .bind(&subject.kind)
         .bind(&subject.id)
@@ -216,6 +216,10 @@ impl CalendarClient for PgCalendar {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| CalendarError::Storage(e.to_string()))?;
+        // `id` breaks a tie on the start (two soft rows may share one),
+        // which until 2026-09-30 fell to whatever the plan returned; the
+        // double sorts the same (`in_memory::by_start_then_id`; backlog
+        // be459ab9, found by the adapters-agree suite).
         rows.into_iter().map(Reservation::try_from).collect()
     }
 
@@ -387,12 +391,18 @@ impl CalendarClient for PgCalendar {
     async fn list_business_calendars(&self) -> Result<Vec<BusinessCalendar>, CalendarError> {
         // Two reads, joined here: the headers in code order, then every
         // closed day grouped by its calendar — one round trip per table
-        // rather than one per code.
-        let headers: Vec<(String, String, Vec<i16>)> =
-            sqlx::query_as("SELECT code, name, weekend FROM business_calendars ORDER BY code")
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| CalendarError::Storage(e.to_string()))?;
+        // rather than one per code. The codes sort `COLLATE "C"`, byte
+        // order, the double's `String::cmp`: the database's locale
+        // ignores `-` at first level and folds case, so until 2026-09-30
+        // `suite-ab` listed before `suite-a-z` here and after it in
+        // memory (backlog be459ab9, found by the adapters-agree suite;
+        // the class is 2987fb2d's).
+        let headers: Vec<(String, String, Vec<i16>)> = sqlx::query_as(
+            "SELECT code, name, weekend FROM business_calendars ORDER BY code COLLATE \"C\"",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CalendarError::Storage(e.to_string()))?;
         let days: Vec<(String, NaiveDate)> = sqlx::query_as(
             "SELECT calendar_code, day FROM business_calendar_closed_days ORDER BY calendar_code, day",
         )
@@ -555,7 +565,7 @@ impl PgCalendar {
                AND resource_id = $2
                AND start_ts < $4
                AND end_ts > $3
-             ORDER BY start_ts",
+             ORDER BY start_ts, id",
         )
         .bind(&subject.kind)
         .bind(&subject.id)

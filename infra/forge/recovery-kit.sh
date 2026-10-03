@@ -86,7 +86,6 @@
 #   BOSS_RECOVERY_KIT_SUDOERS_DIR  /etc/sudoers.d
 #   BOSS_RECOVERY_KIT_RUNNER_UNIT  forgejo-runner.service
 #   BOSS_OPS_DIR                   /etc/boss-ops (talosconfig, kubeconfig)
-#   BOSS_GITHUB_TOKEN_FILE         /etc/boss-publish/github.token
 #   BOSS_ESTATE_SOURCE             infra/estate/estate.toml (the control-plane nodes)
 #   BOSS_SOR_ENV                   /etc/boss/sor.env (BOSS_FORGE_HOST)
 #   OPS_REQUEST_ID                 set by the ops runner: the packet the reader records on
@@ -110,7 +109,6 @@ FORGE_TIMEOUT="${BOSS_RECOVERY_KIT_FORGE_TIMEOUT:-600}"
 SUDOERS_DIR="${BOSS_RECOVERY_KIT_SUDOERS_DIR:-/etc/sudoers.d}"
 RUNNER_UNIT="${BOSS_RECOVERY_KIT_RUNNER_UNIT:-forgejo-runner.service}"
 OPS_DIR="${BOSS_OPS_DIR:-/etc/boss-ops}"
-GITHUB_TOKEN_FILE="${BOSS_GITHUB_TOKEN_FILE:-/etc/boss-publish/github.token}"
 ESTATE="${BOSS_ESTATE_SOURCE:-$REPO/infra/estate/estate.toml}"
 README_SRC="$HERE/recovery-kit-README.txt"
 WRITER="infra/forge/write-recovery-kit.sh"
@@ -422,7 +420,12 @@ mode_assemble() {
     FORGE_LOG_SHOW=""; TALOS_FROM=""; RUNNER_FROM=""
 
     forge_archive
-    take secrets/github.token "$GITHUB_TOKEN_FILE"
+    # No GitHub token rides the kit (backlog d2b7c947, 2026-09-30). The
+    # one it took was the personal access token of David's own GitHub
+    # account, retired with the public fork it pushed to; every GitHub
+    # credential the estate holds now is an installation token of the
+    # organisation's App, minted per act and revoked, which a stick
+    # cannot usefully keep.
     take secrets/talosconfig "$OPS_DIR/talosconfig"
     take secrets/kubeconfig "$OPS_DIR/kubeconfig"
     runner_registration

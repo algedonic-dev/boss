@@ -4,7 +4,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 
-use crate::port::{MessageError, MessageRepository};
+use crate::port::{
+    InboxPage, InboxQuery, KindCount, MessageError, MessageRepository, no_such_parent, refuse_nul,
+    to_the_microsecond,
+};
 use crate::types::{Message, MessageKind};
 
 pub struct InMemoryMessages {
@@ -38,17 +41,54 @@ impl MessageRepository for InMemoryMessages {
     async fn inbox(
         &self,
         recipient_id: &str,
-        include_archived: bool,
-    ) -> Result<Vec<Message>, MessageError> {
+        query: &InboxQuery,
+    ) -> Result<InboxPage, MessageError> {
         let guard = self.messages.read().await;
         let mut msgs: Vec<Message> = guard
             .iter()
             .filter(|m| m.recipient_id == recipient_id)
-            .filter(|m| include_archived || m.archived_at.is_none())
+            .filter(|m| query.include_archived || m.archived_at.is_none())
+            .filter(|m| query.kind.as_deref().is_none_or(|k| m.kind.0 == k))
+            .filter(|m| !query.unread_only || m.read_at.is_none())
             .cloned()
             .collect();
-        msgs.sort_by_key(|m| std::cmp::Reverse(m.sent_at));
-        Ok(msgs)
+        // A tie on the instant breaks by BYTE order of id, as Postgres's
+        // `id COLLATE "C"` does (backlog be459ab9).
+        msgs.sort_by(|a, b| b.sent_at.cmp(&a.sent_at).then_with(|| a.id.cmp(&b.id)));
+        let total = msgs.len() as u64;
+        let rows = msgs
+            .into_iter()
+            .skip(query.offset as usize)
+            .take(query.limit as usize)
+            .collect();
+        Ok(InboxPage { rows, total })
+    }
+
+    async fn inbox_counts(
+        &self,
+        recipient_id: &str,
+        include_archived: bool,
+    ) -> Result<Vec<KindCount>, MessageError> {
+        let guard = self.messages.read().await;
+        // A BTreeMap keyed by the kind's String is BYTE order, as
+        // Postgres's `kind COLLATE "C"` is.
+        let by_kind = guard
+            .iter()
+            .filter(|m| m.recipient_id == recipient_id)
+            .filter(|m| include_archived || m.archived_at.is_none())
+            .fold(
+                std::collections::BTreeMap::<String, (u64, u64)>::new(),
+                |mut acc, m| {
+                    let e = acc.entry(m.kind.0.clone()).or_default();
+                    e.0 += 1;
+                    e.1 += u64::from(m.read_at.is_none());
+                    acc
+                },
+            );
+        Ok(by_kind
+            .into_iter()
+            .map(|(kind, (all, unread))| KindCount { kind, all, unread })
+            .collect())
     }
 
     async fn unread_count(
@@ -81,14 +121,16 @@ impl MessageRepository for InMemoryMessages {
         let updated = {
             let mut guard = self.messages.write().await;
             match guard.iter_mut().find(|m| m.id == id) {
-                Some(msg) => {
-                    msg.read_at = Some(read_at);
+                Some(msg) if msg.read_at.is_none() => {
+                    msg.read_at = Some(to_the_microsecond(read_at));
                     true
                 }
-                None => false,
+                // Already read: the first read_at stands (backlog 624e92eb).
+                Some(_) | None => false,
             }
         };
-        // Mirrors the Pg gate: a phantom id records nothing.
+        // Mirrors the Pg gate: a phantom id, or a repeat mark of a read
+        // message, records nothing.
         if updated {
             self.record(stamp.event(
                 crate::events::MESSAGE_READ,
@@ -103,6 +145,7 @@ impl MessageRepository for InMemoryMessages {
         msg: &Message,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), MessageError> {
+        refuse_nul(msg)?;
         // Mirrors the Pg ON CONFLICT (id) DO NOTHING collapse: a
         // duplicate id is an idempotent no-op and records nothing.
         let inserted = {
@@ -110,7 +153,23 @@ impl MessageRepository for InMemoryMessages {
             if guard.iter().any(|m| m.id == msg.id) {
                 false
             } else {
-                guard.push(msg.clone());
+                // The column's foreign key, mirrored: a reply names a
+                // message that is held (or itself), else it is refused
+                // (backlog be459ab9 — the double stored the orphan).
+                if let Some(parent) = msg.reply_to.as_deref()
+                    && parent != msg.id
+                    && !guard.iter().any(|m| m.id == parent)
+                {
+                    return Err(no_such_parent(parent));
+                }
+                // Stored as the columns keep it: every time to the
+                // microsecond.
+                guard.push(Message {
+                    sent_at: to_the_microsecond(msg.sent_at),
+                    read_at: msg.read_at.map(to_the_microsecond),
+                    archived_at: msg.archived_at.map(to_the_microsecond),
+                    ..msg.clone()
+                });
                 true
             }
         };
@@ -135,6 +194,13 @@ impl MessageRepository for InMemoryMessages {
             guard.retain(|m| m.id != id);
             if guard.len() == len_before {
                 return Err(MessageError::NotFound(format!("no message with ID {id}")));
+            }
+            // The column's ON DELETE SET NULL, mirrored: a reply outlives
+            // its parent and stops pointing at it (backlog be459ab9).
+            for m in guard.iter_mut() {
+                if m.reply_to.as_deref() == Some(id) {
+                    m.reply_to = None;
+                }
             }
         }
         self.record(stamp.event(
@@ -164,10 +230,12 @@ impl MessageRepository for InMemoryMessages {
                     && m.archived_at.is_none()
                     && m.read_at.is_none()
                 {
-                    m.archived_at = Some(now);
+                    m.archived_at = Some(to_the_microsecond(now));
                     hit.push(m.id.clone());
                 }
             }
+            // One fact per row, in BYTE order of id on both adapters.
+            hit.sort();
             hit
         };
         // One event per row, mirroring the Pg adapter — a summary
@@ -203,10 +271,12 @@ impl MessageRepository for InMemoryMessages {
                     && m.archived_at.is_none()
                     && m.read_at.is_none()
                 {
-                    m.archived_at = Some(now);
+                    m.archived_at = Some(to_the_microsecond(now));
                     hit.push(m.id.clone());
                 }
             }
+            // One fact per row, in BYTE order of id on both adapters.
+            hit.sort();
             hit
         };
         for id in &ids {
@@ -230,7 +300,7 @@ impl MessageRepository for InMemoryMessages {
             let mut guard = self.messages.write().await;
             match guard.iter_mut().find(|m| m.id == id) {
                 Some(msg) if msg.archived_at.is_some() => return Ok(()),
-                Some(msg) => msg.archived_at = Some(now),
+                Some(msg) => msg.archived_at = Some(to_the_microsecond(now)),
                 None => return Err(MessageError::NotFound(format!("no message with ID {id}"))),
             }
         }
@@ -248,7 +318,7 @@ impl MessageRepository for InMemoryMessages {
             .filter(|m| m.id == message_id || m.reply_to.as_deref() == Some(message_id))
             .cloned()
             .collect();
-        thread.sort_by_key(|m| m.sent_at);
+        thread.sort_by(|a, b| a.sent_at.cmp(&b.sent_at).then_with(|| a.id.cmp(&b.id)));
         Ok(thread)
     }
 }
@@ -294,7 +364,11 @@ mod tests {
     #[tokio::test]
     async fn inbox_returns_messages_for_recipient() {
         let repo = test_repo();
-        let inbox = repo.inbox("emp-001", false).await.unwrap();
+        let inbox = repo
+            .inbox("emp-001", &InboxQuery::first(100))
+            .await
+            .unwrap()
+            .rows;
         assert_eq!(inbox.len(), 3);
         assert!(inbox.iter().all(|m| m.recipient_id == "emp-001"));
     }
@@ -302,7 +376,11 @@ mod tests {
     #[tokio::test]
     async fn inbox_sorted_by_sent_at_desc() {
         let repo = test_repo();
-        let inbox = repo.inbox("emp-001", false).await.unwrap();
+        let inbox = repo
+            .inbox("emp-001", &InboxQuery::first(100))
+            .await
+            .unwrap()
+            .rows;
         for pair in inbox.windows(2) {
             assert!(pair[0].sent_at >= pair[1].sent_at);
         }
@@ -311,7 +389,11 @@ mod tests {
     #[tokio::test]
     async fn inbox_empty_for_unknown_recipient() {
         let repo = test_repo();
-        let inbox = repo.inbox("emp-999", false).await.unwrap();
+        let inbox = repo
+            .inbox("emp-999", &InboxQuery::first(100))
+            .await
+            .unwrap()
+            .rows;
         assert!(inbox.is_empty());
     }
 
@@ -398,7 +480,7 @@ mod tests {
             .unwrap();
         let msg = repo.message_by_id("msg-001").await.unwrap().unwrap();
         assert_eq!(msg.kind.as_str(), MessageKind::DIRECT);
-        assert_eq!(msg.archived_at, Some(at));
+        assert_eq!(msg.archived_at, Some(to_the_microsecond(at)));
     }
 
     /// Backlog 9bda9726 (idempotence): a second archive of an archived
@@ -425,7 +507,43 @@ mod tests {
             .count();
         assert_eq!(archived, 1, "a repeat archive records nothing");
         let msg = repo.message_by_id("msg-001").await.unwrap().unwrap();
-        assert_eq!(msg.archived_at, Some(first), "the first archive stands");
+        assert_eq!(
+            msg.archived_at,
+            Some(to_the_microsecond(first)),
+            "the first archive stands"
+        );
+    }
+
+    /// Backlog 624e92eb (idempotence, the read half of 9bda9726): a
+    /// second mark-read of a read message is a no-op — Ok, no second
+    /// `messages.message.read`, and the first `read_at` stands. It
+    /// used to overwrite `read_at` and record again.
+    #[tokio::test]
+    async fn marking_read_twice_records_one_event() {
+        let repo = test_repo();
+        let first = Utc::now();
+        repo.mark_read("msg-001", first, &test_stamp())
+            .await
+            .unwrap();
+        repo.mark_read(
+            "msg-001",
+            first + chrono::Duration::minutes(5),
+            &test_stamp(),
+        )
+        .await
+        .unwrap();
+        let reads = repo
+            .recorded_events()
+            .into_iter()
+            .filter(|e| e.kind == crate::events::MESSAGE_READ)
+            .count();
+        assert_eq!(reads, 1, "a repeat mark-read records nothing");
+        let msg = repo.message_by_id("msg-001").await.unwrap().unwrap();
+        assert_eq!(
+            msg.read_at,
+            Some(to_the_microsecond(first)),
+            "the first read stands"
+        );
     }
 
     #[tokio::test]

@@ -23,20 +23,16 @@ fn id(s: &str) -> JobId {
 fn job(job_id: &str, owner: &str) -> Job {
     Job {
         id: id(job_id),
-        kind: "brew-day".to_string(),
-        workflow_version: 1,
-        subject: Subject::new("asset", "FV-1"),
-        title: format!("packet {job_id}"),
-        owner_id: owner.into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 25).expect("day"),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::Value::Null,
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "brew-day".to_string(),
+            Subject::new("asset", "FV-1"),
+            format!("packet {job_id}"),
+            owner,
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 25).expect("day"),
+        )
     }
 }
 

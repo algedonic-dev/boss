@@ -256,19 +256,39 @@ exit 22
         v["code_scanning"].clone()
     }
 
-    /// The body of the PUT that completed the read-checks step.
+    /// The read-checks step's completion, as the two writes that make
+    /// it (backlog e39a9d2a, Stage 2): the verb's keys through the step
+    /// merge door, then a PUT carrying the status alone. Answered as
+    /// `{status, metadata}` — the PUT's status and the merged keys — and
+    /// it FAILS if the PUT carries a metadata body or the merge does not
+    /// precede it: the step PUT's end state refuses any metadata body.
     fn step_put(&self) -> serde_json::Value {
         let writes = self.writes();
-        let body = writes
-            .lines()
-            .skip_while(|l| {
-                !l.starts_with(&format!(
-                    "PUT http://jobs.invalid/api/jobs/{JOB}/steps/{STEP}"
-                ))
-            })
-            .nth(1)
-            .unwrap_or_else(|| panic!("no PUT on the read-checks step; writes:\n{writes}"));
-        serde_json::from_str(body).unwrap()
+        let body_after = |head: &str| -> Option<(usize, serde_json::Value)> {
+            let lines: Vec<&str> = writes.lines().collect();
+            let at = lines.iter().position(|l| *l == head)?;
+            Some((at, serde_json::from_str(lines.get(at + 1)?).unwrap()))
+        };
+        let (put_at, put) = body_after(&format!(
+            "PUT http://jobs.invalid/api/jobs/{JOB}/steps/{STEP}"
+        ))
+        .unwrap_or_else(|| panic!("no PUT on the read-checks step; writes:\n{writes}"));
+        assert_eq!(
+            put,
+            serde_json::json!({"status": "completed"}),
+            "the step PUT carries the status alone, never a metadata body; writes:\n{writes}"
+        );
+        let (merge_at, merged) = body_after(&format!(
+            "PATCH http://jobs.invalid/api/jobs/{JOB}/steps/{STEP}/metadata"
+        ))
+        .unwrap_or_else(|| {
+            panic!("no merge-door PATCH on the read-checks step; writes:\n{writes}")
+        });
+        assert!(
+            merge_at < put_at,
+            "the keys land before the status flips (required-at-done is judged at the flip):\n{writes}"
+        );
+        serde_json::json!({"status": put["status"], "metadata": merged})
     }
 }
 
@@ -377,9 +397,10 @@ fn a_completed_prs_checks_and_alerts_are_read_onto_the_packet_and_the_step_compl
     assert_eq!(put["metadata"]["alerts"], "100");
     assert_eq!(put["metadata"]["rules"], "7");
     assert_eq!(put["metadata"]["read_by"], "read-publish-checks");
-    assert_eq!(
-        put["metadata"]["ops_verb"], "read-publish-checks",
-        "the step's existing metadata is merged, not replaced"
+    assert!(
+        put["metadata"].get("ops_verb").is_none(),
+        "only the verb's own keys ride the merge door — the server keeps the \
+         step's stored ones, so none is read and sent back: {put}"
     );
     // What failed, by name, on the step and on the reading (c6cb678b).
     assert_eq!(put["metadata"]["failing"], "CodeQL: failure");

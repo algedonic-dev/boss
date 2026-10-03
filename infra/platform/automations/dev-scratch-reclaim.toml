@@ -1,0 +1,7 @@
+# automation:dev-scratch-reclaim — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 1,378 audit-log facts.
+# Signs as platform-admin today: infra/cluster/dev-scratch-reclaim.sh.
+
+[[automation]]
+id = "automation:dev-scratch-reclaim"
+role = "platform-admin"
+description = 'The dev pod reclaim sidecar: reclaims scratch space and fast-forwards the main checkout, under its own packet (infra/cluster/dev-scratch-reclaim.sh).'

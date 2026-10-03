@@ -39,6 +39,28 @@ list of verbs:
 A `README.md` beside the verbs is prose, not a verb — only `*.json` is
 read.
 
+## Structured read results
+
+A verb may declare `"capture": "separate-streams"` to retain stdout and
+stderr separately on its execute receipt, under `streams`. Each stream
+holds base64 bytes, the original byte count and SHA-256, the retained
+byte count, and `complete`. Encoding conserves binary bytes and trailing
+newlines. Each retained stream is bounded by `OPS_OUTPUT_CAP`; a larger
+stream is explicitly incomplete. A capture failure records
+`streams_unread` and no stream record. Ordinary verbs clear these keys
+and keep their existing interleaved `output`.
+
+For opted-in verbs, diagnostic `output` contains stdout followed by
+stderr and retains its existing cap. Consumers read the verb's exit
+first, then require complete streams and verify decoded bytes against
+their counts and digest before parsing a proposal. Capturing bytes does
+not judge JSON, approve a plan, or authorize a follow-on write. A timeout
+can leave a completely captured partial answer with a failed exit.
+
+The explicit volume-plan reader opts in so its plan bytes remain apart
+from live-space diagnostics and its printed hash (backlog f3a09e07,
+parent 53c8cb72). Dynamic discovery/request chaining remains separate.
+
 ## Authorization
 
 Phase 1 was READ-ONLY. `reclaim-disk` is the FIRST MUTATING verb —
@@ -159,7 +181,15 @@ script, never a param — keeping a checkout (with its unpushed
 state in the plan as evidence, 2026-09-27, read with plumbing that
 runs nothing the checkout's config names and never as root: as its
 owner, a root-owned one as nobody; a partial clone is kept unread,
-because a missing object would fetch through its promisor remote),
+because a missing object would fetch through its promisor remote) —
+except `/opt/boss-dev-bak`, which it removes, first, when the signed
+plan proves every checkout in it holds nothing unpushed (no commit on any
+ref that only a remote its config does not name, or a remote at a local
+path rather than a network URL, holds; no linked worktree, no
+submodule repository under `.git/modules`, nothing staged, modified,
+untracked or stashed), re-proving it
+just before the rm and refusing the whole run with exit 78 on any change
+(David, 2026-09-30, backlog d3c7eada) —
 refusing a symlink, a backup
 changed (ctime) in 30 days, or one that a live tree, a mount, a
 symlink, a running process, a loaded unit or a unit file on disk
@@ -168,7 +198,24 @@ approval verb: its plan verb `plan-a-gcp-root-reclaim` runs every bound
 and removes nothing, and each real run needs David's passkey on that
 plan. `/var/backups`, homes, `/usr/local`, `/opt/boss` and
 `/opt/boss-cli` are data and David's call, out of its reach by
-construction.
+construction — but for two files-by-shape David decided on: the retired
+second stack's capture (`second-stack-<stamp>.sql`, backlog f44ca628),
+and the dumps the retired boss-gcp off-site leg left in
+`/var/backups/boss-cluster-pg` (`boss-<stamp>.sql.gz`, backlog 4bf7bdd1,
+2026-10-01: the GCS bucket is the off-site copy), each bound to its
+identity in the signed plan. The seventh, `retire-ops-runner` (David 2026-10-01,
+design a79a8067; backlog 98eb9349), serves the forge too: it is the
+one verb that closes the door it arrives through, so the runner retires
+ITSELF — it stops and disables exactly `boss-ops-runner.timer`, a
+literal in the script, and never the oneshot service whose pass is
+running it, so that pass survives to report. It refuses unless the
+host's role is already undeclared on a live read, another host still
+declares `ops-runner`, and no other ops-request is open for the host;
+it writes `/var/lib/boss/ops-runner.retired` before the stop, and the
+host's converge (`install-ops-runner.sh`), owing nothing to the runner,
+reports RETIRED (or DISABLED BY HAND, with no marker) and removes the
+unit files. Each run needs David's passkey on the plan
+`plan-retire-ops-runner` renders.
 
 ## Effect — an exit 0 is not a proof
 
@@ -225,6 +272,100 @@ same passkey ceremony and completes it too. The runner runs the write
 only when the step's `decision` — saved before the stamp, so inside the
 signed shape — is exactly `approved`; ops-request routes any other
 decision to `refused` (adversarial re-review of fd7090cc, 2026-09-25).
+
+## Nothing to do — a plan with no change in it asks nobody
+
+A plan verb may declare the regex (jq's engine, the runner's) its WHOLE
+plan matches when it names no change:
+
+```json
+"nothing_to_do": "\\Awould vacuum the journal to 1G \\(journalctl --vacuum-size=1G\\)\\n\\z"
+```
+
+When the plan the runner renders for an approval request matches it,
+the runner closes the request through ops-request's `nothing-to-do`
+terminal — the plan, its hash, the verb, host, args, the plan verb and
+this pattern recorded on that step — and never writes the plan onto the
+approve step, so no passkey is asked for a no-op (backlog b2f78bb9, car
+3 of 3df309bf: a remedy the machine files again after it already ran
+renders exactly such a plan). Anchor it to the whole plan (`\A` … `\z`),
+not to a line: a plan can quote text it read off the host, and a line
+that text can forge must never close a request. Every doubt asks
+instead — a regex jq cannot judge, or a request filed under an
+ops-request version without the terminal, is rendered for the passkey
+as before. Only a plan verb some approval verb names may declare it;
+`ops_runner_approval_sh.rs` (`the_shipped_nothing_to_do_declarations_hold`)
+holds the tree to that, refuses a declaration that does not open with
+`\A` and close with `\z` or that matches its nothing-plan with a byte
+added at either end, and holds each declaration to the plans its verb
+renders — a verb that declares one with no plans listed in that test's
+`nothing_to_do_plans` is a red gate (backlog aa816dd4).
+
+Only the runner closes a request this way. The `nothing-to-do` step
+declares `written_by = "automation:ops-runner"`, and the jobs API
+refuses its record from any other automation or agent session; a
+person may still write it. A runner refused there — one signing under a
+different `BOSS_OPS_ACTOR` — renders the plan for a passkey instead.
+
+## Discovering explicit volume-plan arguments
+
+`plan-the-largest-instance-volume-expansion <namespace> <pvc>` is a
+read-only discovery verb. It returns one JSON proposal with `verb`,
+explicit `args`, `plan` and `plan_sha256`. The largest whole-GiB size
+must fit every assigned replica's disk, counting replicas sharing a
+disk, satisfy current physical headroom, and remain within the existing
+2x and 100GiB bounds. Missing or ambiguous facts refuse; no growth
+refuses without choosing a replica to move.
+
+The proposal is neither approval nor execution. A later request freezes
+its explicit namespace, PVC and size; the existing
+`plan-an-instance-volume-expansion` renders that exact plan for David's
+passkey, and `expand-instance-volume` requires its signed hash. Live
+physical space can change a new discovery result, but admissible changes
+leave the already resolved explicit-size plan hash unchanged. Automatic
+alarm-to-request filing, unique replica selection and declared-capacity
+drift are still separate partial work under backlog 53c8cb72.
+
+## Remedies — the machine files the request, the human signs the plan
+
+An approval verb may declare the estate findings it relieves:
+
+```json
+"remedies": ["disk_tight:boss-gcp"]
+```
+
+Each entry is a finding keyed exactly as `estate.alarm` keys its alarm
+packet (`<class>:<id>` — `disk_tight:<host>`, `gone:<node>`,
+`unit_unhealthy:<host>/<unit>`, …). When an estate comparison carries
+that finding, the dispatcher rule
+`file-the-remedy-a-verb-declares-for-an-estate-finding` (handler
+`ops.file_remedies`, which compiles this directory in) files the verb's
+ops-request itself — `host` the verb's one host, `args: []`,
+`requires_approval: true`, subject `<verb>@<host>` — so the approve step
+reaches the named approvers with the plan rendered, and nobody types a
+command (backlog 3df309bf: "a human act is a signature on rendered
+bytes, never a transcription"). At most one open request per subject,
+and none refiled while one was opened in the last week, whatever became
+of it: a remedy that ran need not clear its finding. A request whose
+approver DECLINED its plan is not refiled until the estate observes the
+finding clear — its alarm closed after the decline, by the recover rule
+or by a person whose close is not `duplicate` or `decline` — because a
+decline is an answer (backlog b2f78bb9; a person's close counts since
+aa816dd4). While it holds, the open alarm carries
+`remedy_held:<verb>@<host>` saying so, and the request filed once it
+lifts carries `decline_lifted`, naming the declined request and the
+alarm whose close lifted it. And a plan verb that
+declares `nothing_to_do` closes a request whose plan names no change
+before anyone is asked (below).
+
+Filing grants nothing, so it is the machine's; but the handler files
+ONLY a verb that runs under a passkey. A `remedies` declaration is
+refused unless the verb declares `requires_approval`, a `plan_verb` and
+`approvers`, takes `plan_sha256` as its ONLY param (the machine has
+nothing to fill any other with), and serves exactly one host; a class
+the alarm never keys is refused too, because nothing could ever file it.
+The handler's test `every_declared_remedy_is_a_passkey_gated_verb` holds
+this directory to that, so a bad declaration is a red gate.
 
 ## Defense
 

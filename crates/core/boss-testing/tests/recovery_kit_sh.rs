@@ -64,6 +64,9 @@ const K8S_CA: &str = "fake k8s ca\n";
 const OS_CA: &str = "fake talos os ca\n";
 
 struct Opts {
+    /// Whether the RETIRED personal GitHub token (backlog d2b7c947) is
+    /// still on the host, at the path the kit used to take it from — as it
+    /// is until David deletes it. The kit must not take it.
     github_token: bool,
     sudoers: bool,
     gcs_secret: bool,
@@ -463,10 +466,6 @@ fn env_for(c: &Case) -> Vec<(String, String)> {
             c.dir.join("ops").display().to_string(),
         ),
         (
-            "BOSS_GITHUB_TOKEN_FILE".into(),
-            c.dir.join("publish/github.token").display().to_string(),
-        ),
-        (
             "BOSS_RECOVERY_KIT_SUDOERS_DIR".into(),
             c.dir.join("sudoers.d").display().to_string(),
         ),
@@ -562,7 +561,6 @@ fn a_whole_kit_is_cut_into_the_tmpfs_and_no_secret_reaches_the_record() {
         "a kit with every item must exit 0\nstdout:\n{so}\nstderr:\n{se}"
     );
     for item in [
-        "secrets/github.token",
         "secrets/talosconfig",
         "secrets/kubeconfig",
         "runner/.runner",
@@ -612,7 +610,7 @@ fn a_whole_kit_is_cut_into_the_tmpfs_and_no_secret_reaches_the_record() {
         "README.txt",
         "MANIFEST.txt",
         "talos/secrets.yaml",
-        "secrets/github.token",
+        "secrets/talosconfig",
     ] {
         assert!(
             listing.contains(&format!("boss-recovery-kit-{version}/{p}")),
@@ -707,7 +705,7 @@ fn a_missing_item_is_named_and_the_rest_is_still_cut_and_marked_incomplete() {
         code, 3,
         "an incomplete kit exits 3 — cut, and not whole\n{so}\n{se}"
     );
-    for item in ["secrets/github.token", "sudoers/", "gcs/sa.json"] {
+    for item in ["sudoers/", "gcs/sa.json"] {
         assert!(
             so.lines()
                 .any(|l| l.starts_with(&format!("MISSING {item}"))),
@@ -720,12 +718,12 @@ fn a_missing_item_is_named_and_the_rest_is_still_cut_and_marked_incomplete() {
     );
     assert_eq!(
         field(&so, "completeness"),
-        "INCOMPLETE missing=secrets/github.token,sudoers/,gcs/sa.json,gcs/bucket"
+        "INCOMPLETE missing=sudoers/,gcs/sa.json,gcs/bucket"
     );
     let state = read(&c.kit.join("state"));
     assert!(
         state.contains("complete=no\n")
-            && state.contains("missing=secrets/github.token,sudoers/,gcs/sa.json,gcs/bucket\n"),
+            && state.contains("missing=sudoers/,gcs/sa.json,gcs/bucket\n"),
         "the state carries no completeness: {state}"
     );
     assert!(
@@ -734,6 +732,40 @@ fn a_missing_item_is_named_and_the_rest_is_still_cut_and_marked_incomplete() {
             .any(|l| l.ends_with(" talos/secrets.yaml"))
     );
     assert!(c.kit.join("kit.tar").exists());
+}
+
+/// THE KIT CARRIES NO GITHUB TOKEN (backlog d2b7c947, David 2026-09-30:
+/// all GitHub work runs through the algedonic-dev organisation, as the
+/// GitHub App). It used to take /etc/boss-publish/github.token — the
+/// personal access token of David's own GitHub account, which pushed the
+/// public fork the publish flow opened its PRs from. That token is
+/// retired with the fork, and it stays on the host until David deletes
+/// it, so the fixture leaves it there: the kit is still whole without it,
+/// names no such item, and its tar holds neither the path nor the value.
+#[test]
+fn the_retired_personal_github_token_rides_no_kit() {
+    let c = case("retired-personal-token", Opts::default());
+    assert!(
+        c.dir.join("publish/github.token").exists(),
+        "the fixture leaves the retired token on the host"
+    );
+    let (code, so, se) = assemble(&c);
+    assert_eq!(code, 0, "a kit without a GitHub token is whole\n{so}\n{se}");
+    assert_eq!(field(&so, "completeness"), "complete");
+    assert!(
+        !so.contains("github"),
+        "the manifest names no GitHub credential, taken or missing:\n{so}"
+    );
+    let tar = std::fs::read(c.kit.join("kit.tar")).expect("kit.tar in the tmpfs");
+    let tar = String::from_utf8_lossy(&tar);
+    assert!(
+        !tar.contains("github.token") && !tar.contains("fake-github-token-7f3a"),
+        "the retired token rode the kit"
+    );
+    assert!(
+        !read(&repo_root().join(SCRIPT)).contains("/etc/boss-publish/github.token"),
+        "{SCRIPT} still names the retired token's path"
+    );
 }
 
 #[test]
@@ -792,7 +824,7 @@ fn a_bundle_whose_ca_is_not_this_clusters_drops_talos_and_keeps_the_kit() {
         !items(&so).iter().any(|l| l.contains(" talos/")),
         "a refused bundle rode along:\n{so}"
     );
-    for kept in ["secrets/github.token", "gcs/sa.json", "secrets/kubeconfig"] {
+    for kept in ["secrets/talosconfig", "gcs/sa.json", "secrets/kubeconfig"] {
         assert!(
             items(&so).iter().any(|l| l.ends_with(&format!(" {kept}"))),
             "{kept} was dropped with the bundle:\n{so}"
@@ -1367,7 +1399,7 @@ fn an_incomplete_kit_is_written_under_an_incomplete_name_and_recorded_so() {
     let c = case(
         "write-incomplete",
         Opts {
-            github_token: false,
+            sudoers: false,
             ..Opts::default()
         },
     );
@@ -1391,7 +1423,7 @@ fn an_incomplete_kit_is_written_under_an_incomplete_name_and_recorded_so() {
         "an incomplete kit was written under a complete kit's name"
     );
     assert!(
-        wo.contains("INCOMPLETE KIT") && wo.contains("secrets/github.token"),
+        wo.contains("INCOMPLETE KIT") && wo.contains("sudoers/"),
         "{wo}"
     );
     let patches = read(&c.patches);
@@ -1405,7 +1437,7 @@ fn an_incomplete_kit_is_written_under_an_incomplete_name_and_recorded_so() {
     assert_eq!(written["recovery_kit_written"]["complete"], false);
     assert_eq!(
         written["recovery_kit_written"]["missing"],
-        serde_json::json!(["secrets/github.token"])
+        serde_json::json!(["sudoers/"])
     );
 }
 

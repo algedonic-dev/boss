@@ -116,18 +116,14 @@ use crate::train::rows;
 /// which this verb fetches the same way the conductor does, so raising
 /// the bound is a policy edit, not a code car. This constant
 /// survives only so a gate can still run when the registry is
-/// unreachable, and its value matches the seeded policy row
-/// (boss-cli's `the_seeded_policy_equals_the_compiled_fallback` pins
-/// the two — CLAUDE.md §9a).
+/// unreachable.
 ///
-/// Four is the next measured step on w-1 (32 cores, one NVMe), taken
-/// as policy v3 on 2026-09-28 (backlog 366c2ed5) after three bays sat
-/// saturated for a day. Three was the comfort zone; FIVE is the
-/// measured cliff: I/O pressure sat at 65% while CPU pressure stayed at
-/// 0.00, and per-gate wall time went from ~35 to ~93 minutes — total
-/// throughput still beat serial, but each verdict arrived slower than
-/// two gates' worth of queueing (2026-08-26).
-const DEFAULT_MAX_CONCURRENT: usize = 4;
+/// It IS the delivery policy's compiled fallback, not a copy of it
+/// (backlog 461159e7, CLAUDE.md §9a — collapsed rather than pinned):
+/// until 2026-09-30 this was a second literal `4` that no test held to
+/// `COMPILED_GATE_MAX_CONCURRENT`, although this comment said one did.
+/// The value, and why it is four again since policy v5, lives there.
+const DEFAULT_MAX_CONCURRENT: usize = crate::delivery_policy::COMPILED_GATE_MAX_CONCURRENT as usize;
 
 /// The placeholders the runner manifest carries.
 const BRANCH_PLACEHOLDER: &str = "$GATE_BRANCH";
@@ -179,6 +175,13 @@ fn gate_tokens(manifest: &str) -> Vec<String> {
 /// (`- {name: x, mountPath: /gate-target}`) and block-style entries —
 /// a parser proven only against one spelling answers None against the
 /// other and the guard silently never engages (da260655's shape).
+///
+/// A claim is per-run again when the mount carries a per-pod
+/// `subPathExpr` (`runs/$(POD_NAME)`): since backlog 52ea56ac the
+/// workspace is the pod's own directory of the gate claim on w-1's
+/// second NVMe, because it must share the seed's filesystem for the
+/// seeding copy to stay a reflink. A constant `subPath` is still one
+/// directory every gate shares, and still serializes.
 pub(crate) fn pvc_backed_workspace(job_yaml: &str) -> bool {
     let mount_is_gate_target = |line: &str| {
         line.split("mountPath:").nth(1).is_some_and(|rest| {
@@ -189,30 +192,53 @@ pub(crate) fn pvc_backed_workspace(job_yaml: &str) -> bool {
                 == Some("/gate-target")
         })
     };
-    // Which volume is mounted at /gate-target?
+    let per_pod = |text: &str| {
+        text.split("subPathExpr:").nth(1).is_some_and(|rest| {
+            rest.split([',', '}', '\n'])
+                .next()
+                .is_some_and(|v| v.contains("$("))
+        })
+    };
+    // Which volume is mounted at /gate-target, and is it mounted per pod?
+    let lines: Vec<&str> = job_yaml.lines().collect();
     let mut current_entry: Option<String> = None;
     let mut workspace: Option<String> = None;
-    for line in job_yaml.lines() {
+    let mut workspace_per_pod = false;
+    for (i, line) in lines.iter().enumerate() {
         let t = line.trim_start();
         if let Some(rest) = t.strip_prefix("- name:") {
             current_entry = Some(rest.trim().to_string());
         }
         if t.contains("mountPath:") && mount_is_gate_target(t) {
-            workspace = if t.contains("name:") {
-                // Inline `- {name: x, mountPath: /gate-target}`.
-                t.split("name:")
+            if t.contains("name:") {
+                // Inline `- {name: x, mountPath: /gate-target, ...}`.
+                workspace = t
+                    .split("name:")
                     .nth(1)
                     .and_then(|a| a.trim_start().split([',', '}']).next())
-                    .map(|s| s.trim().to_string())
+                    .map(|s| s.trim().to_string());
+                workspace_per_pod = per_pod(t);
             } else {
-                // Block style: the entry opened by the last `- name:`.
-                current_entry.clone()
-            };
+                // Block style: the entry opened by the last `- name:`,
+                // whose keys run until the next list item.
+                workspace = current_entry.clone();
+                let indent = line.len() - t.len();
+                workspace_per_pod = lines[i + 1..]
+                    .iter()
+                    .take_while(|l| {
+                        let lt = l.trim_start();
+                        !lt.is_empty() && l.len() - lt.len() == indent && !lt.starts_with("- ")
+                    })
+                    .any(|l| per_pod(l.trim_start()));
+            }
         }
     }
     let Some(ws) = workspace else {
         return false;
     };
+    if workspace_per_pod {
+        return false;
+    }
     // Is that volume claim-backed?
     let mut in_entry = false;
     for line in job_yaml.lines() {
@@ -2951,20 +2977,18 @@ pub(crate) fn reusable_packet(open: &[Value], branch: &str, sha: &str) -> Option
 /// touching process environment.
 pub(crate) fn no_instance_message() -> String {
     "BOSS_JOBS_URL is not set, and this verb has no default on purpose.\n\
-     The system of record is http://10.20.0.34:7900 (the cluster).\n\
-     boss-gcp's http://127.0.0.1:7900 is a SECOND, older, complete \
-     deployment holding different data — reading it does not error, it \
-     answers, which is worse.\n\
-     Set it explicitly, e.g.:\n    \
-     BOSS_JOBS_URL=http://10.20.0.34:7900 boss gate <branch> --wait"
+     Read this deployment's system-of-record URL from infra/dev/sor-url.\n\
+     Set BOSS_JOBS_URL to that declared URL before running this verb.\n\
+     A wrong deployment can answer with an empty queue instead of an error;\n\
+     verify a known packet on the same connection before accepting absence."
         .to_string()
 }
 
 /// The jobs API this verb talks to. **NO DEFAULT, deliberately.**
 ///
-/// It used to fall back to `http://127.0.0.1:7900`. On boss-gcp that is
-/// not the system of record — it is a second, older, complete BOSS
-/// stack, and a wrong instance does not fail, it answers. On
+/// It used to fall back to `http://127.0.0.1:7900`. On boss-gcp that
+/// reached a second, older, complete BOSS stack (since retired), not
+/// the system of record. A wrong instance does not fail, it answers. On
 /// 2026-08-27 a `?kind=gate-run` read returned `total: 0` from the local
 /// stack while the cluster held 51 packets; a `gate-run v1` spec was
 /// then authored against that zero, which would have regressed the live
@@ -3018,10 +3042,25 @@ pub(crate) fn machine_client() -> Result<boss_core::machine_token::Client> {
 /// [`machine_client`] from a builder carrying the caller's own settings
 /// (a timeout); the redirect policy is the machine client's, whatever
 /// the builder asked for.
+///
+/// UNDER `cfg(test)` IT HOLDS NO TOKEN (backlog 2ee29275, F2). 63 test
+/// sites build their client here, and a failing test prints the request
+/// head it captured — so a test client reading the process's shared
+/// source would put a mounted Secret into the gate's log. The switch is
+/// here, not at the 63 sites, so no test can forget it; the pin
+/// `no_test_reads_the_live_machine_token` refuses a test that names the
+/// shared source itself.
 pub(crate) fn machine_client_with(
     builder: reqwest::ClientBuilder,
 ) -> Result<boss_core::machine_token::Client> {
-    boss_core::machine_token::Client::build(builder).context("building the machine client")
+    #[cfg(not(test))]
+    let client = boss_core::machine_token::Client::build(builder);
+    #[cfg(test)]
+    let client = boss_core::machine_token::Client::build_with_source(
+        builder,
+        std::sync::Arc::new(boss_core::machine_token::Source::fixed(None)),
+    );
+    client.context("building the machine client")
 }
 
 pub(crate) async fn api(
@@ -3118,11 +3157,40 @@ pub(crate) async fn api_at_signed(
     })
     .await?;
     let status = resp.status();
+    if status.is_redirection() {
+        // The client follows no redirect, so a 3xx lands here (backlog
+        // 2ee29275, F4). Name where it pointed by scheme and host only:
+        // a login redirect carries its state in the query, and the page
+        // body echoes the whole target, so neither is quoted.
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok());
+        let target = redirect_target(location)
+            .unwrap_or_else(|| "a target it did not name as an absolute URL".into());
+        bail!(
+            "{service} {method} {path} -> {status}: refused to follow a redirect to {target} \
+             (the machine client follows none; is the base pointed at an edge or another \
+             instance?)"
+        );
+    }
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         bail!("{service} {method} {path} -> {status}: {}", body.trim());
     }
     success_answer(&service, &method, path, status, &body)
+}
+
+/// A redirect's target as a refusal may name it: `scheme://host[:port]`,
+/// never its path, query or fragment. `None` for a relative or
+/// unparseable `Location`, which is then not echoed at all.
+pub(crate) fn redirect_target(location: Option<&str>) -> Option<String> {
+    let url = reqwest::Url::parse(location?.trim()).ok()?;
+    let host = url.host_str()?;
+    Some(match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    })
 }
 
 /// What a 2xx body answers — pure, so each rule is pinned without a
@@ -8072,22 +8140,28 @@ mod tests {
     /// old fallback pointed at boss-gcp's second, older stack, and a read
     /// against it does not fail — it answers `total: 0` while the system
     /// of record holds 51 packets. So this pins the two things the
-    /// message has to carry: the address of the system of record, and a
-    /// warning that the tempting local one is a different deployment.
+    /// message has to carry: the declaration of the system of record,
+    /// and the same-connection control that makes an empty answer usable.
+    /// The second stack has since retired; an adopter's address is not
+    /// this instance's (26f5080a, approved design c6f08b60 D3).
     #[test]
     fn refusing_without_an_instance_names_the_system_of_record() {
         let m = no_instance_message();
         assert!(
-            m.contains("10.20.0.34:7900"),
+            m.contains("infra/dev/sor-url"),
             "the refusal must name the system of record, not just complain: {m}"
         );
         assert!(
-            m.contains("127.0.0.1:7900"),
-            "it must warn about the second deployment, which is the trap: {m}"
+            !m.contains("http://"),
+            "the refusal must not prescribe an instance address: {m}"
         );
         assert!(
             m.contains("BOSS_JOBS_URL"),
             "it must name the variable to set: {m}"
+        );
+        assert!(
+            m.contains("known packet") && m.contains("same connection"),
+            "the refusal must explain how to verify an empty answer: {m}"
         );
     }
 
@@ -8172,12 +8246,12 @@ mod tests {
                 .expect_err("neither a real flag nor a real env must refuse")
                 .to_string();
             assert!(
-                m.contains("10.20.0.34:7900"),
+                m.contains("infra/dev/sor-url"),
                 "refusal must name the record: {m}"
             );
             assert!(
-                m.contains("127.0.0.1:7900"),
-                "refusal must warn of the trap: {m}"
+                !m.contains("SECOND") && !m.contains("http://"),
+                "refusal must not prescribe a retired or private deployment: {m}"
             );
         }
     }
@@ -8531,6 +8605,52 @@ kind: Job\n\
         );
     }
 
+    /// THE GATE-VOLUME SHAPE (backlog 52ea56ac). On w-1's second NVMe the
+    /// workspace is a claim again — it must share one filesystem with the
+    /// seed for the seeding copy to stay a reflink — but each pod mounts
+    /// its OWN directory of it, `subPathExpr: runs/$(POD_NAME)`. A
+    /// per-pod expansion is per-run; a claim at /gate-target without
+    /// one, or with a constant `subPath`, is still one shared workspace
+    /// and the 2026-08-24 law still serializes it. Both spellings.
+    #[test]
+    fn a_claim_mounted_per_pod_by_subpathexpr_is_a_per_run_workspace() {
+        let inline = "\
+kind: Job\n\
+          volumeMounts:\n\
+            - {name: gate, mountPath: /gate-seed, subPath: seed}\n\
+            - {name: gate, mountPath: /gate-target, subPathExpr: runs/$(POD_NAME)}\n\
+      volumes:\n\
+        - name: gate\n\
+          persistentVolumeClaim: {claimName: gate}\n";
+        assert!(
+            !pvc_backed_workspace(inline),
+            "a per-pod subPathExpr is a per-run workspace — reading it as shared \
+             would re-serialize every gate"
+        );
+        let block = "\
+kind: Job\n\
+          volumeMounts:\n\
+            - name: gate\n\
+              mountPath: /gate-target\n\
+              subPathExpr: runs/$(POD_NAME)\n\
+      volumes:\n\
+        - name: gate\n\
+          persistentVolumeClaim:\n\
+            claimName: gate\n";
+        assert!(!pvc_backed_workspace(block));
+        let constant = "\
+kind: Job\n\
+          volumeMounts:\n\
+            - {name: gate, mountPath: /gate-target, subPath: runs/shared}\n\
+      volumes:\n\
+        - name: gate\n\
+          persistentVolumeClaim: {claimName: gate}\n";
+        assert!(
+            pvc_backed_workspace(constant),
+            "a constant subPath is one directory every gate shares"
+        );
+    }
+
     /// The SHIPPED manifest renders as parallel-safe — the guard must
     /// not re-serialize production (checked against the real file, so
     /// a manifest edit that regresses the shape fails here by name).
@@ -8544,7 +8664,8 @@ kind: Job\n\
         let job = render_job(&manifest, "feat/x", "pkt", "").expect("renders");
         assert!(
             !pvc_backed_workspace(&job),
-            "the shipped manifest's /gate-target must stay a per-run emptyDir"
+            "the shipped manifest's /gate-target must stay per-run: an emptyDir, or \
+             the gate claim mounted per pod by subPathExpr"
         );
     }
 
@@ -9318,6 +9439,31 @@ pub(crate) mod stub {
         (format!("http://{addr}"), handle)
     }
 
+    /// A one-shot `302` to `location`, its body echoing the whole target
+    /// the way an HTML redirect page does — the shape Cloudflare Access
+    /// answers `boss.algedonic.dev` with (backlog 2ee29275, F4).
+    pub(crate) async fn one_redirect(
+        location: &'static str,
+    ) -> (String, tokio::task::JoinHandle<Option<String>>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.ok()?;
+            let request = read_request(&mut sock).await;
+            let body = format!("<a href=\"{location}\">Found</a>");
+            let resp = format!(
+                "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-type: text/html\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+            Some(request)
+        });
+        (format!("http://{addr}"), handle)
+    }
+
     /// Read one whole request: the head up to its blank line, then as
     /// many body bytes as its `content-length` names. Answering before
     /// the body is drained closes a socket the client is still writing
@@ -9362,9 +9508,194 @@ pub(crate) mod stub {
 
 #[cfg(test)]
 mod signing_tests {
-    use super::stub::{one_request, one_response};
+    use super::stub::{one_redirect, one_request, one_response};
     use super::*;
     use crate::identity::Signature;
+
+    /// Backlog 2ee29275, F2: a test's client holds NO token, whatever
+    /// the process's token dir holds. A failing test prints the request
+    /// head it captured, so a client reading the process's shared
+    /// source would put a mounted Secret into the gate's log. Proven
+    /// through a wrapper, because the token dir is read from the
+    /// environment and a test must not mutate its own: this test's
+    /// binary re-run with `BOSS_MACHINE_TOKEN_DIR` naming a dir that
+    /// holds a live-looking token sends through both CLI constructors
+    /// and prints whether the header left.
+    #[tokio::test]
+    async fn a_test_client_never_sends_the_process_token() {
+        const LIVE: &str = "live-estate-token-must-never-leave-a-test";
+        if std::env::var("BOSS_CLI_TOKEN_LEAK_INNER").is_ok() {
+            let clients = [
+                ("machine_client", crate::gate::machine_client().unwrap()),
+                (
+                    "machine_client_with",
+                    crate::gate::machine_client_with(reqwest::Client::builder()).unwrap(),
+                ),
+            ];
+            for (name, http) in clients {
+                let (base, stub) = one_request("{}").await;
+                api_at_signed(
+                    &http,
+                    &base,
+                    reqwest::Method::GET,
+                    "/api/jobs",
+                    None,
+                    Signature::As("claude@algedonic.dev".into()),
+                )
+                .await
+                .expect("the stub answers 200");
+                let head = stub.await.unwrap().expect("the stub read a request");
+                let sent = head
+                    .to_ascii_lowercase()
+                    .contains(boss_core::machine_token::HEADER)
+                    || head.contains(LIVE);
+                println!("TOKEN-SENT {name}={sent}");
+            }
+            return;
+        }
+        let dir = boss_testing::scratch_dir("cli-test-token-leak");
+        std::fs::write(dir.join(boss_core::machine_token::CURRENT), LIVE).unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "gate::signing_tests::a_test_client_never_sends_the_process_token",
+                "--nocapture",
+            ])
+            .env(boss_core::machine_token::TOKEN_DIR_ENV, &dir)
+            .env("BOSS_CLI_TOKEN_LEAK_INNER", "1")
+            .output()
+            .unwrap();
+        let printed = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{printed}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for name in ["machine_client", "machine_client_with"] {
+            assert!(
+                printed.contains(&format!("TOKEN-SENT {name}=false")),
+                "a test's {name} must send no machine token, whatever the token dir holds: \
+                 {printed}"
+            );
+        }
+    }
+
+    /// Backlog 2ee29275, F4: the client follows no redirect, so a 3xx
+    /// comes back here — and the refusal names WHERE it was sent, by
+    /// scheme and host, so an operator pointed at the Access edge reads
+    /// that at once. Never the path's query or the body: a login
+    /// redirect carries its state in the query, and the page echoes it.
+    #[tokio::test]
+    async fn a_refused_redirect_names_its_scheme_and_host_never_its_query() {
+        let (base, stub) = one_redirect(
+            "https://edge.example.com:8443/cdn-cgi/access/login?kid=QUERYSECRET&redirect_url=%2Fapi",
+        )
+        .await;
+        let http = crate::gate::machine_client().unwrap();
+        let err = api_at_signed(
+            &http,
+            &base,
+            reqwest::Method::GET,
+            "/api/jobs",
+            None,
+            Signature::As("claude@algedonic.dev".into()),
+        )
+        .await
+        .expect_err("a 302 is not an answer");
+        stub.await.unwrap().expect("the stub read a request");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("302"), "{msg}");
+        assert!(
+            msg.contains("https://edge.example.com:8443"),
+            "the refusal must name the redirect's scheme and host: {msg}"
+        );
+        assert!(
+            !msg.contains("QUERYSECRET") && !msg.contains("kid=") && !msg.contains("/cdn-cgi"),
+            "the refusal must not carry the target's path, query or the page echoing it: {msg}"
+        );
+    }
+
+    /// Backlog 2ee29275, F3: no verb panics building its client. A
+    /// production `machine_client().unwrap()` turns a TLS-backend or
+    /// resolver failure into a panic with no verb named; `?` carries
+    /// `building the machine client` to the operator. Test code is
+    /// blanked first, where `.unwrap()` is the house style.
+    #[test]
+    fn no_verb_unwraps_its_machine_client() {
+        // This crate's own sources only, so a scoped gate that runs
+        // boss-cli runs every file this reads.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        let mut dirs = vec![src.clone()];
+        while let Some(d) = dirs.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    files.push(p);
+                }
+            }
+        }
+        let unwrap =
+            regex::Regex::new(r"machine_client(_with)?\([^;]*?\)\s*\.(unwrap|expect)\(").unwrap();
+        let mut found: Vec<String> = files
+            .iter()
+            .flat_map(|p| {
+                let text = std::fs::read_to_string(p).unwrap();
+                let prod = boss_testing::production_source::production_text(
+                    &boss_testing::production_source::without_comments(&text),
+                )
+                .unwrap();
+                let rel = p.strip_prefix(&src).unwrap().display().to_string();
+                prod.lines()
+                    .enumerate()
+                    .filter(|(_, l)| unwrap.is_match(l))
+                    .map(|(i, _)| format!("{rel}:{}", i + 1))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        found.sort();
+        assert!(
+            found.is_empty(),
+            "a verb unwraps its machine client — use `?`: {found:?}"
+        );
+    }
+
+    /// The target as the refusal names it: scheme and authority only.
+    #[test]
+    fn a_redirect_target_is_named_by_scheme_and_host() {
+        let named = |l: &str| redirect_target(Some(l));
+        assert_eq!(
+            named("https://boss.algedonic.dev/cdn-cgi/access/login?x=1#f").as_deref(),
+            Some("https://boss.algedonic.dev")
+        );
+        assert_eq!(
+            named("http://10.20.0.34:7900/api?t=s").as_deref(),
+            Some("http://10.20.0.34:7900")
+        );
+        // Userinfo is never echoed, a password in it least of all
+        // (backlog 2ee29275, car B's review 83fc0bdf). The literal is
+        // split so the pre-flight's secret scan sees no URL password.
+        let with_userinfo = concat!(
+            "https://operator:",
+            "not-a-secret",
+            "@elsewhere.example/x?q=1"
+        );
+        assert_eq!(
+            named(with_userinfo).as_deref(),
+            Some("https://elsewhere.example")
+        );
+        assert_eq!(
+            named("http://operator@elsewhere.example:8443/").as_deref(),
+            Some("http://elsewhere.example:8443")
+        );
+        // A relative Location names no other host; an unparseable one
+        // is not echoed at all.
+        assert_eq!(named("/login?next=x").as_deref(), None);
+        assert_eq!(named("::not a url::").as_deref(), None);
+        assert_eq!(redirect_target(None), None);
+    }
 
     /// Backlog 5083d6f5, at the wire: the step PUT a `boss prove`
     /// makes must arrive carrying the operator who ran it.

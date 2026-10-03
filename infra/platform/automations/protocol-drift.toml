@@ -1,0 +1,7 @@
+# automation:protocol-drift — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 7 audit-log facts.
+# Signs as platform-admin today: infra/protocol-drift.sh.
+
+[[automation]]
+id = "automation:protocol-drift"
+role = "platform-admin"
+description = 'Compares the live protocols to the authored ones and records the drift (infra/protocol-drift.sh).'

@@ -67,20 +67,16 @@ fn ceo() -> User {
 fn item(id: &str, metadata: serde_json::Value) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).expect("uuid")),
-        kind: "backlog-item".into(),
-        workflow_version: 1,
-        subject: Subject::new("asset", "BOSSNET"),
-        title: format!("item {id}"),
-        owner_id: "emp-david".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: day(2026, 9, 26),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata,
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "backlog-item",
+            Subject::new("asset", "BOSSNET"),
+            format!("item {id}"),
+            "emp-david",
+            Priority::Standard,
+            day(2026, 9, 26),
+        )
     }
 }
 

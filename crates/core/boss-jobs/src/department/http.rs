@@ -50,10 +50,10 @@ use boss_policy_client::CurrentUser;
 use serde_json::{Value, json};
 
 use super::declare::{DepartmentInput, validate_batch};
-use super::readiness::{self, KindReadiness, NewestRetro, NewestTerminal, Part, Readiness};
+use super::readiness::{self, Counts, KindReadiness, NewestRetro, NewestTerminal, Part, Readiness};
 use super::registry::{Department, DepartmentRegistry};
 use super::rules::DispatcherRules;
-use crate::port::{JobFilter, JobsRepository};
+use crate::port::{DepartmentFilter, JobFilter, JobsRepository};
 use crate::registry::WorkflowRegistry;
 use crate::sensors::Sensors;
 use crate::trust::{can_read, is_trusted};
@@ -216,10 +216,26 @@ async fn list(
     }
 }
 
+/// The readiness read's one parameter. `since=<YYYY-MM-DD>` adds, per
+/// kind and for the whole department, how many packets DEPARTED
+/// (closed or cancelled) on or after that day — the counts the weekly
+/// retro takes for its window from this one read, instead of a
+/// terminal report per kind and a page through every packet the week
+/// closed (backlog a22311a1: IT declares 61 kinds and closes ~8,600
+/// packets a week). A date, not a day count: a retro reads a window it
+/// names, on any day. Anything else is a 400, never a read without the
+/// window — the listing learned that from `closed_since` (7f3e871a).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadinessQuery {
+    since: Option<chrono::NaiveDate>,
+}
+
 async fn readiness(
     State(state): State<Arc<DepartmentsApiState>>,
     CurrentUser(user): CurrentUser,
     Path(code): Path<String>,
+    Query(q): Query<ReadinessQuery>,
 ) -> Response {
     if !can_read(&user) {
         return StatusCode::FORBIDDEN.into_response();
@@ -255,12 +271,28 @@ async fn readiness(
     };
 
     // PROTOCOLS: the kinds whose active row declares this department,
-    // each with its packets and newest terminal.
+    // each with its packets and newest terminal — counted over the
+    // packets IN the department by the jobs view's own rule
+    // (`DepartmentFilter`, the filter `GET /api/jobs?department=`
+    // builds), so a declaring kind's packet that names another
+    // department is that department's here too (backlog a22311a1).
+    let protocol_specs = readiness::protocols_of(&specs, &code);
+    let kind_names: Vec<String> = protocol_specs.iter().map(|s| s.kind.clone()).collect();
+    let department_filter = DepartmentFilter {
+        code: code.clone(),
+        declaring_kinds: kind_names.clone(),
+    };
     let mut protocol_rows: Vec<KindReadiness> = Vec::new();
-    for spec in readiness::protocols_of(&specs, &code) {
-        let (packets, open, newest) = match count_and_newest(state.jobs.as_ref(), &spec.kind).await
+    for spec in protocol_specs {
+        let counts = match counts_in_department(
+            state.jobs.as_ref(),
+            Some(&spec.kind),
+            &department_filter,
+            q.since,
+        )
+        .await
         {
-            Ok(t) => t,
+            Ok(c) => c,
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -269,17 +301,49 @@ async fn readiness(
                     .into_response();
             }
         };
+        let newest = match state
+            .jobs
+            .newest_closed_job(&spec.kind, Some(&department_filter))
+            .await
+        {
+            Ok(j) => j.as_ref().map(NewestTerminal::of),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("newest terminal read for kind {} failed: {e}", spec.kind),
+                )
+                    .into_response();
+            }
+        };
         protocol_rows.push(KindReadiness {
             kind: spec.kind.clone(),
             version: spec.version,
             label: spec.label.clone(),
-            packets,
-            open,
+            packets: counts.packets,
+            open: counts.open,
+            departed: counts.departed,
             newest_terminal: newest,
         });
     }
-    let kind_names: Vec<String> = protocol_rows.iter().map(|k| k.kind.clone()).collect();
-    let protocols = Part::judged(!protocol_rows.is_empty(), json!({ "kinds": protocol_rows }));
+    // The whole department beside its kinds: every packet the jobs
+    // view lists, any kind — the declaring kinds' rows above plus the
+    // packets of other kinds that name this department themselves (a
+    // retro, a page audit).
+    let in_department =
+        match counts_in_department(state.jobs.as_ref(), None, &department_filter, q.since).await {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("jobs read for department {code} failed: {e}"),
+                )
+                    .into_response();
+            }
+        };
+    let protocols = Part::judged(
+        !protocol_rows.is_empty(),
+        json!({ "kinds": protocol_rows, "in_department": in_department, "since": q.since }),
+    );
 
     // SENSORS: rows whose readings open one of those kinds.
     let sensors = match state.sensors.as_ref() {
@@ -339,30 +403,44 @@ async fn readiness(
     Json(answer).into_response()
 }
 
-/// `(packets, open, newest terminal)` for one kind — two counted
-/// listings (a `limit=1` page carries the total) and the port's
-/// newest-closed read.
-async fn count_and_newest(
+/// The counts of the packets IN `department` — of one kind, or of any
+/// kind when `kind` is `None` — each a counted listing through the
+/// same `JobFilter` the jobs view narrows on (a `limit=1` page carries
+/// the total). `departed` is counted only for a window, and is `None`
+/// without one.
+async fn counts_in_department(
     jobs: &dyn JobsRepository,
-    kind: &str,
-) -> Result<(i64, i64, Option<NewestTerminal>), crate::port::JobsError> {
-    let all = JobFilter {
-        kind: Some(kind.to_string()),
+    kind: Option<&str>,
+    department: &DepartmentFilter,
+    since: Option<chrono::NaiveDate>,
+) -> Result<Counts, crate::port::JobsError> {
+    let base = || JobFilter {
+        kind: kind.map(str::to_string),
+        department: Some(department.clone()),
         ..Default::default()
     };
-    let (_, packets) = jobs.list_jobs(&all, 1, 0).await?;
+    let (_, packets) = jobs.list_jobs(&base(), 1, 0).await?;
     let open_filter = JobFilter {
-        kind: Some(kind.to_string()),
         status: Some(JobStatus::Open),
-        ..Default::default()
+        ..base()
     };
     let (_, open) = jobs.list_jobs(&open_filter, 1, 0).await?;
-    let newest = jobs
-        .newest_closed_job(kind)
-        .await?
-        .as_ref()
-        .map(NewestTerminal::of);
-    Ok((packets, open, newest))
+    let departed = match since {
+        None => None,
+        Some(since) => {
+            let departed_filter = JobFilter {
+                terminal: Some(true),
+                closed_since: Some(since),
+                ..base()
+            };
+            Some(jobs.list_jobs(&departed_filter, 1, 0).await?.1)
+        }
+    };
+    Ok(Counts {
+        packets,
+        open,
+        departed,
+    })
 }
 
 /// The newest `department-retro` whose `metadata.department` is

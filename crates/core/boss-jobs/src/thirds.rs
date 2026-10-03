@@ -165,10 +165,21 @@ pub struct MachineSummary {
     /// Machines whose state the record cannot tell — "unjudged" on the
     /// HUD. Never folded into idle.
     pub unknown: usize,
+    /// Machines whose record is WITHHELD from this caller by policy
+    /// scope (backlog 1805bac0) — counted apart, never among the
+    /// failed-or-unknown, because a refusal is not trouble. Absent from
+    /// the wire when zero, so a full scope's payload is unchanged.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub withheld: usize,
     pub total: usize,
     /// Every failed and every unknown machine, failed first, then in
     /// region order — each one a link to its own glyph on the map.
     pub failed_or_unknown: Vec<MachineAt>,
+}
+
+/// serde's `skip_serializing_if` for a count only ever sent non-zero.
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// The kinds a region of their OWN reads by kind — the shop floor's runs,
@@ -349,6 +360,7 @@ pub fn machine_summary(regions: &[Region], plant: &[crate::regions::Machine]) ->
         idle: of(MachineState::Idle),
         failed: of(MachineState::Failed),
         unknown: of(MachineState::Unknown),
+        withheld: of(MachineState::Withheld),
         total: all.len(),
         failed_or_unknown: named(MachineState::Failed)
             .chain(named(MachineState::Unknown))
@@ -523,6 +535,10 @@ mod tests {
         let out = regions(&inputs(&status, &[], Some(&[]), Some(&[])));
         let names: Vec<&str> = out.thirds.iter().map(|t| t.third.as_str()).collect();
         assert_eq!(names, ["queue-management", "actors-building", "delivery"]);
+        assert_eq!(
+            row(&out, "queue-management").regions,
+            ["sensors", "receiving", "marshalling"]
+        );
         assert_eq!(
             row(&out, "actors-building").regions,
             ["shop-floor", "gates", "garage"]

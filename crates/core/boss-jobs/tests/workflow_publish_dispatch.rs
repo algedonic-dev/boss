@@ -100,25 +100,9 @@ async fn seed_publish_step(
     // Single active step that will flip to Done in the test.
     let step = Step {
         id: StepId::new(),
-        job_id,
-        kind: "workflow-publish".into(),
-        title: "Publish".into(),
-        spec_slug: None,
-        assignee_id: None,
         status: StepStatus::Active,
-        sort_order: 0,
-        blocked_by: vec![],
-        sign_offs_required: Vec::new(),
-        assurance_required: None,
-        sign_offs: Vec::new(),
-        fields: Vec::new(),
-        completed_on: None,
-        completed_by: None,
-        completed_at: None,
         metadata,
-        notes: None,
-        step_plugin_version: 0,
-        embedded_job: None,
+        ..Step::new(job_id, "workflow-publish", "Publish", 0)
     };
     let step_id = step.id;
     jobs.add_step(&step).await.unwrap();

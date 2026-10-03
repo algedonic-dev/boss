@@ -35,6 +35,17 @@ the instance declares, checks it with `boss tenant check`, and ends
 `delivered` on that check's copied output; landing on tenant main is
 `merge-tenant-main` on David's approval, never a push of the builder's.
 
+A FOURTH, FOR THE REVIEW OF A HELD CAR. `reviewer-rules.md` (backlog
+bc9ef34f, 2026-09-30) serves ship-a-change's `review` step: an
+adversarial read of one trust-boundary car, which ships nothing and so
+runs in the `step` lane with no worktree. It ends on `boss review`
+inside its own run — the record `boss release <car> --review <run>`
+releases on — and it closes its own run on that verdict rather than
+on the car's `review` step, which the conductor completes when the
+car boards. Its rules are not the analyst's because the analyst's
+first rule is "the step is the deliverable": on this step the
+deliverable is the verdict, and completing the step is the train's.
+
 WHICH PROFILES NEED A DOCUMENT IS NOT A LIST HERE (CLAUDE.md 9a): the
 tests in `boss_cli::documents` read the profiles off the platform
 Workflow bundle's `agent` blocks and require a document for each, so a

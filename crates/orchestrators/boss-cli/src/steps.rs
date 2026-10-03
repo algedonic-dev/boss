@@ -45,6 +45,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
 use crate::identity;
+use crate::review_verdict::Releaser;
 
 /// Top-level registration — see `merged::Cmd` for why the variants
 /// live in their verb's module (84f9fbc0).
@@ -182,6 +183,25 @@ pub enum Cmd {
         /// the head, the review, who released it, when, and main — and
         /// the conductor boards the car only while its head is that
         /// head (backlog b7b02024, design 7cedfa29).
+        ///
+        /// THE RUN THAT BUILT THE CAR DOES NOT RELEASE IT, by this form or
+        /// the bare one: a shell whose BOSS_AGENT_RUN is the car's
+        /// agent_run (stamped by the green that filed or last refreshed
+        /// it with a run) is refused before anything is written, and the
+        /// refusal names the road around it (backlog b7b02024 car 3). A
+        /// shell with no run is never refused. Every release, both
+        /// forms, records beside who signed it whether it came from an
+        /// agent's shell or a person's (agent_shell: CLAUDECODE set) and
+        /// the run when one is exported (run). It does NOT tell a
+        /// dispatched builder from the operator session: in the dev pod
+        /// every agent shell shares one process's session markers
+        /// (measured 2026-09-30), and the fix for that is per-actor
+        /// credentials (design 7cedfa29 D7). What holds regardless: a
+        /// review release needs a RELEASE verdict recorded by a run that
+        /// is not the builder's, so a builder's self-release can only act
+        /// on another run's verdict. A person who gated the car inside a
+        /// run of his own runs step 3 below from a shell without that
+        /// variable.
         ///
         /// A HUMAN ALONE, WITH NO AGENT RUNNING (DR rule 62dac114: no dead
         /// end on the operator's path), releases a review-held car in
@@ -368,14 +388,20 @@ pub async fn dispatch(cmd: Cmd) -> Result<()> {
             diagnosis_file: None,
             review: Some(review),
         } => {
-            crate::review_verdict::release(&wire, &car, &review, crate::review_verdict::forge_sha)
-                .await
+            crate::review_verdict::release(
+                &wire,
+                &car,
+                &review,
+                &Releaser::from_env(),
+                crate::review_verdict::forge_sha,
+            )
+            .await
         }
         Cmd::Release {
             car,
             diagnosis_file: None,
             review: None,
-        } => hold(&wire, &car, None).await,
+        } => hold_as(&wire, &car, None, &Releaser::from_env()).await,
         Cmd::Review {
             car,
             verdict,
@@ -862,8 +888,8 @@ pub(crate) fn hold_patch(reason: &str) -> Value {
 /// Through the merge door since e39a9d2a: release used to PUT the
 /// review step's metadata with `hold` left out, clearing by OMISSION —
 /// the one writer the step PUT's drop refusal was measured to break
-/// (refused_2026_09_23 on that packet). The PUT now refuses a metadata
-/// body that omits a stored key; clearing on purpose is a null here.
+/// (refused_2026_09_23 on that packet). The PUT now refuses any
+/// metadata body; clearing on purpose is a null here.
 pub(crate) fn release_patch_body() -> Value {
     json!({ "hold": Value::Null })
 }
@@ -873,9 +899,8 @@ pub(crate) fn release_patch_body() -> Value {
 /// the conductor boards such a car only on a release that names a
 /// review whose verdict is RELEASE at its current head, and holds it
 /// again otherwise (backlog b7b02024, design 7cedfa29 D6). The write is
-/// not refused — a human's road stays as it was until design 7cedfa29
-/// Q1 is built (car 3, behind 62dac114) — but it is not left to be
-/// discovered at the next tick.
+/// not refused for that — only the car's builder run is (car 3) — but
+/// it is not left to be discovered at the next tick.
 pub(crate) fn bare_release_note(review: &Value) -> String {
     let judged = review
         .pointer(&format!("/metadata/{}", boss_jobs::car::HOLD_SHA))
@@ -1009,9 +1034,8 @@ impl Wire {
     }
 
     /// The step's MERGE door: keys land one at a time and an explicit
-    /// null DELETES one. The only door that can clear a key: the PUT
-    /// below refuses a metadata body that omits a stored key
-    /// (e39a9d2a), so clearing by omission is not a thing it does.
+    /// null DELETES one. The only door that writes a key at all: the
+    /// PUT below refuses any metadata body (e39a9d2a).
     async fn patch_step_metadata(&self, job_id: &str, step_id: &str, body: Value) -> Result<()> {
         self.call(
             reqwest::Method::PATCH,
@@ -1385,6 +1409,23 @@ pub(crate) async fn fold(
 /// or nulled to delete it), and the read-back checks the key the same
 /// way the readers do (`stranded::hold_reason`).
 pub(crate) async fn hold(wire: &Wire, car: &str, reason: Option<&str>) -> Result<()> {
+    hold_as(wire, car, reason, &Releaser::default()).await
+}
+
+/// [`hold`], given from the shell `releaser` describes: a bare release
+/// by the car's builder run is refused before the write, the same
+/// refusal the review release makes (`review_verdict::may_release`,
+/// backlog b7b02024 car 3), and a bare release records what it lifted,
+/// who signed it, the run if one is exported, and whether the shell was
+/// an agent's, under
+/// `review_verdict::BARE_RELEASE` (review 5aa91689 N2). A hold is never
+/// refused — putting a brake on is open to anyone.
+pub(crate) async fn hold_as(
+    wire: &Wire,
+    car: &str,
+    reason: Option<&str>,
+    releaser: &Releaser,
+) -> Result<()> {
     if let Some(r) = reason
         && r.trim().is_empty()
     {
@@ -1427,7 +1468,20 @@ pub(crate) async fn hold(wire: &Wire, car: &str, reason: Option<&str>) -> Result
                 );
                 return Ok(());
             }
-            release_patch_body()
+            crate::review_verdict::may_release(&packet, releaser.run())
+                .map_err(|why| anyhow!("{why}"))?;
+            let by = wire
+                .caller_id()
+                .context("an unnamed release is refused before it is sent")?;
+            let at = crate::gate::stamp(boss_clock_client::wall_now());
+            let mut body = release_patch_body();
+            body[crate::review_verdict::BARE_RELEASE] = crate::review_verdict::bare_release_record(
+                already.as_deref().unwrap_or_default(),
+                by,
+                &at,
+                releaser,
+            );
+            body
         }
     };
     let jid = crate::envelope::job_id(&packet).context("the car has no id")?;
@@ -1918,8 +1972,8 @@ pub(crate) fn releasable<'a>(packet: &'a Value, slug: &str) -> Result<&'a Value,
 /// The metadata merge body: the run edge CLEARED, and one evidence
 /// object saying who took the step back, from which run, and why.
 ///
-/// THE NULL IS THE WHOLE POINT. `update_step` refuses a PUT whose
-/// metadata omits a stored key (e39a9d2a; it carried `agent_run`
+/// THE NULL IS THE WHOLE POINT. `update_step` refuses a PUT that
+/// carries any metadata (e39a9d2a; it carried `agent_run`
 /// forward on omission before that, b91a2103), so the only door that
 /// can clear the edge is `PATCH .../steps/{id}/metadata`, where an
 /// explicit null deletes the key. Leaving a dead run named on a freed
@@ -2667,23 +2721,16 @@ mod tests {
                 else {
                     return ("404 Not Found", "step not found".into());
                 };
-                // THE STEP PUT CARRIES NO METADATA — the END STATE of
-                // design 93d2bddb (e39a9d2a), one stage stricter than the
-                // live server. Live today, a step PUT refuses only a
-                // metadata body that OMITS a stored key (stage 1, pinned
-                // by `a_step_put_that_drops_a_stored_key_is_refused`);
-                // the decided end state refuses ANY metadata body, and
-                // the tighten is one block in `update_step` once every
-                // writer has moved to the merge door. This stub refuses
-                // the end state already, so every verb it drives —
-                // triage, fold, step complete, release — is pinned to
-                // the form that survives the tighten, and a verb that
-                // slid back to a read-merge-write PUT fails HERE rather
-                // than on the day the tighten lands. Judged on an open
-                // step only, as the server does: a terminal one answers
-                // with the frozen-row rule below.
-                if sent.get("metadata").is_some()
-                    && !matches!(step["status"].as_str(), Some("completed" | "skipped"))
+                // THE STEP PUT CARRIES NO METADATA — design 93d2bddb's
+                // decided end state, live since Stage 2's last car
+                // (e39a9d2a; pinned by
+                // `a_step_put_carrying_metadata_is_refused`), judged by
+                // the server's own pure rule. A terminal step whose
+                // metadata the body would CHANGE answers with the
+                // frozen-row rule below instead, as the server does.
+                let terminal = matches!(step["status"].as_str(), Some("completed" | "skipped"));
+                if boss_jobs::step_metadata_write::put_carries_metadata(&sent)
+                    && !(terminal && sent.get("metadata") != Some(&step["metadata"]))
                 {
                     return (
                         "409 Conflict",
@@ -3280,7 +3327,7 @@ mod tests {
         assert!(s.puts.lock().unwrap().is_empty());
 
         // A release with no review recorded yet is refused.
-        let err = release(&wire, "fix/held", RUN, forge(H1))
+        let err = release(&wire, "fix/held", RUN, &Releaser::default(), forge(H1))
             .await
             .expect_err("no verdict yet");
         assert!(
@@ -3299,7 +3346,7 @@ mod tests {
         .await
         .expect("the reviewer records RELEASE at H1");
         // The head moved to H2 after the review: no release of H2.
-        let err = release(&wire, "fix/held", RUN, forge(H2))
+        let err = release(&wire, "fix/held", RUN, &Releaser::default(), forge(H2))
             .await
             .expect_err("reviewed H1, head is H2");
         assert!(err.to_string().contains("reviewed 11111111"), "{err}");
@@ -3309,7 +3356,7 @@ mod tests {
             "a refused release leaves the hold on"
         );
 
-        release(&wire, "fix/held", RUN, forge(H1))
+        release(&wire, "fix/held", RUN, &Releaser::default(), forge(H1))
             .await
             .expect("released on the verdict at the head it read");
         let md = s.packets.lock().unwrap()[0]["steps"][1]["metadata"].clone();
@@ -3324,6 +3371,124 @@ mod tests {
             md[boss_jobs::car::HOLD_SHA],
             json!(H1),
             "the judged head stays"
+        );
+    }
+
+    /// CAR 3 (backlog b7b02024, design b08725c2 row A): both release
+    /// forms refuse the run that gated the car — the review release even
+    /// on a verdict another run recorded, the bare release of any hold —
+    /// before anything is written, and the hold stays on. Any other run
+    /// releases, and the record names the run that did.
+    #[tokio::test]
+    async fn the_run_that_gated_a_held_car_releases_it_by_neither_form() {
+        use crate::review_verdict::{record, release};
+        const RUN: &str = "5eed5eed-0000-4000-8000-000000000000";
+        const BUILDER: &str = "b0b0b0b0-0000-4000-8000-000000000000";
+        const H1: &str = "1111111111111111111111111111111111111111";
+        let mut held = car(
+            "ready",
+            json!({ "hold": "area policy", boss_jobs::car::HOLD_SHA: H1 }),
+        );
+        held["metadata"]["agent_run"] = json!(BUILDER);
+        let reviewer = json!({"id": RUN, "kind": "agent-run", "status": "open", "metadata": {}});
+        let s = stub(vec![held, reviewer]).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        const MAIN: &str = "3333333333333333333333333333333333333333";
+        let forge = |r: &str| -> Result<String> {
+            Ok(if r == "refs/heads/main" { MAIN } else { H1 }.to_string())
+        };
+        record(&wire, "fix/held", "release", "", Some(RUN), forge)
+            .await
+            .expect("the reviewer records RELEASE at H1");
+        let writes = s.puts.lock().unwrap().len();
+
+        let builder = Releaser {
+            run: Some(BUILDER.into()),
+            ..Releaser::default()
+        };
+        let err = release(&wire, "fix/held", RUN, &builder, forge)
+            .await
+            .expect_err("the builder releasing on another run's verdict");
+        assert!(err.to_string().contains("REFUSED"), "{err}");
+        assert!(err.to_string().contains(BUILDER), "{err}");
+        let err = hold_as(&wire, "fix/held", None, &builder)
+            .await
+            .expect_err("the builder's bare release");
+        assert!(err.to_string().contains("REFUSED"), "{err}");
+        assert_eq!(s.puts.lock().unwrap().len(), writes, "nothing written");
+        assert!(
+            boss_jobs::stranded::hold_reason(&s.packets.lock().unwrap()[0]["steps"][1]["metadata"])
+                .is_some(),
+            "a refused release leaves the hold on"
+        );
+
+        // An agent's shell with no run exported (a builder's later shell,
+        // or the operator session — the record cannot tell which, review
+        // c91ba45b) is not refused; the record says it was an agent's
+        // shell and names no run.
+        let agent = Releaser {
+            run: None,
+            agent_shell: true,
+        };
+        release(&wire, "fix/held", RUN, &agent, forge)
+            .await
+            .expect("a shell with no run is not refused");
+        let md = s.packets.lock().unwrap()[0]["steps"][1]["metadata"].clone();
+        assert!(md.get("hold").is_none(), "{md}");
+        let rec = &md[boss_jobs::car::RELEASE];
+        assert_eq!(rec["agent_shell"], json!(true), "{md}");
+        assert!(rec.get("run").is_none(), "{md}");
+        assert!(rec.get("child_session").is_none(), "{md}");
+    }
+
+    /// Another run releases, and is named; and the BARE form writes its
+    /// own record too (review 5aa91689 N2) — under `hold_released`, not
+    /// `release`, which the conductor reads as a review's release.
+    #[tokio::test]
+    async fn every_release_records_the_run_and_the_shell_that_gave_it() {
+        use crate::review_verdict::{BARE_RELEASE, record, release};
+        const RUN: &str = "5eed5eed-0000-4000-8000-000000000000";
+        const H1: &str = "1111111111111111111111111111111111111111";
+        let held = car(
+            "ready",
+            json!({ "hold": "area policy", boss_jobs::car::HOLD_SHA: H1 }),
+        );
+        let reviewer = json!({"id": RUN, "kind": "agent-run", "status": "open", "metadata": {}});
+        let s = stub(vec![held, reviewer]).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        let forge = |_: &str| -> Result<String> { Ok(H1.to_string()) };
+        record(&wire, "fix/held", "release", "", Some(RUN), forge)
+            .await
+            .expect("the reviewer records RELEASE at H1");
+        let other = Releaser {
+            run: Some(RUN.into()),
+            agent_shell: true,
+        };
+        release(&wire, "fix/held", RUN, &other, forge)
+            .await
+            .expect("another run releases on the verdict");
+        let md = s.packets.lock().unwrap()[0]["steps"][1]["metadata"].clone();
+        assert_eq!(md[boss_jobs::car::RELEASE]["run"], json!(RUN), "{md}");
+        assert_eq!(md[boss_jobs::car::RELEASE]["agent_shell"], json!(true));
+
+        // A person's shell lifts an operator brake: recorded, unrefused.
+        hold(&wire, "fix/held", Some("waiting on a kubectl delete"))
+            .await
+            .expect("holds");
+        hold_as(&wire, "fix/held", None, &Releaser::default())
+            .await
+            .expect("a person's shell releases");
+        let md = s.packets.lock().unwrap()[0]["steps"][1]["metadata"].clone();
+        assert!(md.get("hold").is_none(), "{md}");
+        let lifted = &md[BARE_RELEASE];
+        assert_eq!(lifted["hold"], json!("waiting on a kubectl delete"), "{md}");
+        assert_eq!(lifted["by"], json!("claude@algedonic.dev"), "{md}");
+        assert_eq!(lifted["agent_shell"], json!(false), "{md}");
+        assert!(lifted["at"].as_str().is_some_and(|a| !a.is_empty()), "{md}");
+        assert_eq!(
+            md[boss_jobs::car::RELEASE]["run"],
+            json!(RUN),
+            "the review's release is left as it was"
         );
     }
 
@@ -3375,7 +3540,12 @@ mod tests {
                 puts[1].0,
                 "/c6bd173e-3dc9-426f-8fff-866a3b2a6117/steps/s-review/metadata"
             );
-            assert_eq!(puts[1].1, json!({ "hold": null }));
+            assert_eq!(puts[1].1["hold"], json!(null), "{:?}", puts[1].1);
+            assert_eq!(
+                puts[1].1[crate::review_verdict::BARE_RELEASE]["hold"],
+                json!("waiting on a kubectl delete"),
+                "the bare release records what it lifted"
+            );
         }
         let md = s.packets.lock().unwrap()[0]["steps"][1]["metadata"].clone();
         assert!(md.get("hold").is_none(), "{md}");
@@ -4047,9 +4217,9 @@ mod tests {
     }
 
     /// THE CLEAR GOES THROUGH THE MERGE DOOR, AND IT HAS TO.
-    /// `update_step` REFUSES a PUT whose metadata lacks a stored key
+    /// `update_step` REFUSES a PUT that carries any metadata
     /// (e39a9d2a, pinned by
-    /// `a_step_put_that_drops_a_stored_key_is_refused`; before that it
+    /// `a_step_put_carrying_metadata_is_refused`; before that it
     /// carried `agent_run` forward on omission, b91a2103, which left
     /// the dead run pinned in silence). `PATCH .../steps/{id}/metadata`
     /// deletes it on an explicit null, and is the only door that can.

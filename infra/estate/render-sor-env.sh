@@ -46,6 +46,15 @@
 #                             the retired second stack's ML API, and
 #                             seven packets said ok while the record's
 #                             risk scores stayed empty (backlog 9599babc).
+#   BOSS_MACHINE_TOKEN_HOSTS  the hosts a Rust client may stamp the machine
+#                             token on, besides loopback (the only
+#                             default; no Service name is one, review
+#                             of 54d9a23a) — the hosts of sor_url and
+#                             sor_cluster_url, DERIVED (backlog
+#                             2ee29275). Every unit that reads this file
+#                             hands it to boss-core's machine_token, and
+#                             a CLI run by hand reads it from here when
+#                             the variable is unset.
 #
 # Backlog 5222163e (audit H10): until this file, the address was a
 # literal in 47 files and the forge's in 62.
@@ -107,6 +116,24 @@ case "$sor_url" in
         exit 1 ;;
 esac
 
+# The hosts that may receive the machine token (backlog 2ee29275): the
+# record's host in each spelling, no scheme, no port, no path. boss-core
+# reads the list at RUNTIME (machine_token::HOSTS_ENV) and never compiles
+# one in, so an adopter's binary stamps its own estate and not this one.
+# A spelling whose host cannot be cut out is refused here, like a missing
+# key: an empty entry would narrow the token to loopback in silence.
+host_of() {
+    local h="${1#*://}"
+    h="${h%%/*}"
+    h="${h%%:*}"
+    if [ -z "$h" ] || [ "$h" = "$1" ]; then
+        echo "render-sor-env: cannot read a host out of \"$1\" in $SOURCE — the machine token's host list would be wrong; refusing to render" >&2
+        exit 1
+    fi
+    printf '%s' "$h"
+}
+token_hosts="$(host_of "$sor_url"),$(host_of "$sor_cluster_url")"
+
 render() {
     printf '# /etc/boss/sor.env — rendered from infra/estate/estate.toml by the host'"'"'s install.\n'
     printf '# Do not edit: the next converge rewrites it. Change the source.\n'
@@ -119,6 +146,7 @@ render() {
     printf 'BOSS_MIRROR_URL=%s\n' "$mirror_url"
     printf 'BOSS_MIRROR_SLUG=%s\n' "$mirror_slug"
     printf 'BOSS_ML_API_URL=%s\n' "$ml_url"
+    printf 'BOSS_MACHINE_TOKEN_HOSTS=%s\n' "$token_hosts"
 }
 
 case "${1:-}" in

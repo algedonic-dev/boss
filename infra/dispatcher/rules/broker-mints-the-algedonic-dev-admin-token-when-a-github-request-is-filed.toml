@@ -58,15 +58,15 @@
 #
 # WHICH REQUESTS. `jobs.job.created` carries the serialized Job, so its
 # `metadata.verb` is the request's verb. The list below is every verb in
-# infra/ops/verbs/ whose argv runs infra/forge/github-act.sh — the three
-# writes and their three plan verbs — pinned equal to that directory by
+# infra/ops/verbs/ whose argv runs infra/forge/github-act.sh — the four
+# writes and their four plan verbs — pinned equal to that directory by
 # crates/core/boss-dispatcher/tests/github_app_installation_token_rules.rs,
 # so a GitHub verb added there without a line here fails the gate rather
 # than acting with a token nobody minted. `publish-github-pr` is not one:
 # it pushes through its own publish credential.
 #
 # WHICH ORGANISATION. Only a request whose first argument — the owner, in
-# all six GitHub verbs — is `algedonic-dev`, exactly as github-act.sh
+# all eight GitHub verbs — is `algedonic-dev`, exactly as github-act.sh
 # selects its slot (`metadata.args.0`). Until 2026-09-29 a request naming
 # another owner minted this organisation's admin token, which then lived
 # its hour unused, since the verb reads that other owner's slot (review
@@ -101,9 +101,13 @@ nothing: it fills one Secret and records credential.installed. Design
 # v2 (backlog 732c3cf9, 2026-09-29): the org filter (#808) and
 # `request_id` (#819) were edited in at v1, so the seed kept the v1 row
 # and neither was live. A content edit is a version bump.
-version = 2
+# v3 (backlog e727fcfd, 2026-09-29): the fourth act, disable-actions —
+# github-disable-actions and its plan verb plan-a-github-actions-disable.
+# Its endpoint (PUT /repos/{o}/{r}/actions/permissions) needs
+# administration:write, which this token already carries.
+version = 3
 on_event = "jobs.job.created"
-when = 'kind = "ops-request" AND metadata.args.0 = "algedonic-dev" AND (metadata.verb = "github-create-repository" OR metadata.verb = "github-delete-refs" OR metadata.verb = "github-set-branch-protection" OR metadata.verb = "plan-a-github-repository" OR metadata.verb = "plan-a-github-ref-delete" OR metadata.verb = "plan-a-github-branch-protection")'
+when = 'kind = "ops-request" AND metadata.args.0 = "algedonic-dev" AND (metadata.verb = "github-create-repository" OR metadata.verb = "github-delete-refs" OR metadata.verb = "github-set-branch-protection" OR metadata.verb = "github-disable-actions" OR metadata.verb = "plan-a-github-repository" OR metadata.verb = "plan-a-github-ref-delete" OR metadata.verb = "plan-a-github-branch-protection" OR metadata.verb = "plan-a-github-actions-disable")'
 [[rule.do]]
 handler = "credential.rotate.github-app-installation"
 args = { phase = "\"refresh\"", refresh_within_minutes = "\"59\"", secret_namespace = "\"boss\"", secret_name = "\"github-app-algedonic-dev\"", secret_key = "\"token\"", credential_id = "\"github-app-algedonic-dev\"", verify_repo = "\"algedonic-dev/boss\"", permissions = "\"administration:write,contents:write,metadata:read\"", request_id = "id" }

@@ -20,7 +20,9 @@
 //! car was green first, so this covers it). A run that is not green
 //! keeps its target: a red gate's rescue rebuilds in that worktree, and
 //! a warm target is the difference between seconds and a cold build.
-//! The report says so and names the second `--report` that frees it.
+//! The report says so, and says the gate's waiter frees it at the green
+//! below — it used to name a second `--report`, which nothing sends
+//! since the landing rule lands the first one (backlog bb32b2a0).
 //!
 //! AND AT THE GREEN ITSELF (backlog a3355e14, decided 2026-09-24). The
 //! report is not the green: a background builder's run is reported by
@@ -257,8 +259,8 @@ pub(crate) fn plan(run: &Value, porcelain: Option<&str>, root: &Path) -> Plan {
     if !is_green(run) {
         return Plan::Keep(
             "the run is not green (`building` has not closed `gated`), so its target stays \
-             for the rescue — a red gate rebuilds in that worktree; run --report again once \
-             the gate is green and it is freed"
+             for the rescue — a red gate rebuilds in that worktree; the gate's waiter frees it \
+             when it sees the green, and no second --report is owed"
                 .into(),
         );
     }

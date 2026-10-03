@@ -23,7 +23,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use boss_core::primitives::{Class, ClassRef};
 use boss_core::publish::KeptRow;
-use boss_policy_client::{Action, CurrentUser, PolicyClient, Resource};
+use boss_policy_client::{CurrentUser, Pair, PolicyClient, controls};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -179,7 +179,7 @@ async fn update_class(
     Path((subject_kind, code)): Path<(String, String)>,
     Json(body): Json<ClassInput>,
 ) -> Response {
-    let stamp = match authorize(&state, &user, Action::Update).await {
+    let stamp = match authorize(&state, &user, controls::UPDATE_CLASS).await {
         Ok(stamp) => stamp,
         Err(refusal) => return refusal,
     };
@@ -222,7 +222,7 @@ async fn retire_class(
     CurrentUser(user): CurrentUser,
     Path((subject_kind, code)): Path<(String, String)>,
 ) -> Response {
-    let stamp = match authorize(&state, &user, Action::Retire).await {
+    let stamp = match authorize(&state, &user, controls::RETIRE_CLASS).await {
         Ok(stamp) => stamp,
         Err(refusal) => return refusal,
     };
@@ -275,7 +275,7 @@ async fn backfill_declared(
         Ok(asked) => asked,
         Err(why) => return (StatusCode::UNPROCESSABLE_ENTITY, why).into_response(),
     };
-    let stamp = match authorize(&state, &user, Action::Create).await {
+    let stamp = match authorize(&state, &user, controls::CREATE_CLASS).await {
         Ok(stamp) => stamp,
         Err(refusal) => return refusal,
     };
@@ -283,7 +283,7 @@ async fn backfill_declared(
     // both (review of car 8778f12f, finding 4): a Create-only grant must
     // not be a way to put a `class.updated` in the log.
     if matches!(asked, Asked::Named(_))
-        && let Err(refusal) = authorize(&state, &user, Action::Update).await
+        && let Err(refusal) = authorize(&state, &user, controls::UPDATE_CLASS).await
     {
         return refusal;
     }
@@ -497,15 +497,11 @@ impl From<ClassInput> for Class {
 async fn authorize(
     state: &ClassesApiState,
     user: &boss_policy_client::User,
-    action: Action,
+    control: Pair,
 ) -> Result<boss_core::publisher::EventStamp, Response> {
-    let actor = boss_policy_client::writes::require_registry_write(
-        state.policy.as_ref(),
-        user,
-        action,
-        Resource::class(),
-    )
-    .await?;
+    let actor =
+        boss_policy_client::writes::require_registry_write(state.policy.as_ref(), user, control)
+            .await?;
     Ok(boss_core::publisher::EventStamp::new("classes", actor))
 }
 
@@ -520,7 +516,7 @@ async fn batch_upsert(
     CurrentUser(user): CurrentUser,
     Json(rows): Json<Vec<ClassInput>>,
 ) -> Response {
-    let stamp = match authorize(&state, &user, Action::Create).await {
+    let stamp = match authorize(&state, &user, controls::CREATE_CLASS).await {
         Ok(stamp) => stamp,
         Err(refusal) => return refusal,
     };
@@ -576,7 +572,7 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::Request;
     use boss_core::primitives::Class;
-    use boss_policy_client::Scope;
+    use boss_policy_client::{Action, Resource, Scope};
     use serde_json::{Value, json};
     use tower::ServiceExt;
 

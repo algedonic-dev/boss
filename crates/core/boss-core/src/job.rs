@@ -386,6 +386,26 @@ pub struct StepField {
     pub writer: Option<String>,
 }
 
+impl StepField {
+    /// Start with the same contract as a registry field authored with
+    /// only its name and type. A fixture can override the constraints it
+    /// exercises without copying every later serde default (caa2acc9 D1).
+    pub fn new(name: impl Into<String>, field_type: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            field_type: field_type.into(),
+            required: false,
+            filled_by: FilledBy::default(),
+            item_keys: Vec::new(),
+            covers: None,
+            binds: None,
+            item_value_max_bytes: None,
+            item_one_of: Vec::new(),
+            writer: None,
+        }
+    }
+}
+
 /// Who supplies a step field's value — the enforcement point follows
 /// the party who can actually fix an omission.
 ///
@@ -1105,6 +1125,54 @@ mod tests {
     }
 
     #[test]
+    fn step_field_constructor_matches_legacy_serde_defaults() {
+        for (name, field_type) in [
+            ("scheduled_at", "date-time"),
+            ("questions", "array"),
+            ("région", "tenant-choice"),
+        ] {
+            let legacy: StepField =
+                serde_json::from_value(serde_json::json!({"name":name,"field_type":field_type}))
+                    .unwrap();
+            let created = StepField::new(name, field_type);
+            assert_eq!(created, legacy);
+            assert_eq!(
+                serde_json::to_value(created).unwrap(),
+                serde_json::to_value(legacy).unwrap()
+            );
+        }
+        let created = StepField::new(String::from("owned"), String::from("string"));
+        assert_eq!(created.name, "owned");
+        assert_eq!(created.field_type, "string");
+    }
+
+    #[test]
+    fn step_field_constructor_base_keeps_explicit_protocol_constraints() {
+        let declared = StepField {
+            required: true,
+            filled_by: FilledBy::Filer,
+            item_keys: vec!["anchor".into(), "title".into()],
+            covers: Some("questions".into()),
+            binds: Some("exhibits".into()),
+            item_value_max_bytes: Some(262_144),
+            item_one_of: vec!["html".into(), "file_ref".into()],
+            writer: Some("runner:ops".into()),
+            ..StepField::new("resolutions", "array")
+        };
+        let legacy: StepField = serde_json::from_value(serde_json::json!({
+            "name":"resolutions", "field_type":"array", "required":true, "filled_by":"filer",
+            "item_keys":["anchor","title"], "covers":"questions", "binds":"exhibits",
+            "item_value_max_bytes":262144, "item_one_of":["html","file_ref"], "writer":"runner:ops"
+        }))
+        .unwrap();
+        assert_eq!(declared, legacy);
+        assert_eq!(
+            serde_json::to_value(declared).unwrap(),
+            serde_json::to_value(legacy).unwrap()
+        );
+    }
+
+    #[test]
     fn step_field_filled_by_defaults_to_executor_when_absent() {
         // Every StepField written before `filled_by` existed — TOML
         // seeds, JSON registry rows, STEP_CREATED payloads in the
@@ -1147,16 +1215,9 @@ mod tests {
     #[test]
     fn step_field_filled_by_round_trips_kebab_case() {
         let f = StepField {
-            name: "markdown".into(),
-            field_type: "string".into(),
             required: true,
             filled_by: FilledBy::Filer,
-            item_keys: Vec::new(),
-            covers: None,
-            binds: None,
-            item_value_max_bytes: None,
-            item_one_of: Vec::new(),
-            writer: None,
+            ..StepField::new("markdown", "string")
         };
         let json = serde_json::to_value(&f).unwrap();
         assert_eq!(json["filled_by"], serde_json::json!("filer"));

@@ -115,6 +115,15 @@ const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
          packet kind has nothing of it to count.",
     ),
     (
+        "broker-advances-the-machine-token-rotation",
+        "runs `credential.rotate.self-issued` with phase = advance over rotation packets \
+         already scoped for boss-machine-token (design 6805c764, car 3); it advances those \
+         and files nothing, so on a quarter-hour with no open rotation it produces NOTHING, \
+         and that zero is the healthy reading. The packets it advances are \
+         rotate-a-credential, opened by an operator, not by this rule — the same reason \
+         broker-revokes-the-cloudflare-tunnel-daily stands here.",
+    ),
+    (
         "sensors-poll-every-5-minutes",
         "runs `sensor.poll`, which reads every declared sensor's SOURCE and opens a packet \
          of the kind the SENSOR ROW declares only when the source recorded something new \
@@ -181,6 +190,15 @@ const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
          held it produces NOTHING, and that zero is the healthy reading; what it files is an \
          alarm keyed by control, not a packet of a kind a sweep could count. It is itself the \
          watch on a state no event reports.",
+    ),
+    (
+        "policy-check-refusals-are-read-hourly",
+        "runs `policy.check.refusals.alarm`, which reads the policy check's refusal tally and \
+         files one urgent backlog-item alarm when a service's Read on policy-rule has lapsed, \
+         and one when the tally overflowed (backlog b8e75382 R3), withdrawing each once a read \
+         no longer shows it. On an hour with no lapse it produces NOTHING, and that zero is the \
+         healthy reading; what it files is an alarm keyed by finding, not a packet of a kind a \
+         sweep could count. It is itself the watch on a warn no event reports.",
     ),
     (
         "a-flight-past-its-period-is-an-alarm",

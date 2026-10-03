@@ -386,6 +386,75 @@ async fn inventory_item_received_rebuilds_gl_inert_fact() {
     assert_eq!(count, 1, "second rebuild reconstructs no duplicate");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn inventory_item_consume_recorded_rebuilds_gl_inert_fact() {
+    // A consume that drained no value writes the GL-inert
+    // `finance.inventory.consumed` marker in-tx — the guard a redelivery
+    // is refused by (backlog 55f69172) — and records
+    // `inventory.item.consume_recorded` carrying its payload. The inert
+    // pass reconstructs the identical fact from the log, keyed
+    // `(inventory_consume, source_id)`, dated `consumed_on`, posting
+    // nothing.
+    let db = TestDb::new().await;
+
+    let payload = serde_json::json!({
+        "source_id": "step-43:ING-YEAST-US05",
+        "part_sku": "ING-YEAST-US05",
+        "qty": 3,
+        "consumed_on": "2026-06-02",
+    });
+    insert_audit_event(
+        &db,
+        "inventory.item.consume_recorded",
+        "2026-06-02T08:00:00Z".parse().unwrap(),
+        "inventory",
+        &payload,
+    )
+    .await;
+
+    let report = rebuild_facts(&db.pool).await.unwrap();
+    assert_eq!(report.events_scanned, 0, "kind is NOT in the registry pass");
+    assert_eq!(report.facts_written, 1, "the inert pass reconstructs it");
+
+    let row = sqlx::query(
+        "SELECT id, kind, source_table, happened_on, created_by, payload \
+         FROM financial_facts WHERE source_id = 'step-43:ING-YEAST-US05'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let fact_id: Uuid = row.get("id");
+    let kind: String = row.get("kind");
+    let source_table: String = row.get("source_table");
+    let happened_on: chrono::NaiveDate = row.get("happened_on");
+    let created_by: String = row.get("created_by");
+    let stored_payload: Value = row.get("payload");
+    assert_eq!(kind, "finance.inventory.consumed");
+    assert_eq!(source_table, "inventory_consume");
+    assert_eq!(happened_on.to_string(), "2026-06-02");
+    assert_eq!(created_by, "inventory");
+    assert_eq!(stored_payload, payload);
+    assert_eq!(
+        fact_id,
+        boss_ledger::deterministic_fact_id(
+            "finance.inventory.consumed",
+            "inventory_consume",
+            "step-43:ING-YEAST-US05"
+        ),
+        "the id the live in-tx write mints"
+    );
+
+    let je_report = boss_ledger::rebuild(&db.pool).await.unwrap();
+    assert!(je_report.is_balanced());
+    let (je_count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*)::bigint FROM gl_journal_entries WHERE fact_id = $1")
+            .bind(fact_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(je_count, 0, "finance.inventory.consumed posts nothing");
+}
+
 // There is deliberately no `commerce.invoice.paid` →
 // `finance.invoice.paid` projection test: that rule was removed from
 // `gl_fact_projection_rules` (see the rationale in schema/40-ledger.sql) because

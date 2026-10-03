@@ -25,6 +25,9 @@ export const ROUTES: ReadonlyArray<string> = [
   // User Experiences perspective — bare / is the public home alias; the
   // operator surfaces are re-rooted under /ux/*.
   '/', '/ux/me', '/ux/inbox', '/ux/views', '/ux/jobs', '/ux/accounts', '/ux/vendors', '/ux/people', '/ux/parts',
+  // Approved company orientation (d4dada70, 2026-10-02): real registry
+  // regions, one connected IT example. All shared crawls exercise it.
+  '/map',
   // An employee's page — the persona's own row, which _smokeMocks.ts
   // seeds at EMPLOYEE_DETAIL (backlog 1a83fe98). Until then only
   // employee-page-roster-read.mocked.spec.ts checked what it says when

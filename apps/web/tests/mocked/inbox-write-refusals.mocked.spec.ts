@@ -19,7 +19,7 @@
 // the two must not look alike.
 
 import { expect, test, type Page, type Route } from './_test';
-import { installApiFloor, servePeopleRows } from './_smokeMocks';
+import { inboxPage, installApiFloor, servePeopleRows } from './_smokeMocks';
 import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
 
 const PATH = ROUTE_CATALOG.inbox.path;
@@ -54,12 +54,12 @@ async function inboxMocks(page: Page): Promise<{ read: () => boolean; markRead: 
     setInterval(() => document.querySelector('bun-hmr')?.remove(), 200);
   });
   await installApiFloor(page);
-  await page.route(/\/api\/people$/, (r) => json(r, [EMP]));
+  await page.route(/\/api\/people\/names$/, (r) => json(r, [{ id: EMP.id, name: EMP.name, role: EMP.role }]));
   await servePeopleRows(page, [EMP]);
   await page.route(/\/api\/session$/, (r) =>
     json(r, { username: 'david', employee_id: EMP.id, role: 'platform-admin' }));
   await page.route(/\/api\/messages\/inbox\//, (r) =>
-    json(r, [{ ...MSG, read_at: read ? '2026-08-20T11:00:00Z' : null }]));
+    json(r, inboxPage([{ ...MSG, read_at: read ? '2026-08-20T11:00:00Z' : null }], r.request().url())));
   return { read: () => read, markRead: () => { read = true; } };
 }
 

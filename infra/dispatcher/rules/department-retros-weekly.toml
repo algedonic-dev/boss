@@ -65,10 +65,10 @@
 # `protocols.has = true`, and records every department it skipped, with
 # the reason, as `departments_skipped` on the protocol-retro it opens in
 # the same firing: the platform's review of its own protocols is where
-# this rule's choices are read. `open_without_protocol` is the one
-# exemption: IT, whose platform workflows carry no department until
-# a8458043 lands, and whose retro reads the agent work profile
-# (2f23f4c6). Delete the arg when a8458043 lands and IT reads true.
+# this rule's choices are read. No department is exempt: IT was, by an
+# `open_without_protocol` arg, until a8458043 stamped IT onto its 61
+# platform workflows and its readiness read true (backlog ab6861a1,
+# 2026-10-01, deleted the arg and the handler's half of it).
 #
 # The silence sweep derives this rule's platform cadence from these
 # args (`cadence_roster::clock_cadences` reads `retro.open` the way it
@@ -90,8 +90,10 @@ this is one rule and not one per department.
 # v2 (backlog 732c3cf9, 2026-09-29): `open_without_protocol` (#753) was
 # edited in at v1, so the seed kept the v1 row and it was not live. A
 # content edit is a version bump.
-version = 2
+# v3 (backlog ab6861a1, 2026-10-01): `open_without_protocol` deleted —
+# IT declares protocols now, so it opens like every other department.
+version = 3
 schedule = { cadence = "weekly", anchor_date = "2026-09-21" }
 [[rule.do]]
 handler = "retro.open"
-args = { department_kind = "\"department-retro\"", platform_kind = "\"protocol-retro\"", platform_subject = "\"infra/protocol-retro\"", open_without_protocol = "\"it\"" }
+args = { department_kind = "\"department-retro\"", platform_kind = "\"protocol-retro\"", platform_subject = "\"infra/protocol-retro\"" }

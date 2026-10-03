@@ -11,28 +11,35 @@
 //! records that caller as `changed_by` (backlog 42c25542; see
 //! [`authorize`]).
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Extension, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
 
-use boss_policy_client::CurrentUser;
 use boss_policy_client::engine::PolicyEngine;
 use boss_policy_client::port::{PolicyError, PolicyRepository};
 use boss_policy_client::types::{
     Action, PolicyRule, Resource, User, UserOverride, refuse_ambiguous_role, rule_id,
 };
+use boss_policy_client::{CurrentUser, Pair, controls};
 
 use crate::authority::{self, Holdings};
+use crate::check_mode::{self, Arm, CheckMode, Mode};
 
 pub struct PolicyApiState<R: PolicyRepository> {
     pub repo: Arc<R>,
     pub engine: Arc<PolicyEngine<R>>,
+    /// What `/check` does with F7's two open arms — `off` as shipped
+    /// (backlog b8e75382, design b08725c2 row D). The service binary
+    /// mounts it from its file ([`CheckMode::mount`]); a router built in
+    /// a test names its mode ([`CheckMode::fixed`]).
+    pub check_mode: Arc<CheckMode>,
 }
 
 pub fn router<R: PolicyRepository + 'static>(state: PolicyApiState<R>) -> Router {
@@ -40,6 +47,7 @@ pub fn router<R: PolicyRepository + 'static>(state: PolicyApiState<R>) -> Router
     Router::new()
         .route("/api/policy/health", get(health))
         .route("/api/policy/check", post(check::<R>))
+        .route(check_mode::REFUSALS_PATH, get(check_refusals::<R>))
         .route(
             "/api/policy/rules",
             get(list_rules::<R>).post(post_rule::<R>),
@@ -92,22 +100,22 @@ async fn health() -> Json<boss_core::startup::HealthResponse> {
 // anyone else only to a holder of Read on `policy-rule` at scope all,
 // the authority to read the table those answers come from.
 //
-// `/check` takes the same bound WHENEVER the request is signed (backlog
-// 5a914364 S1): the gateway always sets `x-boss-user` on a session's
-// request, so a session asking about someone else is judged like the
-// list. An UNSIGNED `/check` stays open for now. Every service asked it
-// through `ReqwestPolicyClient` with no `x-boss-user` of its own, so a
-// bound there would have denied every policy check in the estate; since
-// 2026-09-29 the client signs every check as its service
-// (`User::service`, at platform-admin, which the signed arm admits —
-// `a_check_signed_as_a_service_is_answered_about_anyone` — and which,
-// should that grant be retired, is still answered, logged, rather than
-// refused: `a_retired_policy_read_does_not_lock_the_services_out`,
-// hold F1 of review b8e7). Closing the
-// unsigned arm is a REFUSAL, so it is its own car (F7 of b8e75382),
-// after the DR readiness of 62dac114; until then a caller reaching the
-// port directly with no header is the gap, pinned by
-// `an_unsigned_check_still_answers_about_anyone_until_callers_sign`.
+// `/check` takes the same bound WHENEVER the request is signed by a
+// session (backlog 5a914364 S1): the gateway always sets `x-boss-user` on
+// a session's request, so a session asking about someone else is judged
+// like the list. Every service asked it through `ReqwestPolicyClient`
+// with no `x-boss-user` of its own, so a bound there would have denied
+// every policy check in the estate; since 2026-09-29 the client signs
+// every check as its service (`User::service`, at platform-admin, which
+// the signed arm admits — `a_check_signed_as_a_service_is_answered_about_anyone`).
+// The two arms still answered about anyone — UNSIGNED, and a service the
+// bound refuses — are F7 of b8e75382, and they ride the policy check's
+// own mode word (`crate::check_mode`, design b08725c2 row D), shipped
+// `off` and mounted `report` since the report-prep car (checklist F4):
+// `an_unsigned_check_answers_about_anyone_while_the_check_mode_is_off`
+// and `a_retired_policy_read_does_not_lock_the_services_out` hold `off` to
+// the answer before the mode existed, and the `the_check_mode_*` tests
+// pin `report` and `enforce`.
 //
 // The rule table (`GET /api/policy/rules`, `/rules/{id}`) is read only by
 // a holder of Read on `policy-rule` at scope all — the authority to read
@@ -127,27 +135,40 @@ async fn may_read_for<R: PolicyRepository + 'static>(
     id: &str,
     role: Option<&str>,
 ) -> Result<(), Response> {
+    match read_for_refusal(state, caller, id, role).await? {
+        None => Ok(()),
+        Some(reason) => Err(forbidden(reason)),
+    }
+}
+
+/// [`may_read_for`]'s judgement as data: `None` to allow, the reason to
+/// refuse, and `Err` only when the engine could not be asked — so the
+/// policy check's mode can report a refusal it does not make.
+async fn read_for_refusal<R: PolicyRepository + 'static>(
+    state: &PolicyApiState<R>,
+    caller: &User,
+    id: &str,
+    role: Option<&str>,
+) -> Result<Option<String>, Response> {
     // Its own authority, as itself: a body naming the caller's id with
     // another role asks what that role would get, which is a question
     // about someone else.
     if caller.id == id && role.is_none_or(|r| r == caller.role) {
-        return Ok(());
+        return Ok(None);
     }
     let about = format!("{} asks about {id}", caller.id);
     // The guest session's role holds Read on policy-rule by shipped
     // default; the identity never reads another's authority (rule 5).
     if boss_core::roles::ANONYMOUS_VISITOR_IDS.contains(&caller.id.as_str()) {
-        return Err(forbidden(format!(
+        return Ok(Some(format!(
             "{about}; an anonymous visitor reads only its own authority"
         )));
     }
-    let decision = state
-        .engine
-        .check(caller, Action::Read, Resource::policy_rule())
-        .await
-        .map_err(err_response)?;
-    authority::may(&caller.role, Action::Read, &decision)
-        .map_err(|reason| forbidden(format!("{about}, and only reads its own: {reason}")))
+    let read = controls::READ_POLICY_RULE;
+    let decision = state.engine.ask(caller, read).await.map_err(err_response)?;
+    Ok(authority::may(&caller.role, read.action(), &decision)
+        .err()
+        .map(|reason| format!("{about}, and only reads its own: {reason}")))
 }
 
 // ----- check ---------------------------------------------------------------
@@ -159,50 +180,54 @@ struct CheckBody {
     resource: Resource,
 }
 
-/// A signed caller is judged by [`may_read_for`] — a service's
-/// `ReqwestPolicyClient` among them, signed as `User::service` since
-/// 2026-09-29; an unsigned one is still answered, until the car that
-/// closes that arm (F7 of b8e75382). Presence of the header is the test,
-/// not the id the extractor defaults to, because a signed request may
-/// carry any id.
+/// A signed SESSION caller is judged by [`may_read_for`] in every mode
+/// (5a914364 S1): the gateway replaces `x-boss-user` from the session, so
+/// a session asking about someone else is refused like the override
+/// list. Presence of the header is the test, not the id the extractor
+/// defaults to, because a signed request may carry any id.
 ///
-/// A SERVICE'S SIGNATURE IS ATTRIBUTION, NOT A GATE — until F7 (hold F1
-/// of the review of this car, b8e7, 2026-09-29). Every service's every
-/// check now arrives signed, so refusing a service that lacks Read on
-/// `policy-rule` would hang the whole estate on one mutable grant:
-/// retire `platform-admin:policy-rule:read`, or narrow `automation:<svc>`
-/// with a scope-none override, and every request of every user — the
-/// operator's included — is refused, where the unsigned check answered.
-/// That is a new lockout path, which DR rule 62dac114 forbids before DR
-/// readiness. So a service identity the bound refuses is answered about
-/// its subject exactly as an unsigned check is, and the gap is logged
-/// loudly for the operator to restore. A SESSION caller is still refused
-/// (5a914364 S1): the gateway replaces `x-boss-user` from the session,
-/// so no session presents an `automation:` id, and a caller on the port
-/// that claims one gets only what an unsigned caller already gets. F7
-/// turns this arm into a refusal once DR readiness is proven.
+/// The two other arms — no header at all, and a service identity the
+/// same bound refuses — are F7 of backlog b8e75382, and what they get is
+/// the policy check's MODE ([`crate::check_mode`], design b08725c2 row
+/// D), read from a mounted word rather than decided here:
+///
+/// * `off` (an absent key): answered, as they were. A SERVICE'S SIGNATURE IS
+///   ATTRIBUTION, NOT A GATE (hold F1 of review b8e7, 2026-09-29): every
+///   service's every check arrives signed, so refusing one that lacks
+///   Read on `policy-rule` hangs the whole estate on one mutable grant —
+///   retire `platform-admin:policy-rule:read`, or narrow
+///   `automation:<svc>` with a scope-none override, and every request of
+///   every user, the operator's included, is refused. So a refused
+///   service is answered and the gap logged, and an unsigned check is not
+///   judged at all.
+/// * `report` (mounted by boss.yaml): answered, and counted as what
+///   `enforce` would refuse — a refused service's lapsed grant included,
+///   which the hourly lapsed-grant alarm reads off the tally.
+/// * `enforce`: refused, naming the mode and the file that turns it back.
+///
+/// Why a mode and not a deploy: a misfire here denies every signed-in
+/// write, so the car that reverts it might not be able to ride. The mode
+/// is one word in a mounted file, re-read in seconds.
 async fn check<R: PolicyRepository + 'static>(
     State(state): State<Arc<PolicyApiState<R>>>,
     headers: HeaderMap,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     CurrentUser(caller): CurrentUser,
     Json(body): Json<CheckBody>,
 ) -> Response {
-    if headers.contains_key("x-boss-user")
-        && let Err(refused) =
+    let signed = headers.contains_key("x-boss-user");
+    if signed && !caller.is_service() {
+        if let Err(refused) =
             may_read_for(&state, &caller, &body.user.id, Some(&body.user.role)).await
-    {
-        if !caller.is_service() {
+        {
             return refused;
         }
-        tracing::warn!(
-            caller = %caller.id,
-            role = %caller.role,
-            subject = %body.user.id,
-            refused = %refused.status(),
-            "a signed service check lacks Read on policy-rule at scope all; answered as an \
-             unsigned check until F7 of backlog b8e75382 (restore the grant: \
-             platform-admin:policy-rule:read, and no scope-none override on the service id)"
-        );
+    } else {
+        let arm = if signed { Arm::Service } else { Arm::Unsigned };
+        let peer = peer.map(|Extension(ConnectInfo(addr))| addr.ip());
+        if let Some(refused) = open_arm(&state, arm, &caller, &body.user, peer).await {
+            return refused;
+        }
     }
     match state
         .engine
@@ -212,6 +237,103 @@ async fn check<R: PolicyRepository + 'static>(
         Ok(d) => Json(d).into_response(),
         Err(e) => err_response(e),
     }
+}
+
+/// What the policy check mode makes of a check through one of F7's two
+/// open arms: `None` to answer it, or the refusal to return. `off` is
+/// exactly the behaviour before the mode existed — an unsigned check is
+/// not judged, a refused service is answered with its warn.
+async fn open_arm<R: PolicyRepository + 'static>(
+    state: &PolicyApiState<R>,
+    arm: Arm,
+    caller: &User,
+    subject: &User,
+    peer: Option<std::net::IpAddr>,
+) -> Option<Response> {
+    let mode = state.check_mode.mode();
+    if mode == Mode::Off && arm == Arm::Unsigned {
+        return None;
+    }
+    let reason = match read_for_refusal(state, caller, &subject.id, Some(&subject.role)).await {
+        Ok(None) => return None,
+        Ok(Some(reason)) => reason,
+        // The engine could not be asked whether the caller may read.
+        // Only `enforce` refuses on that; below it, the check is answered
+        // as it was, and says why it could not be judged.
+        Err(failed) if mode == Mode::Enforce => return Some(failed),
+        Err(failed) => {
+            tracing::warn!(
+                arm = arm.name(),
+                caller = %caller.id,
+                subject = %subject.id,
+                status = %failed.status(),
+                mode = mode.name(),
+                "{}: could not judge whether this caller may read another's authority; \
+                 answered, as mode {} answers",
+                check_mode::SWITCH,
+                mode.name()
+            );
+            return None;
+        }
+    };
+    match mode {
+        Mode::Off => {
+            tracing::warn!(
+                caller = %caller.id,
+                role = %caller.role,
+                subject = %subject.id,
+                "a signed service check lacks Read on policy-rule at scope all; answered as an \
+                 unsigned check while the policy check mode is off (F7 of backlog b8e75382; \
+                 restore the grant: platform-admin:policy-rule:read, and no scope-none override \
+                 on the service id)"
+            );
+            None
+        }
+        Mode::Report => {
+            state.check_mode.record(arm, caller, peer);
+            tracing::warn!(
+                arm = arm.name(),
+                caller = %caller.id,
+                role = %caller.role,
+                subject = %subject.id,
+                "{}: mode `enforce` would refuse this check (F7 of backlog b8e75382): {reason}; \
+                 answered, because the mode is `report`",
+                check_mode::SWITCH
+            );
+            None
+        }
+        Mode::Enforce => {
+            state.check_mode.record(arm, caller, peer);
+            let file = state.check_mode.file();
+            tracing::warn!(
+                arm = arm.name(),
+                caller = %caller.id,
+                role = %caller.role,
+                subject = %subject.id,
+                "{}: refused by mode `enforce` (F7 of backlog b8e75382): {reason}",
+                check_mode::SWITCH
+            );
+            Some(forbidden(format!(
+                "{reason}; refused by the {} mode `enforce` ({} check, F7 of backlog b8e75382) \
+                 — the way back is the word `report` in {file}",
+                check_mode::SWITCH,
+                arm.name(),
+            )))
+        }
+    }
+}
+
+/// The policy check mode's tally: in `report`, what `enforce` would have
+/// refused; in `enforce`, what it did. It names callers and addresses,
+/// so it is read as the rule table is.
+async fn check_refusals<R: PolicyRepository + 'static>(
+    State(state): State<Arc<PolicyApiState<R>>>,
+    CurrentUser(caller): CurrentUser,
+) -> Response {
+    if let Err(refused) = may_read_rules(&state, &caller).await {
+        return refused;
+    }
+    Json(state.check_mode.refusals()).into_response()
 }
 
 // ----- rules admin ---------------------------------------------------------
@@ -249,11 +371,9 @@ pub(crate) async fn may_read_rule_table<R: PolicyRepository + 'static>(
             caller.id
         )));
     }
-    let decision = engine
-        .check(caller, Action::Read, Resource::policy_rule())
-        .await
-        .map_err(err_response)?;
-    authority::may(&caller.role, Action::Read, &decision).map_err(|reason| {
+    let read = controls::READ_POLICY_RULE;
+    let decision = engine.ask(caller, read).await.map_err(err_response)?;
+    authority::may(&caller.role, read.action(), &decision).map_err(|reason| {
         forbidden(format!(
             "{} may not read the policy rules: {reason}",
             caller.id
@@ -322,15 +442,15 @@ fn forbidden(reason: String) -> Response {
 async fn authorize<R: PolicyRepository + 'static>(
     state: &PolicyApiState<R>,
     user: &User,
-    action: Action,
+    control: Pair,
 ) -> Result<(), Response> {
     authority::refuse_anonymous_caller(&user.id, &user.role).map_err(forbidden)?;
     let decision = state
         .engine
-        .check(user, action, Resource::policy_rule())
+        .ask(user, control)
         .await
         .map_err(err_response)?;
-    authority::may(&user.role, action, &decision).map_err(forbidden)
+    authority::may(&user.role, control.action(), &decision).map_err(forbidden)
 }
 
 /// What the caller holds on `policy-rule` and on the action and resource
@@ -344,14 +464,14 @@ async fn holdings<R: PolicyRepository + 'static>(
     resource: &Resource,
 ) -> Result<Holdings, Response> {
     authority::refuse_anonymous_caller(&user.id, &user.role).map_err(forbidden)?;
-    let mut policy_rule = Vec::with_capacity(authority::POLICY_VERBS.len());
-    for verb in authority::POLICY_VERBS {
+    let mut policy_rule = Vec::with_capacity(authority::POLICY_WRITES.len());
+    for control in authority::POLICY_WRITES {
         let decision = state
             .engine
-            .check(user, verb, Resource::policy_rule())
+            .ask(user, control)
             .await
             .map_err(err_response)?;
-        policy_rule.push((verb, decision));
+        policy_rule.push((control.action(), decision));
     }
     // With when it stops holding, because a grant made from it may last
     // no longer (H3 of the hold review of car a8becd52).
@@ -446,7 +566,7 @@ async fn deactivate_rule<R: PolicyRepository + 'static>(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(refused) = authorize(&state, &user, Action::Delete).await {
+    if let Err(refused) = authorize(&state, &user, controls::DELETE_POLICY_RULE).await {
         return refused;
     }
     match state.repo.deactivate_rule(&id, &user.id).await {
@@ -668,10 +788,16 @@ mod tests {
         })
     }
 
+    /// The router as it ships: the policy check mode `off`.
     fn app(repo: &Arc<Recording>) -> Router {
+        app_in(repo, &CheckMode::fixed(Mode::Off))
+    }
+
+    fn app_in(repo: &Arc<Recording>, check_mode: &Arc<CheckMode>) -> Router {
         router(PolicyApiState {
             repo: repo.clone(),
             engine: Arc::new(PolicyEngine::new(repo.clone())),
+            check_mode: Arc::clone(check_mode),
         })
     }
 
@@ -1607,6 +1733,16 @@ mod tests {
         body: Option<&serde_json::Value>,
         caller: Option<&str>,
     ) -> (StatusCode, String) {
+        ask_via(app(repo), method, uri, body, caller).await
+    }
+
+    async fn ask_via(
+        app: Router,
+        method: Method,
+        uri: &str,
+        body: Option<&serde_json::Value>,
+        caller: Option<&str>,
+    ) -> (StatusCode, String) {
         let mut req = Request::builder().method(method).uri(uri);
         if let Some(c) = caller {
             req = req.header("x-boss-user", c);
@@ -1618,7 +1754,7 @@ mod tests {
             None => req.body(Body::empty()),
         }
         .expect("request");
-        let resp = app(repo).oneshot(req).await.expect("infallible");
+        let resp = app.oneshot(req).await.expect("infallible");
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -1744,11 +1880,12 @@ mod tests {
     /// `automation:<svc>`, and the signed arm refused every service's
     /// every check (403), which the client read as a Deny: every request
     /// of every user, the operator's included, refused by one policy
-    /// edit, where the unsigned check had answered. Until F7, a service's
-    /// signature is ATTRIBUTION, not a gate: a service lacking the grant
-    /// is answered about its subject exactly as an unsigned check is, and
-    /// the gap is logged. Both edits, and the answer for a permitted and
-    /// a denied subject after each.
+    /// edit, where the unsigned check had answered. While the policy check
+    /// mode is `off` (as shipped; F7's `enforce` is a mode word, design
+    /// b08725c2 row D), a service's signature is ATTRIBUTION, not a gate: a
+    /// service lacking the grant is answered about its subject exactly as
+    /// an unsigned check is, and the gap is logged. Both edits, and the
+    /// answer for a permitted and a denied subject after each.
     #[tokio::test]
     async fn a_retired_policy_read_does_not_lock_the_services_out() {
         let retired = reads_repo().await;
@@ -1796,23 +1933,235 @@ mod tests {
         }
     }
 
-    /// THE GAP, PINNED (5a914364 S4): an unsigned `/check` still answers
-    /// about anyone, reason and all. Every browser session reaches this
-    /// port through the gateway, which always signs, and since backlog
+    /// THE GAP, PINNED (5a914364 S4): an unsigned `/check` answers about
+    /// anyone, reason and all, WHILE THE POLICY CHECK MODE IS `off` — the
+    /// mode this router ships in. Every browser session reaches this port
+    /// through the gateway, which always signs, and since backlog
     /// b8e75382's service-identity car every `ReqwestPolicyClient` signs
     /// too, so the gap is only a caller that reaches the port directly
-    /// with no header — the machine door with its gate mode off
-    /// (2710c8fc/6805c764). This test is meant to go RED in the car that
-    /// closes the unsigned arm (F7 of b8e75382, which waits on the DR
-    /// readiness of 62dac114 because it adds a refusal); invert it then,
-    /// do not delete it.
+    /// with no header. F7 closes it behind its own mode (design b08725c2
+    /// row D): `enforce` refuses it, which
+    /// `the_check_mode_enforce_refuses_both_open_arms` pins; this pin
+    /// holds `off` to today's answer until the mode word is flipped.
     #[tokio::test]
-    async fn an_unsigned_check_still_answers_about_anyone_until_callers_sign() {
+    async fn an_unsigned_check_answers_about_anyone_while_the_check_mode_is_off() {
         let repo = reads_repo().await;
         let (method, uri, body) = reads_about("emp-cover", "reviewer").remove(0);
         let (status, text) = ask(&repo, method, &uri, body.as_ref(), None).await;
         assert_eq!(status, StatusCode::OK, "{text}");
         assert!(text.contains(DENY_REASON), "{text}");
+    }
+
+    // ----- F7 of backlog b8e75382 (design b08725c2 row D): the two open
+    // arms of `/check`, behind their own mode word ------------------------
+
+    /// [`reads_repo`] with the `jobs` service's Read on `policy-rule`
+    /// narrowed to nothing by a scope-none override: the one mutable edit
+    /// that turns a signed service check into the service arm.
+    async fn narrowed_repo() -> Arc<Recording> {
+        let repo = reads_repo().await;
+        repo.inner
+            .upsert_user_override(
+                &grant(
+                    "automation:jobs",
+                    Resource::policy_rule(),
+                    Action::Read,
+                    Scope::None,
+                ),
+                "seed",
+            )
+            .await
+            .expect("seed the scope-none override");
+        repo
+    }
+
+    fn check_about(id: &str, role: &str) -> serde_json::Value {
+        serde_json::json!({
+            "user": {"id": id, "role": role, "access_tier": "user"},
+            "action": "read",
+            "resource": "ledger",
+        })
+    }
+
+    /// The two checks F7 closes, each about emp-cover, whose deny reason
+    /// must not leave in a refusal: one unsigned, one signed as a service
+    /// whose Read on `policy-rule` is narrowed away.
+    async fn the_open_arms(mode: &Arc<CheckMode>) -> Vec<(&'static str, StatusCode, String)> {
+        let repo = narrowed_repo().await;
+        let service = serde_json::to_string(&User::service("jobs")).expect("identity");
+        let body = check_about("emp-cover", "reviewer");
+        let mut out = vec![];
+        for (arm, caller) in [("unsigned", None), ("service", Some(service.as_str()))] {
+            let (status, text) = ask_via(
+                app_in(&repo, mode),
+                Method::POST,
+                "/api/policy/check",
+                Some(&body),
+                caller,
+            )
+            .await;
+            out.push((arm, status, text));
+        }
+        out
+    }
+
+    /// `off` is the shipped mode, and it is today's answer to both arms:
+    /// each is answered, reason and all, and nothing is tallied — the
+    /// machine gate's `off` records nothing either.
+    #[tokio::test]
+    async fn the_check_mode_off_answers_both_open_arms_as_before() {
+        let mode = CheckMode::fixed(Mode::Off);
+        for (arm, status, text) in the_open_arms(&mode).await {
+            assert_eq!(status, StatusCode::OK, "{arm}: {text}");
+            assert!(text.contains(DENY_REASON), "{arm}: {text}");
+        }
+        assert!(mode.refusals().rows.is_empty());
+    }
+
+    /// `report` answers both arms exactly as `off` does, and counts each
+    /// one `enforce` would refuse — the clean window the flip is earned
+    /// on. A check `enforce` would still answer is not counted: a service
+    /// holding its grant, a session about itself, and a session refused
+    /// in every mode (it is already a refusal, not a would-be one).
+    #[tokio::test]
+    async fn the_check_mode_report_answers_both_open_arms_and_tallies_them() {
+        let mode = CheckMode::fixed(Mode::Report);
+        for (arm, status, text) in the_open_arms(&mode).await {
+            assert_eq!(status, StatusCode::OK, "{arm}: {text}");
+            assert!(text.contains(DENY_REASON), "{arm}: {text}");
+        }
+        let repo = reads_repo().await;
+        let service = serde_json::to_string(&User::service("jobs")).expect("identity");
+        let cover = user("emp-cover", "reviewer");
+        let drafter = user("emp-drafter", "rule-drafter");
+        let body = check_about("emp-cover", "reviewer");
+        for (who, caller, want) in [
+            ("a granted service", &service, StatusCode::OK),
+            ("a session about itself", &cover, StatusCode::OK),
+            ("a drafter", &drafter, StatusCode::FORBIDDEN),
+        ] {
+            let (status, text) = ask_via(
+                app_in(&repo, &mode),
+                Method::POST,
+                "/api/policy/check",
+                Some(&body),
+                Some(caller),
+            )
+            .await;
+            assert_eq!(status, want, "{who}: {text}");
+        }
+        let r = mode.refusals();
+        assert_eq!(r.mode, Mode::Report);
+        let rows: Vec<(Arm, &str, u64)> = r
+            .rows
+            .iter()
+            .map(|row| (row.key.arm, row.key.caller.as_str(), row.count))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (Arm::Unsigned, User::ANONYMOUS_ID, 1),
+                (Arm::Service, "automation:jobs", 1),
+            ],
+            "{r:?}"
+        );
+    }
+
+    /// `enforce` refuses both arms 403, hands out no deny reason, and
+    /// names the mode and the file that is the way back — a refusal that
+    /// must be re-derived is not a refusal. Everything `enforce` still
+    /// answers is answered: a service holding its grant, a session about
+    /// itself, the operator about anyone, and an unsigned check about the
+    /// identity-less caller itself.
+    #[tokio::test]
+    async fn the_check_mode_enforce_refuses_both_open_arms() {
+        let mode = CheckMode::fixed(Mode::Enforce);
+        for (arm, status, text) in the_open_arms(&mode).await {
+            assert_eq!(status, StatusCode::FORBIDDEN, "{arm}: {text}");
+            assert!(!text.contains(DENY_REASON), "{arm}: {text}");
+            assert!(
+                text.contains("mode `enforce`") && text.contains(&mode.file()),
+                "{arm}: {text}"
+            );
+        }
+        assert_eq!(mode.refusals().rows.len(), 2);
+
+        let repo = reads_repo().await;
+        let service = serde_json::to_string(&User::service("jobs")).expect("identity");
+        let cover = user("emp-cover", "reviewer");
+        let admin = user("emp-founder", "platform-admin");
+        let about_cover = check_about("emp-cover", "reviewer");
+        let about_nobody = check_about(User::ANONYMOUS_ID, User::ANONYMOUS_ROLE);
+        for (who, caller, body) in [
+            ("a granted service", Some(&service), &about_cover),
+            ("a session about itself", Some(&cover), &about_cover),
+            ("the operator", Some(&admin), &about_cover),
+            ("an unsigned check about itself", None, &about_nobody),
+        ] {
+            let (status, text) = ask_via(
+                app_in(&repo, &mode),
+                Method::POST,
+                "/api/policy/check",
+                Some(body),
+                caller.map(String::as_str),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{who}: {text}");
+        }
+        assert_eq!(
+            mode.refusals().rows.len(),
+            2,
+            "answered checks are not counted"
+        );
+    }
+
+    /// The tally names callers and their addresses, so it is read as the
+    /// rule table is: by a holder of Read on `policy-rule` at scope all,
+    /// never by the identity-less or a guest session.
+    #[tokio::test]
+    async fn the_check_refusal_tally_is_read_only_by_a_policy_reader() {
+        let mode = CheckMode::fixed(Mode::Report);
+        let _ = the_open_arms(&mode).await;
+        let repo = reads_repo().await;
+        let drafter = user("emp-drafter", "rule-drafter");
+        let guest = user(boss_core::roles::GUEST_EMAIL, "audit-readonly");
+        for (who, caller) in [
+            ("no identity", None),
+            ("a drafter", Some(&drafter)),
+            ("the audit guest session", Some(&guest)),
+        ] {
+            let (status, text) = ask_via(
+                app_in(&repo, &mode),
+                Method::GET,
+                check_mode::REFUSALS_PATH,
+                None,
+                caller.map(String::as_str),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{who}: {text}");
+            assert!(!text.contains("automation:jobs"), "{who}: {text}");
+        }
+        let admin = user("emp-founder", "platform-admin");
+        let (status, text) = ask_via(
+            app_in(&repo, &mode),
+            Method::GET,
+            check_mode::REFUSALS_PATH,
+            None,
+            Some(&admin),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let r: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(r["mode"], "report", "{text}");
+        assert_eq!(r["switch"], check_mode::SWITCH, "{text}");
+        assert_eq!(r["rows"].as_array().map(Vec::len), Some(2), "{text}");
+        // The wire carries the window's start and the one clean verdict
+        // (enforce checklist F1/F2, review 1c2860f4), and each row when
+        // it was last seen — what the lapsed-grant alarm reads (R3).
+        assert!(r["recording_since"].is_string(), "{text}");
+        assert!(r["clean_since"].is_null(), "two rows are not clean: {text}");
+        assert!(r["not_clean"][0].is_string(), "{text}");
+        assert!(r["rows"][0]["last_seen"].is_string(), "{text}");
     }
 
     /// THE DEFECT (backlog b8e75382, the rule reads folded into rule 7):

@@ -17,6 +17,19 @@ describe('parseRoutes', () => {
     expect(r.routes.find((x) => x.from === null && x.to === 'receiving')).toBeDefined();
   });
 
+  // Backlog bd506215: a narrowed scope is served the declared routes and
+  // told why no count rides beside them (`observed_withheld`, 070de88c).
+  it('keeps the reason the observed counts were withheld, and says it as the scope, not a failure', () => {
+    const why = "this caller's policy scope reads only some packets, and the moves record counts every packet's crossings, so the observed counts are not read for it";
+    const r = parseRoutes({ ...routesPayload(), observed: false, observed_withheld: why });
+    expect(r.observed).toBe(false);
+    expect(r.observed_withheld).toBe(why);
+    expect(parseRoutes(routesPayload()).observed_withheld).toBeNull();
+    const route = r.routes[0]!;
+    expect(sourceLines(route, 24, r.observed_withheld)).toContain('moves: not in your policy scope');
+    expect(sourceLines(route, 24, null)).not.toContain('moves: not in your policy scope');
+  });
+
   it('refuses a payload that is not the routes read — a failed read, never a map with no edges', () => {
     expect(() => parseRoutes([])).toThrow('yard routes: expected an object');
     expect(() => parseRoutes({ routes: 'x' })).toThrow('expected a routes list');

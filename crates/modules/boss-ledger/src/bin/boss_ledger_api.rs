@@ -129,7 +129,12 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding HTTP listener on {http_addr}"))?;
     info!(addr = %http_addr, "boss-ledger-api listening");
-    let app = boss_core::machine_gate::mount(app, "ledger", &["/api/ledger/health"]);
+    let app = boss_core::machine_gate::mount(
+        app,
+        "ledger",
+        &["/api/ledger/health"],
+        Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
+    );
     let mut http_cancel = cancel_rx.clone();
     let shutdown = async move {
         let _ = http_cancel.changed().await;

@@ -299,7 +299,21 @@ async fn undrained_counts_a_committed_write_until_its_audit_row_lands() {
     .unwrap();
     let day = relay_lag(&db.pool, 24).await.unwrap();
     assert_eq!((day.delivered, day.max_seconds), (1, Some(10.0)));
-    assert_eq!(relay_lag(&db.pool, 48).await.unwrap().delivered, 2);
+    let two_days = relay_lag(&db.pool, 48).await.unwrap();
+    assert_eq!(two_days.delivered, 2);
+
+    // The window MEASURED is what the outbox still holds, not what was
+    // asked for (review afdc2d5d, N2): retention prunes delivered rows
+    // past a week, so a 720 h request answers a week's sample. Asked
+    // for 720 h here, the sample reaches back 30 h and says so.
+    let month = relay_lag(&db.pool, 720).await.unwrap();
+    assert_eq!(month.window_hours, 720);
+    let covered = month.covered_hours.expect("a sample spans some hours");
+    assert!((covered - 30.0).abs() < 0.01, "covered {covered}");
+    assert!(
+        (two_days.covered_hours.unwrap() - 30.0).abs() < 0.01,
+        "the same rows, the same span"
+    );
 }
 
 /// A window with nothing delivered in it answers zero samples and no
@@ -312,6 +326,7 @@ async fn relay_lag_over_an_empty_window_has_no_percentiles() {
     assert_eq!(lag.p50_seconds, None);
     assert_eq!(lag.p95_seconds, None);
     assert_eq!(lag.max_seconds, None);
+    assert_eq!(lag.covered_hours, None);
 }
 
 /// A bus that refuses what NATS refuses: an encoded event larger than

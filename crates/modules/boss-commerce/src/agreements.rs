@@ -14,8 +14,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use boss_core::publisher::DomainPublisher;
-use boss_policy::{Action, Resource};
-use boss_policy_client::{CurrentUser, PolicyClient};
+use boss_policy_client::{CurrentUser, PolicyClient, controls};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -137,10 +136,8 @@ async fn create_agreement(
     // one moves its status, end date and value. It is both verbs, so it
     // asks both — a role granted Create alone must not be able to
     // expire someone else's contract through the create door.
-    for action in [Action::Create, Action::Update] {
-        if let Err(refused) =
-            require_on(state.policy.as_ref(), &user, action, Resource::agreement()).await
-        {
+    for control in [controls::CREATE_AGREEMENT, controls::UPDATE_AGREEMENT] {
+        if let Err(refused) = require_on(state.policy.as_ref(), &user, control).await {
             return refused;
         }
     }

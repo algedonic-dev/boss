@@ -57,6 +57,8 @@ RUN apt-get update -qq \
  && apt-get install -y --no-install-recommends \
       git ca-certificates postgresql-client pkg-config libssl-dev curl gnupg tmux \
       jq python3 \
+      openssh-client \
+ && chmod u-s /usr/lib/openssh/ssh-keysign \
  && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
  && rm -rf /var/lib/apt/lists/*

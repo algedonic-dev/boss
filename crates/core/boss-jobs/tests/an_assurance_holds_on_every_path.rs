@@ -94,25 +94,17 @@ fn policy() -> Arc<dyn PolicyClient> {
 fn step(id: &str, assurance: Option<Assurance>) -> Step {
     Step {
         id: StepId::from_uuid(Uuid::parse_str(id).unwrap()),
-        job_id: JobId::from_uuid(Uuid::parse_str(JOB).unwrap()),
-        kind: "generic".into(),
-        title: "Approve the plan".into(),
         spec_slug: Some("approve".into()),
         assignee_id: Some("emp-david".into()),
         status: StepStatus::Ready,
-        sort_order: 1,
-        blocked_by: vec![],
-        sign_offs_required: Vec::new(),
         assurance_required: assurance,
-        sign_offs: Vec::new(),
-        fields: Vec::new(),
-        completed_on: None,
-        completed_by: None,
-        completed_at: None,
         metadata: serde_json::json!({ "plan": "{\"verb\":\"commission-a-disk\"}" }),
-        notes: None,
-        step_plugin_version: 0,
-        embedded_job: None,
+        ..Step::new(
+            JobId::from_uuid(Uuid::parse_str(JOB).unwrap()),
+            "generic",
+            "Approve the plan",
+            1,
+        )
     }
 }
 
@@ -129,20 +121,17 @@ async fn seed() -> (Router, Arc<InMemoryJobs>) {
     );
     jobs.create_job(&Job {
         id: JobId::from_uuid(Uuid::parse_str(JOB).unwrap()),
-        kind: "ops-request".into(),
         workflow_version: 2,
-        subject: Subject::new("custom", "forge"),
-        title: "df on forge".into(),
-        owner_id: "emp-david".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 22).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "ops-request",
+            Subject::new("custom", "forge"),
+            "df on forge",
+            "emp-david",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 22).unwrap(),
+        )
     })
     .await
     .unwrap();
@@ -154,12 +143,23 @@ async fn seed() -> (Router, Arc<InMemoryJobs>) {
 }
 
 async fn put(app: &Router, step_id: &str, body: &str) -> (StatusCode, String) {
+    send(app, "PUT", format!("/api/jobs/{JOB}/steps/{step_id}"), body).await
+}
+
+/// The step merge door — the one metadata write there is, since the PUT
+/// writes none (e39a9d2a).
+async fn merge(app: &Router, step_id: &str, body: &str) -> (StatusCode, String) {
+    let uri = format!("/api/jobs/{JOB}/steps/{step_id}/metadata");
+    send(app, "PATCH", uri, body).await
+}
+
+async fn send(app: &Router, method: &str, uri: String, body: &str) -> (StatusCode, String) {
     let resp = app
         .clone()
         .oneshot(
             Request::builder()
-                .method("PUT")
-                .uri(format!("/api/jobs/{JOB}/steps/{step_id}"))
+                .method(method)
+                .uri(uri)
                 .header("content-type", "application/json")
                 .header("x-boss-user", serde_json::to_string(&operator()).unwrap())
                 .body(Body::from(body.to_string()))
@@ -227,14 +227,15 @@ async fn an_ordinary_step_still_completes_by_put() {
 /// write that does NOT complete the step is untouched. The plan is put
 /// onto the approve step by an ordinary metadata write before anyone
 /// signs it; refusing that would make the guarded step unusable rather
-/// than guarded.
+/// than guarded. That write goes through the merge door: the PUT writes
+/// no metadata since e39a9d2a.
 #[tokio::test]
 async fn a_write_that_does_not_complete_the_step_needs_no_assurance() {
     let (app, jobs) = seed().await;
-    let (status, body) = put(
+    let (status, body) = merge(
         &app,
         GUARDED,
-        r#"{"metadata":{"plan":"{\"verb\":\"df\"}","note":"re-rendered"}}"#,
+        r#"{"plan":"{\"verb\":\"df\"}","note":"re-rendered"}"#,
     )
     .await;
     assert!(

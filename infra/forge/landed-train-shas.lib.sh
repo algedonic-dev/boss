@@ -109,14 +109,25 @@
 # calls `landed_train_shas` inside $(…) and the helper makes its
 # directory only in the script's own shell. So SOURCE THIS AFTER your own
 # `trap … EXIT`: the helper's cleanup is chained in front of the trap
-# that stands when it is made. A lib that cannot be read, or a file that
-# cannot be made, leaves LTS_MT_HDR empty, and a token that is set but
-# has no file is a read that cannot answer (prune less, never more).
+# that stands when it is made. A lib that cannot be read, or a token
+# whose file cannot be made, is a read that cannot answer (prune less,
+# never more). The token is the lib's machine_token_header: the `current`
+# slot of the mounted Secret, stamped only on an estate host (design
+# 6805c764 car 4) — made for the BOSS_JOBS_URL this lib is sourced
+# under, and sent only to that one.
+LTS_MT_HDR=""
+LTS_MT_FOR="${BOSS_JOBS_URL:-}"
+LTS_MT_BROKEN=""
+# A missing lib declines the read only where there IS a token to send
+# (review ef2da426 F5): with no slot this host has nothing to stamp, and
+# the read goes out unstamped exactly as it did before car 4 — a gate in
+# `report` admits it. With a slot, a read without the lib would send the
+# token nowhere safe, so it declines (prune less, never more).
 # shellcheck source=infra/lib/secret-header.sh
 if . "$(dirname "${BASH_SOURCE[0]}")/../lib/secret-header.sh" 2>/dev/null; then
-    secret_header LTS_MT_HDR ${BOSS_MACHINE_TOKEN:+"x-boss-machine-token: $BOSS_MACHINE_TOKEN"} || LTS_MT_HDR=""
-else
-    LTS_MT_HDR=""
+    machine_token_header LTS_MT_HDR "$LTS_MT_FOR" || { LTS_MT_HDR=""; LTS_MT_BROKEN="its header file could not be made"; }
+elif [ -e "${BOSS_MACHINE_TOKEN_DIR:-/etc/boss/machine-token}/current" ]; then
+    LTS_MT_BROKEN="infra/lib/secret-header.sh, beside this lib, cannot be read, and this host holds a token"
 fi
 
 train_sha_sets() {
@@ -146,13 +157,18 @@ train_sha_sets() {
     # --max-time, because the sweep is on a timer and a hung read must
     # not hold the disk remediation behind it. No retry: the next tick is
     # an hour away and the age window covers this pass either way.
-    if [ -n "${BOSS_MACHINE_TOKEN:-}" ] && [ -z "${LTS_MT_HDR:-}" ]; then
-        TRAIN_SETS_WHY="BOSS_MACHINE_TOKEN is set but its header file could not be made (infra/lib/secret-header.sh, beside this lib), and the token is never sent in curl's command line"
+    if [ -n "${LTS_MT_BROKEN:-}" ]; then
+        TRAIN_SETS_WHY="the machine token could not be read: $LTS_MT_BROKEN, and the token is never sent in curl's command line"
         return 1
     fi
+    # The header was made for the URL this lib was sourced under; any
+    # other gets none, so the token cannot follow a caller's argument to
+    # a host the decision never saw.
+    local mt_hdr=""
+    [ "$jobs_url" != "$LTS_MT_FOR" ] || mt_hdr="${LTS_MT_HDR:-}"
     reply="$("$curl_cmd" -fsS --max-time 20 \
         -H "x-boss-user: $boss_user" \
-        ${LTS_MT_HDR:+-H "$LTS_MT_HDR"} \
+        ${mt_hdr:+-H "$mt_hdr"} \
         "$jobs_url/api/jobs?kind=pr-train&limit=$lookback&full=true" 2>&1)" || rc=$?
     if [ "$rc" -ne 0 ]; then
         TRAIN_SETS_WHY="reading $jobs_url failed (curl exit $rc): ${reply:-no reply}"

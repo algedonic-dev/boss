@@ -52,13 +52,18 @@ impl SurfaceOpens for PgSurfaceOpens {
         validate_window(since, until)?;
         // The ORDER BY is the in-memory adapter's sort, stated once
         // there and once here: actor, then most-opened first, then
-        // route so equal counts land in a stable order.
+        // route so equal counts land in a stable order. Both texts sort
+        // `COLLATE "C"`, byte order, the double's `String::cmp`: the
+        // database's locale ignores `-` at first level and folds case,
+        // so `emp-ab` served before `emp-a-z` here and after it in
+        // memory until the adapters-agree suite held the two to one
+        // answer (backlog be459ab9; the class is 2987fb2d's).
         let rows = sqlx::query(
             "SELECT actor_id, route, COUNT(*)::bigint AS opens, MAX(opened_at) AS last_at \
              FROM surface_opens \
              WHERE opened_at >= $1 AND opened_at < $2 \
              GROUP BY actor_id, route \
-             ORDER BY actor_id, opens DESC, route",
+             ORDER BY actor_id COLLATE \"C\", opens DESC, route COLLATE \"C\"",
         )
         .bind(since)
         .bind(until)

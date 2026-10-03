@@ -63,8 +63,8 @@ pub(super) trait Forge: Send + Sync {
 }
 
 /// `owner/name` from a clone url — https or ssh, with or without
-/// `.git`: `https://github.com/dauld/boss-fork.git` and
-/// `git@github.com:dauld/boss-fork` both give `dauld/boss-fork`.
+/// `.git`: `https://github.com/algedonic-dev/boss.git` and
+/// `git@github.com:algedonic-dev/boss` both give `algedonic-dev/boss`.
 pub(crate) fn repo_path(url: &str) -> String {
     let u = url.trim_end_matches('/').trim_end_matches(".git");
     let mut segs = u.rsplit(['/', ':']);
@@ -757,12 +757,12 @@ mod tests {
     #[test]
     fn repo_path_reads_https_and_ssh_clone_urls() {
         assert_eq!(
-            repo_path("https://github.com/dauld/boss-fork.git"),
-            "dauld/boss-fork"
+            repo_path("https://github.com/algedonic-dev/boss.git"),
+            "algedonic-dev/boss"
         );
         assert_eq!(
-            repo_path("git@github.com:dauld/boss-fork"),
-            "dauld/boss-fork"
+            repo_path("git@github.com:algedonic-dev/boss"),
+            "algedonic-dev/boss"
         );
     }
 

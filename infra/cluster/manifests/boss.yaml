@@ -228,6 +228,61 @@ spec:
     requests:
       storage: 20Gi
 ---
+# THE MACHINE GATE'S MODE (design 6805c764, car 4; backlog 2710c8fc).
+# Every service binary mounts boss_core::machine_gate, which reads its
+# mode from /etc/boss/machine-gate/mode and re-reads it every five
+# seconds, so a change here reaches every gate on kubelet's refresh with
+# no pod roll (design choice 3: the way back from a mode must need
+# neither a roll nor the jobs API).
+#
+# `report`: every request is ADMITTED, and each one that presents no
+# accepted machine token is tallied — caller address, asserted user,
+# method, route — and served at /api/machine-gate/misses to a caller
+# holding the token. That tally is how enforcement is earned: a window
+# of zero misses, read (operator decision (4) on 2710c8fc). NOTHING IS
+# REFUSED in this mode. `enforce` is row C of decision b08725c2, its
+# own car, after a 72-hour clean window, on a Pacific-hours train;
+# crates/core/boss-testing/tests/the_machine_gate_reports_and_refuses_nothing.rs
+# refuses `enforce` anywhere under this directory until then.
+#
+# Rendered per instance, so the playground reports too. It holds no
+# token (the broker writes only boss and boss-dev), so every request it
+# serves is a miss — admitted, and bounded by the tally's key cap.
+#
+# THE POLICY CHECK'S MODE, the second key (F7 of backlog b8e75382, row
+# D of design b08725c2; boss_policy::check_mode). The same reader, the
+# same five-second re-read, at /etc/boss/machine-gate/policy-check.
+# `report`: every POST /api/policy/check is ANSWERED as before; one that
+# arrives unsigned, or signed by a service whose Read on policy-rule has
+# lapsed, is tallied and warned, and served at
+# /api/policy/check/refusals (recording_since, clean_since, and each
+# row's last_seen) to a holder of Read on policy-rule. The hourly
+# policy-check-refusals-are-read-hourly rule reads that tally and files
+# an alarm for a lapsed service grant. NOTHING IS REFUSED in this mode.
+# `enforce` is row D's own car, after G1 (47aed706 car 3) and C, on a
+# clean window read from clean_since; the pin named above refuses
+# `enforce` for this key too until then.
+#
+# THE ROLLBACK ROAD, for the car that flips it (it passes neither the
+# jobs API nor the forge nor the conductor, because a misfire of D
+# refuses every signed-in write): set the word back to `report` over the
+# LAN kube road, with David's admin kubeconfig —
+#   kubectl -n boss patch configmap boss-machine-gate --type merge -p '{"data":{"policy-check":"report"}}'
+# The policy service reads it within kubelet's ConfigMap refresh plus
+# five seconds, with no pod roll, and logs "LEFT enforce" at WARN. The
+# next converge re-applies this file, so a misfire that outlives an hour
+# is a revert car too. On a playground namespace, the same with its -n.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: boss-machine-gate
+  namespace: boss
+data:
+  mode: report
+  policy-check: report
+  # abf9eeae precursor, classes only. No enforcement or 72h readiness.
+  actor-role: report
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -428,6 +483,53 @@ spec:
           configMap:
             name: boss-break-glass-credentials
             optional: true
+        # THE OPS RUNNERS' CREDENTIAL SLOTS (design f623e425 Q1; backlog
+        # 1e50e66b): Secret ops-runner-credential, one key per host and
+        # slot (`forge.current`, `forge.next`, `forge.previous`), which only
+        # the credential broker writes (`credential.rotate.ops-runner`,
+        # name-scoped in boss-credential-broker.yaml). The jobs API's
+        # credential door reads this directory on every request that
+        # presents x-boss-runner-credential, so a rotation reaches it on
+        # kubelet's refresh with no restart and no cache of its own.
+        # The WHOLE Secret as one directory, never an `items:` subset or a
+        # `subPath` mount: a subPath is never refreshed, and a slot the
+        # broker adds later (a new host) must appear without an edit here
+        # (review of 8e5de104, finding 4(a)). `optional` because the door
+        # refuses nothing — no Secret is an empty directory and every
+        # request passes uncredentialed, as before this mount — and the
+        # system of record must boot without it (DR rule 62dac114); the
+        # converge creates it empty from the broker rule anyway. 0400 +
+        # the pod fsGroup, as boss-session-key above: the boss uid reads.
+        - name: runner-credential
+          secret:
+            secretName: ops-runner-credential
+            optional: true
+            defaultMode: 0400
+        # THE ESTATE MACHINE TOKEN (design 6805c764, car 4; backlog
+        # 2710c8fc): Secret boss-machine-token, slots `current`, `next`
+        # and `previous`, which only the credential broker writes
+        # (credential.rotate.self-issued; broker-rotates-the-machine-
+        # token.toml). Every service's gate ACCEPTS any filled slot, and
+        # every caller in this pod — each service's clients, the
+        # gateway's per-request stamp, the broker's own verify — SENDS
+        # `current`, re-read every five seconds, so a rotation reaches
+        # them on kubelet's refresh with no restart.
+        #
+        # The WHOLE Secret as one directory, never `items:` or a
+        # `subPath`, which kubelet never refreshes. `optional` because
+        # nothing here refuses: until the broker's first mint the Secret
+        # is empty, the directory is empty, no caller sends a token and
+        # every gate in `report` admits and tallies — and the system of
+        # record must boot without it (DR rule 62dac114). 0440 + the pod
+        # fsGroup, as runner-credential above: the boss uid reads.
+        - name: machine-token
+          secret: {secretName: boss-machine-token, optional: true, defaultMode: 0440}
+        # The gate's mode, the boss-machine-gate ConfigMap above. The
+        # whole ConfigMap as a directory, for the same refresh; optional,
+        # because a missing mode file reads as `off` — a gate that
+        # admits everything — never a pod that cannot start.
+        - name: machine-gate
+          configMap: {name: boss-machine-gate, optional: true}
       initContainers:
         # Converges the schema (infra/postgres/migrate.sh, manifest order)
         # on EVERY start — an existing database gets the migrations it is
@@ -479,6 +581,12 @@ spec:
             - name: BOSS_POSTGRES_URL
               valueFrom: {secretKeyRef: {name: boss-secrets, key: database-url}}
             - {name: BOSS_NATS_URL, value: "nats://nats:4222"}
+            # The hosts the stack's clients may stamp the machine token on,
+            # besides loopback (backlog 2ee29275): this instance's OWN
+            # namespace, as a suffix. render-instance.sh rewrites it per
+            # instance, so the playground lists its own namespace and a
+            # prod token is never stamped onto another instance's Services.
+            - {name: BOSS_MACHINE_TOKEN_HOSTS, value: ".boss.svc.cluster.local"}
             # Wall clock — the prod default. This is no longer a pure
             # simulation: the IT department is real people and agents, and
             # only the rest of the company is simulated, so events must be
@@ -771,6 +879,19 @@ spec:
             # ever reads them (enrollment emits records for a commit,
             # never a write here — the manifest header explains why).
             - {name: break-glass-credentials, mountPath: /etc/boss/break-glass, readOnly: true}
+            # The ops runners' credential slots (the runner-credential
+            # volume above), at the directory the jobs API's credential
+            # door reads by default (boss_jobs::runner_credential::
+            # DEFAULT_DIR). Whole, read-only; pinned by
+            # crates/core/boss-dispatcher/tests/ops_runner_credential_rules.rs.
+            - {name: runner-credential, mountPath: /etc/boss/runner-credential, readOnly: true}
+            # The machine token and the gate's mode (the two volumes
+            # above), at boss-core's defaults — machine_token::
+            # DEFAULT_TOKEN_DIR and machine_gate::DEFAULT_MODE_FILE — so
+            # no env var names a second path. Pinned by
+            # crates/core/boss-testing/tests/the_machine_gate_reports_and_refuses_nothing.rs.
+            - {name: machine-token, mountPath: /etc/boss/machine-token, readOnly: true}
+            - {name: machine-gate, mountPath: /etc/boss/machine-gate, readOnly: true}
 ---
 apiVersion: v1
 kind: Service

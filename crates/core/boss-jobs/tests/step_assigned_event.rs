@@ -243,15 +243,7 @@ async fn a_step_assigned_before_it_becomes_ready_carries_the_assignee_on_ready()
 
     // …then complete scope, which promotes build to ready.
     let scope_id = scope["id"].as_str().unwrap();
-    let (status, _) = send(
-        &app,
-        req(
-            "PUT",
-            &format!("/api/jobs/{job_id}/steps/{scope_id}"),
-            scope_completion(&scope["metadata"]),
-        ),
-    )
-    .await;
+    let (status, _) = complete_scope(&app, &job_id, scope_id).await;
     assert!(status.is_success(), "step update: {status}");
 
     let recorded = jobs.recorded_events();
@@ -267,13 +259,29 @@ async fn a_step_assigned_before_it_becomes_ready_carries_the_assignee_on_ready()
     );
 }
 
-/// The scope completion as a read-merge-write: the step's stored
-/// metadata with the evidence laid over it. The step PUT refuses a
-/// metadata body that omits a stored key (e39a9d2a), so a completer
-/// sends back everything it read.
-fn scope_completion(stored: &serde_json::Value) -> serde_json::Value {
-    let mut metadata = stored.clone();
-    metadata["summary"] = serde_json::json!("s");
-    metadata["excludes"] = serde_json::json!("e");
-    serde_json::json!({"status": "completed", "metadata": metadata})
+/// Complete `scope` the way every completer does since e39a9d2a: its
+/// evidence through the step merge door (only the keys it writes), then
+/// the status alone through the PUT, which refuses any body carrying
+/// metadata. Answers the PUT.
+async fn complete_scope(
+    app: &axum::Router,
+    job_id: &str,
+    scope_id: &str,
+) -> (StatusCode, serde_json::Value) {
+    let path = format!("/api/jobs/{job_id}/steps/{scope_id}");
+    let (status, body) = send(
+        app,
+        req(
+            "PATCH",
+            &format!("{path}/metadata"),
+            serde_json::json!({"summary": "s", "excludes": "e"}),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "scope's evidence: {status}: {body}");
+    send(
+        app,
+        req("PUT", &path, serde_json::json!({"status": "completed"})),
+    )
+    .await
 }

@@ -64,17 +64,23 @@ use boss_core::roles::{
 };
 use boss_policy_client::defaults::default_rules;
 use boss_policy_client::types::{Action, Decision, PolicyRule, Resource, Scope, UserOverride};
+use boss_policy_client::{Pair, controls};
 use chrono::{DateTime, Utc};
 
-/// The verbs a policy write can be judged as.
-pub const POLICY_VERBS: [Action; 3] = [Action::Create, Action::Update, Action::Delete];
+/// The controls a policy write can be judged as — the write verbs on
+/// `policy-rule`, declared once in `boss_policy_client::controls`.
+pub const POLICY_WRITES: [Pair; 3] = [
+    controls::CREATE_POLICY_RULE,
+    controls::UPDATE_POLICY_RULE,
+    controls::DELETE_POLICY_RULE,
+];
 
 /// What the caller holds, read before the write's transaction opens.
 #[derive(Debug, Clone)]
 pub struct Holdings {
     pub id: String,
     pub role: String,
-    /// The caller's decision on each of [`POLICY_VERBS`] on `policy-rule`.
+    /// The caller's decision on each of [`POLICY_WRITES`], by its verb.
     pub policy_rule: Vec<(Action, Decision)>,
     /// The action and resource the write grants or withholds, and the
     /// caller's own decision on them.

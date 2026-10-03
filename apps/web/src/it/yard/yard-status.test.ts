@@ -394,6 +394,7 @@ describe('parseYardStatus', () => {
       silent: true,
       last_verb: 'reconcile',
       last_rc: 3,
+      withheld: null,
     });
   });
 
@@ -414,7 +415,26 @@ describe('parseYardStatus', () => {
       silent: false,
       last_verb: null,
       last_rc: null,
+      withheld: null,
     });
+  });
+
+  // Backlog bd506215: the server withholds the heartbeat from a caller
+  // whose scope does not read every packet (d0058c92) and says why. The
+  // page used to drop the reason and draw the nulls as "no firing".
+  test('a withheld conductor block keeps the refusal, so it is never read as no firing', () => {
+    const s = parseYardStatus({
+      conductor: {
+        last_seen: null,
+        silent_for_minutes: null,
+        expected_every_minutes: 10,
+        silent: false,
+        last_verb: null,
+        last_rc: null,
+        withheld: "this caller's policy scope does not read every packet",
+      },
+    });
+    expect(s.conductor?.withheld).toBe("this caller's policy scope does not read every packet");
   });
 
   test('the boarding predicate carries every field the conductor block renders', () => {
@@ -496,6 +516,7 @@ const health = (over: Partial<ConductorHealth> = {}): ConductorHealth => ({
   silent: false,
   last_verb: 'reconcile',
   last_rc: 0,
+  withheld: null,
   ...over,
 });
 
@@ -525,6 +546,23 @@ describe('conductorReading', () => {
     const r = conductorReading(null);
     expect(r.tone).toBe('muted');
     expect(r.text).toBe('no liveness reading — this server does not report the conductor');
+  });
+
+  // Backlog bd506215: a refusal by scope in an alarm's colour was the
+  // defect. Withheld is neutral, says so, and never says "unknown".
+  test('a withheld heartbeat reads muted, not in your policy scope — never warn, never unknown', () => {
+    const r = conductorReading(
+      health({
+        last_seen: null,
+        silent_for_minutes: null,
+        last_verb: null,
+        last_rc: null,
+        withheld: "this caller's policy scope does not read every packet",
+      }),
+    );
+    expect(r.tone).toBe('muted');
+    expect(r.text).toBe('not in your policy scope · expects every 10m');
+    expect(r.text).not.toContain('unknown');
   });
 
   test('a heartbeat with no declared interval still reads last-seen', () => {
@@ -558,6 +596,13 @@ describe('lastVerbReading', () => {
   test('no verb on record, and no block at all, both read muted', () => {
     expect(lastVerbReading(health({ last_verb: null })).text).toBe('no verb on record');
     expect(lastVerbReading(null).text).toBe('no verb on record');
+  });
+
+  test('a withheld verb says not in your policy scope, muted — not "no verb on record"', () => {
+    expect(lastVerbReading(health({ last_verb: null, last_rc: null, withheld: 'x' }))).toEqual({
+      tone: 'muted',
+      text: 'not in your policy scope',
+    });
   });
 });
 
@@ -701,6 +746,21 @@ describe('boardHold', () => {
     expect(v!.primary.tone).toBe('muted');
   });
 
+  // Backlog bd506215: the board rule's firing withheld by scope (d0058c92)
+  // is neither "not read" (a failure) nor a blank (never boarded).
+  test('a withheld firing says not in your policy scope, muted', () => {
+    const v = boardHold(
+      predicate({
+        last_board_reading: 'withheld',
+        last_board_at: null,
+        held_because:
+          "the board rule's last firing is withheld from this caller, whose policy scope does not read every packet — the cooldown cannot be evaluated",
+      }),
+    );
+    expect(v!.lastBoard).toBe('not in your policy scope');
+    expect(v!.primary.tone).toBe('muted');
+  });
+
   test('a board that never happened is still a reading — blank, and ok', () => {
     // The honest negative: `Ok(None)` from the registry. The page must
     // keep telling this apart from the unread case above.
@@ -725,6 +785,11 @@ describe('the readings on the wire', () => {
       boarding: { dock_depth: 0, at_times: [], summary: 'x', cadence_reading: 'yes' },
     }).boarding;
     expect(junk.cadence_reading).toBeNull();
+    // Withheld is a stated reading of its own (d0058c92), not dropped.
+    const withheld = parseYardStatus({
+      boarding: { dock_depth: 0, at_times: [], summary: 'x', last_board_reading: 'withheld' },
+    }).boarding;
+    expect(withheld.last_board_reading).toBe('withheld');
   });
 
   test("an unread cadence keeps the server's sentence, not a rule the lens invented", () => {

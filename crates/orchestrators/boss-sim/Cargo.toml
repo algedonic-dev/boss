@@ -10,7 +10,9 @@ edition.workspace = true
 
 [features]
 default = ["http"]
-http = ["dep:reqwest"]
+# `boss-core/blocking`: the live output and the workforce send through
+# machine_token::BlockingClient (design 6805c764 car 2).
+http = ["dep:reqwest", "boss-core/blocking"]
 
 [dependencies]
 boss-ports = { path = "../../core/boss-ports" }

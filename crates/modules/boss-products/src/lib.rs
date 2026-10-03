@@ -9,6 +9,7 @@
 //! ledger (finished products are tracked per-location with cost
 //! basis). This crate is the HTTP API + the read/write surface.
 
+pub mod delta;
 pub mod events;
 pub mod port;
 pub mod types;

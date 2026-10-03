@@ -12,6 +12,21 @@ export type EntityRef = {
   entity_path?: string | null;
 };
 
+/// One kind's rows in the whole inbox, all and unread (boss-messages'
+/// `KindCount`).
+export type KindCount = Readonly<{ kind: string; all: number; unread: number }>;
+
+/// What the inbox read answers (backlog 74da899d): one page of the
+/// narrowed inbox, how many rows the narrowing matches, and the whole
+/// inbox counted per kind.
+export type InboxPage = Readonly<{
+  data: ReadonlyArray<Message>;
+  total: number;
+  limit: number;
+  offset: number;
+  kinds: ReadonlyArray<KindCount>;
+}>;
+
 export type Message = {
   id: string;
   sender_id: string;

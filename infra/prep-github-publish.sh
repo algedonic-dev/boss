@@ -297,6 +297,6 @@ fi
 say ""
 say "  safe to publish. On approval the forge opens the PR by machine"
 say "  (ops verb publish-github-pr: a snapshot commit of $SOURCE on"
-say "  $(printf '%s' "$SLUG") main, pushed to dauld:$PR_BRANCH, then gh pr create)."
-say "  The merge on GitHub is yours."
+say "  $(printf '%s' "$SLUG") main, pushed to $(printf '%s' "$SLUG"):$PR_BRANCH and"
+say "  opened as the GitHub App — backlog d2b7c947)."
 exit 0

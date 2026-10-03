@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set +x # FIRST: an inherited SHELLOPTS=xtrace would trace the token (review L4)
 #
-# github-act — three bounded GitHub acts, each a rendered plan and a
+# github-act — four bounded GitHub acts, each a rendered plan and a
 # passkey-approved write, authenticated as the GitHub App's INSTALLATION
 # on the owner the request names.
 #
@@ -11,6 +11,8 @@ set +x # FIRST: an inherited SHELLOPTS=xtrace would trace the token (review L4)
 #   github-act.sh set-branch-protection        <owner> <repo> <pattern> <push-allow> <checks> <plan-sha256>
 #   github-act.sh delete-refs           --plan <owner> <repo> <refs> <reason>
 #   github-act.sh delete-refs                  <owner> <repo> <refs> <reason> <plan-sha256>
+#   github-act.sh disable-actions       --plan <owner> <repo>
+#   github-act.sh disable-actions              <owner> <repo> <plan-sha256>
 #
 # WHY IT EXISTS (design 76155676 decision 4, David 2026-09-27; backlog
 # 6a8ff89f). Every GitHub act BOSS needed was a click or a personal token
@@ -84,7 +86,7 @@ set +x # FIRST: an inherited SHELLOPTS=xtrace would trace the token (review L4)
 # not inherited, git and curl traces are unset, no redirect is followed,
 # and no core is dumped (adversarial review of 78959555).
 #
-# THE THREE ACTS, each bounded by construction:
+# THE FOUR ACTS, each bounded by construction:
 #
 #   create-repository <owner> <name> <private|public>
 #     POST /orgs/<owner>/repos — an ORGANISATION's repository (an
@@ -95,6 +97,16 @@ set +x # FIRST: an inherited SHELLOPTS=xtrace would trace the token (review L4)
 #     name. One that exists exactly as declared is a plan with no act
 #     (idempotent). Proof: GET /repos/<owner>/<name> reads back as
 #     <owner>/<name>, that visibility, fork false.
+#     Then GitHub ACTIONS OFF: PUT /repos/<owner>/<name>/actions/permissions
+#     {"enabled":false}, read back as enabled false (backlog e727fcfd,
+#     2026-09-29). GitHub enables Actions on every new repository, and
+#     this verb's repositories are BOSS-managed copies whose workflows are
+#     the forge's: on the private DR copy every push of forge main would
+#     otherwise run the tree's ci.yml, codeql and scorecard on paid
+#     minutes, and let a token holder run code on a hosted runner. So the
+#     plan says it and the passkey signs it; one that exists with Actions
+#     on plans the PUT alone — which is also how a create whose PUT failed
+#     after its 201 converges.
 #
 #   set-branch-protection <owner> <repo> <pattern> <push-allow> <checks>
 #     A repository RULESET, not classic branch protection: the classic
@@ -108,7 +120,30 @@ set +x # FIRST: an inherited SHELLOPTS=xtrace would trace the token (review L4)
 #     `team:<team id>` bypass actors, comma-separated, or `none`: nobody)
 #     and WHICH checks (context names, comma-separated, or `none`). A
 #     rulesets API has no user actor, so an identity is an App or a team.
+#     A check name that carries a space, a comma or parentheses — the
+#     mirror's own `Gate (infra/gate.sh, full)` — is spelled with `%XX`
+#     escapes, as in a URL, because an ops argument carries no whitespace
+#     and the list is comma-separated; the plan prints it DECODED, the
+#     name GitHub will require, so that is what the passkey signs. A
+#     check is PINNED to the App that must run it by a trailing
+#     `@<App id>` (GitHub's integration_id; backlog 16a9c5ae): unpinned,
+#     any App that can write checks satisfies it with a run of that name.
 #     Proof: the ruleset reads back, normalised, equal to the plan.
+#
+#     IT REPLACES A CLASSIC RULE ON THE BRANCH IT NAMES (backlog 602fe95f,
+#     David 2026-09-30: only the GitHub App updates algedonic-dev/boss
+#     main). GitHub applies classic branch protection AND rulesets
+#     together, so a stale classic requirement still binds whoever the
+#     ruleset lets through — measured that day, main's classic rule
+#     required the checks `rust` and `web` of non-admins, which no
+#     workflow had produced since ci.yml became one Gate job, so every
+#     merge was an admin bypass and the App (not an admin) could not merge
+#     at all. When the pattern is ONE branch name (no `*`), the plan reads
+#     that branch's classic protection and prints it; when there is one,
+#     the act DELETEs it — only after the ruleset reads back, so the
+#     branch is never unprotected between the two — and proves it by the
+#     read answering 404 "Branch not protected". A pattern is not read:
+#     GitHub serves classic protection by branch name, and says so.
 #
 #   delete-refs <owner> <repo> <refs> <reason>
 #     Each ref named in full (`heads/<branch>` or `tags/<tag>`,
@@ -122,6 +157,16 @@ set +x # FIRST: an inherited SHELLOPTS=xtrace would trace the token (review L4)
 #     only with a reason (a slug, since an ops argument carries no
 #     whitespace). A named ref already absent is listed and left.
 #     Proof: `git ls-remote` lists none of the deleted refs.
+#
+#   disable-actions <owner> <repo>
+#     PUT /repos/<owner>/<repo>/actions/permissions {"enabled":false} —
+#     that one setting: never an enable, a workflow run or any other
+#     setting. An archived, moved, forked or invisible repository is
+#     refused; one whose Actions already read disabled is a plan with no
+#     act. It serves a repository this verb's create did not turn off
+#     (algedonic-dev/boss-dr predates it: disabled by hand on 2026-09-29,
+#     and nothing read it back). Proof: the permission reads back enabled
+#     false.
 #
 # THE BYTES ARE DETERMINISTIC: no clock, no token digits, no temp path.
 # Two renders of one true state are byte-identical; the sha256 goes on
@@ -187,7 +232,7 @@ HERE="$(dirname "$SELF")"
 # protocol and host on stdin; the token is answered ONLY for
 # https://github.com, exactly, and only on `get`. No verb file can name
 # this word (the-controls-are-bounded-verbs holds each GitHub verb to one
-# of the three acts), so it is reachable only through git's helper config
+# of the four acts), so it is reachable only through git's helper config
 # this script writes below.
 if [ "${1-}" = credential-helper ]; then
     [ $# -eq 3 ] && [ "$3" = get ] || exit 0
@@ -228,6 +273,7 @@ usage() {
     say "usage: $ME create-repository [--plan] <owner> <name> <private|public> [<plan-sha256>]"
     say "       $ME set-branch-protection [--plan] <owner> <repo> <pattern> <push-allow> <checks> [<plan-sha256>]"
     say "       $ME delete-refs [--plan] <owner> <repo> <refs> <reason> [<plan-sha256>]"
+    say "       $ME disable-actions [--plan] <owner> <repo> [<plan-sha256>]"
     say "  --plan renders the plan on stdout and plan-sha256 on stderr and changes nothing;"
     say "  without it the last argument is the SIGNED plan's hash, and the act runs only while today's plan hashes to it"
 }
@@ -242,7 +288,8 @@ case "$ACT" in
     create-repository) WANT=3 ;;
     set-branch-protection) WANT=5 ;;
     delete-refs) WANT=4 ;;
-    *) usage; refuse "unknown act '$ACT' — the acts are create-repository, set-branch-protection and delete-refs" ;;
+    disable-actions) WANT=2 ;;
+    *) usage; refuse "unknown act '$ACT' — the acts are create-repository, set-branch-protection, delete-refs and disable-actions" ;;
 esac
 APPROVED=""
 if [ "$PLAN" -eq 1 ]; then
@@ -500,12 +547,41 @@ readback() {
     return 1
 }
 
+# --- GitHub Actions on a repository (backlog e727fcfd) -------------------------
+# read_actions <owner/repo> — ACTIONS_ENABLED is `true` or `false` as GitHub
+# answers it now; any other answer is no answer.
+read_actions() {
+    api GET "/repos/$1/actions/permissions"
+    [ "$CODE" = 200 ] || unexpected "GET /repos/$1/actions/permissions"
+    jq_doc_file "$WORK/out" || fail "GET /repos/$1/actions/permissions answered 200 with no JSON document"
+    ACTIONS_ENABLED="$(jq -er '.enabled | booleans | tostring' "$WORK/out" 2>/dev/null)" \
+        || fail "GET /repos/$1/actions/permissions answered 200 without a boolean enabled: $(head -c 200 "$WORK/out" | tr '\n' ' ')"
+}
+# put_actions_off <owner/repo> <what stands if it fails> — the one write.
+put_actions_off() {
+    jq -n -c '{enabled: false}' >"$WORK/actions.json" || fail "cannot build the request body"
+    api PUT "/repos/$1/actions/permissions" "$WORK/actions.json"
+    [ "$CODE" = 204 ] || fail "PUT /repos/$1/actions/permissions answered HTTP $CODE: $(said) — $2"
+    echo "$ME: PUT /repos/$1/actions/permissions answered 204"
+}
+# actions_read_back — a readback check on $ACTIONS_REPO: enabled is false.
+actions_read_back() {
+    api GET "/repos/$ACTIONS_REPO/actions/permissions"
+    [ "$CODE" = 200 ] || { say "read back: GET /repos/$ACTIONS_REPO/actions/permissions answered HTTP $CODE: $(said)"; return 1; }
+    jq_doc_file "$WORK/out" && jq -e '.enabled == false' "$WORK/out" >/dev/null 2>&1 && return 0
+    say "read back: Actions on $ACTIONS_REPO answer $(jq -c '{enabled, allowed_actions}' "$WORK/out" 2>/dev/null || head -c 200 "$WORK/out")"
+    return 1
+}
+# The body both acts send, as the plan prints it.
+ACTIONS_OFF='{"enabled":false}'
+
 # =============================================================================
 # create-repository
 # =============================================================================
 create_repository() {
     NAME="$2"
     VIS="$3"
+    ACTIONS_ENABLED=""
     repo_name "the repository" "$NAME"
     case "$VIS" in
         private) PRIVATE=true ;;
@@ -550,7 +626,9 @@ create_repository() {
         vis_now="$(jq -r '.visibility // "not stated"' "$WORK/out")" || fail "cannot read visibility"
         [ "$vis_now" = "$VIS" ] || refuse "$full already exists with visibility $vis_now — this verb never changes one's visibility"
         EXISTING="id $id, visibility $VIS, private $priv, fork false, not archived"
+        read_actions "$OWNER/$NAME"
     fi
+    ACTIONS_REPO="$OWNER/$NAME"
 
     jq -n -c --arg name "$NAME" --arg vis "$VIS" --argjson private "$PRIVATE" \
         '{name: $name, private: $private, visibility: $vis, auto_init: false}' >"$WORK/body.json" \
@@ -563,13 +641,21 @@ create_repository() {
         echo "credential: the GitHub App installation on $OWNER, token slot $TOKEN_FILE"
         if [ "$STATE" = absent ]; then
             echo "state: absent — GET /repos/$OWNER/$NAME answers 404"
+            echo "actions: disabled after the create — GitHub enables them on every new repository, and this one's workflows are the forge's"
             echo "act: POST /orgs/$OWNER/repos $(cat "$WORK/body.json")"
+            echo "act: PUT /repos/$OWNER/$NAME/actions/permissions $ACTIONS_OFF"
         else
             echo "state: exists as declared — $EXISTING"
-            echo "act: none — nothing to create; the write reads it back and changes nothing"
+            if [ "$ACTIONS_ENABLED" = true ]; then
+                echo "actions: enabled — GET /repos/$OWNER/$NAME/actions/permissions answers enabled true"
+                echo "act: PUT /repos/$OWNER/$NAME/actions/permissions $ACTIONS_OFF — nothing to create; only its Actions are turned off"
+            else
+                echo "actions: disabled — GET /repos/$OWNER/$NAME/actions/permissions answers enabled false"
+                echo "act: none — nothing to create; the write reads it back and changes nothing"
+            fi
         fi
-        echo "proof: GET /repos/$OWNER/$NAME answers 200 as $OWNER/$NAME, visibility $VIS, private $PRIVATE, fork false, not archived"
-        echo "never: a fork, a visibility change, an archive or a delete, a repository outside $OWNER"
+        echo "proof: GET /repos/$OWNER/$NAME answers 200 as $OWNER/$NAME, visibility $VIS, private $PRIVATE, fork false, not archived; Actions read back as enabled false"
+        echo "never: a fork, a visibility change, an archive or a delete, a repository outside $OWNER, enabling Actions"
     } >"$WORK/plan"
     seal
 
@@ -590,7 +676,15 @@ create_repository() {
     }
     readback repo_reads_back \
         || fail "$OWNER/$NAME does not read back as $OWNER/$NAME, visibility $VIS, fork false, not archived (above)$([ "$STATE" = absent ] && echo ' — the POST answered 201, so what GitHub holds must be read before anything else is done')"
-    echo "$ME: proven — GET /repos/$OWNER/$NAME reads back as $OWNER/$NAME, private $PRIVATE, fork false$([ "$STATE" = exists ] && echo '; nothing was created, it already stood as declared')"
+    # Actions off, only once the repository is proven: a PUT that fails
+    # leaves one standing with Actions on, and the next plan converges it
+    # with the PUT alone.
+    if [ "$STATE" = absent ] || [ "$ACTIONS_ENABLED" = true ]; then
+        put_actions_off "$OWNER/$NAME" "$OWNER/$NAME stands (read back above) with Actions still ENABLED; render the plan again — it plans only the PUT"
+    fi
+    readback actions_read_back \
+        || fail "$OWNER/$NAME stands (read back above), but its Actions do not read back as enabled false (above) — render the plan again; it plans only the PUT"
+    echo "$ME: proven — GET /repos/$OWNER/$NAME reads back as $OWNER/$NAME, private $PRIVATE, fork false; Actions read back as enabled false$([ "$STATE" = exists ] && echo '; nothing was created, it already stood as declared')"
 }
 
 # =============================================================================
@@ -638,19 +732,66 @@ set_branch_protection() {
     esac
     [[ $ALLOW =~ ^(none|(app|team):[0-9]{1,12}(,(app|team):[0-9]{1,12}){0,9})$ ]] \
         || refuse "the push allowlist '$ALLOW' is not 'none' or up to ten app:<App id> / team:<team id>, comma-separated (a ruleset's bypass actors are Apps and teams, never a user)"
-    [[ $CHECKS =~ ^(none|[A-Za-z0-9][A-Za-z0-9._/:-]{0,99}(,[A-Za-z0-9][A-Za-z0-9._/:-]{0,99}){0,19})$ ]] \
-        || refuse "the required checks '$CHECKS' are not 'none' or up to twenty check names, comma-separated, without whitespace"
+    [[ $CHECKS =~ ^(none|([A-Za-z0-9]|%[0-9A-Fa-f]{2})([A-Za-z0-9._/:-]|%[0-9A-Fa-f]{2}){0,299}(@[0-9]{1,12})?(,([A-Za-z0-9]|%[0-9A-Fa-f]{2})([A-Za-z0-9._/:-]|%[0-9A-Fa-f]{2}){0,299}(@[0-9]{1,12})?){0,19})$ ]] \
+        || refuse "the required checks '$CHECKS' are not 'none' or up to twenty check names, comma-separated, without whitespace (a space, comma or parenthesis inside a name is spelled %20, %2C, %28, %29), each optionally pinned to the App that must run it as <name>@<App id>"
+    # The names, DECODED — what GitHub will require and what the plan
+    # prints. Split on the raw commas first, so an escaped comma stays
+    # inside its name. A decoded name is printable ASCII with no leading or
+    # trailing space: a control character in a required check is no name
+    # any workflow could produce.
+    #
+    # PINNED TO AN APP (backlog 16a9c5ae, review 01561b13 N1): `<name>@<App
+    # id>` requires the check from that App alone — GitHub's
+    # `integration_id`. Unpinned, a check run of that NAME from any App that
+    # can write checks satisfies it (measured on #248's head: CodeQL's App,
+    # 57789, can post check runs on the mirror), and publish-github-pr
+    # --merge refuses to merge over an unpinned requirement. The mirror's
+    # Gate runs under GitHub Actions: Gate%20%28infra%2Fgate.sh%2C%20full%29@15368.
+    # A raw `@` is not in a name's alphabet, so the split is exact.
+    local c d app raw=() decoded=() apps=() LC_ALL=C
+    if [ "$CHECKS" != none ]; then
+        IFS=, read -r -a raw <<<"$CHECKS"
+        for c in "${raw[@]}"; do
+            app=""
+            if [[ $c == *@* ]]; then
+                app="${c##*@}"
+                c="${c%@*}"
+            fi
+            apps+=("$app")
+            # The pattern above admits a `%` only before two hex digits and
+            # no backslash at all, so this printf decodes those and nothing else.
+            # The `.` keeps a decoded trailing newline from being stripped
+            # by the substitution — and so refused below, not swallowed.
+            d="$(printf '%b.' "${c//%/\\x}")" || refuse "the check name '$c' does not decode"
+            d="${d%.}"
+            if [ -z "$d" ] || [ "${#d}" -gt 100 ] || [[ $d == *[![:print:]]* || $d == " "* || $d == *" " ]]; then
+                refuse "the check name '$c' decodes to something that is not 1 to 100 printable characters without a leading or trailing space"
+            fi
+            decoded+=("$d")
+        done
+    fi
+    # Shown decoded, each with the App it is pinned to — what the passkey
+    # signs. `,` joins them as the argument did.
+    local shown=() i
+    for i in "${!decoded[@]}"; do
+        shown+=("${decoded[$i]}$([ -n "${apps[$i]}" ] && printf ' (from App %s only)' "${apps[$i]}")")
+    done
+    CHECKS_SHOWN="$([ "$CHECKS" = none ] && echo none || (IFS=,; printf '%s' "${shown[*]}"))"
     BYPASS="$(jq -n -c --arg a "$ALLOW" 'if $a == "none" then [] else ($a | split(",") | map(split(":")
         | {actor_id: (.[1] | tonumber), actor_type: (if .[0] == "app" then "Integration" else "Team" end), bypass_mode: "always"})) end')" \
         || fail "cannot build the bypass list"
     jq_doc_text "$BYPASS" || fail "the bypass list came out empty"
     jq -e 'map("\(.actor_type):\(.actor_id)") | length == (unique | length)' <<<"$BYPASS" >/dev/null \
         || refuse "the push allowlist '$ALLOW' names an actor twice"
-    CHECKS_JSON="$(jq -n -c --arg c "$CHECKS" 'if $c == "none" then [] else ($c | split(",")) end')" \
+    # Each check as GitHub takes it: {context} or {context, integration_id}.
+    # The names and the pins ride as two positional halves of one list.
+    CHECKS_JSON="$(jq -n -c --argjson n "${#decoded[@]}" '$ARGS.positional as $a
+        | [range(0; $n) | {context: $a[.]} + (if $a[$n + .] == "" then {} else {integration_id: ($a[$n + .] | tonumber)} end)]' \
+        --args ${decoded[@]+"${decoded[@]}"} ${apps[@]+"${apps[@]}"})" \
         || fail "cannot build the check list"
     jq_doc_text "$CHECKS_JSON" || fail "the check list came out empty"
-    jq -e 'length == (unique | length)' <<<"$CHECKS_JSON" >/dev/null \
-        || refuse "the required checks '$CHECKS' name a check twice"
+    jq -e 'map(.context) | length == (unique | length)' <<<"$CHECKS_JSON" >/dev/null \
+        || refuse "the required checks '$CHECKS_SHOWN' name a check twice"
     RS_NAME="boss: refs/heads/$PATTERN"
     load_token
 
@@ -696,7 +837,7 @@ set_branch_protection() {
                          [{type: "required_status_checks", parameters: {
                              strict_required_status_checks_policy: false,
                              do_not_enforce_on_create: false,
-                             required_status_checks: ($checks | map({context: .}))}}]
+                             required_status_checks: $checks}}]
                        else [] end))}' >"$WORK/desired.json" || fail "cannot build the ruleset"
     DESIRED="$(jq -S -c "$NORM"' norm' "$WORK/desired.json")" || fail "cannot normalise the ruleset"
 
@@ -716,6 +857,39 @@ set_branch_protection() {
         CURRENT="$(jq -S -c "$NORM"' norm' "$WORK/current.json")" || fail "the ruleset $RS_ID of $OWNER/$REPO does not read as a ruleset: $(said)"
     fi
 
+    # THE CLASSIC RULE THIS RULESET REPLACES (header; backlog 602fe95f).
+    # One branch name only: GitHub serves classic protection by branch,
+    # and a pattern names none. The branch rides the path %-encoded, so a
+    # name with a `/` is one path segment.
+    CLASSIC=""
+    CLASSIC_PATH=""
+    case "$PATTERN" in
+        *'*'*) CLASSIC_LINE="classic protection: not read — $PATTERN is a pattern, and GitHub reads classic protection by branch name" ;;
+        *)
+            CLASSIC_PATH="/repos/$OWNER/$REPO/branches/$(jq -rn --arg b "$PATTERN" '$b | @uri')/protection"
+            api GET "$CLASSIC_PATH"
+            case "$CODE" in
+                200)
+                    jq_doc_file "$WORK/out" && jq -e 'type == "object"' "$WORK/out" >/dev/null 2>&1 \
+                        || fail "GET $CLASSIC_PATH answered 200 without a protection object: $(head -c 200 "$WORK/out" | tr '\n' ' ')"
+                    cp "$WORK/out" "$WORK/classic.json" || fail "cannot keep the classic protection"
+                    CLASSIC=present
+                    CLASSIC_LINE="classic protection on refs/heads/$PATTERN: present — GET $CLASSIC_PATH answers 200; GitHub applies it beside the ruleset, so it goes once the ruleset reads back"
+                    ;;
+                404)
+                    # Only GitHub's two words for "nothing here" are an
+                    # absence; any other 404 is an answer this verb cannot read.
+                    case "$(jq -r '.message // empty' "$WORK/out" 2>/dev/null)" in
+                        "Branch not protected") CLASSIC_LINE="classic protection on refs/heads/$PATTERN: none — GET $CLASSIC_PATH answers 404 Branch not protected" ;;
+                        "Branch not found") CLASSIC_LINE="classic protection on refs/heads/$PATTERN: none — GET $CLASSIC_PATH answers 404 Branch not found (no such branch yet)" ;;
+                        *) unexpected "GET $CLASSIC_PATH" ;;
+                    esac
+                    ;;
+                *) unexpected "GET $CLASSIC_PATH" ;;
+            esac
+            ;;
+    esac
+
     if [ -z "$RS_ID" ]; then
         ACT_LINE="POST /repos/$OWNER/$REPO/rulesets"
     elif [ "$CURRENT" = "$DESIRED" ]; then
@@ -729,19 +903,46 @@ set_branch_protection() {
         echo "ruleset: $RS_NAME ($([ -n "$RS_ID" ] && echo "id $RS_ID" || echo absent))"
         echo "branches: refs/heads/$PATTERN"
         echo "push allowlist: $([ "$ALLOW" = none ] && echo 'none — nobody may create, update or delete a matching branch' || echo "$ALLOW (bypass actors: they alone may create, update or delete a matching branch)")"
-        echo "required checks: $CHECKS"
+        echo "required checks: $CHECKS_SHOWN"
         echo "credential: the GitHub App installation on $OWNER, token slot $TOKEN_FILE"
         echo "current:"
         if [ -n "$RS_ID" ]; then norm_lines "$WORK/current.json"; else echo "  absent"; fi
         echo "desired:"
         norm_lines "$WORK/desired.json"
+        echo "$CLASSIC_LINE"
+        # The classic rule, whole enough to know what is being removed —
+        # and in the signed bytes, so a rule that changes after the
+        # signature voids the plan.
+        if [ "$CLASSIC" = present ]; then
+            jq -r '
+                def on(f): if f == null then "none"
+                    elif (f | type) == "object" then (if (f | has("enabled")) then (f.enabled | tostring) else "set" end)
+                    else (f | tostring) end;
+                "  classic: required_status_checks " + (if .required_status_checks == null then "none"
+                    else "strict=\(.required_status_checks.strict // false) contexts=\((.required_status_checks.contexts // []) | sort | join(","))" end),
+                "  classic: required_pull_request_reviews " + (if .required_pull_request_reviews == null then "none"
+                    else "approvals=\(.required_pull_request_reviews.required_approving_review_count // 0)" end),
+                "  classic: restrictions " + (if .restrictions == null then "none"
+                    else "users=\([(.restrictions.users // [])[].login] | sort | join(",")) teams=\([(.restrictions.teams // [])[].slug] | sort | join(",")) apps=\([(.restrictions.apps // [])[].slug] | sort | join(","))" end),
+                "  classic: enforce_admins \(on(.enforce_admins))",
+                "  classic: allow_force_pushes \(on(.allow_force_pushes))",
+                "  classic: allow_deletions \(on(.allow_deletions))",
+                "  classic: required_linear_history \(on(.required_linear_history))",
+                "  classic: required_signatures \(on(.required_signatures))",
+                "  classic: lock_branch \(on(.lock_branch))"' "$WORK/classic.json" \
+                || fail "the classic protection on refs/heads/$PATTERN does not read as one"
+        fi
         if [ -n "$ACT_LINE" ]; then
             echo "act: $ACT_LINE $(jq -c . "$WORK/desired.json")"
-        else
-            echo "act: none — the ruleset already reads as desired; the write reads it back and changes nothing"
         fi
-        echo "proof: the ruleset reads back, normalised, as desired (above)"
-        echo "never: a ruleset this verb did not name, a delete of any ruleset, a rule outside the fixed set above"
+        if [ "$CLASSIC" = present ]; then
+            echo "act: DELETE $CLASSIC_PATH — after the ruleset reads back, never before"
+        fi
+        if [ -z "$ACT_LINE" ] && [ "$CLASSIC" != present ]; then
+            echo "act: none — the ruleset already reads as desired and no classic rule stands beside it; the write reads it back and changes nothing"
+        fi
+        echo "proof: the ruleset reads back, normalised, as desired (above)$([ "$CLASSIC" = present ] && echo "; then GET $CLASSIC_PATH answers 404 Branch not protected")"
+        echo "never: a ruleset this verb did not name, a delete of any ruleset, a rule outside the fixed set above, a classic rule on any branch but refs/heads/$PATTERN, or that one before the ruleset stands"
     } >"$WORK/plan"
     seal
 
@@ -768,8 +969,25 @@ set_branch_protection() {
         return 1
     }
     readback ruleset_reads_back \
-        || fail "ruleset $RS_ID on $OWNER/$REPO does not read back as desired (above; wanted $DESIRED)"
-    echo "$ME: proven — ruleset $RS_ID ($RS_NAME) on $OWNER/$REPO reads back as desired$([ -z "$ACT_LINE" ] && echo '; nothing was written, it already stood as declared')"
+        || fail "ruleset $RS_ID on $OWNER/$REPO does not read back as desired (above; wanted $DESIRED)$([ "$CLASSIC" = present ] && echo " — the classic protection on refs/heads/$PATTERN was NOT touched")"
+    # The classic rule goes only now: the ruleset that replaces it stands.
+    local classic_said=""
+    if [ "$CLASSIC" = present ]; then
+        api DELETE "$CLASSIC_PATH"
+        [ "$CODE" = 204 ] \
+            || fail "DELETE $CLASSIC_PATH answered HTTP $CODE: $(said) — ruleset $RS_ID stands (read back above) and the classic rule beside it was not removed; render the plan again, which plans the delete alone"
+        echo "$ME: DELETE $CLASSIC_PATH answered 204"
+        classic_reads_back() {
+            api GET "$CLASSIC_PATH"
+            [ "$CODE" = 404 ] && [ "$(jq -r '.message // empty' "$WORK/out" 2>/dev/null)" = "Branch not protected" ] && return 0
+            say "read back: GET $CLASSIC_PATH answered HTTP $CODE: $(said)"
+            return 1
+        }
+        readback classic_reads_back \
+            || fail "the classic protection on refs/heads/$PATTERN still reads as standing after its DELETE answered 204 (above) — ruleset $RS_ID stands; render the plan again"
+        classic_said="; the classic protection on refs/heads/$PATTERN is removed — GET $CLASSIC_PATH answers 404 Branch not protected"
+    fi
+    echo "$ME: proven — ruleset $RS_ID ($RS_NAME) on $OWNER/$REPO reads back as desired$([ -z "$ACT_LINE" ] && echo '; the ruleset was not written, it already stood as declared')$classic_said"
 }
 
 # =============================================================================
@@ -910,9 +1128,57 @@ delete_refs() {
     fi
 }
 
+# =============================================================================
+# disable-actions
+# =============================================================================
+disable_actions() {
+    REPO="$2"
+    repo_name "the repository" "$REPO"
+    load_token
+
+    api GET "/repos/$OWNER/$REPO"
+    case "$CODE" in
+        200) ;;
+        404) refuse "$OWNER/$REPO does not exist or this installation cannot see it (GET answered 404)" ;;
+        301) refuse "$OWNER/$REPO has moved (GitHub answers 301) — name the repository as it is now" ;;
+        *) unexpected "GET /repos/$OWNER/$REPO" ;;
+    esac
+    jq_doc_file "$WORK/out" || fail "GET /repos/$OWNER/$REPO answered 200 with no JSON document"
+    jq -e --arg full "${OWNER,,}/${REPO,,}" '(.full_name // "" | ascii_downcase) == $full' "$WORK/out" >/dev/null 2>&1 \
+        || refuse "GET /repos/$OWNER/$REPO answered as $(jq -r '.full_name // "no full_name"' "$WORK/out" 2>/dev/null)"
+    jq -e '.archived != true' "$WORK/out" >/dev/null 2>&1 || refuse "$OWNER/$REPO is archived"
+    jq -e '.fork != true' "$WORK/out" >/dev/null 2>&1 \
+        || refuse "$OWNER/$REPO is a FORK — this verb acts on the BOSS-managed copies github-create-repository makes, never a fork"
+
+    read_actions "$OWNER/$REPO"
+    ACTIONS_REPO="$OWNER/$REPO"
+    {
+        echo "plan: github-disable-actions"
+        echo "repository: $OWNER/$REPO"
+        echo "credential: the GitHub App installation on $OWNER, token slot $TOKEN_FILE"
+        echo "state: Actions enabled $ACTIONS_ENABLED — GET /repos/$OWNER/$REPO/actions/permissions"
+        if [ "$ACTIONS_ENABLED" = true ]; then
+            echo "act: PUT /repos/$OWNER/$REPO/actions/permissions $ACTIONS_OFF"
+        else
+            echo "act: none — Actions already read disabled; the write reads it back and changes nothing"
+        fi
+        echo "proof: GET /repos/$OWNER/$REPO/actions/permissions reads back enabled false"
+        echo "never: enabling Actions, running a workflow, any other setting of $OWNER/$REPO"
+    } >"$WORK/plan"
+    seal
+
+    if [ "$ACTIONS_ENABLED" = true ]; then
+        put_actions_off "$OWNER/$REPO" "Actions on $OWNER/$REPO were not disabled"
+    fi
+    readback actions_read_back \
+        || fail "Actions on $OWNER/$REPO do not read back as enabled false (above)"
+    echo "$ME: proven — Actions on $OWNER/$REPO reads back as enabled false$([ "$ACTIONS_ENABLED" = false ] && echo '; nothing was written, it already stood as declared')"
+}
+
 case "$ACT" in
     create-repository) create_repository "$@" ;;
     set-branch-protection) set_branch_protection "$@" ;;
     delete-refs) delete_refs "$@" ;;
+    disable-actions) disable_actions "$@" ;;
 esac
 exit 0

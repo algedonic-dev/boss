@@ -70,45 +70,77 @@ use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+/// Which of the gateway's sessionless tables opens a door onto a jobs
+/// read (crates/core/boss-gateway/src/public_reads.rs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Door {
+    /// No gateway door: through the gateway it is session-gated like
+    /// every other `/api` route, and sessionless only at the service's
+    /// own port — which is why its reason must still hold for anyone.
+    Gated,
+    /// A `PUBLISHABLE` row: a stranger reaches it through the gateway on
+    /// any instance whose tenant manifest declares it.
+    Publishable,
+    /// A `PUBLIC_BY_DESIGN` row: a stranger reaches it through the
+    /// gateway on every instance.
+    ByDesign,
+}
+
 /// Sessionless by design. Each reason must hold for EVERY instance: a
 /// read a stranger may make on only some instances is the gateway's
 /// per-tenant `PUBLISHABLE` table, not a reason for this door to skip
 /// policy.
-const PUBLIC: &[(&str, &str)] = &[
+///
+/// EACH ROW SAYS WHICH GATEWAY DOOR, IF ANY, OPENS ONTO IT ([`Door`];
+/// backlog 070de88c, item 1). That was prose — "(gateway PUBLISHABLE)"
+/// in one reason, "the gateway's one PUBLIC_BY_DESIGN jobs route" in
+/// another — a fact living twice with nothing holding the copies equal
+/// (CLAUDE.md §9a). The column is now read against the gateway's own
+/// tables by [`every_public_row_names_the_gateway_door_that_opens_onto_it`].
+const PUBLIC: &[(&str, Door, &str)] = &[
     (
         "/api/jobs/health",
+        Door::Gated,
         "liveness and build; the off-cluster watchdog reads it with no identity, and the machine gate exempts it for the same reason",
     ),
     (
         "/api/jobs/live",
-        "the public landing window (gateway PUBLISHABLE): open counts per kind and twelve recent titles, deliberately unscoped (19f08bd6 left it so)",
+        Door::Publishable,
+        "the public landing window: open counts per kind and twelve recent titles, deliberately unscoped (19f08bd6 left it so)",
     ),
     (
         "/api/jobs/sim-clock/stream",
+        Door::Gated,
         "the simulated date the SPA badge shows; a clock reading, nothing of any packet",
     ),
     (
         "/api/jobs/step-types",
+        Door::Gated,
         "the StepType registry: the alphabet of legal transitions, platform code, no tenant data",
     ),
     (
         "/api/jobs/job-edges",
+        Door::Gated,
         "the declared job-to-job link fields: schema, no rows",
     ),
     (
         "/api/tenant/edit-level",
+        Door::Gated,
         "the instance's hosting edit level word off the tenant manifest; the dispatch door and a lint read it",
     ),
     (
         "/api/flights/mine",
+        Door::Gated,
         "answers only the flight codes whose audience includes the CALLER; an anonymous caller is in no audience a packet names (design c4c2a607)",
     ),
     (
         "/ics/{token}/calendar.ics",
-        "the calendar feed: the token in the path IS the credential, and it is the gateway's one PUBLIC_BY_DESIGN jobs route",
+        Door::ByDesign,
+        "the calendar feed: the token in the path IS the credential",
     ),
     (
         "/api/scheduling/calendar-tokens/logged-raw",
+        Door::Gated,
         "one integer, how many feeds still open with a token the log holds in the clear; any caller by design (4aaff4dc), and the proof of that design reads it to zero",
     ),
 ];
@@ -638,7 +670,7 @@ async fn every_jobs_read_asks_policy_or_is_named_public() {
     let gets = derived_get_routes();
     let answers = measure(&gets).await;
 
-    let public: BTreeMap<&str, &str> = PUBLIC.iter().copied().collect();
+    let public: BTreeMap<&str, &str> = PUBLIC.iter().map(|(p, _, why)| (*p, *why)).collect();
     let pending: BTreeMap<&str, &str> = PENDING.iter().copied().collect();
     let mut failures = Vec::new();
 
@@ -689,6 +721,186 @@ async fn every_jobs_read_asks_policy_or_is_named_public() {
         "{} of {} jobs-API GET routes break the rule:\n  {}",
         failures.len(),
         gets.len(),
+        failures.join("\n  ")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The gateway's sessionless doors onto this service (backlog 070de88c)
+// ---------------------------------------------------------------------------
+
+/// Where the gateway declares every read it answers without a session.
+const GATEWAY_TABLES: &str = "crates/core/boss-gateway/src/public_reads.rs";
+
+/// The text of `pub static <name>` from its head to its closing `];`.
+fn static_table<'a>(src: &'a str, name: &str) -> &'a str {
+    let head = format!("pub static {name}: ");
+    let start = src
+        .find(&head)
+        .unwrap_or_else(|| panic!("{GATEWAY_TABLES}: no `{head}` — did the table move?"));
+    let rest = &src[start..];
+    let end = rest
+        .find("\n];")
+        .unwrap_or_else(|| panic!("{GATEWAY_TABLES}: `{name}` never closes"));
+    &rest[..end]
+}
+
+/// The text between `open` and the next `close` after it.
+fn between<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let rest = &text[text.find(open)? + open.len()..];
+    Some(&rest[..rest.find(close)?])
+}
+
+/// Every matcher the gateway answers WITHOUT A SESSION onto the jobs
+/// upstream, with the table that opens it — read out of the gateway's
+/// source, the way this file reads the router's, so the tables stay the
+/// one definition and this pin cannot hold a copy of them. A row this
+/// reader cannot parse panics naming the table: a reader that quietly
+/// found fewer rows would pass on a gateway it never read.
+fn gateway_jobs_doors() -> Vec<(Door, String)> {
+    let path = boss_testing::repo_root().join(GATEWAY_TABLES);
+    let src =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let mut out = Vec::new();
+
+    let publishable = static_table(&src, "PUBLISHABLE");
+    let rows: Vec<&str> = publishable.split("PublicRead {").skip(1).collect();
+    assert!(
+        !rows.is_empty() && rows.len() == publishable.matches("upstream: &proxy::").count(),
+        "{GATEWAY_TABLES}: read {} PUBLISHABLE rows, but the table names {} upstreams — \
+         teach this reader the table's shape",
+        rows.len(),
+        publishable.matches("upstream: &proxy::").count()
+    );
+    for row in rows {
+        let matchers = between(row, "matchers: &[", "]")
+            .unwrap_or_else(|| panic!("{GATEWAY_TABLES}: a PUBLISHABLE row with no matchers"));
+        let upstream = between(row, "upstream: &proxy::", ",")
+            .unwrap_or_else(|| panic!("{GATEWAY_TABLES}: a PUBLISHABLE row with no upstream"));
+        let named: Vec<&str> = matchers.split('"').skip(1).step_by(2).collect();
+        assert!(
+            !named.is_empty(),
+            "{GATEWAY_TABLES}: a PUBLISHABLE row whose matchers this reader cannot read: {matchers}"
+        );
+        if upstream.trim() == "JOBS" {
+            out.extend(
+                named
+                    .into_iter()
+                    .map(|m| (Door::Publishable, m.to_string())),
+            );
+        }
+    }
+
+    let by_design = static_table(&src, "PUBLIC_BY_DESIGN");
+    let rows: Vec<&str> = by_design.split("PublicByDesign {").skip(1).collect();
+    assert!(
+        !rows.is_empty() && rows.len() == by_design.matches("served: Served::").count(),
+        "{GATEWAY_TABLES}: read {} PUBLIC_BY_DESIGN rows, but the table serves {} — teach \
+         this reader the table's shape",
+        rows.len(),
+        by_design.matches("served: Served::").count()
+    );
+    for row in rows {
+        let matcher = between(row, "matcher: \"", "\"")
+            .unwrap_or_else(|| panic!("{GATEWAY_TABLES}: a PUBLIC_BY_DESIGN row with no matcher"));
+        let served = between(row, "served: Served::", ",").unwrap_or_else(|| {
+            panic!("{GATEWAY_TABLES}: `{matcher}` says nothing it is served by")
+        });
+        match served.trim() {
+            "Upstream(&proxy::JOBS)" => out.push((Door::ByDesign, matcher.to_string())),
+            s if s.starts_with("Upstream(") || s.starts_with("ByTheGatewayItself(") => {}
+            s => panic!(
+                "{GATEWAY_TABLES}: `{matcher}` is served by `{s}`, a form this reader does not know"
+            ),
+        }
+    }
+    out
+}
+
+/// Whether the gateway matcher `door` routes the request for `route` —
+/// both in axum's syntax: a `{*rest}` takes every segment left (one at
+/// least), a `{param}` in the door takes any one segment, and a literal
+/// door segment takes only itself. A `{param}` in the ROUTE is not taken
+/// by a literal door segment: the door names one value of it, and the
+/// service's literal route of that name would answer it instead.
+fn covers(door: &str, route: &str) -> bool {
+    let d: Vec<&str> = door.split('/').collect();
+    let r: Vec<&str> = route.split('/').collect();
+    for (i, seg) in d.iter().enumerate() {
+        if seg.starts_with("{*") {
+            return r.len() > i;
+        }
+        match r.get(i) {
+            Some(rs) if seg.starts_with('{') || seg == rs => {}
+            _ => return false,
+        }
+    }
+    d.len() == r.len()
+}
+
+#[test]
+fn the_door_matcher_reads_axum_the_way_the_gateway_does() {
+    assert!(covers("/ics/{*rest}", "/ics/{token}/calendar.ics"));
+    assert!(covers("/api/jobs/live", "/api/jobs/live"));
+    assert!(covers("/api/workflows/{*rest}", "/api/workflows/{kind}"));
+    assert!(!covers("/api/workflows", "/api/workflows/{kind}"));
+    assert!(!covers("/api/workflows/{*rest}", "/api/workflows"));
+    assert!(!covers("/api/jobs/live", "/api/jobs/{id}"));
+    assert!(!covers("/api/jobs/live", "/api/jobs/live/stream"));
+}
+
+/// THE PUBLIC LIST AND THE GATEWAY'S TABLES ARE HELD EQUAL (backlog
+/// 070de88c, item 1; CLAUDE.md §9a). Two files declare which jobs reads
+/// a stranger may make: [`PUBLIC`] here, which says which reads answer
+/// with no identity at the service, and the gateway's `PUBLISHABLE` and
+/// `PUBLIC_BY_DESIGN`, which say which of them a stranger reaches
+/// through the front door. Each PUBLIC row's [`Door`] is its claim about
+/// the second; this reads the gateway's own tables and holds every claim
+/// to them, naming the row that drifted — a door the gateway closed, one
+/// it opened onto a row that still says gated, or a door that opens onto
+/// no read this service serves at all. A gateway door onto a read that is
+/// NOT on the list is the other test's business: that read must ask
+/// policy, and [`every_jobs_read_asks_policy_or_is_named_public`] holds
+/// it to that.
+#[test]
+fn every_public_row_names_the_gateway_door_that_opens_onto_it() {
+    let gets = derived_get_routes();
+    let doors = gateway_jobs_doors();
+    let mut failures = Vec::new();
+    for (door, matcher) in &doors {
+        if !gets.iter().any(|route| covers(matcher, route)) {
+            failures.push(format!(
+                "the gateway's {door:?} door `{matcher}` (upstream JOBS) opens onto no GET this \
+                 service serves — the gateway table or the route moved"
+            ));
+        }
+    }
+    for (route, named, _) in PUBLIC {
+        let opened: Vec<Door> = doors
+            .iter()
+            .filter(|(_, matcher)| covers(matcher, route))
+            .map(|(door, _)| *door)
+            .collect();
+        let actual = match opened.as_slice() {
+            [] => Door::Gated,
+            [door] => *door,
+            many => {
+                failures.push(format!(
+                    "{route}: opened by more than one gateway door {many:?} — one read, one door"
+                ));
+                continue;
+            }
+        };
+        if actual != *named {
+            failures.push(format!(
+                "{route}: its PUBLIC row names {named:?}, and {GATEWAY_TABLES} says {actual:?} — \
+                 correct the row, or the gateway table, whichever moved"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "the PUBLIC list and the gateway's sessionless tables disagree:\n  {}",
         failures.join("\n  ")
     );
 }

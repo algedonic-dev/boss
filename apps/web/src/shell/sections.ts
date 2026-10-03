@@ -154,6 +154,7 @@ const SECTION_FOR_KIND: Readonly<Record<Route['kind'], string>> = {
   login: 'me',
   stepFocus: 'me',
   home: 'me',
+  companyMap: 'company-map',
   // The kind half only: `sectionForRoute` answers by the path's
   // department, the way it answers a yard floor by its region.
   notFound: 'me',

@@ -325,6 +325,24 @@ file = "infra/ops/verbs/rollback-to.json"
 [[road.line]]
 prose = "Roll to a NAMED last-known-good build, read from the stamp above, never to the previous revision: the previous revision may carry the same broken image."
 
+[[road.line]]
+label = "If the break-glass policy refuses a roll it should allow, delete its binding, on the forge (its named rollback, design b08725c2)"
+command = "sudo docker run --rm --network host -v {ops}/kubeconfig:/kc:ro {image} kubectl --kubeconfig=/kc delete validatingadmissionpolicybinding {binding}"
+with = { image = { file = "infra/cluster/manifests/boss-estate-observe.yaml", pattern = 'image: (alpine/k8s:\S+)$' }, ops = { file = "infra/estate/install-cluster-operator.sh", pattern = '^BOSS_OPS_DIR="\$\{BOSS_OPS_DIR:-([^}]+)\}"$' }, binding = { file = "infra/cluster/break-glass-deposit.sh", pattern = '^POLICY_BINDING="\$\{BOSS_DEPOSIT_POLICY_BINDING:-([^}]+)\}"$' } }
+
+[[road.line]]
+label = "The kit item that is the admin kubeconfig"
+file = "infra/forge/recovery-kit.sh"
+pattern = '^    take (secrets/kubeconfig) "\$OPS_DIR/kubeconfig"$'
+
+[[road.line]]
+label = "With the forge dark, the same delete from any home-network host with a kubectl client, the kit's admin kubeconfig placed where its README's step 2 says"
+command = "sudo kubectl --kubeconfig={placed} delete validatingadmissionpolicybinding {binding}"
+with = { placed = { file = "infra/forge/recovery-kit-README.txt", pattern = '^   and kubectl\) as \S+ and (\S+),$' }, binding = { file = "infra/cluster/break-glass-deposit.sh", pattern = '^POLICY_BINDING="\$\{BOSS_DEPOSIT_POLICY_BINDING:-([^}]+)\}"$' } }
+
+[[road.line]]
+prose = "Delete the binding only when the policy refuses a roll you need. A policy with no binding judges nothing, so the bastion's credential can again rewrite a pod template and read what it names. The next converge binds it again, and the daily deposit check files a red while it is gone; to keep it gone past the next train, a revert car moves it back to reporting."
+
 [[road]]
 id = "bastion-cluster-credential"
 title = "The bastion's scoped cluster credential — when the forge is down"
@@ -344,7 +362,35 @@ label = "Declared in"
 file = "infra/cluster/manifests/boss-break-glass-operator.yaml"
 
 [[road.line]]
-prose = "It can see whether the cluster is working and roll a workload back to the last image that worked. It cannot open a shell in a pod, read a credential, deploy or delete: for those, the forge's admin credential."
+prose = "It can see whether the cluster is working and roll a workload to a build in the repository that workload already pulls from. For the boss Deployment that is ONE command moving the image of its main container AND its init container together, the same two images the forge's rollback moves; never rollout undo. It cannot open a shell in a pod or create a workload, and it holds no delete."
+
+[[road.line]]
+prose = "What its patch can still do, said plainly (backlog e4a9a9b3). An admission policy REFUSES every patch beyond an image move: an owner reference, which would hand a workload to the garbage collector to delete, and a rewritten pod template, which would run with the template's Secrets and so read a credential, are both refused. The patch can STILL roll to ANY tag in that repository: an older build with a known bug, or one that never converged, is a roll it accepts. Name the build; the policy does not choose it for you. If the policy refuses the two-image roll itself, this credential cannot undo that: the way back is deleting the policy's binding with the admin kubeconfig. The cluster-admin road above prints it twice: on the forge, and, on a day the forge is dark, with the recovery kit's copy of that kubeconfig on any home-network host that has a kubectl client."
+
+[[road.line]]
+label = "Find the build to roll to (the images column)"
+command = "sudo kubectl --kubeconfig={ops}/kubeconfig -n {namespace} get replicasets -o wide"
+with = { ops = { file = "infra/estate/install-cluster-operator.sh", pattern = '^BOSS_OPS_DIR="\$\{BOSS_OPS_DIR:-([^}]+)\}"$' }, namespace = { file = "infra/cluster/manifests/boss.yaml", pattern = '^kind: Deployment\nmetadata:\n  name: \S+\n  namespace: (\S+)$' } }
+
+[[road.line]]
+label = "The two-image roll, one patch (type the build's tag in place of BUILD, both times)"
+command = "sudo kubectl --kubeconfig={ops}/kubeconfig -n {namespace} set image deployment/{deployment} {main}={repository}:BUILD {init}={repository}:BUILD"
+with = { ops = { file = "infra/estate/install-cluster-operator.sh", pattern = '^BOSS_OPS_DIR="\$\{BOSS_OPS_DIR:-([^}]+)\}"$' }, namespace = { file = "infra/cluster/manifests/boss.yaml", pattern = '^kind: Deployment\nmetadata:\n  name: \S+\n  namespace: (\S+)$' }, deployment = { file = "infra/cluster/manifests/boss.yaml", pattern = '^kind: Deployment\nmetadata:\n  name: (\S+)$' }, repository = { file = "infra/cluster/manifests/boss.yaml", pattern = '^      containers:\n        - name: \S+\n          image: (\S+/boss):\S+$' }, main = { file = "infra/cluster/manifests/boss.yaml", pattern = '^      containers:\n        - name: (\S+)\n          image: \S+/boss:\S+$' }, init = { file = "infra/cluster/manifests/boss.yaml", pattern = '^      initContainers:\n(?:\s*#.*\n)*        - name: (\S+)\n          image: \S+/boss:\S+$' } }
+
+[[road.line]]
+label = "The boss Deployment replaces its pod by"
+file = "infra/cluster/manifests/boss.yaml"
+pattern = '^  strategy: \{type: (\S+)\}$'
+
+[[road.line]]
+prose = "Under Recreate the running pod stops before the new one pulls its image, and with the forge down its registry is down too. A build that is not already on the node is an outage until the registry returns, where the broken build was at least a pod. Roll only to a build the cluster ran recently, whose image its nodes still hold."
+
+[[road.line]]
+label = "The same two images, as the forge's own roll sends them"
+file = "infra/forge/cluster-deploy-lib.sh"
+
+[[road.line]]
+not_tree_held = "a kubectl client on this host. The cluster-operator role installs the Talos client alone here, so both commands above need one put in place by hand before the day they are needed."
 
 [[road.line]]
 not_tree_held = "whether the bastion's copy of this credential is in place today (backlog 7336cb5f). Try the forge first."
@@ -417,23 +463,20 @@ label = "In-cluster copies kept (days)"
 file = "infra/cluster/manifests/boss-backup.yaml"
 pattern = '''-name '[^']*sql[^']*' -mtime \+(\d+) -print -delete$'''
 
+# THE ONE OFFSITE COPY (backlog 4bf7bdd1, David 2026-10-01: "boss-gcp
+# doesn't need to be storage backup"). Until then the nightly dump was
+# also shipped to a directory on the bastion, and this road printed that
+# directory as offsite copy one. That leg is deleted from the manifest,
+# so the bucket is the only offsite copy, and the road prints how to
+# fetch from it — each command read from the kit README's step 6, where
+# the bucket's key and name are opened, so the stick and the paper agree.
 [[road.line]]
-label = "Offsite copy one: shipped to"
-file = "infra/cluster/manifests/boss-backup.yaml"
-pattern = '-o ConnectTimeout=20 (\S+)$'
-
-[[road.line]]
-label = "Into the directory (stated in the manifest's header)"
-file = "infra/cluster/manifests/boss-backup.yaml"
-pattern = 'into (/var/backups/[a-z-]+) on boss-gcp'
-
-[[road.line]]
-label = "Offsite copy two: a cloud bucket, named in the Secret"
+label = "The offsite copy: a cloud bucket, named in the Secret"
 file = "infra/cluster/manifests/boss-backup.yaml"
 pattern = '\{secretName: ([a-z-]*gcs[a-z-]*),'
 
 [[road.line]]
-label = "Offsite dumps kept in the bucket (the header states the bastion keeps as many)"
+label = "Offsite dumps kept in the bucket"
 file = "infra/cluster/manifests/boss-backup.yaml"
 pattern = "prune '[^']*sql[^']*' (\\d+)$"
 
@@ -443,13 +486,34 @@ file = "infra/cluster/manifests/boss-backup.yaml"
 pattern = "prune '[^']*files[^']*' (\\d+)$"
 
 [[road.line]]
-prose = "A restore is the newest dump plus the file-store archive stamped beside it. The bastion's copy holds dumps only, so a restore from it alone brings back rows without their files."
+prose = "A restore is the newest dump plus the file-store archive stamped beside it. The bucket is the one offsite copy and holds both; the bastion keeps none. The bucket's key and its name ride the recovery kit, never this paper. To fetch from it, open the kit and run these in its directory: sign in, list the bucket, then copy the dump and the archive whose stamp the list shows newest."
 
 [[road.line]]
-not_tree_held = "the receiver on the bastion that stamps and prunes the shipped dumps. Its script is not in the tree, so the directory and the count it keeps are the manifest header's word, not a read of the receiver."
+label = "Sign in with the kit's bucket credential (the kit README's step 6)"
+file = "infra/forge/recovery-kit-README.txt"
+pattern = '^\s+(gcloud auth activate-service-account --key-file \S+)$'
+
+# Commands, not single reads: a read that resolved to a whole command
+# line would print words from a file the hold does not cover
+# (mutating_verb.rs, on_the_real_tree_every_read_the_hold_calls_a_value_
+# is_a_value). The words live here; only the object's address is read.
+[[road.line]]
+label = "List the bucket"
+command = "gcloud storage ls {bucket}"
+with = { bucket = { file = "infra/forge/recovery-kit-README.txt", pattern = '^\s+gcloud storage ls ("gs://\$\(cat \S+\)/")$' } }
 
 [[road.line]]
-not_tree_held = "the bucket's own name, which lives only in that Secret, and the order to restore in. A later car of design 125d405d declares the order with the recovery kit."
+label = "Fetch a dump, its stamp read from the list"
+command = "gcloud storage cp {dump} ."
+with = { dump = { file = "infra/forge/recovery-kit-README.txt", pattern = '^\s+gcloud storage cp ("gs://\$\(cat \S+\)/boss-<stamp>\.sql\.gz") \.$' } }
+
+[[road.line]]
+label = "Fetch the file-store archive stamped beside it"
+command = "gcloud storage cp {archive} ."
+with = { archive = { file = "infra/forge/recovery-kit-README.txt", pattern = '^\s+gcloud storage cp ("gs://\$\(cat \S+\)/boss-files-<stamp>\.tar\.gz") \.$' } }
+
+[[road.line]]
+not_tree_held = "the bucket's own name, which lives only in that Secret and in the kit, and the order to restore in. A later car of design 125d405d declares the order with the recovery kit."
 
 [[road]]
 id = "recovery-kit"
@@ -461,9 +525,27 @@ prose = "The kit is a PIN-protected stick. It holds every artifact that is itsel
 [[road.line]]
 not_tree_held = "what the kit holds and the order to restore it. The kit is not built yet (backlog c1bb822e); a later car of design 125d405d declares both, by name only."
 
+# THE ACCOUNT MAP (backlog e81b4ecb). The recovery kit's README sends its
+# reader here for the Google, GitHub and Cloudflare accounts, by this
+# road's title; a test holds that title to the README. It was a runbook
+# under docs/ until train #808 deleted it, and the stick went on pointing
+# at it. Each line says the account, its second factor and its recovery
+# road — never a password, a recovery code or where a factor is kept.
 [[road]]
-id = "who-to-call"
-title = "Who and where to call"
+id = "outside-accounts"
+title = "The accounts outside the system: Google, GitHub, Cloudflare"
+
+[[road.line]]
+prose = "Three accounts anchor roads on this sheet and are recovered only through their own providers, never through this system. Each has a second factor of its own. This road names each account, what it opens, and its recovery road; nothing that signs in to one is on this paper."
+
+[[road.line]]
+prose = "Google: the account that owns the bastion's cloud project. Second factor: its own two-step verification. It opens the cloud console, which adds a new ssh key to the bastion and reaches the bastion's serial console. Recovery road: the provider's own account recovery."
+
+[[road.line]]
+prose = "GitHub: the account that holds the public mirror of the source, the tree that rebuilds every machine. Second factor: its own two-factor sign-in. Recovery road: the provider's own account recovery, with that account's recovery codes."
+
+[[road.line]]
+prose = "Cloudflare: the account that owns the edge, its Access applications in front of the web app and the dev workspace, and the tunnel. Second factor: its own. Recovery road: the provider's own account recovery. While it is dark, the key door from the home network and the bastion road still open the workspace."
 
 [[road.line]]
 label = "Cloudflare account zone"
@@ -471,10 +553,17 @@ file = "infra/cluster/dns/access.toml"
 key = "account_zone"
 
 [[road.line]]
-prose = "The last anchor is being in the room: each machine's own console, and Talos maintenance mode to bootstrap a node again when nothing else answers."
+not_tree_held = "which sign-in owns the Google account that owns the bastion's cloud project. A later car of design 125d405d declares it as a location (question 3)."
 
 [[road.line]]
 not_tree_held = "which sign-in owns the Cloudflare account, the domain registrar, and the mail provider that receives the Access one-time code. A later car of design 125d405d declares them as locations (question 3)."
 
 [[road.line]]
 not_tree_held = "which sign-in owns the GitHub account that holds the public mirror of the source."
+
+[[road]]
+id = "who-to-call"
+title = "Who and where to call"
+
+[[road.line]]
+prose = "The last anchor is being in the room: each machine's own console, and Talos maintenance mode to bootstrap a node again when nothing else answers."

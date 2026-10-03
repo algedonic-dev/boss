@@ -13,7 +13,8 @@
 //! (later) the guards all answer the question the same way.
 //!
 //! A CONTROL is anything a door asks for before it acts, of four kinds:
-//! - a policy pair — static ones declared here in [`DOORS`], dynamic ones
+//! - a policy pair — static ones declared as the consts every door asks
+//!   through ([`crate::controls`]), dynamic ones
 //!   read off every active workflow: `sign-off` on `step-signoff:<role>`
 //!   for each required sign-off, and the claim door's `authority_role`
 //!   ([`Control::Authority`], held the three ways the claim door admits);
@@ -31,7 +32,11 @@
 //!
 //! A PAIR IS HELD AT THE WIDEST SCOPE ANY ACTIVE RULE GRANTS FOR IT
 //! (decision 2): authority rule 1 lets a person re-grant only within
-//! their own scope, so a narrower holder cannot restore it.
+//! their own scope, so a narrower holder cannot restore it. A pair some
+//! door admits only at scope `all` ([`Pair::all_only`]) is held only at
+//! `all`, whatever the rules grant — the release review of car 1 (LOW):
+//! a tenant granting Read on `estate` only at `territory` read HELD
+//! while the door refused every caller.
 //!
 //! THIS CAR REFUSES NOTHING. The coverage core, its read and the backstop
 //! ship now and only report; the guards that would refuse a write that
@@ -40,408 +45,24 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::controls::{CONTROLS, Pair};
 use crate::types::{AccessTier, Action, PolicyRule, Scope, UserOverride, rule_id};
+use Action::{SignOff, Update};
 use boss_core::roles::PLATFORM_ADMIN_ROLE;
 
 // ---------------------------------------------------------------------------
-// The static controls — what each door file asks policy for.
+// The static controls — declared once, as the consts every door asks
+// through (`crate::controls`).
 // ---------------------------------------------------------------------------
 
-/// One `(action, resource)` pair a door asks policy for, spelled so a
-/// `const` can hold it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Pair {
-    pub action: Action,
-    pub resource: &'static str,
-}
-
-const fn ask(action: Action, resource: &'static str) -> Pair {
-    Pair { action, resource }
-}
-
-/// One source file that asks policy, how many asks the pin's scan sees
-/// in it, and the pairs those asks resolve to.
-///
-/// THE STATIC PAIR LIST IS DECLARED ONCE, HERE (design 1c4e42e1
-/// decision 8, CLAUDE.md §9a). A door's resource usually rides a helper
-/// (`authorize(&state, &user, Action::Update)` means `class` in
-/// boss-classes), so no scan can resolve it and the list is written by
-/// hand — and pinned: `tests/every_door_is_a_declared_control.rs` reruns
-/// the triage's scan (every `Action::<verb>`, `.scope_predicate(` and
-/// `asks!(` outside tests and comments) and names every file whose count
-/// differs from `mentions` or whose ask lines — and the resource tokens
-/// beside them — no longer hash to `digest`, or that asks and is not
-/// listed. Either means a door was added, moved, removed or changed:
-/// resolve what it asks, correct `asks`, set the two values the failure
-/// prints. The collapse the design names next —
-/// every door asking through a `Control` const, so the compiler is the
-/// pin — is a later car; until then this table is the holding action.
-///
-/// Measured on origin/main 10bddfaf (2026-09-29): 150 mentions in 40
-/// files; the triage's resolution (run 60497b5d, at f04f7cf7) re-read
-/// for the four files that moved since.
-#[derive(Debug, Clone, Copy)]
-pub struct Door {
-    pub file: &'static str,
-    pub mentions: usize,
-    /// FNV-1a of the file's ask lines and the resource tokens beside
-    /// them, as the pin computes it — so an ask swapped in place, which
-    /// leaves `mentions` unchanged, still fails (review of this car, L1).
-    pub digest: &'static str,
-    pub asks: &'static [Pair],
-}
-
-use Action::{Close, Create, Delete, Publish, Read, Retire, SignOff, Update};
-
-/// Every door file, and what it asks. A file whose asks are EMPTY is
-/// plumbing (the policy client's own helpers) or asks for a resource
-/// only data names (a View, a search facet) — the design's "named as
-/// unmeasured, not covered".
-pub const DOORS: &[Door] = &[
-    Door {
-        file: "crates/core/boss-calendar/src/http.rs",
-        mentions: 5,
-        digest: "8697fbf37dc33397",
-        asks: &[
-            ask(Create, "schedule"),
-            ask(Delete, "schedule"),
-            ask(Create, "business-calendar"),
-            ask(Update, "business-calendar"),
-        ],
-    },
-    Door {
-        file: "crates/core/boss-classes/src/http.rs",
-        mentions: 5,
-        digest: "1d1994bab11f9e20",
-        asks: &[
-            ask(Create, "class"),
-            ask(Update, "class"),
-            ask(Retire, "class"),
-        ],
-    },
-    // A file's target decides the resource: job, step, or a Subject
-    // (read as `account`); the audit read is `policy-rule`.
-    Door {
-        file: "crates/core/boss-content/src/files/http.rs",
-        mentions: 7,
-        digest: "0388b6e49998a6e9",
-        asks: &[
-            ask(Read, "job"),
-            ask(Update, "job"),
-            ask(Read, "step"),
-            ask(Update, "step"),
-            ask(Read, "account"),
-            ask(Update, "account"),
-            ask(Read, "policy-rule"),
-        ],
-    },
-    Door {
-        file: "crates/core/boss-dispatcher/src/http.rs",
-        mentions: 4,
-        digest: "d37815044a2940c4",
-        asks: &[
-            ask(Read, "job"),
-            ask(Create, "dispatcher-rule"),
-            ask(Publish, "dispatcher-rule"),
-            ask(Retire, "dispatcher-rule"),
-        ],
-    },
-    Door {
-        file: "crates/core/boss-jobs/src/cadence/http.rs",
-        mentions: 2,
-        digest: "4d18e5eadbe35367",
-        asks: &[ask(Publish, "workflow"), ask(Retire, "workflow")],
-    },
-    Door {
-        file: "crates/core/boss-jobs/src/http/jobs.rs",
-        mentions: 11,
-        digest: "14d3c0fca00aae18",
-        asks: &[
-            ask(Read, "job"),
-            ask(Update, "job"),
-            ask(Close, "job"),
-            ask(Read, "workflow"),
-            ask(Update, "workflow"),
-            ask(Publish, "workflow"),
-            // The estate readers' gate, `estate_read_refusal` (train #805).
-            ask(Read, "estate"),
-        ],
-    },
-    Door {
-        file: "crates/core/boss-jobs/src/http/kinds.rs",
-        mentions: 13,
-        digest: "d86917ced6d28f7a",
-        asks: &[
-            ask(Read, "workflow"),
-            ask(Create, "workflow"),
-            ask(Update, "workflow"),
-            ask(Publish, "workflow"),
-            ask(Retire, "workflow"),
-        ],
-    },
-    Door {
-        file: "crates/core/boss-jobs/src/http/mod.rs",
-        mentions: 1,
-        digest: "30ac134c2198b71d",
-        asks: &[ask(Read, "job")],
-    },
-    Door {
-        file: "crates/core/boss-jobs/src/http/moves.rs",
-        mentions: 1,
-        digest: "3f676098b4ccc06c",
-        asks: &[ask(Read, "job")],
-    },
-    Door {
-        file: "crates/core/boss-jobs/src/http/plugins.rs",
-        mentions: 11,
-        digest: "18e51c9da866d2eb",
-        asks: &[
-            ask(Read, "step-plugin"),
-            ask(Create, "step-plugin"),
-            ask(Update, "step-plugin"),
-            ask(Publish, "step-plugin"),
-            ask(Retire, "step-plugin"),
-            ask(Read, "step"),
-        ],
-    },
-    Door {
-        file: "crates/core/boss-jobs/src/http/queue_age.rs",
-        mentions: 1,
-        digest: "772f551d423b2bf1",
-        asks: &[ask(Read, "job")],
-    },
-    Door {
-        file: "crates/core/boss-jobs/src/http/regions.rs",
-        mentions: 1,
-        digest: "4ece82220886201f",
-        asks: &[ask(Read, "job")],
-    },
-    Door {
-        file: "crates/core/boss-jobs/src/http/routes.rs",
-        mentions: 1,
-        digest: "34b9c59c486d4cc8",
-        asks: &[ask(Read, "job")],
-    },
-    Door {
-        file: "crates/core/boss-jobs/src/http/rule_firings.rs",
-        mentions: 1,
-        digest: "772f551d423b2bf1",
-        asks: &[ask(Read, "job")],
-    },
-    Door {
-        file: "crates/core/boss-jobs/src/http/stations.rs",
-        mentions: 7,
-        digest: "744e7af11c14f8f5",
-        asks: &[
-            ask(Read, "job"),
-            ask(Read, "workflow"),
-            ask(Create, "workflow"),
-            ask(Update, "workflow"),
-        ],
-    },
-    // The sign-off door and the claim door also ask `sign-off` on
-    // `step-signoff:<role>` for a role only a workflow names — those are
-    // the dynamic controls [`controls`] reads off the workflows.
-    Door {
-        file: "crates/core/boss-jobs/src/http/steps.rs",
-        mentions: 9,
-        digest: "fe47ef85b7d61bf6",
-        asks: &[
-            ask(Update, "step"),
-            ask(Update, "job"),
-            ask(Update, "step-assign"),
-        ],
-    },
-    Door {
-        file: "crates/core/boss-jobs/src/http/terminal_report.rs",
-        mentions: 1,
-        digest: "64f478af82c31b4d",
-        asks: &[ask(Read, "workflow")],
-    },
-    Door {
-        file: "crates/core/boss-jobs/src/http/yard.rs",
-        mentions: 1,
-        digest: "772f551d423b2bf1",
-        asks: &[ask(Read, "job")],
-    },
-    // `create` on `job` is the all-kinds grant the door takes first;
-    // `job:<kind>` is the per-kind grant a tenant may add beside it, so
-    // a holder of `create job` holds every kind (design 222fc982).
-    Door {
-        file: "crates/core/boss-jobs/src/open_authority.rs",
-        mentions: 2,
-        digest: "5a1b0049c3673c9d",
-        asks: &[ask(Create, "job")],
-    },
-    Door {
-        file: "crates/core/boss-jobs/src/scheduling/access.rs",
-        mentions: 1,
-        digest: "0f69460ef8f67877",
-        asks: &[ask(Read, "schedule")],
-    },
-    Door {
-        file: "crates/core/boss-jobs/src/scheduling/http.rs",
-        mentions: 7,
-        digest: "7738844a4568702e",
-        asks: &[
-            ask(Create, "schedule"),
-            ask(Update, "schedule"),
-            ask(Delete, "schedule"),
-        ],
-    },
-    Door {
-        file: "crates/core/boss-locations/src/http.rs",
-        mentions: 1,
-        digest: "11fd26fd8b9b00ed",
-        asks: &[ask(Create, "location")],
-    },
-    // The client's own helpers: `scope_predicate` is `check(Read)` on
-    // the resource its CALLER names, and the caller's file is the door.
-    Door {
-        file: "crates/core/boss-policy-client/src/engine.rs",
-        mentions: 1,
-        digest: "0107313527a6731e",
-        asks: &[],
-    },
-    Door {
-        file: "crates/core/boss-policy-client/src/lib.rs",
-        mentions: 3,
-        digest: "b4e502ff07b66680",
-        asks: &[],
-    },
-    Door {
-        file: "crates/core/boss-policy/src/authority.rs",
-        mentions: 14,
-        digest: "413dc6e85edf631b",
-        asks: &[
-            ask(Read, "policy-rule"),
-            ask(Create, "policy-rule"),
-            ask(Update, "policy-rule"),
-            ask(Delete, "policy-rule"),
-        ],
-    },
-    Door {
-        file: "crates/core/boss-policy/src/http.rs",
-        mentions: 5,
-        digest: "28e13194622ca93d",
-        asks: &[ask(Read, "policy-rule"), ask(Delete, "policy-rule")],
-    },
-    // Search reads `job`, and a facet's resource is data (unmeasured).
-    Door {
-        file: "crates/core/boss-search/src/query.rs",
-        mentions: 2,
-        digest: "0c434e51df38fbc0",
-        asks: &[ask(Read, "job")],
-    },
-    Door {
-        file: "crates/core/boss-subject-kinds/src/http.rs",
-        mentions: 1,
-        digest: "f7b1fe1d7fb7a83c",
-        asks: &[ask(Update, "subject-kind")],
-    },
-    // A View names its own resource: data, unmeasured.
-    Door {
-        file: "crates/core/boss-views/src/query.rs",
-        mentions: 1,
-        digest: "3c00822ae37dab92",
-        asks: &[],
-    },
-    Door {
-        file: "crates/modules/boss-assets/src/http.rs",
-        mentions: 1,
-        digest: "c1d85f61a1a028e8",
-        asks: &[ask(Update, "asset")],
-    },
-    Door {
-        file: "crates/modules/boss-commerce/src/agreements.rs",
-        mentions: 2,
-        digest: "3ee72b0181519d34",
-        asks: &[ask(Create, "agreement"), ask(Update, "agreement")],
-    },
-    Door {
-        file: "crates/modules/boss-commerce/src/http.rs",
-        mentions: 6,
-        digest: "74fbd2d6d5d922e5",
-        asks: &[ask(Create, "invoice"), ask(Update, "invoice")],
-    },
-    // The four `asks!` extractors, the router-wide read, and the
-    // declaration helper the chart (`accounts.rs`) and the tax registry
-    // (`tax_registry.rs`) call with their own resource.
-    Door {
-        file: "crates/modules/boss-ledger/src/http.rs",
-        mentions: 6,
-        digest: "6661d9267eaa6dc3",
-        asks: &[
-            ask(Read, "ledger"),
-            ask(Create, "ledger"),
-            ask(Update, "ledger"),
-            ask(Create, "posting-rule"),
-            ask(Create, "tax-regime"),
-            ask(Create, "ledger-account"),
-        ],
-    },
-    Door {
-        file: "crates/modules/boss-ledger/src/http/periods.rs",
-        mentions: 4,
-        digest: "2f83d8a0ddcf1708",
-        asks: &[
-            ask(Create, "ledger-period"),
-            ask(Update, "ledger-period"),
-            ask(Close, "ledger-period"),
-        ],
-    },
-    Door {
-        file: "crates/modules/boss-people/src/employee_changes.rs",
-        mentions: 1,
-        digest: "2f24dced9ac3bc17",
-        asks: &[ask(Update, "employee")],
-    },
-    Door {
-        file: "crates/modules/boss-people/src/grants.rs",
-        mentions: 3,
-        digest: "0a4562c0393e423f",
-        asks: &[ask(Read, "employee"), ask(Read, "compensation")],
-    },
-    Door {
-        file: "crates/modules/boss-people/src/http.rs",
-        mentions: 3,
-        digest: "9c2ea39630e83810",
-        asks: &[
-            ask(Create, "employee"),
-            ask(Update, "employee"),
-            ask(Delete, "employee"),
-        ],
-    },
-    Door {
-        file: "crates/modules/boss-people/src/pto.rs",
-        mentions: 1,
-        digest: "e8e69b4dcc1ab753",
-        asks: &[ask(Create, "schedule")],
-    },
-    Door {
-        file: "crates/modules/boss-people/src/requisitions.rs",
-        mentions: 1,
-        digest: "7c1522e49d8fe9c2",
-        asks: &[ask(Create, "employee")],
-    },
-    Door {
-        file: "crates/modules/boss-people/src/workflows.rs",
-        mentions: 4,
-        digest: "38452f602d897705",
-        asks: &[ask(Update, "employee")],
-    },
-];
-
-/// The static pairs — every pair any [`DOORS`] entry asks, once each,
-/// ordered by resource then action.
+/// The static pairs — every [`CONTROLS`] const, ordered by resource then
+/// action. Until 2026-09-29 this read a hand-kept `DOORS` table, one
+/// entry per door file, pinned by a count-and-digest scan (car 1 of
+/// design 1c4e42e1); every door now asks through a const, so the list is
+/// the consts and cannot miss a door that asks one.
 pub fn static_pairs() -> Vec<Pair> {
-    let mut out: Vec<Pair> = Vec::new();
-    for pair in DOORS.iter().flat_map(|d| d.asks.iter()) {
-        if !out.contains(pair) {
-            out.push(*pair);
-        }
-    }
-    out.sort_by_key(|p| (p.resource, p.action.as_str()));
+    let mut out: Vec<Pair> = CONTROLS.to_vec();
+    out.sort_by_key(|p| (p.resource_name(), p.action().as_str()));
     out
 }
 
@@ -455,8 +76,14 @@ pub fn static_pairs() -> Vec<Pair> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Control {
-    /// A door asks policy for `action` on `resource`.
-    Policy { action: Action, resource: String },
+    /// A door asks policy for `action` on `resource`; `all_only` when
+    /// the door admits it only at scope `all` ([`Pair::all_only`]).
+    Policy {
+        action: Action,
+        resource: String,
+        #[serde(default)]
+        all_only: bool,
+    },
     /// A step whose `authority_role` is `role` is claimed by a holder of
     /// that role, of `sign-off` on `step-signoff:<role>`, or of `update`
     /// on `step-assign` — the claim door's three routes
@@ -497,7 +124,9 @@ impl Control {
     /// The stable id an orphan is named and an alarm is deduped by.
     pub fn id(&self) -> String {
         match self {
-            Self::Policy { action, resource } => format!("policy:{}:{resource}", action.as_str()),
+            Self::Policy {
+                action, resource, ..
+            } => format!("policy:{}:{resource}", action.as_str()),
             Self::Authority { role } => format!("authority:{role}"),
             Self::OperatorTier => "operator-tier".to_string(),
             Self::PlatformOwner => "platform-owner".to_string(),
@@ -518,7 +147,18 @@ impl Control {
     /// What a holder must have, in words a reader acts on.
     pub fn wants(&self) -> String {
         match self {
-            Self::Policy { action, resource } => format!(
+            Self::Policy {
+                action,
+                resource,
+                all_only: true,
+            } => format!(
+                "a real person granted {} on {resource} at scope all — the door admits no \
+                 narrower scope",
+                action.as_str()
+            ),
+            Self::Policy {
+                action, resource, ..
+            } => format!(
                 "a real person granted {} on {resource} at the widest scope any active rule \
                  grants it",
                 action.as_str()
@@ -686,17 +326,23 @@ fn held_scope(
 
 /// Whether `person` holds the pair at the widest scope any active rule
 /// grants for it (decision 2). With no active rule granting it, any
-/// grant at all holds it — an override is then the only road.
+/// grant at all holds it — an override is then the only road. A pair
+/// whose door admits only scope `all` is held only at `all`: the door
+/// refuses anything narrower, whatever the widest rule is.
 fn holds_pair(
     person: &Person,
     action: Action,
     resource: &str,
+    all_only: bool,
     rules: &[PolicyRule],
     overrides: &[UserOverride],
 ) -> bool {
     let Some(scope) = held_scope(person, action, resource, rules, overrides) else {
         return false;
     };
+    if all_only {
+        return scope == Scope::All;
+    }
     rules
         .iter()
         .filter(|r| r.active && r.action == action && r.resource.as_str() == resource)
@@ -715,9 +361,11 @@ fn holds(
     let role = person.role.as_deref();
     let is_owner = owner == Some(person.id.as_str());
     match control {
-        Control::Policy { action, resource } => {
-            holds_pair(person, *action, resource, rules, overrides)
-        }
+        Control::Policy {
+            action,
+            resource,
+            all_only,
+        } => holds_pair(person, *action, resource, *all_only, rules, overrides),
         Control::Authority { role: wanted } => {
             role == Some(wanted.as_str())
                 || held_scope(
@@ -852,8 +500,9 @@ pub fn controls(workflows: &[WorkflowFacts]) -> Vec<Control> {
     let mut out: Vec<Control> = static_pairs()
         .into_iter()
         .map(|p| Control::Policy {
-            action: p.action,
-            resource: p.resource.to_string(),
+            action: p.action(),
+            resource: p.resource_name().to_string(),
+            all_only: p.all_only(),
         })
         .collect();
     out.push(Control::OperatorTier);
@@ -866,6 +515,7 @@ pub fn controls(workflows: &[WorkflowFacts]) -> Vec<Control> {
             out.extend(s.sign_offs_required.iter().map(|r| Control::Policy {
                 action: SignOff,
                 resource: format!("step-signoff:{r}"),
+                all_only: false,
             }));
             let role = s.role();
             out.extend(role.iter().map(|r| Control::Authority { role: r.clone() }));
@@ -922,6 +572,17 @@ mod tests {
         Control::Policy {
             action,
             resource: resource.into(),
+            all_only: false,
+        }
+    }
+
+    /// The control a door asking `p` declares — the same derivation
+    /// [`controls`] makes of every const.
+    fn declared(p: Pair) -> Control {
+        Control::Policy {
+            action: p.action(),
+            resource: p.resource_name().into(),
+            all_only: p.all_only(),
         }
     }
 
@@ -984,6 +645,51 @@ mod tests {
             rule("nobody", "account", Action::Read, Scope::None),
         ];
         assert!(coverage(&c, &equal, &[], &roster, &keys).is_empty());
+    }
+
+    /// The release review of car 1 (LOW, 2026-09-29): the estate door
+    /// admits Read only at scope `all`. A tenant granting it only at
+    /// `territory` has a widest rule of `territory`, so decision 2 alone
+    /// read the territory holder as HELD while the door refused them.
+    /// Held only at `all` now — and still held there.
+    #[test]
+    fn a_scope_all_door_is_held_only_at_scope_all() {
+        use crate::controls::{READ_ESTATE, READ_JOB};
+        let roster = vec![person("emp-a", "site-lead")];
+        let keys = vec![key("emp-a", AccessTier::User)];
+        let c = [declared(READ_ESTATE)];
+        let narrow = vec![rule("site-lead", "estate", Action::Read, Scope::Territory)];
+        let orphans = coverage(&c, &narrow, &[], &roster, &keys);
+        assert_eq!(ids(&orphans), vec!["policy:read:estate"]);
+        assert!(
+            orphans[0].wants.contains("scope all"),
+            "the orphan says why: {}",
+            orphans[0].wants
+        );
+
+        let wide = vec![rule("site-lead", "estate", Action::Read, Scope::All)];
+        assert!(coverage(&c, &wide, &[], &roster, &keys).is_empty());
+
+        // A pair whose door admits any scope keeps decision 2.
+        let jobs = vec![rule("site-lead", "job", Action::Read, Scope::Territory)];
+        assert!(coverage(&[declared(READ_JOB)], &jobs, &[], &roster, &keys).is_empty());
+    }
+
+    /// Every scope-all const reaches coverage as scope-all.
+    #[test]
+    fn the_static_controls_carry_their_scope_all_flag() {
+        let all_only: Vec<String> = controls(&[])
+            .iter()
+            .filter(|c| matches!(c, Control::Policy { all_only: true, .. }))
+            .map(Control::id)
+            .collect();
+        let want: Vec<String> = CONTROLS
+            .iter()
+            .filter(|p| p.all_only())
+            .map(|p| declared(*p).id())
+            .collect();
+        assert_eq!(all_only.len(), want.len());
+        assert!(all_only.contains(&"policy:read:estate".to_string()));
     }
 
     /// A live override decides before the role rule, both ways.
@@ -1294,7 +1000,9 @@ mod tests {
             (Action::Read, "compensation"),
         ] {
             assert!(
-                pairs.contains(&ask(action, resource)),
+                pairs
+                    .iter()
+                    .any(|p| p.action() == action && p.resource_name() == resource),
                 "{} {resource}",
                 action.as_str()
             );

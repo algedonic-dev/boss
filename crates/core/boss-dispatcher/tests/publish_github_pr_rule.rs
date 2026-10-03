@@ -5,8 +5,9 @@
 //! When the protocol's `open-pr` step becomes READY (David approved
 //! the publish), the dispatcher spawns an ops-request for host=forge
 //! verb=publish-github-pr; the root ops-runner on the forge runs the
-//! verb, which builds the snapshot commit, pushes it to the dauld fork
-//! and opens the PR, then completes `open-pr` with `pr_url`.
+//! verb, which builds the snapshot commit, pushes it to a publish/*
+//! branch of the mirror itself and opens the PR as the GitHub App
+//! (backlog d2b7c947), then completes `open-pr` with `pr_url`.
 //!
 //! Routing rides on the STEP's metadata, not its slug: `step.ready.*`
 //! payloads carry `metadata` (the step's `metadata_defaults`, stamped

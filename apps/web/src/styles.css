@@ -1639,6 +1639,9 @@ a:hover { color: var(--fog); }
 .inbox-bulk-all { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--static); }
 .inbox-bulk-note { margin: 0 0 8px; font-size: 12px; color: var(--static); }
 .inbox-bulk-note-refused { color: var(--err); }
+/* Which rows of how many, and the way to the rest (backlog 74da899d). */
+.inbox-pager { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-top: 12px; }
+.inbox-pager p { margin: 0; color: var(--static); font-size: 13px; }
 
 /* ==========================================================================
    Debug Gear — floating dev tools panel

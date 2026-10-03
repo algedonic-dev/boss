@@ -9,6 +9,7 @@ members = [
     "crates/core/boss-expr",
     "crates/core/boss-gateway",
     "crates/orchestrators/boss-cli",
+    "crates/orchestrators/boss-events-api",
     "crates/core/boss-nats",
     "crates/modules/boss-catalog",
     "crates/modules/boss-assets",

@@ -1,0 +1,27 @@
+# Bounded explicit observations, not a continuous collector (daa8f63f,
+# engineering decision aad7c419). Native paths are aliases, never task joins.
+[[workflow]]
+kind = "runtime-roster-capture"
+label = "Native roster snapshot"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "An operator-copied native call/output pair, its evidenced namespace and collection interval. Completed capture metadata is immutable evidence; the terminal establishes recording only, never work delivery."
+metadata = { department = "it", owner_role = "platform-admin" }
+metadata_schema = { type = "object", required = ["source", "namespace", "call_id", "payload_sha256"], properties = { source = { type = "string" }, namespace = { type = "string" }, call_id = { type = "string" }, payload_sha256 = { type = "string" } } }
+
+[[workflow.step]]
+title = "capture"
+kind = "task"
+ready_when = "true"
+title_template = "Record the bounded native observation"
+authority_role = "platform-admin"
+fields = [{ name = "snapshot", field_type = "object", required = true }, { name = "result", field_type = "captured|failed", required = true }]
+
+[[workflow.step]]
+title = "recorded"
+kind = "outcome"
+ready_when = "steps.capture.done"
+title_template = "Observation recorded"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "recorded" }

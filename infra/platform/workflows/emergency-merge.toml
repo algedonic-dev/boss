@@ -56,7 +56,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "The sanctioned lane for a fix the pipeline cannot carry because the system of record is down. Rollback to a NAMED last-good revision is tried first and ends the packet if it restores service; otherwise the fix is gated locally for a real receipt, a platform-admin signs the train bypass, the branch fast-forwards onto main, the system of record is read answering on the fix, and the retro is filed. Each step carries the evidence the next needs to become ready, so the lane cannot be improvised twice the same way."
-metadata = { owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "declared"

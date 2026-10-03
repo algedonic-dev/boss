@@ -82,16 +82,9 @@ fn spec() -> WorkflowSpec {
                     outcome: "aborted".into(),
                 }),
                 fields: vec![boss_core::job::StepField {
-                    name: "reason".into(),
-                    field_type: "string".into(),
                     required: true,
                     filled_by: Default::default(),
-                    item_keys: Vec::new(),
-                    covers: None,
-                    binds: None,
-                    item_value_max_bytes: None,
-                    item_one_of: Vec::new(),
-                    writer: None,
+                    ..boss_core::job::StepField::new("reason", "string")
                 }],
                 ..Default::default()
             },
@@ -242,21 +235,33 @@ fn step_by_slug(job: &serde_json::Value, slug: &str) -> serde_json::Value {
         .unwrap_or_else(|| panic!("no step with slug `{slug}` on {job:#}"))
 }
 
-/// PUT `status=completed` on one step, merging `extra` into the step's
-/// stored metadata (never replacing: `outcome_kind` shares the object).
+/// Complete one step: `extra` through the step merge door first (never
+/// replacing: `outcome_kind` shares the object), then `status=completed`
+/// alone through the PUT, which writes no metadata (e39a9d2a). A merge
+/// the door refuses is the answer, and the PUT is not sent.
 async fn complete(
     app: &axum::Router,
     job_id: &str,
     step: &serde_json::Value,
     extra: serde_json::Value,
 ) -> (StatusCode, serde_json::Value) {
-    let mut metadata = step["metadata"].clone();
-    if let (Some(dst), Some(src)) = (metadata.as_object_mut(), extra.as_object()) {
-        for (k, v) in src {
-            dst.insert(k.clone(), v.clone());
+    let step_id = step["id"].as_str().expect("step id");
+    if extra.as_object().is_some_and(|o| !o.is_empty()) {
+        let (status, body) = send(
+            app,
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/jobs/{job_id}/steps/{step_id}/metadata"))
+                .header("content-type", "application/json")
+                .header("x-boss-user", admin_header())
+                .body(Body::from(extra.to_string()))
+                .unwrap(),
+        )
+        .await;
+        if !status.is_success() {
+            return (status, body);
         }
     }
-    let step_id = step["id"].as_str().expect("step id");
     send(
         app,
         Request::builder()
@@ -265,7 +270,7 @@ async fn complete(
             .header("content-type", "application/json")
             .header("x-boss-user", admin_header())
             .body(Body::from(
-                serde_json::json!({ "status": "completed", "metadata": metadata }).to_string(),
+                serde_json::json!({ "status": "completed" }).to_string(),
             ))
             .unwrap(),
     )
@@ -390,8 +395,15 @@ async fn a_body_cannot_claim_aborted_to_pass_the_gate() {
         "a body-claimed outcome_kind must not open the gate: {body}"
     );
     // Refused before the gate is reached since b433bdf3: the key is the
-    // protocol's, and a body that changes it is told so by name.
+    // protocol's, and a body that changes it is told so by name. The
+    // claim now rides the merge door (the PUT writes no metadata since
+    // e39a9d2a), which carries the same protocol-key refusal.
     assert_eq!(body["refused_keys"], serde_json::json!(["outcome_kind"]));
+    assert_eq!(
+        step_by_slug(&get_job(&h.app, &job_id).await, "done")["metadata"]["reason"],
+        serde_json::Value::Null,
+        "the refused merge wrote none of its keys"
+    );
     assert_eq!(get_job(&h.app, &job_id).await["status"], "open");
 }
 

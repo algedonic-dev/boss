@@ -14,6 +14,9 @@
 //!   - DELETE /api/catalog/models/{sku} → 503 when assets is unreachable (fails closed)
 //!   - DELETE /api/catalog/models/{sku} → 404 for unknown SKU (guard returns 0, then repo reports NotFound)
 //!   - The guard fires BEFORE the SQL delete: verify the row is still present on 409.
+//!   - DELETE /api/catalog/models/{sku} → 409 naming the units when only
+//!     DECOMMISSIONED assets reference it (the guard passes; the foreign
+//!     key refuses, and the adapter answers Conflict, not Storage — e9ff7ccb)
 
 mod common;
 
@@ -215,6 +218,45 @@ async fn guard_queries_assets_before_touching_database() {
         "model must still exist after guard-blocked delete"
     );
     assert_eq!(fake.calls().len(), 1, "guard should have been called once");
+}
+
+#[tokio::test]
+async fn delete_model_referenced_only_by_decommissioned_assets_returns_409_naming_them() {
+    // Backlog e9ff7ccb: the guard above counts only ACTIVE assets,
+    // and `assets.sku REFERENCES asset_models(sku)` has no ON DELETE,
+    // so a model only decommissioned units still name passed the guard
+    // and failed the foreign key — a Storage 500. A unit that left
+    // service is still the record of what it was; the delete is
+    // refused as a 409 naming the units, and the model stays.
+    let db = TestDb::new().await;
+    seed_model(&db.pool, "Boss-GUARD-RETIRED").await;
+    sqlx::query(
+        "INSERT INTO assets (asset_id, sku, phase, first_seen, last_event_at) \
+         VALUES ('ASSET-RETIRED-1', 'Boss-GUARD-RETIRED', 'decommissioned', \
+                 '2026-01-01', '2026-06-01')",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("insert decommissioned asset");
+
+    // Assets answers 0 ACTIVE devices — the guard passes, as it does live.
+    let assets: Arc<dyn AssetsClient> = Arc::new(FakeAssetsClient::with_count(0));
+    let router = build_router(db.pool.clone(), assets);
+
+    let resp = TestRequest::delete("/api/catalog/models/Boss-GUARD-RETIRED")
+        .send(&router)
+        .await;
+
+    resp.assert_status(StatusCode::CONFLICT);
+    let body = resp.body_text();
+    assert!(
+        body.contains("ASSET-RETIRED-1"),
+        "the 409 names the referencing asset; got: {body}"
+    );
+    assert!(
+        model_exists(&db.pool, "Boss-GUARD-RETIRED").await,
+        "the model (and its satellites, same tx) must survive a refused delete"
+    );
 }
 
 // Silence unused import warnings when the test file compiles alone.

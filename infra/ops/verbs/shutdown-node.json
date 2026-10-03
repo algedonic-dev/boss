@@ -1,0 +1,28 @@
+{
+  "about": "MUTATING — a graceful Talos shutdown of ONE cordoned worker node (infra/forge/shutdown-node.sh <node> <plan_sha256>): talosctl -n <the registry's address> shutdown --wait=false through the forge's ops_talosctl door (the talosconfig David placed, infra/estate/ops-credentials.sh) — never --force, so Talos cordons and drains the node through the eviction API before it powers off. Asked for by design 8457c07b §2 (the w-1 second-NVMe window of 2026-09-30, backlog 52ea56ac; built as backlog f0aaa72f), which chose it over the power button because a hard cut leaves the node NotReady for five minutes before anything is evicted — the Longhorn Multi-Attach shape of 2026-09-11. AUTHORISED PER RUN BY DAVID'S PASSKEY (design 8457c07b Q1's proposal), in design 17835005's shape, as reclaim-gcp-root and reap-terminated-pods are: it declares requires_approval with the read-only plan-a-node-shutdown (this script's --plan) as its plan_verb, so the runner renders the plan onto the request's approve step, runs this only after a passkey on the approvers list signs those bytes, and hands the script sha256 of the SIGNED plan; the script re-renders and shuts nothing down unless today's plan hashes to it. The plan names the node, its estate role and address, the Node's uid, its cordon, its Ready condition, the one command, and the pods the drain will evict and those that stay (DaemonSet and static mirror pods), and the disruption budgets at 0 that would hold the drain. Ready is in the bytes, so a second run of an applied plan re-renders differently and is refused: at most once. THE BOUND IS THE SCRIPT'S, NEVER A PARAM (infra/forge/cluster-node-lib.sh): the node must be a talos-worker in the live estate registry (not retired, one IPv4 address) AND the cluster must agree — no node-role.kubernetes.io/control-plane label, the registry's address as its InternalIP — AND already cordoned (cordon-node first), or nothing is done (exit 78). A control plane is refused by the registry's role before any door opens. THE EFFECT IS READ BACK: every 10 s for up to 720 s, Kubernetes' Ready condition and talosctl version; only when the Node reads Ready=False or Unknown AND the Talos API no longer answers is the effect line printed, and otherwise the run exits 1 saying the node is NOT proven down. Powering the machine back on is a hand at the machine. Timeout 900: the drain's evictions and the kubelet's grace period, inside which the script's own 720 s read-back gives its verdict before the runner's kill.",
+  "hosts": [
+    "forge"
+  ],
+  "requires_approval": true,
+  "plan_verb": "plan-a-node-shutdown",
+  "approvers": [
+    "emp-david"
+  ],
+  "argv": [
+    "infra/forge/shutdown-node.sh",
+    "{1}",
+    "{2}"
+  ],
+  "params": [
+    {
+      "name": "node",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    {
+      "name": "plan_sha256",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  ],
+  "timeout": 900,
+  "effect": "^shutdown-node: [a-z0-9-]+ is down — read back: Kubernetes reports Ready=(False|Unknown) and the Talos API at [0-9.]+ no longer answers"
+}

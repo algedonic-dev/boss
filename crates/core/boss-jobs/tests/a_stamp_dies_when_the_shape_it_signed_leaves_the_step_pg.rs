@@ -36,20 +36,16 @@ const MIGRATION: &str = "infra/postgres/schema/20260925145943-a-stamp-dies-when-
 fn job(id: &str) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
-        kind: "ops-request".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "forge"),
-        title: "An approval".into(),
-        owner_id: "emp-1".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "ops-request",
+            Subject::new("custom", "forge"),
+            "An approval",
+            "emp-1",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
+        )
     }
 }
 

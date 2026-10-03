@@ -238,6 +238,21 @@ render_rc=0
     --rule "$INFRA/dispatcher/rules/broker-rotates-the-github-dr-push-token.toml" \
     --dest "${BOSS_GITHUB_DR_TOKEN_FILE:-/etc/boss-publish/github-dr.token}" || render_rc=$?
 
+# THIS HOST'S OPS RUNNER CREDENTIAL (design f623e425 Q1; backlog 1e50e66b).
+# The broker stages the forge's new value in Secret
+# boss/ops-runner-credential (key forge.next); runner-credential-deposit.sh
+# proves it through the jobs API's credential door, installs it into the
+# root-only file infra/ops/ops-runner.sh presents (the same
+# BOSS_RUNNER_CREDENTIAL_FILE, one default in both — pinned by
+# runner_credential_deposit_sh.rs), and records delivery on the rotation
+# packet so the broker may promote it. It never stops the runner: no file
+# is a runner that answers without a credential, as every runner did
+# before the door. Its exit is carried like the render's.
+runner_rc=0
+"$INFRA/forge/runner-credential-deposit.sh" \
+    --rule "$INFRA/dispatcher/rules/broker-rotates-the-forge-ops-runner-credential.toml" \
+    --dest "${BOSS_RUNNER_CREDENTIAL_FILE:-/etc/boss/ops-runner.credential}" || runner_rc=$?
+
 # THE OFF-SITE COPY, pushed by us and not by Forgejo (backlog 21d54f4a,
 # decided 2026-09-26: no mirror can wipe what it mirrors). Forgejo's push
 # mirror is `git push -f --mirror` whatever its filter, and it was the
@@ -246,10 +261,11 @@ render_rc=0
 # offsite-push.json declares — a non-fast-forward is refused and named,
 # never overwritten — read back, and only then the Forgejo push mirror
 # deleted. Main goes, alone, to the PRIVATE DR copy algedonic-dev/boss-dr
-# (backlog 761bc8a9), read with the token rendered just above. It
-# declares NOTHING for the public fork dauld/boss-mirror: not main
-# (backlog 67931115), not publish/* (backlog a2b58aab) — the fork gets
-# publish branches only from publish-github-pr.sh, scanned and approved.
+# (backlog 761bc8a9), read with the token rendered just above, and it is
+# the one target: every target is the algedonic-dev organisation's
+# (backlog d2b7c947). The public mirror gets publish branches only from
+# publish-github-pr.sh, scanned and approved — never main (backlog
+# 67931115) and never a forge branch by its name alone (backlog a2b58aab).
 # Same forge header as protect-main (deleting a mirror is the same
 # repository administration); each GitHub token is its target's own
 # file, read by git's credential helper, never here — and an empty DR
@@ -259,10 +275,12 @@ if [ "$offsite_rc" -eq 0 ]; then
 fi
 
 # install.sh's verdict first (it is the older and wider one), then the
-# protection's, then the off-site push's, then the deposit's: any reds
-# this run and puts the packet on `failed`.
+# protection's, then the off-site push's, the DR render's, the runner
+# credential's, then the checkout deposit's: any reds this run and puts
+# the packet on `failed`.
 [ "$install_rc" -eq 0 ] || exit "$install_rc"
 [ "$protect_rc" -eq 0 ] || exit "$protect_rc"
 [ "$offsite_rc" -eq 0 ] || exit "$offsite_rc"
 [ "$render_rc" -eq 0 ] || exit "$render_rc"
+[ "$runner_rc" -eq 0 ] || exit "$runner_rc"
 exit "$deposit_rc"

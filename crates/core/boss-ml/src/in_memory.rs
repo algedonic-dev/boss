@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use async_trait::async_trait;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, SubsecRound, Utc};
 
-use crate::port::{MlError, MlRepository};
+use crate::port::{MlError, MlRepository, checked_limit, name_version_taken};
 use crate::types::{CreatePredictionInput, MlModel, MlModelSummary, MlPrediction, ModelStatus};
 
 #[derive(Default)]
@@ -31,6 +31,27 @@ impl InMemoryMlRepo {
     pub fn new() -> Self {
         Self::default()
     }
+}
+
+/// An instant as a TIMESTAMPTZ column keeps it: to the microsecond.
+/// The double kept nanoseconds, so the same write read back unequal on
+/// the two adapters (backlog be459ab9, the adapters-agree suite).
+fn to_micros(t: DateTime<Utc>) -> DateTime<Utc> {
+    t.trunc_subsecs(6)
+}
+
+/// Newest first, then id in byte order — the Postgres adapter's
+/// `ORDER BY created_at DESC, id COLLATE "C"`. Both used to stop at
+/// `created_at`, so a same-microsecond pair answered in insertion order
+/// here and plan order there (backlog be459ab9).
+fn newest_first_capped(mut rows: Vec<MlPrediction>, limit: i64) -> Vec<MlPrediction> {
+    rows.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    rows.truncate(usize::try_from(limit).unwrap_or(0));
+    rows
 }
 
 #[async_trait]
@@ -67,7 +88,15 @@ impl MlRepository for InMemoryMlRepo {
                 }
             })
             .collect();
-        out.sort_by(|a, b| a.model.name.cmp(&b.model.name));
+        // Byte order by name, then id: the Postgres adapter's
+        // `COLLATE "C"`. The name alone left two versions of one model
+        // in HashMap order (backlog be459ab9).
+        out.sort_by(|a, b| {
+            a.model
+                .name
+                .cmp(&b.model.name)
+                .then_with(|| a.model.id.cmp(&b.model.id))
+        });
         Ok(out)
     }
 
@@ -99,7 +128,28 @@ impl MlRepository for InMemoryMlRepo {
 
     async fn upsert_model(&self, model: &MlModel) -> Result<(), MlError> {
         let mut inner = self.inner.write().unwrap();
-        inner.models.insert(model.id.clone(), model.clone());
+        // The table's UNIQUE (name, version), which this double did not
+        // hold until the adapters-agree suite (backlog be459ab9).
+        if let Some(holder) = inner
+            .models
+            .values()
+            .find(|m| m.id != model.id && m.name == model.name && m.version == model.version)
+        {
+            return Err(name_version_taken(&model.name, &model.version, &holder.id));
+        }
+        // ON CONFLICT DO UPDATE leaves created_at alone; this double
+        // replaced it until the same suite.
+        let created_at = inner
+            .models
+            .get(&model.id)
+            .map(|m| m.created_at)
+            .unwrap_or_else(|| to_micros(model.created_at));
+        let stored = MlModel {
+            created_at,
+            updated_at: to_micros(model.updated_at),
+            ..model.clone()
+        };
+        inner.models.insert(model.id.clone(), stored);
         Ok(())
     }
 
@@ -122,7 +172,7 @@ impl MlRepository for InMemoryMlRepo {
             entity_id: input.entity_id.clone(),
             score: input.score,
             payload: input.payload.clone(),
-            created_at: Utc::now(),
+            created_at: to_micros(Utc::now()),
         };
         inner.predictions.push(row.clone());
         Ok(row)
@@ -134,16 +184,15 @@ impl MlRepository for InMemoryMlRepo {
         entity_id: &str,
         limit: i64,
     ) -> Result<Vec<MlPrediction>, MlError> {
+        let limit = checked_limit(limit)?;
         let inner = self.inner.read().unwrap();
-        let mut rows: Vec<_> = inner
+        let rows: Vec<_> = inner
             .predictions
             .iter()
             .filter(|p| p.entity_type == entity_type && p.entity_id == entity_id)
             .cloned()
             .collect();
-        rows.sort_by_key(|r| std::cmp::Reverse(r.created_at));
-        rows.truncate(limit as usize);
-        Ok(rows)
+        Ok(newest_first_capped(rows, limit))
     }
 
     async fn recent_predictions_for_model(
@@ -151,16 +200,15 @@ impl MlRepository for InMemoryMlRepo {
         model_id: &str,
         limit: i64,
     ) -> Result<Vec<MlPrediction>, MlError> {
+        let limit = checked_limit(limit)?;
         let inner = self.inner.read().unwrap();
-        let mut rows: Vec<_> = inner
+        let rows: Vec<_> = inner
             .predictions
             .iter()
             .filter(|p| p.model_id == model_id)
             .cloned()
             .collect();
-        rows.sort_by_key(|r| std::cmp::Reverse(r.created_at));
-        rows.truncate(limit as usize);
-        Ok(rows)
+        Ok(newest_first_capped(rows, limit))
     }
 }
 

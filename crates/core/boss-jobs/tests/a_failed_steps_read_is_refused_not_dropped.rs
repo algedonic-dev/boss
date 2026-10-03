@@ -70,20 +70,16 @@ fn ceo() -> String {
 fn request(job: &str) -> Job {
     Job {
         id: id(job),
-        kind: "ops-request".into(),
-        workflow_version: 1,
-        subject: Subject::new("asset", "BOSSNET"),
-        title: format!("request {job}"),
-        owner_id: "emp-david".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 24).expect("day"),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({ "verb": "converge" }),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "ops-request",
+            Subject::new("asset", "BOSSNET"),
+            format!("request {job}"),
+            "emp-david",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 24).expect("day"),
+        )
     }
 }
 

@@ -1,0 +1,23 @@
+{
+  "about": "READ-ONLY: renders what `set-volume-replicas` WOULD do to one Longhorn volume, and does nothing (infra/forge/volume-replicas.sh --plan <volume> <replicas>; backlog f5f182fc). It runs every bound the write runs — the volume is one pvc-<uuid> name Longhorn holds in longhorn-system; the count is 1, 2 or 3 and greater than spec.numberOfReplicas now (the verb only raises: what a lowered count leaves over Longhorn v1.11.3 trims only under eviction, best-effort data locality or replica auto-balance, so lowering is not a door this verb opens); at least one replica is healthy (spec.healthyAt set, spec.failedAt empty); and enough Longhorn nodes can take a new replica to put every replica on a distinct node — allowScheduling, no eviction, Ready and Schedulable, no live replica of the volume, and a disk with scheduling room (storageMaximum − storageReserved − storageScheduled) for the volume's size — and then prints the plan: the volume, its claim, size, state, robustness and data locality, the count before and after, the one compare-and-set patch, every replica of the volume with its node, disk and health, and every Longhorn node's verdict with its reason. No clock and no live free space in the bytes (storageAvailable rides stderr); its sha256 is printed on stderr as `plan-sha256:`, and that hash is what David's passkey signs (design 17835005 q1). Every read goes through the forge's ops_kubectl door; a read that could not look is CANNOT ANSWER (exit 1), never a plan. Any refusal renders no plan.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/volume-replicas.sh",
+    "--plan",
+    "{1}",
+    "{2}"
+  ],
+  "params": [
+    {
+      "name": "volume",
+      "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    {
+      "name": "replicas",
+      "pattern": "^[1-3]$"
+    }
+  ],
+  "timeout": 120
+}

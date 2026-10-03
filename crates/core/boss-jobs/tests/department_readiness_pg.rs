@@ -79,20 +79,17 @@ fn packet(n: u8, kind: &str, status: JobStatus, metadata: Value) -> Job {
         id: JobId::from_uuid(
             Uuid::parse_str(&format!("00000000-0000-0000-0000-0000000000{n:02}")).expect("uuid"),
         ),
-        kind: kind.into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "algedonic"),
-        title: format!("{kind} #{n}"),
-        owner_id: "emp-david".into(),
         status,
-        priority: Priority::Standard,
-        opened_on: day(2026, 9, 1 + u32::from(n)),
-        opened_at: None,
-        due_on: None,
         closed_on: (status == JobStatus::Closed).then(|| day(2026, 9, 10 + u32::from(n))),
         metadata,
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            kind,
+            Subject::new("custom", "algedonic"),
+            format!("{kind} #{n}"),
+            "emp-david",
+            Priority::Standard,
+            day(2026, 9, 1 + u32::from(n)),
+        )
     }
 }
 
@@ -296,6 +293,95 @@ async fn a_filled_out_department_reads_five_of_six_with_the_probe_undetermined()
     assert_eq!(v["have"], 5);
     assert_eq!(v["of"], 6);
     assert_eq!(v["undetermined"], json!(["probes"]));
+}
+
+/// READINESS COUNTS THE PACKETS THE JOBS VIEW SHOWS (backlog a22311a1).
+/// The view keeps a packet by the packet-department rule
+/// (`DepartmentFilter::keeps`): its own `metadata.department` wins, and
+/// only a packet naming none falls to its kind's declaration. Readiness
+/// counted by kind alone, so a declaring kind's packet that names
+/// ANOTHER department counted here — and once 61 platform kinds declared
+/// `it`, every backlog-item a finance audit files would have counted as
+/// IT's on IT's readiness and as finance's on finance's view.
+///
+/// And with `?since=<date>` each kind says how many of its packets
+/// departed (closed or cancelled) on or after that day, with a
+/// whole-department line beside the kinds — one read the weekly retro
+/// takes its per-kind counts from, rather than a terminal report per
+/// kind and a page through every closed packet of the week.
+#[tokio::test(flavor = "multi_thread")]
+async fn readiness_counts_the_packets_the_jobs_view_keeps() {
+    let f = fixture(true, Some(rules())).await;
+    let jobs = boss_jobs::PgJobs::new(f.db.pool.clone());
+    for j in [
+        // A sales kind whose packets name marketing: marketing's, and
+        // NEWER than sales' own closed inquiry.
+        packet(
+            5,
+            "receive-an-inquiry",
+            JobStatus::Closed,
+            json!({ "department": "marketing", "outcome": "not-ours" }),
+        ),
+        packet(
+            6,
+            "receive-an-inquiry",
+            JobStatus::Open,
+            json!({ "department": "marketing" }),
+        ),
+    ] {
+        jobs.create_job(&j).await.expect("seed packet");
+    }
+
+    let v = readiness(&f.app, "sales").await;
+    let kinds = v["protocols"]["kinds"].as_array().expect("kinds");
+    let inquiry = &kinds[1];
+    assert_eq!(inquiry["kind"], "receive-an-inquiry");
+    assert_eq!(inquiry["packets"], 2, "marketing's two are not sales': {v}");
+    assert_eq!(inquiry["open"], 1);
+    assert_eq!(
+        inquiry["newest_terminal"]["outcome"], "answered",
+        "the newest terminal is sales' own, not marketing's newer one"
+    );
+    assert_eq!(inquiry["departed"], Value::Null, "no window asked for");
+
+    // The whole department, any kind — what `?department=sales` lists:
+    // inquiries #1 and #2, and the retro #3 that names sales though its
+    // kind declares no department.
+    let all = &v["protocols"]["in_department"];
+    assert_eq!(all["packets"], 3, "{v}");
+    assert_eq!(all["open"], 2);
+    assert_eq!(all["departed"], Value::Null);
+    assert_eq!(v["protocols"]["since"], Value::Null);
+
+    // The week: #1 closed on 11 Sep, marketing's #5 on 15 Sep.
+    let (status, body) = get(&f.app, "/api/departments/sales/readiness?since=2026-09-11").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let week: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(week["protocols"]["since"], "2026-09-11");
+    assert_eq!(week["protocols"]["kinds"][1]["departed"], 1, "{week}");
+    assert_eq!(week["protocols"]["kinds"][0]["departed"], 0);
+    assert_eq!(week["protocols"]["in_department"]["departed"], 1);
+
+    let (_, body) = get(&f.app, "/api/departments/sales/readiness?since=2026-09-12").await;
+    let later: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        later["protocols"]["kinds"][1]["departed"], 0,
+        "marketing's departure on 15 Sep is not sales': {later}"
+    );
+
+    // A window that is not a date is refused, never read as no window.
+    let (status, _) = get(&f.app, "/api/departments/sales/readiness?since=last-monday").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = get(
+        &f.app,
+        "/api/departments/sales/readiness?closed_since=2026-09-11",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unknown parameter is refused, not dropped"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

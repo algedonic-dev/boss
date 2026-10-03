@@ -23,7 +23,6 @@ use std::sync::Arc;
 
 use boss_core::actor::ActorId;
 use boss_core::job::{Job, JobId, JobStatus, Priority, Subject};
-use boss_core::partition::Partition;
 use boss_core::port::EventBus;
 use boss_core::publisher::EventStamp;
 use boss_jobs::PgJobs;
@@ -49,20 +48,18 @@ fn logged_at() -> DateTime<Utc> {
 fn job(id: &str, opened_at: Option<DateTime<Utc>>) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).expect("uuid")),
-        kind: "keg-return".to_string(),
         workflow_version: 4,
-        subject: Subject::new("account", "acct-1"),
-        title: "t".into(),
-        owner_id: "emp-1".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date"),
         opened_at,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: Partition::Real,
+        ..Job::new(
+            "keg-return".to_string(),
+            Subject::new("account", "acct-1"),
+            "t",
+            "emp-1",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 20).expect("valid date"),
+        )
     }
 }
 

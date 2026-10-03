@@ -28,7 +28,7 @@
 // crawl, which breaks /api/people on /hr (c69e7455).
 
 import { expect, test, type Page, type Route } from './_test';
-import { mountPage } from './_helpers';
+import { mountPage, openedRequests, recordPageRequests } from './_helpers';
 import { installSmokeMocks, servePeopleRows } from './_smokeMocks';
 
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>
@@ -104,6 +104,218 @@ const header = (page: Page) => page.locator('header.exec-header');
 const tab = (page: Page, name: string) => page.getByRole('tab', { name, exact: true });
 
 test.describe('/hr — page audit b959394e', () => {
+  for (const site of ['urgent', 'workflow', 'certifications'] as const) {
+    test(`${site} employee link opens the catalogued employee surface and Back returns to HR`, async ({ page }) => {
+      await page.clock.install({ time: new Date('2026-10-03T12:00:00Z') });
+      const certified = {
+        ...OWNER,
+        certifications: [{ name: 'Safety training', issuing_body: 'Training Authority', expires_on: '2026-10-15' }],
+      };
+      await openHr(page, (r) => json(r, [certified]));
+      await page.route(/\/api\/people\/emp-david$/, (r) => json(r, certified));
+      if (site === 'workflow') await tab(page, 'Workflows').click();
+      if (site === 'certifications') await tab(page, 'Certifications').click();
+      const link = page.getByRole('link', { name: 'Dee Owner', exact: true }).first();
+      await expect(link).toHaveAttribute('href', '/ux/people/emp-david');
+      await link.click();
+      await expect(page).toHaveURL(/\/ux\/people\/emp-david$/);
+      await expect(page.getByRole('heading', { name: 'Dee Owner', exact: true })).toBeVisible();
+      await page.goBack();
+      await expect(page).toHaveURL(/\/hr$/);
+      await expect(tab(page, 'Overview')).toHaveAttribute('aria-selected', 'true');
+      await expect(page.getByRole('link', { name: 'Dee Owner', exact: true })).toBeVisible();
+    });
+  }
+
+  test('all four tabs select their own panel and returning to Overview restores its data', async ({ page }) => {
+    await openHr(page, (r) => json(r, [OWNER]));
+    for (const [name, heading] of [
+      ['Workflows', 'Start Workflow'],
+      ['Certifications', 'Expiring in 90 days (0)'],
+      ['Headcount', 'Headcount by department'],
+      ['Overview', 'At a glance'],
+    ] as const) {
+      await tab(page, name).click();
+      await expect(tab(page, name)).toHaveAttribute('aria-selected', 'true');
+      await expect(page.getByRole('heading', { name: heading, exact: true })).toBeVisible();
+      await expect(page.getByRole('tab', { selected: true })).toHaveCount(1);
+    }
+    await expect(page.getByText('Nothing urgent today.')).toBeVisible();
+  });
+
+  test('urgent shows at most five links while Certifications shows the complete ninety-day population', async ({ page }) => {
+    await page.clock.install({ time: new Date('2026-10-03T12:00:00Z') });
+    const rows = Array.from({ length: 6 }, (_, n) => ({
+      ...emp(`emp-${n}`, `Employee ${n}`, 'platform-admin'),
+      certifications: [{ name: `Training ${n}`, issuing_body: 'Training Authority', expires_on: '2026-10-15' }],
+    }));
+    const later = {
+      ...emp('emp-later', 'Later Employee', 'platform-admin'),
+      certifications: [{ name: 'Later training', issuing_body: 'Later Authority', expires_on: '2026-12-01' }],
+    };
+    await openHr(page, (r) => json(r, [...rows, later]));
+    await expect(header(page)).toContainText('7 certifications expiring in 90 days');
+    await expect(page.getByRole('heading', { name: '6 certs expiring in 30 days', exact: true })).toBeVisible();
+    await expect(page.locator('.tab-panel').getByRole('link')).toHaveCount(5);
+    await tab(page, 'Certifications').click();
+    await expect(page.getByRole('heading', { name: 'Expiring in 90 days (7)', exact: true })).toBeVisible();
+    await expect(page.locator('table tbody tr')).toHaveCount(7);
+    await expect(page.locator('tr').filter({ hasText: 'Later Employee' })).toContainText('Later Authority');
+    await expect(page.locator('tr').filter({ hasText: 'Later Employee' })).toContainText('2026-12-01');
+  });
+
+  test('empty successful reads keep the roster, workflow and certification empty states distinct', async ({ page }) => {
+    await openHr(page, (r) => json(r, []));
+    await page.route(/\/api\/workflows$/, (r) => json(r, []));
+    await expect(title(page)).toHaveText('0 active employees');
+    await expect(page.getByText('Nothing urgent today.')).toBeVisible();
+    await tab(page, 'Workflows').click();
+    await expect(page.getByText('No HR workflows are published in this deployment.', { exact: false })).toBeVisible();
+    await expect(page.getByText('No active workflows.', { exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: /^Start / })).toHaveCount(0);
+    await tab(page, 'Certifications').click();
+    await expect(page.getByText('No certifications expiring in the next 90 days.')).toBeVisible();
+    await expect(page.locator('.load-failed')).toHaveCount(0);
+  });
+
+  test('Start buttons require a selection and the picker admits active and on-leave employees only', async ({ page }) => {
+    const leave = { ...emp('emp-leave', 'Lee Leave', 'platform-admin'), status: 'on-leave' };
+    const former = { ...emp('emp-former', 'Former Employee', 'platform-admin'), status: 'terminated' };
+    await openHr(page, (r) => json(r, [OWNER, leave, former]));
+    await tab(page, 'Workflows').click();
+    await expect(page.getByRole('button', { name: 'Start Onboarding' })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Start Offboarding' })).toBeDisabled();
+    await expect(page.locator('select.hr-select option')).toHaveText([
+      'Select employee...', 'Dee Owner (emp-david)', 'Lee Leave (emp-leave)',
+    ]);
+    await page.locator('select.hr-select').selectOption('emp-leave');
+    await expect(page.getByRole('button', { name: 'Start Offboarding' })).toBeEnabled();
+    await page.getByRole('button', { name: 'Start Offboarding' }).click();
+    await expect(page).toHaveURL(/\/jobs\?new=1&kind=offboarding&subject_kind=employee&subject_id=emp-leave$/);
+    await page.goBack();
+    await expect(title(page)).toHaveText('1 active employee');
+    await expect(tab(page, 'Overview')).toHaveAttribute('aria-selected', 'true');
+  });
+
+  for (const name of ['Overview', 'Certifications', 'Headcount']) {
+    test(`${name} renders the roster refusal instead of derived empty data`, async ({ page }) => {
+      await openHr(page, (r) => json(r, 'roster unavailable', 503));
+      await tab(page, name).click();
+      await expect(page.locator('.load-failed')).toContainText("Couldn't load the roster — HTTP 503");
+      await expect(page.getByText('Nothing urgent today.')).toHaveCount(0);
+      await expect(page.getByText('No certifications expiring in the next 90 days.')).toHaveCount(0);
+      await expect(page.locator('table.data-table')).toHaveCount(0);
+    });
+  }
+
+  test('registry refusal explains both unavailable workflow discovery and the active list', async ({ page }) => {
+    await openHr(page, (r) => json(r, [OWNER]));
+    await page.route(/\/api\/workflows$/, (r) => json(r, 'registry unavailable', 503));
+    await tab(page, 'Workflows').click();
+    await expect(page.locator('.load-failed')).toHaveText([
+      "Couldn't load HR workflows — workflows registry: HTTP 503",
+      "Couldn't load active workflows — workflows registry: HTTP 503",
+    ]);
+    await expect(page.getByText('No active workflows.', { exact: true })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: /^Start / })).toHaveCount(0);
+  });
+
+  test('failed role classes declare the fallback instead of claiming excluded-account headcount', async ({ page }) => {
+    await openHr(page, (r) => json(r, [OWNER, AUDIT]));
+    // Register before remounting: the shared session loads classes once
+    // per document, so changing a response after it was read is no test.
+    await page.route(/\/api\/classes(\?|$)/, (r) => json(r, 'classes unavailable', 503));
+    await page.reload();
+    await expect(page.locator('.catalog.theme-exec .load-failed').filter({ hasText: "Couldn't load the roles" }))
+      .toContainText('Roles show by code, and the counts include every role.');
+    await expect(title(page)).toHaveText('2 active employees');
+  });
+
+  test('a failed kind list is unknown even when another kind was read successfully', async ({ page }) => {
+    await openHr(page, (r) => json(r, [OWNER]));
+    await page.route(/\/api\/jobs\?kind=offboarding/, (r) => json(r, 'jobs unavailable', 503));
+    await tab(page, 'Workflows').click();
+    await expect(page.locator('.load-failed')).toContainText("Couldn't load active workflows — offboarding jobs:");
+    await expect(page.locator('.load-failed')).toContainText('503');
+    await expect(page.getByText('No active workflows.', { exact: true })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'View tasks' })).toHaveCount(0);
+  });
+
+  test('workflow discovery follows registry surfaces and employee subjects rather than fixed kind names', async ({ page }) => {
+    await openHr(page, (r) => json(r, [OWNER]));
+    const custom = { ...HR_KINDS[0], kind: 'employee-review', label: 'Employee Review' };
+    await page.route(/\/api\/workflows$/, (r) => json(r, [
+      custom,
+      { ...custom, kind: 'asset-review', label: 'Asset Review', subject_kinds: ['asset'] },
+      { ...custom, kind: 'unlisted-review', label: 'Unlisted Review', metadata: { surfaces: [] } },
+    ]));
+    await page.route(/\/api\/jobs\?kind=employee-review/, (r) => json(r, { data: [], total: 0 }));
+    await tab(page, 'Workflows').click();
+    await expect(page.getByRole('button', { name: /^Start / })).toHaveText(['Start Employee Review']);
+    await expect(page.getByText('No active workflows.', { exact: true })).toBeVisible();
+    await page.locator('select.hr-select').selectOption('emp-david');
+    await page.getByRole('button', { name: 'Start Employee Review' }).click();
+    await expect(page).toHaveURL(/kind=employee-review&subject_kind=employee&subject_id=emp-david$/);
+  });
+
+  test('an unrecognised jobs envelope renders a failed list rather than an empty department', async ({ page }) => {
+    await openHr(page, (r) => json(r, [OWNER]));
+    await page.route(/\/api\/jobs\?kind=onboarding/, (r) => json(r, { jobs: [], total: 0 }));
+    await tab(page, 'Workflows').click();
+    await expect(page.locator('.load-failed')).toContainText("Couldn't load active workflows — onboarding jobs:");
+    await expect(page.getByText('No active workflows.', { exact: true })).toHaveCount(0);
+  });
+
+  for (const answer of ['failed', 'malformed', 'empty'] as const) {
+    test(`View tasks keeps a ${answer} step read distinct`, async ({ page }) => {
+      await openHr(page, (r) => json(r, [OWNER]));
+      await page.route(/\/api\/jobs\/job-hire\/steps$/, (r) =>
+        answer === 'failed' ? json(r, 'steps unavailable', 503)
+          : answer === 'malformed' ? json(r, { unexpected: [] }) : json(r, []));
+      await tab(page, 'Workflows').click();
+      if (answer !== 'empty') {
+        await expect(page.locator('tr').filter({ hasText: 'Onboarding' })).toContainText('Progress unknown');
+      }
+      await page.getByRole('button', { name: 'View tasks' }).first().click();
+      if (answer === 'empty') {
+        await expect(page.getByText('This workflow has no steps — the Job was read and it is genuinely empty.', { exact: false })).toBeVisible();
+        await expect(page.locator('.load-failed')).toHaveCount(0);
+      } else {
+        await expect(page.getByRole('alert')).toContainText("Couldn't read Dee Owner's onboarding steps");
+        await expect(page.getByRole('alert')).toContainText('unknown, not absent');
+        await expect(page.getByText('This workflow has no steps', { exact: false })).toHaveCount(0);
+      }
+      await expect(page.getByRole('button', { name: 'Mark done' })).toHaveCount(0);
+    });
+  }
+
+  test('task rows open their own Job for completion evidence without a task-table write (36132827)', async ({ page }) => {
+    await recordPageRequests(page);
+    await openHr(page, (r) => json(r, [OWNER]));
+    await page.route(/\/api\/jobs\/job-hire\/steps$/, (r) => json(r, [
+      step('s-hire', 'Issue a laptop'),
+      { ...step('s-accepted', 'Record acceptance'), status: 'completed', completed_on: '2026-10-02' },
+    ]));
+    await page.route(/\/api\/jobs\/job-hire$/, (r) => json(r, {
+      ...job('job-hire', 'onboarding', 'emp-david'), steps: [],
+    }));
+    await tab(page, 'Workflows').click();
+    await page.getByRole('button', { name: 'View tasks' }).first().click();
+    for (const title of ['Issue a laptop', 'Record acceptance']) {
+      await expect(page.locator('tr').filter({ hasText: title }).getByRole('link', { name: 'Open job' }))
+        .toHaveAttribute('href', '/jobs/job-hire');
+    }
+    await expect(page.getByRole('button', { name: 'Mark done' })).toHaveCount(0);
+    await page.locator('tr').filter({ hasText: 'Issue a laptop' }).getByRole('link', { name: 'Open job' }).click();
+    await expect(page).toHaveURL(/\/jobs\/job-hire$/);
+    await expect(page.getByRole('heading', { name: 'onboarding emp-david', exact: true })).toBeVisible();
+    expect((await openedRequests(page)).filter((r) => r.method !== 'GET' && r.path !== '/api/surface-opens'))
+      .toEqual([]);
+    await page.goBack();
+    await expect(page).toHaveURL(/\/hr$/);
+    await expect(title(page)).toHaveText('1 active employee');
+  });
+
   test('a failed roster read states no count in the header (d8d48a49)', async ({ page }) => {
     await openHr(page, (r) => json(r, 'people store down', 500));
 

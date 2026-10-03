@@ -65,3 +65,7 @@ required-features = ["postgres"]
 [[test]]
 name = "the_asset_parts_writes_ask_policy"
 required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_assets_store_pg"
+required-features = ["postgres"]

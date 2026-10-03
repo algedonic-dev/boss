@@ -25,9 +25,219 @@ pub enum InventoryError {
     /// a client error, distinct from real 5xx storage trouble.
     #[error("invalid account: {0}")]
     InvalidAccount(String),
+    /// A request the port refuses on its face — a NUL byte in written
+    /// text, a non-positive amount, a currency not three characters
+    /// long, a negative limit. The HTTP layer answers 400. Until the
+    /// adapters-agree suite (backlog be459ab9) Postgres answered each
+    /// with its own error as `Storage` (a 500) and the double accepted
+    /// them.
+    #[error("invalid: {0}")]
+    Invalid(String),
+}
+
+/// Refuse text Postgres cannot store: a NUL byte in any of `fields`
+/// (TEXT and JSONB reject one). Both adapters call this before writing,
+/// so the refusal is `Invalid` naming the field on each.
+pub fn refuse_nul(fields: &[(&str, &str)]) -> Result<(), InventoryError> {
+    match fields.iter().find(|(_, v)| v.contains('\0')) {
+        Some((f, _)) => Err(InventoryError::Invalid(format!(
+            "{f} holds a NUL byte, which cannot be stored"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// True when a read key holds a NUL byte: no stored key can, so the
+/// read is a miss — answered before Postgres sees the key, which it
+/// would refuse with an encoding error (a 500).
+pub fn nul_key(key: &str) -> bool {
+    key.contains('\0')
+}
+
+/// A currency is three characters (the tables' `length(currency) = 3`
+/// CHECK, which Postgres counts in characters).
+fn refuse_currency(currency: &str) -> Result<(), InventoryError> {
+    if currency.chars().count() == 3 {
+        Ok(())
+    } else {
+        Err(InventoryError::Invalid(format!(
+            "currency `{}` is not three characters long",
+            currency.escape_debug()
+        )))
+    }
+}
+
+/// A GL amount is positive: a JE or overhead of zero or fewer cents
+/// moves nothing a journal can carry.
+pub fn refuse_non_positive(total_cost_cents: i64) -> Result<(), InventoryError> {
+    if total_cost_cents > 0 {
+        Ok(())
+    } else {
+        Err(InventoryError::Invalid(format!(
+            "total_cost_cents must be positive, got {total_cost_cents}"
+        )))
+    }
+}
+
+/// A list limit is zero or more.
+pub fn refuse_negative_limit(limit: i64) -> Result<(), InventoryError> {
+    if limit >= 0 {
+        Ok(())
+    } else {
+        Err(InventoryError::Invalid(format!(
+            "limit must not be negative, got {limit}"
+        )))
+    }
+}
+
+/// Refuse a count its 32-bit signed column cannot hold. The port counts
+/// in `u32` and Postgres stores `INTEGER`, so a count past `i32::MAX`
+/// was bound as a NEGATIVE number — a receive that large LOWERED stock
+/// (backlog 55f69172). Both adapters call this before writing.
+pub fn refuse_past_i32(fields: &[(&str, u32)]) -> Result<(), InventoryError> {
+    match fields.iter().find(|(_, v)| i32::try_from(*v).is_err()) {
+        Some((f, v)) => Err(InventoryError::Invalid(format!(
+            "{f} {v} is past the largest count stored ({})",
+            i32::MAX
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The refusal of a receive that would carry a row's `on_hand` past
+/// what its column holds — one wording for both adapters (Postgres
+/// answered its overflow error as `Storage`, a 500, and the double,
+/// counting in `u32`, accepted it; backlog 55f69172).
+pub fn on_hand_overflow(part_sku: &str, on_hand: u32, qty: u32) -> InventoryError {
+    InventoryError::Invalid(format!(
+        "receiving {qty} of {part_sku} would carry on_hand past {} (holds {on_hand})",
+        i32::MAX
+    ))
+}
+
+/// The refusals an item write makes before either adapter touches state.
+pub fn refuse_bad_item(item: &InventoryItem) -> Result<(), InventoryError> {
+    refuse_past_i32(&[
+        ("on_hand", item.on_hand),
+        ("allocated", item.allocated),
+        ("reorder_point", item.reorder_point),
+        ("reorder_qty", item.reorder_qty),
+        ("trailing_90d_usage", item.trailing_90d_usage),
+    ])?;
+    refuse_nul(&[
+        ("part_sku", &item.part_sku),
+        ("bin", &item.bin),
+        (
+            "vendor_category",
+            item.vendor_category.as_deref().unwrap_or(""),
+        ),
+    ])
+}
+
+/// The refusals a purchase-order write makes before either adapter
+/// touches state.
+pub fn refuse_bad_po(po: &PurchaseOrder) -> Result<(), InventoryError> {
+    refuse_nul(&[
+        ("id", &po.id),
+        ("vendor", po.vendor.as_deref().unwrap_or("")),
+        ("status", po.status.as_str()),
+    ])?;
+    for line in &po.lines {
+        refuse_nul(&[("part_sku", &line.part_sku), ("currency", &line.currency)])?;
+        refuse_past_i32(&[("qty", line.qty)])?;
+        refuse_currency(&line.currency)?;
+    }
+    Ok(())
+}
+
+/// The refusals a vendor write makes before either adapter touches
+/// state. The behaviour profile is JSONB, searched whole.
+pub fn refuse_bad_vendor(vendor: &Vendor) -> Result<(), InventoryError> {
+    // The column is SMALLINT; a `u16` past `i16::MAX` was stored
+    // negative (backlog 55f69172).
+    if i16::try_from(vendor.lead_time_days).is_err() {
+        return Err(InventoryError::Invalid(format!(
+            "lead_time_days {} is past the largest stored ({})",
+            vendor.lead_time_days,
+            i16::MAX
+        )));
+    }
+    let opt = |v: &Option<String>| v.clone().unwrap_or_default();
+    refuse_nul(&[
+        ("id", &vendor.id),
+        ("name", &opt(&vendor.name)),
+        ("contact_name", &opt(&vendor.contact_name)),
+        ("contact_email", &opt(&vendor.contact_email)),
+        ("city", &opt(&vendor.city)),
+        ("state", &opt(&vendor.state)),
+        ("payment_terms", &opt(&vendor.payment_terms)),
+        ("category", &opt(&vendor.category)),
+    ])?;
+    fn json_holds_nul(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::String(s) => s.contains('\0'),
+            serde_json::Value::Array(a) => a.iter().any(json_holds_nul),
+            serde_json::Value::Object(o) => {
+                o.iter().any(|(k, v)| k.contains('\0') || json_holds_nul(v))
+            }
+            _ => false,
+        }
+    }
+    if json_holds_nul(&serde_json::to_value(&vendor.behavior).unwrap_or_default()) {
+        return Err(InventoryError::Invalid(
+            "behavior holds a NUL byte, which cannot be stored".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The refusals a vendor-invoice write makes before either adapter
+/// touches state.
+pub fn refuse_bad_invoice(invoice: &VendorInvoice) -> Result<(), InventoryError> {
+    refuse_nul(&[
+        ("id", &invoice.id),
+        ("po_id", &invoice.po_id),
+        ("vendor", &invoice.vendor),
+        ("vendor_invoice_no", &invoice.vendor_invoice_no),
+        ("currency", &invoice.currency),
+        ("status", invoice.status.as_str()),
+        (
+            "discrepancy_kind",
+            invoice
+                .discrepancy_kind
+                .as_ref()
+                .map(|k| k.as_str())
+                .unwrap_or(""),
+        ),
+    ])?;
+    for line in &invoice.lines {
+        refuse_nul(&[("part_sku", &line.part_sku)])?;
+    }
+    refuse_currency(&invoice.currency)
+}
+
+/// The refusal of a purchase order naming a vendor no Subject holds —
+/// one wording for both adapters (backlog be459ab9: Postgres answered
+/// the subject-edge trigger's error as `Storage`, a 500, and the double
+/// stored the order).
+pub fn unregistered_vendor(vendor: &str) -> InventoryError {
+    InventoryError::NotFound(format!("vendor {vendor} is not registered"))
+}
+
+/// The refusal of a vendor invoice billing an order nobody placed (the
+/// `po_id` foreign key Postgres answered as `Storage`, a 500).
+pub fn unplaced_order(po_id: &str) -> InventoryError {
+    InventoryError::NotFound(format!("purchase order {po_id} does not exist"))
 }
 
 /// Persistence port for inventory tables.
+///
+/// Every method is held to one statement across both adapters by
+/// `tests/the_adapters_agree_on_the_inventory_store_pg.rs` (backlog
+/// be459ab9). Common to every method: a NUL byte in a written text
+/// argument or field is refused `Invalid` naming it, and a read keyed by
+/// one is a miss; lists are in BYTE order (never the database's locale,
+/// backlog 2987fb2d) with an id breaking every tie.
 ///
 /// **Timestamp threading.** Mutation methods come in two flavors:
 /// a convenience overload that stamps `Utc::now()` server-side, and
@@ -91,6 +301,14 @@ pub trait InventoryRepository: Send + Sync {
     /// fact payload, value-draining consumes only) in the SAME
     /// transaction as the decrement. The idempotency guard sits ahead
     /// of both, so a redelivered consume records nothing.
+    ///
+    /// The guard is keyed by `source_id` whatever the consume drained:
+    /// a valued consume's proof is its transfer fact; a consume that
+    /// drained nothing writes the GL-inert `finance.inventory.consumed`
+    /// marker under the same key and records `inventory.item.
+    /// consume_recorded` (its rebuild source) in place of the transfer.
+    /// Until backlog 55f69172 a valueless consume wrote no fact, so its
+    /// redelivery took the units again.
     async fn consume_part_at(
         &self,
         part_sku: &str,
@@ -200,6 +418,9 @@ pub trait InventoryRepository: Send + Sync {
     /// (the DR-1300 rides the idempotent bill-approval path). The
     /// fallback id the HTTP layer supplies must be RANDOM, never
     /// time-based (see `consume_part_at`).
+    ///
+    /// A `qty` past `i32::MAX`, or one that would carry `on_hand` past
+    /// it, is refused `Invalid` before any write (backlog 55f69172).
     async fn receive_part(
         &self,
         part_sku: &str,

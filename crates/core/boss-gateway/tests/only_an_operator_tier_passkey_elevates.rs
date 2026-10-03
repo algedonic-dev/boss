@@ -215,7 +215,7 @@ fn router(base: String, events: Arc<Captured>) -> Router {
     let audit = AuthAudit::spawn(events);
     let passkey = Arc::new(PasskeyState {
         session_key: KEY.to_vec(),
-        http: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+        http: boss_gateway::machine_client::MachineClient::unstamped(reqwest::Client::builder())
             .unwrap(),
         people_base: base.clone(),
         jobs_base: base.clone(),
@@ -226,7 +226,7 @@ fn router(base: String, events: Arc<Captured>) -> Router {
         audit,
     });
     let owner = RosterPlatformOwner::new(
-        boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder()).unwrap(),
+        boss_gateway::machine_client::MachineClient::unstamped(reqwest::Client::builder()).unwrap(),
         base,
     );
     elevation_router(Arc::new(ElevationState {

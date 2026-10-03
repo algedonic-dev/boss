@@ -77,6 +77,25 @@ export function triggerTopics(rules: ReadonlyArray<DispatcherRule>): string[] {
   return [...new Set(rules.flatMap((r) => (r.on_event ? [r.on_event] : [])))].sort();
 }
 
+/** One thing the page's filter can start a forward cascade from: an
+ *  on_event topic, or a rule no event fires. */
+export type FilterStart = Readonly<{ id: string; label: string; group: 'event' | 'schedule' }>;
+
+/** The filter's options, by node id: every topic rules listen for, then
+ *  every rule with no on_event — a clock fires those, so each is a source
+ *  in the graph with no trigger node, and offering only topics left them
+ *  unreachable and dropped from every filtered view (backlog d3734028:
+ *  19 of 65 rules on 2026-09-23, 31 of 104 on 2026-10-01). */
+export function filterStarts(rules: ReadonlyArray<DispatcherRule>): FilterStart[] {
+  const events = triggerTopics(rules).map((t): FilterStart => ({ id: EVT(t), label: t, group: 'event' }));
+  const scheduled = rules
+    .filter((r) => !r.on_event)
+    .map((r) => r.name)
+    .sort()
+    .map((n): FilterStart => ({ id: RULE(n), label: n, group: 'schedule' }));
+  return [...events, ...scheduled];
+}
+
 /** What fires the rule, in words: `on <topic>` for an event-triggered
  *  rule, the cadence for a scheduled one, and an honest "no trigger
  *  recorded" for a row carrying neither (the registry refuses such a
@@ -212,20 +231,16 @@ export function buildCascade(data: DispatcherRules): Cascade {
 }
 
 /** Narrow a cascade to the forward-reachable subgraph from one or more
- *  trigger events (by event `ref` — the on_event topic). Follows edges in
+ *  start nodes (by node id — a `filterStarts` option: an on_event topic's
+ *  event node, or a scheduled rule's own node). Follows edges in
  *  direction (trigger → rule → handler → emit → event → match/system → …),
- *  so you see exactly what firing those events cascades into. Cycle flags
- *  are preserved from the full graph. An empty selection returns the
- *  cascade unchanged (the full view). */
-export function filterCascadeFromEvents(
-  cascade: Cascade,
-  eventRefs: ReadonlyArray<string>,
-): Cascade {
-  if (eventRefs.length === 0) return cascade;
-  const refs = new Set(eventRefs);
-  const starts = cascade.nodes
-    .filter((n) => n.kind === 'event' && refs.has(n.ref))
-    .map((n) => n.id);
+ *  so you see exactly what firing those events, or those clocks, cascades
+ *  into. Cycle flags are preserved from the full graph. An empty selection
+ *  returns the cascade unchanged (the full view). */
+export function filterCascadeFrom(cascade: Cascade, startIds: ReadonlyArray<string>): Cascade {
+  if (startIds.length === 0) return cascade;
+  const ids = new Set(startIds);
+  const starts = cascade.nodes.filter((n) => ids.has(n.id)).map((n) => n.id);
   const adj = new Map<string, string[]>();
   for (const e of cascade.edges) {
     const out = adj.get(e.source);

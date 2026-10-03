@@ -12,7 +12,7 @@ use axum::routing::{get, patch};
 use axum::{Json, Router};
 use boss_core::actor::ActorId;
 use boss_core::publisher::EventStamp;
-use boss_policy_client::{Action, CurrentUser, PolicyClient, Resource, User};
+use boss_policy_client::{CurrentUser, PolicyClient, User, controls};
 use serde_json::{Map, Value};
 
 use crate::port::{SubjectKindError, SubjectKindRepository};
@@ -151,13 +151,8 @@ async fn patch_metadata(
 /// allow it returns the caller's actor, which is what the fact is signed
 /// with — so no fallback author exists anywhere on this path.
 async fn authorize_update(policy: &dyn PolicyClient, user: &User) -> Result<ActorId, Response> {
-    boss_policy_client::writes::require_registry_write(
-        policy,
-        user,
-        Action::Update,
-        Resource::subject_kind(),
-    )
-    .await
+    boss_policy_client::writes::require_registry_write(policy, user, controls::UPDATE_SUBJECT_KIND)
+        .await
 }
 
 #[cfg(test)]
@@ -167,6 +162,7 @@ mod tests {
     use crate::port::SubjectKind;
     use axum::body::to_bytes;
     use axum::http::Request;
+    use boss_policy_client::{Action, Resource};
     use serde_json::{Value, json};
     use tower::ServiceExt;
 

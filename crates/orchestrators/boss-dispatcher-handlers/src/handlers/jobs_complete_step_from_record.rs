@@ -47,6 +47,41 @@
 //! A value already on the step is its writer's record: every key fills
 //! ABSENT ones only, and rides the step merge door (e39a9d2a).
 //!
+//! ## The record the landing also posts (backlog bb32b2a0)
+//!
+//! Landing the step was half the run's ending. `boss dispatch --report`
+//! writes the run's `agent_runs` cost row only once the run has an
+//! outcome — the row is insert-once, so an outcome guessed before the
+//! terminal would be permanent — and a report sent before the green has
+//! none. With this rule landing that report, no second report ever
+//! came, so every such run ended with NO cost row and the budget gate
+//! (hourly spend, cost per run) under-counted it. So `--report` now
+//! stores the finish record on the packet (`finish_record`, everything
+//! but what the terminal decides), and a rule naming these args posts
+//! it as the step lands:
+//!
+//! - `post_to` — the API path the record is POSTed to.
+//! - `post_record` — the packet metadata key holding the record (an
+//!   object). Absent: nothing is posted, and the step's evidence says so.
+//! - `post_id_key` — the body key that must name this packet (`run_id`):
+//!   the packet's own id is written there, and a record naming another
+//!   packet is refused, never posted.
+//! - `post_fields` — fixed keys that OVERRIDE the record: the `outcome`
+//!   the step going ready implies (`reported` opens only on `gated` or
+//!   `delivered`, both `success`).
+//! - `post_fill` — keys read off another step of the packet, filled where
+//!   the record holds none: `{key: {step, from: [pointer, …]}}`, the
+//!   first non-empty string wins — the car's `branch`, which only the
+//!   green's evidence on `building` knows.
+//!
+//! The POST goes BEFORE the completion: the row is insert-once
+//! (`ON CONFLICT (run_id) DO NOTHING`), so a redelivery re-posting is
+//! harmless, while a completion made first would close the step and a
+//! redelivery would never post. A refusal that no redelivery repairs
+//! (the door's 400, or a 422) does not hold the landing hostage: the step completes, and its
+//! evidence carries the refusal as `posted`, where the next reader of
+//! the step sees it.
+//!
 //! ## Idempotence
 //!
 //! JetStream is at-least-once. A completed step is not open, so a
@@ -54,7 +89,9 @@
 //! nothing. A builder whose own `--report` completes the step first
 //! wins the same way.
 
-use super::common::{api_client, complete_step, get_json};
+use super::common::{
+    api_client, complete_step, dispatcher_actor_header, get_json, sim_origin_value,
+};
 use super::jobs_complete_linked_step::{is_open, is_unset, step_by_slug, template_arg};
 use async_trait::async_trait;
 use boss_dispatcher::rules::expr::Value;
@@ -177,6 +214,150 @@ pub(crate) fn landing_fields(
     Some(fields)
 }
 
+/// The record the landing posts, read off the rule's `post_*` args
+/// (bb32b2a0 — see the module doc).
+#[derive(Debug, Clone)]
+pub(crate) struct Post<'a> {
+    pub to: &'a str,
+    pub record: &'a str,
+    /// The body key that must name THIS packet (`run_id`): the packet's
+    /// own id is written there, and a stored value naming another packet
+    /// is refused rather than posted (review de8a09bd N1: a record that
+    /// rides packet metadata is editable by any `job:update` holder, and
+    /// an insert-once row posted for another run would take that run's
+    /// place — its own report would then record nothing).
+    pub id_key: Option<&'a str>,
+    pub fields: serde_json::Map<String, serde_json::Value>,
+    pub fill: serde_json::Map<String, serde_json::Value>,
+}
+
+/// PURE: the body to post — `None` when the packet holds no record under
+/// `p.record` (absent, null, or not an object), `Some(Err)` with the
+/// refusal when the record names another packet. `fields` OVERRIDE the
+/// record: they are what the step going ready implies (`outcome =
+/// success` — `reported` opens on no other ending), and no stored value
+/// outranks that. `fill` fills only what the record left unset.
+pub(crate) fn post_body(
+    job: &serde_json::Value,
+    p: &Post<'_>,
+) -> Option<Result<serde_json::Value, String>> {
+    let mut body = job
+        .get("metadata")
+        .and_then(|m| m.get(p.record))
+        .and_then(|r| r.as_object())
+        .cloned()?;
+    // A null is unset here, unlike on a step: the record states the
+    // keys it could not know as null (`branch` before the green).
+    let unset = |b: &serde_json::Map<String, serde_json::Value>, k: &str| {
+        matches!(b.get(k), None | Some(serde_json::Value::Null)) || is_unset(b.get(k))
+    };
+    if let Some(key) = p.id_key {
+        let own = job.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        if !unset(&body, key) && body.get(key).and_then(|v| v.as_str()) != Some(own) {
+            return Some(Err(format!(
+                "`{}.{key}` names {} and the packet is {own}; a record for another packet is \
+                 never posted",
+                p.record,
+                body.get(key).cloned().unwrap_or_default()
+            )));
+        }
+        body.insert(key.to_string(), json!(own));
+    }
+    for (k, v) in &p.fields {
+        body.insert(k.clone(), v.clone());
+    }
+    for (k, spec) in &p.fill {
+        if !unset(&body, k) {
+            continue;
+        }
+        let Some(step) = spec
+            .get("step")
+            .and_then(|s| s.as_str())
+            .and_then(|slug| step_by_slug(job, slug))
+        else {
+            continue;
+        };
+        let found = spec
+            .get("from")
+            .and_then(|f| f.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|ptr| ptr.as_str())
+            .find_map(|ptr| step.pointer(ptr).and_then(|v| v.as_str()))
+            .filter(|s| !s.is_empty());
+        if let Some(found) = found {
+            body.insert(k.clone(), json!(found));
+        }
+    }
+    Some(Ok(serde_json::Value::Object(body)))
+}
+
+/// POST the record: `Ok(Ok)` recorded (or already held — the door is
+/// insert-once), `Ok(Err)` a refusal no redelivery repairs, `Err` one
+/// worth retrying.
+///
+/// WHY NOT `post_json` (review de8a09bd B1). That maps only 422 to a
+/// final refusal, and the agent-runs door answers its OWN refusals —
+/// an empty run_id, finished before started, an actor that is not an
+/// agent, no model and no default — with 400 (`agent_runs/http.rs`,
+/// `AgentRunError::BadRequest`); 422 is only axum's shape rejection.
+/// Retried, a 400 dead-letters after the backoff with `reported` still
+/// ready, which is the state b951c00a fixed. So for this post 400 and
+/// 422 are final, and everything else (409, 404, 429, 5xx, transport)
+/// retries as before.
+async fn post_record(
+    client: &boss_core::machine_token::Client,
+    url: &str,
+    body: &serde_json::Value,
+    rule_name: &str,
+) -> Result<Result<(), String>, HandlerError> {
+    let resp = client
+        .post(url)
+        .header("content-type", "application/json")
+        .header("x-boss-user", dispatcher_actor_header(rule_name))
+        .header("x-sim-origin", sim_origin_value())
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| HandlerError::Downstream(format!("POST {url}: {e}")))?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(Ok(()));
+    }
+    let text = resp.text().await.unwrap_or_default();
+    let said = format!("POST {url} returned {status}: {text}");
+    match status.as_u16() {
+        400 | 422 => Ok(Err(said)),
+        _ => Err(HandlerError::Downstream(said)),
+    }
+}
+
+/// The `post_*` args, or `None` when the rule names no post. One of
+/// `post_to` / `post_record` without the other is rule authoring — no
+/// redelivery repairs it.
+fn post_args<'a>(
+    args: &'a [(String, Value)],
+    rule: &str,
+) -> Result<Option<Post<'a>>, HandlerError> {
+    let text = |k: &str| match arg(args, k) {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.as_str()),
+        _ => None,
+    };
+    match (text("post_to"), text("post_record")) {
+        (None, None) => Ok(None),
+        (Some(to), Some(record)) => Ok(Some(Post {
+            to,
+            record,
+            id_key: text("post_id_key"),
+            fields: template_arg(args, "post_fields", rule).unwrap_or_default(),
+            fill: template_arg(args, "post_fill", rule).unwrap_or_default(),
+        })),
+        _ => Err(HandlerError::Permanent(
+            "post_to and post_record name a post together, or not at all".into(),
+        )),
+    }
+}
+
 #[async_trait]
 impl Handler for JobsCompleteStepFromRecord {
     fn name(&self) -> &'static str {
@@ -203,6 +384,7 @@ impl Handler for JobsCompleteStepFromRecord {
             Some(Value::String(s)) if !s.is_empty() => s.as_str(),
             _ => DEFAULT_EVIDENCE_KEY,
         };
+        let post = post_args(args, &ctx.rule_name)?;
         let (Some(job_id), Some(step_id)) = (
             ctx.event_payload.get("job_id").and_then(|v| v.as_str()),
             ctx.event_payload.get("step_id").and_then(|v| v.as_str()),
@@ -228,9 +410,34 @@ impl Handler for JobsCompleteStepFromRecord {
             "event": ctx.triggering_event_id,
             "from": requires,
         });
-        let Some(fields) = landing_fields(&job, step_id, &landing, provenance) else {
+        let Some(mut fields) = landing_fields(&job, step_id, &landing, provenance) else {
             return Ok(());
         };
+        // THE RECORD, BEFORE THE COMPLETION (bb32b2a0): insert-once, so
+        // a redelivery re-posting is harmless; the completion closes
+        // the step, after which no redelivery would reach this line.
+        if let Some(p) = &post {
+            let refused = |e: String| {
+                tracing::warn!(rule = %ctx.rule_name, packet = %job_id, "{e}");
+                format!("refused: {e}")
+            };
+            let posted = match post_body(&job, p) {
+                None => format!("absent: the packet holds no `{}`", p.record),
+                Some(Err(e)) => refused(e),
+                Some(Ok(body)) => {
+                    let url = format!("{}{}", self.base(), p.to);
+                    // A refusal no redelivery repairs must not hold the
+                    // landing hostage — the step's own evidence carries it.
+                    match post_record(&self.client, &url, &body, &ctx.rule_name).await? {
+                        Ok(()) => format!("recorded: `{}` posted to {}", p.record, p.to),
+                        Err(e) => refused(e),
+                    }
+                }
+            };
+            if let Some(evidence) = fields.get_mut(evidence_key) {
+                evidence["posted"] = json!(posted);
+            }
+        }
         complete_step(
             &self.client,
             self.base(),
@@ -283,23 +490,72 @@ mod tests {
                 "done_metadata".into(),
                 Value::String(r#"{"handback": "recorded"}"#.into()),
             ),
+            ("post_to".into(), Value::String("/api/agent-runs".into())),
+            ("post_record".into(), Value::String("finish_record".into())),
+            ("post_id_key".into(), Value::String("run_id".into())),
+            (
+                "post_fields".into(),
+                Value::String(r#"{"outcome": "success"}"#.into()),
+            ),
+            (
+                "post_fill".into(),
+                Value::String(
+                    r#"{"branch": {"step": "building", "from": ["/metadata/gate_run/branch", "/metadata/car/branch"]}}"#
+                        .into(),
+                ),
+            ),
         ]
+    }
+
+    /// THE PIN (CLAUDE.md §9a): [`args`] is the authored rule's own
+    /// args, so every test here judges the rule that runs, not a copy.
+    #[test]
+    fn the_fixture_is_the_authored_rule() {
+        let path = boss_testing::repo_root()
+            .join("infra/dispatcher/rules/agent-run-lands-a-report-sent-before-green.toml");
+        let text = std::fs::read_to_string(&path).expect("the rule is authored");
+        let rule: toml::Value = toml::from_str(&text).expect("the rule parses");
+        let authored = rule["rule"][0]["do"][0]["args"]
+            .as_table()
+            .expect("the rule has args")
+            .clone();
+        let fixture = args();
+        assert_eq!(authored.len(), fixture.len(), "{authored:?}");
+        for (k, v) in &fixture {
+            let Value::String(v) = v else { unreachable!() };
+            let src = authored[k]
+                .as_str()
+                .expect("an arg is an expression string");
+            // An arg is an expression: a quoted string literal.
+            let lit: String = serde_json::from_str(src).expect("a string literal");
+            if let (Ok(a), Ok(b)) = (
+                serde_json::from_str::<serde_json::Value>(&lit),
+                serde_json::from_str::<serde_json::Value>(v),
+            ) {
+                assert_eq!(a, b, "{k}");
+            } else {
+                assert_eq!(&lit, v, "{k}");
+            }
+        }
     }
 
     /// A run whose gate just went green: `building` closed `gated`,
     /// `reported` is ready, and the builder's pre-green `--report` is
-    /// on the packet.
+    /// on the packet — with the finish record it stored beside it.
     fn run(report: Option<&str>) -> serde_json::Value {
         let mut metadata = json!({ "packet": "p", "step": "build", "tokens": 761000,
                                    "spend_usd": 4.2 });
         if let Some(r) = report {
             metadata["report"] = json!(r);
+            metadata["finish_record"] = json!({ "run_id": RUN, "actor_id": "agent-claude",
+                                                "branch": null, "total_tokens": 761000 });
         }
         json!({
             "id": RUN, "kind": "agent-run", "status": "open", "metadata": metadata,
             "steps": [
                 { "id": "run-building", "spec_slug": "building", "status": "completed",
-                  "metadata": { "result": "gated" } },
+                  "metadata": { "result": "gated",
+                                "gate_run": { "id": "g", "branch": "fix/the-car" } } },
                 { "id": "run-reported", "spec_slug": "reported", "status": "ready",
                   "metadata": { "authority_role": "platform-admin" } },
             ],
@@ -420,13 +676,28 @@ mod tests {
 
     /// A jobs API holding one run: GET it, the step merge door, the
     /// status PUT — which flips the stored step, so a redelivery reads
-    /// it closed.
-    async fn mock(job: serde_json::Value) -> (String, Writes) {
+    /// it closed — and the agent-runs door, answering `post_status`.
+    async fn mock(job: serde_json::Value, post_status: u16) -> (String, Writes) {
         let writes: Writes = Arc::new(Mutex::new(Vec::new()));
         let stored = Arc::new(Mutex::new(job));
         let (g, u) = (stored.clone(), stored);
-        let (pw, uw) = (writes.clone(), writes.clone());
+        let (pw, uw, rw) = (writes.clone(), writes.clone(), writes.clone());
         let app = Router::new()
+            .route(
+                "/api/agent-runs",
+                axum::routing::post(move |Json(b): Json<serde_json::Value>| {
+                    let rw = rw.clone();
+                    async move {
+                        rw.lock()
+                            .unwrap()
+                            .push(("POST".into(), "/api/agent-runs".into(), b));
+                        (
+                            axum::http::StatusCode::from_u16(post_status).unwrap(),
+                            Json(json!({ "recorded": true })),
+                        )
+                    }
+                }),
+            )
             .route(
                 "/api/jobs/{id}",
                 get(move || {
@@ -476,27 +747,190 @@ mod tests {
                 "workflow_kind": "agent-run", "spec_slug": "reported" })
     }
 
-    /// The firing end to end: one merge and one flip, and a redelivery
-    /// of the same event writes nothing more.
+    /// The firing end to end: the finish record posted FIRST, then one
+    /// merge and one flip, and a redelivery of the same event writes
+    /// nothing more (bb32b2a0).
     #[tokio::test]
-    async fn the_green_lands_the_report_once() {
-        let (base, writes) = mock(run(Some("packet x, branch y"))).await;
+    async fn the_green_lands_the_report_and_its_cost_row_once() {
+        let (base, writes) = mock(run(Some("packet x, branch y")), 200).await;
         let h =
             JobsCompleteStepFromRecord::with_client(crate::handlers::common::api_client(), &base);
         h.invoke(&args(), &ctx(ready("run-reported")))
             .await
             .expect("the firing runs");
         let w = writes.lock().unwrap().clone();
-        assert_eq!(w.len(), 2, "the merge, then the flip: {w:?}");
-        assert_eq!(w[0].1, "run-reported/metadata");
-        assert_eq!(w[0].2["summary"], "packet x, branch y");
-        assert_eq!(w[0].2["from_record"]["event"], "ev-1");
-        assert_eq!(w[1].2, json!({ "status": "completed" }));
+        assert_eq!(w.len(), 3, "the post, the merge, then the flip: {w:?}");
+        assert_eq!(
+            w[0].1, "/api/agent-runs",
+            "the record goes before the completion"
+        );
+        assert_eq!(w[0].2["outcome"], "success");
+        assert_eq!(w[0].2["branch"], "fix/the-car");
+        assert_eq!(w[0].2["run_id"], RUN);
+        assert_eq!(w[1].1, "run-reported/metadata");
+        assert_eq!(w[1].2["summary"], "packet x, branch y");
+        assert_eq!(w[1].2["from_record"]["event"], "ev-1");
+        assert!(
+            w[1].2["from_record"]["posted"]
+                .as_str()
+                .is_some_and(|p| p.starts_with("recorded")),
+            "{}",
+            w[1].2
+        );
+        assert_eq!(w[2].2, json!({ "status": "completed" }));
 
         h.invoke(&args(), &ctx(ready("run-reported")))
             .await
             .expect("the redelivery runs");
-        assert_eq!(writes.lock().unwrap().len(), 2, "nothing is written twice");
+        assert_eq!(writes.lock().unwrap().len(), 3, "nothing is written twice");
+    }
+
+    /// A refusal no redelivery repairs does not hold the landing
+    /// hostage: the step completes and its evidence carries the refusal.
+    /// 400 is what the agent-runs door answers for its OWN refusals
+    /// (`AgentRunError::BadRequest`, review de8a09bd B1) — the car's
+    /// first version mocked only a 422 the door never sends for them.
+    #[tokio::test]
+    async fn a_refused_record_still_lands_the_report_and_says_so() {
+        for status in [400, 422] {
+            let (base, writes) = mock(run(Some("r")), status).await;
+            let h = JobsCompleteStepFromRecord::with_client(
+                crate::handlers::common::api_client(),
+                &base,
+            );
+            h.invoke(&args(), &ctx(ready("run-reported")))
+                .await
+                .unwrap_or_else(|e| panic!("a {status} lands the step: {e}"));
+            let w = writes.lock().unwrap().clone();
+            assert_eq!(w.len(), 3, "{status}: {w:?}");
+            assert!(
+                w[1].2["from_record"]["posted"]
+                    .as_str()
+                    .is_some_and(|p| p.starts_with("refused") && p.contains(&status.to_string())),
+                "{status}: {}",
+                w[1].2
+            );
+            assert_eq!(w[2].2, json!({ "status": "completed" }));
+        }
+    }
+
+    /// A record naming ANOTHER run is refused, never posted: an
+    /// insert-once row for run B written by run A's landing would take
+    /// B's place (review de8a09bd N1). The step still lands.
+    #[tokio::test]
+    async fn a_record_naming_another_run_is_refused_and_never_posted() {
+        let mut r = run(Some("r"));
+        r["metadata"]["finish_record"]["run_id"] = json!("55555555-5555-5555-5555-555555555555");
+        let (base, writes) = mock(r, 200).await;
+        let h =
+            JobsCompleteStepFromRecord::with_client(crate::handlers::common::api_client(), &base);
+        h.invoke(&args(), &ctx(ready("run-reported")))
+            .await
+            .expect("the firing runs");
+        let w = writes.lock().unwrap().clone();
+        assert_eq!(w.len(), 2, "no post: {w:?}");
+        assert!(
+            w[0].2["from_record"]["posted"]
+                .as_str()
+                .is_some_and(|p| p.starts_with("refused") && p.contains("55555555")),
+            "{}",
+            w[0].2
+        );
+    }
+
+    /// A transient failure is retried: nothing is completed, so the
+    /// redelivery posts again (insert-once makes that harmless).
+    #[tokio::test]
+    async fn a_transient_post_failure_retries_before_anything_completes() {
+        let (base, writes) = mock(run(Some("r")), 503).await;
+        let h =
+            JobsCompleteStepFromRecord::with_client(crate::handlers::common::api_client(), &base);
+        let err = h
+            .invoke(&args(), &ctx(ready("run-reported")))
+            .await
+            .expect_err("a 503 is retried");
+        assert!(matches!(err, HandlerError::Downstream(_)), "{err}");
+        assert_eq!(writes.lock().unwrap().len(), 1, "only the post was tried");
+    }
+
+    /// The body: the implied outcome OVERRIDES any stored one (review
+    /// de8a09bd N1 — `reported` opening means success, and nothing on
+    /// the packet outranks that), the run id is the packet's own, and
+    /// the green's branch fills only what the record left unset.
+    #[test]
+    fn the_posted_body_takes_the_implied_outcome_and_fills_the_branch() {
+        let a = args();
+        let p = post_args(&a, "t").unwrap().expect("the rule posts");
+        let body = post_body(&run(Some("r")), &p)
+            .expect("the packet holds a record")
+            .expect("the record names this run");
+        assert_eq!(body["outcome"], "success");
+        assert_eq!(body["branch"], "fix/the-car");
+        assert_eq!(body["run_id"], RUN);
+        assert_eq!(body["total_tokens"], 761000);
+
+        let mut held = run(Some("r"));
+        held["metadata"]["finish_record"]["branch"] = json!("tenant/branch");
+        held["metadata"]["finish_record"]["outcome"] = json!("cancelled");
+        held["metadata"]["finish_record"]
+            .as_object_mut()
+            .unwrap()
+            .remove("run_id");
+        let body = post_body(&held, &p).unwrap().unwrap();
+        assert_eq!(body["branch"], "tenant/branch", "a stored branch is kept");
+        assert_eq!(body["outcome"], "success", "the implied outcome wins");
+        assert_eq!(body["run_id"], RUN, "an unset run id is the packet's");
+
+        let mut merged = run(Some("r"));
+        merged["steps"][0]["metadata"] =
+            json!({ "result": "gated", "car": { "branch": "fix/merged" } });
+        assert_eq!(
+            post_body(&merged, &p).unwrap().unwrap()["branch"],
+            "fix/merged"
+        );
+
+        let mut none = run(Some("r"));
+        none["metadata"]["finish_record"] = serde_json::Value::Null;
+        assert!(post_body(&none, &p).is_none(), "no record, nothing to post");
+    }
+
+    /// A packet from before `finish_record` existed still lands, and the
+    /// step says nothing was posted.
+    #[tokio::test]
+    async fn a_packet_holding_no_finish_record_lands_and_says_so() {
+        let mut r = run(Some("r"));
+        r["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("finish_record");
+        let (base, writes) = mock(r, 200).await;
+        let h =
+            JobsCompleteStepFromRecord::with_client(crate::handlers::common::api_client(), &base);
+        h.invoke(&args(), &ctx(ready("run-reported")))
+            .await
+            .expect("the firing runs");
+        let w = writes.lock().unwrap().clone();
+        assert_eq!(w.len(), 2, "no post: {w:?}");
+        assert!(
+            w[0].2["from_record"]["posted"]
+                .as_str()
+                .is_some_and(|p| p.starts_with("absent")),
+            "{}",
+            w[0].2
+        );
+    }
+
+    /// Half a post is rule authoring, and permanent.
+    #[test]
+    fn half_a_post_is_refused() {
+        let a: Vec<_> = args()
+            .into_iter()
+            .filter(|(k, _)| k != "post_record")
+            .collect();
+        assert!(matches!(
+            post_args(&a, "t"),
+            Err(HandlerError::Permanent(_))
+        ));
     }
 
     /// A record that is not an object is rule authoring, and permanent.
@@ -526,7 +960,7 @@ mod tests {
             crate::cascade::handler_emits()
                 .get("jobs.complete_step_from_record")
                 .cloned(),
-            Some(vec!["jobs.step.completed"]),
+            Some(vec!["jobs.step.completed", "agents.run.recorded"]),
             "the cascade table knows what this handler emits"
         );
     }

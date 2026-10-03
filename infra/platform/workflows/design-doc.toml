@@ -52,7 +52,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "A design doc while it is still being decided. The prose and the open questions ride in the packet, so it is reviewable the moment it exists rather than after it ships; the markdown lands as a file only when the packet terminates. Replaces the index-and-flush round trip that made a review possible only after its doc reached deployed main."
-metadata = { owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "drafted"
@@ -81,10 +81,19 @@ metadata_defaults = { trigger_kind = "operator", trigger_name = "author-drafts-a
 # array admits: it is `boss design --no-questions` — a doc that
 # records a decision and asks nothing — and `no_open_questions` on
 # the Job carries that intent explicitly.
+#
+# Only an explicit string "true" with no questions bypasses review
+# (backlog 5932204e). Absent operands compare unequal even to themselves
+# in the DSL, so the first anchor's self-equality detects a question;
+# admission already requires every question to carry that scalar anchor.
+# This also keeps a contradictory hand-filed bypass flag from hiding
+# questions. Legacy packets without the flag still require review.
+# Workflow publication allocates above the registry's spent versions
+# (live v7 at measurement); the bundle does not declare a version.
 [[workflow.step]]
 title = "review"
 kind = "review-design"
-ready_when = "steps.drafted.done"
+ready_when = "steps.drafted.done AND (NOT (job.metadata.no_open_questions = \"true\") OR job.metadata.questions.0.anchor = job.metadata.questions.0.anchor)"
 title_template = "Answer the open questions"
 authority_role = "platform-admin"
 metadata_defaults = { title = "{metadata.title}", markdown = "{metadata.markdown}", questions = "{metadata.questions}", resolutions = [] }
@@ -186,7 +195,7 @@ required = true
 [[workflow.step]]
 title = "fold"
 kind = "task"
-ready_when = "steps.review.done"
+ready_when = "steps.drafted.done AND (steps.review.done OR (job.metadata.no_open_questions = \"true\" AND NOT (job.metadata.questions.0.anchor = job.metadata.questions.0.anchor)))"
 title_template = "Fold it into current truth"
 # WHO EXECUTES THE FOLD (2026-09-23). The fold is agent work — a car
 # that writes the settled paragraphs into docs/architecture-decisions.md

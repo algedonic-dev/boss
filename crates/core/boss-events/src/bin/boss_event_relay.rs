@@ -15,6 +15,13 @@
 //! Inert until an emitter is migrated to `record_event_in_tx` — an
 //! empty outbox costs one indexed probe per idle tick.
 //!
+//! It also owns the outbox's retention: an hourly pass, on a task of
+//! its own, deletes DELIVERED rows older than `--outbox-retention-hours`
+//! (default a week) whose fact `audit_log` holds — until 2026-10-01
+//! nothing deleted any, and every event was stored twice for good
+//! (backlog eec0c1f3, incident d3c0a67c). See
+//! `boss_events::outbox::prune_delivered_outbox`.
+//!
 //! Exit codes: 0 clean shutdown (never in service mode), 1
 //! operational error at startup (DB/NATS unreachable, bad config).
 //! Runtime storage errors log + back off; the relay never gives up —
@@ -27,7 +34,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use boss_core::port::EventBus;
 use boss_core::rebuild::resolve_database_url;
-use boss_events::outbox::drain_outbox_once;
+use boss_events::outbox::{
+    DEFAULT_OUTBOX_RETENTION, DEFAULT_PRUNE_BATCH, DEFAULT_PRUNE_MAX_ROWS, drain_outbox_once,
+    prune_delivered_outbox,
+};
 use clap::Parser;
 use sqlx::postgres::PgPoolOptions;
 use tracing::{error, info};
@@ -72,9 +82,53 @@ struct Cli {
     idle_sleep_ms: u64,
 
     /// Drain until empty, then exit 0. For scripts and tests; the
-    /// service unit runs without it.
+    /// service unit runs without it. No retention pass runs in this
+    /// mode.
     #[arg(long, default_value_t = false)]
     once: bool,
+
+    /// Keep a DELIVERED outbox row this many hours, then delete it —
+    /// its fact is already in audit_log (backlog eec0c1f3). Undelivered
+    /// and dead-lettered rows are never deleted. At least 1.
+    #[arg(long, default_value_t = DEFAULT_OUTBOX_RETENTION.as_secs() / 3600,
+          value_parser = clap::value_parser!(u64).range(1..))]
+    outbox_retention_hours: u64,
+
+    /// Seconds between retention passes. The first runs at start.
+    #[arg(long, default_value_t = 3600,
+          value_parser = clap::value_parser!(u64).range(60..))]
+    prune_interval_secs: u64,
+}
+
+/// The outbox's retention, on its own task so a pass never stalls the
+/// drain: delivery latency is what every step.ready waits on, and a
+/// pass of many batches takes seconds. Every pass logs what it deleted,
+/// including nothing; every batch that deleted a row staged its own
+/// `events.outbox.pruned` fact with the rows. A failed pass is logged
+/// and the next one runs on schedule — retention is never a reason for
+/// the relay to stop relaying.
+async fn retention_loop(pool: sqlx::PgPool, retention: Duration, every: Duration) {
+    let mut tick = tokio::time::interval(every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        match prune_delivered_outbox(
+            &pool,
+            retention,
+            DEFAULT_PRUNE_BATCH,
+            DEFAULT_PRUNE_MAX_ROWS,
+        )
+        .await
+        {
+            Ok(stats) => info!(
+                deleted = stats.deleted,
+                batches = stats.batches,
+                retention_hours = retention.as_secs() / 3600,
+                "outbox retention pass: delivered rows older than the window deleted"
+            ),
+            Err(e) => error!(error = %e, "outbox retention pass failed — retrying next interval"),
+        }
+    }
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -128,8 +182,17 @@ async fn main() -> Result<()> {
     info!(
         batch = cli.batch,
         once = cli.once,
+        outbox_retention_hours = cli.outbox_retention_hours,
         "boss-event-relay started"
     );
+
+    if !cli.once {
+        tokio::spawn(retention_loop(
+            pool.clone(),
+            Duration::from_secs(cli.outbox_retention_hours * 3600),
+            Duration::from_secs(cli.prune_interval_secs),
+        ));
+    }
 
     let mut total_delivered: u64 = 0;
     let mut since_heartbeat: u64 = 0;

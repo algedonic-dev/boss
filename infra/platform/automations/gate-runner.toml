@@ -1,0 +1,7 @@
+# automation:gate-runner — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 12,906 audit-log facts.
+# Signs as platform-admin today: infra/gate-runner/run.sh.
+
+[[automation]]
+id = "automation:gate-runner"
+role = "platform-admin"
+description = 'The cluster gate Job: judges a branch and records its receipt on the gate-run packet (infra/gate-runner/run.sh).'

@@ -83,6 +83,59 @@ manifests_the_converge_ignores() {
     )
 }
 
+# deposit_config_render K NAMESPACE TEMPLATE OUTPUT RENDERER RECEIPT
+# The deployment already owns its endpoint, account and SSH host pin.
+# Read only the two named nonsecret objects through the existing operator
+# adapter (877ad378). The first pass migrates literal CronJob inputs into
+# its ConfigMap; later passes reread the same data. No Secret, grant or
+# executable command is read or inferred. A failed read leaves no apply
+# manifest or positive receipt, and the runner aborts before any apply.
+deposit_config_render() {
+    local k="$1" ns="$2" template="$3" output="$4" renderer="$5" receipt="$6" dir
+    dir=$(mktemp -d) || return 2
+    if ! $k get configmap break-glass-deposit-known-hosts -n "$ns" -o json > "$dir/cm.json" \
+        || ! $k get cronjob boss-break-glass-deposit -n "$ns" -o json > "$dir/cron.json"; then
+        echo 'deposit-config: REFUSED — required deployment config could not be read; nothing staged' >&2
+        rm -rf "$dir"
+        return 2
+    fi
+    if ! bash "$renderer" "$template" "$dir/cm.json" "$dir/cron.json" "$ns" "$output" "$receipt"; then
+        rm -rf "$dir"
+        return 2
+    fi
+    rm -rf "$dir"
+}
+
+# The same existing operator write door, stdin enabled. No new authority:
+# it already applies these two objects. The helper makes both conditional
+# and excludes them from the ordinary apply that follows.
+deposit_config_apply() {
+    bash "$(dirname "${BASH_SOURCE[0]}")/../cluster/apply-deposit-config.sh" "$@"
+}
+
+# kubectl create --dry-run=client -o json emits one document per input
+# YAML object, not a List. Count the COMPLETE producer sequence against
+# the source before making one canonical typed envelope (877ad378).
+deposit_config_source() {
+    local template="$1" documents="$2" output="$3" expected tmp
+    expected=$(awk '/^kind: / { n++ } END { print n+0 }' "$template")
+    [ "$expected" -gt 0 ] || return 2
+    tmp=$(mktemp) || return 2
+    if ! jq -s --argjson expected "$expected" '
+        if length == $expected and all(.[];
+          type == "object" and (.apiVersion | type == "string" and length > 0)
+          and (.kind | type == "string" and length > 0)
+          and (.metadata.name | type == "string" and length > 0))
+        then {apiVersion:"v1",kind:"List",items:.}
+        else error("deposit-config: incomplete client conversion") end
+    ' "$documents" > "$tmp"; then
+        echo 'deposit-config: REFUSED — incomplete client conversion; nothing staged' >&2
+        rm -f "$tmp"
+        return 2
+    fi
+    mv "$tmp" "$output"
+}
+
 # manifests_with_image SRC_DIR DST_DIR REGISTRY TAG
 #   Copy the manifests, rewriting the boss image tag to TAG so the
 #   apply carries the build that is already converged. TAG "none"
@@ -1111,12 +1164,16 @@ observe_sites() {
 #   Read with grep/sed, not a TOML parser (roles.toml's rule): the
 #   `handler = "…"` line names the handler, the `args = { … }` line that
 #   follows it carries the Secret as two string LITERALS — the expr
-#   spelling is `"\"boss\""`. A broker rule whose Secret is not a literal
+#   spelling is `"\"boss\""`. An `also_in_namespaces` literal on the same
+#   line (comma-separated) declares the same Secret name in each of those
+#   namespaces too — the machine token's copy for the dev pod's doors
+#   (design 6805c764, car 3). A broker rule whose Secret is not a literal
 #   (a metadata expression, an absent arg) is a NAMED refusal on stderr
 #   and return 1: the converge cannot know what to create and must not
 #   guess; the readable declarations are still printed.
 broker_secrets() {
-    local dir="$1" f line handler="" ns name found="" bad=0
+    local dir="$1" f line handler="" ns name also found="" bad=0
+    local -a extra=()
     for f in "$dir"/*.toml; do
         [ -f "$f" ] || continue
         while IFS= read -r line; do
@@ -1131,11 +1188,21 @@ broker_secrets() {
                     esac
                     ns=$(sed -nE 's/.*secret_namespace = "\\"([^"\\]+)\\"".*/\1/p' <<< "$line")
                     name=$(sed -nE 's/.*secret_name = "\\"([^"\\]+)\\"".*/\1/p' <<< "$line")
+                    # `also_in_namespaces` (design 6805c764, car 3): the
+                    # SAME Secret name in each listed namespace, which the
+                    # handler writes in step with the first — a pod mounts
+                    # only its own namespace's Secrets. Comma-separated.
+                    also=$(sed -nE 's/.*also_in_namespaces = "\\"([^"\\]+)\\"".*/\1/p' <<< "$line")
                     if [ -z "$ns" ] || [ -z "$name" ]; then
                         echo "cluster-deploy-runner: $f: rule handler $handler declares no literal secret_namespace / secret_name — cannot know which Secret to create" >&2
                         bad=1
                     else
                         found="$found$ns"$'\t'"$name"$'\n'
+                        IFS=',' read -ra extra <<< "$also"
+                        for ns in "${extra[@]}"; do
+                            ns="${ns// /}"
+                            [ -z "$ns" ] || found="$found$ns"$'\t'"$name"$'\n'
+                        done
                     fi
                     handler="" ;;
             esac

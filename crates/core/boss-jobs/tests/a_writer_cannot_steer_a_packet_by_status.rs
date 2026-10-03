@@ -52,16 +52,9 @@ const LOOSE_KIND: &str = "no-protocol-here";
 
 fn required(name: &str) -> boss_core::job::StepField {
     boss_core::job::StepField {
-        name: name.into(),
-        field_type: "string".into(),
         required: true,
         filled_by: Default::default(),
-        item_keys: Vec::new(),
-        covers: None,
-        binds: None,
-        item_value_max_bytes: None,
-        item_one_of: Vec::new(),
-        writer: None,
+        ..boss_core::job::StepField::new(name, "string")
     }
 }
 
@@ -334,15 +327,18 @@ fn job_body(job: &Value) -> Value {
 async fn finish_the_work(app: &axum::Router, job_id: &str) -> Value {
     let job = get_job(app, job_id).await;
     let work = step_by_slug(&job, "work");
-    let mut metadata = work["metadata"].clone();
-    metadata["evidence"] = json!("measured");
-    let (status, body) = put_step(
+    // The evidence through the merge door, the status alone through the
+    // PUT: the PUT writes no metadata (e39a9d2a).
+    let work_id = work["id"].as_str().expect("step id");
+    let (status, body) = send(
         app,
-        job_id,
-        &work,
-        json!({ "status": "completed", "metadata": metadata }),
+        "PATCH",
+        &format!("/api/jobs/{job_id}/steps/{work_id}/metadata"),
+        Some(json!({ "evidence": "measured" })),
     )
     .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "the evidence lands: {body}");
+    let (status, body) = put_step(app, job_id, &work, json!({ "status": "completed" })).await;
     assert_eq!(
         status,
         StatusCode::NO_CONTENT,
@@ -565,7 +561,9 @@ async fn a_step_put_cannot_move_its_plugin_version() {
 }
 
 /// Control: the whole step sent back as read — assurance and plugin
-/// version included — with one field changed still lands.
+/// version included — with one field changed still lands. Every field
+/// but `metadata`: the PUT refuses any metadata body since e39a9d2a, and
+/// a whole-row write-back is not a metadata write.
 #[tokio::test]
 async fn a_step_sent_back_as_read_still_lands() {
     let (app, _) = app();
@@ -573,6 +571,7 @@ async fn a_step_sent_back_as_read_still_lands() {
     let job = get_job(&app, &job_id).await;
     let mut approve = step_by_slug(&job, "approve");
     approve["title"] = json!("Approve, in person");
+    approve.as_object_mut().unwrap().remove("metadata");
     let (status, answer) = put_step(&app, &job_id, &approve.clone(), approve).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
     let still = get_job(&app, &job_id).await;

@@ -37,6 +37,7 @@
   import type { Band, FanBranch, Section } from './route-layout';
   import { sectionGround, stationLabel, trainsOf, waitingBlocks } from './transit';
   import { safeLinkHref } from '@boss/web-kit/links';
+  import { presentationHref } from './map-navigation';
 
   type Props = Readonly<{
     /** The served routes, laid out (route-layout.ts `sectionsOf`). */
@@ -56,8 +57,9 @@
      *  of design e765b3fc): the rate-replay blocks are then off, so no
      *  crossing is drawn twice, once as a picture of it. */
     live?: boolean;
+    overview?: boolean;
   }>;
-  let { sections, borders, reduced, selected, live = false, band = null, width = 0, height = 0 }: Props = $props();
+  let { sections, borders, reduced, selected, live = false, overview = false, band = null, width = 0, height = 0 }: Props = $props();
 
   const track = $derived(sections.filter((s) => s.kind === 'section'));
   const ramps = $derived(sections.filter((s) => s.kind !== 'section'));
@@ -88,18 +90,19 @@
   const labelAt = (b: FanBranch): string => `translate(${b.end.x + 3} ${b.end.y + 11}) rotate(45)`;
 
   function open(e: MouseEvent, href: string): void {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
     e.preventDefault();
     navigate(href);
   }
 </script>
 
-<g class="routes" data-routes>
+<g class="routes" class:overview data-routes>
   {#if band !== null}
     <!-- THE EXITS BAND (design f0313eda E2): one place to read how
          packets leave the map. Not a route, so no data-section. -->
     <g data-exits-band>
       <rect x="12" y={band.top} width={Math.max(0, width - 24)} height={Math.max(0, height - band.top - 16)} rx="6" class="band" />
-      <text x="28" y={height - 26} class="band-h">EXITS · where packets leave the map · a branch per terminal, every buffer on one rail</text>
+      <text x="28" y={height - 26} class="band-h">{overview ? 'EXITS · select a station for its terminals' : 'EXITS · where packets leave the map · a branch per terminal, every buffer on one rail'}</text>
     </g>
   {/if}
   {#each ramps as s (s.key)}
@@ -109,14 +112,18 @@
       <path d={s.d} class="ramp-line line-{s.line}" class:stub={s.fan !== null} class:undeclared={!s.declared} />
       {#if s.fan !== null}
         {@const fan = s.fan}
-        <text x={fan.head.x} y={fan.head.y} class="fan-h" data-fan-head={s.from}>{stationLabel(s.from ?? '')} · off {fan.total}</text>
+        {#if !overview || selected === s.from}
+          <text x={fan.head.x} y={fan.head.y} class="fan-h" data-fan-head={s.from}>{stationLabel(s.from ?? '')} · off {fan.total}</text>
+        {/if}
         {#each fan.branches as b (b.name)}
           <g class="branch-g" data-terminal={b.name} data-count={b.count} data-declared={b.declared ? 'true' : 'false'}>
             <title>{branchTitle(s, b)}</title>
             <path d={b.d} class="branch {branchClass(s, b)}" />
             <path d="M{b.end.x - 5} {b.end.y} H{b.end.x + 5}" class="buffer {branchClass(s, b)}" data-buffer={b.name} />
+            {#if !overview || selected === s.from}
             <text transform={labelAt(b)} class="blabel"><tspan class="n" class:zero={b.count === 0}>{b.count}</tspan> <tspan
                 class="t" class:bad={!b.declared}>{b.name.replace(/-/g, ' ')}</tspan></text>
+            {/if}
           </g>
         {/each}
       {/if}
@@ -133,9 +140,9 @@
     {@const ground = sectionGround(b)}
     {@const waiting = waitingBlocks(s, b)}
     {@const trains = live ? null : trainsOf(b, reduced)}
-    {@const href = sectionHref(from, to)}
+    {@const href = presentationHref(sectionHref(from, to), overview)}
     {@const isSelected = selected === s.key}
-    <a class="section-link" href={safeLinkHref(href)} data-section-link={s.key} data-selected={isSelected ? 'true' : undefined}
+    <a class="section-link" class:context-muted={overview && selected !== null && selected !== s.key && selected !== from && selected !== to} href={safeLinkHref(href)} data-section-link={s.key} data-selected={isSelected ? 'true' : undefined}
       aria-current={isSelected ? 'true' : undefined} aria-label={sectionTitle(from, to)}
       onclick={(e) => open(e, href)}>
       {#if isSelected}
@@ -209,12 +216,14 @@
   .band { fill: var(--map-surface); stroke: var(--map-rule); }
   text.band-h { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.08em; fill: var(--map-muted); }
   text.fan-h { font-size: 11px; font-weight: 700; fill: var(--map-ink); }
+  .overview text.band-h, .overview text.fan-h, .overview text.blabel { font-size: 26px; }
   text.blabel { font-size: 10.5px; fill: var(--map-muted); dominant-baseline: middle; }
   .blabel .n { font-family: var(--font-mono); font-weight: 700; fill: var(--map-ink); font-variant-numeric: tabular-nums; }
   .blabel .n.zero { font-weight: 400; fill: var(--map-muted); }
   .blabel .t.bad { fill: var(--map-bad-ink); font-weight: 600; }
   /* The section's door: a wide stroke nobody sees takes the click. */
   .section-link { cursor: pointer; }
+  .section-link.context-muted { opacity: 0.55; }
   .section-link:focus-visible { outline: none; }
   .hit { fill: none; stroke: transparent; stroke-width: 22; stroke-linecap: round; pointer-events: stroke; }
   /* THE SELECTION'S MARK (car N2), in the map's ink: a casing under the

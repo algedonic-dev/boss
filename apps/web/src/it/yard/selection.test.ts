@@ -78,7 +78,7 @@ const border = (from: string, to: string): Border => ({
   flowing: true,
   held_since: null,
   flowing_why: 'last crossed 19m ago',
-  machine: { name: 'train-board-on-dock-depth', kind: 'dispatcher-rule', last_fired: null, silent_for_minutes: null, expected_every_minutes: null, silent: null, why: '' },
+  machine: { name: 'train-board-on-dock-depth', kind: 'dispatcher-rule', last_fired: null, silent_for_minutes: null, expected_every_minutes: null, silent: null, why: '', withheld: false },
   state: 'clear',
   why: 'flowing',
 });

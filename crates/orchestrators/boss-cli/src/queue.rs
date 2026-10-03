@@ -257,8 +257,14 @@ mod tests {
         let m = crate::gate::resolve_jobs_base_from(None, None)
             .expect_err("no BOSS_JOBS_URL must refuse, not default to 127.0.0.1")
             .to_string();
-        assert!(m.contains("10.20.0.34:7900"), "must name the record: {m}");
-        assert!(m.contains("127.0.0.1:7900"), "must warn of the trap: {m}");
+        assert!(
+            m.contains("infra/dev/sor-url"),
+            "must name the declaration: {m}"
+        );
+        assert!(
+            !m.contains("http://"),
+            "must not prescribe an instance: {m}"
+        );
     }
 
     #[test]

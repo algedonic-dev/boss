@@ -43,20 +43,16 @@ fn filer(id: &str) -> User {
 fn job_with_metadata(id: &str, owner: &str, metadata: serde_json::Value) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
-        kind: "user-feedback".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "/ux/jobs"),
-        title: "The column picker forgets my choice".into(),
-        owner_id: owner.to_string(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata,
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "user-feedback",
+            Subject::new("custom", "/ux/jobs"),
+            "The column picker forgets my choice",
+            owner.to_string(),
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+        )
     }
 }
 

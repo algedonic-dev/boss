@@ -1,0 +1,43 @@
+# Read every daily check of Longhorn's node-drain-policy, and alarm when
+# a non-default value has stood 24 hours or the check could not read.
+#
+# THE GAP (backlog 46584350). check-longhorn-drain-policy-daily files the
+# read-only check every day, and its ops-request closes `answered`
+# whenever the verb RAN — a relaxed policy and a CANNOT ANSWER included.
+# A closed packet nobody opens is the relaxed policy forgotten.
+#
+# THE READER. `ops.judge` in WATCH mode (no then_verb / then_host /
+# then_args), as watch-prune-registry-versions-daily: nothing is filed on
+# a run whose `when` holds, and ONE urgent alarm, keyed for_request, is
+# filed for a run that FAILED (exit 1 — a read that could not look, a
+# stored value Longhorn's API disagrees with, a non-default value whose
+# write time cannot be read), was REFUSED by the runner, printed no
+# verdict, or carries a verdict `when` is false over.
+#
+# THE VERDICT is the check's last line, read out of the script by
+# crates/core/boss-testing/tests/longhorn_drain_policy_sh.rs:
+# `READ — node-drain-policy <v>, default <d>, non_default <0|1>, hours <h>`.
+# `hours` is how long the value has stood since the API server last
+# recorded a write of it (managedFields). THE THRESHOLD IS HERE, in
+# `when`, and nowhere in the script: 24 hours, David's figure on the
+# item. The pattern avoids the em-dash (`.` spans it) and a backslash:
+# the arg crosses TOML's lexer and then boss-expr's.
+[[rule]]
+name = "watch-check-longhorn-drain-policy-daily"
+why = """
+A CROSS-PROTOCOL READER no Workflow consequence can express: the
+ops-request protocol closes a request when its verb has run, and
+`jobs.job.closed` carries neither the exit nor the output. Asked for on
+backlog 46584350 (David, 2026-09-30): node-drain-policy relaxed for the
+w-1 NVMe window must not stay relaxed unnoticed. ops.judge already reads
+a closed request's exit and verdict line and files a for_request-keyed
+alarm; this rule runs it as a watch, with no follow-on, so a policy
+non-default for 24 hours is an urgent packet rather than a closed one.
+Redelivery-safe: the request carries `judged` once read, and an open
+alarm with the same for_request is reused.
+"""
+on_event = "jobs.job.closed"
+when = 'kind = "ops-request" AND (outcome = "answered" OR outcome = "refused")'
+[[rule.do]]
+handler = "ops.judge"
+args = { verb = '"check-longhorn-drain-policy"', verdict_pattern = '"^check-longhorn-drain-policy: READ . node-drain-policy (?P<value>[a-z-]+), default (?P<default>[a-z-]+), non_default (?P<non_default>[0-9]+), hours (?P<hours>[0-9]+)$"', when = '"non_default = 0 OR hours < 24"' }

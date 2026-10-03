@@ -75,13 +75,20 @@ BASE="${BOSS_JOBS_URL%/}"
 # unnamed write is refused rather than attributed to a default, because
 # the opposite cost a misattribution the audit log then held as fact
 # (backlog 5083d6f5).
+#
+# The actor file is BOSS_ACTOR_FILE when set, as every other reader
+# takes it (identity.rs, boss-api, hooks/lib.sh): the dev pod's codex and
+# gemini sessions point it at /dev/null so they file as nobody until
+# registered, and reading $HOME's file directly filed their records as
+# the pod's Claude (review 23f1c6fd N1).
+ACTOR_FILE="${BOSS_ACTOR_FILE:-$HOME/.config/boss/actor}"
 FILER="${BOSS_ACTOR:-}"
-if [ -z "$FILER" ] && [ -r "$HOME/.config/boss/actor" ]; then
-    FILER=$(head -1 "$HOME/.config/boss/actor")
+if [ -z "$FILER" ] && [ -r "$ACTOR_FILE" ]; then
+    FILER=$(head -1 "$ACTOR_FILE" | tr -d '[:space:]')
 fi
 if [ -z "$FILER" ]; then
     echo "record-agent-runs: no actor — who is filing these records?" >&2
-    echo "    Set BOSS_ACTOR, or write the id into $HOME/.config/boss/actor." >&2
+    echo "    Set BOSS_ACTOR, or write the id into $ACTOR_FILE." >&2
     exit 78
 fi
 BOSS_USER="{\"id\":\"$FILER\",\"role\":\"platform-admin\",\"access_tier\":\"operator\",\"territory_account_ids\":[],\"direct_report_ids\":[],\"department\":\"platform\"}"

@@ -287,11 +287,11 @@ export const SHIPMENT_DETAIL = /\/api\/shipping\/shipments\/[^/]+$/;
 export const EMPLOYEE_DETAIL = /\/api\/people\/emp-001$/;
 /// ANY one person, for the floor's 404 (backlog d50e5828): one path
 /// segment under /api/people. `accounts` is excluded because it is the
-/// one list at that depth the SPA reads; every other single segment the
+/// names and accounts are lists at that depth; every other single segment the
 /// SPA asks for there is a person id (ownerNames.ts, EmployeePage.svelte).
 /// A future read of a list at that depth 404s under the floor — loud, and
 /// fixed by mocking it — where a person read used to get 200 [] quietly.
-export const PERSON_DETAIL = /\/api\/people\/(?!accounts(\?|$))[^/?]+(\?|$)/;
+export const PERSON_DETAIL = /\/api\/people\/(?!(?:accounts|names)(\?|$))[^/?]+(\?|$)/;
 /// The viewer's own people row, answered for each employee a spec signs
 /// in as. The shell's session resolves the gateway probe's employee_id
 /// by reading `/api/people/{id}` — one row, not the roster it used to
@@ -406,6 +406,31 @@ export const PAGED_ENDPOINTS: ReadonlyArray<RegExp> = [
   /\/api\/jobs\?(?:[^#]*&)?department=/,
 ];
 export const EMPTY_PAGE = { data: [], total: 0, limit: 0, offset: 0 } as const;
+/// The inbox read (boss-messages `GET /api/messages/inbox/{id}`), which
+/// is paged and narrowed by the server since backlog 74da899d.
+export const INBOX_READ = /\/api\/messages\/inbox\/[^/?]+(\?.*)?$/;
+type InboxRow = Readonly<{ kind: string; read_at: string | null }>;
+/// What the server answers a read of `url` over `rows` (already in its
+/// order, newest first): the rows `kind` and `unread=true` narrow to,
+/// `limit` of them after `offset`, the narrowing's total, and every row
+/// counted per kind in byte order of kind — the store's own rules, so a
+/// spec's backend pages and filters as production does.
+export function inboxPage<T extends InboxRow>(rows: ReadonlyArray<T>, url: string) {
+  const q = new URL(url).searchParams;
+  const kind = q.get('kind');
+  const unread = q.get('unread') === 'true';
+  const limit = Math.min(Math.max(Number(q.get('limit') ?? 100) || 1, 1), 1000);
+  const offset = Number(q.get('offset') ?? 0) || 0;
+  const narrowed = rows.filter((m) => (!kind || m.kind === kind) && (!unread || m.read_at === null));
+  const kinds = [...new Set(rows.map((m) => m.kind))].sort().map((k) => ({
+    kind: k,
+    all: rows.filter((m) => m.kind === k).length,
+    unread: rows.filter((m) => m.kind === k && m.read_at === null).length,
+  }));
+  return { data: narrowed.slice(offset, offset + limit), total: narrowed.length, limit, offset, kinds };
+}
+/// An inbox with nothing in it, as the server answers its first page.
+export const EMPTY_INBOX = { data: [], total: 0, limit: 100, offset: 0, kinds: [] } as const;
 /// The empty-but-valid body of each ledger statement (apps/web/src/finance
 /// ledger.ts's types), keyed by the path LEDGER_STATEMENTS matched. The
 /// cash-flow path answers two shapes, told apart by `?method=direct`.
@@ -518,6 +543,10 @@ export async function installApiFloor(page: Page): Promise<void> {
   await page.route(DEPARTMENTS_ENDPOINT, (r) => json(r, { data: DEPARTMENTS, total: DEPARTMENTS.length }));
   // The unread badge: `{ count }` (boss-messages' UnreadResponse).
   await page.route(/\/api\/messages\/unread\/[^/]+(\?|$)/, (r) => json(r, { count: 0 }));
+  // The inbox: an empty page of the `{data, total, …, kinds}` envelope.
+  // A bare `[]` is the shape the read answered before it was paged
+  // (74da899d), and the page reads it as a failed read.
+  await page.route(INBOX_READ, (r) => json(r, inboxPage([], r.request().url())));
   // The route-open record: a fire-and-forget POST the API answers 204.
   await page.route(/\/api\/surface-opens$/, (r) => r.fulfill({ status: 204 }));
   // Server-sent streams (the sim clock, a job's, the event pulse's): a
@@ -652,6 +681,7 @@ export async function installSmokeMocks(page: Page): Promise<void> {
 
   // Identity / session: a persona, so `/api/auth/me` is someone.
   await page.route(/\/api\/people$/, (r) => json(r, [EMP]));
+  await page.route(/\/api\/people\/names$/, (r) => json(r, [{ id: EMP.id, name: EMP.name, role: EMP.role }]));
   await page.route(EMPLOYEE_DETAIL, (r) => json(r, EMP));
   await page.route(/\/api\/session$/, (r) => json(r, {}));
   await page.route(/\/api\/auth\/me$/, (r) => json(r, {}));

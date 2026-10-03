@@ -497,7 +497,7 @@ SELECT json_build_object(
         'pending', (SELECT coalesce(sum(n), 0)::bigint FROM ob WHERE pending),
         'dead_lettered', (SELECT coalesce(sum(n), 0)::bigint FROM ob WHERE dead_lettered),
         'by_simulated', (SELECT coalesce(json_object_agg(sim, n ORDER BY sim), '{}'::json) FROM (SELECT sim, sum(n)::bigint AS n FROM ob GROUP BY 1) x),
-        'note', 'the same envelope as audit_log: the relay copies each row into audit_log and stamps delivered_at, and nothing prunes delivered rows (02-events.sql), so rows here are the log since the outbox landed, pending is the relay lag, and a marker split that differs from audit_log over the same era is a relay gap. dead_lettered is apart from pending: rows the bus refused and the relay set aside, in audit_log but never published, and not yet redelivered or resolved (boss events redeliver) — not lag, since the relay has finished with them'
+        'note', 'the same envelope as audit_log: the relay copies each row into audit_log and stamps delivered_at, and the relay deletes a delivered row once it is older than its retention window (a week by default) and audit_log holds the same fact (backlog eec0c1f3; each batch is an events.outbox.pruned fact), so rows here are about the last week of the log, never all of it: fewer rows than audit_log is retention, not a relay gap. pending is the relay lag, and a gap shows there, as undrained rows, not as a difference in totals. dead_lettered is apart from pending: rows the bus refused and the relay set aside, in audit_log but never published, and not yet redelivered or resolved (boss events redeliver) — not lag, since the relay has finished with them'
     ),
     'event_facts', json_build_object(
         'rows', (SELECT coalesce(sum(n), 0)::bigint FROM ef),

@@ -8,13 +8,14 @@
   import FilterButton from '@boss/web-kit/ui/FilterButton.svelte';
   import SearchInput from '@boss/web-kit/ui/SearchInput.svelte';
   import WriteGate from '@boss/web-kit/ui/WriteGate.svelte';
-  import type { Message, MessageKind } from './types';
-  import { classLabel, type Employee } from '../people/types';
+  import type { InboxPage, Message } from './types';
+  import { classLabel } from '../people/types';
+  import { NAMES_URL, parseNames, recipientReason, type EmployeeName } from './roster';
   import { href, navigate } from '../router';
   import { session } from '@boss/web-kit/session/session.svelte';
   import { classesFor, loadClasses } from '@boss/web-kit/session/classes.svelte';
   import { fetchRemote, type Remote } from '../data/remote';
-  import { parseInbox } from './read';
+  import { countsOf, inboxPath, parseInbox, type KindFilter } from './read';
   import { emptyState, loadingRead, readStateOf } from '../data/readState';
   import ListEmpty from '../data/ListEmpty.svelte';
   import { postEach, postWrite, type BulkOutcome } from './writes';
@@ -35,17 +36,35 @@
   /// directs are the only category that is waiting on you, so that is
   /// what the page opens on. Everything else is one click away and
   /// nothing is hidden.
-  type KindFilter = MessageKind | 'all' | 'unread' | 'needs-you';
+  ///
+  /// Each view is a narrowing the SERVER answers, one page at a time
+  /// (backlog 74da899d, page audit 5477d9eb GAP 3). The page read every
+  /// row ever addressed to the viewer — 5,129 to one recipient in the
+  /// audit window — rendered them in one list and filtered in the
+  /// browser. Now it reads PAGE_SIZE rows of the view it shows, says
+  /// which of how many those are, and pages; the header and the filter
+  /// counts come from the read's per-kind counts of the whole inbox.
 
   /// The inbox itself, as a discriminated union — a failed fetch is a
   /// FAILED inbox, never an empty one. The old shape (`messages = []`
   /// plus a swallowed error) made an outage render "Nothing is
   /// waiting on you", which is a claim about the world the page had
   /// no basis for (packet 3fba9c35, the false-empty sweep).
-  let inbox = $state<Remote<Message[]>>({ kind: 'loading' });
-  let messages = $derived(inbox.kind === 'ready' ? inbox.data : []);
-  let employees = $state<Employee[]>([]);
+  let inbox = $state<Remote<InboxPage>>({ kind: 'loading' });
+  /// The read the inbox above answers. A view or page turned since is
+  /// a read not yet answered, and the list says loading, not the rows
+  /// of the view it left.
+  let answered = $state('');
   let kindFilter = $state<KindFilter>('needs-you');
+  const PAGE_SIZE = 100;
+  /// The page belongs to the view it was turned under, so a filter
+  /// change lands back on the first page without an effect of its own
+  /// (JobsListPage's pager, d1310776).
+  let turned = $state<{ filter: KindFilter; offset: number }>({ filter: 'needs-you', offset: 0 });
+  let offset = $derived(turned.filter === kindFilter ? turned.offset : 0);
+  let roster = $state<Remote<ReadonlyArray<EmployeeName>>>({ kind: 'loading' });
+  let rosterViewer = $state('');
+  let rosterAsked = 0;
   let query = $state('');
   let composing = $state(false);
 
@@ -78,17 +97,60 @@
     session.value.kind === 'ready' ? session.value.user.id : '',
   );
 
-  function inboxPath(user: string): string {
-    return `/api/messages/inbox/${encodeURIComponent(user)}`;
+  // A prior viewer's scoped identities cannot become this viewer's To
+  // list while its read is pending (backlog 7d1c11a3).
+  let rosterRead = $derived<Remote<ReadonlyArray<EmployeeName>>>(
+    rosterViewer === userId ? roster : { kind: 'loading' },
+  );
+  let employees = $derived(rosterRead.kind === 'ready' ? rosterRead.data : []);
+  let recipientBlock = $derived(recipientReason(rosterRead, recipientId));
+  let sendBlock = $derived(recipientBlock ?? (!subject ? 'Enter a subject' : !body ? 'Enter a message' : null));
+
+  async function refreshRoster(): Promise<void> {
+    const viewer = userId;
+    const mine = ++rosterAsked;
+    rosterViewer = viewer;
+    roster = { kind: 'loading' };
+    if (!viewer) return;
+    const out = await fetchRemote(NAMES_URL, parseNames);
+    if (mine !== rosterAsked || viewer !== userId) return;
+    roster = out;
   }
 
+  /// The read of the view and page shown.
+  let readPath = $derived(userId ? inboxPath(userId, kindFilter, offset, PAGE_SIZE) : '');
+
+  /// Reads answer out of order when views change quickly; only the
+  /// latest one asked for lands.
+  let asked = 0;
+
   async function refreshInbox(): Promise<void> {
-    if (!userId) return;
-    // Only a list is an inbox: any other 200 is a failed read, never
-    // an empty one (backlog e2679b23 (c); ./read.ts).
-    const path = inboxPath(userId);
-    inbox = await fetchRemote(path, parseInbox(path));
+    const path = readPath;
+    if (!path) return;
+    const mine = ++asked;
+    // Only the inbox envelope is an inbox: any other 200 is a failed
+    // read, never an empty one (backlog e2679b23 (c); ./read.ts).
+    const out = await fetchRemote(path, parseInbox(path));
+    if (mine !== asked) return;
+    inbox = out;
+    answered = path;
   }
+
+  $effect(() => {
+    if (readPath) void refreshInbox();
+  });
+
+  /// The page of rows shown — only the read for the view and page the
+  /// viewer is on; while that read is out, none.
+  let messages = $derived(
+    inbox.kind === 'ready' && answered === readPath ? inbox.data.data : [],
+  );
+  /// The whole inbox's numbers, from the last read that landed: they
+  /// do not change with the view, so a view in flight keeps them.
+  let counts = $derived(inbox.kind === 'ready' ? countsOf(inbox.data.kinds) : countsOf([]));
+  /// How many rows the shown view holds in all, of which `messages` is
+  /// one page.
+  let viewTotal = $derived(inbox.kind === 'ready' && answered === readPath ? inbox.data.total : 0);
 
   /// A filter button's count, only from a read that landed: a failed or
   /// pending read has no count to give, and zeros would be the empty
@@ -105,40 +167,21 @@
     const uid = userId;
     if (!uid) return;
     void loadClasses('employee');
-    void refreshInbox();
-    // Load the roster alongside so the compose modal can offer names.
-    (async () => {
-      try {
-        const r = await fetch('/api/people');
-        if (r.ok) employees = (await r.json()) as Employee[];
-      } catch {
-        // ignore
-      }
-    })();
+    // The inbox read is its own effect, keyed on the view and page.
+    // The scoped names projection needs none of the full profile/pay.
+    void refreshRoster();
   });
 
   let employeeById = $derived.by(() => {
-    const m = new Map<string, Employee>();
+    const m = new Map<string, EmployeeName>();
     for (const e of employees) m.set(e.id, e);
     return m;
   });
 
-  let unread = $derived(messages.filter((m) => m.read_at === null));
-  /// Waiting on you: unread, and from someone rather than from the
-  /// machine.
-  let needsYou = $derived(
-    messages.filter((m) => m.read_at === null && m.kind === 'direct'),
-  );
-  let directCount = $derived(messages.filter((m) => m.kind === 'direct').length);
-  let signalCount = $derived(messages.filter((m) => m.kind === 'signal').length);
-
+  /// The view's own narrowing is the server's; the search narrows the
+  /// page it answered, by what the row shows.
   let visible = $derived(
     messages.filter((m) => {
-      if (kindFilter === 'needs-you' && (m.read_at !== null || m.kind !== 'direct'))
-        return false;
-      if (kindFilter === 'unread' && m.read_at !== null) return false;
-      if (kindFilter === 'direct' && m.kind !== 'direct') return false;
-      if (kindFilter === 'signal' && m.kind !== 'signal') return false;
       if (query) {
         const q = query.toLowerCase();
         // The sender as the row SHOWS it, and its id: a search that
@@ -151,11 +194,24 @@
     }),
   );
 
+  /// The pager says which rows of how many the list shows, and only
+  /// when the view holds more than one page.
+  let paged = $derived(
+    inbox.kind === 'ready' && answered === readPath && (offset > 0 || offset + messages.length < viewTotal),
+  );
+
   // Read failed, no messages, or the filters hid them (backlog 0ef5e008).
+  // A view in flight is loading; an inbox with rows that the view or
+  // the search leaves none of is the filters' doing, not an empty one.
   let listState = $derived(
     emptyState(
-      [{ source: inboxPath(userId), state: inbox.kind === 'loading' ? loadingRead : readStateOf(inbox) }],
-      messages.length,
+      [{
+        source: readPath,
+        state: inbox.kind === 'loading' || (inbox.kind === 'ready' && answered !== readPath)
+          ? loadingRead
+          : readStateOf(inbox),
+      }],
+      counts.all,
       visible.length,
     ),
   );
@@ -270,10 +326,11 @@
 
   function senderLabel(m: Message): string {
     if (m.sender_id === 'system') return 'System';
-    return employeeById.get(m.sender_id)?.name ?? m.sender_id;
+    return employeeById.get(m.sender_id)?.name?.trim() || m.sender_id;
   }
 
   async function send(): Promise<void> {
+    if (sending || sendBlock !== null) return;
     if (!recipientId || !subject || !body || !userId) return;
     sending = true;
     sendRefusal = null;
@@ -312,16 +369,20 @@
     eyebrow="Inbox"
     title={inbox.kind !== 'ready'
       ? 'Inbox'
-      : needsYou.length === 0
+      : counts.needsYou === 0
         ? 'Nothing is waiting on you'
-        : `${needsYou.length} waiting on you`}
+        : `${counts.needsYou} waiting on you`}
     subtitle={inbox.kind === 'ready'
-      ? `${unread.length} unread · ${directCount} direct · ${signalCount} signals · ${messages.length} total`
+      ? `${counts.unread} unread · ${counts.direct} direct · ${counts.signal} signals · ${counts.all} total`
       : inbox.kind === 'failed'
         ? 'Your inbox could not be read.'
         : 'Loading…'}
   />
   <ClassesReadFailed subjectKind="employee" what="roles" fallback="Roles show by code, not by their registry names." />
+
+  {#if rosterRead.kind === 'failed'}
+    <p class="roster-note" role="status">Sender names unavailable — {rosterRead.error}. Sender ids are retained.</p>
+  {/if}
 
   <div style="padding:0 32px 12px">
     <!-- The composer's entry stands behind the readonly gate: a guest
@@ -355,15 +416,24 @@
           <select
             id="inbox-to"
             bind:value={recipientId}
+            disabled={rosterRead.kind !== 'ready' || !employees.length}
             class="hr-select"
             style="width:100%"
           >
             <option value="">Select recipient...</option>
             {#each employees as e (e.id)}
-              <option value={e.id}>{e.name} ({classLabel(e.role, roleClasses)})</option>
+              <option value={e.id}>{e.name?.trim() || e.id} ({classLabel(e.role, roleClasses)})</option>
             {/each}
           </select>
         </div>
+        {#if rosterRead.kind === 'loading'}
+          <p role="status">Loading recipients…</p>
+        {:else if rosterRead.kind === 'failed'}
+          <p class="roster-refused" role="alert">Recipients unavailable — {rosterRead.error}</p>
+          <button class="btn btn-sm" onclick={refreshRoster}>Retry recipients</button>
+        {:else if !employees.length}
+          <p role="status">No recipients are available in this read</p>
+        {/if}
         <div class="compose-field">
           <label for="inbox-subject">Subject</label>
           <input
@@ -391,12 +461,15 @@
           <button
             class="btn btn-primary"
             onclick={send}
-            disabled={sending || !recipientId || !subject || !body}
+            disabled={sending || sendBlock !== null}
           >
             {sending ? 'Sending...' : 'Send'}
           </button>
           <button class="btn" onclick={() => (composing = false)}>Cancel</button>
         </div>
+        {#if sendBlock !== null && !(rosterRead.kind === 'ready' && !employees.length)}
+          <p class="send-unavailable" role="status">{sendBlock}</p>
+        {/if}
       </div>
     </div>
   {/if}
@@ -413,19 +486,19 @@
             active={kindFilter === 'needs-you'}
             onclick={() => (kindFilter = 'needs-you')}
           >
-            Waiting on you{counted(needsYou.length)}
+            Waiting on you{counted(counts.needsYou)}
           </FilterButton>
           <FilterButton active={kindFilter === 'all'} onclick={() => (kindFilter = 'all')}>
-            All{counted(messages.length)}
+            All{counted(counts.all)}
           </FilterButton>
           <FilterButton active={kindFilter === 'unread'} onclick={() => (kindFilter = 'unread')}>
-            Unread{counted(unread.length)}
+            Unread{counted(counts.unread)}
           </FilterButton>
           <FilterButton active={kindFilter === 'direct'} onclick={() => (kindFilter = 'direct')}>
-            Direct{counted(directCount)}
+            Direct{counted(counts.direct)}
           </FilterButton>
           <FilterButton active={kindFilter === 'signal'} onclick={() => (kindFilter = 'signal')}>
-            Signals{counted(signalCount)}
+            Signals{counted(counts.signal)}
           </FilterButton>
       </FilterGroup>
     </aside>
@@ -574,6 +647,37 @@
             {/each}
           </div>
         </WriteGate>
+      {/if}
+      {#if paged}
+        <!-- Which rows of how many the view holds, and the way to the
+             rest (backlog 74da899d). Outside the list's branches: a
+             search that leaves none of this page still needs the way
+             on. The search reads the page shown, and says so. -->
+        <nav class="inbox-pager" aria-label="Pages of messages">
+          <p>
+            Showing {messages.length > 0
+              ? `${(offset + 1).toLocaleString()}–${(offset + messages.length).toLocaleString()}`
+              : 'none'} of {viewTotal.toLocaleString()}, newest first{query
+              ? ' — the search reads this page only'
+              : ''}
+          </p>
+          <button
+            type="button"
+            class="btn btn-sm"
+            disabled={offset === 0}
+            onclick={() => (turned = { filter: kindFilter, offset: Math.max(0, offset - PAGE_SIZE) })}
+          >
+            Previous
+          </button>
+          <button
+            type="button"
+            class="btn btn-sm"
+            disabled={messages.length === 0 || offset + messages.length >= viewTotal}
+            onclick={() => (turned = { filter: kindFilter, offset: offset + messages.length })}
+          >
+            Next
+          </button>
+        </nav>
       {/if}
     </section>
   </div>

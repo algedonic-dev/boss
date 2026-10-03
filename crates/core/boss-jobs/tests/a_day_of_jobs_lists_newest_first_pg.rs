@@ -24,20 +24,16 @@ use uuid::Uuid;
 fn job(id: &str, title: &str) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
-        kind: "pr-train".to_string(),
-        workflow_version: 1,
-        subject: Subject::new("branch", "fix/x"),
-        title: title.into(),
-        owner_id: "emp-1".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 7).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::Value::Null,
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "pr-train".to_string(),
+            Subject::new("branch", "fix/x"),
+            title,
+            "emp-1",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 7).unwrap(),
+        )
     }
 }
 

@@ -3,7 +3,8 @@
   // (59ef456a: three hand-written accounts of the machines were wrong
   // the same way on 2026-08-30; this page reads the system so nobody
   // writes that doc again). Declared beside observed beside the
-  // difference, then the loops that keep the estate (0d9b2960), and the
+  // difference, then the loops that keep the estate (0d9b2960), the edge
+  // in front of it — zone, Access, tunnel (e0e183fb) — and the
   // dev-workspace door at the bottom.
   import { onMount } from 'svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
@@ -13,6 +14,7 @@
     alarmsOn,
     CLUSTER_SCOPE,
     comparisonVerdict,
+    capacityIntentLine,
     DEV_DOOR_HOST,
     HOST_SCOPE,
     MACHINE_FIELDS,
@@ -34,9 +36,13 @@
     registryFailure,
     seriesAbsentText,
     seriesFreshness,
+    tunnelLine,
     unitsVerdict,
+    volumeAlarms,
+    volumeLine,
+    zoneAlarms,
+    zoneVerdict,
     type EstateState,
-    type Observation,
   } from './estate';
 
   let estate = $state<EstateState | null>(null);
@@ -62,10 +68,12 @@
   // test (e1eb34bc): past three of them the stamp reads amber and says
   // so, because the alarm has filed — or is about to file — that series
   // as unobserved.
-  function when(rows: readonly Observation[]): { stale: boolean; text: string } {
+  function when(rows: readonly Readonly<{ observed_at: string }>[]): { stale: boolean; text: string } {
     const f = seriesFreshness(rows, loadedAt);
     return f ? { stale: f.state === 'stale', text: freshnessText(f) } : { stale: false, text: '' };
   }
+  // The tunnel routes, off the cluster converge's loop row (THE EDGE).
+  const tunnel = $derived(estate ? tunnelLine(estate.loops) : null);
   const clusterCmp = $derived(
     estate?.comparisons.kind === 'ready' ? latestComparison(estate.comparisons.data, 'kubernetes-nodes') : null,
   );
@@ -96,6 +104,10 @@
     {#if estate.nodes.kind === 'failed'}
       <p class="estate-fail load-failed">{registryFailure(estate.nodes.error)}</p>
     {:else if estate.nodes.kind === 'ready'}
+      {@const activeMachines = estate.nodes.data.filter((n) => !n.retired)}
+      <p class="estate-machine-count estate-quiet">
+        {estate.nodes.data.length} machine{estate.nodes.data.length === 1 ? '' : 's'} declared · {activeMachines.length} active · {estate.nodes.data.length - activeMachines.length} retired
+      </p>
       <!-- DECLARED BESIDE OBSERVED (ab3c54d7): each value cell is the
            declared value, then what the newest reading of the machine's
            own series saw; a field the newest comparison names as drift
@@ -109,7 +121,7 @@
           <tr><th>machine</th><th>role</th><th>address</th><th>cpu</th><th>mem</th><th>disk</th></tr>
         </thead>
         <tbody>
-          {#each estate.nodes.data.filter((n) => !n.retired) as n (n.id)}
+          {#each activeMachines as n (n.id)}
             {@const sight = machineSight(estate, n)}
             {@const drift = machineDrift(estate, n.id)}
             <tr title={n.notes ?? ''}>
@@ -132,6 +144,56 @@
         </tbody>
       </table>
     {/if}
+    <!-- THE INSTANCE VOLUMES (backlog 21ee3b4e, incident d3c0a67c): every
+         claim in every instance namespace, beside the machines that hold
+         them. The system of record's database volume filled on
+         2026-10-01 with nothing watching; each row is the comparator's
+         verdict on the forge's newest reading, a claim it could not read
+         says unread, and an open alarm on a claim is linked on its row. -->
+    <div class="estate-volumes">
+      {#if estate.volumes.kind === 'failed'}
+        <p class="estate-fail load-failed">Volume readings unavailable: {estate.volumes.error}</p>
+      {:else if estate.volumes.kind === 'ready'}
+        {@const vr = estate.volumes.data[0]}
+        {#if vr}
+          {@const w = when(estate.volumes.data)}
+          <div class="estate-volumes-head">
+            <span>Instance volumes — {vr.volumes.length} claims read by {vr.observer}</span>
+            <span class={w.stale ? 'estate-when estate-drift' : 'estate-when'}>{w.text}</span>
+          </div>
+          <table class="estate-volume-table">
+            <thead>
+              <tr><th>claim</th><th>volume</th><th>free</th><th>declared capacity · report only</th></tr>
+            </thead>
+            <tbody>
+              {#each vr.volumes as v (v.id)}
+                {@const line = volumeLine(v)}
+                <tr data-volume={v.id} data-state={line.state}>
+                  <td class="estate-id">{v.id}</td>
+                  <td class="estate-addr">{v.volume ?? '—'}</td>
+                  <td class={line.state === 'ok' ? 'estate-ok' : 'estate-drift'}>
+                    {line.text}
+                    {#each volumeAlarms(estate.alarms, v.id) as a (a.id)}
+                      <a class="estate-alarm-link" href={`/ux/jobs/${a.id}`} title={a.title}>alarm</a>
+                    {/each}
+                  </td>
+                  <td class={v.capacity_intent.verdict === 'match' ? 'estate-ok' : 'estate-drift'} data-capacity-intent={v.capacity_intent.verdict}>
+                    {capacityIntentLine(v)}
+                    {#if v.capacity_intent.assignment}
+                      <a class="estate-alarm-link" href={`/ux/jobs/${v.capacity_intent.assignment.packet}`} title={`Assigned by ${v.capacity_intent.assignment.decided_by} at ${v.capacity_intent.assignment.decided_at}; step ${v.capacity_intent.assignment.step}`}>
+                        assignment {v.capacity_intent.assignment.question}
+                      </a>
+                    {/if}
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        {:else}
+          <p class="estate-volumes-none">Instance volumes: no volume reading recorded yet.</p>
+        {/if}
+      {/if}
+    </div>
 
     <div class="estate-section">01 — OBSERVED vs DECLARED</div>
     <!-- THE OPEN ALARMS (48ef9961): every open packet estate.alarm filed,
@@ -251,6 +313,8 @@
           {@render alarmLinks(CLUSTER_SCOPE, null)}
           <span class="estate-when">{formatRelative(clusterCmp.observed_at, loadedAt)}</span>
         </div>
+      {:else if estate.comparisons.kind === 'ready'}
+        <div class="estate-obs-row"><span class="estate-scope">comparison</span><span>0 cluster comparisons in this read</span></div>
       {/if}
       <!-- THE HOST COMPARISON (backlog 2d8d983b, page audit 2cff1d6e
            GAP 1): each host's newest self-scoped comparison, from its
@@ -341,7 +405,108 @@
       </tbody>
     </table>
 
-    <div class="estate-section">03 — THE DEV WORKSPACE</div>
+    <!-- THE EDGE (backlog e0e183fb, page audit 2cff1d6e GAP 11): the
+         DNS zone, the Access applications in front of it and the tunnel
+         routes behind it — declared in the tree, read back and compared
+         by the daily zone observation and the cluster converge, and
+         rendered here off those packets. A zone's alarm sits on its own
+         line. Nothing here is spelled by the page: every name is the
+         packet's. -->
+    <div class="estate-section">03 — THE EDGE</div>
+    <p class="estate-hint">
+      What the declaration says beside what the newest reading found: each zone record, each Access
+      application in front of it, and the tunnel routes behind them. A record or application a
+      reading names as drift reads amber.
+    </p>
+    <div class="estate-edge">
+      {#if estate.zones.open.kind === 'failed'}
+        <p class="estate-fail load-failed">Open zone readings unavailable: {estate.zones.open.error}</p>
+      {:else if estate.zones.open.kind === 'ready'}
+        {#each estate.zones.open.data as o (o.id)}
+          <div class="estate-obs-row" data-zone-open={o.zone}>
+            <span class="estate-scope">zone</span>
+            <a class="estate-drift" href={`/ux/jobs/${o.id}`}>{o.zone}: a reading is still open — the zone could not be read or compared</a>
+            <span class="estate-when">{loopAge(o.at, loadedAt)}</span>
+          </div>
+        {/each}
+      {/if}
+      {#if estate.zones.latest.kind === 'failed'}
+        <p class="estate-fail load-failed">Zone readings unavailable: {estate.zones.latest.error}</p>
+      {:else if estate.zones.latest.kind === 'ready'}
+        {#each estate.zones.latest.data as z (z.zone)}
+          {@const v = zoneVerdict(z)}
+          <div class="estate-obs-row estate-zone" data-zone={z.zone}>
+            <span class="estate-scope">zone</span>
+            <a class={v.ok ? 'estate-ok' : 'estate-drift'} href={`/ux/jobs/${z.id}`}>{z.zone}: {v.text}</a>
+            {#each zoneAlarms(estate.alarms, z.zone) as a (a.id)}
+              <a class="estate-alarm-link" href={`/ux/jobs/${a.id}`} title={a.title}>alarm</a>
+            {/each}
+            <span class="estate-when">{loopAge(z.at, loadedAt)}</span>
+          </div>
+          <table class="estate-edge-table estate-records">
+            <thead>
+              <tr><th>record</th><th>declared</th><th>in front</th><th>verdict</th></tr>
+            </thead>
+            <tbody>
+              {#each z.records as r, i (`${r.record}#${i}`)}
+                <tr title={r.why ?? ''}>
+                  <td class="estate-id">{r.record}</td>
+                  <td class="estate-addr">
+                    {r.declared ?? '—'}
+                    <span class={r.verdict === 'MATCH' ? 'estate-seen' : 'estate-seen estate-drift'}>{r.live === null ? 'not in the zone' : `zone holds ${r.live}`}</span>
+                  </td>
+                  <td class="estate-addr">{r.front ?? '—'}</td>
+                  <td class={r.verdict === 'MATCH' ? 'estate-ok' : 'estate-drift'}>{r.verdict}{r.note ? ` — ${r.note}` : ''}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+          {#if z.undeclared > 0}
+            <p class="estate-edge-note">{z.undeclared} live record{z.undeclared === 1 ? '' : 's'} the declaration names nowhere — reported on the reading, not a finding.</p>
+          {/if}
+          <table class="estate-edge-table estate-access">
+            <thead>
+              <tr><th>access application</th><th>type</th><th>policies</th><th>verdict</th></tr>
+            </thead>
+            <tbody>
+              {#each z.access as a, i (`${a.domain}#${i}`)}
+                <tr title={a.why ?? ''}>
+                  <td class="estate-id">{a.domain}</td>
+                  <td class="estate-addr">{a.type ?? '—'}</td>
+                  <td class="estate-addr">{a.policies.length > 0 ? a.policies.join(' · ') : '—'}</td>
+                  <td class={a.verdict === 'MATCH' ? 'estate-ok' : 'estate-drift'}>{a.verdict}{a.note ? ` — ${a.note}` : ''}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+          {#if z.accessUndeclared > 0}
+            <p class="estate-edge-note">{z.accessUndeclared} Access application{z.accessUndeclared === 1 ? '' : 's'} the declaration names nowhere.</p>
+          {/if}
+        {:else}
+          <div class="estate-obs-row"><span class="estate-scope">zone</span><span>no zone reading recorded yet</span></div>
+        {/each}
+      {/if}
+      {#if tunnel}
+        <div class="estate-obs-row estate-tunnel">
+          <span class="estate-scope">tunnel routes</span>
+          {#if tunnel.id}
+            <a class={tunnel.ok ? 'estate-ok' : 'estate-drift'} href={`/ux/jobs/${tunnel.id}`}>{tunnel.text}</a>
+          {:else}
+            <span class="estate-drift">{tunnel.text}</span>
+          {/if}
+          {#if tunnel.at}<span class="estate-when">{loopAge(tunnel.at, loadedAt)}</span>{/if}
+        </div>
+        {#if tunnel.routes.length > 0}
+          <ul class="estate-routes">
+            {#each tunnel.routes as r, i (`${r}#${i}`)}
+              <li>{r}</li>
+            {/each}
+          </ul>
+        {/if}
+      {/if}
+    </div>
+
+    <div class="estate-section">04 — THE DEV WORKSPACE</div>
     <div class="estate-door">
       <p class="estate-hint">
         The workspace answers on <code>{DEV_DOOR_HOST}</code>, from anywhere, behind Cloudflare
@@ -408,6 +573,31 @@
   .estate-alarm-none, .estate-alarm-cover { color: var(--static); font-size: 12px; margin: 0; }
   .estate-alarm-link { color: var(--warn); font-size: 12px; }
   .estate-door { display: flex; flex-direction: column; gap: 8px; }
+  /* THE INSTANCE VOLUMES, under the machines, in the machines' idiom. */
+  .estate-volumes { margin-top: 16px; font-size: 13px; }
+  .estate-volumes-none { color: var(--static); font-size: 12px; margin: 0; }
+  .estate-volumes-head { display: flex; gap: 16px; align-items: baseline; color: var(--static); font-size: 12px; margin-bottom: 4px; }
+  .estate-volume-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .estate-volume-table th {
+    text-align: left; font-family: var(--font-mono);
+    font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase;
+    color: var(--static); font-weight: 400;
+    border-bottom: 1px solid var(--hairline); padding: 4px 12px 4px 0;
+  }
+  .estate-volume-table td { padding: 6px 12px 6px 0; border-bottom: 1px solid var(--hairline); overflow-wrap: anywhere; }
+  /* THE EDGE: one zone line, its records, its Access applications, then
+     the tunnel routes — the machines table's own cell idiom. */
+  .estate-edge { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+  .estate-edge-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 6px; }
+  .estate-edge-table th {
+    text-align: left; font-family: var(--font-mono);
+    font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase;
+    color: var(--static); font-weight: 400;
+    border-bottom: 1px solid var(--hairline); padding: 4px 12px 4px 0;
+  }
+  .estate-edge-table td { padding: 6px 12px 6px 0; border-bottom: 1px solid var(--hairline); overflow-wrap: anywhere; }
+  .estate-edge-note { color: var(--static); font-size: 12px; margin: 0 0 6px; }
+  .estate-routes { margin: 0; padding-left: 166px; font-family: var(--font-mono); font-size: 12px; color: var(--static); list-style: none; }
   .estate-hint, .estate-cover { color: var(--static); font-size: 12px; max-width: 60ch; }
   .estate-cover { margin: 0; }
   .estate-hint code { font-family: var(--font-mono); }

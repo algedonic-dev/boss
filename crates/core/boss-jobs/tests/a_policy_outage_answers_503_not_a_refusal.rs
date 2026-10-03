@@ -88,20 +88,16 @@ async fn app(policy: Arc<dyn PolicyClient>) -> (Router, String) {
     let jobs = Arc::new(InMemoryJobs::new());
     jobs.create_job(&Job {
         id: packet_id(),
-        kind: "brew-day".into(),
-        workflow_version: 1,
-        subject: Subject::new("asset", "FV-1"),
-        title: "a packet the operator may read".into(),
-        owner_id: "emp-david".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 25).expect("day"),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: Value::Null,
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "brew-day",
+            Subject::new("asset", "FV-1"),
+            "a packet the operator may read",
+            "emp-david",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 25).expect("day"),
+        )
     })
     .await
     .expect("packet");

@@ -1,0 +1,282 @@
+# boss-break-glass-deposit — delivers the break-glass kubeconfig to
+# a configured recovery receiver, with no person carrying it (backlog 7336cb5f).
+#
+# WHY. An off-cluster recovery operator needs the SCOPED kubeconfig of
+# the break-glass-operator ServiceAccount. It is derivable from what
+# the cluster already holds, so its path is a machine, never a hand
+# (CLAUDE.md §Doors, "A credential admin can MINT is never placed by
+# hand"). Deployment-owned endpoint, account and host-key data come
+# from the existing ConfigMap/CronJob read adapter at convergence
+# (877ad378), never a receiver compiled into this public template.
+#
+# THE SHAPE (design 835c0c9c, David 2026-09-20; design b08725c2 Q3,
+# David 2026-09-29). A CronJob in this namespace reads Secret
+# break-glass-operator-token through a Role that names it and nothing
+# else, assembles the kubeconfig, proves it by effect in BOTH
+# directions — it can read nodes; it cannot read secrets, delete pods,
+# create deployments, or (server-side dry runs, nothing persisted)
+# rewrite a Deployment's command, set it a foreign image, or give it an
+# owner the garbage collector would delete it for — and pipes it
+# over ssh to the configured forced-command receiver
+# (infra/gcp/ops-credential-recv.sh), which refuses an empty, foreign or
+# tokenless deposit and writes /etc/boss-ops/kubeconfig root:root 0600
+# by atomic rename. Any answer but the declared one refuses the
+# deposit. The script is infra/cluster/break-glass-deposit.sh, in the
+# boss image as /usr/local/bin/boss-break-glass-deposit.
+#
+# IT DEPOSITS ONLY WHILE THE IMAGE-ONLY POLICY DENIES. The operator's
+# Role patches every Deployment in this namespace, pod template and
+# metadata included; the policy (boss-break-glass-operator.yaml) is what
+# refuses the three dry-run patches, bound [Deny, Audit] by backlog
+# e4a9a9b3. That is the decided order (b08725c2: the narrowing to Deny
+# first, then this delivers), enforced by the probes rather than by a
+# calendar. While the policy only reported, an accepted patch closed the
+# run `not-yet` (backlog 17a7bd18); since the Deny car it is a REFUSAL
+# on a RED line (review 0d3019f0, F1), because a binding deleted — the
+# Deny car's own misfire rollback — or moved back off Deny widens a
+# credential the receiver may already hold. The Job then reads the binding
+# through the ClusterRole below, get on that one name, so the line says
+# what it found: Deny that does not refuse, the actions it was moved to,
+# another policy, absent, or unreadable. It sets no
+# BOSS_CHORE_NOT_YET_ON_75: nothing it measures is changed by waiting.
+#
+# A REFUSAL REACHES A READER (review b6d2a716, N1): each prints a `RED`
+# line that file-backlog-items-on-break-glass-deposit-red files as a
+# backlog-item, the key David must authorize rides one of its own, and
+# cadence-silence-sweep-daily expects a packet of this kind every day.
+#
+# THE IMAGE AND THE UID, MEASURED (b08725c2 Q3: non-root, one image
+# carrying kubectl AND an ssh client, no package install at run time).
+#   - alpine/k8s:1.33.3, the kubectl image every forge script uses, was
+#     read from its registry on 2026-09-30: config User is empty (uid 0)
+#     and there is no ssh client anywhere in its 18 layers. It would
+#     need root AND an `apk add` at run time — the two things Q3 rules
+#     out — so it is not used.
+#   - The boss image (infra/oss-quickstart/Dockerfile) declares
+#     `useradd --uid 1500` and `USER boss`, already carries kubectl
+#     (copied from that alpine/k8s tag), jq and bash, and now carries
+#     openssh-client from its own apt install at BUILD time. So the pod
+#     runs as 1500, the uid the image declares, and says so below.
+#
+# THE KEY IS 0440, root:1500, AND THAT IS WHAT MAKES NON-ROOT WORK.
+# OpenSSH refuses a group-readable private key only when the running
+# user OWNS it; the kubelet projects a Secret as root and, with fsGroup,
+# gives it group 1500 — so uid 1500 reads the key through its group and
+# ssh never applies the check. boss-backup's retired 0400 ship key worked only as
+# root, for the mirror reason (backlog a05835da).
+# Proved with a real sshd before this landed, not assumed.
+#
+# THE DEPOSIT KEY IS MINTED HERE AND AUTHORIZED BY DAVID. Secret
+# break-glass-deposit-key is declared EMPTY below; the first run mints
+# an ed25519 pair inside its own pod, patches it into that one Secret
+# (testing the resourceVersion it read, so a key already minted is
+# never overwritten) and prints the authorized_keys line to place on
+# the receiver. The private half never leaves the cluster. Authorizing the
+# public half is a signed act, David's, exactly as the recovery kit's
+# reader key is (infra/forge/install-recovery-kit-reader.sh); the receiver's
+# converge installs the receiver and its sudoers rule and prints the
+# same line (infra/gcp/install-ops-credential-receiver.sh).
+# `kubectl apply` of a Secret with no `data` never removes data a patch
+# added — the break-glass-operator-token Secret beside this is declared
+# the same way and filled by the token controller.
+#
+# HOST KEY. The deployment ConfigMap pins its receiver's ed25519 host
+# key. Convergence preserves the exact pin while refusing an absent,
+# malformed, duplicate or mismatched input before apply; it never scans
+# the network for a replacement. Strict host authentication still fails
+# loudly when a rebuilt host disagrees with the retained pin.
+#
+# SCHEDULE. Daily, 17:20 UTC — Pacific working hours, so a refusal meets
+# a human the same day. Each run re-proves the negative, so a grant
+# widened later refuses the next deposit; `kubectl create job
+# --from=cronjob/boss-break-glass-deposit` runs one now.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: break-glass-deposit
+  namespace: boss
+  labels: {app.kubernetes.io/part-of: boss, boss.dev/purpose: break-glass-deposit}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: break-glass-deposit
+  namespace: boss
+  labels: {app.kubernetes.io/part-of: boss, boss.dev/purpose: break-glass-deposit}
+rules:
+  # The credential it delivers: read, by name, and nothing else.
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [break-glass-operator-token]
+    verbs: [get]
+  # Its own deposit key: `get` to see whether one is held, `patch` to
+  # mint the first. No `create` (it cannot be name-scoped; the Secret is
+  # declared below) and no `update`.
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [break-glass-deposit-key]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: break-glass-deposit
+  namespace: boss
+  labels: {app.kubernetes.io/part-of: boss, boss.dev/purpose: break-glass-deposit}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: break-glass-deposit
+subjects:
+  - kind: ServiceAccount
+    name: break-glass-deposit
+    namespace: boss
+---
+# THE BINDING, READ BY NAME (backlog 17a7bd18; e4a9a9b3). When a
+# must-refuse patch is accepted the deposit is refused whatever the
+# binding says, and its RED line names what the live binding reads — so
+# the Job reads that ONE binding with its own account, never the
+# credential it is judging. Cluster-scoped because bindings are; `get`
+# on one resourceName, which a list or a watch cannot reach.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: break-glass-deposit-policy-phase
+  labels: {app.kubernetes.io/part-of: boss, boss.dev/purpose: break-glass-deposit}
+rules:
+  - apiGroups: [admissionregistration.k8s.io]
+    resources: [validatingadmissionpolicybindings]
+    resourceNames: [break-glass-operator-image-only]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: break-glass-deposit-policy-phase
+  labels: {app.kubernetes.io/part-of: boss, boss.dev/purpose: break-glass-deposit}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: break-glass-deposit-policy-phase
+subjects:
+  - kind: ServiceAccount
+    name: break-glass-deposit
+    namespace: boss
+---
+# Declared with no data: the deposit Job mints into it (see the header).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: break-glass-deposit-key
+  namespace: boss
+  labels: {app.kubernetes.io/part-of: boss, boss.dev/purpose: break-glass-deposit}
+type: Opaque
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: break-glass-deposit-known-hosts
+  namespace: boss
+  labels: {app.kubernetes.io/part-of: boss, boss.dev/purpose: break-glass-deposit}
+# Filled from this deployment's existing ConfigMap/CronJob by the
+# converge's required read adapter, before apply. No public default.
+data: {}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: boss-break-glass-deposit
+  namespace: boss
+  labels: {app.kubernetes.io/part-of: boss, boss.dev/purpose: break-glass-deposit, boss-chore: "true"}
+spec:
+  schedule: "20 17 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # A refusal does not change on a retry: the grant, the key and the
+      # receiver are what they are until someone changes them.
+      backoffLimit: 0
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          serviceAccountName: break-glass-deposit
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1500
+            runAsGroup: 1500
+            # The Secret volume below is projected root:1500 because of
+            # this — the group read the 0440 key depends on.
+            fsGroup: 1500
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            # The converge pins boss-chore=true CronJobs by this name.
+            - name: chore
+              image: 10.20.0.15:3000/david/boss:latest
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities: {drop: ["ALL"]}
+              # Through boss-chore.sh, so every run — a deposit or a
+              # refusal — leaves a maintenance-break-glass-deposit packet
+              # carrying the verification lines (and the authorized_keys
+              # line when the key is new). The packet is best-effort; the
+              # Job's own status is the check's.
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  /usr/local/bin/boss-chore.sh maintenance-break-glass-deposit "Break-glass kubeconfig deposit to the configured receiver" -- /usr/local/bin/boss-break-glass-deposit
+              env:
+                # The full refusal must reach the stored field, including
+                # long admission details. The step sends it as a JSON file.
+                - name: BOSS_CHORE_FULL_OUTPUT
+                  value: "1"
+                - name: BOSS_JOBS_URL
+                  value: http://boss-jobs-internal.boss.svc.cluster.local:7900
+                # The hosts its packet writes may carry the estate machine
+                # token to, besides loopback: this namespace's Services, by
+                # suffix (backlog 2ee29275; the car-4 checklist on 2710c8fc).
+                - name: BOSS_MACHINE_TOKEN_HOSTS
+                  value: ".boss.svc.cluster.local"
+                # Deployment-owned inputs, migrated from this CronJob's
+                # literal env on first convergence and kept in the same
+                # ConfigMap as the host pin. Missing data never defaults.
+                - name: BOSS_DEPOSIT_API_SERVER
+                  valueFrom:
+                    configMapKeyRef: {name: break-glass-deposit-known-hosts, key: api_server}
+                - name: BOSS_DEPOSIT_TARGET
+                  valueFrom:
+                    configMapKeyRef: {name: break-glass-deposit-known-hosts, key: target}
+                - name: TMPDIR
+                  value: /work
+              resources:
+                requests: {cpu: 50m, memory: 64Mi}
+                limits: {memory: 256Mi}
+              volumeMounts:
+                - {name: deposit-key, mountPath: /keys, readOnly: true}
+                - {name: known-hosts, mountPath: /known, readOnly: true}
+                - {name: work, mountPath: /work}
+                # The estate machine token, read by the chore pair
+                # (design 6805c764 car 4).
+                - {name: machine-token, mountPath: /etc/boss/machine-token, readOnly: true}
+          volumes:
+            # The estate machine token, Secret boss-machine-token, whole —
+            # the broker writes it (design 6805c764 car 4). Optional: until
+            # its first mint the directory is empty and the chore sends no
+            # token, which every gate in `report` admits. 0440 + the pod's
+            # fsGroup 1500, as deposit-key.
+            - name: machine-token
+              secret: {secretName: boss-machine-token, optional: true, defaultMode: 0440}
+            - name: deposit-key
+              # 0440: owner root, group 1500 (fsGroup) — see the header.
+              # optional, so the first run starts on an empty Secret
+              # and mints into it rather than hanging in ContainerCreating.
+              secret: {secretName: break-glass-deposit-key, defaultMode: 0o440, optional: true}
+            - name: known-hosts
+              configMap: {name: break-glass-deposit-known-hosts, defaultMode: 0o444}
+            # The assembled kubeconfig carries a bearer token: memory,
+            # never the node's disk.
+            - name: work
+              emptyDir: {medium: Memory, sizeLimit: 16Mi}

@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
     let mut app = router(state);
     // The subjects identity surface (R1): mint + existence probe.
     // Postgres-only — the identity table has no in-memory twin.
-    if let Some(pool) = subjects_pool {
+    if let Some(pool) = subjects_pool.clone() {
         app = app.merge(boss_subject_kinds::subjects::subjects_router(pool));
     }
     // Sim-origin middleware: extract x-sim-origin header and set the
@@ -90,7 +90,14 @@ async fn main() -> Result<()> {
         .with_context(|| format!("binding HTTP listener on {http_addr}"))?;
     info!(addr = %http_addr, "subject-kinds HTTP API listening");
 
-    let app = boss_core::machine_gate::mount(app, "subject-kinds", &["/api/subject-kinds/health"]);
+    let app = boss_core::machine_gate::mount(
+        app,
+        "subject-kinds",
+        &["/api/subject-kinds/health"],
+        subjects_pool
+            .as_ref()
+            .map(boss_events::outbox::PgOutboxRecorder::shared),
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }

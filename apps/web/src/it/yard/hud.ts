@@ -223,8 +223,11 @@ export function needsYouBoard(
 export type NextLine = Readonly<{
   /** `timed` — a time and a countdown; `untimed` — coming, with no time
    *  the record can support (`basis` says why); `unread` — the source
-   *  could not be read (`why`). */
-  state: 'timed' | 'untimed' | 'unread';
+   *  could not be read (`why`); `withheld` — the server did not read the
+   *  source for this caller, whose policy scope does not read every
+   *  packet (`why`, backlog bd506215): a refusal, drawn neutral, never
+   *  the unread `?`. */
+  state: 'timed' | 'untimed' | 'unread' | 'withheld';
   /** The server's kind in words — `train-board` → `train board`. */
   kind: string;
   title: string;
@@ -294,7 +297,11 @@ export function nextUpBoard(
   const lines = field.rows.map((e): NextLine => {
     const common = { kind: e.kind.replace(/-/g, ' '), title: e.title, estimate: e.estimate, basis: e.basis, source: e.source };
     if (e.unread !== null) {
-      return { ...common, state: 'unread', time: null, countdown: null, why: e.unread };
+      // The wire carries a refusal in `unread` too (next_up.rs
+      // `withheld_rows`), told apart by the row's own `withheld` flag —
+      // never by its words (backlog 1805bac0, CLAUDE.md 9a).
+      const state = e.withheld ? 'withheld' : 'unread';
+      return { ...common, state, time: null, countdown: null, why: e.unread };
     }
     const at = e.at === null ? Number.NaN : Date.parse(e.at);
     if (Number.isNaN(at)) return { ...common, state: 'untimed', time: null, countdown: null, why: null };

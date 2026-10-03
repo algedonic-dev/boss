@@ -71,7 +71,13 @@ fn main() -> Result<()> {
         .compact()
         .init();
     let cli = Cli::parse();
+    // Stamps the machine token per request, follows no redirect (design
+    // 6805c764 car 2).
+    let client = boss_core::machine_token::BlockingClient::build(
+        reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(15)),
+    )?;
     boss_people::operator_baseline::seed(
+        &client,
         &cli.people_base,
         &cli.seed_path,
         cli.tenant_dir.as_deref(),

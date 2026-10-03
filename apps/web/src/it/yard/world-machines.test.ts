@@ -121,6 +121,15 @@ describe('machineryStrip — every machine the read answers is drawn', () => {
       'conductor · failed — SILENT',
     );
   });
+
+  // Backlog 1805bac0: the server's own withheld state, said as the scope
+  // and ranked after every reading — a refusal is not trouble.
+  it('says a withheld machine is not in your policy scope, and ranks it last', () => {
+    const w = machine({ id: 'conductor', state: 'withheld', name: 'conductor', why: 'withheld: scope' });
+    expect(machineTitle(w)).toBe('conductor · not in your policy scope — withheld: scope');
+    expect(machineryLabel([w])).toBe('1 machine: 1 withheld');
+    expect(machineOrder([w, machine({ id: 'z', state: 'idle' })]).map((m) => m.id)).toEqual(['z', 'conductor']);
+  });
 });
 
 describe('the map draws what the strip places', () => {

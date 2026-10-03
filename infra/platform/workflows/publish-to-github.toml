@@ -1,6 +1,8 @@
 # ---------------------------------------------------------------------
 # publish-to-github — the public mirror is a BACKUP OF SOURCE, fed by a
-# pull request the machine opens and David merges.
+# pull request the machine opens and — since v11 below (backlog
+# 602fe95f) — the GitHub App merges once every check main requires is
+# green.
 #
 # v6 (design packet 7b59af2c, David 2026-09-08). v1–v5 were published
 # live and never seeded; v5 was retired by the boot guard on 2026-09-07
@@ -18,8 +20,9 @@
 #      `publish-github-pr-on-open-pr-ready` (202609081200) spawns an
 #      ops-request for the forge on `step.ready.task` with that marker,
 #      the root ops-runner runs the verb (fetch forge main, build the
-#      dated snapshot commit on the mirror's main, push it to the dauld
-#      fork, `gh pr create`), and the verb completes this step with
+#      dated snapshot commit on the mirror's main, push it to a publish/*
+#      branch of the mirror itself and open the PR as the GitHub App —
+#      backlog d2b7c947), and the verb completes this step with
 #      `pr_url`. The merge on GitHub stays David's — the second gate.
 #   3. The measure step's instrument, infra/prep-github-publish.sh,
 #      refuses (non-zero, naming the ref) when a ref does not resolve
@@ -123,6 +126,55 @@
 #      published forge main's head at the moment it ran, which no one
 #      had measured or read.
 #
+# v11 (backlog 602fe95f, David 2026-09-30: option (ii) — "NOBODY pushes
+# or merges main by hand"). Measured anonymously that day: main carried
+# a CLASSIC rule requiring the checks `rust` and `web` of non-admins,
+# which no workflow has produced since ci.yml became one Gate job, so
+# every merge was an admin bypass through the UI, and a UI squash stamped
+# a personal address on the public main (#248). So the merge is the
+# App's, and main takes no other writer (a ruleset, applied by the
+# bounded github-set-branch-protection verb under David's passkey):
+#
+#  15. `merge` is a third MACHINE step, the open-pr shape: nobody
+#      nominated, `ops_verb = "merge-publish-pr"`, filed by the rule
+#      `merge-publish-pr-on-merge-ready`, run on the forge as
+#      publish-github-pr.sh --merge. Ready once the reading is green, or
+#      judged and nothing in it is `real`. The verb re-reads the passkey
+#      approval (THE SAME signature: it signed the tree, and the merge
+#      lands exactly that tree — no second prompt), refuses unless every
+#      check main's ruleset requires is green on the PR head, and
+#      FAST-FORWARDS main to the snapshot the passkey approved: the commit
+#      on main is that commit, authored and committed as the declared
+#      publisher, where a squash or a merge commit would be a new commit
+#      GitHub mints and stamps with an identity the API does not let the
+#      caller choose. It proves the merge by reading main and the PR back.
+#  16. `merged` is the terminal after it. `pr-opened` now closes only a
+#      publish whose judged reading found something REAL: its PR stays
+#      open and unmerged, and the next publish supersedes it.
+#
+#  The lineage labels here are this file's; the registry assigns its own
+#  number when a version is published, and no other file names one
+#  (review 01561b13 N6; review af3f2996: v11 was already live when this
+#  file said which number it would get).
+#
+# v12 (backlog 16a9c5ae, review 01561b13 N2, 2026-09-30). v11 gave
+# `merge` no failure outcome: a refused merge left the packet OPEN, and
+# the daily rule spawns nothing while a publish packet is open
+# (`open_publish_exists`), so one red required Gate judged `noise` — the
+# refusal working as designed — stopped the daily publish until a person
+# superseded the packet by hand, while the refusal's own text said the
+# next publish would supersede it.
+#
+#  17. `merge-refused` closes the packet when the answer rule has
+#      annotated `merge` FAILED with exit 1 or 2 — which the verb gives
+#      only after READING the mirror's main and finding it not at the
+#      snapshot, before any push. The alert is filed first, so the close
+#      is loud; the daily rule then spawns tomorrow's publish, whose
+#      open-pr closes this PR as superseded (its source contains this
+#      one's). Any other exit — 3 (main moved, the record did not
+#      follow), 4 (main not read), a timeout, a kill — is left open and
+#      troubled: the terminal never closes a packet whose main moved.
+#
 # Cadence: the daily `publish-to-github-daily` rule (129/149) spawns one
 # packet per day, guarded to one open packet per mirror; most days land
 # on `nothing-to-publish`, which is the measurement that the mirror is
@@ -142,8 +194,8 @@ label = "Publish to the public GitHub mirror"
 category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
-description = "Measure what a push to the public GitHub mirror would publish, prove it carries no credential material, and put the newly-public surface in front of a human before any of it leaves the network. Runs daily; most days it will find nothing and close on the nothing-to-publish terminal, which is the measurement that says the mirror is current. On approval the forge opens the pull request by machine (the publish-github-pr ops verb, as dauld); the merge on GitHub is the second, human gate."
-metadata = { owner_role = "platform-admin" }
+description = "Measure what a push to the public GitHub mirror would publish, prove it carries no credential material, and put the newly-public surface in front of a human before any of it leaves the network. Runs daily; most days it will find nothing and close on the nothing-to-publish terminal, which is the measurement that says the mirror is current. On approval the forge opens the pull request by machine (the publish-github-pr ops verb, as the algedonic-dev GitHub App), reads its checks back, and — once every check main requires is green — the App fast-forwards main to exactly the approved commit (merge-publish-pr). Nobody merges main by hand."
+metadata = { department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "opened"
@@ -324,7 +376,7 @@ ready_when = "steps.read-checks.done AND steps.read-checks.metadata.conclusion !
 title_template = "Judge the code-scanning alerts: a disposition per rule"
 audience = { role = "platform-admin" }
 agent = { profile = "analyst", model = "opus-5[1m]", budget_usd = 2, effort = "medium" }
-metadata_defaults = { human_only = false, procedure = "The reading is ON THIS PACKET: `metadata.code_scanning` — every check on the PR head with its conclusion, and under `alerts` the scan's annotations counted by rule (`by_rule`, largest first, each with its file count), by file and by level, with `declared` (what the check-run says it holds) beside `read` (what the API exposed). Judge each RULE in `by_rule`, not each alert: record `dispositions` as one entry per rule — `{rule, disposition, reason}` — where disposition is `noise` (a heuristic that named a non-secret: an account_id / employee_id / uid in a log line, a #[cfg(test)] constant, an in-cluster http URL) with the reason that makes it noise, or `real` with the backlog-item you FILED for it (its id in the reason). Read the code behind a rule before calling it noise — `by_file` names the files, and the check-run's url the lines. EVERY FAILING CHECK IS JUDGED TOO, not only the scan's rules (backlog c6cb678b: #243 closed pr-opened with its Gate red, judged on CodeQL alone). `metadata.code_scanning.failing` names each check on the head that completed without passing — the mirror's own `Gate (infra/gate.sh, full)` among them — and `still_running` names any the reading saw unfinished (the step's `conclusion` reads `unfinished` when a check outlasted the ceiling). For each one that is not the scan itself, add one `dispositions` entry with `rule` = the check's name: `real` with the backlog-item you FILED for it (open the check's `url`, name the failing test or phase in the reason), or `noise` only with the evidence that the failure is not the tree's (a runner fault, a GitHub outage — never 'it passed on our gate'). An unfinished check is judged the same way, from what its url shows. Then `verdict`: `noise` when every rule and check is noise, `real` when any is, `clean` only when there were no alerts and nothing failed. The merge on GitHub is David's and follows this verdict; a rule or check left unjudged is a red badge he merges over by hand, which is the defect this step exists to end (backlog 321f1409: #238 merged over 64 unread alerts, #239 stalled on 109)." }
+metadata_defaults = { human_only = false, procedure = "The reading is ON THIS PACKET: `metadata.code_scanning` — every check on the PR head with its conclusion, and under `alerts` the scan's annotations counted by rule (`by_rule`, largest first, each with its file count), by file and by level, with `declared` (what the check-run says it holds) beside `read` (what the API exposed). Judge each RULE in `by_rule`, not each alert: record `dispositions` as one entry per rule — `{rule, disposition, reason}` — where disposition is `noise` (a heuristic that named a non-secret: an account_id / employee_id / uid in a log line, a #[cfg(test)] constant, an in-cluster http URL) with the reason that makes it noise, or `real` with the backlog-item you FILED for it (its id in the reason). Read the code behind a rule before calling it noise — `by_file` names the files, and the check-run's url the lines. EVERY FAILING CHECK IS JUDGED TOO, not only the scan's rules (backlog c6cb678b: #243 closed pr-opened with its Gate red, judged on CodeQL alone). `metadata.code_scanning.failing` names each check on the head that completed without passing — the mirror's own `Gate (infra/gate.sh, full)` among them — and `still_running` names any the reading saw unfinished (the step's `conclusion` reads `unfinished` when a check outlasted the ceiling). For each one that is not the scan itself, add one `dispositions` entry with `rule` = the check's name: `real` with the backlog-item you FILED for it (open the check's `url`, name the failing test or phase in the reason), or `noise` only with the evidence that the failure is not the tree's (a runner fault, a GitHub outage — never 'it passed on our gate'). An unfinished check is judged the same way, from what its url shows. Then `verdict`: `noise` when every rule and check is noise, `real` when any is, `clean` only when there were no alerts and nothing failed. The merge follows this verdict and is the machine's (backlog 602fe95f): `real` closes the packet with its PR left open and unmerged; `noise` or `clean` makes the `merge` step ready, and the GitHub App merges only if every check main's ruleset requires is green on the head — when one is not, the merge is refused and the packet closes `merge-refused`, so tomorrow's publish supersedes its PR (backlog 16a9c5ae). A rule or check left unjudged was a red badge merged over by hand, which is the defect this step exists to end (backlog 321f1409: #238 merged over 64 unread alerts, #239 stalled on 109)." }
 [[workflow.step.fields]]
 name = "dispositions"
 field_type = "array"
@@ -335,14 +387,64 @@ name = "verdict"
 field_type = "clean|noise|real"
 required = true
 
-# The terminal follows the judgement when there was one, and the
-# reading alone when the scan was clean — so a clean run never waits
-# on a judge with nothing to judge, and a red one never closes unjudged.
+# The merge (15). A machine step like open-pr: nobody nominated, the
+# `ops_verb` marker routes it (merge-publish-pr-on-merge-ready), the
+# forge verb completes it with the commit main now reads. Ready after
+# the reading was green, or after a judgement that found nothing real —
+# guarded by `.done` before every comparison, so neither side reads over
+# an absent field. Readiness is not the verb's evidence: it re-reads the
+# approval, the snapshot and every check main requires on the PR head,
+# and refuses loudly (the answer rule's annotate-and-alert) on any red.
+[[workflow.step]]
+title = "merge"
+kind = "task"
+ready_when = "(steps.read-checks.done AND steps.read-checks.metadata.conclusion = \"success\") OR (steps.judge-checks.done AND steps.judge-checks.metadata.verdict != \"real\")"
+title_template = "Merge the approved pull request into the mirror's main (by machine, as the GitHub App)"
+metadata_defaults = { ops_verb = "merge-publish-pr" }
+[[workflow.step.fields]]
+name = "merged_sha"
+field_type = "string"
+required = true
+
+[[workflow.step]]
+title = "merged"
+kind = "outcome"
+ready_when = "steps.merge.done"
+title_template = "Published: the mirror's main is the approved commit"
+authority_role = "platform-admin"
+terminal = { outcome = "merged" }
+
+# (17) The close for a merge that did not happen. `failed` and
+# `failed_exit` are the keys the answer rule's annotate-and-alert writes
+# onto the still-open `merge` step (jobs.complete_linked_step, AFTER it
+# has filed the urgent alert, so the close never silences it). The verb
+# exits 2 (refused) or 1 (failed) ONLY after it has read the mirror's
+# main and found it NOT at the approved snapshot, and before it pushes:
+# the one state in which "nothing was merged" is a reading, not a hope.
+# Every other exit keeps the packet open and troubled: 3 (main moved,
+# the record did not follow), 4 (main not read yet), and whatever the
+# verb did not choose — the runner's timeout (124), a kill (137). So the
+# predicate is a WHITELIST of 1 and 2 (review af3f2996 B1: `!= "3"` read
+# a timeout after the push as "nothing merged"). `> ""` holds only once
+# the annotation is there (the v5 lesson: never `!=` over an absent
+# key); `failed_exit` is written in the same write as `failed`.
+[[workflow.step]]
+title = "merge-refused"
+kind = "outcome"
+ready_when = "steps.merge.metadata.failed > \"\" AND (steps.merge.metadata.failed_exit = \"1\" OR steps.merge.metadata.failed_exit = \"2\")"
+title_template = "Not merged: the App refused the merge, and the next daily publish supersedes this PR"
+authority_role = "platform-admin"
+metadata_defaults = { outcome_kind = "aborted" }
+terminal = { outcome = "merge-refused" }
+
+# (16) The terminal for a judged reading that found something REAL: the
+# PR is opened and read, and it is NOT merged — the fix lands on forge
+# main and the next publish supersedes this PR. Never before a judgement.
 [[workflow.step]]
 title = "pr-opened"
 kind = "outcome"
-ready_when = "steps.judge-checks.done OR (steps.read-checks.done AND steps.read-checks.metadata.conclusion = \"success\")"
-title_template = "Pull request opened and its checks read"
+ready_when = "steps.judge-checks.done AND steps.judge-checks.metadata.verdict = \"real\""
+title_template = "Pull request opened and left unmerged: its judged checks found something real"
 authority_role = "platform-admin"
 terminal = { outcome = "pr-opened" }
 

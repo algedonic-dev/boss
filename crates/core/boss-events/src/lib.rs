@@ -4,6 +4,8 @@ pub mod bus;
 #[cfg(feature = "events-api")]
 pub mod events_api_config;
 #[cfg(feature = "postgres")]
+pub mod gate_evidence_pg;
+#[cfg(feature = "postgres")]
 pub mod integrity;
 #[cfg(feature = "postgres")]
 pub mod messages_events_pg;
@@ -19,6 +21,8 @@ pub mod tail_http;
 
 #[cfg(feature = "postgres")]
 pub use audit_pg::PgAuditWriter;
+#[cfg(feature = "postgres")]
+pub use gate_evidence_pg::PgGateEvidence;
 #[cfg(feature = "postgres")]
 pub use integrity::{
     ChainBreak, CreatedAtRegression, GapReading, IdGap, IntegrityReport, check_audit_log_integrity,

@@ -591,7 +591,7 @@ pub mod live {
     }
 
     pub struct LiveApiOutput {
-        client: reqwest::blocking::Client,
+        client: boss_core::machine_token::BlockingClient,
         api_base: String,
         /// Base URL of the deployed `boss-clock-api`. When set, every
         /// `start_of_day(day)` POSTs `/api/clock/advance` with the new
@@ -700,7 +700,16 @@ pub mod live {
     }
 
     impl LiveApiOutput {
-        pub fn new(api_base: &str) -> Self {
+        /// `token` is the machine-token source the output's client
+        /// stamps from on every request: the daemon passes
+        /// `boss_core::machine_token::shared()`, a test a
+        /// `Source::fixed(None)` — never the process's live value, so a
+        /// failing test's captured request cannot carry a mounted Secret
+        /// into a log (backlog 2ee29275, F2).
+        pub fn new(
+            api_base: &str,
+            token: std::sync::Arc<boss_core::machine_token::Source>,
+        ) -> Self {
             // Default x-boss-user identity is `automation:sim` — a
             // named automation, never an anonymous "system" (there is
             // no system actor; every audit_log _actor is a human or a
@@ -730,7 +739,6 @@ pub mod live {
             if let Ok(v) = reqwest::header::HeaderValue::from_str(&actor) {
                 headers.insert("x-boss-user", v);
             }
-            boss_core::machine_token::attach(&mut headers);
             // Mark every outbound call as part of a simulated event
             // chain. Receivers' SimOrigin middleware extracts this
             // and sets the per-request task-local so the publisher
@@ -742,15 +750,20 @@ pub mod live {
                 reqwest::header::HeaderValue::from_static("true"),
             );
             Self {
-                client: reqwest::blocking::Client::builder()
-                    .default_headers(headers)
-                    .timeout(std::time::Duration::from_secs(30))
-                    // The token rides in default headers; a followed
-                    // cross-host redirect would carry it (review of
-                    // 39949355, 2026-09-28).
-                    .redirect(reqwest::redirect::Policy::none())
-                    .build()
-                    .expect("HTTP client"),
+                // The machine token is STAMPED per request from `token`,
+                // not baked into the default headers above: the output
+                // lives as long as the daemon, and a value read once at
+                // start would be refused the moment a rotation revoked it
+                // (review S1 of car 2 slice 1; design 6805c764 car 2, the
+                // blocking-senders slice, 2026-09-29). BlockingClient
+                // also follows no redirect.
+                client: boss_core::machine_token::BlockingClient::build_with_source(
+                    reqwest::blocking::Client::builder()
+                        .default_headers(headers)
+                        .timeout(std::time::Duration::from_secs(30)),
+                    token,
+                )
+                .expect("HTTP client"),
                 api_base: api_base.to_string(),
                 clock_api_url: Some(boss_ports::url("clock")),
                 event_routes: Vec::new(),
@@ -1467,7 +1480,8 @@ pub mod live {
                 }
             }
 
-            // --- Shipments (batch create; updates via upsert) ---
+            // --- Shipments (batch create; a held id is refused and
+            // skipped, never upserted — backlog be459ab9) ---
             if !self.day_shipments.is_empty() {
                 self.advance_clock_to_instant(la_anchor(14, 0)); // 14:00 — afternoon shipping
                 let shipments: Vec<_> = self.day_shipments.drain(..).collect();
@@ -2160,7 +2174,12 @@ mod emit_event_tests {
     #[test]
     fn live_api_register_event_route_replaces_existing() {
         use super::live::{EventHttpMethod, LiveApiOutput};
-        let mut out = LiveApiOutput::new("http://localhost");
+        // A fixed source holding no token, never the process's live one
+        // (backlog 2ee29275, F2).
+        let mut out = LiveApiOutput::new(
+            "http://localhost",
+            std::sync::Arc::new(boss_core::machine_token::Source::fixed(None)),
+        );
         out.register_event_route("a.b", "/api/old", EventHttpMethod::Post);
         out.register_event_route("a.b", "/api/new", EventHttpMethod::Put);
         // Lookup is private; verify via emit_event behaviour: with no

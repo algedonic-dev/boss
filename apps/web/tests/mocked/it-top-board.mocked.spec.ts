@@ -286,6 +286,33 @@ test('UNREAD, a failed read: the server’s own null, a refused queue, and one d
   await expect(next.locator('.dep[data-next="gates"] .dep-in')).toHaveText('10m');
 });
 
+// Backlog bd506215: a narrowed scope is served `withheld_rows` for the
+// sources not scoped by packet (next_up.rs, 0964ba80) — a refusal by
+// policy, drawn as the row and the scope's words, never the unread `?`.
+test('WITHHELD by policy scope: the row stands, says not in your policy scope, and wears no ?', async ({ page }) => {
+  const why = "withheld: this caller's policy scope does not read every packet, and this source is not scoped by packet";
+  await board(
+    page,
+    regions({
+      next_up: [
+        event('gates', 'a bay frees', after(10)),
+        event('scheduled', 'scheduled rules', null, { unread: why, withheld: true, basis: 'the dispatcher schedule is withheld from this caller', source: 'dispatcher schedule' }),
+        event('rotation-due', 'credential rotations', null, { unread: why, withheld: true, basis: 'the credentials registry is withheld from this caller', source: 'credentials registry' }),
+      ],
+    }),
+  );
+  await page.goto('/it');
+  const next = row(page, 'next-up');
+  for (const kind of ['scheduled', 'rotation due']) {
+    const dep = next.locator(`.dep[data-next="${kind}"]`);
+    await expect(dep).toHaveAttribute('data-state', 'withheld');
+    await expect(dep.locator('.dep-basis')).toHaveText('not in your policy scope');
+    await expect(dep.locator('[data-fig="unread"]')).toHaveCount(0);
+  }
+  await expect(next.locator('.dep[data-next="scheduled"] .dep-title')).toHaveText('scheduled rules');
+  await expect(next.locator('.dep[data-next="gates"] .dep-in')).toHaveText('10m');
+});
+
 test('UNREAD, the regions read failed: every regions row is ? with the failure, and no stale value is kept', async ({ page }) => {
   await board(page, regions());
   await page.unroute(YARD_REGIONS);

@@ -20,6 +20,7 @@
 
 import { expect, test, type Page, type Route } from './_test';
 import { TERRITORIES } from '../../src/it/yard/world';
+import { REGION_NAMES } from '../../src/it/yard/regions';
 import { BORDERS } from '../fixtures/yard';
 import { YARD_BORDERS, YARD_REGIONS, installSmokeMocks } from './_smokeMocks';
 
@@ -51,13 +52,14 @@ const REGIONS = {
     { name: 'marshalling', count: null, state: 'troubled', why: 'the station registry could not be read', trend: trend('served', 'per day', null, null) },
     { name: 'shop-floor', count: 2, bound: 6, state: 'clear', why: '2 runs in flight, 1 crew on the floor', trend: trend('build duration', 'minutes', 64, 58) },
     { name: 'publish', count: 0, state: 'clear', why: 'no pull request awaiting a merge', trend: trend('publishes', 'per day', 1, 1) },
+    { name: 'sensors', count: 2, unit: 'declared sensors', state: 'clear', why: '2 declared sensors; readings stamped', trend: trend('sensor readings', 'per day', 4, 3) },
   ],
   // THE HUD'S BLOCK (design 00774ca8): the server's rows — one reading a
   // floor, one whose edges were unread, one balanced at a true zero with
   // a troubled stuck count — and its machine cell.
   thirds: [
     {
-      third: 'queue-management', regions: ['receiving', 'marshalling'],
+      third: 'queue-management', regions: ['sensors', 'receiving', 'marshalling'],
       balance: { unit: 'inbound packets', in_means: 'an inbound packet opened', out_means: 'an inbound packet taken off the queue',
         in: 40, out: 28, net: 12, in_count: 40, out_count: 28 },
       stuck: { third: 'queue-management', stuck: 3, waiting: 0, oldest_hours: 170, regions: ['receiving', 'marshalling'],
@@ -188,6 +190,7 @@ test('the world paints a territory per region in one SVG, along the flow, with t
 });
 
 test('a troubled territory looks troubled where it is and carries its why', async ({ page }) => {
+  expect(REGIONS.regions.map((r) => r.name).sort()).toEqual([...REGION_NAMES].sort());
   await mocks(page);
   await page.goto('/it');
 
@@ -417,6 +420,38 @@ test('a border carries its traffic, what waits on it and the machine that moves 
   await expect(page.locator('.yard-flow', { hasText: 'crossings in' })).toHaveCount(0);
 });
 
+// Backlog bd506215: a narrowed scope is refused the machines' firing
+// records (`machines_withheld`, 0964ba80); the border's machine says so
+// in `why`. The rail used to write "no firing recorded" under a broken
+// "cannot tell" lamp — a finding about the machine made of a refusal.
+test('a machine whose firing record is withheld by policy scope reads not in your policy scope, on a whole neutral lamp', async ({ page }) => {
+  const withheld = {
+    ...BORDERS_PAYLOAD,
+    borders: BORDERS_PAYLOAD.borders.map((b) =>
+      b.from === 'dock' && b.to === 'track'
+        ? {
+            ...b,
+            machine: { name: 'train-board-on-dock-depth', kind: 'cadence', last_fired: null,
+              silent_for_minutes: null, expected_every_minutes: null, silent: null,
+              why: "the firing record is withheld: this caller's policy scope does not read every packet",
+              // The server's flag is what the rail reads (1805bac0).
+              withheld: true },
+          }
+        : b,
+    ),
+  };
+  await installSmokeMocks(page);
+  const json = (r: Route, b: unknown) =>
+    r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(b) });
+  await page.route(YARD_REGIONS, (r) => json(r, REGIONS));
+  await page.route(YARD_BORDERS, (r) => json(r, withheld));
+  await page.goto('/it');
+  const boarding = page.locator('section.yard svg .crossing[data-crossing="dock→track"]');
+  await expect(boarding.locator('text.machine-status')).toHaveText('not in your policy scope');
+  await expect(boarding.locator('.machine-lamp.scope')).toHaveCount(1);
+  await expect(boarding.locator('.machine-lamp.unknown, .machine-lamp.err')).toHaveCount(0);
+});
+
 test('a border the server could not measure reads unknown, never zero', async ({ page }) => {
   await mocks(page);
   await page.goto('/it');
@@ -457,4 +492,20 @@ test('a borders read that fails is said, and the territories still paint', async
   // guessed in its place.
   await expect(page.locator('section.yard svg .territory')).toHaveCount(TERRITORIES.length);
   await expect(page.locator('section.yard svg .crossing')).toHaveCount(0);
+});
+
+// An older server remains an unread source, never a healthy zero.
+test('a partial regions payload retains missing Sensors once with the desktop unread reason', async ({ page }) => {
+  await mocks(page);
+  await page.route(YARD_REGIONS, (r) => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+    ...REGIONS, regions: REGIONS.regions.filter((region) => region.name !== 'sensors'),
+    thirds: REGIONS.thirds.map((third) => ({ ...third, regions: third.regions.filter((name) => name !== 'sensors') })),
+  }) }));
+  await page.goto('/it');
+  const sensors = page.locator('section.yard svg .territory[data-region="sensors"]');
+  await expect(sensors).toHaveCount(1);
+  await expect(sensors).toHaveAttribute('data-state', 'troubled');
+  await expect(sensors.locator('text.count')).toHaveText('no reading');
+  await expect(sensors.locator('title').first()).toContainText('the server answered no reading for this region');
+  await expect(page.locator('section.yard svg .territory')).toHaveCount(REGION_NAMES.length);
 });

@@ -303,7 +303,13 @@ impl Config {
         let home = env_or("BOSS_TRAIN_HOME", "/var/lib/boss-train");
         Config {
             jobs: env_or("BOSS_JOBS_URL", "http://127.0.0.1:7900"),
-            head_owner: env_or("BOSS_TRAIN_HEAD_OWNER", "dauld"),
+            // The owner a GitHub-adapter PR's head names: the
+            // organisation, never a personal account (backlog d2b7c947,
+            // David 2026-09-30: all GitHub work runs through the
+            // algedonic-dev organisation, as the GitHub App). The default
+            // was a personal handle, which is what an unconfigured run
+            // gets. The forge adapter never reads it.
+            head_owner: env_or("BOSS_TRAIN_HEAD_OWNER", "algedonic-dev"),
             // Under the forge there is no separate fork: the conductor
             // pushes train branches to the same repository it reads,
             // which is what the running conductor's `fork` remote

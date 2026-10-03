@@ -59,8 +59,40 @@
 # and a car's probe reads /api/ml/models the same way. Everything
 # unlisted — jobs, steps, the yard, agents, sensors, workflows — is the
 # jobs API.
+#
+# THE READ-ONLY ROUTES come first, in their own block (backlog
+# 9a440539, 2026-10-01): the services boss-ports declares that the LAN
+# door does not carry. Their prefixes are the gateway's (boss-gateway
+# main.rs, each `proxy::<NAME>` route) and the clock's own router
+# (/api/clock/*, which the gateway does not front). They answer only on
+# the pod's door, through the in-cluster boss-read-internal Service and
+# infra/dev/sor-read-ports.env, GET only. On the forge such a path now
+# REFUSES in boss-sor-read — its table has no row for the service —
+# where it used to reach the jobs port and answer 404 about a surface
+# that exists. They sit OUTSIDE the SOR-ROUTES markers because those
+# markers are the LAN door's set, which its pin holds to the manifest;
+# every_boss_ports_service_has_a_door.rs reads this block the same way
+# and holds it to the read table.
 sor_service_for_path() {
-    local route="${1%%\?*}" service
+    local route="${1%%\?*}" service=""
+    # SOR-READ-ROUTES-BEGIN
+    case "$route" in
+        /api/assets|/api/assets/*)                             service=assets ;;
+        /api/customers|/api/customers/*)                       service=customers ;;
+        /api/catalog/*)                                        service=catalog ;;
+        /api/commerce/*)                                       service=commerce ;;
+        /api/inventory/*)                                      service=inventory ;;
+        /api/messages/*)                                       service=messages ;;
+        /api/shipping/*)                                       service=shipping ;;
+        /api/products|/api/products/*)                         service=products ;;
+        /api/campaigns|/api/campaigns/*)                       service=campaigns ;;
+        /api/clock/*)                                          service=clock ;;
+    esac
+    # SOR-READ-ROUTES-END
+    if [ -n "$service" ]; then
+        printf '%s\n' "$service"
+        return 0
+    fi
     # SOR-ROUTES-BEGIN
     case "$route" in
         /api/people/accounts|/api/people/accounts/*)           service=accounts ;;

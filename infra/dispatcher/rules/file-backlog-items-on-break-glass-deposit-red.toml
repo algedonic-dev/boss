@@ -1,0 +1,38 @@
+# The daily break-glass deposit is judged by its own record (review
+# b6d2a716 of 7336cb5f, finding N1; backlog 17a7bd18). The chore
+# (infra/cluster/manifests/boss-break-glass-deposit.yaml, kind
+# maintenance-break-glass-deposit) records its verdict on its `run` step
+# through boss-chore.sh. A refusal prints ONE line
+# `RED break-glass-deposit refused: <why>`, and a deposit key boss-gcp
+# does not hold yet prints `RED break-glass-deposit/authorize-key
+# authorize: <the host key to check> ... <the authorized_keys line>`.
+# This rule fires when a deposit packet closes `failed` and hands it to
+# the chore judge the playground crawl and the recovery sheet use
+# (maintenance.chore.file_reds): one backlog-item per route, deduped
+# while it is open. Since the image-only policy's Deny car (backlog
+# e4a9a9b3) a must-refuse patch that lands is a refusal too — the
+# binding deleted or moved off Deny, named on the RED line — so no run
+# closes `not-yet` any more.
+[[rule]]
+name = "file-backlog-items-on-break-glass-deposit-red"
+why = """
+A CROSS-PROTOCOL REACTOR: maintenance-break-glass-deposit ->
+backlog-item, which no single Workflow consequence can express — the
+chore's protocol records its own failure but cannot open another kind's
+packet. The cadence-silence sweep watches ARRIVAL only, and boss-chore.sh
+opens and closes the packet `failed`, so a refusal after Deny (a grant
+widened again, a changed host key, a receiver that no longer answers)
+arrives on time and raises nothing, and the first run's authorized_keys
+line — the one act David owes this delivery — lived only in a closed
+packet's output and a pod log (review b6d2a716, N1). No authority
+widened: the handler is the crawl's judge (maintenance.chore.file_reds),
+its only writes are standard backlog-items owned by the platform owner
+and one `judged` note on the chore's own packet, and the dedup keys are
+the two routes the Job prints, so a refusal repeated nightly is ONE item
+until someone closes it.
+"""
+on_event = "jobs.job.closed"
+when = 'kind = "maintenance-break-glass-deposit" AND outcome = "failed"'
+[[rule.do]]
+handler = "maintenance.chore.file_reds"
+args = { step = "\"run\"", design = "\"835c0c9c\"", area = "\"credentials\"" }

@@ -62,7 +62,7 @@ to complete the step — a status is one of `pending`, `ready`, `active`,
 `completed`, `skipped`, and any other word is refused with 400; the pin
 `crates/core/boss-testing/tests/a_step_plugin_writes_only_step_statuses.rs`
 holds every bundle here to that list). The PUT keeps every field its
-body omits, and it is closing to any metadata body (backlog e39a9d2a):
+body omits, and it refuses any metadata body, 409 (backlog e39a9d2a):
 `apps/web/src/steps/a-step-plugin-put-carries-no-metadata.test.ts`
 refuses a step PUT here whose body is anything but the status. Send
 the PUT only after the merge answered ok, so a failed save moves no

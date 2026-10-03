@@ -220,6 +220,25 @@ fn the_secrets_are_derived_from_the_broker_rules_and_nothing_else() {
         "the per-act admin token's two rules (design 76c46869) declare \
          boss/github-app-algedonic-dev, once: {got:?}"
     );
+    for (ns, why) in [
+        (
+            "boss",
+            "the Secret every service port's machine gate mounts",
+        ),
+        (
+            "boss-dev",
+            "its copy for the dev pod's doors, via also_in_namespaces",
+        ),
+    ] {
+        assert_eq!(
+            got.iter()
+                .filter(|l| **l == format!("{ns}\tboss-machine-token"))
+                .count(),
+            1,
+            "the machine token's two rules (design 6805c764, car 3) declare \
+             {ns}/boss-machine-token, {why}, once: {got:?}"
+        );
+    }
     for line in &got {
         let (ns, name) = line.split_once('\t').expect("ns<TAB>name");
         assert!(
@@ -227,6 +246,41 @@ fn the_secrets_are_derived_from_the_broker_rules_and_nothing_else() {
             "a bare namespace and name, never TOML quoting: {line:?}"
         );
     }
+}
+
+/// `also_in_namespaces` declares the same Secret name in each namespace
+/// it lists (design 6805c764, car 3): a pod mounts only its own
+/// namespace's Secrets, so the machine token has a copy wherever it has
+/// a caller, and the converge must create each one empty for the broker
+/// to fill.
+#[test]
+fn a_secret_declared_in_several_namespaces_is_listed_in_each() {
+    let c = Case::new("mirrored");
+    write_file(
+        &c.rules.join("broker-rotates-m.toml"),
+        r#"[[rule]]
+name = "broker-rotates-m"
+why = "fixture"
+on_event = "step.done.credential-rotation"
+[[rule.do]]
+handler = "credential.rotate.self-issued"
+args = { secret_namespace = "\"boss\"", secret_name = "\"mirrored-fixture\"", also_in_namespaces = "\"boss-dev, boss-x\"", credential_id = "\"m\"", drain_minutes = "\"60\"" }
+"#,
+    );
+    let (rc, out, err) = c.run(r#"broker_secrets "$R""#, &[]);
+    assert_eq!(rc, 0, "{err}");
+    let got: Vec<&str> = out.lines().collect();
+    for want in [
+        "boss\tmirrored-fixture",
+        "boss-dev\tmirrored-fixture",
+        "boss-x\tmirrored-fixture",
+    ] {
+        assert!(got.contains(&want), "{want:?} is declared: {got:?}");
+    }
+    assert!(
+        got.contains(&"boss\ttunnel-creds-fixture"),
+        "the other rules still read as before: {got:?}"
+    );
 }
 
 /// Every Secret a broker rule declares has the broker's grant on it, by

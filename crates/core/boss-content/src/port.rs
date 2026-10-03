@@ -15,9 +15,9 @@ use crate::types::{
 #[async_trait]
 pub trait ContentRepository: Send + Sync {
     /// Return the live bulletins for this user as of `today`, sorted
-    /// priority-desc then posted_on-desc. Excludes expired rows and
-    /// (when `include_dismissed=false`) rows the user already
-    /// dismissed.
+    /// priority-desc, then posted_on-desc, then created_at-desc, then
+    /// id. Excludes expired rows and (when `include_dismissed=false`)
+    /// rows the user already dismissed.
     async fn list_bulletins_for(
         &self,
         user: &UserContext,
@@ -26,7 +26,8 @@ pub trait ContentRepository: Send + Sync {
     ) -> Result<Vec<Bulletin>, ContentError>;
 
     /// Return every bulletin, active or expired, for the admin surface.
-    /// No audience filter — this is the HR-author view.
+    /// No audience filter — this is the HR-author view. Sorted
+    /// posted_on-desc, then created_at-desc, then id.
     async fn list_all_bulletins(&self) -> Result<Vec<Bulletin>, ContentError>;
 
     async fn get_bulletin(&self, id: Uuid) -> Result<Option<Bulletin>, ContentError>;
@@ -103,7 +104,9 @@ pub trait ContentRepository: Send + Sync {
     // --- Manual ---------------------------------------------------------
 
     /// List every published section visible to this user, sorted by
-    /// (parent_slug, sort_order, title). Intended for tree rendering —
+    /// (parent_slug, sort_order, title, slug) — roots first, texts in
+    /// byte order (`-` before a letter, upper before lower), the only
+    /// order both adapters can hold. Intended for tree rendering —
     /// the client reassembles the hierarchy from `parent_slug` links.
     async fn manual_tree(&self, user: &UserContext) -> Result<Vec<ManualSection>, ContentError>;
 

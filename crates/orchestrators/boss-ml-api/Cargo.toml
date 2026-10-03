@@ -18,6 +18,8 @@ tracing-subscriber = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"] }
 
 boss-core = { path = "../../core/boss-core" }
+# The machine gate states its facts through the outbox (design 21946380).
+boss-events = { path = "../../core/boss-events", default-features = false, features = ["postgres"] }
 boss-ml = { path = "../../core/boss-ml", features = ["postgres"] }
 boss-ml-plugins = { path = "../../modules/boss-ml-plugins" }
 boss-clock-client = { path = "../../core/boss-clock-client" }

@@ -58,8 +58,8 @@ LINT_SOR_WAIT_SECONDS=60
 # SYSTEM, so it reads what the system holds: role `audit-readonly`
 # (core policy's Read at Scope::All on every shipped resource, and no
 # other action anywhere) at the auditor tier — the shape a recorded
-# probe reads with through boss-sor-read (boss-cli identity.rs
-# `reader_header`). The id is the gate's own actor, automation:gate-runner,
+# probe reads with through boss-sor-read (`boss_core::roles::
+# reader_header`). The id is the gate's own actor, automation:gate-runner,
 # because every lint runs under infra/gate.sh; it signs here with the
 # read role alone, so no lint can write through this helper.
 # `a_lint_read_of_the_record_is_signed` holds every caller to it. The

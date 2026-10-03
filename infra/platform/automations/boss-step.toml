@@ -1,0 +1,7 @@
+# automation:boss-step — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 73,264 audit-log facts.
+# Signs as platform-admin today: infra/boss-step.sh (the x-boss-user it builds).
+
+[[automation]]
+id = "automation:boss-step"
+role = "platform-admin"
+description = 'Closes a step on the open packet of a named workflow, the step door the maintenance units use (infra/boss-step.sh).'

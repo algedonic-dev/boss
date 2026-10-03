@@ -1,0 +1,19 @@
+{
+  "about": "MUTATING — uncordon ONE worker node and read it back (infra/forge/cordon-node.sh uncordon <node>): kubectl uncordon through the forge's ops_kubectl door (the admin kubeconfig David placed, infra/estate/ops-credentials.sh), then a separate read of the Node's spec.unschedulable, which must be unset or false before the effect line is printed. The pair of cordon-node, asked for by design 8457c07b (the w-1 second-NVMe window of 2026-09-30, backlog 52ea56ac; built as backlog f0aaa72f): Talos uncordons a node it cordoned itself on its next boot, and this is the verb for when the morning read shows it did not. AUTHORISATION: the design's Q1 proposes cordon-node and uncordon-node be authorised once as bounded verbs, like hold-converge; this verb is authorised when David releases its held trust-boundary car. THE BOUND IS THE SCRIPT'S, NEVER A PARAM (infra/forge/cluster-node-lib.sh): the one argument is a DNS label, and the node must be a talos-worker in the live estate registry (not retired, one IPv4 address) AND the cluster must agree — no node-role.kubernetes.io/control-plane label, the registry's address as its InternalIP — or nothing is written (exit 78). A registry that does not answer is a failure, never an empty registry. Timeout 120: three bounded kubectl calls and, the first time, a bounded pull of the door's image.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/cordon-node.sh",
+    "uncordon",
+    "{1}"
+  ],
+  "params": [
+    {
+      "name": "node",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    }
+  ],
+  "timeout": 120,
+  "effect": "^uncordon-node: [a-z0-9-]+ is schedulable — read back spec[.]unschedulable=(unset|false) [(]was (true|false)[)]$"
+}

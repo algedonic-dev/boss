@@ -74,9 +74,9 @@ pub(super) fn lint_result_json(
 pub(super) async fn policy_check<R: JobsRepository, B: EventBus>(
     state: &JobsApiState<R, B>,
     user: &boss_policy_client::User,
-    action: Action,
+    control: Pair,
 ) -> Result<(), Response> {
-    match state.policy.check(user, action, Resource::workflow()).await {
+    match state.policy.ask(user, control).await {
         Ok(Decision::Allow { .. }) => Ok(()),
         Ok(Decision::Deny { reason }) => Err((StatusCode::FORBIDDEN, reason).into_response()),
         Err(e) => Err(e.into_response()),
@@ -102,8 +102,12 @@ pub(super) async fn may_read_drafts<R: JobsRepository, B: EventBus>(
     state: &JobsApiState<R, B>,
     user: &boss_policy_client::User,
 ) -> Result<bool, Response> {
-    for action in [Action::Create, Action::Update, Action::Publish] {
-        match state.policy.check(user, action, Resource::workflow()).await {
+    for control in [
+        controls::CREATE_WORKFLOW,
+        controls::UPDATE_WORKFLOW,
+        controls::PUBLISH_WORKFLOW,
+    ] {
+        match state.policy.ask(user, control).await {
             Ok(Decision::Allow { .. }) => return Ok(true),
             Ok(Decision::Deny { .. }) => {}
             Err(e) => return Err(e.into_response()),
@@ -139,7 +143,19 @@ pub(super) async fn list_kinds<R: JobsRepository + 'static, B: EventBus + 'stati
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = policy_check(&state, &user, Action::Read).await {
+    // MACHINERY reads the active list by tier, not by grant (backlog
+    // 47aed706, the follow-up of review 771c1308). The policy service's
+    // coverage read signs as `automation:policy-coverage` at the
+    // operator tier and judges every policy write by what this list
+    // names; asked through policy, a rule narrowing its role's workflow
+    // read — accepted once a second person holds the pair — blinded it,
+    // and every guarded write then answered 503 until break-glass
+    // restored the rule. People's roster admits the same reader the same
+    // way (`boss-people` `grants::roster_scope`). Only active versions
+    // are listed here, which the shipped basic guest already reads.
+    if !crate::trust::is_trusted(&user)
+        && let Err(r) = policy_check(&state, &user, controls::READ_WORKFLOW).await
+    {
         return r;
     }
     match reg.list_active(q.category.as_deref()).await {
@@ -183,7 +199,7 @@ pub(super) async fn get_kind<R: JobsRepository + 'static, B: EventBus + 'static>
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = policy_check(&state, &user, Action::Read).await {
+    if let Err(r) = policy_check(&state, &user, controls::READ_WORKFLOW).await {
         return r;
     }
     match reg.get_active(&kind).await {
@@ -201,7 +217,7 @@ pub(super) async fn get_kind_version<R: JobsRepository + 'static, B: EventBus + 
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = policy_check(&state, &user, Action::Read).await {
+    if let Err(r) = policy_check(&state, &user, controls::READ_WORKFLOW).await {
         return r;
     }
     match reg.get_version(&kind, version).await {
@@ -226,7 +242,7 @@ pub(super) async fn list_kind_versions<R: JobsRepository + 'static, B: EventBus 
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = policy_check(&state, &user, Action::Read).await {
+    if let Err(r) = policy_check(&state, &user, controls::READ_WORKFLOW).await {
         return r;
     }
     let drafts = match may_read_drafts(&state, &user).await {
@@ -256,7 +272,7 @@ pub(super) async fn create_kind<R: JobsRepository + 'static, B: EventBus + 'stat
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = policy_check(&state, &user, Action::Create).await {
+    if let Err(r) = policy_check(&state, &user, controls::CREATE_WORKFLOW).await {
         return r;
     }
     let (actor, now) = write_stamp(&state, &user).await;
@@ -290,7 +306,7 @@ pub(super) async fn validate_kind<R: JobsRepository + 'static, B: EventBus + 'st
     Json(req): Json<DraftLintRequest>,
 ) -> Response {
     // Gated like create — the dry run is an authoring affordance.
-    if let Err(r) = policy_check(&state, &user, Action::Create).await {
+    if let Err(r) = policy_check(&state, &user, controls::CREATE_WORKFLOW).await {
         return r;
     }
     let kind = if req.kind.is_empty() {
@@ -316,7 +332,7 @@ pub(super) async fn update_kind<R: JobsRepository + 'static, B: EventBus + 'stat
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = policy_check(&state, &user, Action::Update).await {
+    if let Err(r) = policy_check(&state, &user, controls::UPDATE_WORKFLOW).await {
         return r;
     }
     // Force kind match — a PUT for /kinds/foo always edits foo.
@@ -346,7 +362,7 @@ pub(super) async fn publish_kind<R: JobsRepository + 'static, B: EventBus + 'sta
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = policy_check(&state, &user, Action::Publish).await {
+    if let Err(r) = policy_check(&state, &user, controls::PUBLISH_WORKFLOW).await {
         return r;
     }
     let (actor, now) = write_stamp(&state, &user).await;
@@ -386,7 +402,7 @@ pub(super) async fn discard_kind_version<R: JobsRepository + 'static, B: EventBu
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = policy_check(&state, &user, Action::Update).await {
+    if let Err(r) = policy_check(&state, &user, controls::UPDATE_WORKFLOW).await {
         return r;
     }
     match state.jobs.jobs_pinned_to_workflow(&kind, version).await {
@@ -418,7 +434,7 @@ pub(super) async fn retire_kind<R: JobsRepository + 'static, B: EventBus + 'stat
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = policy_check(&state, &user, Action::Retire).await {
+    if let Err(r) = policy_check(&state, &user, controls::RETIRE_WORKFLOW).await {
         return r;
     }
     let (actor, now) = write_stamp(&state, &user).await;

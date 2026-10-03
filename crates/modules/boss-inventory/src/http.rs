@@ -24,6 +24,32 @@ use vendor_invoices::*;
 use vendors::*;
 use warehouse::*;
 
+/// The one mapping from a repository refusal to its HTTP answer. Write
+/// handlers that matched only the refusals they expected answered every
+/// other one 500 — so a NUL byte, a non-positive JE, a PO naming an
+/// unregistered vendor or an invoice billing an unplaced order read as
+/// service trouble (backlog be459ab9, found by the adapters-agree
+/// suite). A handler keeps its own arm only where its wording differs.
+pub(crate) fn error_response(e: crate::port::InventoryError) -> axum::response::Response {
+    use crate::port::InventoryError;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    match e {
+        InventoryError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
+        InventoryError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
+        InventoryError::InsufficientStock(sku, on_hand, need) => (
+            StatusCode::CONFLICT,
+            format!("insufficient stock: {sku} has {on_hand}, need {need}"),
+        )
+            .into_response(),
+        e @ InventoryError::InvalidAccount(_) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response()
+        }
+        e @ InventoryError::Invalid(_) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        InventoryError::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+    }
+}
+
 /// Cross-service clients the warehouse-status projection reads.
 /// Bundled so the binary constructs once and passes a single Option —
 /// `clients = None` answers the shipping leg as unavailable, not the read.

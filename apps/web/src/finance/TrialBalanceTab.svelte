@@ -207,6 +207,8 @@
 
   function factSourceKind(sourceTable: string): EntityKind | null {
     switch (sourceTable) {
+      case 'jobs':
+        return 'job';
       case 'invoices':
         return 'invoice';
       default:
@@ -416,4 +418,3 @@
       {/if}
   </Section>
 </div>
-

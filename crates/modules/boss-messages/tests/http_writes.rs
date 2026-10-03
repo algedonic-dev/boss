@@ -307,6 +307,13 @@ async fn compose_with_reply_to_creates_reply() {
 // GET /api/messages/inbox/{employee_id}
 // ---------------------------------------------------------------------------
 
+/// The rows of the inbox read's `{data, total, limit, offset, kinds}`
+/// envelope — a bare array until backlog 74da899d.
+#[derive(serde::Deserialize)]
+struct InboxPage {
+    data: Vec<Message>,
+}
+
 #[tokio::test]
 async fn get_inbox_returns_messages_for_recipient() {
     let mut m1 = message_fixture("msg-inbox-1");
@@ -324,7 +331,7 @@ async fn get_inbox_returns_messages_for_recipient() {
         .await;
     resp.assert_status(StatusCode::OK);
 
-    let msgs: Vec<Message> = resp.assert_json();
+    let InboxPage { data: msgs } = resp.assert_json();
     assert_eq!(msgs.len(), 2);
     assert!(msgs.iter().all(|m| m.recipient_id == "emp-42"));
 }
@@ -339,7 +346,7 @@ async fn get_inbox_for_unknown_employee_returns_empty_list() {
         .await;
     resp.assert_status(StatusCode::OK);
 
-    let msgs: Vec<Message> = resp.assert_json();
+    let InboxPage { data: msgs } = resp.assert_json();
     assert!(msgs.is_empty());
 }
 
@@ -369,7 +376,7 @@ async fn get_inbox_leaves_out_archived_rows() {
         .await;
     resp.assert_status(StatusCode::OK);
 
-    let msgs: Vec<Message> = resp.assert_json();
+    let InboxPage { data: msgs } = resp.assert_json();
     let ids: Vec<&str> = msgs.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, vec!["msg-kept"]);
 }
@@ -384,7 +391,7 @@ async fn get_inbox_with_include_archived_returns_them_too() {
         .await;
     resp.assert_status(StatusCode::OK);
 
-    let msgs: Vec<Message> = resp.assert_json();
+    let InboxPage { data: msgs } = resp.assert_json();
     let mut ids: Vec<&str> = msgs.iter().map(|m| m.id.as_str()).collect();
     ids.sort_unstable();
     assert_eq!(ids, vec!["msg-archived", "msg-kept"]);
@@ -410,7 +417,7 @@ async fn an_archived_message_leaves_the_inbox_read_and_records_its_event() {
         .send(&app.router)
         .await;
     resp.assert_status(StatusCode::OK);
-    let msgs: Vec<Message> = resp.assert_json();
+    let InboxPage { data: msgs } = resp.assert_json();
     assert!(msgs.is_empty(), "archived row still in the inbox: {msgs:?}");
 }
 

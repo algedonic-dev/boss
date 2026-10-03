@@ -166,6 +166,33 @@ fn the_env_file_renders_every_key_from_the_source() {
         "{}",
         r.out
     );
+    // The hosts that may receive the machine token (backlog 2ee29275):
+    // the record's two spellings, host only, DERIVED from the same two
+    // lines — so the token's scope cannot name a host the record does
+    // not live on. boss-core reads it at runtime and never compiles a
+    // list in; it holds this file's value equal to what it parses.
+    let host_of = |url: &str| {
+        let rest = url.split_once("://").map_or(url, |(_, r)| r);
+        rest.split(['/', ':']).next().unwrap_or("").to_string()
+    };
+    let hosts = format!(
+        "{},{}",
+        host_of(&sor),
+        host_of(&source_key("sor_cluster_url"))
+    );
+    assert_eq!(
+        value_of_str(&r.out, "BOSS_MACHINE_TOKEN_HOSTS"),
+        hosts,
+        "{}",
+        r.out
+    );
+    let parsed = boss_core::machine_token::Hosts::parse(&hosts);
+    assert!(parsed.allows(&host_of(&sor)), "boss-core reads the list");
+    assert_eq!(
+        boss_core::machine_token::HOSTS_ENV,
+        "BOSS_MACHINE_TOKEN_HOSTS",
+        "the renderer and boss-core name one variable"
+    );
     // A comment saying where it came from and not to edit it: the next
     // converge rewrites the file.
     assert!(r.out.starts_with("# /etc/boss/sor.env"), "{}", r.out);

@@ -1,0 +1,13 @@
+{
+  "about": "READ-ONLY: renders what `retire-ops-runner` WOULD do on this host, and stops nothing (infra/ops/retire-ops-runner.sh --dry-run; backlog 98eb9349, design a79a8067). It runs every bound the write runs — HOST_ID and OPS_REQUEST_ID from the runner; this host's roles read LIVE from the estate registry and judged by install-ops-runner.sh --in-role (still declaring ops-runner, declaring none, or a cached or dark read is a refusal); another host this verb serves (forge, boss-gcp) still declaring ops-runner — declared, not proven alive, which the plan states; no other open ops-request for this host, read with its own control (this request on the read, every row this host's, the rows the server's whole total); boss-ops-runner.timer still on — and then prints the plan: the host and request, the roles read, the other runners, the queue read, the timer's is-enabled and is-active words, the marker it would write, the one act (systemctl disable --now boss-ops-runner.timer), that boss-ops-runner.service is never touched, and that the next converge reports RETIRED and removes the unit files. No clock in the bytes; its sha256 is printed on stderr as `plan-sha256:`, and that hash is what David's passkey signs (design 17835005 q1). Any refusal renders no plan. The live roles read refreshes the host converge's roles cache, as the converge's own read does. Filed on its own, it is the dry run on a host: its output names the live role read and the queue read.",
+  "hosts": [
+    "forge",
+    "boss-gcp"
+  ],
+  "argv": [
+    "infra/ops/retire-ops-runner.sh",
+    "--dry-run"
+  ],
+  "params": [],
+  "timeout": 60
+}

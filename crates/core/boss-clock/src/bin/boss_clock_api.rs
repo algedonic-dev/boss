@@ -164,6 +164,21 @@ async fn main() -> Result<()> {
         (ClockMode::Wall, _) => (Arc::new(RwLock::new(None)), None),
     };
 
+    // The machine gate states what it would refuse on the log whatever
+    // the clock's mode (design 21946380): wall mode keeps no pool of its
+    // own, so the gate's outbox takes a lazy one on the same URL, which
+    // opens nothing until the first fact.
+    let recorder = match (&pool, &cli.postgres_url) {
+        (Some(pool), _) => Some(boss_events::outbox::PgOutboxRecorder::shared(pool)),
+        (None, Some(url)) => Some(boss_events::outbox::PgOutboxRecorder::shared(
+            &sqlx::postgres::PgPoolOptions::new()
+                .max_connections(2)
+                .connect_lazy(url)
+                .with_context(|| "reading the Postgres URL for the machine gate's outbox")?,
+        )),
+        (None, None) => None,
+    };
+
     let state = ClockApiState { mode, params, pool };
 
     // Sim mode with a pool: the DB `sim_clock` row is the source of
@@ -192,7 +207,7 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding HTTP listener on {bind}"))?;
     info!(addr = %bind, "boss-clock-api listening");
-    let app = boss_core::machine_gate::mount(app, "clock", &["/api/clock/health"]);
+    let app = boss_core::machine_gate::mount(app, "clock", &["/api/clock/health"], recorder);
     axum::serve(listener, app).await?;
     Ok(())
 }

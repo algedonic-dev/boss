@@ -74,6 +74,7 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use boss_core::machine_token::TOKEN_DIR_ENV;
 use boss_policy_client::{PermissivePolicyClient, PolicyClient};
 use boss_testing::{TestDb, repo_root, scratch_dir};
 use serde_json::{Value, json};
@@ -83,6 +84,14 @@ const FIXTURE: &str = "crates/orchestrators/boss-cli/tests/fixtures/tenant-alged
 const OPERATOR_HIRES: &str = "infra/operator-baseline/operator_hires.toml";
 const FOUNDER_EMAIL: &str = "david@algedonic.dev";
 const FOUNDER_ID: &str = "emp-david";
+
+/// The token directory every spawned `boss` is handed: a scratch dir
+/// that holds no `current`, so the production build this test runs
+/// never reads the pod's mounted Secret (backlog 2ee29275). Pinned by
+/// `no_test_builds_a_client_on_the_live_token`.
+fn no_machine_token() -> PathBuf {
+    scratch_dir("no-machine-token")
+}
 
 /// The real people, locations, calendar and policy routers over `pool`,
 /// plus a stub for the doors outside this proof, on one ephemeral port
@@ -156,8 +165,13 @@ async fn serve(pool: PgPool) -> String {
         .await
         .expect("the default rules reconcile into an empty policy_rules");
     let engine = Arc::new(boss_policy::PolicyEngine::new(repo.clone()));
-    let policy_router =
-        boss_policy::http::router(boss_policy::http::PolicyApiState { repo, engine });
+    // The policy check mode as it ships: `off` (backlog b8e75382 F7).
+    let check_mode = boss_policy::check_mode::CheckMode::fixed(boss_policy::check_mode::Mode::Off);
+    let policy_router = boss_policy::http::router(boss_policy::http::PolicyApiState {
+        repo,
+        engine,
+        check_mode,
+    });
     let outside_this_proof = Router::new()
         .route(
             "/api/classes/batch",
@@ -245,7 +259,8 @@ fn boss_tenant_publish_taking(dir: &Path, base: &str, take: Option<&str>) -> (bo
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_boss"));
     cmd.args(["tenant", "publish"])
         .arg(dir)
-        .args(["--gateway", base]);
+        .args(["--gateway", base])
+        .env(TOKEN_DIR_ENV, no_machine_token());
     if let Some(t) = take {
         cmd.args(["--take", t]);
     }
@@ -273,7 +288,14 @@ async fn operator_baseline(
     unsafe { std::env::set_var("BOSS_BOOTSTRAP_ADMIN_EMAIL", FOUNDER_EMAIL) };
     let seeds = repo_root().join(OPERATOR_HIRES);
     tokio::task::spawn_blocking(move || {
-        boss_people::operator_baseline::seed(&base, &seeds, tenant_dir.as_deref())
+        // A FIXED source holding no token, never the process's live one
+        // (backlog 2ee29275, F2): a failing test prints what it sent.
+        let client = boss_core::machine_token::BlockingClient::build_with_source(
+            reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(15)),
+            Arc::new(boss_core::machine_token::Source::fixed(None)),
+        )
+        .expect("a blocking client");
+        boss_people::operator_baseline::seed(&client, &base, &seeds, tenant_dir.as_deref())
     })
     .await
     .unwrap()
@@ -894,10 +916,13 @@ fn boss_unnamed(db: Option<&TestDb>, args: &[&str], take: Option<&str>) -> (i32,
     };
     // Unnamed, as the launcher runs: the stamp then records the id
     // the writes were signed with, not whoever runs this test.
-    cmd.args(args).env_remove("BOSS_ACTOR").env(
-        "BOSS_ACTOR_FILE",
-        scratch_dir("tenant-stamp-unnamed").join("no-actor-file"),
-    );
+    cmd.args(args)
+        .env_remove("BOSS_ACTOR")
+        .env(
+            "BOSS_ACTOR_FILE",
+            scratch_dir("tenant-stamp-unnamed").join("no-actor-file"),
+        )
+        .env(TOKEN_DIR_ENV, no_machine_token());
     if let Some(t) = take {
         cmd.args(["--take", t]);
     }
@@ -928,6 +953,7 @@ async fn a_successful_publish_stamps_the_database_once_per_run_and_published_rea
     // the launcher publishes on 1 and says why on 2.
     let out = Command::new(env!("CARGO_BIN_EXE_boss"))
         .args(["tenant", "published"])
+        .env(TOKEN_DIR_ENV, no_machine_token())
         .env_remove("BOSS_POSTGRES_URL")
         .output()
         .unwrap();

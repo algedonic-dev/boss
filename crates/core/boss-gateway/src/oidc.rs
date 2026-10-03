@@ -723,7 +723,7 @@ mod tests {
             store,
             session_key: vec![9u8; 32],
             http: reqwest::Client::new(),
-            machine: crate::machine_client::MachineClient::build(reqwest::Client::builder())
+            machine: crate::machine_client::MachineClient::unstamped(reqwest::Client::builder())
                 .unwrap(),
             audit,
             guest_access: crate::local_auth::GuestAccess::Off,

@@ -70,20 +70,16 @@ fn admin_header() -> String {
 fn job_at(id: &str, title: &str) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
-        kind: "backlog-item".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "bosspipeline"),
-        title: title.into(),
-        owner_id: "emp-op".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "backlog-item",
+            Subject::new("custom", "bosspipeline"),
+            title,
+            "emp-op",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+        )
     }
 }
 

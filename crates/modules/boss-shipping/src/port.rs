@@ -16,6 +16,86 @@ pub enum ShippingError {
     NotFound(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    /// The caller's request can never be stored as sent — a negative
+    /// limit, a line item of no units, a NUL byte, an update whose body
+    /// names another id. Named by the adapters-agree suite (backlog
+    /// be459ab9): until 2026-10-01 each reached Postgres and came back
+    /// as `Storage` (a 500) while the in-memory double accepted it.
+    #[error("invalid: {0}")]
+    Invalid(String),
+}
+
+/// Refuse a shipment no adapter can store as sent: a NUL byte in any
+/// text field (Postgres TEXT cannot hold one) or a line item of no
+/// units (the `qty > 0` CHECK). Both adapters call this one function so
+/// they refuse the same things with the same words.
+pub fn validate_shipment(s: &Shipment) -> Result<(), ShippingError> {
+    let opt = |v: &Option<String>| v.clone().unwrap_or_default();
+    let mut texts: Vec<(String, String)> = vec![
+        ("id".into(), s.id.clone()),
+        ("status".into(), s.status.as_str().into()),
+        (
+            "carrier".into(),
+            s.carrier
+                .as_ref()
+                .map(|c| c.as_str().to_string())
+                .unwrap_or_default(),
+        ),
+        ("tracking_number".into(), opt(&s.tracking_number)),
+        ("origin".into(), s.origin.clone()),
+        ("destination".into(), s.destination.clone()),
+        ("po_id".into(), opt(&s.po_id)),
+        ("order_id".into(), opt(&s.order_id)),
+        ("account_id".into(), opt(&s.account_id)),
+    ];
+    texts.extend(
+        s.asset_ids
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (format!("asset_ids[{i}]"), a.clone())),
+    );
+    for (i, line) in s.line_items.iter().enumerate() {
+        texts.push((format!("line_items[{i}].sku"), line.sku.clone()));
+        texts.push((
+            format!("line_items[{i}].description"),
+            opt(&line.description),
+        ));
+        if line.qty <= 0 {
+            return Err(ShippingError::Invalid(format!(
+                "line_items[{i}].qty must be positive, got {}",
+                line.qty
+            )));
+        }
+    }
+    match texts.into_iter().find(|(_, v)| v.contains('\0')) {
+        Some((field, _)) => Err(ShippingError::Invalid(format!(
+            "{field} carries a NUL byte, which cannot be stored"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Refuse an update whose body names another id than the one it
+/// updates: it would rename the row in one adapter and write a second
+/// row in the other.
+pub fn validate_update(id: &str, s: &Shipment) -> Result<(), ShippingError> {
+    if s.id != id {
+        return Err(ShippingError::Invalid(format!(
+            "update of {id} carries a body naming {}",
+            s.id
+        )));
+    }
+    validate_shipment(s)
+}
+
+/// Refuse a negative page bound by name.
+pub fn validate_bound(field: &str, n: i64) -> Result<(), ShippingError> {
+    if n < 0 {
+        return Err(ShippingError::Invalid(format!(
+            "{field} must not be negative, got {n}"
+        )));
+    }
+    Ok(())
 }
 
 /// Persistence port for shipments.
@@ -35,10 +115,15 @@ pub enum ShippingError {
 /// Nothing publishes post-commit.
 #[async_trait]
 pub trait ShippingRepository: Send + Sync {
-    /// Return every shipment.
+    /// Return every shipment, newest `created_on` first, then by id in
+    /// byte order. A shipment's asset ids answer in byte order, each
+    /// once; its line items in authoring order. Held to both adapters by
+    /// `tests/the_adapters_agree_on_the_shipment_store_pg.rs`.
     async fn all_shipments(&self) -> Result<Vec<Shipment>, ShippingError>;
 
-    /// Return a page of shipments with total count.
+    /// Return a page of shipments with total count, cut from the order
+    /// of [`Self::all_shipments`]; a negative `limit` or `offset` is
+    /// refused `Invalid`.
     /// `account_id` filters to a single account when `Some`. The account
     /// detail view uses this to scope the shipments section.
     async fn list_shipments(
@@ -51,7 +136,9 @@ pub trait ShippingRepository: Send + Sync {
     /// Return a single shipment by ID, or `None` if not found.
     async fn shipment_by_id(&self, id: &str) -> Result<Option<Shipment>, ShippingError>;
 
-    /// Create a new shipment. Returns the ID. Errors if ID already exists.
+    /// Create a new shipment. Returns the ID. Errors `Conflict` if ID
+    /// already exists, writing and recording nothing; a body
+    /// [`validate_shipment`] refuses is `Invalid`.
     /// Records `shipping.shipment.created` (full row state) in-tx.
     async fn create_shipment(&self, shipment: &Shipment) -> Result<String, ShippingError> {
         let stamp = EventStamp::new("shipping", ActorId::Automation("platform".into()));

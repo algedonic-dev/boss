@@ -224,13 +224,26 @@ async fn a_claim_and_a_completion_signed_with_the_alias_carry_the_agent_id() {
         "the claim path writes user.id, so the id must already be resolved: {claimed}"
     );
 
+    // The evidence through the step merge door, then the status alone:
+    // the step PUT writes no metadata (e39a9d2a).
+    let (status, body) = send(
+        &app,
+        req(
+            "PATCH",
+            &format!("/api/jobs/{job_id}/steps/{scope_id}/metadata"),
+            ALIAS,
+            serde_json::json!({"summary": "s", "excludes": "e"}),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "scope evidence: {status}: {body}");
     let (status, body) = send(
         &app,
         req(
             "PUT",
             &format!("/api/jobs/{job_id}/steps/{scope_id}"),
             ALIAS,
-            scope_completion(&scope_step(&app, &job_id).await["metadata"]),
+            serde_json::json!({"status": "completed"}),
         ),
     )
     .await;
@@ -345,15 +358,4 @@ async fn reads_and_non_address_ids_count_nothing() {
             && actors.contains(&"automation:train-conductor".to_string()),
         "non-alias ids pass through the door untouched: {actors:?}"
     );
-}
-
-/// The scope completion as a read-merge-write: the step's stored
-/// metadata with the evidence laid over it. The step PUT refuses a
-/// metadata body that omits a stored key (e39a9d2a), so a completer
-/// sends back everything it read.
-fn scope_completion(stored: &serde_json::Value) -> serde_json::Value {
-    let mut metadata = stored.clone();
-    metadata["summary"] = serde_json::json!("s");
-    metadata["excludes"] = serde_json::json!("e");
-    serde_json::json!({"status": "completed", "metadata": metadata})
 }

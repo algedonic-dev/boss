@@ -134,8 +134,9 @@ function siding(name: RegionName, first: RegionName, last: RegionName): Territor
 // proposes to the public mirror, so it hangs under arrivals and the shed.
 const garage = siding('garage', 'gates', 'track');
 const publish = siding('publish', 'arrivals', 'shed');
+const sensors = siding('sensors', 'receiving', 'marshalling');
 
-export const TERRITORIES: ReadonlyArray<Territory> = [...line, garage, publish];
+export const TERRITORIES: ReadonlyArray<Territory> = [...line, garage, publish, sensors];
 
 // THE BORDERS ARE NOT HERE (design e765b3fc, car R3). This file declared
 // the ten pairs WorldMap drew rails for, one of three hand copies (with

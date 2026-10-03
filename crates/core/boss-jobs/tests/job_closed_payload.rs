@@ -224,8 +224,10 @@ async fn drive_to_quiescence(app: &axum::Router, job_id: &str, choose: &dyn Fn(&
         }
         for s in actionable {
             let step_id = s["id"].as_str().expect("step id");
-            // Merge, never replace: `authority_role` shares this object.
-            let mut metadata = s["metadata"].clone();
+            // Only the filled keys, through the step merge door — it
+            // keeps every unsent key (`authority_role` shares this
+            // object), and the PUT writes no metadata since e39a9d2a.
+            let mut metadata = serde_json::json!({});
             for f in s["fields"].as_array().into_iter().flatten() {
                 if f["required"].as_bool() != Some(true) {
                     continue;
@@ -233,6 +235,24 @@ async fn drive_to_quiescence(app: &axum::Router, job_id: &str, choose: &dyn Fn(&
                 let name = f["name"].as_str().unwrap_or_default();
                 let declared = f["field_type"].as_str().unwrap_or_default();
                 metadata[name] = serde_json::Value::String(choose(declared));
+            }
+            if metadata.as_object().is_some_and(|keys| !keys.is_empty()) {
+                let (status, body) = send(
+                    app,
+                    Request::builder()
+                        .method("PATCH")
+                        .uri(format!("/api/jobs/{job_id}/steps/{step_id}/metadata"))
+                        .header("content-type", "application/json")
+                        .header("x-boss-user", admin_header())
+                        .body(Body::from(metadata.to_string()))
+                        .unwrap(),
+                )
+                .await;
+                assert!(
+                    status.is_success(),
+                    "writing `{}`'s keys failed with {status}: {body}",
+                    s["title"].as_str().unwrap_or("?"),
+                );
             }
             let (status, body) = send(
                 app,
@@ -242,8 +262,7 @@ async fn drive_to_quiescence(app: &axum::Router, job_id: &str, choose: &dyn Fn(&
                     .header("content-type", "application/json")
                     .header("x-boss-user", admin_header())
                     .body(Body::from(
-                        serde_json::json!({ "status": "completed", "metadata": metadata })
-                            .to_string(),
+                        serde_json::json!({ "status": "completed" }).to_string(),
                     ))
                     .unwrap(),
             )

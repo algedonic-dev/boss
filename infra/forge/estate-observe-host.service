@@ -58,4 +58,13 @@ ExecStart=/home/david/boss/infra/estate/observe-host.sh
 # one, so while the host observation cannot post (the record is dark)
 # this is not read either — and it could not have posted.
 ExecStart=-/home/david/boss/infra/estate/observe-nodefs.sh
+# Every instance volume's filesystem — each PersistentVolumeClaim in the
+# instance namespaces, capacity and free, from the kubelet's volume
+# stats through the admin kubeconfig (backlog 21ee3b4e, incident
+# d3c0a67c: the system of record's Postgres volume filled and nothing
+# was watching). THIRD and `-` for the nodefs line's reasons: the
+# forge's own reading never waits on it, and a claim that cannot be read
+# is recorded unread, not a failed unit. Five nodes' summaries are
+# bounded at 20s each, inside the ten minutes above.
+ExecStart=-/home/david/boss/infra/estate/observe-volumes.sh
 ExecStopPost=-/home/david/boss/infra/boss-step.sh maintenance-estate-observe-host run

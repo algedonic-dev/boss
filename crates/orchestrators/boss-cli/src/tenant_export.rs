@@ -126,19 +126,23 @@ pub struct Snapshot {
 // Reading the instance
 // ---------------------------------------------------------------------------
 
-fn seed_client() -> Result<BlockingClient> {
+fn seed_client(bases: &Bases) -> Result<BlockingClient> {
+    // Stamps the machine token per request and follows no redirect
+    // (design 6805c764 car 2, the CLI slice): the gate guards reads too.
+    // Through a gateway it stamps nothing (backlog 2ee29275), the rule
+    // publish takes, from the one function both walks call.
+    crate::tenant_publish::walk_client(bases, seed_builder(), boss_core::machine_token::shared())
+}
+
+fn seed_builder() -> reqwest::blocking::ClientBuilder {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         "x-boss-user",
         reqwest::header::HeaderValue::from_static(SEED_USER),
     );
-    // Stamps the machine token per request and follows no redirect
-    // (design 6805c764 car 2, the CLI slice): the gate guards reads too.
-    Ok(BlockingClient::build(
-        reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .default_headers(headers),
-    )?)
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .default_headers(headers)
 }
 
 fn get(client: &BlockingClient, base: &str, path: &str) -> Result<Value> {
@@ -193,7 +197,7 @@ fn str_of<'a>(v: &'a Value, key: &str) -> &'a str {
 /// Read every registry through the doors. Blocking HTTP — call from
 /// `spawn_blocking`.
 pub fn read_instance(bases: &Bases, tenant_id: &str) -> Result<Snapshot> {
-    let client = seed_client()?;
+    let client = seed_client(bases)?;
     let source = format!("tenant:{tenant_id}");
 
     let kinds = list(&client, &bases.subjects, "/api/subject-kinds")?;
@@ -1083,8 +1087,12 @@ mod tests {
             );
             sock.write_all(resp.as_bytes()).unwrap();
         });
-        let why = list(&seed_client().unwrap(), &base, "/api/agents")
-            .expect_err("one row of two is a page, not the registry");
+        let why = list(
+            &BlockingClient::unstamped(seed_builder()).unwrap(),
+            &base,
+            "/api/agents",
+        )
+        .expect_err("one row of two is a page, not the registry");
         server.join().unwrap();
         let why = format!("{why:#}");
         assert!(why.contains("/api/agents"), "names the door: {why}");

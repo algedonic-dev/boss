@@ -20,7 +20,9 @@
 #   * a RESERVED domain that names nobody: example.com/net/org, any
 #     `.example`, `.invalid`, `.test`, `.local`, `.localhost`, or
 #   * GitHub's per-account no-reply (`users.noreply.github.com`), which
-#     is a commit identity, not a mailbox, or
+#     is a commit identity, not a mailbox (whether a PERSON'S GitHub
+#     identity may appear at all is no-github-path-outside-the-org.sh's
+#     question, and it refuses one), or
 #   * any `noreply@` / `no-reply@` / `no_reply@` local part: a mailbox
 #     nobody reads is a machine's, not a person's. The commit trailer
 #     every car carries (`Co-Authored-By: … <noreply@anthropic.com>`)

@@ -1,5 +1,5 @@
 //! What is stuck, per third (backlog 4142d821, design cf820810 car 2) —
-//! and [`THIRDS`], the partition of the ten regions into the operator
+//! and [`THIRDS`], the partition of the regions into the operator
 //! surface's three thirds.
 
 use super::*;
@@ -10,7 +10,7 @@ use super::*;
 /// order.
 ///
 /// A PARTITION since design 00774ca8 decision 1 (approved 2026-09-24):
-/// every one of the ten [`REGIONS`] belongs to exactly one third, pinned
+/// every one of the [`REGIONS`] belongs to exactly one third, pinned
 /// by `every_region_stands_in_exactly_one_third`. Until then the table
 /// listed only the regions whose populations make up each third's stuck
 /// figure (design cf820810 Q2), and the HUD would have had to hold the
@@ -18,7 +18,7 @@ use super::*;
 /// (CLAUDE.md 9a). [`stuck`] still reads only the regions that have a
 /// stuck part; the others simply contribute none.
 pub const THIRDS: [(&str, &[&str]); 3] = [
-    ("queue-management", &["receiving", "marshalling"]),
+    ("queue-management", &["sensors", "receiving", "marshalling"]),
     ("actors-building", &["shop-floor", "gates", "garage"]),
     (
         "delivery",
@@ -552,6 +552,7 @@ mod tests {
         status.held_cars = vec![crate::yard::HeldCar {
             car: crate::yard::dock_car(&held),
             reason: "wait for the migration".into(),
+            kind: crate::yard::CarHoldKind::Operator,
         }];
         status.held = vec![crate::yard::HeldGreen {
             branch: "feat/held-green".into(),

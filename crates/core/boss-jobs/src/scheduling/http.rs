@@ -11,7 +11,7 @@ use boss_clock_client::ClockClient;
 use boss_core::publisher::DomainPublisher;
 use boss_core::roles::{ANONYMOUS_VISITOR_IDS, PLATFORM_ADMIN_ROLE, is_anonymous_visitor_role};
 use boss_policy_client::writes::{require_reaching, require_reaching_row};
-use boss_policy_client::{Action, CurrentUser, PolicyClient, Resource, User};
+use boss_policy_client::{CurrentUser, Pair, PolicyClient, User, controls};
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use uuid::Uuid;
@@ -165,17 +165,10 @@ async fn list_avail(
 async fn may_write(
     state: &SchedulingApiState,
     user: &User,
-    action: Action,
+    control: Pair,
     employee: Option<&str>,
 ) -> Result<(), Response> {
-    require_reaching(
-        state.policy.as_ref(),
-        user,
-        action,
-        Resource::schedule(),
-        employee,
-    )
-    .await
+    require_reaching(state.policy.as_ref(), user, control, employee).await
 }
 
 /// Gate one write BY ID on `owner`, the employee the stored row belongs
@@ -187,17 +180,10 @@ async fn may_write(
 async fn may_write_row(
     state: &SchedulingApiState,
     user: &User,
-    action: Action,
+    control: Pair,
     owner: Option<&str>,
 ) -> Result<(), Response> {
-    require_reaching_row(
-        state.policy.as_ref(),
-        user,
-        action,
-        Resource::schedule(),
-        owner,
-    )
-    .await
+    require_reaching_row(state.policy.as_ref(), user, control, owner).await
 }
 
 async fn create_avail(
@@ -205,7 +191,14 @@ async fn create_avail(
     CurrentUser(user): CurrentUser,
     Json(body): Json<NewTechAvailability>,
 ) -> Response {
-    if let Err(refused) = may_write(&state, &user, Action::Create, Some(&body.employee_id)).await {
+    if let Err(refused) = may_write(
+        &state,
+        &user,
+        controls::CREATE_SCHEDULE,
+        Some(&body.employee_id),
+    )
+    .await
+    {
         return refused;
     }
     // OUTBOX (phase 2): the adapter records the scheduling events
@@ -226,7 +219,14 @@ async fn delete_avail(
         Ok(row) => row.map(|r| r.employee_id),
         Err(e) => return err(e),
     };
-    if let Err(refused) = may_write_row(&state, &user, Action::Delete, employee.as_deref()).await {
+    if let Err(refused) = may_write_row(
+        &state,
+        &user,
+        controls::DELETE_SCHEDULE,
+        employee.as_deref(),
+    )
+    .await
+    {
         return refused;
     }
     let now = boss_clock_client::now_from(&state.clock).await;
@@ -278,7 +278,14 @@ async fn create_assign(
     CurrentUser(user): CurrentUser,
     Json(body): Json<NewScheduledAssignment>,
 ) -> Response {
-    if let Err(refused) = may_write(&state, &user, Action::Create, Some(&body.tech_id)).await {
+    if let Err(refused) = may_write(
+        &state,
+        &user,
+        controls::CREATE_SCHEDULE,
+        Some(&body.tech_id),
+    )
+    .await
+    {
         return refused;
     }
     let stamp = event_stamp(&state).await;
@@ -313,7 +320,7 @@ async fn get_assign(
 async fn may_write_assignment(
     state: &SchedulingApiState,
     user: &User,
-    action: Action,
+    control: Pair,
     id: Uuid,
 ) -> Result<(), Response> {
     let tech = state
@@ -322,7 +329,7 @@ async fn may_write_assignment(
         .await
         .map_err(err)?
         .map(|row| row.tech_id);
-    may_write_row(state, user, action, tech.as_deref()).await
+    may_write_row(state, user, control, tech.as_deref()).await
 }
 
 async fn delete_assign(
@@ -330,7 +337,7 @@ async fn delete_assign(
     CurrentUser(user): CurrentUser,
     Path(id): Path<Uuid>,
 ) -> Response {
-    if let Err(refused) = may_write_assignment(&state, &user, Action::Delete, id).await {
+    if let Err(refused) = may_write_assignment(&state, &user, controls::DELETE_SCHEDULE, id).await {
         return refused;
     }
     let now = boss_clock_client::now_from(&state.clock).await;
@@ -352,7 +359,7 @@ async fn update_assign_status(
     Path(id): Path<Uuid>,
     Json(body): Json<StatusBody>,
 ) -> Response {
-    if let Err(refused) = may_write_assignment(&state, &user, Action::Update, id).await {
+    if let Err(refused) = may_write_assignment(&state, &user, controls::UPDATE_SCHEDULE, id).await {
         return refused;
     }
     let now = boss_clock_client::now_from(&state.clock).await;
@@ -418,7 +425,14 @@ async fn upsert_shift(
     CurrentUser(user): CurrentUser,
     Json(body): Json<UpsertShiftBody>,
 ) -> Response {
-    if let Err(refused) = may_write(&state, &user, Action::Create, Some(&body.employee_id)).await {
+    if let Err(refused) = may_write(
+        &state,
+        &user,
+        controls::CREATE_SCHEDULE,
+        Some(&body.employee_id),
+    )
+    .await
+    {
         return refused;
     }
     let eff = body
@@ -459,7 +473,7 @@ async fn materialize(
     CurrentUser(user): CurrentUser,
     Json(body): Json<MaterializeBody>,
 ) -> Response {
-    if let Err(refused) = may_write(&state, &user, Action::Create, None).await {
+    if let Err(refused) = may_write(&state, &user, controls::CREATE_SCHEDULE, None).await {
         return refused;
     }
     match super::materialize::materialize_next(state.repo.as_ref(), body.weeks_ahead).await {

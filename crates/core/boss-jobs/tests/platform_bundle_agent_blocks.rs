@@ -128,6 +128,13 @@ fn the_steps_agents_execute_today_declare_their_agent_block() {
         // 3): a scoped resolve-and-regate car, not a design — the same
         // setting as doc-flatten's `curate`.
         "rerail-a-car/rerail builder $3.00 medium",
+        // The adversarial review of a held car (backlog bc9ef34f,
+        // 2026-09-30): `boss dispatch` refused the step by name, so
+        // every review was a bare agent-run filed and closed by hand
+        // (23 of them read TROUBLED on 2026-09-29). A read and a
+        // verdict on a trust-boundary car, no car of its own: the
+        // reviewer setting, at the effort trust-boundary work runs at.
+        "ship-a-change/review reviewer $3.00 high",
     ]
     .into_iter()
     .map(str::to_string)
@@ -136,8 +143,8 @@ fn the_steps_agents_execute_today_declare_their_agent_block() {
 }
 
 /// What the profile still fixes, now that it no longer fixes the
-/// effort: the rules document the run is briefed with, and so the two
-/// names a claim door knows. Plus the one priced model on every block
+/// effort: the rules document the run is briefed with, and so the
+/// names a claim door knows (three since `reviewer`, bc9ef34f). Plus the one priced model on every block
 /// — a step naming a model `agent_rate_card` cannot price would run
 /// unpriced — and a budget inside the cap a builder's car carries, so
 /// a typo'd `50` is a red test rather than an hour of the agent's
@@ -150,7 +157,7 @@ fn every_block_names_a_known_profile_a_priced_model_and_a_bounded_budget() {
             let at = format!("{}/{}", w.kind, s.title);
             assert_eq!(a.model, "opus-5[1m]", "{at}");
             assert!(
-                matches!(a.profile.as_str(), "builder" | "analyst"),
+                matches!(a.profile.as_str(), "builder" | "analyst" | "reviewer"),
                 "{at}: unexpected profile {}",
                 a.profile
             );

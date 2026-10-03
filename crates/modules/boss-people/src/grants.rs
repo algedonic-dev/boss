@@ -15,25 +15,24 @@ use std::sync::Arc;
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use boss_policy::{AccessTier, Action, Decision, Resource, Scope, User};
-use boss_policy_client::PolicyClient;
+use boss_policy::{AccessTier, Decision, Scope, User};
+use boss_policy_client::{Pair, PolicyClient, controls};
 use serde::Serialize;
 
-/// Ask policy for `action` on `resource`, answering the scope granted
-/// or the response that refuses. `None` policy allows at `All`: that
-/// is the test path the write gate has always had (the binary wires a
+/// Ask policy for a declared control, answering the scope granted or
+/// the response that refuses. `None` policy allows at `All`: that is
+/// the test path the write gate has always had (the binary wires a
 /// client since 8cdad84c). A policy service that cannot answer refuses
 /// with 500 — a gate that cannot be asked is not a gate that passed.
 pub(crate) async fn require(
     policy: Option<&Arc<dyn PolicyClient>>,
     user: &User,
-    action: Action,
-    resource: Resource,
+    control: Pair,
 ) -> Result<Scope, Response> {
     let Some(policy) = policy else {
         return Ok(Scope::All);
     };
-    match policy.check(user, action, resource).await {
+    match policy.ask(user, control).await {
         Ok(Decision::Allow { scope }) => Ok(scope),
         Ok(Decision::Deny { reason }) => Err((StatusCode::FORBIDDEN, reason).into_response()),
         Err(e) => Err(e.into_response()),
@@ -64,7 +63,7 @@ pub(crate) async fn roster_scope(
     if user.access_tier == AccessTier::Operator {
         return Ok(Scope::All);
     }
-    require(policy, user, Action::Read, Resource::employee()).await
+    require(policy, user, controls::READ_EMPLOYEE).await
 }
 
 /// Whether a roster read in `scope` shows `employee_id`'s row. A
@@ -90,10 +89,7 @@ pub(crate) async fn compensation_scope(
     user: &User,
 ) -> Option<Scope> {
     let policy = policy?;
-    match policy
-        .check(user, Action::Read, Resource::compensation())
-        .await
-    {
+    match policy.ask(user, controls::READ_COMPENSATION).await {
         Ok(Decision::Allow { scope }) => Some(scope),
         Ok(Decision::Deny { .. }) => None,
         Err(e) => {
@@ -162,7 +158,7 @@ impl ChangeReader {
         policy: Option<&Arc<dyn PolicyClient>>,
         user: User,
     ) -> Result<Self, Response> {
-        let read = require(policy, &user, Action::Read, Resource::employee()).await?;
+        let read = require(policy, &user, controls::READ_EMPLOYEE).await?;
         let pay = compensation_scope(policy, &user).await;
         Ok(Self { user, read, pay })
     }
@@ -222,6 +218,7 @@ impl ChangeReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boss_policy::{Action, Resource};
     use boss_policy_client::FakePolicyClient;
     use serde_json::json;
 

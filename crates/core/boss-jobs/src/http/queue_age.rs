@@ -24,7 +24,7 @@ pub(super) async fn list_queue_age<R: JobsRepository + 'static, B: EventBus + 's
     // The job read gate, scoped — same shape as the station surfaces:
     // an unreadable caller gets an empty lens, not a 403, and a
     // partially-scoped one sees exactly their slice of the network.
-    let predicate = match state.policy.scope_predicate(&user, Resource::job()).await {
+    let predicate = match state.policy.scope_of(&user, controls::READ_JOB).await {
         Ok(p) => p,
         Err(e) => {
             return e.into_response();
@@ -33,7 +33,7 @@ pub(super) async fn list_queue_age<R: JobsRepository + 'static, B: EventBus + 's
     if matches!(predicate, boss_policy_client::Predicate::None) {
         return Json(serde_json::json!({ "data": [], "total": 0 })).into_response();
     }
-    let scope = job_scope_from_predicate(&user, &predicate);
+    let scope = JobScope::from_predicate(&user, &predicate);
     let now = boss_clock_client::now_from(&state.clock).await;
     match state.jobs.queue_age(&scope).await {
         Ok(rows) => {

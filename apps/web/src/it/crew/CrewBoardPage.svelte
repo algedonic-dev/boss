@@ -22,6 +22,7 @@
   import { href } from '../../router';
   import type { Deck } from '../yard/world-interior';
   import { actors } from '../yard/shop-floor';
+  import RuntimeRoster from './RuntimeRoster.svelte';
   import {
     actorCards,
     CAR_WINDOW,
@@ -170,6 +171,8 @@
       subtitle="Who is building what, right now — the interval between work waiting and work landed"
     />
   {/if}
+
+  <RuntimeRoster />
 
   {#if !crew}
     <p class="crew-quiet">Reading the pipeline…</p>

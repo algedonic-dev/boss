@@ -73,6 +73,32 @@ pub const OUTCOME_DEAD_LETTER: &str = "dead-letter";
 /// re-exports this one; the rollup below reads it.
 pub const DEAD_LETTER_KEY: &str = "dead_letter";
 
+/// Which firing of a rule is its NEWEST: the later `fired_at`, and at
+/// one instant the greater `firing_id` in byte order. The primary key
+/// makes that a total order, so "the newest" names one row.
+///
+/// WHY IT EXISTS (backlog be459ab9, found by the adapters-agree suite,
+/// 2026-09-29). Two firings of one rule can share an instant — a clock
+/// tick and an event, or two events stamped by one clock reading — and
+/// the order said nothing past `fired_at`. Postgres answered whichever
+/// tied row its plan met first; the double's `last_firing` answered the
+/// LAST one declared and its `last_firings` the FIRST, so the world map
+/// and the rules list could name two different topics for one rule. The
+/// cadence record has the same class (backlog af532492).
+///
+/// The in-memory adapter orders by this key; [`NEWEST_FIRST`] is the
+/// same order spelled for SQL, and
+/// `the_adapters_agree_on_the_dispatcher_firings_pg.rs` holds the two
+/// to each other on a tie whose ids a locale and byte order disagree on.
+pub fn recency(f: &LastFiring) -> (DateTime<Utc>, &str) {
+    (f.fired_at, f.firing_id.as_str())
+}
+
+/// [`recency`], descending, as an `ORDER BY` both Postgres reads end
+/// with. `COLLATE "C"` is byte order — Rust's `str` order — where the
+/// database's locale would ignore case and punctuation.
+pub const NEWEST_FIRST: &str = "fired_at DESC, firing_id COLLATE \"C\" DESC";
+
 #[derive(Debug, thiserror::Error)]
 pub enum DispatcherFiringsError {
     #[error("storage: {0}")]
@@ -283,16 +309,18 @@ impl DispatcherFiringsRepository for InMemoryDispatcherFirings {
             .iter()
             .filter(|(name, _)| name == rule)
             .map(|(_, f)| f)
-            .max_by_key(|f| f.fired_at)
+            .max_by_key(|f| recency(f))
             .cloned())
     }
 
+    /// The map's key order is byte order — the order "ordered by rule
+    /// name" means on both adapters.
     async fn last_firings(&self) -> Result<Vec<RuleLastFiring>, DispatcherFiringsError> {
         let mut newest: std::collections::BTreeMap<&str, &LastFiring> =
             std::collections::BTreeMap::new();
         for (rule, f) in &self.firings {
             let slot = newest.entry(rule.as_str()).or_insert(f);
-            if f.fired_at > slot.fired_at {
+            if recency(f) > recency(slot) {
                 *slot = f;
             }
         }
@@ -351,15 +379,16 @@ mod pg {
             &self,
             rule: &str,
         ) -> Result<Option<LastFiring>, DispatcherFiringsError> {
-            let row = sqlx::query(
+            let sql = format!(
                 "SELECT firing_id, fired_on, fired_at FROM dispatcher_firings \
-                 WHERE rule_name = $1 AND outcome = $2 ORDER BY fired_at DESC LIMIT 1",
-            )
-            .bind(rule)
-            .bind(OUTCOME_FIRED)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(storage)?;
+                 WHERE rule_name = $1 AND outcome = $2 ORDER BY {NEWEST_FIRST} LIMIT 1"
+            );
+            let row = sqlx::query(&sql)
+                .bind(rule)
+                .bind(OUTCOME_FIRED)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(storage)?;
             let Some(r) = row else { return Ok(None) };
             Ok(Some(LastFiring {
                 firing_id: r.try_get("firing_id").map_err(storage)?,
@@ -370,17 +399,25 @@ mod pg {
 
         /// `DISTINCT ON (rule_name)` walks the recency index
         /// (`rule_name, fired_at DESC`) and keeps each rule's first row —
-        /// one row per rule, however many firings the month holds.
+        /// one row per rule, however many firings the month holds; a tie
+        /// at one instant goes to [`NEWEST_FIRST`]'s second key. The
+        /// outer sort is the rule name in BYTE order (`COLLATE "C"`),
+        /// the double's map order — the locale's put `suite-ab` before
+        /// `suite-a-z` (backlog be459ab9) — and it sorts the one row per
+        /// rule, so the index still serves the scan.
         async fn last_firings(&self) -> Result<Vec<RuleLastFiring>, DispatcherFiringsError> {
-            let rows = sqlx::query(
-                "SELECT DISTINCT ON (rule_name) rule_name, fired_on, fired_at \
-                 FROM dispatcher_firings WHERE outcome = $1 \
-                 ORDER BY rule_name, fired_at DESC",
-            )
-            .bind(OUTCOME_FIRED)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(storage)?;
+            let sql = format!(
+                "SELECT rule_name, fired_on, fired_at FROM ( \
+                   SELECT DISTINCT ON (rule_name) rule_name, fired_on, fired_at \
+                   FROM dispatcher_firings WHERE outcome = $1 \
+                   ORDER BY rule_name, {NEWEST_FIRST} \
+                 ) newest ORDER BY rule_name COLLATE \"C\""
+            );
+            let rows = sqlx::query(&sql)
+                .bind(OUTCOME_FIRED)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(storage)?;
             rows.into_iter()
                 .map(|r| {
                     Ok(RuleLastFiring {
@@ -399,7 +436,7 @@ mod pg {
             let rows = sqlx::query(
                 "SELECT rule_name, count(*) AS n, max(fired_at) AS newest \
                  FROM dispatcher_firings WHERE outcome = $1 AND fired_at >= $2 \
-                 GROUP BY rule_name ORDER BY rule_name",
+                 GROUP BY rule_name ORDER BY rule_name COLLATE \"C\"",
             )
             .bind(OUTCOME_DEAD_LETTER)
             .bind(since)

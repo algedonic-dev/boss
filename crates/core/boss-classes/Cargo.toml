@@ -41,6 +41,8 @@ tracing-subscriber = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"], optional = true }
 
 [dev-dependencies]
+boss-policy = { path = "../boss-policy", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 boss-testing = { path = "../boss-testing", features = ["postgres"] }
 tower = { workspace = true }
 http-body-util = "0.1"

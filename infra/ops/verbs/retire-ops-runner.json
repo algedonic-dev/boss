@@ -1,0 +1,25 @@
+{
+  "about": "MUTATING — retire THIS host's ops-request runner by stopping and disabling exactly boss-ops-runner.timer, from inside the runner pass that runs this verb, and nothing else (infra/ops/retire-ops-runner.sh --for-real). Drop the ops-runner role from a host and its converge stops installing a runner but leaves the one already there claiming the host's ops-requests, reporting STILL INSTALLED on every packet (backlog 1c7f8f23); with no door the only way out was a hand SSH (backlog 98eb9349). THE VERB CANNOT RUN THROUGH ANOTHER DOOR, so the runner retires itself and the cut is behind the run, not under it: boss-ops-runner.service is the Type=oneshot pass the timer fires and this script runs inside one; stopping the timer does not stop a service run it already started (a timer only triggers its service), so the same pass completes its own execute step. THE SERVICE IS NEVER TOUCHED — only read, after the stop, so the record shows the pass survived. THE BOUNDS, each a refusal by name with nothing stopped: HOST_ID and OPS_REQUEST_ID from the runner; the host's roles read LIVE through infra/estate/node-roles.sh (a cached or dark read refuses) and judged by install-ops-runner.sh --in-role, so a host that still declares ops-runner — or declares no roles, which installs one — is refused, because its converge would enable --now the timer within the half hour (the live read also refreshes the converge's roles cache, so a dark tick cannot reinstall it); another host this verb serves (forge, boss-gcp — the hosts with a runner installer, read from this file) must still declare ops-runner (the estate never retires its last DECLARED door; whether that runner is alive is not checked, and the plan says so — recovery is to declare ops-runner here again, adversarial review 9c02f3b0 F2); no other ops-request may be open for this host, read with its own control (this very request must be on the read, every row this host's, the rows the server's whole total); one literal unit, never a param; a timer already off is refused. THE WITNESSES: before the stop it writes /var/lib/boss/ops-runner.retired naming the request and the UTC time; after it, is-enabled must answer disabled or masked and is-active inactive, each printed as read — any other word FAILS by name, and the marker follows what TOOK, not the exit: it stands while is-enabled reads disabled or masked, so a disable that failed part-way is still credited to this request rather than to a hand (review 9c02f3b0 F3), and goes when nothing durable took, no answer is CANNOT ANSWER; and the host's converge (install-ops-runner.sh), on its own timer and packet, reports RETIRED from the marker or DISABLED BY HAND without it, then removes the unit files and reports REMOVED. Undo needs no SSH: declare ops-runner again and the next converge reinstalls and enables the runner, removing the marker. AUTHORISED PER RUN BY DAVID'S PASSKEY in design 17835005's shape: requires_approval with the read-only plan-retire-ops-runner (this script's --dry-run) as its plan_verb; the script re-renders, every bound again, and stops nothing unless today's plan hashes to the signed one, which also refuses a second run of an applied plan. Authorized by David 2026-10-01 on design a79a8067 (Q1: admit it as a MUTATING verb on forge and boss-gcp, requires_approval with plan-retire-ops-runner, approvers emp-david, the same explicit per-verb process as retire-second-stack, design 9e3e093f — a precedent for the process, not a looser default); admitted by name in infra/lint/a-verb-declares-the-hosts-it-serves.sh.",
+  "hosts": [
+    "forge",
+    "boss-gcp"
+  ],
+  "requires_approval": true,
+  "plan_verb": "plan-retire-ops-runner",
+  "approvers": [
+    "emp-david"
+  ],
+  "argv": [
+    "infra/ops/retire-ops-runner.sh",
+    "--for-real",
+    "{1}"
+  ],
+  "params": [
+    {
+      "name": "plan_sha256",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  ],
+  "timeout": 60,
+  "effect": "^retire-ops-runner: OK — stopped[+]disabled boss-ops-runner[.]timer on [a-z0-9-]+; read back: is-enabled answers (disabled|masked), is-active answers inactive;"
+}

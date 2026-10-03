@@ -47,11 +47,12 @@
 # -------------------------------
 # A file is exempt only with a reason, and the reason is always the same
 # kind of thing: the uid its data or its credentials require has not been
-# MEASURED yet. boss-backup.yaml is the worked example — its ship-key is
-# defaultMode 0400 and (its own comment, line 264) "only ever succeeded
-# because it runs as root", so the moment anything hands that pod
-# runAsNonRoot the offsite leg fails, and it fails as an SSH problem,
-# which is the wrong place to look. Guessing there breaks the service
+# MEASURED yet. boss-backup.yaml is the worked example — its ship-key was
+# defaultMode 0400 and "only ever succeeded because it runs as root", so
+# handing that pod runAsNonRoot would have failed the offsite leg as an
+# SSH problem, which is the wrong place to look. That key left with the
+# boss-gcp leg (backlog 4bf7bdd1, 2026-10-01); its GCS key is the same
+# trap, failing as a gcloud auth problem instead. Guessing there breaks the service
 # rather than one check. Each exempt entry gets its own car with its own
 # establishment work.
 #
@@ -71,7 +72,7 @@ DIR="infra/cluster/manifests"
 EXEMPT=(
     "boss-dev.yaml	part (3) of 5234cda4, and it is worse than the hard set: the dev container needs SETGID/SETUID for the ssh door, so it can never reach drop-ALL — only baseline compliance. A car editing this file rolls the dev pod on converge and ends the live operator session, so it lands only at a David-timed restart (boss-dev-manifest-cars-restart-the-session)."
     "boss.yaml	holds THREE workloads with three different answers: the SoR postgres StatefulSet (the gate-runner car had to read /proc to establish postgres runs as 999), the nats StatefulSet, and the SoR app Deployment whose strategy is Recreate — so any roll of it is a full outage of :7900. Carries fsGroup: 1500 today, which is the volume half of the answer and not the user half. One car each, measured."
-    "boss-backup.yaml	the documented trap: its ship-key is defaultMode 0400 and only ever succeeded because the pod runs as root, so runAsNonRoot breaks the offsite leg and reports it as an SSH failure. Also carries a postgres container and a google/cloud-sdk container, each with its own uid answer."
+    "boss-backup.yaml	the documented trap: its gcs-key is defaultMode 0400 and is read as root, so runAsNonRoot breaks the offsite leg and reports it as a gcloud auth failure (its retired ship-key was the first instance, backlog a05835da). Also carries a postgres container and a google/cloud-sdk container, each with its own uid answer."
     "boss-estate-observe.yaml	alpine/k8s, uid unmeasured — and a separate car is holding this file, so declaring it here would collide rather than land."
 )
 

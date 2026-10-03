@@ -92,25 +92,16 @@ fn policy() -> Arc<dyn PolicyClient> {
 fn step(id: &str, slug: &str, status: StepStatus, blocked_by: Vec<StepId>) -> Step {
     Step {
         id: StepId::from_uuid(Uuid::parse_str(id).unwrap()),
-        job_id: JobId::from_uuid(Uuid::parse_str(JOB).unwrap()),
-        kind: "task".into(),
-        title: slug.into(),
         spec_slug: Some(slug.into()),
-        assignee_id: None,
         status,
-        sort_order: 1,
         blocked_by,
-        sign_offs_required: Vec::new(),
-        assurance_required: None,
-        sign_offs: Vec::new(),
-        fields: Vec::new(),
-        completed_on: None,
-        completed_by: None,
-        completed_at: None,
         metadata: serde_json::json!({}),
-        notes: None,
-        step_plugin_version: 0,
-        embedded_job: None,
+        ..Step::new(
+            JobId::from_uuid(Uuid::parse_str(JOB).unwrap()),
+            "task",
+            slug,
+            1,
+        )
     }
 }
 
@@ -131,20 +122,17 @@ async fn seed() -> (Router, Arc<InMemoryJobs>) {
     );
     jobs.create_job(&Job {
         id: JobId::from_uuid(Uuid::parse_str(JOB).unwrap()),
-        kind: "ops-request".into(),
         workflow_version: 2,
-        subject: Subject::new("custom", "forge"),
-        title: "converge on forge".into(),
-        owner_id: "automation-runner".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 22).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({ "verb": "converge", "host": "forge" }),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "ops-request",
+            Subject::new("custom", "forge"),
+            "converge on forge",
+            "automation-runner",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 22).unwrap(),
+        )
     })
     .await
     .unwrap();

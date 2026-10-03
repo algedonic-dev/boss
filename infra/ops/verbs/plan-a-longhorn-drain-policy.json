@@ -1,0 +1,18 @@
+{
+  "about": "READ-ONLY: renders what `set-longhorn-drain-policy` WOULD do to Longhorn's node-drain-policy, and does nothing (infra/forge/longhorn-drain-policy.sh --plan <value>; backlog 46584350). It runs every bound the write runs — the one setting settings.longhorn.io/node-drain-policy in longhorn-system, fixed in the script; a value that is one of the options Longhorn's LIVE definition enumerates (its manager API through the API server's service proxy, never a list typed in the tree), on a definition that is not read-only; a value other than the one that stands; and the stored setting and Longhorn's API agreeing on that value — and then prints the plan: the value before and after, Longhorn's default, the allowed options, Longhorn's own words for the requested option, the one compare-and-set patch, a note when the value is not the default (the daily check-longhorn-drain-policy alarms once it has stood 24 hours), and every Longhorn volume whose only healthy replica (spec.healthyAt set, spec.failedAt empty) is on a worker node. No clock and no volume state in the bytes (states ride stderr); its sha256 is printed on stderr as `plan-sha256:`, and that hash is what David's passkey signs (design 17835005 q1). Every read goes through the forge's ops_kubectl door; a read that could not look is CANNOT ANSWER (exit 1), never a plan. Any refusal renders no plan.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/longhorn-drain-policy.sh",
+    "--plan",
+    "{1}"
+  ],
+  "params": [
+    {
+      "name": "value",
+      "pattern": "^[a-z]([a-z-]{0,61}[a-z])?$"
+    }
+  ],
+  "timeout": 120
+}

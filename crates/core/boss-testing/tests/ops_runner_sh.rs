@@ -71,7 +71,8 @@ fn write_exec(path: &Path, body: &str) {
 ///
 /// Every write's method and url is appended to `STUB_WRITE_ORDER` when
 /// set, so a case can read which door was used first. A `gh` stub stands
-/// in for the publish verb's `--check` tool probe.
+/// in for the publish verb's `--check` tool probe, and a `df` stub for
+/// the host's mounts.
 fn stub_sor(root: &Path) -> PathBuf {
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -111,6 +112,15 @@ fn stub_sor(root: &Path) -> PathBuf {
          cat \"$STUB_JOBS\"\n",
     );
     write_exec(&bin.join("gh"), "#!/bin/sh\nexit 0\n");
+    // `df` is the host's too: the shipped `df` verb (and disk-report's
+    // `df -k /`) would otherwise statfs every mount of the gate pod,
+    // under the runner's 30 s default, on a node other gates are
+    // loading — the wall time backlog 1ac5ee40 found a tree lint
+    // losing. One fixed table, the shape `df -k /` is parsed in.
+    write_exec(
+        &bin.join("df"),
+        "#!/bin/sh\nprintf 'Filesystem 1K-blocks Used Available Use%% Mounted on\\nstub 104857600 52428800 52428800 50%% /\\n'\n",
+    );
     bin
 }
 
@@ -143,13 +153,24 @@ fn run(
     verbs: &Path,
     extra_env: &[(&str, String)],
 ) -> (String, Option<serde_json::Value>) {
+    run_from(&repo_root(), root, verbs, extra_env)
+}
+
+/// `run`, with the runner started from `checkout` — this tree, or a
+/// checkout of its own (`runner_checkout`).
+fn run_from(
+    checkout: &Path,
+    root: &Path,
+    verbs: &Path,
+    extra_env: &[(&str, String)],
+) -> (String, Option<serde_json::Value>) {
     let put = root.join("put.json");
     let merge = root.join("merge.json");
     let _ = std::fs::remove_file(&put);
     let _ = std::fs::remove_file(&merge);
     let _ = std::fs::remove_file(root.join("merge.json.first"));
     let _ = std::fs::remove_file(root.join("patch.json"));
-    let out = runner(root, verbs, extra_env)
+    let out = runner_from(checkout, root, verbs, extra_env)
         .output()
         .expect("ops-runner.sh runs");
     let text = format!(
@@ -167,17 +188,33 @@ fn run(
 /// allowlist directory — not yet started, so a case can choose where its
 /// output goes.
 fn runner(root: &Path, verbs: &Path, extra_env: &[(&str, String)]) -> Command {
+    runner_from(&repo_root(), root, verbs, extra_env)
+}
+
+/// `runner`, started from `checkout`: the runner derives its own
+/// checkout from its `$0`, so this is the checkout its relative verb
+/// scripts resolve against.
+fn runner_from(
+    checkout: &Path,
+    root: &Path,
+    verbs: &Path,
+    extra_env: &[(&str, String)],
+) -> Command {
     let path = format!(
         "{}:{}",
         root.join("bin").display(),
         std::env::var("PATH").unwrap_or_default()
     );
     let mut cmd = Command::new("sh");
-    cmd.arg(repo_root().join("infra/ops/ops-runner.sh"))
+    cmd.arg(checkout.join("infra/ops/ops-runner.sh"))
         .env_clear()
         .env("PATH", path)
         .env("HOST_ID", "forge")
         .env("BOSS_JOBS_URL", "http://sor.invalid")
+        // The machine token comes from the test, never from this host's
+        // mount or rendered sor.env (design 6805c764 car 4).
+        .env("BOSS_MACHINE_TOKEN_DIR", root.join("no-token-dir"))
+        .env("BOSS_SOR_ENV", root.join("no-sor.env"))
         .env("OPS_VERBS_DIR", verbs)
         .env("STUB_JOBS", root.join("jobs.json"))
         .env("STUB_PUT", root.join("put.json"))
@@ -228,14 +265,14 @@ fn shipped_verb_files() -> Vec<PathBuf> {
 }
 
 /// What `publish-github-pr.sh --check` needs to say ok without a
-/// network: a state dir, a bare repo standing in for the forge
-/// checkout, and a 0600 token file (the value is never printed).
+/// network: a state dir and a bare repo standing in for the forge
+/// checkout. No token: since backlog d2b7c947 the verb's token is the
+/// GitHub App's, minted per request and rendered only by a run.
 ///
 /// The stand-in carries a `main` commit, because since 2026-09-11
 /// `--check` FETCHES `refs/heads/main` rather than only reading the
 /// directory — a cheaper check passed while the publish failed.
 fn publish_check_env(root: &Path) -> Vec<(&'static str, String)> {
-    use std::os::unix::fs::PermissionsExt;
     let state = root.join("state");
     let etc = root.join("etc");
     std::fs::create_dir_all(&state).unwrap();
@@ -282,9 +319,6 @@ fn publish_check_env(root: &Path) -> Vec<(&'static str, String)> {
             assert!(st.success(), "update-ref refs/heads/main");
         }
     }
-    let token = etc.join("github.token");
-    std::fs::write(&token, "not-a-real-token\n").unwrap();
-    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
     // The forge's address file (/etc/boss/sor.env on the host), rendered
     // from the one source: the verb derives its forge clone URL from it.
     let sor_env = etc.join("sor.env");
@@ -302,9 +336,30 @@ fn publish_check_env(root: &Path) -> Vec<(&'static str, String)> {
     vec![
         ("BOSS_PUBLISH_STATE_DIR", state.display().to_string()),
         ("BOSS_FORGE_REPO_PATH", forge.display().to_string()),
-        ("BOSS_GITHUB_TOKEN_FILE", token.display().to_string()),
         ("BOSS_SOR_ENV", sor_env.display().to_string()),
     ]
+}
+
+/// STALL EVERYTHING A TREE SCRIPT REACHES FOR. `bash`, `git`, `grep`,
+/// `find` and `python3` on the case's PATH become stubs that note their
+/// name in `tripped.log` and then hang for longer than the runner's
+/// 30 s default — the shape a loaded gate node gave the real lint
+/// (below). The runner and the libraries it sources call none of them,
+/// so a case run under this answers exactly as fast as it would on an
+/// idle box, and a verb that reaches past its fixture is named. Returns
+/// the log's path.
+fn stall_the_tree_tools(root: &Path) -> PathBuf {
+    let log = root.join("tripped.log");
+    for tool in ["bash", "git", "grep", "find", "python3"] {
+        write_exec(
+            &root.join("bin").join(tool),
+            &format!(
+                "#!/bin/sh\nprintf '%s %s\\n' {tool} \"$*\" >> '{}'\nexec sleep 45\n",
+                log.display()
+            ),
+        );
+    }
+    log
 }
 
 macro_rules! needs_jq {
@@ -316,6 +371,25 @@ macro_rules! needs_jq {
     };
 }
 
+/// A checkout of the runner's own under `root/checkout`: the runner, the
+/// allowlist assembler and `infra/lib/` it sources, each LINKED from this
+/// tree (so the code under test is this tree's, never a stale copy), and
+/// nothing else. A script written there exists in no other checkout.
+fn runner_checkout(root: &Path) -> PathBuf {
+    use std::os::unix::fs::symlink;
+    let checkout = root.join("checkout");
+    std::fs::create_dir_all(checkout.join("infra/ops")).unwrap();
+    for linked in [
+        "infra/ops/ops-runner.sh",
+        "infra/ops/verbs-allowlist.sh",
+        "infra/lib",
+    ] {
+        symlink(repo_root().join(linked), checkout.join(linked))
+            .unwrap_or_else(|e| panic!("link {linked} into the runner's checkout: {e}"));
+    }
+    checkout
+}
+
 /// A verb's script is named RELATIVE to the repo and resolved against
 /// the runner's OWN checkout (backlog 66077f9c). Eleven of sixteen verbs
 /// baked `/home/david/boss/infra/forge/…` — the forge checkout's path —
@@ -325,18 +399,40 @@ macro_rules! needs_jq {
 /// where it is; a relative argv[0] resolves against that, an absent
 /// script is a REFUSAL naming the resolved path, and a bare command is
 /// left to PATH as before.
+///
+/// THE PROBE IS A FIXTURE, NOT A TREE LINT (backlog 1ac5ee40). Until
+/// 2026-10-01 this case ran the real `infra/lint/no-manifest-mounts-a-
+/// hostpath.sh` from this tree — bash, grep and find over the
+/// manifests, 0.017 s alone — under the runner's 30 s default. Twice
+/// that day, on a node other gates were building on, it was killed at
+/// 30 s with 0 bytes written (`duration_ms: 30002, exit 124`): car gate
+/// 001d7db3, and train gate eac9adf7, which cancelled a train of three
+/// cars none of which touched it. The 30 s was inside the verb — the
+/// runner's own record brackets only the exec, and its system of record
+/// is the stub `curl`, so no SoR, DNS or retry budget was in reach. What
+/// was in reach was the node: a real script's wall time is the gate
+/// host's, and nothing about resolution needs it. So the runner runs
+/// from a checkout of its own whose probe is a two-line `sh` script that
+/// exists nowhere else, under `stall_the_tree_tools`: a probe that found
+/// the script anywhere but the runner's checkout is refused, and one
+/// that reaches for a tree tool is named instead of timing out.
 #[test]
 fn a_relative_argv0_resolves_against_the_runners_own_checkout() {
     needs_jq!();
     let root = scratch("relative-argv0");
     stub_sor(&root);
+    let checkout = runner_checkout(&root);
+    write_exec(
+        &checkout.join("infra/ops/relative-argv0-probe.sh"),
+        "#!/bin/sh\nprintf 'relative-argv0-probe: ran %s\\n' \"$0\"\n",
+    );
     let verbs = verbs_dir(
         &root,
         &[
             (
                 "probe",
-                r#"{"about": "a tree lint, as a probe of resolution", "hosts": ["forge"],
-                    "argv": ["infra/lint/no-manifest-mounts-a-hostpath.sh"], "params": []}"#,
+                r#"{"about": "a script only the runner's own checkout carries", "hosts": ["forge"],
+                    "argv": ["infra/ops/relative-argv0-probe.sh"], "params": []}"#,
             ),
             (
                 "gone",
@@ -345,25 +441,34 @@ fn a_relative_argv0_resolves_against_the_runners_own_checkout() {
             ),
         ],
     );
+    let tripped = stall_the_tree_tools(&root);
     packet(&root, "probe", "[]");
-    let (out, payload) = run(&root, &verbs, &[]);
+    let (out, payload) = run_from(&checkout, &root, &verbs, &[]);
     let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
     assert_eq!(md["disposition"], "answered", "{md} / {out}");
+    let reached = std::fs::read_to_string(&tripped).unwrap_or_default();
+    assert!(
+        reached.is_empty(),
+        "the verb reached past its fixture into a tool this pass stalls:\n{reached}{md} / {out}"
+    );
+    assert_eq!(md["exit_code"], "0", "{md} / {out}");
+    let ran = checkout.join("infra/ops/relative-argv0-probe.sh");
     assert!(
         md["output"]
             .as_str()
             .unwrap_or("")
-            .contains("no-manifest-mounts-a-hostpath: ok"),
-        "the relative script ran from this checkout: {md} / {out}"
+            .contains(&format!("relative-argv0-probe: ran {}", ran.display())),
+        "the relative script ran from the runner's own checkout: {md} / {out}"
     );
 
     packet(&root, "gone", "[]");
-    let (out, payload) = run(&root, &verbs, &[]);
+    let (out, payload) = run_from(&checkout, &root, &verbs, &[]);
     let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
     assert_eq!(md["disposition"], "refused", "{md} / {out}");
     let reason = md["reason"].as_str().unwrap_or("");
+    let gone = checkout.join("infra/ops/does-not-exist.sh");
     assert!(
-        reason.contains("infra/ops/does-not-exist.sh") && reason.contains("not in this checkout"),
+        reason.contains(&gone.display().to_string()) && reason.contains("not in this checkout"),
         "the refusal names the resolved path: {md} / {out}"
     );
 
@@ -613,9 +718,20 @@ fn a_read_only_verb_answers_on_boss_gcp() {
     assert!(out.contains("answered df"), "{out}");
 }
 
+/// The mounted Secret's shape, under `root`: a directory whose `current`
+/// file holds `token` — what the runner reads since design 6805c764 car 4
+/// (infra/lib/secret-header.sh machine_token_header), in place of the
+/// `BOSS_MACHINE_TOKEN` env var it read before.
+fn token_dir(root: &Path, token: &str) -> String {
+    let dir = root.join("machine-token");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("current"), format!("{token}\n")).unwrap();
+    dir.display().to_string()
+}
+
 /// THE MACHINE TOKEN NEVER RIDES IN curl's ARGV (backlog 5f3ad356,
 /// 2026-09-28). Every one of the runner's writes carried it as
-/// `-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"`, readable by every
+/// `-H "x-boss-machine-token: <the token>"`, readable by every
 /// local user in ps while curl ran. Under /bin/sh — dash on the hosts —
 /// a whole pass now hands it over as `-H @<0600 file>`: the header still
 /// reaches every request, the value is in no argv, and the private
@@ -638,7 +754,9 @@ fn the_machine_token_rides_in_a_header_file_never_in_argv() {
         &verbs,
         &[
             ("HOST_ID", "boss-gcp".to_string()),
-            ("BOSS_MACHINE_TOKEN", token.to_string()),
+            ("BOSS_MACHINE_TOKEN_DIR", token_dir(&root, token)),
+            // The stub record is an estate host, as the runner's is.
+            ("BOSS_MACHINE_TOKEN_HOSTS", "sor.invalid".to_string()),
             ("TMPDIR", tmp.display().to_string()),
             ("STUB_ARGV_LOG", argv_log.display().to_string()),
             ("STUB_HEADER_LOG", header_log.display().to_string()),
@@ -696,7 +814,9 @@ fn the_runner_credential_rides_beside_the_machine_token_in_a_header_file() {
     let env = |file: &Path| {
         vec![
             ("HOST_ID", "boss-gcp".to_string()),
-            ("BOSS_MACHINE_TOKEN", token.to_string()),
+            ("BOSS_MACHINE_TOKEN_DIR", token_dir(&root, token)),
+            // The stub record is an estate host, as the runner's is.
+            ("BOSS_MACHINE_TOKEN_HOSTS", "sor.invalid".to_string()),
             ("BOSS_RUNNER_CREDENTIAL_FILE", file.display().to_string()),
             ("TMPDIR", tmp.display().to_string()),
             ("STUB_ARGV_LOG", argv_log.display().to_string()),
@@ -2729,6 +2849,175 @@ fn effect_fixture(case: &str, body: &str, spec_extra: &str) -> (PathBuf, PathBuf
 
 const EFFECT_RE: &str =
     r#","effect":"^acts: (deleted [0-9]+, re-listed [0-9]+ left|dry run: would delete [0-9]+)$""#;
+
+/// Structured reads keep bytes apart; stderr is evidence, never JSON input.
+#[test]
+fn a_declared_structured_read_preserves_both_streams_without_interpreting_them() {
+    assert!(has("jq"), "structured-result test requires jq");
+    let (root, verbs) = effect_fixture(
+        "separate-streams",
+        "#!/bin/sh\nprintf '{\"ok\":true}\\n'\nprintf 'diagnostic\\n' >&2\n",
+        r#", "capture":"separate-streams""#,
+    );
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no receipt: {out}"));
+    assert_eq!(md["exit_code"], "0", "{md}");
+    assert_eq!(
+        md["streams"]["stdout"]["base64"], "eyJvayI6dHJ1ZX0K",
+        "{md}"
+    );
+    assert_eq!(md["streams"]["stdout"]["bytes"], 12, "{md}");
+    assert_eq!(
+        md["streams"]["stderr"]["base64"], "ZGlhZ25vc3RpYwo=",
+        "{md}"
+    );
+    assert_eq!(md["streams"]["stderr"]["bytes"], 11, "{md}");
+    assert_eq!(md["streams"]["stdout"]["complete"], true, "{md}");
+    assert_eq!(md["streams"]["stderr"]["complete"], true, "{md}");
+    assert!(md["output"].as_str().unwrap().contains("diagnostic"));
+}
+
+#[test]
+fn a_capped_structured_read_names_the_lost_bytes_instead_of_claiming_completeness() {
+    assert!(has("jq"), "structured-result test requires jq");
+    let (root, verbs) = effect_fixture(
+        "separate-streams-capped",
+        "#!/bin/sh\nprintf 'abcdefgh'\nprintf 'diagnostic' >&2\nexit 7\n",
+        r#", "capture":"separate-streams""#,
+    );
+    let (out, payload) = run(&root, &verbs, &[("OPS_OUTPUT_CAP", "4".into())]);
+    let md = payload.unwrap_or_else(|| panic!("no receipt: {out}"));
+    assert_eq!(md["exit_code"], "7", "{md}");
+    assert_eq!(md["streams"]["stdout"]["bytes"], 8, "{md}");
+    assert_eq!(md["streams"]["stdout"]["base64"], "YWJjZA==", "{md}");
+    assert_eq!(md["streams"]["stdout"]["complete"], false, "{md}");
+    assert_eq!(md["streams"]["stderr"]["complete"], false, "{md}");
+}
+
+#[test]
+fn an_ordinary_read_clears_any_prior_structured_stream_record() {
+    assert!(has("jq"), "structured-result test requires jq");
+    let (root, verbs) = effect_fixture("ordinary-no-streams", "#!/bin/sh\necho ordinary\n", "");
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no receipt: {out}"));
+    assert!(
+        md.get("streams").is_some(),
+        "merge must explicitly clear prior streams: {md}"
+    );
+    assert_eq!(md["streams"], serde_json::Value::Null);
+    assert_eq!(md["output"], "ordinary\n");
+}
+
+#[test]
+fn a_failed_structured_stream_encoder_leaves_an_explicit_unread_result() {
+    assert!(has("jq"), "structured-result test requires jq");
+    let (root, verbs) = effect_fixture(
+        "separate-streams-encoder-failed",
+        "#!/bin/sh\necho actual-answer\n",
+        r#", "capture":"separate-streams""#,
+    );
+    write_exec(&root.join("bin/base64"), "#!/bin/sh\nexit 8\n");
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no receipt: {out}"));
+    assert_eq!(md["exit_code"], "0", "verb result is conserved: {md}");
+    assert_eq!(md["streams"], serde_json::Value::Null, "{md}");
+    assert!(
+        md["streams_unread"].as_str().is_some_and(|s| !s.is_empty()),
+        "{md}"
+    );
+    assert_eq!(md["output"], "actual-answer\n");
+}
+
+#[test]
+fn a_structured_read_conserves_binary_bytes_and_their_digest() {
+    assert!(has("jq"), "structured-result test requires jq");
+    let (root, verbs) = effect_fixture(
+        "separate-streams-binary",
+        "#!/bin/sh\nprintf '\\000\\377\\n\\n'\n",
+        r#", "capture":"separate-streams""#,
+    );
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no receipt: {out}"));
+    assert_eq!(md["streams"]["stdout"]["base64"], "AP8KCg==", "{md}");
+    assert_eq!(md["streams"]["stdout"]["bytes"], 4, "{md}");
+    assert_eq!(md["streams"]["stdout"]["retained_bytes"], 4, "{md}");
+    assert_eq!(md["streams"]["stdout"]["complete"], true, "{md}");
+    let file = root.join("expected-bytes");
+    std::fs::write(&file, [0, 255, 10, 10]).unwrap();
+    let hash = Command::new("sha256sum").arg(&file).output().unwrap();
+    assert!(hash.status.success());
+    assert_eq!(
+        md["streams"]["stdout"]["sha256"],
+        String::from_utf8_lossy(&hash.stdout)[..64]
+    );
+}
+
+#[test]
+fn a_timed_out_structured_read_retains_its_partial_output_and_failed_exit() {
+    assert!(has("jq"), "structured-result test requires jq");
+    let (root, verbs) = effect_fixture(
+        "separate-streams-timeout",
+        "#!/bin/sh\nprintf 'partial'\nsleep 10\n",
+        r#", "capture":"separate-streams", "timeout":1"#,
+    );
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no receipt: {out}"));
+    assert_eq!(md["exit_code"], "124", "{md}");
+    assert_eq!(md["streams"]["stdout"]["base64"], "cGFydGlhbA==", "{md}");
+    assert!(md["output"].as_str().unwrap().contains("command killed"));
+}
+
+#[test]
+fn an_unknown_structured_capture_format_is_refused_before_the_verb_runs() {
+    assert!(has("jq"), "structured-result test requires jq");
+    let (root, verbs) = effect_fixture(
+        "separate-streams-unknown",
+        "#!/bin/sh\necho should-never-run\n",
+        r#", "capture":"unknown""#,
+    );
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no receipt: {out}"));
+    assert_eq!(md["disposition"], "refused", "{md}");
+    assert_eq!(md["streams"], serde_json::Value::Null);
+    assert!(
+        md["output"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported capture")
+    );
+    assert!(!md["output"].as_str().unwrap().contains("should-never-run"));
+}
+
+#[test]
+fn the_explicit_volume_plan_declares_structured_stream_capture() {
+    let spec: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(repo_root().join("infra/ops/verbs/plan-an-instance-volume-expansion.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(spec["capture"], "separate-streams");
+    assert_ne!(spec["requires_approval"], true);
+}
+
+#[test]
+fn full_sized_structured_streams_are_recorded_without_putting_bytes_on_argv() {
+    assert!(has("jq"), "structured-result test requires jq");
+    let (root, verbs) = effect_fixture(
+        "separate-streams-full-sized",
+        "#!/bin/sh\nhead -c 102400 /dev/zero\nhead -c 102400 /dev/zero >&2\n",
+        r#", "capture":"separate-streams""#,
+    );
+    let (out, payload) = run(&root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no receipt: {out}"));
+    for stream in ["stdout", "stderr"] {
+        assert_eq!(md["streams"][stream]["bytes"], 102400, "{stream}: {out}");
+        assert_eq!(md["streams"][stream]["complete"], true, "{stream}: {out}");
+        assert_eq!(
+            md["streams"][stream]["base64"].as_str().unwrap().len(),
+            136536
+        );
+    }
+}
 
 #[test]
 fn a_declared_effect_the_run_printed_is_recorded_beside_its_exit() {

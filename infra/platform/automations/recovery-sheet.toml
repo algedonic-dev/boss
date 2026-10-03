@@ -1,0 +1,7 @@
+# automation:recovery-sheet — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 18 audit-log facts.
+# Signs as platform-admin today: the boss CLI header, BOSS_ACTOR in infra/cluster/manifests/boss-recovery-sheet.yaml.
+
+[[automation]]
+id = "automation:recovery-sheet"
+role = "platform-admin"
+description = 'The recovery sheet CronJob: records the sheet a human recovers the estate from (infra/cluster/manifests/boss-recovery-sheet.yaml).'

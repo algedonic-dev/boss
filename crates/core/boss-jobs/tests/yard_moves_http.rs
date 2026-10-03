@@ -380,6 +380,67 @@ async fn a_caller_who_reads_no_packets_reads_no_undeclared_moves() {
     assert_eq!(arrivals["undeclared"][0]["moves"], 2, "{arrivals}");
 }
 
+/// A NARROWED SCOPE READS NO UNDECLARED MOVES EITHER (backlog 070de88c,
+/// item 2). The gate above withheld the reading only from a caller whose
+/// scope reads NO packets; a caller who reads SOME — its own — was
+/// handed every crossing in the window, including the moves of packets
+/// its scope cannot read. The record counts routes, not packets, so it
+/// cannot be narrowed to the caller's packets without a read per move;
+/// it is withheld below a full scope instead. The routes read serves the
+/// same record as its observed counts, so it withholds them too, and
+/// says why rather than reading as an unwired record. The control is
+/// the operator's full scope over the same record and routes.
+#[tokio::test]
+async fn a_caller_whose_scope_is_narrowed_reads_no_undeclared_moves() {
+    let (status, sales) = get(app(true).await, "/api/yard/regions", "sales").await;
+    assert_eq!(status, StatusCode::OK, "{sales}");
+    let regions = sales["regions"]
+        .as_array()
+        .expect("the scoped map's regions");
+    assert!(!regions.is_empty(), "{sales}");
+    for r in regions {
+        assert_eq!(
+            r["undeclared"],
+            Value::Null,
+            "{} carried the moves record to a caller that reads only its own packets",
+            r["name"]
+        );
+        assert_ne!(r["band"]["id"], "moves-undeclared", "{r}");
+    }
+
+    let (status, routes) = get(app(true).await, "/api/yard/routes", "sales").await;
+    assert_eq!(status, StatusCode::OK, "{routes}");
+    assert_eq!(routes["observed"], false, "{routes}");
+    assert!(
+        routes["observed_withheld"]
+            .as_str()
+            .is_some_and(|why| why.contains("scope")),
+        "a withheld record says so, not that it could not be read: {routes}"
+    );
+    for route in routes["routes"].as_array().unwrap() {
+        for source in route["sources"].as_array().unwrap() {
+            assert_ne!(
+                source["source"], "observed",
+                "an observed count reached a narrowed scope: {route}"
+            );
+        }
+    }
+
+    // The control: the same record and routes, read by a caller who
+    // reads every packet, still carry both readings.
+    let (_, operator) = get(app(true).await, "/api/yard/regions", "operator").await;
+    let arrivals = operator["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "arrivals")
+        .unwrap();
+    assert_eq!(arrivals["undeclared"][0]["moves"], 2, "{arrivals}");
+    let (_, operator) = get(app(true).await, "/api/yard/routes", "operator").await;
+    assert_eq!(operator["observed"], true, "{operator}");
+    assert_eq!(operator["observed_withheld"], Value::Null, "{operator}");
+}
+
 /// `GET /api/yard/routes` serves the derived routes with their sources,
 /// the observed counts beside them, and 503 — naming the registry — when
 /// there is nothing to walk.

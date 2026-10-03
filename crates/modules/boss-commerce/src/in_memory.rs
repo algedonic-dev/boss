@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use boss_core::publisher::EventStamp;
+use chrono::Datelike;
 
 use crate::port::{CommerceError, CommerceRepository, InvoiceCreate};
 use crate::types::{
@@ -11,7 +12,6 @@ use crate::types::{
 
 pub struct InMemoryCommerce {
     invoices: Vec<Invoice>,
-    revenue: Vec<RevenueLine>,
     /// Invoices a status verb moved, by id, overlaid on `invoices` by
     /// every read. It held only the write-off ids until backlog
     /// 203ef806, so mark-paid and mark-past-due moved nothing here and
@@ -30,10 +30,11 @@ pub struct InMemoryCommerce {
 }
 
 impl InMemoryCommerce {
+    /// A store seeded with `invoices`, each kept as stored
+    /// ([`Invoice::as_stored`]).
     pub fn new(invoices: Vec<Invoice>) -> Self {
         Self {
-            invoices,
-            revenue: Vec::new(),
+            invoices: invoices.iter().map(Invoice::as_stored).collect(),
             moved: std::sync::Mutex::new(std::collections::HashMap::new()),
             created: std::sync::Mutex::new(Vec::new()),
             recorded: std::sync::Mutex::new(Vec::new()),
@@ -49,11 +50,6 @@ impl InMemoryCommerce {
         if let Ok(mut v) = self.recorded.lock() {
             v.push(event);
         }
-    }
-
-    pub fn with_revenue(mut self, revenue: Vec<RevenueLine>) -> Self {
-        self.revenue = revenue;
-        self
     }
 
     fn moved(
@@ -80,14 +76,18 @@ impl InMemoryCommerce {
     }
 
     /// Every invoice as it stands now — the seed and the created, with
-    /// the moves applied.
+    /// the moves applied — newest issue first, ties in byte order of id,
+    /// as Postgres orders them (backlog be459ab9: this answered in
+    /// insertion order).
     fn current(&self) -> Result<Vec<Invoice>, CommerceError> {
         let issued = self.issued()?;
         let moved = self.moved()?;
-        Ok(issued
+        let mut current: Vec<Invoice> = issued
             .into_iter()
             .map(|i| moved.get(&i.id).cloned().unwrap_or(i))
-            .collect())
+            .collect();
+        current.sort_by(|a, b| b.issued_on.cmp(&a.issued_on).then_with(|| a.id.cmp(&b.id)));
+        Ok(current)
     }
 
     /// The invoices still owed — `InvoiceStatus::is_owed` on the
@@ -141,7 +141,35 @@ impl InMemoryCommerce {
 #[async_trait]
 impl CommerceRepository for InMemoryCommerce {
     async fn all_revenue(&self) -> Result<Vec<RevenueLine>, CommerceError> {
-        Ok(self.revenue.clone())
+        // Derived from the invoices, as Postgres derives it from the
+        // stored line items (backlog be459ab9: this answered a list a
+        // test seeded through `with_revenue`, so no created invoice ever
+        // reached it). Keyed (newest month first, category in byte
+        // order) — a BTreeMap over `Reverse(month)` gives that order.
+        let rolled = self.current()?.into_iter().fold(
+            std::collections::BTreeMap::<(std::cmp::Reverse<chrono::NaiveDate>, String), i64>::new(
+            ),
+            |mut acc, inv| {
+                let month = inv.issued_on.with_day(1).unwrap_or(inv.issued_on);
+                for l in &inv.line_items {
+                    *acc.entry((
+                        std::cmp::Reverse(month),
+                        l.revenue_category.as_str().to_string(),
+                    ))
+                    .or_default() += l.amount_cents;
+                }
+                acc
+            },
+        );
+        Ok(rolled
+            .into_iter()
+            .map(|((month, category), amount_cents)| RevenueLine {
+                month: month.0,
+                category: category.into(),
+                amount_cents,
+                currency: "USD".to_string(),
+            })
+            .collect())
     }
 
     async fn all_invoices(&self) -> Result<Vec<Invoice>, CommerceError> {
@@ -154,6 +182,9 @@ impl CommerceRepository for InMemoryCommerce {
         offset: i64,
         account_id: Option<&str>,
     ) -> Result<(Vec<Invoice>, i64), CommerceError> {
+        if let Some(refused) = CommerceError::negative_page_bound(limit, offset) {
+            return Err(refused);
+        }
         let filtered: Vec<Invoice> = self
             .current()?
             .into_iter()
@@ -161,7 +192,7 @@ impl CommerceRepository for InMemoryCommerce {
             .collect();
         let total = filtered.len() as i64;
         let start = (offset as usize).min(filtered.len());
-        let end = (start + limit as usize).min(filtered.len());
+        let end = start.saturating_add(limit as usize).min(filtered.len());
         Ok((filtered[start..end].to_vec(), total))
     }
 
@@ -195,38 +226,33 @@ impl CommerceRepository for InMemoryCommerce {
         _now: chrono::DateTime<chrono::Utc>,
         stamp: &EventStamp,
     ) -> Result<InvoiceCreate, CommerceError> {
-        if invoice.line_items.is_empty() {
-            return Err(CommerceError::Storage(format!(
-                "invoice {} has no line items",
-                invoice.id
-            )));
+        // One statement of a malformed body for both adapters (backlog
+        // be459ab9): this copy had no tax, so it refused every taxed
+        // invoice Postgres keeps.
+        if let Some(why) = invoice.malformed() {
+            return Err(CommerceError::Invalid(why));
         }
-        let sum: i64 = invoice.line_items.iter().map(|l| l.amount_cents).sum();
-        if sum != invoice.amount_cents {
-            return Err(CommerceError::Storage(format!(
-                "invoice {} amount_cents={} but line items sum to {}",
-                invoice.id, invoice.amount_cents, sum
-            )));
-        }
-        if invoice
-            .line_items
-            .iter()
-            .any(|l| l.currency != invoice.currency)
-        {
-            return Err(CommerceError::Storage(format!(
-                "invoice {} line items disagree on currency with header {}",
-                invoice.id, invoice.currency
-            )));
-        }
+        let invoice = &invoice.as_stored();
         // Once per id, as the Pg adapter's `ON CONFLICT (id) DO NOTHING`
         // decides it (backlog 9d2af748): the `created` lock is held
         // across the check and the write, so two creates cannot both
         // find the id free. An existing id writes and records nothing.
+        // A line id another invoice holds is refused, as Postgres's
+        // primary key refuses it (backlog be459ab9: this stored it twice).
         let exists = {
             let mut created = self.created()?;
             let exists = self.invoices.iter().any(|i| i.id == invoice.id)
                 || created.iter().any(|i| i.id == invoice.id);
             if !exists {
+                if let Some(taken) = invoice.line_items.iter().find(|l| {
+                    self.invoices
+                        .iter()
+                        .chain(created.iter())
+                        .flat_map(|i| &i.line_items)
+                        .any(|held| held.id == l.id)
+                }) {
+                    return Err(CommerceError::line_id_taken(&invoice.id, &taken.id));
+                }
                 created.push(invoice.clone());
             }
             exists
@@ -319,7 +345,9 @@ impl CommerceRepository for InMemoryCommerce {
             total_gross_margin_ttm_cents: 0,
             ar_aging,
             total_outstanding_cents,
-            total_invoice_count: self.invoices.len() as i64,
+            // Every invoice the store holds — it counted the seed alone,
+            // so no created invoice was in it (backlog be459ab9).
+            total_invoice_count: self.current()?.len() as i64,
             revenue_by_month: Vec::new(),
             currency: "USD".to_string(),
         })

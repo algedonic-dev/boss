@@ -122,6 +122,55 @@ pub trait SecretStore: Send + Sync {
         }
         Ok(())
     }
+    /// Every key of ONE Secret as one read, with the version it was read
+    /// at — `None` when the Secret does not exist. One read cannot tear:
+    /// a slot and its `minted-for` come from the same version (review
+    /// 70d449f9 of car 3, N5). A store that reads key by key has no such
+    /// read, and says so.
+    async fn read_secret(&self, namespace: &str, name: &str) -> Result<Option<SecretData>, String> {
+        let _ = (namespace, name);
+        Err("this Secret store reads one key at a time".into())
+    }
+    /// [`SecretStore::write_keys`] only if the Secret is still at
+    /// `version` — [`WriteAt::Moved`] when another writer got there
+    /// first, and nothing is written. The broker's mint uses it so two
+    /// concurrent firings of one rotation cannot both stage a value
+    /// (review 70d449f9, N2).
+    async fn write_keys_at(
+        &self,
+        namespace: &str,
+        name: &str,
+        entries: &[(&str, &str)],
+        version: &str,
+    ) -> Result<WriteAt, String> {
+        let _ = (namespace, name, entries, version);
+        Err("this Secret store has no conditional write".into())
+    }
+}
+
+/// One Secret, read whole: its version and its keys. `Debug` names the
+/// keys and never a value.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct SecretData {
+    pub version: String,
+    pub data: std::collections::BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for SecretData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretData")
+            .field("version", &self.version)
+            .field("keys", &self.data.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// What a conditional write found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteAt {
+    Written,
+    /// The Secret moved past the version the write was conditioned on.
+    Moved,
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +525,81 @@ impl SecretStore for KubeSecretStore {
         name: &str,
         entries: &[(&str, &str)],
     ) -> Result<(), String> {
+        self.patch_data(namespace, name, entries, None)
+            .await
+            .and_then(|w| match w {
+                WriteAt::Written => Ok(()),
+                WriteAt::Moved => Err(format!(
+                    "PATCH secret {namespace}/{name} answered 409 with no version asked for"
+                )),
+            })
+    }
+
+    /// One GET: the whole `data` map, base64-decoded, and the
+    /// resourceVersion it was read at.
+    async fn read_secret(&self, namespace: &str, name: &str) -> Result<Option<SecretData>, String> {
+        let url = format!(
+            "{}/api/v1/namespaces/{namespace}/secrets/{name}",
+            self.base.trim_end_matches('/')
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.bearer)
+            .send()
+            .await
+            .map_err(|e| format!("GET {url}: {e}"))?;
+        match resp.status() {
+            reqwest::StatusCode::NOT_FOUND => return Ok(None),
+            s if !s.is_success() => return Err(format!("GET {url} returned {s}")),
+            _ => {}
+        }
+        let body: JsonValue = resp.json().await.map_err(|e| format!("{url}: {e}"))?;
+        let version = body
+            .pointer("/metadata/resourceVersion")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| format!("secret {namespace}/{name}: no metadata.resourceVersion"))?
+            .to_string();
+        let mut data = std::collections::BTreeMap::new();
+        for (key, v) in body
+            .get("data")
+            .and_then(JsonValue::as_object)
+            .into_iter()
+            .flatten()
+        {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(v.as_str().unwrap_or_default())
+                .map_err(|e| format!("secret {namespace}/{name} key {key}: base64: {e}"))?;
+            let text = String::from_utf8(bytes)
+                .map_err(|_| format!("secret {namespace}/{name} key {key}: not utf-8"))?;
+            data.insert(key.clone(), text.trim().to_string());
+        }
+        Ok(Some(SecretData { version, data }))
+    }
+
+    /// The merge-patch carries `metadata.resourceVersion`, which the API
+    /// server treats as a precondition: 409 Conflict when the Secret has
+    /// moved, and nothing applied.
+    async fn write_keys_at(
+        &self,
+        namespace: &str,
+        name: &str,
+        entries: &[(&str, &str)],
+        version: &str,
+    ) -> Result<WriteAt, String> {
+        self.patch_data(namespace, name, entries, Some(version))
+            .await
+    }
+}
+
+impl KubeSecretStore {
+    async fn patch_data(
+        &self,
+        namespace: &str,
+        name: &str,
+        entries: &[(&str, &str)],
+        version: Option<&str>,
+    ) -> Result<WriteAt, String> {
         let url = format!(
             "{}/api/v1/namespaces/{namespace}/secrets/{name}",
             self.base.trim_end_matches('/')
@@ -489,17 +613,22 @@ impl SecretStore for KubeSecretStore {
                 )
             })
             .collect();
+        let body = match version {
+            Some(v) => json!({ "metadata": { "resourceVersion": v }, "data": data }),
+            None => json!({ "data": data }),
+        };
         let resp = self
             .client
             .patch(&url)
             .bearer_auth(&self.bearer)
             .header("Content-Type", "application/merge-patch+json")
-            .json(&json!({ "data": data }))
+            .json(&body)
             .send()
             .await
             .map_err(|e| format!("PATCH {url}: {e}"))?;
         match resp.status() {
-            s if s.is_success() => Ok(()),
+            s if s.is_success() => Ok(WriteAt::Written),
+            reqwest::StatusCode::CONFLICT if version.is_some() => Ok(WriteAt::Moved),
             reqwest::StatusCode::NOT_FOUND => Err(format!(
                 "secret {namespace}/{name} does not exist — the broker is \
                  deliberately not granted `create` (it cannot be name-scoped); \
@@ -541,6 +670,18 @@ impl SecretStore for Unconfigured {
         Err(self.0.clone())
     }
     async fn write_key(&self, _n: &str, _s: &str, _k: &str, _v: &str) -> Result<(), String> {
+        Err(self.0.clone())
+    }
+    async fn read_secret(&self, _n: &str, _s: &str) -> Result<Option<SecretData>, String> {
+        Err(self.0.clone())
+    }
+    async fn write_keys_at(
+        &self,
+        _n: &str,
+        _s: &str,
+        _e: &[(&str, &str)],
+        _v: &str,
+    ) -> Result<WriteAt, String> {
         Err(self.0.clone())
     }
 }
@@ -2341,7 +2482,7 @@ mod github_tests {
 
     #[test]
     fn a_repo_outside_the_grammar_never_becomes_a_path() {
-        for ok in ["algedonic-dev/boss-dr", "dauld/boss-mirror", "a/b.c_d"] {
+        for ok in ["algedonic-dev/boss-dr", "algedonic-dev/boss", "a/b.c_d"] {
             assert_eq!(github_repo(ok), Ok(ok));
         }
         for bad in [

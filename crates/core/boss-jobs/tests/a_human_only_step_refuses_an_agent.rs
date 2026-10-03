@@ -130,16 +130,8 @@ fn review_spec() -> WorkflowSpec {
 
 fn field(name: &str, filled_by: boss_core::job::FilledBy) -> boss_core::job::StepField {
     boss_core::job::StepField {
-        name: name.into(),
-        field_type: "string".into(),
-        required: false,
         filled_by,
-        item_keys: Vec::new(),
-        covers: None,
-        binds: None,
-        item_value_max_bytes: None,
-        item_one_of: Vec::new(),
-        writer: None,
+        ..boss_core::job::StepField::new(name, "string")
     }
 }
 
@@ -244,8 +236,9 @@ async fn step_by_slug(jobs: &InMemoryJobs, job: &Job, slug: &str) -> Step {
 }
 
 /// The step's stored metadata with `keys` laid over it — the
-/// read-merge-write body the step PUT requires, since it refuses a
-/// metadata body that omits a stored key (e39a9d2a).
+/// read-merge-write body a step PUT used to carry. Since e39a9d2a
+/// (Stage 2's last car) the PUT refuses ANY metadata body, so this now
+/// builds only the bodies the tests below show it refusing.
 fn over(step: &Step, keys: serde_json::Value) -> serde_json::Value {
     let mut md = step.metadata.clone();
     if let (Some(m), Some(k)) = (md.as_object_mut(), keys.as_object()) {
@@ -274,6 +267,23 @@ async fn put_step(
         .await
         .unwrap();
     read(resp).await
+}
+
+/// The step PUT's refusal of a metadata body (e39a9d2a, Stage 2's last
+/// car: the PUT writes no metadata). It answers before any metadata
+/// guard is reached, naming the merge door where those guards live.
+fn assert_merge_door(status: StatusCode, body: &serde_json::Value, text: &str, step: &Step) {
+    assert_eq!(status, StatusCode::CONFLICT, "{text}");
+    assert_eq!(
+        body["merge_door"],
+        format!("/api/jobs/{}/steps/{}/metadata", step.job_id, step.id),
+        "the refusal names the step's merge door: {text}"
+    );
+    assert_eq!(
+        body["hint"],
+        boss_jobs::step_metadata_write::METADATA_BODY_HINT,
+        "{text}"
+    );
 }
 
 async fn claim(
@@ -375,10 +385,13 @@ async fn a_step_that_is_not_human_only_is_untouched() {
 }
 
 /// The declaration is protocol data on the step and a body cannot
-/// strip it by omission: a metadata PUT that omits `human_only` is
-/// refused (the drop refusal, e39a9d2a — it used to be carried forward
-/// by hand), the step stays human-only, and the next assignment is
-/// still refused.
+/// strip it by omission. It used to be carried forward by hand, then
+/// refused as a dropped key (e39a9d2a, Stage 1); since Stage 2's last
+/// car the step PUT writes no metadata at all, so the omitting body is
+/// refused whole, naming the merge door — where an unsent key is kept
+/// and a `null` deletion is refused (see
+/// `the_declaration_cannot_be_lifted_on_the_way_to_completion`). The
+/// step stays human-only, and the next assignment is still refused.
 #[tokio::test]
 async fn human_only_cannot_be_stripped_by_a_metadata_put() {
     let (app, jobs) = app();
@@ -392,13 +405,7 @@ async fn human_only_cannot_be_stripped_by_a_metadata_put() {
         serde_json::json!({ "metadata": { "note": "stripped" } }),
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{text}");
-    assert!(
-        body["missing_keys"]
-            .as_array()
-            .is_some_and(|k| k.iter().any(|k| k == boss_jobs::human_only::KEY)),
-        "the refusal names the dropped declaration: {text}"
-    );
+    assert_merge_door(status, &body, &text, &kill);
     let stored = jobs.get_step(&kill.id).await.unwrap().unwrap();
     assert!(
         boss_jobs::human_only::declared(&stored.metadata),
@@ -466,17 +473,14 @@ async fn an_answer_question_completion_records_whether_the_proposal_was_accepted
     )
     .await;
     let decide = step_by_slug(&jobs, &job, "decide").await;
-    let (status, _, text) = put_step(
+    // The answer through the merge door, then the status alone: since
+    // e39a9d2a (Stage 2's last car) the step PUT writes no metadata.
+    complete_with(
         &app,
         &decide,
-        &user(DAVID, "platform-admin"),
-        serde_json::json!({
-            "status": "completed",
-            "metadata": over(&decide, serde_json::json!({ "verdict": "approved", "answer": proposed })),
-        }),
+        serde_json::json!({ "verdict": "approved", "answer": proposed }),
     )
     .await;
-    assert!(status.is_success(), "{status} {text}");
     let stored = jobs.get_step(&decide.id).await.unwrap().unwrap();
     assert_eq!(
         stored.metadata["accepted_as_proposed"], true,
@@ -494,27 +498,38 @@ async fn an_answer_question_completion_records_whether_the_proposal_was_accepted
     )
     .await;
     let decide = step_by_slug(&jobs, &job, "decide").await;
-    let (status, _, text) = put_step(
+    complete_with(
         &app,
         &decide,
-        &user(DAVID, "platform-admin"),
         serde_json::json!({
-            "status": "completed",
-            "metadata": over(&decide, serde_json::json!({
-                "verdict": "approved",
-                "answer": "Stamp completed_by only; drop the rest.",
-                "accepted_as_proposed": true,
-            })),
+            "verdict": "approved",
+            "answer": "Stamp completed_by only; drop the rest.",
+            "accepted_as_proposed": true,
         }),
     )
     .await;
-    assert!(status.is_success(), "{status} {text}");
     let stored = jobs.get_step(&decide.id).await.unwrap().unwrap();
     assert_eq!(
         stored.metadata["accepted_as_proposed"], false,
         "{}",
         stored.metadata
     );
+}
+
+/// Complete `step` as David: `keys` through its merge door, then the
+/// status alone.
+async fn complete_with(app: &Router, step: &Step, keys: serde_json::Value) {
+    let david = user(DAVID, "platform-admin");
+    let (status, _, text) = patch_metadata(app, step, &david, keys).await;
+    assert!(status.is_success(), "{status} {text}");
+    let (status, _, text) = put_step(
+        app,
+        step,
+        &david,
+        serde_json::json!({ "status": "completed" }),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {text}");
 }
 
 // ── COMPLETION (backlog adac8fa4) ──────────────────────────────────
@@ -658,7 +673,10 @@ async fn an_automation_cannot_complete_a_human_only_step_by_naming_a_person() {
 /// The declaration cannot be lifted on the way to completion: not in
 /// the completing PUT's own body, and not through the merge door first
 /// (a key sent as `null` is deleted there). The rule is the protocol's
-/// — a new workflow version changes it, never a step write.
+/// — a new workflow version changes it, never a step write. The two PUT
+/// bodies used to meet the declaration check (403); since e39a9d2a
+/// (Stage 2's last car) the PUT writes no metadata and refuses both
+/// before it, naming the merge door, whose own 403 is asserted below.
 #[tokio::test]
 async fn the_declaration_cannot_be_lifted_on_the_way_to_completion() {
     let (app, jobs) = app();
@@ -677,12 +695,11 @@ async fn the_declaration_cannot_be_lifted_on_the_way_to_completion() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
-    assert_eq!(body["step_id"], kill.id.to_string(), "{text}");
+    assert_merge_door(status, &body, &text, &kill);
     assert_still_open(&jobs, &kill).await;
 
     // In a PUT that does not complete, to set up a later flip.
-    let (status, _, text) = put_step(
+    let (status, body, text) = put_step(
         &app,
         &kill,
         &agent,
@@ -691,7 +708,7 @@ async fn the_declaration_cannot_be_lifted_on_the_way_to_completion() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+    assert_merge_door(status, &body, &text, &kill);
     assert_still_open(&jobs, &kill).await;
 
     // Through the merge door, deleted or flipped.
@@ -815,34 +832,34 @@ async fn an_agent_cannot_write_the_persons_field_through_the_merge_door() {
     }
 }
 
-/// The same rule on the step PUT: a metadata body that stops short of
-/// completing does not carry the person's field past the check either.
+/// The step PUT carries no person's field past the check either. It
+/// used to meet this rule on its metadata body; since e39a9d2a (Stage
+/// 2's last car) the PUT writes no metadata, so the body is refused
+/// before any rule reads it, naming the merge door — where the rule is
+/// asserted above. The refusal is the body's shape, not its content:
+/// context is refused at the PUT too, and lands through the door
+/// (`an_agent_still_writes_context_for_the_person`).
 #[tokio::test]
-async fn an_agent_cannot_write_the_persons_field_through_the_step_put() {
+async fn the_step_put_carries_no_persons_field_it_refuses_any_metadata_body() {
     let (app, jobs) = app();
     let job = file(&app, &jobs, "decide", serde_json::json!({})).await;
     let decide = step_by_slug(&jobs, &job, "decide").await;
 
-    let (status, body, text) = put_step(
-        &app,
-        &decide,
-        &user(AGENT, "platform-admin"),
-        serde_json::json!({ "metadata": over(&decide, serde_json::json!({ "verdict": "pull" })) }),
-    )
-    .await;
-    assert_write_refused(status, &body, &text, &decide, AGENT, "verdict");
-    let stored = jobs.get_step(&decide.id).await.unwrap().unwrap();
-    assert_eq!(stored.metadata, decide.metadata);
-
-    // Context through the PUT is still context.
-    let (status, _, text) = put_step(
-        &app,
-        &decide,
-        &user(AGENT, "platform-admin"),
-        serde_json::json!({ "metadata": over(&decide, serde_json::json!({ "context_md": "the reading" })) }),
-    )
-    .await;
-    assert!(status.is_success(), "{status} {text}");
+    for keys in [
+        serde_json::json!({ "verdict": "pull" }),
+        serde_json::json!({ "context_md": "the reading" }),
+    ] {
+        let (status, body, text) = put_step(
+            &app,
+            &decide,
+            &user(AGENT, "platform-admin"),
+            serde_json::json!({ "metadata": over(&decide, keys) }),
+        )
+        .await;
+        assert_merge_door(status, &body, &text, &decide);
+        let stored = jobs.get_step(&decide.id).await.unwrap().unwrap();
+        assert_eq!(stored.metadata, decide.metadata, "nothing was written");
+    }
 }
 
 /// THE CALLER THAT MUST KEEP WORKING: context written for the person —

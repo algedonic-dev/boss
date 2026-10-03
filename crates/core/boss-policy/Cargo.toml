@@ -21,12 +21,17 @@ path = "src/bin/boss_policy_bootstrap.rs"
 # build silently produces an in-memory-only binary that fails on
 # startup. Same fix as boss-docs (postgres → default 2026-05-05).
 default = ["postgres"]
-postgres = ["dep:sqlx"]
+postgres = ["dep:sqlx", "dep:boss-events"]
 
 [dependencies]
-boss-core = { path = "../boss-core" }
+# `blocking`: the policy bootstrap walk sends through
+# machine_token::BlockingClient (design 6805c764 car 2).
+boss-core = { path = "../boss-core", features = ["blocking"] }
 boss-ports = { path = "../boss-ports" }
 boss-policy-client = { path = "../boss-policy-client" }
+# The outbox the policy check and the machine gate state their facts
+# through (design 21946380), in the binary only.
+boss-events = { path = "../boss-events", default-features = false, features = ["postgres"], optional = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }

@@ -25,7 +25,7 @@
 # rendered for into it beside the plan (render_plan in
 # infra/ops/ops-runner.sh), so `metadata.verb` is the act being approved.
 # The list is every verb that runs infra/forge/github-act.sh AND declares
-# requires_approval — the three writes — pinned to infra/ops/verbs/ by
+# requires_approval — the four writes — pinned to infra/ops/verbs/ by
 # the same test. The runner writes the request's `args` beside the verb,
 # so `metadata.args.0` is the owner the approved act names, and only an
 # act on algedonic-dev re-mints algedonic-dev's admin token (the twin's
@@ -52,9 +52,11 @@ one Secret and records credential.installed. Design 76c46869
 # v2 (backlog 732c3cf9, 2026-09-29): the org filter (#808) and
 # `request_id` (#819) were edited in at v1, so the seed kept the v1 row
 # and neither was live. A content edit is a version bump.
-version = 2
+# v3 (backlog e727fcfd, 2026-09-29): the fourth write,
+# github-disable-actions.
+version = 3
 on_event = "step.done.sign-off"
-when = 'workflow_kind = "ops-request" AND spec_slug = "approve" AND metadata.decision = "approved" AND metadata.args.0 = "algedonic-dev" AND (metadata.verb = "github-create-repository" OR metadata.verb = "github-delete-refs" OR metadata.verb = "github-set-branch-protection")'
+when = 'workflow_kind = "ops-request" AND spec_slug = "approve" AND metadata.decision = "approved" AND metadata.args.0 = "algedonic-dev" AND (metadata.verb = "github-create-repository" OR metadata.verb = "github-delete-refs" OR metadata.verb = "github-set-branch-protection" OR metadata.verb = "github-disable-actions")'
 [[rule.do]]
 handler = "credential.rotate.github-app-installation"
 args = { phase = "\"refresh\"", refresh_within_minutes = "\"40\"", secret_namespace = "\"boss\"", secret_name = "\"github-app-algedonic-dev\"", secret_key = "\"token\"", credential_id = "\"github-app-algedonic-dev\"", verify_repo = "\"algedonic-dev/boss\"", permissions = "\"administration:write,contents:write,metadata:read\"", request_id = "job_id" }

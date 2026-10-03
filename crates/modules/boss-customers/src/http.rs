@@ -20,7 +20,7 @@ use axum::routing::get;
 use serde::Deserialize;
 
 use crate::port::{CustomersError, CustomersRepository};
-use crate::types::{Customer, id_from_email};
+use crate::types::{Customer, email_key, id_from_email};
 
 #[derive(Clone)]
 pub struct CustomersApiState<R: CustomersRepository> {
@@ -68,7 +68,7 @@ async fn create_customer<R: CustomersRepository + 'static>(
     // tooling); otherwise the R3 mint derives it from the email.
     let id = match (&body.id, &body.email) {
         (Some(id), _) if !id.trim().is_empty() => id.clone(),
-        (_, Some(email)) if !email.trim().is_empty() => id_from_email(email),
+        (_, Some(email)) if !email_key(email).is_empty() => id_from_email(email),
         _ => {
             return (StatusCode::BAD_REQUEST, "id or email is required").into_response();
         }

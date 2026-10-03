@@ -37,6 +37,7 @@
 
 import type { Machine, MachineState } from './regions';
 import type { Territory } from './world';
+import { NOT_IN_SCOPE } from '../../policy/withheld';
 
 /** The strip a territory reserves along its bottom edge for machinery.
  *  `region-contents.ts` subtracts it from the room the interior's wagon
@@ -67,6 +68,9 @@ const RANK: Readonly<Record<MachineState, number>> = {
   unknown: 1,
   running: 2,
   idle: 3,
+  // Withheld by policy scope (1805bac0) is not a reading that asks for
+  // attention: it is the first to be cut on a narrow territory.
+  withheld: 4,
 };
 
 /** The machines of a territory, in drawing order: by what matters,
@@ -103,7 +107,8 @@ export function machineryStrip(
 /** The whole reading, for the glyph's `<title>` and its aria-label —
  *  the sentence the server wrote, never a shortened copy of it. */
 export function machineTitle(m: Machine): string {
-  return `${m.name} · ${m.state} — ${m.why}`;
+  // A withheld machine is said as the scope (bd506215, 1805bac0).
+  return `${m.name} · ${m.state === 'withheld' ? NOT_IN_SCOPE : m.state} — ${m.why}`;
 }
 
 /** What the machinery of a region amounts to, in words: the line a
@@ -112,7 +117,7 @@ export function machineTitle(m: Machine): string {
  *  no machinery says so rather than printing zeroes. */
 export function machineryLabel(machines: ReadonlyArray<Machine>): string {
   if (machines.length === 0) return 'no machinery of ours works here';
-  const counts = (['failed', 'unknown', 'running', 'idle'] as const)
+  const counts = (['failed', 'unknown', 'running', 'idle', 'withheld'] as const)
     .map((state) => [state, machines.filter((m) => m.state === state).length] as const)
     .filter(([, n]) => n > 0)
     .map(([state, n]) => `${n} ${state}`);

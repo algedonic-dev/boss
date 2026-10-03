@@ -1,0 +1,68 @@
+# ---------------------------------------------------------------------
+# The credential broker mints and rotates the estate machine token
+# (design 6805c764, car 3; backlog 2710c8fc; David 2026-09-25: "the
+# token VALUE is never placed by hand: it lives in a Secret the
+# credential broker mints and rotates"). THIS RULE ROW IS THE
+# CREDENTIAL'S CONSUMER DECLARATION, the convention of every broker
+# rule: which Secret the gates mount, which other namespaces hold a copy
+# for their callers, which registry row the phases land on, and how long
+# the old value must go unpresented before it is revoked — data, not
+# code. The registry row proper is `boss-machine-token` (kind
+# machine-token, credentials table).
+#
+# SELF-ISSUED: there is no issuer to call and no root credential. The
+# handler generates 32 bytes from the operating system's random source
+# and writes them only to the Secrets below.
+#
+# Fires when the SCOPE step of a rotate-a-credential packet about this
+# credential completes — opened ON it (subject_id) or naming it on the
+# scope step (`credential`), the two spellings every broker rule
+# matches. The handler then stages the value in `next` of
+# boss/boss-machine-token and boss-dev/boss-machine-token, waits until
+# every service port's machine gate accepts it, promotes it to
+# `current` (the old value moves to `previous`, still accepted), and
+# blanks `previous` only once every gate's tally shows nothing has
+# presented it for `drain_minutes`. What cannot happen inside one
+# delivery is carried by its twin, `broker-advances-the-machine-token-
+# rotation`, which hands the handler the same declaration every fifteen
+# minutes (pinned equal, machine_token_rotation_rules.rs).
+#
+# `drain_minutes` outlasts the longest CronJob period in
+# infra/cluster/manifests/ (daily, 2026-09-30), so every scheduled caller
+# has run inside the window before its old value stops being accepted —
+# pinned by the_machine_token_drain_outlasts_every_cronjob.rs.
+#
+# `also_in_namespaces` names the SAME Secret name in each namespace: a
+# pod mounts only its own namespace's Secrets, and the dev pod's doors
+# (boss-api, the boss shim) are callers. The converge creates each one
+# empty (cluster-deploy-lib.sh broker_secrets) and the broker's Roles
+# grant each one by name (boss-credential-broker.yaml).
+#
+# MOUNTED SINCE CAR 4: boss.yaml, the chores, the backup, the break-glass
+# deposit and the conductor mount boss/boss-machine-token (or boss-dev's
+# copy) at /etc/boss/machine-token, and the dev pod mounts its copy at
+# the doors' own directory (infra/dev/machine-token-dir) — the roster is
+# pinned by the_machine_gate_reports_and_refuses_nothing.rs. Every gate
+# is in mode `report`: it admits every request and tallies the ones that
+# present no accepted slot, so a rotation filed now stages, verifies and
+# promotes against live gates, and nothing here refuses a request.
+# Enforcement is its own car (decision b08725c2, row C).
+[[rule]]
+name = "broker-rotates-the-machine-token"
+why = """
+EXTERNAL GLUE, the census class for reactions whose effect lives
+outside the system: the credential broker writes the k8s Secret store
+and reads every service port's machine gate, neither of which a
+Workflow definition can address. The rotate-a-credential protocol row
+declares the ORDER (issue -> install -> verify -> revoke); this rule is
+the machine executor for ONE credential, and its args are that
+credential's consumer declaration — the Secrets, the registry row, the
+drain window. It adds no routing: it advances the very packet that
+fired it and spawns nothing. Self-issued, on the same protocol as the
+forge, tunnel, GitHub App and ops-runner rules (design 6805c764, car 3).
+"""
+on_event = "step.done.credential-rotation"
+when = 'subject_id = "boss-machine-token" OR metadata.credential = "boss-machine-token"'
+[[rule.do]]
+handler = "credential.rotate.self-issued"
+args = { secret_namespace = "\"boss\"", secret_name = "\"boss-machine-token\"", also_in_namespaces = "\"boss-dev\"", credential_id = "\"boss-machine-token\"", drain_minutes = "\"1440\"" }

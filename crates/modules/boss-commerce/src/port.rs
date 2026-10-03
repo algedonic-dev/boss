@@ -15,6 +15,12 @@ pub enum CommerceError {
     NotFound(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    /// The request itself is wrong — a body no store can keep as a true
+    /// document, a page bound that names no page. A 400. Until the
+    /// adapters-agree suite (backlog be459ab9) these were `Storage`,
+    /// so the caller's mistake read as the server's (a 500).
+    #[error("invalid: {0}")]
+    Invalid(String),
 }
 
 impl CommerceError {
@@ -37,7 +43,39 @@ impl CommerceError {
             differing.join(", ")
         ))
     }
+
+    /// The refusal of a create whose line id another invoice already
+    /// holds, worded once so both adapters name the same line (backlog
+    /// be459ab9: Postgres answered its primary-key error as `Storage`,
+    /// a 500, and the double stored the line twice). A `Conflict`, so
+    /// the API answers 409.
+    pub fn line_id_taken(id: &str, line: &str) -> Self {
+        Self::Conflict(format!(
+            "invoice {id}: line id {line} is already held by another invoice"
+        ))
+    }
+
+    /// The refusal of a page bound that names no page (backlog
+    /// be459ab9). `Invalid`, so the API answers 400.
+    pub fn negative_page_bound(limit: i64, offset: i64) -> Option<Self> {
+        let field = if limit < 0 {
+            "limit"
+        } else if offset < 0 {
+            "offset"
+        } else {
+            return None;
+        };
+        Some(Self::Invalid(format!(
+            "{field} must not be negative (limit {limit}, offset {offset})"
+        )))
+    }
 }
+
+/// How an account may pay an invoice — the values `invoices.payment_method`
+/// accepts (its CHECK in `23-commerce.sql`). A fact living twice, so it
+/// is pinned: the adapters-agree suite creates an invoice under each on
+/// Postgres, and the CHECK refuses any this list holds and it does not.
+pub const PAYMENT_METHODS: [&str; 4] = ["ach", "wire", "check", "card"];
 
 /// What [`CommerceRepository::create_invoice_at`] did with the id it was
 /// handed (backlog 9d2af748). Both arms carry the invoice AS STORED.
@@ -63,13 +101,22 @@ impl InvoiceCreate {
 /// Read-only persistence port for invoices and revenue.
 #[async_trait]
 pub trait CommerceRepository: Send + Sync {
-    /// Return all revenue lines ordered by month descending, then category.
+    /// Every stored line rolled up by the month its invoice was issued
+    /// and its revenue category, over every invoice of any status:
+    /// newest month first, categories in BYTE order (backlog be459ab9 —
+    /// the double answered only what a test seeded, Postgres ordered
+    /// categories in the database's locale).
     async fn all_revenue(&self) -> Result<Vec<RevenueLine>, CommerceError>;
 
-    /// Return every invoice.
+    /// Return every invoice, as stored: newest `issued_on` first, ties
+    /// in BYTE order of id — the order a page of `list_invoices` is a
+    /// window on (backlog be459ab9: the double listed in insertion
+    /// order, Postgres left ties unordered).
     async fn all_invoices(&self) -> Result<Vec<Invoice>, CommerceError>;
 
-    /// Return a page of invoices with total count.
+    /// Return a page of invoices with total count, in the order of
+    /// `all_invoices`; a negative `limit` or `offset` is refused
+    /// `Invalid`.
     /// `account_id` filters to a single account when `Some`. The account
     /// detail view uses this to scope the finance/A-R section.
     async fn list_invoices(
@@ -81,7 +128,7 @@ pub trait CommerceRepository: Send + Sync {
 
     /// Open receivables per account, summed over EVERY invoice: one
     /// row per account that still owes anything (a status outside
-    /// `InvoiceStatus::NOT_OWED`), ordered by `account_id`. Unpaged,
+    /// `InvoiceStatus::NOT_OWED`), in BYTE order of `account_id`. Unpaged,
     /// because it is an aggregate — its size is the number of accounts
     /// with open AR, not the number of invoices (backlog 5257bfa9).
     async fn open_ar_by_account(&self) -> Result<Vec<AccountOpenAr>, CommerceError>;
@@ -103,7 +150,10 @@ pub trait CommerceRepository: Send + Sync {
             .await
             .map(InvoiceCreate::into_invoice)
     }
-    /// Persists the invoice and returns it as stored.
+    /// Persists the invoice and returns it as stored
+    /// ([`Invoice::as_stored`]). A body [`Invoice::malformed`] names is
+    /// refused `Invalid` and writes nothing; a line id another invoice
+    /// holds is refused [`CommerceError::line_id_taken`].
     ///
     /// OUTBOX (transactional-audit-log phase 2): the adapter records
     /// the `commerce.invoice.created` event — enriched via `stamp` —

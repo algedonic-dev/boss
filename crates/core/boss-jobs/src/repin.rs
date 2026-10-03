@@ -673,16 +673,8 @@ mod tests {
         let v1 = wf(1, vec![step("scope"), after("build", "scope")]);
         let mut build = after("build", "scope");
         build.fields = vec![StepField {
-            name: "test".into(),
-            field_type: "string".into(),
             required: true,
-            filled_by: boss_core::job::FilledBy::Executor,
-            item_keys: Vec::new(),
-            covers: None,
-            binds: None,
-            item_value_max_bytes: None,
-            item_one_of: Vec::new(),
-            writer: None,
+            ..StepField::new("test", "string")
         }];
         build.kind = "checklist".into();
         build.sign_offs_required = vec!["cto".into()];
@@ -963,16 +955,9 @@ mod tests {
     fn reserved(title: &str, writer: Option<&str>) -> StepSpec {
         let mut s = step(title);
         s.fields = vec![StepField {
-            name: "plan".into(),
-            field_type: "string".into(),
             required: true,
-            filled_by: boss_core::job::FilledBy::Executor,
-            item_keys: Vec::new(),
-            covers: None,
-            binds: None,
-            item_value_max_bytes: None,
-            item_one_of: Vec::new(),
             writer: writer.map(str::to_string),
+            ..StepField::new("plan", "string")
         }];
         s
     }

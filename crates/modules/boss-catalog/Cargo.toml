@@ -68,3 +68,7 @@ required-features = ["postgres"]
 [[test]]
 name = "rebuild_e2e"
 required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_equipment_kb_pg"
+required-features = ["postgres"]

@@ -1,0 +1,7 @@
+# automation:recovery-kit — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 2 audit-log facts.
+# Signs as platform-admin today: infra/forge/recovery-kit-read.sh.
+
+[[automation]]
+id = "automation:recovery-kit"
+role = "platform-admin"
+description = 'The workstation door to a recovery kit the forge has cut (infra/forge/recovery-kit-read.sh).'

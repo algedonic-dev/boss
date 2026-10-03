@@ -505,7 +505,10 @@ mod tests {
             "boss job patch",
             // The evidence rules, in the words the incidents left.
             "total",
-            "wholesale",
+            // Was `wholesale`, the step PUT's old replace, until that PUT
+            // stopped taking metadata (e39a9d2a): the hazard is now which
+            // door keeps the keys a write leaves out.
+            "keeps every key you leave out",
             "read it back",
             "control",
             "count",
@@ -599,15 +602,107 @@ mod tests {
             actions.contains("    Complete {"),
             "`boss step complete` is a StepAction variant"
         );
-        // ONE PUT, NOT TWO. The freeze in `boss-jobs/src/http/steps.rs`
-        // is gated on the step's OLD status, so a step still ready
-        // takes its metadata and its completion in one body; a
-        // document that teaches a write and THEN a completion teaches
-        // a second write the API answers with a 409.
+        // THE KEYS, THEN THE STATUS ALONE. This pinned "one PUT" until
+        // the step PUT stopped writing metadata (backlog e39a9d2a,
+        // Stage 2's last car): a completion is now the merge door and
+        // then a status-only PUT, and a document that still taught the
+        // one PUT would teach a body the API answers with a 409.
+        for phrase in ["merge door", "status alone", "refuses any"] {
+            assert!(
+                text.contains(phrase),
+                "the analyst rules teach the two-write completion: `{phrase}`"
+            );
+        }
         assert!(
-            text.contains("one PUT"),
-            "the analyst rules say a completion is one PUT, not two"
+            !text.contains("one PUT"),
+            "and no longer teach the one-PUT completion the API refuses"
         );
+    }
+
+    /// THE REVIEWER DOCUMENT (backlog bc9ef34f, 2026-09-30). The
+    /// ship-a-change `review` step declares the `reviewer` profile so
+    /// `boss dispatch` can open a run for an adversarial review instead
+    /// of refusing the step by name. What the run must be told is
+    /// narrow and pinned here: it ends on `boss review` INSIDE its own
+    /// run, with the verdict set and the findings as a file — the
+    /// record `boss release <car> --review <run>` releases on — and it
+    /// completes its OWN run's `building`, never the car's `review`
+    /// step, which the conductor completes when the car boards and
+    /// which a reviewer's claim would otherwise be read as owing. And
+    /// it is not a builder: no worktree of its own to build in, no
+    /// gate, no push, and no release, which is the operator's act on
+    /// the verdict.
+    #[test]
+    fn the_reviewer_document_ends_the_run_on_its_recorded_verdict() {
+        let doc = read(&repo(), "reviewer")
+            .expect("readable")
+            .expect("infra/platform/documents/reviewer-rules.md is authored");
+        assert_eq!(profile_of(&doc).as_deref(), Some("reviewer"));
+        assert_eq!(
+            lane(&repo(), "reviewer").expect("the lane reads"),
+            crate::brief::LANE_STEP,
+            "a reviewer ships no car, so it runs without a worktree of this tree"
+        );
+        let text = body(&doc);
+        for phrase in [
+            // The verdict, in the one shape `boss review` accepts and
+            // `review_verdict::vouches` reads back.
+            "BOSS_AGENT_RUN=<your run id> boss review <car> --verdict release|changes \
+             --findings-file",
+            // What the verdict is FOR, and whose act it is.
+            "boss release <car> --review <your run id>",
+            // Its own run closes on the verdict, not on the car boarding.
+            "--step building --field result=delivered",
+            "boss dispatch <your run id> --report --summary-file",
+            // A reviewer reads the head its verdict will name.
+            "reviewed_sha",
+            // A review tree, locked, as rule 12 of the analyst's taught,
+            // and NAMED FOR THE RUN (review 0545d1b1): wt-cargo names a
+            // target after the tree's basename, so one shared name put
+            // every concurrent reviewer in one cargo target.
+            "git worktree add --lock --detach <that directory>/review-<first 8 of your run id>",
+            // The test-safety invariants, QUOTED rather than pointed at
+            // (review 0545d1b1): the step lane's invariants section
+            // carries neither, so a rule saying "the bound the
+            // invariants name" pointed at nothing.
+            "{{invariant:cargo jobs}}",
+            "{{invariant:the database}}",
+            "wt-cargo",
+            // The builder's run is in the brief; it is not the
+            // reviewer's to close (review 0545d1b1 item 5).
+            "never the car's builder run",
+        ] {
+            assert!(text.contains(phrase), "the reviewer rules say `{phrase}`");
+        }
+        // The verb it names ships, with the flags it names.
+        let steps =
+            std::fs::read_to_string(repo().join("crates/orchestrators/boss-cli/src/steps.rs"))
+                .expect("the step verbs' module");
+        let review = steps
+            .split_once("    Review {")
+            .expect("`boss review` is a verb")
+            .1;
+        for field in ["verdict: String", "findings_file:"] {
+            assert!(review.contains(field), "`boss review` takes `{field}`");
+        }
+        assert_eq!(
+            crate::review_verdict::VERDICTS.join("|"),
+            "release|changes",
+            "the verdicts the document names are the ones `boss review` records"
+        );
+        // The quotes expand: both invariants exist in this tree.
+        let invs = crate::brief::invariants(&repo()).expect("the invariants derive");
+        let expanded = expand(&text, &invs).expect("the reviewer's quotes expand");
+        assert!(expanded.contains("wt-cargo <cargo args>"), "{expanded}");
+        // NOT A BUILDER: the car lane's shipping doors must not appear.
+        // `wt-cargo` is NOT among them: a reviewer that runs a test
+        // runs it through the bound (review 0545d1b1).
+        for builders_only in ["git push", "--park-", "boss gate "] {
+            assert!(
+                !text.contains(builders_only),
+                "the reviewer rules carry the builder's `{builders_only}`"
+            );
+        }
     }
 
     /// THE ROSTER IS THE BUNDLE, NOT A LIST HERE (CLAUDE.md 9a). The

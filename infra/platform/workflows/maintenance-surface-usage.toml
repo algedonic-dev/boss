@@ -49,7 +49,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "The daily reading of which surfaces each operator opened: opens per actor per route over the last 24 hours, distinct routes, the top routes, and the nav-catalog surfaces nobody opened (the deletion candidates), read off the surface_opens roll-up and filed as a measured row with its coverage stated. Sweeps rows past the 30-day retention on the same run."
-metadata = { owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin" }
 # The chore contract (14c135f5): a packet of this kind states what it
 # measured and what it covered, or it is not a measurement.
 metadata_schema = { type = "object", required = ["measured", "coverage"], properties = { measured = { type = "object" }, coverage = { type = "object" } } }

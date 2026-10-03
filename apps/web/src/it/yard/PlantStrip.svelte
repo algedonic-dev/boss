@@ -69,6 +69,8 @@
   .glyph.idle .shed { opacity: 0.55; }
   .glyph.failed .shed { stroke-width: 1.5; }
   .glyph.unknown .shed { stroke-dasharray: 2 2; }
+  /* Withheld by policy scope (1805bac0): whole, unfilled, unmarked. */
+  .glyph.withheld .shed { fill: none; stroke: var(--map-muted); }
   @keyframes piston { to { transform: translateX(4px); } }
   @media (prefers-reduced-motion: reduce) {
     .lamp, .glyph .piston { animation: none !important; }

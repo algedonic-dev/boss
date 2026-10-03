@@ -54,10 +54,6 @@ const ALLOWANCE: &[(&str, &str)] = &[
         "the page's own href — a visitor's browser reads no env file; it is the CLAIM, held equal to the source by the_landing_pages_link_is_the_declared_mirror below",
     ),
     (
-        "infra/ops/verbs/publish-github-pr.json",
-        "the verb's `about` prose (registry data) describing what the verb opens a PR against",
-    ),
-    (
         "infra/ops/verbs/read-publish-checks.json",
         "the verb's `about` prose (registry data) naming the API path it reads",
     ),
@@ -68,6 +64,10 @@ const ALLOWANCE: &[(&str, &str)] = &[
     (
         "infra/dispatcher/rules/broker-re-mints-the-algedonic-dev-admin-token-when-a-github-request-is-approved.toml",
         "the same `verify_repo` as its filing twin, held equal to it word for word by boss-dispatcher's github_app_installation_token_rules.rs",
+    ),
+    (
+        "infra/dispatcher/rules/broker-mints-the-algedonic-dev-publish-token-when-a-publish-request-is-filed.toml",
+        "the broker's `verify_repo` for the publish token (backlog d2b7c947), a rule-row literal the dispatcher reads in-cluster where no sor.env exists; held equal to the declared mirror by boss-dispatcher's github_app_installation_token_rules.rs, because the token is narrowed to exactly that repository",
     ),
     (
         "infra/sim/boss-brewery-sim.service",

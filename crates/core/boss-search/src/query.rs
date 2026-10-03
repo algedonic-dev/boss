@@ -8,7 +8,7 @@
 
 use sqlx::{PgPool, Row};
 
-use boss_policy_client::{PolicyClientError, Predicate, Resource, User};
+use boss_policy_client::{Pair, PolicyClientError, Predicate, User, controls};
 
 use crate::error::SearchError;
 use crate::types::{RefKind, SearchResults, SearchRow, SubjectHit};
@@ -80,23 +80,24 @@ impl SearchScope {
         policy: &dyn boss_policy_client::PolicyClient,
         user: &User,
     ) -> Result<Self, PolicyClientError> {
-        let predicate = policy.scope_predicate(user, Resource::job()).await?;
+        let predicate = policy.scope_of(user, controls::READ_JOB).await?;
         let job_owners = predicate.owner_allow_list(user);
         Ok(Self {
             job_owners,
-            may_read_events: unrestricted_read(policy, user, Resource::event()).await?,
-            may_read_subjects: unrestricted_read(policy, user, Resource::subject()).await?,
+            may_read_events: unrestricted_read(policy, user, controls::READ_EVENT).await?,
+            may_read_subjects: unrestricted_read(policy, user, controls::READ_SUBJECT).await?,
         })
     }
 }
 
-/// True only when policy grants an unnarrowed Read on `resource`.
+/// True only when policy grants an unnarrowed Read on the control's
+/// resource — which is why both controls asked here are declared `all`.
 async fn unrestricted_read(
     policy: &dyn boss_policy_client::PolicyClient,
     user: &User,
-    resource: Resource,
+    control: Pair,
 ) -> Result<bool, PolicyClientError> {
-    let p = policy.scope_predicate(user, resource).await?;
+    let p = policy.scope_of(user, control).await?;
     Ok(matches!(p, Predicate::Unrestricted))
 }
 
@@ -279,7 +280,7 @@ pub async fn search(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boss_policy_client::{AccessTier, Action, FakePolicyClient, Scope};
+    use boss_policy_client::{AccessTier, Action, FakePolicyClient, Resource, Scope};
 
     /// Tier is irrelevant to these gates now — it is here only
     /// because `User` requires it. That is the point of the change:

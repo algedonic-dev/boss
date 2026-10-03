@@ -15,6 +15,18 @@
 //! 2026-09-25 (backlog e84de48e), when the audit was the one reader
 //! that relied on it.
 //!
+//! NO PACKET SCOPE IS ASKED, AND NONE NEEDS TO BE (checked for backlog
+//! d0058c92, whose rule is that a caller whose scope does not read
+//! every packet reads no record that is not scoped by packet). The tier
+//! gate is already narrower: the gateway mints the operator tier only
+//! for a passkey-elevated platform-admin session, and the auditor tier
+//! not at all — it is the probe reader's, `audit-readonly`, which reads
+//! every packet. A session of any role is user tier and refused here,
+//! pinned by `a_session_reads_no_row_whatever_its_packet_scope`. A
+//! header claiming operator tier with a narrow role can only come from a
+//! holder of the machine token, who could claim any role at all, so a
+//! scope question here would add a check without adding a refusal.
+//!
 //! An unknown id is a 404 that names it — unlike the delivery door,
 //! there is no fallback for a missing credential row; an absent row
 //! is a finding, and the caller should hear so unambiguously.
@@ -406,6 +418,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// NARROWER THAN THE SCOPE RULE, ALREADY (backlog d0058c92, item 3).
+    /// The IT map and the dispatcher's doors withhold a record not scoped
+    /// by packet from a caller whose scope does not read every packet;
+    /// this door asks no packet scope at all, because it asks the TIER,
+    /// and every session the gateway mints is user tier unless it is a
+    /// passkey-elevated platform-admin's. So a session reads no row here
+    /// even when its role reads every packet — the platform-admin's own,
+    /// unelevated — and so a narrowed one, whatever its role, reads none
+    /// either. Both reads, both callers.
+    #[tokio::test]
+    async fn a_session_reads_no_row_whatever_its_packet_scope() {
+        let unelevated_admin = serde_json::to_string(&User {
+            id: "emp-ops".into(),
+            role: "platform-admin".into(),
+            access_tier: AccessTier::User,
+            territory_account_ids: Vec::new(),
+            direct_report_ids: Vec::new(),
+            department: Some("it".into()),
+        })
+        .unwrap();
+        let app = app(vec![row("boss-dev-forge-token")]);
+        for (who, header) in [
+            ("a narrowed session", user_tier_header()),
+            ("an unelevated platform-admin", unelevated_admin),
+        ] {
+            for path in ["/api/credentials", "/api/credentials/boss-dev-forge-token"] {
+                let resp = app
+                    .clone()
+                    .oneshot(
+                        Request::get(path)
+                            .header("x-boss-user", header.clone())
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{who}: GET {path}");
+            }
+        }
     }
 
     #[tokio::test]

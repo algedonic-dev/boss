@@ -476,7 +476,7 @@ fn conflict_steps(
         "  The worktree is left at {wt} — resolve it, then:\n    \
          git -C {wt} cherry-pick --continue\n    \
          git -C {wt} push origin HEAD:refs/heads/{new_branch}\n    \
-         boss gate {new_branch} --wait --rebase\n    \
+         boss gate {new_branch} --wait --rebase --mode auto\n    \
          boss rerail {given} --finish{back}"
     )
 }
@@ -1058,10 +1058,14 @@ pub async fn run(
 
     // Gate the new head through the existing verb — one definition of
     // launching a gate, waits to a verdict, and a refusal cleans up its
-    // own packet (the ed7f1355 fix rides the same binary).
+    // own packet (the ed7f1355 fix rides the same binary). Derive the
+    // scope from the NEW tree, just like an ordinary car: an omitted
+    // mode silently spent 48 minutes on the yard rerail's full test
+    // phase, versus four on its scoped gate (a5462105). The assembled
+    // train still owns its full gate; no old receipt scope is copied.
     gate::run(
         &new_branch,
-        None,
+        Some("auto".to_string()),
         None,
         "boss-dev",
         true,
@@ -1465,6 +1469,15 @@ mod tests {
             Some("true"),
             "rerail's gate::run call must pass rebase = true: {args}"
         );
+        let mode_at = params(sig)
+            .iter()
+            .position(|p| p.starts_with("mode:"))
+            .expect("gate::run takes a mode parameter");
+        assert_eq!(
+            params(&args).get(mode_at).map(String::as_str),
+            Some("Some(\"auto\".to_string())"),
+            "rerail must ask the gate to derive scope from the NEW tree, not default to full: {args}"
+        );
     }
 
     /// The conflict path's printed gate carries `--rebase` too: a human
@@ -1488,6 +1501,7 @@ mod tests {
             "{temp}"
         );
         assert!(temp.contains("boss rerail fix/x --finish"), "{temp}");
+        assert!(temp.contains("--mode auto"), "{temp}");
 
         let here = conflict_steps(
             &Workspace::InPlace("/w/agent-1".into()),
@@ -1499,6 +1513,7 @@ mod tests {
             here.contains("boss gate fix/x-rerail --wait --rebase"),
             "{here}"
         );
+        assert!(here.contains("--mode auto"), "{here}");
         assert!(
             here.contains("git -C /w/agent-1 checkout worktree-agent-1"),
             "an in-place rerail names the checkout it moved the actor off: {here}"

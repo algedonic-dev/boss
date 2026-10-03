@@ -38,3 +38,7 @@ workspace = true
 [[test]]
 name = "phase_two_seed_queries_pg"
 required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_ml_registry_pg"
+required-features = ["postgres"]

@@ -91,5 +91,9 @@ name = "the_agreements_upsert_asks_policy"
 required-features = ["postgres"]
 
 [[test]]
+name = "the_adapters_agree_on_the_commerce_store_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "write_off_convergence_pg"
 required-features = ["postgres"]

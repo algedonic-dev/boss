@@ -280,6 +280,29 @@ pub struct Bases {
     /// The rule-authoring door (backlog 458971ef); the gateway proxies
     /// `/api/dispatcher/*` to it, the launcher path is its own port.
     pub dispatcher: String,
+    /// Every base is one GATEWAY (`--gateway`), so the walk sends no
+    /// machine token ([`walk_client`], backlog 2ee29275).
+    pub through_gateway: bool,
+}
+
+/// The blocking client a publish or export walk over `bases` sends
+/// with. Through a gateway it NEVER stamps the machine token (backlog
+/// 2ee29275): the gateway strips every client `x-boss-*` header at its
+/// edge, so the token buys nothing there, and a `--gateway` is a URL the
+/// operator typed — the public edge, which answers with a 302 to
+/// Cloudflare Access, or another instance. Everywhere else — the
+/// machine door, the in-pod ports — it stamps from `token`, under
+/// boss-core's host decision. Redirects are off either way.
+pub fn walk_client(
+    bases: &Bases,
+    builder: reqwest::blocking::ClientBuilder,
+    token: std::sync::Arc<boss_core::machine_token::Source>,
+) -> Result<BlockingClient> {
+    Ok(if bases.through_gateway {
+        BlockingClient::unstamped(builder)?
+    } else {
+        BlockingClient::build_with_source(builder, token)?
+    })
 }
 
 impl Bases {
@@ -290,6 +313,7 @@ impl Bases {
                 .unwrap_or_else(|| boss_ports::url(service))
         };
         Self {
+            through_gateway: gateway.is_some(),
             classes: resolve("classes"),
             ledger: resolve("ledger"),
             locations: resolve("locations"),
@@ -331,6 +355,7 @@ impl Bases {
             people: service_on_door(base, "people")?,
             jobs: service_on_door(base, "jobs")?,
             dispatcher: service_on_door(base, "dispatcher")?,
+            through_gateway: false,
         })
     }
 
@@ -1063,7 +1088,7 @@ pub fn plan(dir: &Path) -> Result<Plan> {
     })
 }
 
-fn seed_client() -> Result<BlockingClient> {
+fn seed_client(bases: &Bases) -> Result<BlockingClient> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         "x-boss-user",
@@ -1075,12 +1100,15 @@ fn seed_client() -> Result<BlockingClient> {
     );
     // Stamps the machine token per request and follows no redirect
     // (design 6805c764 car 2, the CLI slice): a publish walk writes to
-    // every service port the gate will guard.
-    Ok(BlockingClient::build(
+    // every service port the gate will guard — unless it was routed
+    // through a gateway, which is never stamped (walk_client).
+    walk_client(
+        bases,
         reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .default_headers(headers),
-    )?)
+        boss_core::machine_token::shared(),
+    )
 }
 
 fn url(base: &str, path: &str) -> String {
@@ -1450,6 +1478,7 @@ fn send(client: &BlockingClient, bases: &Bases, door: &Door, take: &Take) -> Res
         }
         Door::Policy { path, .. } => {
             let out = boss_policy::bootstrap::publish_policy_rules(
+                client,
                 &bases.policy,
                 path,
                 take.has("policy"),
@@ -1487,6 +1516,7 @@ fn send(client: &BlockingClient, bases: &Bases, door: &Door, take: &Take) -> Res
             path, owning_team, ..
         } => {
             let out = boss_jobs::bootstrap::publish_workflows(
+                client,
                 &bases.jobs,
                 path,
                 owning_team,
@@ -1747,7 +1777,7 @@ pub fn publish(plan: &Plan, bases: &Bases, take: &Take, out: &mut dyn FnMut(Stri
         }
         bail!("{}", plan.render_footer());
     }
-    let client = seed_client()?;
+    let client = seed_client(bases)?;
     let roster_len: usize = plan
         .steps
         .iter()
@@ -3245,6 +3275,39 @@ mod tests {
         assert!(line.contains("boss_ports"), "{line}");
     }
 
+    /// Backlog 2ee29275: a walk routed through a GATEWAY never stamps
+    /// the machine token — the gateway strips every client `x-boss-*`
+    /// header at its edge, and a `--gateway` the operator types may be
+    /// the public edge (`boss.algedonic.dev` 302s to Cloudflare Access)
+    /// or another instance. The machine door and the in-pod ports are
+    /// the services the gate guards, so they keep the stamp, under
+    /// boss-core's host decision like every machine client.
+    #[test]
+    fn a_gateway_walk_never_stamps_and_a_door_walk_keeps_the_host_decision() {
+        use boss_core::machine_token::{HEADER, Source};
+        let token = || Arc::new(Source::fixed(Some("estate-token-value".into())));
+        let stamped = |c: &BlockingClient, url: &str| {
+            c.get(url).build().unwrap().headers().get(HEADER).is_some()
+        };
+        let (gw, _) = Bases::routed(Some("http://127.0.0.1:8080"), None).unwrap();
+        assert!(gw.through_gateway);
+        let c = walk_client(&gw, reqwest::blocking::Client::builder(), token()).unwrap();
+        assert!(
+            !stamped(&c, &gw.jobs),
+            "a gateway walk stamps nothing, even on loopback"
+        );
+
+        let (door, _) = Bases::routed(None, Some("http://127.0.0.1:7900")).unwrap();
+        assert!(!door.through_gateway);
+        let c = walk_client(&door, reqwest::blocking::Client::builder(), token()).unwrap();
+        assert!(stamped(&c, &door.jobs), "the machine door is stamped");
+
+        let (pod, _) = Bases::routed(None, None).unwrap();
+        assert!(!pod.through_gateway);
+        let c = walk_client(&pod, reqwest::blocking::Client::builder(), token()).unwrap();
+        assert!(stamped(&c, &pod.jobs), "the in-pod ports are stamped");
+    }
+
     fn line_of<'a>(lines: &'a [String], path: &str) -> &'a str {
         lines
             .iter()
@@ -4469,6 +4532,43 @@ mod tests {
                 .count(),
             0,
             "no design Job opens against a roster that did not land"
+        );
+    }
+
+    /// A LOCATION BATCH NAMING AN ABSENT PARENT IS A REFUSAL THE
+    /// PUBLISH NAMES (backlog 3292f4ee, 2026-09-30). The locations door
+    /// answers the orphan-parent refusal 409 with its own text, where it
+    /// answered every store error 500; the publish stops at that door,
+    /// saying the status and the parent, and seeds no employee against
+    /// sites that did not land.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_location_batch_names_the_absent_parent_and_stops_the_publish() {
+        let dir = real_shape("orphan-parent");
+        let p = plan(&dir).unwrap();
+        let st = Arc::new(Mutex::new(Stub::default()));
+        let base = spawn_stub_with(st.clone(), |st, m, path, body| {
+            if m == "POST" && path == "/api/locations/batch" {
+                return (
+                    409,
+                    boss_locations::port::absent_parent("loc-nowhere").to_string(),
+                );
+            }
+            route(st, m, path, body)
+        })
+        .await;
+        let err = run_publish(p, base).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("/api/locations/batch"), "{msg}");
+        assert!(msg.contains("409"), "the status, not a server fault: {msg}");
+        assert!(msg.contains("loc-nowhere"), "the parent is named: {msg}");
+        let st = st.lock().unwrap();
+        assert_eq!(
+            st.log
+                .iter()
+                .filter(|(m, p, _, _)| m == "POST" && p == "/api/people")
+                .count(),
+            0,
+            "no employee is seeded against sites that did not land"
         );
     }
 

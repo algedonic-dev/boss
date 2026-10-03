@@ -115,6 +115,16 @@ case "$1" in
     kind="$2"; name="$3"; ns=""
     shift 3
     while [ $# -gt 0 ]; do [ "$1" = -n ] && ns="$2"; shift; done
+    # An existence read that FAILS, in kubectl's own words (backlog
+    # 7c023eaf): the object is neither there nor known to be absent.
+    case "$(awk -v k="$kind/$name/$ns" '$1 == k { print $2 }' "$STUB_FAIL")" in
+      timeout)
+        echo "Unable to connect to the server: net/http: request canceled (Client.Timeout exceeded while awaiting headers)" >&2
+        exit 1 ;;
+      500)
+        echo "Error from server (InternalError): an error on the server (\"\") has prevented the request from succeeding (get $kind $name)" >&2
+        exit 1 ;;
+    esac
     if grep -qx -- "$kind/$name/$ns" "$STUB_PRESENT"; then echo "NAME READY"; exit 0; fi
     echo "Error from server (NotFound): $kind \"$name\" not found" >&2; exit 1 ;;
 esac
@@ -123,6 +133,7 @@ exit 0
         );
         let present = root.join("present");
         write_file(&present, "");
+        write_file(&root.join("fail"), "");
         let log = root.join("calls");
         Self {
             root,
@@ -130,6 +141,12 @@ exit 0
             present,
             log,
         }
+    }
+
+    /// Make one object's EXISTENCE read fail — `timeout` or `500` — the
+    /// way kubectl's does, whether or not the object is there.
+    fn existence_read_fails(&self, object: &str, how: &str) {
+        write_file(&self.root.join("fail"), &format!("{object} {how}\n"));
     }
 
     /// Everything the fixture declares, in both namespaces.
@@ -162,6 +179,7 @@ exit 0
             .env("BOSS_CLUSTER_TREE", &self.tree)
             .env("STUB_LOG", &self.log)
             .env("STUB_PRESENT", &self.present)
+            .env("STUB_FAIL", self.root.join("fail"))
             .env_remove("BOSS_INSTANCES_SKIPPED");
         for (k, v) in env {
             cmd.env(k, v);
@@ -277,6 +295,124 @@ fn a_declared_skip_whose_objects_are_present_counts_them_present() {
     );
 }
 
+// --- backlog 7c023eaf: a failed EXISTENCE read is unreadable ------------
+//
+// Review 6b7032f5, N1. Until this car an existence read that failed for
+// any reason but Forbidden — a timeout, a refused connection, a 5xx —
+// fell through to the absence branches: MISSING (exit 1) in an applied
+// instance, and in a skipped one an expected `skipped`, exit 0, so a
+// read that never happened hid as the skip. Only kubectl's NotFound
+// says an object is absent; every other failure is unknown, in every
+// instance.
+
+/// The failed read is counted unreadable, named with kubectl's words,
+/// never missing and never skipped, and the run exits 2.
+fn assert_existence_unreadable(
+    c: &Case,
+    object: &str,
+    how: &str,
+    skipped: Option<&str>,
+    summary: &str,
+    named: &str,
+    words: &str,
+) {
+    c.existence_read_fails(object, how);
+    let env: Vec<(&str, &str)> = skipped
+        .map(|s| vec![("BOSS_INSTANCES_SKIPPED", s)])
+        .unwrap_or_default();
+    let (rc, out, err) = c.run_check(&env);
+    assert_eq!(
+        rc, 2,
+        "an existence read that failed is 'unknown', not missing and not \
+         skipped: {out}\n{err}"
+    );
+    assert_eq!(summary_line(&out), summary);
+    assert!(
+        !err.contains("MISSING"),
+        "a failed read is not an absence: {err}"
+    );
+    assert!(
+        out.contains(&format!(
+            "skip    {named} — its existence could not be read: "
+        )) && out.contains(words),
+        "the object and kubectl's own words are named: {out}"
+    );
+    assert!(
+        !out.contains(&format!("skip    {named} — instance")),
+        "a failed read is never counted as the converge's skip: {out}"
+    );
+}
+
+const TIMEOUT: &str = "Client.Timeout exceeded while awaiting headers";
+const HTTP_500: &str = "Error from server (InternalError)";
+
+#[test]
+fn an_existence_read_that_times_out_in_an_applied_instance_is_unreadable_not_missing() {
+    let c = Case::new("exist-timeout-applied");
+    c.present(&Case::all_objects());
+    assert_existence_unreadable(
+        &c,
+        "Service/boss-gateway/boss",
+        "timeout",
+        None,
+        "check-manifests-applied: 8 present, 0 missing, 0 skipped, 0 drifted, 1 unreadable (of 9)",
+        "Service/boss-gateway (ns boss)",
+        TIMEOUT,
+    );
+}
+
+#[test]
+fn an_existence_read_that_answers_500_in_an_applied_instance_is_unreadable_not_missing() {
+    let c = Case::new("exist-500-applied");
+    c.present(&Case::all_objects());
+    assert_existence_unreadable(
+        &c,
+        "Service/boss-gateway/boss",
+        "500",
+        None,
+        "check-manifests-applied: 8 present, 0 missing, 0 skipped, 0 drifted, 1 unreadable (of 9)",
+        "Service/boss-gateway (ns boss)",
+        HTTP_500,
+    );
+}
+
+fn prod_only() -> Vec<String> {
+    Case::all_objects()
+        .into_iter()
+        .filter(|o| !o.contains("boss-playground"))
+        .collect()
+}
+
+#[test]
+fn an_existence_read_that_times_out_in_a_skipped_instance_is_unreadable_not_skipped() {
+    let c = Case::new("exist-timeout-skipped");
+    c.present(&prod_only());
+    assert_existence_unreadable(
+        &c,
+        "Service/boss-gateway/boss-playground",
+        "timeout",
+        Some(SKIPPED),
+        "check-manifests-applied: 5 present, 0 missing, 3 skipped (boss-playground: secrets absent), 0 drifted, 1 unreadable (of 9)",
+        "Service/boss-gateway (ns boss-playground)",
+        TIMEOUT,
+    );
+}
+
+#[test]
+fn an_existence_read_that_answers_500_in_a_skipped_instance_is_unreadable_not_skipped() {
+    let c = Case::new("exist-500-skipped");
+    c.present(&prod_only());
+    assert_existence_unreadable(
+        &c,
+        "Service/boss-gateway/boss-playground",
+        "500",
+        Some(SKIPPED),
+        "check-manifests-applied: 5 present, 0 missing, 3 skipped (boss-playground: secrets absent), 0 drifted, 1 unreadable (of 9)",
+        "Service/boss-gateway (ns boss-playground)",
+        HTTP_500,
+    );
+}
+
 // --- the runner: the summary and the failing stage reach the packet -----
 
 /// The verify block, lifted from the runner between its two markers, so
@@ -370,6 +506,25 @@ check-manifests-applied: 59 present, 1 missing, 21 skipped (boss-playground: sec
         "the verdict names what failed without the journal: {recorded}"
     );
     assert!(err.contains("MANIFESTS CHECK FAILED (rc=1)"), "{err}");
+}
+
+#[test]
+fn an_unreadable_check_is_not_verified_by_the_runner() {
+    // Exit 2 is 'unknown' (backlog 7c023eaf): the unit fails exactly as
+    // for a miss, and the summary naming the unreadable count rides the
+    // packet — never "manifests verified".
+    let dir = scratch_dir("skipped-instance-runner-unreadable");
+    let unknown = "  skip    Service/boss-gateway (ns boss-playground) — its existence could not be read: Unable to connect to the server\n\
+check-manifests-applied: 60 present, 0 missing, 20 skipped (boss-playground: secrets absent), 0 drifted, 1 unreadable (of 81)";
+    let (rc, out, err, recorded) = run_verify(&dir, 2, unknown);
+    assert_eq!(rc, 1, "an unverified check fails the unit: {out}\n{err}");
+    assert_eq!(
+        recorded["manifests_check"],
+        "check-manifests-applied: 60 present, 0 missing, 20 skipped (boss-playground: secrets absent), 0 drifted, 1 unreadable (of 81)",
+        "{recorded}"
+    );
+    assert!(err.contains("MANIFESTS CHECK FAILED (rc=2)"), "{err}");
+    assert!(!out.contains("manifests verified"), "{out}");
 }
 
 /// The exit trap, lifted from the runner, so a run that dies at any

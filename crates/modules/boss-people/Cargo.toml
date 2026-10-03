@@ -46,7 +46,9 @@ base64 = "0.22"
 
 boss-clock-client = { path = "../../core/boss-clock-client" }
 boss-ports = { path = "../../core/boss-ports" }
-boss-core = { path = "../../core/boss-core" }
+# `blocking`: the operator-baseline seed sends through
+# machine_token::BlockingClient (design 6805c764 car 2).
+boss-core = { path = "../../core/boss-core", features = ["blocking"] }
 boss-classes-client = { path = "../../core/boss-classes-client" }
 boss-locations-client = { path = "../../core/boss-locations-client" }
 boss-subject-kinds-client = { path = "../../core/boss-subject-kinds-client" }
@@ -94,6 +96,10 @@ required-features = ["postgres"]
 
 [[test]]
 name = "pg_people_roundtrip"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_people_roster_pg"
 required-features = ["postgres"]
 
 [[test]]

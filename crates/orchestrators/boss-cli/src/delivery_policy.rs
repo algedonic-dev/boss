@@ -82,11 +82,11 @@ pub(crate) const COMPILED_MAX_RED_TRAINS: i64 = 2;
 pub(crate) const COMPILED_STALL_HOURS: i64 = 6;
 
 /// Wall clock the whole consist check may spend before it stops asking
-/// and lets the train go. The measured set costs ~9 seconds, so this is
-/// roughly six times headroom — wide enough that a slow box never trips
-/// it, narrow enough that "seconds, not minutes" stays true if something
-/// expensive lands in `infra/lint/` unannounced.
-pub(crate) const COMPILED_CONSIST_BUDGET_SECS: u64 = 60;
+/// and lets the train go. It was 60 when the set cost ~9 seconds; policy
+/// v6 (backlog 0491b7d6, 2026-10-01) measured 94 lints at 85-89 s serial,
+/// CPU-bound at the conductor's 1-CPU limit, so 60 spent itself after 68
+/// of 94 on every board and 26 never ran. 120 is ~40% over that.
+pub(crate) const COMPILED_CONSIST_BUDGET_SECS: u64 = 120;
 
 /// How much of a failing lint's output goes on the record: enough to act
 /// on, bounded so a chatty check cannot bloat a Job's metadata.
@@ -130,6 +130,23 @@ pub(crate) const COMPILED_CI_HOST_FLOOR_GB: i64 = 40;
 /// day of three saturated bays, and measured for a day on that packet
 /// before five is considered. Raising it was a policy edit plus this
 /// fallback's pin, not a deploy — which is the point of moving it here.
+///
+/// THREE AGAIN since policy v4 (backlog 461159e7, 2026-09-30): the gate
+/// now requests the 160Gi its workspace may fill, so w-1's disk admits
+/// three gates beside the dev pod (634 of ~790 GiB; a fourth needs 794)
+/// and a fourth bay would only sit Pending, read as a running slot, and
+/// take the dev pod's room when it rolls. Four returns with w-1's second
+/// NVMe (52ea56ac). `gate.rs`'s `DEFAULT_MAX_CONCURRENT` is this constant.
+///
+/// FOUR since policy v5 (backlog e6dc7331, 2026-09-30): the workspace is
+/// on w-1's second NVMe, a new-layout gate was measured keeping roughly
+/// ~8 GB on EPHEMERAL, and its request is 40Gi (review be559bda) — five
+/// gate pods (four bays and the train gate) beside the dev pod ask 354
+/// of w-1's 789 GiB,
+/// pinned by boss-testing's
+/// `a_gate_requests_what_the_new_layout_uses_and_the_bays_fit`. Four
+/// itself has never been measured with the I/O split across two disks,
+/// so a day of gate duration at four comes before five is considered.
 pub(crate) const COMPILED_GATE_MAX_CONCURRENT: i64 = 4;
 
 // WHICH LINTS THE CONSIST CHECK LEAVES OUT IS NOT POLICY ANY MORE. It
@@ -304,7 +321,12 @@ mod tests {
         let p = DeliveryPolicy::compiled();
         assert_eq!(p.max_red_trains, 2, "train.rs MAX_RED_TRAINS");
         assert_eq!(p.stall_hours, 6, "Config::stall_hours default");
-        assert_eq!(p.consist_budget, Duration::from_secs(60));
+        assert_eq!(
+            p.consist_budget,
+            Duration::from_secs(120),
+            "policy v6 (backlog 0491b7d6, 2026-10-01): 94 consist lints take 85-89 s \
+             serial at the conductor's 1-CPU limit, so 60 s skipped 26 of them"
+        );
         assert_eq!(p.consist_output_budget, 1200);
         assert_eq!(p.consist_files_named, 6);
         assert_eq!(p.skip_reason_file_budget, 96);
@@ -318,8 +340,9 @@ mod tests {
         );
         assert_eq!(
             p.gate_max_concurrent, 4,
-            "gate.rs DEFAULT_MAX_CONCURRENT — policy v3 (backlog 366c2ed5, David \
-             2026-09-28): four bays, the next step below the measured cliff at five"
+            "gate.rs DEFAULT_MAX_CONCURRENT — policy v5 (backlog e6dc7331, \
+             2026-09-30): four bays, now that a gate's workspace is on w-1's \
+             second NVMe and its ephemeral request is 40Gi"
         );
         assert_eq!(
             p.version, NO_VERSION,

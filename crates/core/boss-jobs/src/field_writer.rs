@@ -345,16 +345,9 @@ mod tests {
 
     fn field(name: &str, writer: Option<&str>) -> StepField {
         StepField {
-            name: name.into(),
-            field_type: "string".into(),
-            required: false,
             filled_by: Default::default(),
-            item_keys: Vec::new(),
-            covers: None,
-            binds: None,
-            item_value_max_bytes: None,
-            item_one_of: Vec::new(),
             writer: writer.map(str::to_string),
+            ..StepField::new(name, "string")
         }
     }
 

@@ -2166,7 +2166,7 @@ pub async fn dispatch(cmd: Cmd) -> Result<()> {
             let took = take.names();
             // The stamp goes to the same jobs service the publish's own
             // writes go to, whichever route carried them (42da8bd2).
-            let stamps = crate::tenant_stamp::HttpStamps::new(&bases.jobs)?;
+            let stamps = crate::tenant_stamp::HttpStamps::new(&bases)?;
             let plan = tokio::task::spawn_blocking(move || {
                 crate::tenant_publish::publish(&plan, &bases, &take, &mut |l| println!("{l}"))?;
                 println!("{}", plan.render_footer());

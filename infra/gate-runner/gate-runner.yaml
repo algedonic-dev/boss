@@ -17,12 +17,31 @@
 #     planes together, and not a control plane at all, so a gate
 #     cannot starve etcd however hard it runs. The ceiling below is
 #     sized for that box.
-#   - OWN DISK, per run. /gate-target is an emptyDir: born with the
-#     pod, dead with it. Two concurrent gates cannot see each other's
-#     workspace AT ALL — the 2026-08-24 crossed-receipts incident is
-#     structurally impossible, not merely guarded against, which is
-#     what lets gates run in parallel (bounded by `boss gate`,
+#   - OWN DISK, per run. /gate-target was an emptyDir: born with the
+#     pod, dead with it. Until 2026-09-30 two concurrent gates could not
+#     see each other's workspace AT ALL — the 2026-08-24 crossed-receipts
+#     incident was structurally impossible, not merely guarded against,
+#     which is what let gates run in parallel (bounded by `boss gate`,
 #     BOSS_GATE_MAX_CONCURRENT, default 3).
+#     Since backlog 52ea56ac (2026-09-30) it is the pod's OWN directory
+#     of the gate claim on w-1's second NVMe — `runs/<pod name>`,
+#     mounted by subPathExpr — because the kubelet puts every emptyDir
+#     on the install disk, and the workspace must share the seed's
+#     filesystem for the seeding copy to stay a reflink. /gate-target
+#     is still this pod's own directory, so two gates never share a
+#     workspace PATH, and the crossed-receipts shape stays impossible.
+#     But the isolation is no longer total (review 0b9c02f1, F2): the
+#     gate container ALSO mounts the claim's `runs/` at /gate-runs,
+#     read-write, for the sweep and the proof marker, so code a gate runs
+#     (build scripts, tests, lints, as uid 65534 in gid 1500) CAN reach a
+#     concurrent run's workspace — an `rm -rf "$UNSET/"`-class bug now
+#     reaches other gates. The seed was already shared read-write, so
+#     this widens an exposure rather than opening a new class; the
+#     structural fix, moving the sweep and the marker check out of the
+#     gate container, is backlog 5e77f216. What the emptyDir gave for
+#     free and a directory does not — dying with the pod — run.sh now
+#     does itself (a liveness lock, an empty-on-exit, and a sweep of
+#     dead runs' directories).
 #   - WARM SEED on the surviving PVC. run.sh copies a warm target/
 #     (snapshotted at main's tip by the previous green near-tip run)
 #     into the workspace before building, and CARGO_HOME lives on the
@@ -30,7 +49,9 @@
 #     and 20+ minutes of compile; the seed copy is the same bytes at
 #     disk speed, a few minutes, and it parallelizes. Without the
 #     seed, "parallel" gates would each pay the cold build — slower
-#     than the serial rig they replace.
+#     than the serial rig they replace. (Since 5b3dabb5 the copy is a
+#     reflink, metadata only; since 52ea56ac the seed is `seed/` of the
+#     same gate claim the workspaces are `runs/` of.)
 #   - DATABASE SIDECAR with the 1Gi /dev/shm the dev pod's sidecar
 #     earned on 2026-08-22.
 #   - SELF-REPORTING: run.sh completes the gate-run packet with the
@@ -65,6 +86,11 @@ spec:
   # the migration). Bound by name to the one local PV; the class has no
   # provisioner, so a typo here binds nothing and the Job stays Pending
   # rather than gating on the wrong disk.
+  # SUPERSEDED 2026-09-30 (backlog 52ea56ac): the Job below mounts the
+  # gate claim on w-1's second NVMe instead (declared and converged in
+  # gate-seed-local.yaml). This claim stays declared while a gate from an
+  # older checkout can still render the manifest that mounts it, then a
+  # car retires it with its PV, as gate-runner-disk below is retired.
   accessModes: [ReadWriteOnce]
   storageClassName: gate-seed-local
   volumeName: gate-seed-w-1
@@ -295,11 +321,34 @@ spec:
             # starts and fsGroup has already made it group-writable —
             # and bun's install cache ($HOME/.bun) then lands on the
             # volume that has a sizeLimit instead of on the node's
-            # container store. This must be an env var, not a mkdir in
+            # container store. (Since 52ea56ac that volume is the gate
+            # disk, which has no sizeLimit but is not the node's disk
+            # either.) This must be an env var, not a mkdir in
             # run.sh: the script reaches the pod through a ConfigMap
             # applied separately, so a manifest that depended on a
             # run.sh change would be live before the change was.
             - {name: HOME, value: /gate-target}
+            # THE WORKSPACE'S NAME: this pod's own, so /gate-target
+            # (subPathExpr runs/$(POD_NAME) below) is a directory no
+            # other gate mounts AS ITS WORKSPACE — every gate can still
+            # reach it through /gate-runs (the known exception, see the
+            # header; 5e77f216). A Job's pods are named by generateName
+            # and never reused, so a dead run's directory is never
+            # adopted by a new one — which is what lets run.sh sweep it.
+            # The same rule as HOME: the manifest must not depend on a
+            # run.sh change, and a pod name needs no script at all.
+            # INLINE like every entry here: a block-style `- name:` inside
+            # this container ends the container for the readers that scan
+            # it (brief.rs gate_ids reads the uid below that way).
+            - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+            # THE LAYOUT, DECLARED where the claim is mounted (review
+            # 635317c5, C1/C2). run.sh arms its gate-disk guard, empties
+            # the workspace at exit and sweeps dead runs ONLY under this
+            # key, and refuses a runner that mounts /gate-runs without
+            # it. Dropping the key or the mount is a red in
+            # a_runner_mounting_the_gate_claim_arms_the_guard, never a
+            # silently disarmed guard.
+            - {name: GATE_DISK, value: required}
           # uid 65534 (`nobody`) WITH GROUP 1500, so everything this build
           # writes is owned by the group that owns the volumes. The gate's
           # capability posture was already compliant; only the uid was
@@ -331,6 +380,11 @@ spec:
           #     the dev pod carries the same fsGroup. Seed files written
           #     by the root era stay writable for exactly that reason,
           #     and so do files written by a run at a different uid.
+          #     (Since 52ea56ac both are directories of ONE claim, and
+          #     the kubelet makes a subPath's directory with the volume
+          #     root's mode — g+rwxs after fsGroup — so both stay
+          #     group-writable. The apply sequence's proof pod mounts
+          #     the claim in exactly this shape, as this uid, and writes.)
           #   - /etc/forge/token (secret, defaultMode 0400): the kubelet
           #     ORs group-read onto a read-only secret under fsGroup, so
           #     it lands root:1500 0440 — the same arrangement boss.yaml
@@ -359,27 +413,127 @@ spec:
             capabilities: {drop: ["ALL"]}
           resources:
             # CPU/memory: four concurrent gates (policy v3, backlog
-            # 366c2ed5, 2026-09-28) request 16 CPU / 32Gi against w-1's
-            # 32 / 63Gi; the 20-CPU limit lets a lone gate use the box.
-            # Disk at four: 4 x 90Gi ephemeral + the 200Gi seed + ~39G
-            # containerd fits the 929GB disk. Five is the measured
-            # cliff (2026-08-26: I/O pressure 65%, a ~35-min gate took
-            # ~93), so four is measured for a day before any further
-            # step. ephemeral-storage is the DISK half of
-            # the concurrency bound: each workspace is seed (~74G) +
-            # rebuild delta + clone, and the request makes the
-            # SCHEDULER refuse a gate the node's disk cannot hold —
-            # the containerd store (39G measured) and other tenants
-            # share that disk, and 2026-08-23 proved what silent
-            # exhaustion does (fake code failures for everyone).
-            requests: {cpu: "4", memory: 8Gi, ephemeral-storage: 90Gi}
+            # 366c2ed5, 2026-09-28; four again at v5, e6dc7331) request
+            # 16 CPU / 32Gi against w-1's 32 / 63Gi — five with the train
+            # gate, 20 / 40Gi; the 20-CPU limit lets a lone gate use the box.
+            # Five is the measured I/O cliff (2026-08-26: I/O pressure
+            # 65%, a ~35-min gate took ~93), so four is measured for a
+            # day before any further step.
+            #
+            # DISK: the ephemeral-storage request EQUALLED the workspace
+            # sizeLimit below (160Gi), pinned equal by
+            # the_gate_requests_the_workspace_it_may_fill (backlog
+            # 461159e7; since 52ea56ac the workspace is off this disk and
+            # since e6dc7331 the pin is
+            # a_gate_requests_what_the_new_layout_uses_and_the_bays_fit,
+            # see the 2026-09-30 paragraphs below). The kubelet evicts on USAGE, which only the
+            # sizeLimit bounds; the scheduler admits on the REQUEST. At
+            # 90Gi the two disagreed, and on 2026-09-29 at 22:30:29Z w-1
+            # evicted a running gate: five gate pods were live (four
+            # bays plus the train gate, which launches outside the bay
+            # bound — 0f4224bc), and the scheduler had seen 5 x 90 + 154
+            # (the dev pod) = 604 GiB of w-1's ~790 allocatable (929 GiB
+            # nodefs less the kubelet's 15% line, 139.3 GiB). The worst
+            # case it had admitted was 5 x 160 + 154 = 954, plus the
+            # 200Gi seed PV and ~39G of containerd on the same /var that
+            # no pod requests: 1193 against 790.
+            #
+            # At 160: 3 x 160 + 154 = 634 fits and a fourth needs 794,
+            # so w-1 holds THREE gates beside the dev pod and a fourth
+            # (bay or train gate) waits Pending — visible, loses no
+            # verdict, spends its activeDeadlineSeconds. So the policy
+            # drops to three with this change (train-conductor v4,
+            # gate_max_concurrent = 3): at v3's four, the fourth bay's
+            # gate sat Pending most of a busy day, read as a running
+            # slot, queued ahead of the train gate, and took the dev
+            # pod's room whenever the dev pod rolled (Recreate, with a
+            # PriorityClass that never preempts). The capacity that
+            # restores four is 52ea56ac (a second NVMe). The train gate
+            # still launches outside the bay bound (0f4224bc), so a dev
+            # pod roll that meets a Pending train gate can still wait
+            # one gate for its room. The request narrows the disk gap
+            # rather than closing it: the seed, containerd and the
+            # unrequested pgdata emptyDir are still outside every
+            # request (634 + 239 = 873 > 790).
+            #
+            # EVICTION ORDER, which way it now falls: the kubelet ranks
+            # pods "usage exceeds request" first, then by priority. A
+            # gate can no longer exceed its request by more than its
+            # pgdata and writable layers, so under pressure a dev pod
+            # OVER its own 154Gi request is evicted before any gate —
+            # where a gate between 90 and 160 used to share that class
+            # and lose to the dev pod's priority. A dev pod WITHIN its
+            # request still outranks every gate
+            # (the_dev_pod_outranks_a_gate_under_pressure), so its
+            # protection is the scratch floor wt-cargo runs before
+            # every build, as it has been since 2026-09-24 (3f2a08ab).
+            #
+            # 2026-09-30 (backlog 52ea56ac): the workspace LEFT the
+            # install disk for the gate disk, so the 160Gi sizeLimit the
+            # request above was pinned to no longer exists, and this
+            # request now over-reserves EPHEMERAL on purpose: it is what
+            # holds w-1 at v4's three gates. Lowering it is the v5 step
+            # — measure w-1's allocatable ephemeral-storage and a gate's
+            # real use of it (writable layer, /tmp, pgdata) on the new
+            # layout, then move this request, gate_max_concurrent and
+            # COMPILED_GATE_MAX_CONCURRENT together — never a side
+            # effect of the move (the packet's `after_the_disk`).
+            # The kubelet also stops measuring the workspace at all,
+            # which ends the reflink-at-full-size eviction run.sh's
+            # prune paragraph records (#424's train gate, "exceeds the
+            # limit 160Gi" two minutes in).
+            #
+            # 2026-09-30, later (backlog e6dc7331, delivery-policy v5):
+            # MEASURED, and moved. w-1's allocatable ephemeral-storage is
+            # 789 GiB, read off the kubelet's own eviction threshold
+            # (149611037292 bytes, the 15% line: nodefs 928.9 GiB). A
+            # new-layout gate's use was read off the estate observer's
+            # 15-minute talos-nodefs series across the first five
+            # new-layout gates (21:03Z-22:37Z): 494 and 491 GB free with
+            # no gate, 492 / 501 / 489 / 486 with one or two running,
+            # so roughly ~8 GB per gate against the 506 -> 391 swings of
+            # the old layout that afternoon. The car first set 20Gi from
+            # that; review be559bda raised it to 40Gi, because (N1) the
+            # 8 GB sits inside the samples' noise — one gate-running
+            # sample read MORE free than both idle ones, and none of the
+            # five shows a full train gate at its peak — so it is not an
+            # upper bound, and (N2) the pgdata emptyDir (no sizeLimit;
+            # the postgres container requests nothing) and /tmp (no
+            # TMPDIR, so the writable layer) both land under this one
+            # request unmeasured. 40Gi costs nothing — four bays plus
+            # the train gate beside the dev pod ask 5 x 40 + 154 = 354
+            # of 789 — and keeps an ordinary full gate out of the
+            # kubelet's "exceeds request" eviction class until 943f1065
+            # records a measured peak on the receipt to set it from. The
+            # pin reads that sum out of this file, the policy row and
+            # boss-dev.yaml, so a raise of either number that would
+            # leave a gate Pending is a red. Under pressure a gate within
+            # 40Gi still ranks below a dev pod within its own request
+            # (priority), and a runaway gate past 40Gi is evicted first.
+            requests: {cpu: "4", memory: 8Gi, ephemeral-storage: 40Gi}
             limits: {cpu: "20", memory: 32Gi}
           volumeMounts:
-            - {name: gate-workspace, mountPath: /gate-target}
-            - {name: gate-seed, mountPath: /gate-seed}
+            # ONE claim, three directories of it, so the seed and every
+            # workspace share a filesystem and the seeding copy is a
+            # reflink (52ea56ac): the seed, this pod's OWN workspace
+            # (named by the pod — see POD_NAME above), and the runs
+            # directory itself, which run.sh uses to sweep the
+            # directories of gates that died (a lock tells it which) and
+            # to read the proof marker. It is mounted READ-WRITE and holds
+            # every live run's workspace, so it is the one known
+            # exception to per-pod isolation (review 0b9c02f1, F2;
+            # structural fix 5e77f216).
+            # The kubelet makes a missing subPath directory itself.
+            - {name: gate-disk, mountPath: /gate-seed, subPath: seed}
+            - {name: gate-disk, mountPath: /gate-target, subPathExpr: runs/$(POD_NAME)}
+            - {name: gate-disk, mountPath: /gate-runs, subPath: runs}
             - {name: run-script, mountPath: /repo-script}
             - {name: forge-token, mountPath: /etc/forge, readOnly: true}
       volumes:
+        # THE HISTORY OF THE WORKSPACE VOLUME, kept because each number
+        # in it was paid for. Until 2026-09-30 the per-run workspace was
+        # an emptyDir `gate-workspace` on the install disk:
+        #
         # The per-run workspace: clone + CARGO_TARGET_DIR + logs +
         # receipt. Nothing here outlives the pod, and nothing here is
         # visible to any other gate. The sizeLimit is the eviction
@@ -403,24 +557,69 @@ spec:
         # ate a car). A backstop that fires on normal work does not
         # protect the node, it just loses runs.
         #
-        # w-1 carries 929GB and gate concurrency is 3, so the worst case
-        # is ~480GB of workspace — comfortable. The scheduler request
-        # below stays at 90Gi deliberately: it reflects the typical run
-        # for placement, while this limit reflects the worst one.
-        # TODO: measure a full run's actual peak and set both from it.
-        - name: gate-workspace
-          emptyDir: {sizeLimit: 160Gi}
-        # The warm seed + crate cache (see the PVC's comment). Mounted
-        # read-write because run.sh's post-verdict refresh writes the
-        # next snapshot here; reads and writes coordinate through
-        # flock on the volume, never by luck.
-        # …on the build node's OWN filesystem (a `local` PV declared in
-        # infra/cluster/manifests/gate-seed-local.yaml), so run.sh's
-        # `cp --reflink=auto` shares extents instead of rewriting tens of
-        # GB per gate. The Longhorn claim above stays until this seed is
-        # warm, then a car retires it.
-        - name: gate-seed
-          persistentVolumeClaim: {claimName: gate-seed}
+        # The gate container's ephemeral-storage REQUEST is this same
+        # 160Gi, pinned equal (backlog 461159e7). It stood at 90Gi as
+        # "the typical run, for placement", which let the scheduler pack
+        # five gates whose worst case the node could not hold, and the
+        # kubelet evicted one mid-run on 2026-09-29 — the arithmetic is
+        # beside the request above. A limit is the size the scheduler
+        # must reserve, because it is the size the kubelet evicts on.
+        # 160 itself is still an estimate, not a measured peak; 943f1065
+        # records the peak on the receipt so both can be set from it.
+        #
+        # …and the warm seed + crate cache was the claim `gate-seed`
+        # (see that PVC's comment), mounted read-write because run.sh's
+        # post-verdict refresh writes the next snapshot there; reads and
+        # writes coordinate through flock on the volume, never by luck.
+        # It sat on the build node's OWN filesystem (a `local` PV
+        # declared in infra/cluster/manifests/gate-seed-local.yaml), so
+        # run.sh's `cp --reflink=auto` shares extents instead of
+        # rewriting tens of GB per gate. The Longhorn claim above stays
+        # until this seed is warm, then a car retires it.
+        #
+        # SINCE 2026-09-30 (backlog 52ea56ac, design 8457c07b) both are
+        # ONE claim, `gate`, on w-1's second NVMe — a Talos user volume
+        # at /var/mnt/gate — because the bound on parallel gates was
+        # that one disk's I/O, and a reflink cannot cross two
+        # filesystems, so the workspaces had to move WITH the seed. The
+        # mounts above give each pod its own `runs/<pod>` directory as
+        # /gate-target, so no two gates share a workspace path; the flock
+        # discipline on the seed is unchanged. What changed:
+        #   - isolation is NO LONGER TOTAL: /gate-runs mounts every run's
+        #     directory read-write into every gate, for the sweep and the
+        #     marker (review 0b9c02f1, F2; structural fix 5e77f216). It is
+        #     the one known exception, and the isolation pin lists every
+        #     mount of the claim so a second one cannot arrive silently.
+        #   - no sizeLimit: a local volume has no quota. A runaway run
+        #     can fill the gate disk, not the node's; gate.sh's disk
+        #     floor reads the workspace's filesystem and REFUSES a gate
+        #     before any check when it is short, instead of letting
+        #     ENOSPC read as red.
+        #   - nothing dies with the pod: run.sh holds a liveness lock,
+        #     empties its workspace on exit, and sweeps the directories
+        #     of runs that died (the lock is free and nothing in them
+        #     moved for an hour).
+        #   - the kubelet no longer measures the workspace, so a
+        #     reflinked seed can no longer be counted at full size and
+        #     evicted as over its limit.
+        #   - a missing gate disk is NOT loud by itself: the volume's
+        #     old mountpoint directory stays on EPHEMERAL and the PV
+        #     mounts it, and PV writes are not ephemeral storage, so
+        #     nothing would evict (review a79746c6). run.sh therefore
+        #     compares devices before it writes anything and REFUSES
+        #     (verdict `refused`, exit 2) when /gate-target shares one
+        #     with the pod's /etc/hosts or the seed and workspace sit on
+        #     two. The guard is armed by GATE_DISK=required above, not by
+        #     a mount happening to exist, and it also requires the
+        #     marker /gate-runs/.gate-volume that the gate-volume proof
+        #     Job writes once (review 635317c5, C1 and C3).
+        # The claim is declared and converged beside its PV in
+        # gate-seed-local.yaml, not here: nothing applies this file's
+        # claims (`boss gate` creates only the Job). The VOLUME is named
+        # gate-disk, not gate, because the container is `gate` and more
+        # than one reader finds that container by its `- name: gate` line.
+        - name: gate-disk
+          persistentVolumeClaim: {claimName: gate}
         - name: pgdata
           emptyDir: {}
         - name: pg-shm

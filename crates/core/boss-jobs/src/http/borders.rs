@@ -25,6 +25,13 @@ use crate::borders::{self, BORDERS, CadenceFiring, DispatcherFiring, MachineKind
 const MACHINES_WITHHELD: &str = "this caller's policy scope reads no packets, so the firing \
                                  record of the machinery that moves them is not read for it";
 
+/// Why a caller whose scope reads SOME packets but not every one reads
+/// no machine's firing record either (backlog 0964ba80): the record is
+/// not scoped by packet — the rule the crossings keep (070de88c).
+const MACHINES_WITHHELD_NARROWED: &str = "this caller's policy scope does not read every packet, \
+                                          and the firing record of the machinery that moves them \
+                                          is not scoped by packet, so it is not read for it";
+
 #[derive(Debug, Deserialize, Default)]
 pub(super) struct BordersQuery {
     window: Option<String>,
@@ -54,8 +61,19 @@ pub(super) async fn yard_borders<R: JobsRepository + 'static, B: EventBus + 'sta
     // machine's last-fired instant to that caller, beside the region
     // half that refused it; until 493cebf3 the border then called the
     // refusal "could not be read", a failure's words.
-    let withheld = rows.reads_no_packets.then_some(MACHINES_WITHHELD);
-    let (firings, dispatcher) = if rows.reads_no_packets {
+    //
+    // AND A CALLER WHOSE SCOPE READS SOME PACKETS BUT NOT ALL (backlog
+    // 0964ba80): the records name every machine's last-fired instant,
+    // whoever's packets it moved, so below a full scope they are
+    // withheld as the crossings are (070de88c).
+    let withheld = if rows.reads_no_packets {
+        Some(MACHINES_WITHHELD)
+    } else if !rows.reads_every_packet {
+        Some(MACHINES_WITHHELD_NARROWED)
+    } else {
+        None
+    };
+    let (firings, dispatcher) = if withheld.is_some() {
         (None, None)
     } else {
         (

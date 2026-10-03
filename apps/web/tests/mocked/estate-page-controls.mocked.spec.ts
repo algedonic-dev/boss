@@ -30,7 +30,11 @@
 //             (75027a93) the observations are one read PER SERIES — the
 //             cluster's, then per host its host and host-units series —
 //             and the cluster comparison is read by its scope: 4 + 2 per
-//             host. Plus one jobs read of the open estate alarms (48ef9961).
+//             host. Plus one jobs read of the open estate alarms (48ef9961),
+//             and since gap 11 (e0e183fb) two of the DNS zone readings —
+//             the newest closed ones, whole, and the open ones — whose
+//             zone line, open reading, zone alarm and tunnel-routes line
+//             each link to their packet.
 //   writes    0
 //   timer     1         — every read again each 60 s
 //
@@ -68,6 +72,8 @@ const CMP_READ = /\/api\/estate\/comparisons\?scope=kubernetes-nodes&limit=1$/;
 /// almost never holds boss-gcp's row — and grouped per host on the
 /// server (725532ab), because even scoped, 50 of 768 rows were forge's.
 const HOST_CMP_READ = /\/api\/estate\/comparisons\?scope=host&latest_per=host&limit=50$/;
+/// The instance volumes' judged series (backlog 21ee3b4e).
+const VOLUMES_READ = /\/api\/estate\/comparisons\?scope=instance-volumes&limit=10$/;
 /// The loops' reads (two per row).
 const LOOPS_READ = /\/api\/jobs\?kind=(maintenance-|ops-request)/;
 /// The open estate alarms (gap 9, 48ef9961), keyed as the raiser keys them.
@@ -198,6 +204,29 @@ const openAlarms = () => ({
   total: 2,
 });
 
+/// The instance volumes as compare_volumes records them (backlog
+/// 21ee3b4e, incident d3c0a67c): the database volume under its floor,
+/// boss-auth with room, and boss-files unread — each row judged, the
+/// floor on the row. Three readings fifteen minutes apart.
+const GIB = 1024 ** 3;
+const VOLUME_ALARM = 'd3c0a67c-0000-0000-0000-00000000000b';
+const volumeRows = () => [
+  { id: 'boss/pgdata-postgres-0', namespace: 'boss', claim: 'pgdata-postgres-0', volume: 'pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56',
+    capacity_bytes: 30 * GIB, used_bytes: 25 * GIB, free_bytes: 5 * GIB, floor_bytes: 6 * GIB, tight: true },
+  { id: 'boss/boss-auth', namespace: 'boss', claim: 'boss-auth', volume: 'pvc-auth',
+    capacity_bytes: GIB, used_bytes: GIB / 10, free_bytes: GIB - GIB / 10, floor_bytes: GIB / 2, tight: false },
+  { id: 'boss/boss-files', namespace: 'boss', claim: 'boss-files', volume: 'pvc-files',
+    capacity_bytes: null, used_bytes: null, free_bytes: null, tight: null,
+    unread: 'the kubelet stats of w-2 could not be read' },
+];
+const volumeReadings = () => ({
+  data: [4, 19, 34].map((m) => envelope({
+    scope: 'instance-volumes', observer: 'boss-estate-observe-volumes', observed_at: ago(m),
+    counts: { volumes: 3, disk_tight: 1, disk_unmeasured: 1 }, findings: {}, volumes: volumeRows(),
+  })),
+  total: 3,
+});
+
 /// Two loop packets, so the loops table carries both link kinds.
 const WATCHDOG_DONE = 'c0c0c0c0-0000-0000-0000-000000000003';
 const UNITS_OPEN = 'e1e1e1e1-0000-0000-0000-000000000008';
@@ -222,6 +251,8 @@ type Reads = Readonly<{
   series?: Answer;
   /** The open estate alarms. */
   alarms?: Answer;
+  /** The instance volumes' series (21ee3b4e). */
+  volumes?: Answer;
   cmpBody?: () => unknown; hostBody?: () => unknown; alarmsBody?: () => unknown;
 }>;
 
@@ -254,6 +285,11 @@ async function install(page: Page, reads: Reads = {}): Promise<Seen> {
     const data = loopAnswer(new URL(r.request().url()));
     return json(r, { data, total: data.length });
   });
+  await page.route(VOLUMES_READ, (r) => {
+    const mode = reads.volumes ?? 'fixture';
+    if (mode === 'down') return json(r, { error: 'estate upstream unavailable' }, 503);
+    return json(r, mode === 'empty' ? { data: [], total: 0 } : volumeReadings());
+  });
   await page.route(ALARMS_READ, (r) => {
     const mode = reads.alarms ?? 'fixture';
     if (mode === 'down') return json(r, { error: 'jobs upstream unavailable' }, 503);
@@ -280,7 +316,7 @@ function route(path: string): ReturnType<typeof parseRoute> {
 }
 
 test.describe('/it/estate — the chrome, the loading line and the reads', () => {
-  test('the page is the catalogued Estate surface, with its header and four sections in order', async ({ page }) => {
+  test('the page is the catalogued Estate surface, with its header and five sections in order', async ({ page }) => {
     expect(route(PATH)).toEqual({ kind: 'systemEstate' });
     await install(page);
     await mountPage(page, PATH, TITLE);
@@ -292,7 +328,8 @@ test.describe('/it/estate — the chrome, the loading line and the reads', () =>
       '00 — THE MACHINES',
       '01 — OBSERVED vs DECLARED',
       '02 — THE LOOPS',
-      '03 — THE DEV WORKSPACE',
+      '03 — THE EDGE',
+      '04 — THE DEV WORKSPACE',
     ]);
   });
 
@@ -332,6 +369,7 @@ test.describe('/it/estate — the chrome, the loading line and the reads', () =>
     const estate = sent.filter((s) => s.includes('/api/estate')).sort();
     expect(estate).toEqual([
       'GET /api/estate/comparisons?scope=host&latest_per=host&limit=50',
+      'GET /api/estate/comparisons?scope=instance-volumes&limit=10',
       'GET /api/estate/comparisons?scope=kubernetes-nodes&limit=1',
       'GET /api/estate/nodes',
       'GET /api/estate/observations?scope=host&host=boss-gcp&limit=10',
@@ -341,10 +379,16 @@ test.describe('/it/estate — the chrome, the loading line and the reads', () =>
       'GET /api/estate/observations?scope=kubernetes-nodes&limit=10',
     ]);
     // Six declared loops plus the two ops-runner hosts, two reads each,
-    // and the open estate alarms once (gap 9, 48ef9961).
-    expect(sent.filter((s) => s.startsWith('GET /api/jobs?kind=')).length).toBe((6 + 2) * 2 + 1);
+    // the open estate alarms once (gap 9, 48ef9961), and the zone
+    // readings, closed and open (gap 11, e0e183fb) — the tunnel routes
+    // ride the cluster converge's loop read, so they cost none.
+    expect(sent.filter((s) => s.startsWith('GET /api/jobs?kind=')).length).toBe((6 + 2) * 2 + 1 + 2);
     expect(sent.filter((s) => s.startsWith('GET /api/jobs?kind=backlog-item'))).toEqual([
       'GET /api/jobs?kind=backlog-item&status=open&metadata_has=estate_finding&limit=50',
+    ]);
+    expect(sent.filter((s) => s.startsWith('GET /api/jobs?kind=dns-zone-observation')).sort()).toEqual([
+      'GET /api/jobs?kind=dns-zone-observation&status=closed&limit=7&full=true',
+      'GET /api/jobs?kind=dns-zone-observation&status=open',
     ]);
     expect(sent.filter((s) => !s.startsWith('GET ')), 'the page wrote').toEqual([]);
 
@@ -382,17 +426,18 @@ test.describe('/it/estate — the chrome, the loading line and the reads', () =>
     await expect.poll(() => sameEach(seen)).toBeGreaterThan(before);
     await expect(machines(page).locator('tbody tr')).toHaveCount(4);
     await expect(machines(page).locator('td.estate-id').last()).toHaveText('w-2');
+    await expect(page.locator('.estate-machine-count')).toHaveText('5 machines declared · 4 active · 1 retired');
   });
 });
 
 test.describe('/it/estate — 00 THE MACHINES', () => {
-  // CURRENT, gap 12 (d6d39f60): a retired machine is filtered out with
-  // no count of how many were.
+  // Gap 12 (d6d39f60): the registry total conserves active and retired
+  // machines, even though only the active rows are drawn.
   // Gap 7 (ab3c54d7), FIXED: this test pinned the cells verbatim as the
   // declared value alone ('30G'), while the subtitle promised declared
   // beside observed. Each value cell now reads the declared value, then
   // what the newest reading of that machine's own series saw.
-  test('one row per live machine, in registry order, every cell declared then seen; CURRENT, gap 12: retired machines vanish uncounted', async ({ page }) => {
+  test('gap 12: one row per active machine and the declared, active and retired counts agree', async ({ page }) => {
     await install(page);
     await mountPage(page, PATH, TITLE);
 
@@ -418,7 +463,7 @@ test.describe('/it/estate — 00 THE MACHINES', () => {
     await expect(rows.nth(1)).toHaveAttribute('title', '');
 
     await expect(page.locator('.estate-root').getByText('old-1')).toHaveCount(0);
-    await expect(page.locator('.estate-root').getByText(/retired/i)).toHaveCount(0);
+    await expect(page.locator('.estate-machine-count')).toHaveText('4 machines declared · 3 active · 1 retired');
   });
 
   // Gap 7 (ab3c54d7): the pin the finding asked for — a mocked drift
@@ -458,17 +503,23 @@ test.describe('/it/estate — 00 THE MACHINES', () => {
     await expect(machines(page).locator('td[data-drift]')).toHaveCount(0);
   });
 
-  // CURRENT, gap 12 (d6d39f60): an empty registry paints a table of
-  // headers and nothing else — no "0 machines declared" line. It is at
-  // least not a failure.
-  test('CURRENT, gap 12: an empty registry paints a header-only table, and no failure', async ({ page }) => {
+  test('gap 12: an empty registry states its zero counts and remains distinct from failure', async ({ page }) => {
     await install(page, { nodes: 'empty' });
     await mountPage(page, PATH, TITLE);
 
     await expect(machines(page).locator('thead th')).toHaveCount(6);
     await expect(machines(page).locator('tbody tr')).toHaveCount(0);
-    await expect(page.locator('.estate-root').getByText(/0 machines/)).toHaveCount(0);
+    await expect(page.locator('.estate-machine-count')).toHaveText('0 machines declared · 0 active · 0 retired');
     await expect(loops(page).locator('tbody tr')).toHaveCount(6);
+    await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
+  });
+
+  test('gap 12: a retired-only registry conserves its one machine while drawing no active row', async ({ page }) => {
+    await install(page);
+    await page.route(NODES_READ, (r) => json(r, [NODES[3]]));
+    await mountPage(page, PATH, TITLE);
+    await expect(page.locator('.estate-machine-count')).toHaveText('1 machine declared · 0 active · 1 retired');
+    await expect(machines(page).locator('tbody tr')).toHaveCount(0);
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
   });
 
@@ -481,9 +532,79 @@ test.describe('/it/estate — 00 THE MACHINES', () => {
       'The registry did not answer: /api/estate/nodes: HTTP 503. This page refuses to guess — an unreachable registry is not an empty estate.',
     );
     await expect(machines(page)).toHaveCount(0);
+    await expect(page.locator('.estate-machine-count')).toHaveCount(0);
     // The loops still read: the runner row kept, unfiltered, with no host.
     await expect(loops(page).locator('tbody tr')).toHaveCount(7);
     await expect(loops(page).locator('tr[data-loop="ops-request"] td').nth(1)).toHaveText('not named on the packet');
+  });
+});
+
+// THE INSTANCE VOLUMES (backlog 21ee3b4e, incident d3c0a67c): the
+// database volume filled on 2026-10-01 and no surface showed any claim.
+test.describe('/it/estate — 00 THE MACHINES: the instance volumes', () => {
+  const volumes = (page: Page) => page.locator('table.estate-volume-table tbody tr');
+
+  test('every claim sits under the machines with the comparator\'s verdict; a tight one and an unread one read amber', async ({ page }) => {
+    await install(page, {
+      alarmsBody: () => ({
+        data: [
+          ...openAlarms().data,
+          alarm(VOLUME_ALARM, 'ESTATE ALARM: disk_tight:boss/pgdata-postgres-0 persisted 3 consecutive comparisons', 20,
+            { estate_finding: 'disk_tight:boss/pgdata-postgres-0', scope: 'instance-volumes' }),
+        ],
+        total: 3,
+      }),
+    });
+    await mountPage(page, PATH, TITLE);
+
+    // Inside section 00, after the machines and before section 01.
+    await expect(page.locator('.estate-section').nth(1)).toHaveText('01 — OBSERVED vs DECLARED');
+    await expect(page.locator('.estate-volumes-head span').first()).toHaveText(
+      'Instance volumes — 3 claims read by boss-estate-observe-volumes',
+    );
+    await expect(page.locator('.estate-volumes-head .estate-when')).toHaveText('4m ago · every 15m');
+    await expect(page.locator('table.estate-volume-table thead th')).toHaveText([
+      'claim', 'volume', 'free', 'declared capacity · report only',
+    ]);
+    await expect(volumes(page)).toHaveCount(3);
+    await expect(volumes(page).nth(0).locator('td')).toHaveText([
+      'boss/pgdata-postgres-0', 'pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56', '5.0G free of 30.0G — under its 6.0G floor alarm',
+      'Capacity intent unknown: no declared capacity comparison recorded · desired unknown · requested unread',
+    ]);
+    await expect(volumes(page).nth(0)).toHaveAttribute('data-state', 'tight');
+    await expect(volumes(page).nth(0).locator('td').nth(2)).toHaveClass(/\bestate-drift\b/);
+    await expect(volumes(page).nth(0).locator('a.estate-alarm-link')).toHaveAttribute('href', `/ux/jobs/${VOLUME_ALARM}`);
+    await expect(volumes(page).nth(1).locator('td').nth(2)).toHaveText('0.9G free of 1.0G · floor 0.5G');
+    await expect(volumes(page).nth(1).locator('td').nth(2)).toHaveClass(/\bestate-ok\b/);
+    // A claim the forge could not read says unread and why — never fine.
+    await expect(volumes(page).nth(2).locator('td').nth(2)).toHaveText('unread: the kubelet stats of w-2 could not be read');
+    await expect(volumes(page).nth(2)).toHaveAttribute('data-state', 'unread');
+    await expect(volumes(page).nth(2).locator('td').nth(2)).toHaveClass(/\bestate-drift\b/);
+    // Legacy filesystem evidence carries no capacity assignment or request.
+    // Its healthy floor must not turn the independent intent column green.
+    const unknownCapacity = 'Capacity intent unknown: no declared capacity comparison recorded · desired unknown · requested unread';
+    await expect(volumes(page).locator('[data-capacity-intent]')).toHaveText([
+      unknownCapacity, unknownCapacity, unknownCapacity,
+    ]);
+    await expect(volumes(page).locator('td[data-capacity-intent="unknown"].estate-drift')).toHaveCount(3);
+    await expect(volumes(page).locator('[data-capacity-intent] a')).toHaveCount(0);
+  });
+
+  test('a failed volume read says so in the page\'s words, never as no claims', async ({ page }) => {
+    await install(page, { volumes: 'down' });
+    await mountPage(page, PATH, TITLE);
+    await expect(page.locator(`.estate-volumes p.estate-fail${FAILURE_MARKER}`)).toHaveText(
+      'Volume readings unavailable: /api/estate/comparisons?scope=instance-volumes&limit=10: HTTP 503',
+    );
+    await expect(volumes(page)).toHaveCount(0);
+    await expect(machines(page).locator('tbody tr')).toHaveCount(3);
+  });
+
+  test('a series never recorded says so', async ({ page }) => {
+    await install(page, { volumes: 'empty' });
+    await mountPage(page, PATH, TITLE);
+    await expect(page.locator('p.estate-volumes-none')).toHaveText('Instance volumes: no volume reading recorded yet.');
+    await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
   });
 });
 
@@ -762,9 +883,7 @@ test.describe('/it/estate — 01 OBSERVED vs DECLARED', () => {
     await expect(verdict).toHaveClass(/\bestate-drift\b/);
   });
 
-  // CURRENT, gap 12 (d6d39f60): with no cluster comparison in the page
-  // there is no comparison row at all — silence, not a counted empty.
-  test('empty series say "no observation recorded yet"; CURRENT, gap 12: an empty comparison read paints nothing', async ({ page }) => {
+  test('gap 12: empty observation series and a zero cluster-comparison read each state what they hold', async ({ page }) => {
     await install(page, { cluster: 'empty', series: 'empty', cmp: 'empty', host: 'empty' });
     await mountPage(page, PATH, TITLE);
 
@@ -772,7 +891,7 @@ test.describe('/it/estate — 01 OBSERVED vs DECLARED', () => {
     // two series, and its host-comparison line (gap 1; per declared host
     // since 725532ab). Each says "no observation recorded yet" because
     // ITS OWN read counted zero (75027a93).
-    await expect(obsRows(page)).toHaveCount(7);
+    await expect(obsRows(page)).toHaveCount(8);
     await expect(obsRow(page, 'host comparison').locator('span:nth-child(2)')).toHaveText([
       'boss-gcp: no host comparison recorded',
       'forge: no host comparison recorded',
@@ -786,7 +905,7 @@ test.describe('/it/estate — 01 OBSERVED vs DECLARED', () => {
       'boss-gcp: no observation recorded yet',
       'forge: no observation recorded yet',
     ]);
-    await expect(obsRow(page, 'comparison')).toHaveCount(0);
+    await expect(obsRow(page, 'comparison').locator('span').nth(1)).toHaveText('0 cluster comparisons in this read');
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
   });
 
@@ -835,6 +954,7 @@ test.describe('/it/estate — 01 OBSERVED vs DECLARED', () => {
     await expect(obsRows(page)).toHaveCount(7);
     await expect(hostRows(page)).toHaveCount(2);
     await expect(page.getByText(/no drift/)).toHaveCount(0);
+    await expect(page.getByText('0 cluster comparisons in this read')).toHaveCount(0);
   });
 });
 
@@ -961,7 +1081,162 @@ test.describe('/it/estate — 02 THE LOOPS, as links', () => {
   }
 });
 
-test.describe('/it/estate — 03 THE DEV WORKSPACE', () => {
+// GAP 11 (e0e183fb), FIXED: the page rendered only machines, while the
+// DNS zone, the Access applications in front of it and the tunnel routes
+// behind it are declared in the tree and read back daily — so the one
+// estate alarm about the zone had no line to stand beside. The shapes
+// are the live ones of 2026-10-01 (zone reading d6ecf14f, converge
+// 05ec4e89), names moved to example.org.
+const ZONES_READ = /\/api\/jobs\?kind=dns-zone-observation&status=closed&limit=7&full=true$/;
+const ZONES_OPEN_READ = /\/api\/jobs\?kind=dns-zone-observation&status=open$/;
+const ZONE_READING = 'd6ecf14f-0000-0000-0000-00000000000b';
+const ZONE_OPEN = 'd6ecf14f-0000-0000-0000-00000000000e';
+const ZONE_ALARM = 'd3470342-0000-0000-0000-00000000000c';
+const CONVERGE_DONE = '05ec4e89-0000-0000-0000-00000000000d';
+const TUNNEL = 'd8a8ef3b-0000-0000-0000-000000000000.cfargotunnel.com';
+
+/// The newest reading of example.org: one record matches behind Access,
+/// one has drifted off the tunnel, two live records nobody declared, one
+/// Access application that matches.
+const zoneReading = () => ({
+  id: ZONE_READING, kind: 'dns-zone-observation', status: 'closed',
+  subject: { id: 'example.org', subject_kind: 'custom' },
+  metadata: { zone: 'example.org', outcome: 'findings', closed_at: ago(600) },
+  steps: [{
+    spec_slug: 'observe',
+    metadata: {
+      result: 'findings',
+      verdicts: [
+        { record: 'boss.example.org CNAME', verdict: 'MATCH', interlock: 'access', access: 'present', why: 'the operating site',
+          declared: { content: TUNNEL, target: 'tunnel:cloudflare-tunnel-credentials' }, live: { content: TUNNEL } },
+        { record: 'www.example.org CNAME', verdict: 'DRIFT',
+          declared: { content: TUNNEL, target: 'tunnel:cloudflare-tunnel-credentials' }, live: { content: 'old.example.net' } },
+        { record: 'example.org MX', verdict: 'UNDECLARED', live: { content: 'mail.example.net' } },
+        { record: 'example.org TXT', verdict: 'UNDECLARED', live: { content: '"v=spf1 ~all"' } },
+      ],
+      access: [{
+        domain: 'boss.example.org', verdict: 'MATCH',
+        declared: { name: 'BOSS', type: 'self_hosted', policies: [{ name: 'operators', decision: 'allow', emails: ['op@example.org'] }] },
+        live: { name: 'BOSS', type: 'self_hosted', policies: [{ name: 'operators', decision: 'allow', include: [{ email: { email: 'op@example.org' } }] }] },
+      }],
+    },
+  }],
+});
+
+/// The alarm the drift raised, keyed as dns_observe.rs keys it.
+const zoneAlarm = () => alarm(ZONE_ALARM, 'ESTATE ALARM: DNS zone example.org disagrees with its declaration (1 finding(s))', 590,
+  { estate_finding: 'dns_drift:example.org', scope: 'dns-zone', zone: 'example.org' });
+
+async function installEdge(page: Page, zones: 'fixture' | 'down' = 'fixture', open: readonly unknown[] = []): Promise<void> {
+  await install(page, { alarmsBody: () => ({ data: [...openAlarms().data, zoneAlarm()], total: 3 }) });
+  await page.route(ZONES_READ, (r) =>
+    zones === 'down' ? json(r, { error: 'jobs upstream unavailable' }, 503) : json(r, { data: [zoneReading()], total: 1 }));
+  await page.route(ZONES_OPEN_READ, (r) => json(r, { data: open, total: open.length }));
+}
+
+const edge = (page: Page) => page.locator('.estate-edge');
+
+test.describe('/it/estate — 03 THE EDGE', () => {
+  test('gap 11: the zone line reads its verdict, linked to its reading, with the alarm its drift raised beside it', async ({ page }) => {
+    await installEdge(page);
+    await mountPage(page, PATH, TITLE);
+
+    const line = edge(page).locator('.estate-zone[data-zone="example.org"]');
+    const verdict = line.locator('a').first();
+    await expect(verdict).toHaveText('example.org: 1 of 2 declared records match · 1 of 1 Access applications match');
+    await expect(verdict).toHaveClass(/\bestate-drift\b/);
+    await expect(verdict).toHaveAttribute('href', `/ux/jobs/${ZONE_READING}`);
+    await expect(line.locator('a.estate-alarm-link')).toHaveAttribute('href', `/ux/jobs/${ZONE_ALARM}`);
+    await expect(line.locator('.estate-when')).toHaveText(/^\d+h ago$/);
+  });
+
+  test('gap 11: each declared record reads the tree\'s spelling, what the zone holds, what fronts it and its verdict', async ({ page }) => {
+    await installEdge(page);
+    await mountPage(page, PATH, TITLE);
+
+    const records = edge(page).locator('table.estate-records');
+    await expect(records.locator('thead th')).toHaveText(['record', 'declared', 'in front', 'verdict']);
+    await expect(records.locator('tbody tr').nth(0).locator('td')).toHaveText([
+      'boss.example.org CNAME',
+      `tunnel:cloudflare-tunnel-credentials zone holds ${TUNNEL}`,
+      'access: present',
+      'MATCH',
+    ]);
+    await expect(records.locator('tbody tr').nth(1).locator('td')).toHaveText([
+      'www.example.org CNAME',
+      'tunnel:cloudflare-tunnel-credentials zone holds old.example.net',
+      '—',
+      'DRIFT',
+    ]);
+    await expect(records.locator('tbody tr').nth(1).locator('td').last()).toHaveClass(/\bestate-drift\b/);
+    await expect(records.locator('tbody tr')).toHaveCount(2);
+    await expect(edge(page).locator('p.estate-edge-note')).toHaveText([
+      '2 live records the declaration names nowhere — reported on the reading, not a finding.',
+    ]);
+  });
+
+  test('gap 11: each Access application reads its type and policies by name and decision — never the people admitted', async ({ page }) => {
+    await installEdge(page);
+    await mountPage(page, PATH, TITLE);
+
+    const apps = edge(page).locator('table.estate-access');
+    await expect(apps.locator('thead th')).toHaveText(['access application', 'type', 'policies', 'verdict']);
+    await expect(apps.locator('tbody tr td')).toHaveText(['boss.example.org', 'self_hosted', 'operators (allow)', 'MATCH']);
+    await expect(edge(page).getByText('op@example.org')).toHaveCount(0);
+  });
+
+  test('gap 11: the tunnel routes are the newest cluster converge\'s, with its connector, linked to it', async ({ page }) => {
+    await installEdge(page);
+    await page.route(LOOPS_READ, (r) => {
+      const url = new URL(r.request().url());
+      const data = url.searchParams.get('kind') === 'maintenance-cluster-converge' && url.searchParams.get('status') === 'closed'
+        ? [{ id: CONVERGE_DONE, status: 'closed', metadata: { outcome: 'completed', closed_at: ago(4) }, steps: [{ spec_slug: 'run', metadata: {
+          cloudflared: 'connected',
+          tunnel_ingress: 'boss.example.org → boss; www.example.org → boss (site); dev.example.org → ssh://boss-dev-ssh:22 (origin)',
+        } }] }]
+        : loopAnswer(url);
+      return json(r, { data, total: data.length });
+    });
+    await mountPage(page, PATH, TITLE);
+
+    const line = edge(page).locator('.estate-tunnel');
+    await expect(line.locator('a')).toHaveText('connector connected · 3 routes');
+    await expect(line.locator('a')).toHaveClass(/\bestate-ok\b/);
+    await expect(line.locator('a')).toHaveAttribute('href', `/ux/jobs/${CONVERGE_DONE}`);
+    await expect(edge(page).locator('ul.estate-routes li')).toHaveText([
+      'boss.example.org → boss',
+      'www.example.org → boss (site)',
+      'dev.example.org → ssh://boss-dev-ssh:22 (origin)',
+    ]);
+  });
+
+  test('gap 11: with nothing recorded the edge says so — no zone reading, no converge — and fails nothing', async ({ page }) => {
+    await install(page);
+    await mountPage(page, PATH, TITLE);
+
+    await expect(edge(page).locator('.estate-obs-row').first().locator('span').nth(1)).toHaveText('no zone reading recorded yet');
+    await expect(edge(page).locator('.estate-tunnel span').nth(1)).toHaveText('no cluster converge has finished, so no route is recorded');
+    await expect(edge(page).locator(FAILURE_MARKER)).toHaveCount(0);
+  });
+
+  test('gap 11: a failed zone read says so in the page\'s words — never "no zone reading" — and an open reading reads amber, linked', async ({ page }) => {
+    await installEdge(page, 'down', [
+      { id: ZONE_OPEN, kind: 'dns-zone-observation', status: 'open', opened_at: ago(30), subject: { id: 'example.org' }, metadata: { zone: 'example.org' } },
+    ]);
+    await mountPage(page, PATH, TITLE);
+
+    await expect(edge(page).locator(`p.estate-fail${FAILURE_MARKER}`)).toHaveText([
+      'Zone readings unavailable: /api/jobs?kind=dns-zone-observation&status=closed&limit=7&full=true: HTTP 503',
+    ]);
+    await expect(edge(page).getByText('no zone reading recorded yet')).toHaveCount(0);
+    const open = edge(page).locator('[data-zone-open="example.org"] a');
+    await expect(open).toHaveText('example.org: a reading is still open — the zone could not be read or compared');
+    await expect(open).toHaveClass(/\bestate-drift\b/);
+    await expect(open).toHaveAttribute('href', `/ux/jobs/${ZONE_OPEN}`);
+  });
+});
+
+test.describe('/it/estate — 04 THE DEV WORKSPACE', () => {
   test('three numbered steps, each with its reason and one copyable command, verbatim', async ({ page }) => {
     await install(page);
     await mountPage(page, PATH, TITLE);

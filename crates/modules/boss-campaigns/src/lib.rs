@@ -13,6 +13,7 @@
 //! births minted identity with no audit event and were reproducible
 //! only via the jobs.job.created pass).
 
+pub mod events;
 pub mod http;
 pub mod in_memory;
 pub mod port;

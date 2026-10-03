@@ -28,6 +28,7 @@
 import { formatDate } from '@boss/web-kit/ui/date';
 import type { ClusterMachine, RunnerMachine } from './yard-machines';
 import { standingNote } from '../../jobs/position';
+import { NOT_IN_SCOPE } from '../../policy/withheld';
 export type { ClusterMachine, RunnerMachine } from './yard-machines';
 import {
   DELIVERY_CHANNELS,
@@ -652,6 +653,9 @@ function queueLaneLabel(queue: readonly QueuedGate[]): string {
 
 function conductorMachine(c: ConductorHealth | null): ConductorMachine {
   if (!c) return { lamp: 'off', silent: false, lastSeen: null, nextTick: null, label: 'no reading' };
+  // Withheld by scope (backlog bd506215): unlit and said as the refusal.
+  // It fell through to the warn lamp's "no firing on record" until then.
+  if (c.withheld !== null) return { lamp: 'off', silent: false, lastSeen: null, nextTick: null, label: NOT_IN_SCOPE };
   if (c.silent) {
     const since =
       c.silent_for_minutes !== null

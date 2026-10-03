@@ -88,6 +88,10 @@ impl Converge {
             &infra.join("forge/credential-render.sh"),
             &logged("credential-render"),
         );
+        write_exec(
+            &infra.join("forge/runner-credential-deposit.sh"),
+            &logged("runner-credential-deposit"),
+        );
         write_exec(&infra.join("forge/install.sh"), &logged("install"));
         write_exec(
             &infra.join("forge/protect-main.sh"),

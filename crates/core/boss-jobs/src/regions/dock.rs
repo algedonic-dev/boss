@@ -49,6 +49,21 @@ fn behind_of(holds: &[&crate::car::EdgeHold], kind: &str) -> Vec<String> {
         })
 }
 
+/// The held cars counted by the brake that holds each, in a fixed order:
+/// "2 on an operator's hold, 1 on a red re-gate". Empty when none is
+/// held.
+fn held_by_kind(held: &[crate::yard::HeldCar]) -> String {
+    use crate::yard::CarHoldKind;
+    [CarHoldKind::Operator, CarHoldKind::RegateRed]
+        .into_iter()
+        .filter_map(|kind| {
+            let n = held.iter().filter(|h| h.kind == kind).count();
+            (n > 0).then(|| format!("{n} {}", kind.label()))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// THE DOCK: cars parked, and whether they can board. Busy when the
 /// boarding depth is met — a train is due — and troubled when the dock
 /// row could not be read (an unread dock is not an empty one, 52fed017).
@@ -97,7 +112,9 @@ pub(super) fn dock(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
         .map(|b| (b, BoundKind::Threshold));
     const UNIT: &str = "cars parked";
     match inputs.dock_reading {
-        Reading::Unread => region(
+        // No handler withholds the dock (it is read within the caller's
+        // scope, d0058c92); the arm is the type's, and draws no count.
+        Reading::Unread | Reading::Withheld => region(
             "dock",
             None,
             bound,
@@ -175,15 +192,50 @@ pub(super) fn dock(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
             // trouble is read where it stands.
             let made_up = trains_in(inputs, "dock");
             findings.extend(train_findings(inputs, &made_up));
+            // THE BOARD WAITS ON THE TRACK while a train with its PR open
+            // has not merged — the conductor's single-track check
+            // (`yard::holds_the_track`), the first hold it reads. On
+            // 2026-10-01 this said "a train is due" with PR train 02:41 at
+            // its CI verdict, when no board could happen until it cleared
+            // (backlog 3eddffc4). Such a train stands under test at the
+            // gates (car R1) — a train still being made up is named below.
+            let holding: Vec<String> = trains_in(inputs, "gates")
+                .into_iter()
+                .filter(|(_, s)| crate::yard::holds_the_track(s))
+                .filter_map(|(j, _)| {
+                    let id = j.id.to_string();
+                    let t = status.trains.iter().find(|t| t.id == id)?;
+                    Some(format!("{} {}", j.title, t.phase.label()))
+                })
+                .collect();
             // A TRAIN DUE IS CLEAR (decision 1): the boarding depth met is
             // the designed state two minutes after any departure, and it
             // painted the dock amber on every read.
             let clear_why = if !holds.is_empty() {
                 format!("{parked}, {} waiting behind an edge", holds.len())
+            } else if status.boarding.threshold_met == Some(true) && !holding.is_empty() {
+                format!(
+                    "{parked} — the boarding depth is met, the board waits on the track: {}",
+                    holding.join(", ")
+                )
             } else if status.boarding.threshold_met == Some(true) {
                 format!("{parked} — the boarding depth is met, a train is due")
             } else {
                 parked
+            };
+            // HELD CARS CANNOT BOARD (backlog 3eddffc4): the yard's held
+            // lane, each named by the brake that holds it. They are
+            // counted in the garage, so they are not in this region's
+            // count — but they stand on the dock and the kpi below asks
+            // which cars cannot board, so they are in its answer.
+            let held_kinds = held_by_kind(&status.held_cars);
+            let clear_why = if held_kinds.is_empty() {
+                clear_why
+            } else {
+                format!(
+                    "{clear_why} · {} held: {held_kinds}",
+                    status.held_cars.len()
+                )
             };
             let clear_why = if made_up.is_empty() {
                 clear_why
@@ -220,12 +272,27 @@ pub(super) fn dock(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
                 UNIT,
                 settled,
                 trend,
-                vec![measure_said(
-                    "cars that cannot board",
-                    count_value(holds.len()),
-                    "cars",
-                    format!("{} cannot board", plural(holds.len(), "car", "cars")),
-                )],
+                vec![{
+                    let cannot = holds.len() + status.held_cars.len();
+                    let named = [
+                        (!holds.is_empty()).then(|| format!("{} behind an edge", holds.len())),
+                        (!held_kinds.is_empty()).then(|| held_kinds.clone()),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                    let text = format!("{} cannot board", plural(cannot, "car", "cars"));
+                    measure_said(
+                        "cars that cannot board",
+                        count_value(cannot),
+                        "cars",
+                        if named.is_empty() || status.held_cars.is_empty() {
+                            text
+                        } else {
+                            format!("{text} ({})", named.join(", "))
+                        },
+                    )
+                }],
             )
         }
     }
@@ -412,6 +479,106 @@ mod tests {
             by_name(&out, "dock").why,
             "1 car parked — the boarding depth is met, a train is due",
             "a car with no edge — every car but one today — reads as it always did"
+        );
+    }
+
+    /// THE MEASURED SCENE (backlog 3eddffc4, 2026-10-01 03:26Z): three
+    /// cars stood HELD on the dock — two on an operator's hold, one on a
+    /// red re-gate — while the kpi read "0 cars cannot board", and with
+    /// the depth met and PR train 2026-10-01 02:41 at its CI verdict the
+    /// why promised "a train is due" though the conductor will not board
+    /// while a pre-merge train holds the single track. A held car cannot
+    /// board, named by its hold kind; a board the track holds back waits
+    /// on the track, and says so.
+    #[test]
+    fn held_cars_cannot_board_and_a_board_behind_a_train_waits_on_the_track() {
+        let train = job(
+            "pr-train",
+            "PR train 2026-10-01 02:41",
+            JobStatus::Open,
+            json!({}),
+        );
+        let train_steps = vec![
+            step(
+                &train,
+                "collect",
+                StepStatus::Completed,
+                Some("2026-09-19T11:00:00Z"),
+            ),
+            step(
+                &train,
+                "pr",
+                StepStatus::Completed,
+                Some("2026-09-19T11:01:00Z"),
+            ),
+            step(&train, "ci", StepStatus::Ready, None),
+            step(&train, "merged", StepStatus::Ready, None),
+        ];
+        let open = vec![(train, train_steps)];
+        let operator_hold = |branch: &str| {
+            let (j, mut s) = parked(branch, json!({}));
+            s[0].metadata = json!({ "hold": "waits on David" });
+            (j, s)
+        };
+        let red = parked(
+            "fix/kit-readme",
+            json!({ "base_regate": { "red": {
+                "gate_run": "eeeeeeee-1111-2222-3333-444444444444",
+                "verdict": "red", "head": "abcdef0", "main": "1234567"
+            } } }),
+        );
+        let ready = parked("fix/ready", json!({}));
+        let dock_cars = vec![
+            operator_hold("fix/g1"),
+            operator_hold("fix/deny"),
+            red,
+            ready,
+        ];
+        let mut status = build_status_for(
+            YardInputs {
+                open_trains: &open,
+                dock_cars: &dock_cars,
+                now: Some(t(NOW)),
+                ..Default::default()
+            },
+            Reading::Read,
+            BoardingReadings::default(),
+        );
+        assert_eq!(status.held_cars.len(), 3, "the yard's own held lane");
+        status.boarding.threshold_met = Some(true);
+        let out = regions(&inputs(
+            &status,
+            &open,
+            &[],
+            &dock_cars,
+            &[],
+            Some(&[]),
+            Some(&[]),
+        ));
+        let dock = by_name(&out, "dock");
+        assert_eq!(dock.kpi[0].value, Some(3.0), "{}", dock.kpi[0].text);
+        assert_eq!(
+            dock.kpi[0].text,
+            "3 cars cannot board (2 on an operator's hold, 1 on a red re-gate)"
+        );
+        assert!(
+            !dock.why.contains("a train is due"),
+            "the track is held; no train is due: {}",
+            dock.why
+        );
+        assert!(
+            dock.why.contains(
+                "the boarding depth is met, the board waits on the track: \
+                 PR train 2026-10-01 02:41 awaiting CI"
+            ),
+            "{}",
+            dock.why
+        );
+        assert!(
+            dock.why
+                .contains("3 held: 2 on an operator's hold, 1 on a red re-gate"),
+            "{}",
+            dock.why
         );
     }
 

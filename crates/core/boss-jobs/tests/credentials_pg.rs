@@ -383,3 +383,73 @@ async fn a_made_up_rotation_policy_is_refused() {
         "rotation_policy is on-demand | scheduled"
     );
 }
+
+/// Backlog 2ee29275, S4: a row whose consumer names the deleted
+/// `machine_token::attach` door is corrected in place by
+/// 20260929231035, run from THE MIGRATION FILE against the row shape
+/// the live instance holds (read through GET /api/credentials on
+/// 2026-09-29) — the one entry replaced at its position, every other
+/// entry and every other row untouched, and a second run a no-op.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_consumer_naming_the_deleted_attach_door_is_corrected_in_place() {
+    const MIGRATION: &str = "infra/postgres/schema/\
+        20260929231035-a-credential-row-names-the-stamping-clients-not-attach.sql";
+    let sql = std::fs::read_to_string(boss_testing::repo_root().join(MIGRATION))
+        .unwrap_or_else(|e| panic!("read {MIGRATION}: {e}"));
+    let db = TestDb::new().await;
+    let stale = serde_json::json!([
+        {"kind": "env", "location": "maintenance CronJobs via secretKeyRef"},
+        {"kind": "env", "location": "every service writer via boss_core::machine_token::attach (reads BOSS_MACHINE_TOKEN at process start)", "verified_by": "an operator note"},
+        {"kind": "env", "location": "infra/boss-step.sh forwards it when set"}
+    ]);
+    let other =
+        serde_json::json!([{"kind": "secret-mount", "location": "/etc/boss-train/forge.token"}]);
+    for (id, consumers) in [("boss-machine-token", &stale), ("a-forge-token", &other)] {
+        sqlx::query(
+            "INSERT INTO credentials (id, kind, issuer, principal, consumers, \
+             storage_location, rotation_policy) \
+             VALUES ($1, 'machine-token', 'x', 'y', $2, 'z', 'on-demand')",
+        )
+        .bind(id)
+        .bind(consumers)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    let consumers = |id: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT consumers FROM credentials WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    sqlx::raw_sql(&sql).execute(&db.pool).await.unwrap();
+    let after = consumers("boss-machine-token").await;
+    let rows = after.as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{after}");
+    assert_eq!(rows[0], stale[0], "the entry before is untouched");
+    assert_eq!(rows[2], stale[2], "the entry after is untouched");
+    let fixed = rows[1]["location"].as_str().unwrap();
+    assert!(!fixed.contains("attach"), "{fixed}");
+    assert!(
+        fixed.contains("machine_token::Client") && fixed.contains("BOSS_MACHINE_TOKEN_HOSTS"),
+        "{fixed}"
+    );
+    // The review of 54d9a23a: no Service name is stamped by default, so
+    // the text must not say so (MEDIUM-1); and a key the entry carried
+    // beside kind and location survives the rewrite (LOW-3).
+    assert!(!fixed.contains("*.svc.cluster.local"), "{fixed}");
+    assert_eq!(rows[1]["kind"], "secret-mount");
+    assert_eq!(rows[1]["verified_by"], "an operator note", "{after}");
+    assert_eq!(consumers("a-forge-token").await, other);
+
+    // Idempotent: a second run changes nothing.
+    sqlx::raw_sql(&sql).execute(&db.pool).await.unwrap();
+    assert_eq!(consumers("boss-machine-token").await, after);
+}

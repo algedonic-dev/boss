@@ -34,13 +34,9 @@ fn plugin_err_response(err: StepPluginError) -> Response {
 async fn plugin_policy_check<R: JobsRepository, B: EventBus>(
     state: &JobsApiState<R, B>,
     user: &boss_policy_client::User,
-    action: Action,
+    control: Pair,
 ) -> Result<(), Response> {
-    match state
-        .policy
-        .check(user, action, Resource::step_plugin())
-        .await
-    {
+    match state.policy.ask(user, control).await {
         Ok(Decision::Allow { .. }) => Ok(()),
         Ok(Decision::Deny { reason }) => Err((StatusCode::FORBIDDEN, reason).into_response()),
         Err(e) => Err(e.into_response()),
@@ -61,7 +57,7 @@ pub(super) async fn list_plugins<R: JobsRepository + 'static, B: EventBus + 'sta
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = plugin_policy_check(&state, &user, Action::Read).await {
+    if let Err(r) = plugin_policy_check(&state, &user, controls::READ_STEP_PLUGIN).await {
         return r;
     }
     match reg.list_active(q.category.as_deref()).await {
@@ -79,7 +75,7 @@ pub(super) async fn get_plugin<R: JobsRepository + 'static, B: EventBus + 'stati
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = plugin_policy_check(&state, &user, Action::Read).await {
+    if let Err(r) = plugin_policy_check(&state, &user, controls::READ_STEP_PLUGIN).await {
         return r;
     }
     match reg.get_active(&kind).await {
@@ -97,7 +93,7 @@ pub(super) async fn get_plugin_version<R: JobsRepository + 'static, B: EventBus 
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = plugin_policy_check(&state, &user, Action::Read).await {
+    if let Err(r) = plugin_policy_check(&state, &user, controls::READ_STEP_PLUGIN).await {
         return r;
     }
     match reg.get_version(&kind, version).await {
@@ -115,7 +111,7 @@ pub(super) async fn list_plugin_versions<R: JobsRepository + 'static, B: EventBu
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = plugin_policy_check(&state, &user, Action::Read).await {
+    if let Err(r) = plugin_policy_check(&state, &user, controls::READ_STEP_PLUGIN).await {
         return r;
     }
     match reg.list_versions(&kind).await {
@@ -133,7 +129,7 @@ pub(super) async fn create_plugin<R: JobsRepository + 'static, B: EventBus + 'st
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = plugin_policy_check(&state, &user, Action::Create).await {
+    if let Err(r) = plugin_policy_check(&state, &user, controls::CREATE_STEP_PLUGIN).await {
         return r;
     }
     let (actor, now) = write_stamp(&state, &user).await;
@@ -153,7 +149,7 @@ pub(super) async fn update_plugin<R: JobsRepository + 'static, B: EventBus + 'st
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = plugin_policy_check(&state, &user, Action::Update).await {
+    if let Err(r) = plugin_policy_check(&state, &user, controls::UPDATE_STEP_PLUGIN).await {
         return r;
     }
     spec.kind = kind;
@@ -173,7 +169,7 @@ pub(super) async fn publish_plugin<R: JobsRepository + 'static, B: EventBus + 's
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = plugin_policy_check(&state, &user, Action::Publish).await {
+    if let Err(r) = plugin_policy_check(&state, &user, controls::PUBLISH_STEP_PLUGIN).await {
         return r;
     }
     let (actor, now) = write_stamp(&state, &user).await;
@@ -192,7 +188,7 @@ pub(super) async fn retire_plugin<R: JobsRepository + 'static, B: EventBus + 'st
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = plugin_policy_check(&state, &user, Action::Retire).await {
+    if let Err(r) = plugin_policy_check(&state, &user, controls::RETIRE_STEP_PLUGIN).await {
         return r;
     }
     let (actor, now) = write_stamp(&state, &user).await;
@@ -226,14 +222,10 @@ pub(super) async fn in_flight_plugin_count<R: JobsRepository + 'static, B: Event
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = plugin_policy_check(&state, &user, Action::Read).await {
+    if let Err(r) = plugin_policy_check(&state, &user, controls::READ_STEP_PLUGIN).await {
         return r;
     }
-    match state
-        .policy
-        .check(&user, Action::Read, Resource::step())
-        .await
-    {
+    match state.policy.ask(&user, controls::READ_STEP).await {
         Ok(Decision::Allow { scope: Scope::All }) => {}
         Ok(Decision::Allow { scope }) => {
             return (
@@ -307,7 +299,7 @@ async fn plugin_version_repair<R: JobsRepository, B: EventBus>(
     user: &boss_policy_client::User,
     write: bool,
 ) -> Response {
-    if let Err(r) = plugin_policy_check(state, user, Action::Publish).await {
+    if let Err(r) = plugin_policy_check(state, user, controls::PUBLISH_STEP_PLUGIN).await {
         return r;
     }
     let actor = user

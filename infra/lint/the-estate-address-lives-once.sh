@@ -69,14 +69,12 @@ crates/core/boss-jobs/src/credentials/http.rs	credential issuer label "forgejo (
 crates/core/boss-jobs/src/credentials/in_memory.rs	credential issuer label "forgejo (<ip>)" — registry data mirrored from the migration
 crates/core/boss-jobs/src/probe.rs	#[cfg(test)] probe fixture inside a src file
 crates/orchestrators/boss-cli/src/cadence.rs	the CLI names the record in a refusal message (reads BOSS_JOBS_URL as before)
-crates/orchestrators/boss-cli/src/census.rs	#[cfg(test)] assertion that a refusal names the record
 crates/orchestrators/boss-cli/src/credential.rs	BOSS_TRAIN_FORGE_URL default and a refusal message (the CLI reads env as before)
-crates/orchestrators/boss-cli/src/gate.rs	refusal prose plus #[cfg(test)] probe fixtures
+crates/orchestrators/boss-cli/src/gate.rs	#[cfg(test)] probe fixtures
 crates/orchestrators/boss-cli/src/git_auth.rs	BOSS_TRAIN_FORGE_URL default plus #[cfg(test)] fixtures
 crates/orchestrators/boss-cli/src/host_readiness.rs	#[cfg(test)] estate fixture
 crates/orchestrators/boss-cli/src/prove.rs	#[cfg(test)] probe fixture
 crates/orchestrators/boss-cli/src/publish.rs	#[cfg(test)] clone-URL fixture
-crates/orchestrators/boss-cli/src/queue.rs	#[cfg(test)] assertion that a refusal names the record
 crates/orchestrators/boss-cli/src/train/forge.rs	the Forgejo adapter's BOSS_TRAIN_FORGE_URL default (the CLI reads env as before)
 crates/orchestrators/boss-cli/src/train/jobs_api.rs	#[cfg(test)] fixture: the transport error a blip classifies
 crates/orchestrators/boss-cli/src/train/mod.rs	the conductor Config's BOSS_TRAIN_FORGE_URL default (the CLI reads env as before)
@@ -85,6 +83,8 @@ crates/orchestrators/boss-cli/src/train/red_verdict.rs	#[cfg(test)] fixtures: th
 crates/orchestrators/boss-dispatcher-handlers/src/handlers/estate_compare.rs	#[cfg(test)] estate fixtures
 infra/cluster/manifests/boss-audit-integrity.yaml	a CronJob's image: the kubelet pulls it; a manifest reads no host file (the registry as a render parameter is a later car)
 infra/cluster/manifests/boss-backup.yaml	CronJob images, as above
+infra/cluster/manifests/boss-break-glass-deposit.yaml	CronJob image
+infra/cluster/manifests/boss-break-glass-operator.yaml	the admission policy's repository per rollback target, a CEL literal the API server reads (no host file); held equal to boss.yaml's images and forge-defaults.sh's REGISTRY by the_break_glass_patch_is_image_only.rs
 infra/cluster/manifests/boss-conservation-invariants.yaml	CronJob image
 infra/cluster/manifests/boss-conductor.yaml	the conductor's image and BOSS_TRAIN_FORGE_URL — prod is the source instance; render-instance.sh substitutes only the instance keys
 infra/cluster/manifests/boss-dev.yaml	the dev pod's images and forge credential key; editing it rolls the pod

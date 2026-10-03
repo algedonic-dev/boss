@@ -1,0 +1,7 @@
+# automation:train-conductor — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 37,127 audit-log facts.
+# Signs as platform-admin today: the boss CLI header (crates/orchestrators/boss-cli/src/identity.rs header), BOSS_ACTOR in infra/cluster/manifests/boss-conductor.yaml.
+
+[[automation]]
+id = "automation:train-conductor"
+role = "platform-admin"
+description = 'The delivery pipeline conductor: boards cars, opens trains, reconciles them to merge and converge (boss train verbs, in-cluster).'

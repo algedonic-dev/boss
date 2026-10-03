@@ -111,25 +111,17 @@ fn design_review_fields(workflow: &str) -> Vec<StepField> {
 fn step(id: &str, kind: &str, fields: Vec<StepField>) -> Step {
     Step {
         id: StepId::from_uuid(Uuid::parse_str(id).unwrap()),
-        job_id: JobId::from_uuid(Uuid::parse_str(JOB).unwrap()),
-        kind: kind.into(),
-        title: "Decide the design".into(),
         spec_slug: Some("design-review".into()),
         assignee_id: Some("emp-op".into()),
         status: StepStatus::Ready,
-        sort_order: 1,
-        blocked_by: vec![],
-        sign_offs_required: Vec::new(),
-        assurance_required: None,
-        sign_offs: Vec::new(),
         fields,
-        completed_on: None,
-        completed_by: None,
-        completed_at: None,
         metadata: serde_json::json!({}),
-        notes: None,
-        step_plugin_version: 0,
-        embedded_job: None,
+        ..Step::new(
+            JobId::from_uuid(Uuid::parse_str(JOB).unwrap()),
+            kind,
+            "Decide the design",
+            1,
+        )
     }
 }
 
@@ -137,20 +129,17 @@ async fn seed() -> (Router, Arc<InMemoryJobs>) {
     let (app, jobs) = build_app();
     let job = Job {
         id: JobId::from_uuid(Uuid::parse_str(JOB).unwrap()),
-        kind: "backlog-item".into(),
         workflow_version: 3,
-        subject: Subject::new("custom", "boss-jobs"),
-        title: "answer-question verdict enum not enforced".into(),
-        owner_id: "emp-op".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 7).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "backlog-item",
+            Subject::new("custom", "boss-jobs"),
+            "answer-question verdict enum not enforced",
+            "emp-op",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 7).unwrap(),
+        )
     };
     jobs.create_job(&job).await.unwrap();
     // The step as backlog-item now materializes it: the authored
@@ -167,16 +156,9 @@ async fn seed() -> (Router, Arc<InMemoryJobs>) {
         FREE_TEXT,
         "task",
         vec![StepField {
-            name: "finding".into(),
-            field_type: "string".into(),
             required: true,
             filled_by: Default::default(),
-            item_keys: Vec::new(),
-            covers: None,
-            binds: None,
-            item_value_max_bytes: None,
-            item_one_of: Vec::new(),
-            writer: None,
+            ..StepField::new("finding", "string")
         }],
     ))
     .await
@@ -184,18 +166,45 @@ async fn seed() -> (Router, Arc<InMemoryJobs>) {
     (app, jobs)
 }
 
+/// Complete a step with `metadata`: the keys through the step merge door,
+/// then the status alone through the PUT, which writes no metadata
+/// (e39a9d2a). A merge the door refuses is the answer.
 async fn complete(
     app: &Router,
     step_id: &str,
     metadata: serde_json::Value,
 ) -> (StatusCode, String) {
-    let body = serde_json::json!({ "status": "completed", "metadata": metadata });
+    let merged = send(
+        app,
+        "PATCH",
+        format!("/api/jobs/{JOB}/steps/{step_id}/metadata"),
+        metadata,
+    )
+    .await;
+    if !merged.0.is_success() {
+        return merged;
+    }
+    send(
+        app,
+        "PUT",
+        format!("/api/jobs/{JOB}/steps/{step_id}"),
+        serde_json::json!({ "status": "completed" }),
+    )
+    .await
+}
+
+async fn send(
+    app: &Router,
+    method: &str,
+    uri: String,
+    body: serde_json::Value,
+) -> (StatusCode, String) {
     let resp = app
         .clone()
         .oneshot(
             Request::builder()
-                .method("PUT")
-                .uri(format!("/api/jobs/{JOB}/steps/{step_id}"))
+                .method(method)
+                .uri(uri)
                 .header("content-type", "application/json")
                 .header("x-boss-user", serde_json::to_string(&operator()).unwrap())
                 .body(Body::from(body.to_string()))

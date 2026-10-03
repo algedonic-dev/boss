@@ -4,7 +4,8 @@
 # publish-to-github v6's `open-pr` step is a MACHINE step: the filing
 # rule (publish-github-pr-on-open-pr-ready) spawns an ops-request for
 # the forge the moment David approves, and the verb opens the mirror PR
-# as dauld and completes the step with `pr_url` by itself. Measured on
+# (as the GitHub App since backlog d2b7c947) and completes the step with
+# `pr_url` by itself. Measured on
 # publish 254177e2: David approved at 23:05Z, the request (c98a782f)
 # was ANSWERED within the minute with its last line
 #

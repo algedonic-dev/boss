@@ -49,7 +49,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "A car the conductor left behind on a merge conflict three trains running, filed by the machine for a builder to repair: rerail it onto current main, resolve the hunk so both sides' intent survives, re-gate, and carry the green onto the car - or refuse, naming the hunk, so a person decides. Closes itself as overtaken when the car closes first."
-metadata = { owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "filed"
@@ -80,7 +80,7 @@ This packet names a car (`car`), its branch (`branch`) and the conflict the cond
 
 1. `boss rerail <car>` cuts `<branch>-rerail` from current main and replays the car onto it. A clean replay gates and carries the green onto the car by itself: go to step 4.
 2. On a real conflict the verb stops once and says where. Resolve it so that BOTH sides' intent survives: the car's change, and whatever landed on main, read from the git log of each conflicting file since the car's base. Never drop main's side to make the car's apply.
-3. Run the touched crates' whole suites and `infra/gate.sh --lint` (judged by its exit code), commit, push the `-rerail` branch as a fast-forward, and gate it with `BOSS_AGENT_RUN` exported so the gate-run records this run.
+3. Run targeted regression checks for the repair and `infra/gate.sh --lint`; comprehensive validation belongs to the gate (judged by its exit code), commit, push the `-rerail` branch as a fast-forward, and gate it with `BOSS_AGENT_RUN` exported so the gate-run records this run.
 4. `boss rerail <car> --finish` copies the green receipt onto the car as `regate_receipt`, repoints it and clears the skip. Record `result = rerailed`, and in `evidence` the gate-run and the line `--finish` printed, copied rather than retyped.
 
 If the two changes cannot both survive (they contradict, and one must be withdrawn), do not force a resolution: record `result = refused`, and in `evidence` the file, the hunk and why. A person decides through the car's left-behind and stall alarms. `overtaken` is the machine's answer, written when the car closes before this repair finishes.

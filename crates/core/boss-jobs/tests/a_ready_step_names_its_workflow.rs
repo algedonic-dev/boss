@@ -207,17 +207,24 @@ async fn a_step_promoted_by_a_completion_names_its_workflow_and_slug() {
     let build_id = build["id"].as_str().expect("step id");
 
     let scope_id = scope["id"].as_str().expect("step id");
-    // Read-merge-write: the PUT refuses a metadata body that omits a
-    // stored key (e39a9d2a).
-    let mut metadata = scope["metadata"].clone();
-    metadata["summary"] = serde_json::json!("s");
-    metadata["excludes"] = serde_json::json!("e");
+    // The evidence goes through the step merge door and the status
+    // alone through the PUT: the PUT writes no metadata (e39a9d2a).
+    let (status, body) = send(
+        &app,
+        req(
+            "PATCH",
+            &format!("/api/jobs/{job_id}/steps/{scope_id}/metadata"),
+            serde_json::json!({"summary": "s", "excludes": "e"}),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "step metadata: {status}: {body}");
     let (status, body) = send(
         &app,
         req(
             "PUT",
             &format!("/api/jobs/{job_id}/steps/{scope_id}"),
-            serde_json::json!({"status": "completed", "metadata": metadata}),
+            serde_json::json!({"status": "completed"}),
         ),
     )
     .await;

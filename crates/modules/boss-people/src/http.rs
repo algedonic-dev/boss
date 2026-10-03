@@ -7,11 +7,11 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use boss_core::publisher::DomainPublisher;
-use boss_policy::{Action, Resource, Scope, User};
-use boss_policy_client::{CurrentUser, PolicyClient};
+use boss_policy::{Scope, User};
+use boss_policy_client::{CurrentUser, PolicyClient, controls};
 
 use crate::port::{PeopleError, PeopleRepository};
 use crate::types::Employee;
@@ -50,6 +50,7 @@ pub fn router<R: PeopleRepository + 'static>(state: PeopleApiState<R>) -> Router
     let shared = Arc::new(state);
     Router::new()
         .route("/api/people/health", get(health))
+        .route("/api/people/names", get(list_employee_names::<R>))
         .route(
             "/api/people",
             get(list_employees::<R>).post(create_employee::<R>),
@@ -122,15 +123,31 @@ async fn list_employees<R: PeopleRepository + 'static>(
     CurrentUser(user): CurrentUser,
     Query(q): Query<ListEmployeesQuery>,
 ) -> Response {
-    let scope = match crate::grants::roster_scope(state.policy.as_ref(), &user).await {
+    match roster_rows(&state, &user, &q).await {
+        Ok(filtered) => {
+            let pay = compensation_scope(&state, &user).await;
+            rows_response(&filtered, pay.as_ref(), &user)
+        }
+        Err(refused) => refused,
+    }
+}
+
+// One row frontier for both reads: the inbox needs names, not a second
+// interpretation of employee Read scope or the roster's query filters.
+async fn roster_rows<R: PeopleRepository + 'static>(
+    state: &PeopleApiState<R>,
+    user: &User,
+    q: &ListEmployeesQuery,
+) -> Result<Vec<Employee>, Response> {
+    let scope = match crate::grants::roster_scope(state.policy.as_ref(), user).await {
         Ok(scope) => scope,
-        Err(refused) => return refused,
+        Err(refused) => return Err(refused),
     };
     match state.people.all_employees().await {
         Ok(employees) => {
             let filtered: Vec<Employee> = employees
                 .into_iter()
-                .filter(|e| shows(Some(&scope), &user, e))
+                .filter(|e| shows(Some(&scope), user, e))
                 .filter(|e| q.role.as_ref().is_none_or(|r| e.role.as_ref() == Some(r)))
                 .filter(|e| {
                     q.status
@@ -145,10 +162,39 @@ async fn list_employees<R: PeopleRepository + 'static>(
                     })
                 })
                 .collect();
-            let pay = compensation_scope(&state, &user).await;
-            rows_response(&filtered, pay.as_ref(), &user)
+            Ok(filtered)
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()),
+    }
+}
+
+/// The inbox's identity projection (7d1c11a3): nullable descriptions
+/// remain unknown, and compensation/email/private profile fields never
+/// ride this response, even for a caller allowed to read compensation.
+#[derive(Serialize)]
+struct EmployeeName {
+    id: String,
+    name: Option<String>,
+    role: Option<String>,
+}
+
+async fn list_employee_names<R: PeopleRepository + 'static>(
+    State(state): State<Arc<PeopleApiState<R>>>,
+    CurrentUser(user): CurrentUser,
+    Query(q): Query<ListEmployeesQuery>,
+) -> Response {
+    match roster_rows(&state, &user, &q).await {
+        Ok(rows) => Json(
+            rows.into_iter()
+                .map(|e| EmployeeName {
+                    id: e.id,
+                    name: e.name,
+                    role: e.role,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(refused) => refused,
     }
 }
 
@@ -287,13 +333,8 @@ async fn create_employee<R: PeopleRepository + 'static>(
     // Hiring is Create on employee (backlog 69906ab9: after 8cdad84c
     // gated the PUT, this route still took no caller). The seed writers
     // sign as platform-admin, which the core default rules grant.
-    if let Err(refused) = crate::grants::require(
-        state.policy.as_ref(),
-        &user,
-        Action::Create,
-        Resource::employee(),
-    )
-    .await
+    if let Err(refused) =
+        crate::grants::require(state.policy.as_ref(), &user, controls::CREATE_EMPLOYEE).await
     {
         return refused;
     }
@@ -380,13 +421,8 @@ async fn update_employee<R: PeopleRepository + 'static>(
     // Resource::employee(). Test path (policy: None) bypasses the gate;
     // the binary wires a client — until 2026-09-23 it did not, and this
     // gate never ran in production (backlog 8cdad84c).
-    if let Err(refused) = crate::grants::require(
-        state.policy.as_ref(),
-        &user,
-        Action::Update,
-        Resource::employee(),
-    )
-    .await
+    if let Err(refused) =
+        crate::grants::require(state.policy.as_ref(), &user, controls::UPDATE_EMPLOYEE).await
     {
         return refused;
     }
@@ -430,13 +466,8 @@ async fn delete_employee<R: PeopleRepository + 'static>(
     Path(id): Path<String>,
 ) -> Response {
     // Deleting an employee is Delete on employee (backlog 69906ab9).
-    if let Err(refused) = crate::grants::require(
-        state.policy.as_ref(),
-        &user,
-        Action::Delete,
-        Resource::employee(),
-    )
-    .await
+    if let Err(refused) =
+        crate::grants::require(state.policy.as_ref(), &user, controls::DELETE_EMPLOYEE).await
     {
         return refused;
     }
@@ -494,6 +525,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use boss_policy::{Action, Resource};
     use tower::ServiceExt;
 
     use crate::in_memory::InMemoryPeople;
@@ -1225,6 +1257,92 @@ mod tests {
             .collect();
         ids.sort();
         ids
+    }
+
+    // Inbox names must not acquire a wider row scope or carry pay merely
+    // because its viewer may read compensation (backlog 7d1c11a3).
+    #[tokio::test]
+    async fn names_only_roster_preserves_the_read_scope_and_filters() {
+        let people = paid_roster();
+        let policy: Arc<dyn PolicyClient> = Arc::new(
+            boss_policy_client::FakePolicyClient::builder()
+                .allow("reviewer", Action::Read, Resource::employee(), Scope::Self_)
+                .allow(
+                    "reviewer",
+                    Action::Read,
+                    Resource::compensation(),
+                    Scope::All,
+                )
+                .build(),
+        );
+        let app = app_with_policy(people, Some(policy));
+        let who = signed("emp-001", "reviewer", "user", &[]);
+        let (status, body) = answer(app.clone(), "/api/people/names", Some(&who)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(ids_of(&body), vec!["emp-001"]);
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        let keys: std::collections::BTreeSet<_> = rows[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["id", "name", "role"].into_iter().collect());
+        let (status, body) =
+            answer(app.clone(), "/api/people/names?status=retired", Some(&who)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ids_of(&body), Vec::<String>::new());
+        let (status, body) =
+            answer(app, "/api/people/names?email=other%40boss.io", Some(&who)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ids_of(&body), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn names_only_roster_matches_existing_frontiers_including_machine_tier() {
+        for (scope, tier) in [
+            (Scope::Self_, "user"),
+            (Scope::Team, "user"),
+            (Scope::Department("service".into()), "user"),
+            (Scope::All, "user"),
+            (Scope::Self_, "operator"),
+        ] {
+            let policy: Arc<dyn PolicyClient> = Arc::new(
+                boss_policy_client::FakePolicyClient::builder()
+                    .allow("reader", Action::Read, Resource::employee(), scope)
+                    .build(),
+            );
+            let app = app_with_policy(paid_roster(), Some(policy));
+            let who = signed("emp-001", "reader", tier, &["emp-002"]);
+            for suffix in [
+                "",
+                "?role=service-tech&status=active",
+                "?role=unknown",
+                "?email=EMP-002%40BOSS.IO",
+            ] {
+                let (full_status, full) =
+                    answer(app.clone(), &format!("/api/people{suffix}"), Some(&who)).await;
+                let (name_status, names) = answer(
+                    app.clone(),
+                    &format!("/api/people/names{suffix}"),
+                    Some(&who),
+                )
+                .await;
+                assert_eq!(name_status, full_status, "{tier} {suffix}");
+                assert_eq!(ids_of(&names), ids_of(&full), "{tier} {suffix}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn names_only_roster_refuses_an_ungranted_or_unnamed_reader() {
+        let app = app_with_policy(paid_roster(), Some(default_rules()));
+        let visitor = signed("outside", boss_core::roles::VISITOR_ROLE, "user", &[]);
+        for who in [None, Some(visitor.as_str())] {
+            let (status, body) = answer(app.clone(), "/api/people/names", who).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(!body.contains("emp-001"));
+        }
     }
 
     const ROSTER_READS: [&str; 4] = [

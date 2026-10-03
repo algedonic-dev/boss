@@ -1,23 +1,23 @@
 # ---------------------------------------------------------------------------
 # Push notifier (human-powered-state-machine awareness)
 # ---------------------------------------------------------------------------
-# When ANY step becomes Ready, message the responsible role's on-call
-# member so waiting work has a human-visible signal in their inbox. This
-# is the PUSH half; the PULL half (the `/api/jobs/assignments` My Day
-# query the sim workforce + SPA poll) is what actually drives the work.
-# `step.ready.*` is a NATS single-token wildcard — each step kind
-# (`bill-approval`, `production-consume`, ...) is one token. The handler
-# no-ops for steps with no `authority_role` (generic / outcome kinds an
-# operator picks off a queue), and sends one message per ready step
-# (no role-wide fan-out).
+# A Ready step with an assignee sends human-visible assignment awareness.
+# Agents and automations read their queues; registered aliases are registry
+# data. A role-only Ready step remains in its pull queue without a push
+# notification. The optional rule argument keeps done-signal defaults intact.
+# `step.ready.*` is a NATS single-token wildcard for every step kind.
 [[rule]]
 name = "notify-assignee-on-step-ready"
+version = 2
 why = """
 A CROSS-DOMAIN reaction: a step becoming ready must reach a human's
 inbox, and the inbox is the messages domain, not part of any
 Workflow's definition. This is the PUSH half of awareness; the PULL
 half (the assignments query) is what actually drives the work.
+Agents and automations read that queue, so assignment awareness skips
+them; registered aliases come from the agents registry (efd5a07d).
 """
 on_event = "step.ready.*"
 [[rule.do]]
 handler = "messages.notify"
+args = { skip_machine_recipients = "true" }

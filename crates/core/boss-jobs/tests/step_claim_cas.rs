@@ -16,20 +16,16 @@ async fn seeded_step(status: StepStatus, assignee: Option<&str>) -> (InMemoryJob
     let job_id = JobId::from_uuid(Uuid::new_v4());
     let job = Job {
         id: job_id,
-        kind: "field-service".into(),
-        workflow_version: 1,
-        subject: Subject::new("asset", "SYS-1"),
-        title: "Repair".into(),
-        owner_id: "emp-owner".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::Value::Null,
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "field-service",
+            Subject::new("asset", "SYS-1"),
+            "Repair",
+            "emp-owner",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+        )
     };
     let mut step = Step::new(job_id, "task", "Do the work", 0);
     step.spec_slug = Some("work".into());

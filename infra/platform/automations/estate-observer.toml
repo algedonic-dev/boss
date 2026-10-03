@@ -1,0 +1,7 @@
+# automation:estate-observer — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 693 audit-log facts.
+# Signs as platform-admin today: infra/estate/observe-lib.sh, infra/cluster/manifests/boss-estate-observe.yaml.
+
+[[automation]]
+id = "automation:estate-observer"
+role = "platform-admin"
+description = 'The estate observer: records what the cluster and its nodes are (infra/cluster/manifests/boss-estate-observe.yaml).'

@@ -59,9 +59,13 @@ fn the_bundle_is_one_file_per_policy() {
 
 /// The bundled row publishes as-is into an empty registry at its
 /// declared version, and is then what the conductor's read serves —
-/// `train-conductor` lands at v3 with no v1/v2 history nobody wrote
-/// into this registry. v3 is the first version declared only here:
-/// the fourth gate bay (backlog 366c2ed5, David 2026-09-28).
+/// `train-conductor` lands at v5 with no v1-v4 history nobody wrote
+/// into this registry. v3 was the first version declared only here
+/// (the fourth gate bay, backlog 366c2ed5, David 2026-09-28); v4 took
+/// the bound back to three until w-1's disk held four 160Gi gate
+/// workspaces (backlog 461159e7, 2026-09-30); v5 returns four, the
+/// workspace on w-1's second NVMe and a gate's ephemeral request the
+/// 40Gi (backlog e6dc7331, 2026-09-30).
 #[tokio::test]
 async fn every_bundled_policy_is_publishable_at_its_declared_version() {
     let registry = InMemoryDeliveryPolicy::default();
@@ -94,9 +98,10 @@ async fn every_bundled_policy_is_publishable_at_its_declared_version() {
         (
             served.version,
             served.ci_host_floor_gb,
-            served.gate_max_concurrent
+            served.gate_max_concurrent,
+            served.consist_budget_secs
         ),
-        (3, 40, 4),
+        (6, 40, 4, 120),
         "the row the conductor reads is the row the bundle declares"
     );
 }

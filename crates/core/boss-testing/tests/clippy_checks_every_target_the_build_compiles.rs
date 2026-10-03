@@ -74,6 +74,77 @@ fn every_gate_clippy_runs_the_same_flags() {
     }
 }
 
+/// A core type's new field breaks a dependent TEST target, not its lib.
+/// Run each actual gate invocation against that tiny offline workspace:
+/// checking only the changed core crate cannot see the missing field.
+/// The repaired fixture is the allowed control, so a broken tool or a
+/// command that always refuses cannot stand in for coverage (4669e9d7).
+#[test]
+fn every_gate_clippy_sees_a_new_core_field_in_a_dependents_test() {
+    let root = boss_testing::scratch_dir("clippy-dependent-test-field");
+    for dir in ["fixture-core/src", "fixture-dependent/src"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"fixture-core\", \"fixture-dependent\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("fixture-core/Cargo.toml"),
+        "[package]\nname = \"fixture-core\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("fixture-dependent/Cargo.toml"),
+        "[package]\nname = \"fixture-dependent\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[dependencies]\nfixture-core = { path = \"../fixture-core\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("fixture-core/src/lib.rs"),
+        "pub struct Datum { pub old: u32, pub added: u32 }\n",
+    )
+    .unwrap();
+    let dependent = root.join("fixture-dependent/src/lib.rs");
+    let run = |line: &str| {
+        std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "set -e\ncheck() {{ shift; \"$@\"; }}\nSCOPE=(-p fixture-core)\nLINT_SCOPE=(-p fixture-core)\n{line}\n"
+            ))
+            .current_dir(&root)
+            .env("CARGO_TARGET_DIR", root.join("target"))
+            .env("CARGO_BUILD_JOBS", "1")
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .expect("execute the gate's clippy in an isolated dependency-free workspace")
+    };
+    for (line, _) in gate_clippy_flags() {
+        std::fs::write(
+            &dependent,
+            "#[cfg(test)] mod tests { #[test] fn datum() { let _ = fixture_core::Datum { old: 1 }; } }\n",
+        )
+        .unwrap();
+        let red = run(&line);
+        let diagnostic = String::from_utf8_lossy(&red.stderr);
+        assert!(
+            !red.status.success() && diagnostic.contains("missing field `added`"),
+            "`{line}` must find the dependent test's missing core field, not accept only the core crate or fail for another cause: {diagnostic}"
+        );
+        std::fs::write(
+            &dependent,
+            "#[cfg(test)] mod tests { #[test] fn datum() { let _ = fixture_core::Datum { old: 1, added: 2 }; } }\n",
+        )
+        .unwrap();
+        let green = run(&line);
+        assert!(
+            green.status.success(),
+            "`{line}` must accept the corrected dependent fixture: {}",
+            String::from_utf8_lossy(&green.stderr)
+        );
+    }
+}
+
 #[test]
 fn rule_two_hands_a_builder_the_gates_clippy_flags() {
     let rules =

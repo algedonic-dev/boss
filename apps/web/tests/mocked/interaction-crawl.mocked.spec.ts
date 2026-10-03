@@ -119,7 +119,7 @@
 
 import { test, expect, type Page, type Request } from './_test';
 import {
-  DISPATCHER_RULES, EMPTY_PAGE, OBJECT_ENDPOINTS, PAGED_ENDPOINTS, SHELL_ENDPOINTS, VIEW_RESULTS, installSmokeMocks,
+  DISPATCHER_RULES, EMPTY_INBOX, EMPTY_PAGE, INBOX_READ, OBJECT_ENDPOINTS, PAGED_ENDPOINTS, SHELL_ENDPOINTS, VIEW_RESULTS, installSmokeMocks,
 } from './_smokeMocks';
 import { FAILURE_MARKER, NOT_FOUND_ROW, ROUTES } from './_routes';
 import { parseRoute, routable } from '../../src/router';
@@ -385,6 +385,8 @@ const EMPTIED: ReadonlyArray<readonly [RegExp, unknown]> = [
   [VIEW_RESULTS, { view_id: 'view-1', source: 'jobs', layout: 'table', rows: [], matched: 0, truncated: false, scope: 'all' }],
   // A paged read's empty is the empty page, not `[]` (backlog 0ef5e008).
   ...PAGED_ENDPOINTS.map((re): readonly [RegExp, unknown] => [re, EMPTY_PAGE]),
+  // And the inbox's, the paged read with its per-kind counts (74da899d).
+  [INBOX_READ, EMPTY_INBOX],
 ];
 
 /// window.print() opens the browser's print dialog — a native dialog the

@@ -46,16 +46,9 @@ const RUNNER_KEYS: [&str; 5] = ["plan", "verb", "host", "args", "rendered_plan_s
 
 fn field(name: &str, writer: Option<&str>) -> StepField {
     StepField {
-        name: name.into(),
-        field_type: "string".into(),
-        required: false,
         filled_by: Default::default(),
-        item_keys: Vec::new(),
-        covers: None,
-        binds: None,
-        item_value_max_bytes: None,
-        item_one_of: Vec::new(),
         writer: writer.map(str::to_string),
+        ..StepField::new(name, "string")
     }
 }
 
@@ -249,16 +242,29 @@ async fn the_merge_door_refuses_a_forged_runner_every_reserved_key() {
     assert_eq!(stored(&jobs, &step).await, before, "nothing was written");
 }
 
-/// The same claim at the step PUT: its metadata body is the other door
-/// that overlays step keys.
+/// The same claim at the step PUT, which used to be the other door that
+/// overlaid step keys. Since e39a9d2a (Stage 2's last car) the PUT writes
+/// no metadata at all: it refuses the body before the writer rule is
+/// reached, naming the merge door — where the rule is asserted above —
+/// so the forged plan has one door left, and that door refuses it.
 #[tokio::test]
-async fn the_step_put_refuses_a_forged_runner_a_reserved_key() {
+async fn the_step_put_refuses_a_forged_runner_any_metadata_body() {
     let (app, jobs) = app(None);
     let step = file(&app, &jobs, "forge").await;
     let mut md = stored(&jobs, &step).await;
     md["plan"] = json!("PLAN wipe");
     let (status, body) = put(&app, &step, json!({ "metadata": md })).await;
-    assert_refused(status, &body, "plan");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["merge_door"],
+        format!("/api/jobs/{}/steps/{}/metadata", step.job_id, step.id),
+        "{body}"
+    );
+    assert_eq!(
+        body["hint"],
+        boss_jobs::step_metadata_write::METADATA_BODY_HINT,
+        "{body}"
+    );
     assert!(stored(&jobs, &step).await.get("plan").is_none());
 }
 
@@ -278,25 +284,32 @@ async fn deleting_a_reserved_key_is_refused_like_writing_it() {
 }
 
 /// CONTROLS. A key with no declared writer is untouched by the rule,
-/// and so is an unchanged re-send of a reserved one — a
-/// read-modify-write caller sending the stored value back is not
-/// writing it.
+/// and so is an unchanged re-send of a reserved one — a caller sending
+/// the stored value back is not writing it. The re-send used to ride a
+/// step PUT's whole metadata body; since e39a9d2a the PUT writes no
+/// metadata, so it is asserted at the merge door, over a plan the
+/// runner really wrote.
 #[tokio::test]
 async fn undeclared_keys_and_unchanged_re_sends_are_admitted() {
-    let (app, jobs) = app(None);
-    let step = file(&app, &jobs, "forge").await;
+    let jobs = Arc::new(InMemoryJobs::new());
+    let runner = app_with_jobs(jobs.clone(), Some(runner_credential("forge")));
+    let step = file(&runner, &jobs, "forge").await;
+    let (status, body) = merge(&runner, &step, json!({ "plan": "PLAN a" })).await;
+    assert!(status.is_success(), "the runner writes its plan: {body}");
+
+    let app = app_with_jobs(jobs.clone(), None);
     let (status, body) = merge(&app, &step, json!({ "comment": "looks right" })).await;
     assert!(
         status.is_success(),
         "an undeclared key is not reserved: {body}"
     );
 
-    let md = stored(&jobs, &step).await;
-    let (status, body) = put(&app, &step, json!({ "metadata": md })).await;
+    let (status, body) = merge(&app, &step, json!({ "plan": "PLAN a" })).await;
     assert!(
         status.is_success(),
-        "sending the stored metadata back changes no reserved key: {body}"
+        "sending the stored plan back changes no reserved key: {body}"
     );
+    assert_eq!(stored(&jobs, &step).await["plan"], "PLAN a");
 }
 
 /// THE WRITER ITSELF: a caller the server resolved from a credential for

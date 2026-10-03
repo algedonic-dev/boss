@@ -43,6 +43,16 @@ impl<R: PolicyRepository> PolicyEngine<R> {
             .map(|(decision, _)| decision)
     }
 
+    /// [`Self::check`] for a declared control — the policy service's own
+    /// doors ask through the consts too (`crate::PolicyClient::ask`).
+    pub async fn ask(
+        &self,
+        user: &User,
+        control: crate::controls::Pair,
+    ) -> Result<Decision, PolicyError> {
+        self.check(user, control.action(), control.resource()).await
+    }
+
     /// [`Self::check`], and when the decision stops holding: the expiry
     /// of the user override that decided it, or `None` when nothing in
     /// it expires — a role rule, or an override with no expiry. The

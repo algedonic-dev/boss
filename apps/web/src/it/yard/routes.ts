@@ -28,6 +28,7 @@
 // Pure functions of the payload, so `bun test` pins every rule without a
 // DOM.
 import { fetchRemote, type Remote } from '../../data/remote';
+import { NOT_IN_SCOPE } from '../../policy/withheld';
 
 /** What supports one route (boss_jobs::routes::Source). A hand-off's
  *  `terminal` is the terminal it hands off, null when it takes the packet
@@ -53,6 +54,12 @@ export type Routes = Readonly<{
   /** Whether the moves record was read: false serves the declared
    *  routes with no counts beside them — never zeroes. */
   observed: boolean;
+  /** Why the moves record was not read FOR THIS CALLER, when the server
+   *  withheld it (070de88c): the caller's policy scope reads only some
+   *  packets and the record counts every packet's crossings. Null for a
+   *  full scope, and on an older server. Said as "not in your policy
+   *  scope" beside the declared routes (bd506215). */
+  observed_withheld: string | null;
   routes: ReadonlyArray<Route>;
   /** Hand-offs the server could not resolve, each naming why. */
   refused: ReadonlyArray<string>;
@@ -120,6 +127,7 @@ export function parseRoutes(raw: unknown): Routes {
   return {
     window_hours: typeof o.window_hours === 'number' ? o.window_hours : 0,
     observed: o.observed === true,
+    observed_withheld: typeof o.observed_withheld === 'string' && o.observed_withheld !== '' ? o.observed_withheld : null,
     routes: o.routes.map(parseRoute),
     refused: Array.isArray(o.refused) ? o.refused.map(String) : [],
   };
@@ -223,7 +231,11 @@ export function movesOn(r: Route): number | null {
 
 /** One line per source: the protocol step that makes the move, the
  *  declared hand-off and its why, the moves the record counted. */
-export function sourceLines(r: Route, windowHours: number): ReadonlyArray<string> {
+export function sourceLines(
+  r: Route,
+  windowHours: number,
+  observedWithheld: string | null = null,
+): ReadonlyArray<string> {
   const lines = r.sources.map((s) =>
     s.source === 'workflow'
       ? `${s.workflow} v${s.version}, step ${s.step} (${s.via})`
@@ -231,5 +243,8 @@ export function sourceLines(r: Route, windowHours: number): ReadonlyArray<string
         ? `${s.by}: ${s.why}`
         : `${s.moves} moves observed in ${windowHours}h`,
   );
-  return r.declared ? lines : ['observed, undeclared — no protocol or hand-off declares this route', ...lines];
+  // The counts withheld from this caller (bd506215): said, so their
+  // absence never reads as a route nothing crossed.
+  const withheld = observedWithheld === null ? [] : [`moves: ${NOT_IN_SCOPE}`];
+  return [...(r.declared ? [] : ['observed, undeclared — no protocol or hand-off declares this route']), ...lines, ...withheld];
 }

@@ -1,0 +1,11 @@
+{
+  "about": "READ-ONLY: which storage driver, and so which image store, each of the forge's two docker daemons runs — `docker info -f '{{.Driver}} {{json .DriverStatus}}'` against the system daemon (sudo -n docker, no DOCKER_HOST; the CI jobs) and the rootless daemon (DOCKER_HOST=unix:///run/user/1000/docker.sock; the converge builds). A containerd image store reads as the io.containerd.snapshotter.v1 driver-type. Added for backlog 3f28860d: the mirror read-back's correctness depends on whether the rootless dockerd uses the containerd image store, and no door could read it (disk-report shows docker system df, ci-image-report reads only the system daemon, journal-tail cannot reach a user unit). A daemon it cannot reach gets a NOT REACHED line with docker's own reason, the closing `unreached:` line names it, and the exit is 1 — never silent. No arguments, nothing mutated.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/docker-driver-report.sh"
+  ],
+  "params": [],
+  "timeout": 60
+}

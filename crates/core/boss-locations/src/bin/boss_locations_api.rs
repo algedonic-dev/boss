@@ -40,14 +40,13 @@ async fn main() -> Result<()> {
 
     info!(http_bind = %cfg.http_bind, "boss-locations-api starting");
 
-    let locations: Arc<dyn LocationRepository> = {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(10)
-            .connect(&cfg.postgres_url)
-            .await
-            .with_context(|| "connecting to Postgres")?;
-        Arc::new(boss_locations::PgLocations::new(pool))
-    };
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&cfg.postgres_url)
+        .await
+        .with_context(|| "connecting to Postgres")?;
+    let locations: Arc<dyn LocationRepository> =
+        Arc::new(boss_locations::PgLocations::new(pool.clone()));
 
     // The batch door asks policy (backlog 59deda40), wired the way
     // boss-classes-api wires its doors: the sim bypass is installed on a
@@ -79,7 +78,12 @@ async fn main() -> Result<()> {
         .with_context(|| format!("binding HTTP listener on {http_addr}"))?;
     info!(addr = %http_addr, "locations HTTP API listening");
 
-    let app = boss_core::machine_gate::mount(app, "locations", &["/api/locations/health"]);
+    let app = boss_core::machine_gate::mount(
+        app,
+        "locations",
+        &["/api/locations/health"],
+        Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }

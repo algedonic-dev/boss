@@ -354,6 +354,27 @@ test.describe('/it/registry/rules — a stalled rule and an idle one are two row
     ).toHaveAttribute('title', 'fired 2026-09-24T11:00:00Z on step.done.gate-verdict');
   });
 
+  // Backlog bd506215: a narrowed scope is served the rules and refused
+  // the firing record (d0058c92) — both halves null with the refusal's
+  // own words. That is the policy working: never "unknown", never failing.
+  test('an activity record withheld by policy scope says not in your policy scope in every cell', async ({ page }) => {
+    const why =
+      "this caller's policy scope does not read every packet, and the firing record is not scoped by packet, so neither it nor the dead-letters beside it are read for it — withheld";
+    await installSmokeMocks(page);
+    await page.route(RULES, (r) => json(r, payload(ROWS)));
+    await page.route(FIRINGS, (r) =>
+      json(r, { ...ACTIVITY, firings: null, firings_error: why, dead_letters: null, dead_letters_error: why, withheld: true }),
+    );
+    await mountPage(page, PAGE, { titleMatch: new RegExp(TITLE) });
+
+    await expect(page.locator('.catalog tbody tr')).toHaveCount(ROWS.length);
+    const scope = Array(ROWS.length).fill('not in your policy scope');
+    await expect(page.locator('.catalog tbody td:nth-child(6)')).toHaveText(scope);
+    await expect(page.locator('.catalog tbody td:nth-child(7)')).toHaveText(scope);
+    await expect(page.locator('.catalog tbody td:nth-child(6)').first()).toHaveAttribute('title', why);
+    await expect(page.locator('.catalog td.dead-letters.failing')).toHaveCount(0);
+  });
+
   test('an activity read that fails leaves the rules painted and every activity cell unknown', async ({ page }) => {
     await installSmokeMocks(page);
     await page.route(RULES, (r) => json(r, payload(ROWS)));

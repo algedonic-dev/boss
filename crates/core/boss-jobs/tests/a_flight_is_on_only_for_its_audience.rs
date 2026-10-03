@@ -153,8 +153,9 @@ async fn step(jobs: &InMemoryJobs, job: &Job, slug: &str) -> Step {
         .unwrap_or_else(|| panic!("no step {slug}"))
 }
 
-/// Complete `slug` as `who`, with `fields` laid over its stored
-/// metadata (the step PUT refuses a body that drops a stored key).
+/// Complete `slug` as `who`: `fields` through the step's metadata merge
+/// door, then the status alone through the step PUT, which refuses any
+/// metadata body since e39a9d2a.
 async fn complete(
     app: &Router,
     jobs: &InMemoryJobs,
@@ -164,27 +165,30 @@ async fn complete(
     fields: Value,
 ) {
     let s = step(jobs, job, slug).await;
-    let mut md = s.metadata.clone();
-    if let (Some(m), Some(f)) = (md.as_object_mut(), fields.as_object()) {
-        m.extend(f.clone());
+    let uri = format!("/api/jobs/{}/steps/{}", s.job_id, s.id);
+    for (method, uri, body) in [
+        ("PATCH", format!("{uri}/metadata"), fields),
+        ("PUT", uri.clone(), json!({"status": "completed"})),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .header("x-boss-user", who)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, body) = read(resp).await;
+        assert!(
+            status.is_success(),
+            "completing `{slug}` ({method}): {status} {body}"
+        );
     }
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri(format!("/api/jobs/{}/steps/{}", s.job_id, s.id))
-                .header("content-type", "application/json")
-                .header("x-boss-user", who)
-                .body(Body::from(
-                    json!({"status": "completed", "metadata": md}).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let (status, body) = read(resp).await;
-    assert!(status.is_success(), "completing `{slug}`: {status} {body}");
 }
 
 async fn mine(app: &Router, who: &str) -> Vec<String> {

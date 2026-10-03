@@ -568,7 +568,7 @@ async fn main() -> Result<()> {
         m
     };
     let output = Arc::new(Mutex::new({
-        let mut o = LiveApiOutput::new(&api_base)
+        let mut o = LiveApiOutput::new(&api_base, boss_core::machine_token::shared())
             .with_api_activity(api_activity.clone())
             .with_account_classes(account_classes);
         register_default_event_routes(&mut o);
@@ -1763,7 +1763,7 @@ fn run_regen(
     // update flush, which nothing fed and was deleted, e39a9d2a. The
     // workforce, which does complete steps, takes its own durations
     // in `Workforce::new`.)
-    let mut output = LiveApiOutput::new(api_base)
+    let mut output = LiveApiOutput::new(api_base, boss_core::machine_token::shared())
         .with_hard_fail(hard_fail)
         .with_drain_pause_ms(drain_pause_ms);
     register_default_event_routes(&mut output);

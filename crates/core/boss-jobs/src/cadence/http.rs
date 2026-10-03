@@ -27,7 +27,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
-use boss_policy_client::{Action, CurrentUser, Decision, PolicyClient, Resource};
+use boss_policy_client::{CurrentUser, Decision, Pair, PolicyClient, controls};
 
 use crate::registry::WorkflowStatus;
 use crate::trust::{can_read, is_trusted};
@@ -76,9 +76,9 @@ pub fn router(state: CadenceApiState) -> Router {
 async fn policy_check(
     state: &CadenceApiState,
     user: &boss_policy_client::User,
-    action: Action,
+    control: Pair,
 ) -> Result<(), Response> {
-    match state.policy.check(user, action, Resource::workflow()).await {
+    match state.policy.ask(user, control).await {
         Ok(Decision::Allow { .. }) => Ok(()),
         Ok(Decision::Deny { reason }) => Err((StatusCode::FORBIDDEN, reason).into_response()),
         Err(e) => Err(e.into_response()),
@@ -127,7 +127,7 @@ async fn publish_rule(
     Path(name): Path<String>,
     Json(spec): Json<CadenceRuleSpec>,
 ) -> Response {
-    if let Err(r) = policy_check(&state, &user, Action::Publish).await {
+    if let Err(r) = policy_check(&state, &user, controls::PUBLISH_WORKFLOW).await {
         return r;
     }
     if spec.name() != name {
@@ -169,7 +169,7 @@ async fn retire_rule(
     CurrentUser(user): CurrentUser,
     Path(name): Path<String>,
 ) -> Response {
-    if let Err(r) = policy_check(&state, &user, Action::Retire).await {
+    if let Err(r) = policy_check(&state, &user, controls::RETIRE_WORKFLOW).await {
         return r;
     }
     let (actor, now) = write_stamp(&state, &user).await;

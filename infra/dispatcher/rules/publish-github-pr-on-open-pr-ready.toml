@@ -2,7 +2,8 @@
 # protocol's `open-pr` step becomes READY — David approved the publish —
 # spawn an ops-request for host=forge verb=publish-github-pr; the root
 # ops-runner runs the verb (snapshot commit on the mirror's main, push to
-# the dauld fork, `gh pr create`) and completes `open-pr` with `pr_url`.
+# a publish/* branch of the mirror itself, the PR opened as the GitHub
+# App — backlog d2b7c947) and completes `open-pr` with `pr_url`.
 # Routed on the STEP's metadata marker, not its slug: `step.ready.*`
 # payloads carry the step's metadata_defaults but do not hoist spec_slug
 # the way step.done does. `metadata.ops_verb` is Absent on every other

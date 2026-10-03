@@ -4,7 +4,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
-use crate::port::{GlMove, InventoryDeltaResult, ProductsError, ProductsRepository};
+use crate::delta;
+use crate::port::{
+    InventoryDeltaResult, ProductsError, ProductsRepository, refuse_nul, refuse_nul_in_product,
+    unregistered,
+};
 use crate::types::{JeRecorded, Product, ProductInventory};
 
 pub struct PgProducts {
@@ -20,17 +24,20 @@ impl PgProducts {
 #[async_trait]
 impl ProductsRepository for PgProducts {
     async fn list_products(&self, active_only: bool) -> Result<Vec<Product>, ProductsError> {
+        // Byte order of SKU, as the double: the database's locale put
+        // `suite-ab` before `suite-B` (backlog be459ab9, found by the
+        // adapters-agree suite; the class is 2987fb2d's).
         let rows: Vec<ProductRow> = if active_only {
             sqlx::query_as(
                 "SELECT sku, name, product_kind, package_unit, description, metadata, active \
-                 FROM products WHERE active = TRUE ORDER BY sku",
+                 FROM products WHERE active = TRUE ORDER BY sku COLLATE \"C\"",
             )
             .fetch_all(&self.pool)
             .await
         } else {
             sqlx::query_as(
                 "SELECT sku, name, product_kind, package_unit, description, metadata, active \
-                 FROM products ORDER BY sku",
+                 FROM products ORDER BY sku COLLATE \"C\"",
             )
             .fetch_all(&self.pool)
             .await
@@ -40,6 +47,12 @@ impl ProductsRepository for PgProducts {
     }
 
     async fn get_product(&self, sku: &str) -> Result<Option<Product>, ProductsError> {
+        // No stored SKU can hold a NUL byte, and binding one is an
+        // encoding error Postgres answers as a 500 — so it is the miss
+        // it is (backlog be459ab9, found by the adapters-agree suite).
+        if sku.contains('\0') {
+            return Ok(None);
+        }
         let row: Option<ProductRow> = sqlx::query_as(
             "SELECT sku, name, product_kind, package_unit, description, metadata, active \
              FROM products WHERE sku = $1",
@@ -56,6 +69,7 @@ impl ProductsRepository for PgProducts {
         product: &Product,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), ProductsError> {
+        refuse_nul_in_product(product)?;
         let mut tx = self
             .pool
             .begin()
@@ -112,11 +126,16 @@ impl ProductsRepository for PgProducts {
     }
 
     async fn inventory_for(&self, sku: &str) -> Result<Vec<ProductInventory>, ProductsError> {
+        // A NUL-keyed read is a miss, and the rows are in byte order of
+        // location, as the double's (backlog be459ab9).
+        if sku.contains('\0') {
+            return Ok(Vec::new());
+        }
         let rows: Vec<InventoryRow> = sqlx::query_as(
             "SELECT product_sku, location_id, on_hand, reserved, \
                     value_cents, production_cost_cents, updated_at \
              FROM finished_product_inventory WHERE product_sku = $1 \
-             ORDER BY location_id",
+             ORDER BY location_id COLLATE \"C\"",
         )
         .bind(sku)
         .fetch_all(&self.pool)
@@ -130,6 +149,10 @@ impl ProductsRepository for PgProducts {
         row: &ProductInventory,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), ProductsError> {
+        refuse_nul(&[
+            ("product_sku", &row.product_sku),
+            ("location_id", &row.location_id),
+        ])?;
         let mut tx = self
             .pool
             .begin()
@@ -137,7 +160,10 @@ impl ProductsRepository for PgProducts {
             .map_err(|e| ProductsError::Storage(e.to_string()))?;
         // updated_at = stamp.timestamp (the event's recorded instant),
         // not NOW() — the rebuilder binds ev.ts for the same column.
-        sqlx::query(
+        // RETURNING the stored row: the fact carries what the write
+        // produced (derived cost, the instant to the microsecond), not
+        // what the caller sent (backlog 797b6168).
+        let stored: InventoryRow = sqlx::query_as(
             "INSERT INTO finished_product_inventory \
                 (product_sku, location_id, on_hand, reserved, value_cents, updated_at) \
              VALUES ($1, $2, $3, $4, $5, $6) \
@@ -145,7 +171,9 @@ impl ProductsRepository for PgProducts {
                 on_hand = EXCLUDED.on_hand, \
                 reserved = EXCLUDED.reserved, \
                 value_cents = EXCLUDED.value_cents, \
-                updated_at = EXCLUDED.updated_at",
+                updated_at = EXCLUDED.updated_at \
+             RETURNING product_sku, location_id, on_hand, reserved, \
+                       value_cents, production_cost_cents, updated_at",
         )
         .bind(&row.product_sku)
         .bind(&row.location_id)
@@ -153,13 +181,13 @@ impl ProductsRepository for PgProducts {
         .bind(row.reserved)
         .bind(row.value_cents)
         .bind(stamp.timestamp)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
-        .map_err(|e| ProductsError::Storage(e.to_string()))?;
+        .map_err(|e| write_err(e, &row.product_sku))?;
         // OUTBOX (phase 2): the inventory event records with the row.
         let event = stamp.event(
             crate::events::PRODUCT_INVENTORY_UPSERTED,
-            serde_json::to_value(row).unwrap_or_default(),
+            delta::inventory_upserted(&stored.into()),
         );
         boss_events::outbox::record_event_in_tx(&mut tx, &event)
             .await
@@ -186,6 +214,13 @@ impl ProductsRepository for PgProducts {
                 "total_cost_cents must be positive".to_string(),
             ));
         }
+        refuse_nul(&[
+            ("debit_account", debit_account),
+            ("credit_account", credit_account),
+            ("memo", memo),
+            ("source_table", source_table),
+            ("source_id", source_id),
+        ])?;
         let mut tx = self
             .pool
             .begin()
@@ -195,15 +230,15 @@ impl ProductsRepository for PgProducts {
         // source_table folded in like the ledger movement endpoints do:
         // the emitted event must let rebuild reproduce the original
         // provenance tag (payload-authoritative source_table).
-        let payload = serde_json::json!({
-            "total_cost_cents": total_cost_cents,
-            "debit_account": debit_account,
-            "credit_account": credit_account,
-            "memo": memo,
-            "happened_on": happened_on.to_string(),
-            "source_table": source_table,
-            "source_id": source_id,
-        });
+        let payload = delta::je_payload(
+            total_cost_cents,
+            debit_account,
+            credit_account,
+            memo,
+            source_table,
+            source_id,
+            happened_on,
+        );
 
         let inserted = insert_fact(
             &mut tx,
@@ -267,6 +302,11 @@ impl ProductsRepository for PgProducts {
                 "produce qty must be positive, got {qty}"
             )));
         }
+        refuse_nul(&[
+            ("sku", sku),
+            ("location_id", location_id),
+            ("source_id", &source_id),
+        ])?;
         // One tx wraps: (1) on_hand increment + the EXACT line total
         // landing on value_cents, (2) the matching
         // `finance.inventory.transferred` financial_fact sized at the
@@ -342,7 +382,7 @@ impl ProductsRepository for PgProducts {
         }
         .fetch_one(&mut *tx)
         .await
-        .map_err(|e| ProductsError::Storage(e.to_string()))?;
+        .map_err(|e| write_err(e, sku))?;
 
         // WIP→FG cost transfer, only when the caller knew the
         // standard cost per unit. When unit_cost_cents is None, FG
@@ -351,38 +391,18 @@ impl ProductsRepository for PgProducts {
         let gl_move = if let Some(total) = total_cost_cents
             && total > 0
         {
-            let happened_on = now.date_naive();
-            // `source_id` + `happened_on` go INTO the payload so
-            // the projection rule's `/source_id` + `/happened_on`
-            // pointers find them on rebuild. Bundle export +
-            // re-import lands an identical `financial_facts` row.
-            let payload = serde_json::json!({
-                "total_cost_cents": total,
-                "debit_account": "1320",
-                "credit_account": "1310",
-                "memo": format!(
-                    "Production — produced {qty} × {sku} (WIP → FG, exact line total)"
-                ),
-                "sku": sku,
-                "location_id": location_id,
-                "qty": qty,
-                "source_id": source_id,
-                "happened_on": happened_on.to_string(),
-            });
+            // The one WIP→FG move both adapters answer (delta.rs).
+            let gl = delta::produced_move(sku, location_id, qty, total, now, source_id);
             insert_fact(
                 &mut tx,
-                "finance.inventory.transferred",
-                happened_on,
-                &payload,
-                "products_produce",
-                &source_id,
+                delta::TRANSFER_FACT,
+                gl.happened_on,
+                &gl.payload,
+                delta::PRODUCE_SOURCE,
+                &gl.source_id,
             )
             .await?;
-            Some(GlMove {
-                source_id,
-                happened_on,
-                payload,
-            })
+            Some(gl)
         } else {
             None
         };
@@ -395,7 +415,7 @@ impl ProductsRepository for PgProducts {
         let inventory: ProductInventory = row.into();
         let event = stamp.event(
             crate::events::PRODUCT_INVENTORY_UPSERTED,
-            serde_json::to_value(&inventory).unwrap_or_default(),
+            delta::inventory_upserted(&inventory),
         );
         boss_events::outbox::record_event_in_tx(&mut tx, &event)
             .await
@@ -428,6 +448,12 @@ impl ProductsRepository for PgProducts {
                 "consume qty must be positive, got {qty}"
             )));
         }
+        refuse_nul(&[
+            ("sku", sku),
+            ("location_id", location_id),
+            ("source_id", &source_id),
+            ("revenue_category", revenue_category.unwrap_or("")),
+        ])?;
         // One tx wraps: (1) the proportional value drain + on_hand
         // decrement, (2) the matching `finance.cogs.recognized` JE
         // sized at exactly the drained value (DR 5100 COGS / CR 1320
@@ -482,12 +508,7 @@ impl ProductsRepository for PgProducts {
         .map_err(|e| ProductsError::Storage(e.to_string()))?;
         let drained_cents = match before {
             Some((on_hand_before, value_before)) if on_hand_before >= qty => {
-                if on_hand_before == qty {
-                    value_before
-                } else {
-                    (((value_before as i128) * (qty as i128) + (on_hand_before as i128) / 2)
-                        / (on_hand_before as i128)) as i64
-                }
+                delta::drained_cents(on_hand_before, value_before, qty)
             }
             _ => {
                 drop(tx);
@@ -525,37 +546,26 @@ impl ProductsRepository for PgProducts {
                 // absorb the gap until the next produce lands value.
                 let total_cost = drained_cents;
                 let gl_move = if total_cost > 0 {
-                    let happened_on = now.date_naive();
-                    let mut payload = serde_json::json!({
-                        "total_cost_cents": total_cost,
-                        "cogs_account": "5100",
-                        "inventory_account": "1320",
-                        "memo": format!(
-                            "COGS — sold {qty} × {sku} (value drain)"
-                        ),
-                        "sku": sku,
-                        "location_id": location_id,
-                        "qty": qty,
-                        "source_id": source_id,
-                        "happened_on": happened_on.to_string(),
-                    });
-                    if let Some(cat) = revenue_category {
-                        payload["revenue_category"] = serde_json::Value::String(cat.to_string());
-                    }
+                    // The one COGS move both adapters answer (delta.rs).
+                    let gl = delta::consumed_move(
+                        sku,
+                        location_id,
+                        qty,
+                        total_cost,
+                        revenue_category,
+                        now,
+                        source_id,
+                    );
                     insert_fact(
                         &mut tx,
-                        "finance.cogs.recognized",
-                        happened_on,
-                        &payload,
-                        "products_consume",
-                        &source_id,
+                        delta::COGS_FACT,
+                        gl.happened_on,
+                        &gl.payload,
+                        delta::CONSUME_SOURCE,
+                        &gl.source_id,
                     )
                     .await?;
-                    Some(GlMove {
-                        source_id,
-                        happened_on,
-                        payload,
-                    })
+                    Some(gl)
                 } else {
                     None
                 };
@@ -566,7 +576,7 @@ impl ProductsRepository for PgProducts {
                 let inventory: ProductInventory = row.into();
                 let event = stamp.event(
                     crate::events::PRODUCT_INVENTORY_UPSERTED,
-                    serde_json::to_value(&inventory).unwrap_or_default(),
+                    delta::inventory_upserted(&inventory),
                 );
                 boss_events::outbox::record_event_in_tx(&mut tx, &event)
                     .await
@@ -586,6 +596,22 @@ impl ProductsRepository for PgProducts {
                 "consume failed: row missing or on_hand < {qty} for {sku} @ {location_id}"
             ))),
         }
+    }
+}
+
+/// A write's error, with the foreign key to `products(sku)` read as
+/// the refusal it is: an inventory row for a SKU nobody registered.
+/// Until the adapters-agree suite (backlog be459ab9) it was `Storage`,
+/// a 500, while the double stored the row.
+fn write_err(e: sqlx::Error, sku: &str) -> ProductsError {
+    let fk = e
+        .as_database_error()
+        .and_then(|d| d.code())
+        .is_some_and(|c| c == "23503");
+    if fk {
+        unregistered(sku)
+    } else {
+        ProductsError::Storage(e.to_string())
     }
 }
 

@@ -9,7 +9,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "Hourly on the dev pod: removes git worktrees whose branch is gone from the forge (clean, git-quiet for a grace period) with the cargo target each kept alive, retires sibling targets by age, and below a floor trims the regenerable build cache. Files a packet only for a pass that reclaimed something or left a floor unmet, carrying the totals and the dirty worktrees it kept, by name (backlog 1933db9e: 203 worktrees, 175 of their branches gone, 364 GB on a 77%-full disk, and nothing that could see it)."
-metadata = { owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "scheduled"

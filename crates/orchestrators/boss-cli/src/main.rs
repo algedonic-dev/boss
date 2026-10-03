@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 mod attach;
+mod automations;
 mod brief;
 mod built_from;
 mod bundle_lineage;
@@ -24,6 +25,7 @@ mod dock_preview;
 mod doctor;
 mod documents;
 mod door;
+mod door_env;
 mod envelope;
 mod estate;
 mod events;
@@ -36,6 +38,7 @@ mod inspect;
 mod item_source;
 mod job;
 mod kept_probe;
+mod launch;
 mod ledger;
 mod memory_index;
 mod merged;
@@ -59,6 +62,7 @@ mod repair;
 mod reporting_to;
 mod rerail;
 mod review_verdict;
+mod roster;
 mod running;
 mod scratch_target;
 mod script;
@@ -105,6 +109,10 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
+    #[command(flatten)]
+    Roster(roster::Cmd),
+    #[command(flatten)]
+    Launch(launch::Cmd),
     /// Post-install health check — verifies Postgres, NATS, gateway,
     /// tenant manifest, SPA bundle, and registered systemd services.
     Doctor,
@@ -779,7 +787,7 @@ enum Commands {
         questions: Vec<String>,
         /// Record it without queuing a review — for a doc that states
         /// a decision already made.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "questions")]
         no_questions: bool,
         /// The docs/design path this packet mirrors, when there is one.
         #[arg(long)]
@@ -1007,6 +1015,8 @@ enum Commands {
     // ------------------------------------------------------------------
     #[command(flatten)]
     Attach(attach::Cmd),
+    #[command(flatten)]
+    Automations(automations::Cmd),
     #[command(flatten)]
     Correct(correct::Cmd),
     #[command(flatten)]
@@ -1631,6 +1641,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Launch(cmd) => launch::dispatch(cmd).await,
+        Commands::Roster(cmd) => roster::dispatch(cmd).await,
         Commands::Doctor => doctor::run_install().await,
         Commands::Emit { kind, payload } => cmd_emit(kind, payload).await,
         Commands::Upgrade => upgrade::run().await,
@@ -2236,6 +2248,7 @@ async fn main() -> Result<()> {
         // Per-module verbs, one arm each, ALPHABETIZED — the note on
         // `Commands` says why (84f9fbc0).
         Commands::Attach(cmd) => attach::dispatch(cmd).await,
+        Commands::Automations(cmd) => automations::dispatch(cmd, chrono::Utc::now()).await,
         Commands::Correct(cmd) => correct::dispatch(cmd).await,
         Commands::Credential(cmd) => credential::dispatch(cmd).await,
         Commands::Events(cmd) => events::dispatch(cmd).await,
@@ -2294,6 +2307,33 @@ async fn cmd_emit(kind: String, payload: String) -> Result<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn a_design_cannot_claim_no_questions_while_asking_one() {
+        let err = Cli::try_parse_from([
+            "boss",
+            "design",
+            "A decision",
+            "--no-questions",
+            "--question",
+            "Q1|Which host?|forge",
+        ])
+        .err()
+        .expect("contradictory review intent must be refused before filing");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        for args in [
+            vec!["boss", "design", "A decision", "--no-questions"],
+            vec![
+                "boss",
+                "design",
+                "A question",
+                "--question",
+                "Q1|Which host?|forge",
+            ],
+        ] {
+            Cli::try_parse_from(args).expect("each legitimate review intent is accepted");
+        }
+    }
 
     /// clap's own structural validation of the whole command tree —
     /// catches a misconfigured `#[command(flatten)]`, a duplicate verb

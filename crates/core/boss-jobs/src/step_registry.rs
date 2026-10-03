@@ -1258,16 +1258,9 @@ mod tests {
     #[test]
     fn an_enum_refusal_names_field_value_and_set() {
         let fields = vec![boss_core::job::StepField {
-            name: "disposition".into(),
-            field_type: "verify|design|build".into(),
             required: true,
             filled_by: Default::default(),
-            item_keys: Vec::new(),
-            covers: None,
-            binds: None,
-            item_value_max_bytes: None,
-            item_one_of: Vec::new(),
-            writer: None,
+            ..boss_core::job::StepField::new("disposition", "verify|design|build")
         }];
         let meta = serde_json::json!({"disposition": "ship"});
         let err = StepRegistry::validate_authored_fields(&fields, &meta).unwrap_err();
@@ -1353,28 +1346,16 @@ mod tests {
         use boss_core::job::{FilledBy, StepField};
         let fields = vec![
             StepField {
-                name: "questions".into(),
-                field_type: "array".into(),
                 required: true,
                 filled_by: FilledBy::Filer,
                 item_keys: vec!["anchor".into(), "title".into(), "proposal".into()],
-                covers: None,
-                binds: None,
-                item_value_max_bytes: None,
-                item_one_of: Vec::new(),
-                writer: None,
+                ..StepField::new("questions", "array")
             },
             StepField {
-                name: "resolutions".into(),
-                field_type: "array".into(),
                 required: true,
-                filled_by: FilledBy::Executor,
                 item_keys: vec!["anchor".into(), "decision".into()],
                 covers: Some("questions".into()),
-                binds: None,
-                item_value_max_bytes: None,
-                item_one_of: Vec::new(),
-                writer: None,
+                ..StepField::new("resolutions", "array")
             },
         ];
         let questions = serde_json::json!([
@@ -1451,28 +1432,18 @@ mod tests {
         use boss_core::job::{FilledBy, StepField};
         vec![
             StepField {
-                name: "questions".into(),
-                field_type: "array".into(),
                 required: true,
                 filled_by: FilledBy::Filer,
                 item_keys: vec!["anchor".into(), "title".into(), "proposal".into()],
-                covers: None,
                 binds: Some("exhibits".into()),
-                item_value_max_bytes: None,
-                item_one_of: Vec::new(),
-                writer: None,
+                ..StepField::new("questions", "array")
             },
             StepField {
-                name: "exhibits".into(),
-                field_type: "array".into(),
-                required: false,
                 filled_by: FilledBy::Filer,
                 item_keys: vec!["anchor".into(), "title".into()],
-                covers: None,
-                binds: None,
                 item_value_max_bytes: Some(max),
                 item_one_of: vec!["html".into(), "file_ref".into()],
-                writer: None,
+                ..StepField::new("exhibits", "array")
             },
         ]
     }
@@ -1734,16 +1705,8 @@ mod tests {
     fn an_unknown_field_type_refuses_every_value() {
         use boss_core::job::StepField;
         let fields = vec![StepField {
-            name: "receipt_verdict".into(),
-            field_type: "green".into(),
             required: true,
-            filled_by: boss_core::job::FilledBy::Executor,
-            item_keys: Vec::new(),
-            covers: None,
-            binds: None,
-            item_value_max_bytes: None,
-            item_one_of: Vec::new(),
-            writer: None,
+            ..StepField::new("receipt_verdict", "green")
         }];
         for value in [
             serde_json::json!("gren"),
@@ -1799,29 +1762,10 @@ mod tests {
         use boss_core::job::StepField;
         let fields = vec![
             StepField {
-                name: "counter_offer_cents".into(),
-                field_type: "integer".into(),
                 required: true,
-                filled_by: boss_core::job::FilledBy::Executor,
-                item_keys: Vec::new(),
-                covers: None,
-                binds: None,
-                item_value_max_bytes: None,
-                item_one_of: Vec::new(),
-                writer: None,
+                ..StepField::new("counter_offer_cents", "integer")
             },
-            StepField {
-                name: "notes".into(),
-                field_type: "string".into(),
-                required: false,
-                filled_by: boss_core::job::FilledBy::Executor,
-                item_keys: Vec::new(),
-                covers: None,
-                binds: None,
-                item_value_max_bytes: None,
-                item_one_of: Vec::new(),
-                writer: None,
-            },
+            StepField::new("notes", "string"),
         ];
         // Missing required authored field → error naming it.
         let err =

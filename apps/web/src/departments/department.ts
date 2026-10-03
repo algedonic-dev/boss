@@ -23,9 +23,9 @@
 // WHICH THIRD A PACKET IS IN is derived here, from its steps, and the
 // rule is deliberately the plainest one that is true:
 //
-//   out      — terminal (closed or cancelled). The read asks for the
-//              last OUT_WINDOW_DAYS of them, so this third is "what
-//              left recently", not the archive.
+//   out      — terminal (closed or cancelled). Its own read asks for
+//              the last OUT_WINDOW_DAYS of them, so this third is
+//              "what left recently", not the archive.
 //   in       — live, and nothing has been done on it yet: no step has
 //              started or finished. It stands at its first step.
 //   working  — live, and something has: a step is active, or one has
@@ -39,14 +39,21 @@
 // says so.
 
 import { fetchRemote, type Remote } from '../data/remote';
-import type { Job, Step } from '../jobs/types';
+import { parseJob, type Job, type Step } from '../jobs/types';
 import { lensNow, waitedText, type StepWaits } from '../jobs/queueAge';
 
 /** The OUT third is the last thirty days of departures. */
 export const OUT_WINDOW_DAYS = 30;
-/** One page. A department past this is reported, not silently cut
+/** The live read's page: In and Working, the work a department holds.
+ *  Sized so the busiest department's open work fits whole — IT's
+ *  ~430 open backlog-items once its kinds are published (backlog
+ *  a22311a1) — and a department past it is reported, not silently cut
  *  (a-limit-is-not-a-filter). */
-export const PAGE = 200;
+export const LIVE_PAGE = 500;
+/** The departures read's page: the Out third is "what left recently",
+ *  a sample beside its total, never the archive — IT closes ~1,230
+ *  packets a day, so no page could hold its thirty days. */
+export const OUT_PAGE = 100;
 
 export type Third = 'in' | 'working' | 'out';
 
@@ -140,24 +147,94 @@ export function thirds(jobs: ReadonlyArray<Job>): Thirds {
 export type JobsPage = Readonly<{ rows: ReadonlyArray<Job>; total: number }>;
 
 /** The listing's envelope, kept whole: `total` is what the page
- *  compares itself against. */
+ *  compares itself against. Exec audit a1d62870 (2026-10-03): a
+ *  malformed 200 used to become "No jobs", and missing lifecycle
+ *  data became In. Require the table's identities and slim steps;
+ *  missing step metadata is valid on a listing, missing steps is not. */
 export function parseJobsPage(raw: unknown): JobsPage {
   const env = raw as { data?: unknown; total?: unknown } | null;
-  const rows = Array.isArray(env?.data) ? (env.data as ReadonlyArray<Job>) : [];
-  const total = typeof env?.total === 'number' ? env.total : rows.length;
+  if (!env || !Array.isArray(env.data) || typeof env.total !== 'number'
+      || !Number.isSafeInteger(env.total) || env.total < env.data.length
+      || (env.data.length === 0 && env.total !== 0)) {
+    throw new Error('the department jobs read answered an invalid counted envelope');
+  }
+  const rows = env.data.map((rawRow) => {
+    const row = parseJob('the department jobs read', rawRow);
+    if (!row.id.trim() || typeof row.kind !== 'string' || !row.kind.trim() || typeof row.title !== 'string'
+        || !['draft', 'open', 'closed', 'cancelled'].includes(row.status)
+        || typeof row.priority !== 'string' || typeof row.opened_on !== 'string' || !row.opened_on.trim()
+        || (row.closed_on !== null && typeof row.closed_on !== 'string')
+        || typeof row.subject.id !== 'string' || !row.subject.id.trim()
+        || typeof row.subject.subject_kind !== 'string' || !row.subject.subject_kind.trim()
+        || !Array.isArray(row.steps)
+        || row.steps.some((s) => !s || typeof s.id !== 'string' || !s.id.trim()
+          || typeof s.title !== 'string' || typeof s.kind !== 'string'
+          || !['pending', 'ready', 'active', 'completed', 'skipped'].includes(s.status)
+          || !Number.isSafeInteger(s.sort_order))) {
+      throw new Error('the department jobs read answered an invalid table row');
+    }
+    return row;
+  });
+  if (new Set(rows.map((row) => row.id)).size !== rows.length) {
+    throw new Error('the department jobs read answered duplicate packet identities');
+  }
+  const total = env.total;
   return { rows, total };
 }
 
-/** The one read: live packets plus the window's departures, of the
- *  department's kinds. `closed_within` is the server's retention
- *  window (live OR closed since), so the three thirds come from one
- *  page and agree with each other. */
-export function departmentJobsUrl(code: string): string {
-  return `/api/jobs?department=${encodeURIComponent(code)}&closed_within=${OUT_WINDOW_DAYS}&limit=${PAGE}`;
+// TWO READS, NOT ONE (backlog a22311a1). The view read live packets and
+// the window's departures as ONE page of 200 (`closed_within`, live OR
+// closed since), newest first. Once 61 platform kinds declared `it`,
+// those kinds would open ~1,230 packets a day: the page would hold
+// about four hours of closed chores and the 429 open IT backlog-items
+// would fall off it, so In and Working read near-empty on the
+// department with the most open work. The live packets and the
+// departures are now two reads (`terminal=false` / `terminal=true`,
+// the server's live-or-terminal filter), each bounded and each with
+// its own `total`, so neither third can crowd out the other.
+
+/** In and Working: every live (draft or open) packet in the department. */
+export function liveJobsUrl(code: string): string {
+  return `/api/jobs?department=${encodeURIComponent(code)}&terminal=false&limit=${LIVE_PAGE}`;
 }
 
-export function loadDepartment(
+/** Out: the packets that closed or were cancelled in the window. */
+export function departuresUrl(code: string): string {
+  return `/api/jobs?department=${encodeURIComponent(code)}&terminal=true&closed_within=${OUT_WINDOW_DAYS}&limit=${OUT_PAGE}`;
+}
+
+export type DepartmentJobs = Readonly<{ live: JobsPage; out: JobsPage }>;
+
+/** The three thirds from the two reads. Each third takes rows from its
+ *  own read only — In and Working from the live page, Out from the
+ *  departures — so a reply carrying both kinds of row cannot draw one
+ *  packet twice. */
+export function departmentThirds(d: DepartmentJobs): Thirds {
+  const live = thirds(d.live.rows);
+  return { in: live.in, working: live.working, out: thirds(d.out.rows).out };
+}
+
+export type Truncation = Readonly<{ read: 'live' | 'out'; shown: number; total: number }>;
+
+/** The reads whose page is smaller than their total — each said on
+ *  the page by name, never a page passed off as the department. */
+export function truncatedReads(d: DepartmentJobs): ReadonlyArray<Truncation> {
+  return (['live', 'out'] as const)
+    .filter((read) => d[read].total > d[read].rows.length)
+    .map((read) => ({ read, shown: d[read].rows.length, total: d[read].total }));
+}
+
+/** Both reads, concurrently. Either failing fails the view, with the
+ *  failing read's own error: half a department drawn as the whole
+ *  would be the false-empty this page exists to refuse. */
+export async function loadDepartment(
   code: string,
-): Promise<Exclude<Remote<JobsPage>, { kind: 'loading' }>> {
-  return fetchRemote(departmentJobsUrl(code), parseJobsPage);
+): Promise<Exclude<Remote<DepartmentJobs>, { kind: 'loading' }>> {
+  const [live, out] = await Promise.all([
+    fetchRemote(liveJobsUrl(code), parseJobsPage),
+    fetchRemote(departuresUrl(code), parseJobsPage),
+  ]);
+  if (live.kind === 'failed') return live;
+  if (out.kind === 'failed') return out;
+  return { kind: 'ready', data: { live: live.data, out: out.data } };
 }

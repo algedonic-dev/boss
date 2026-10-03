@@ -172,6 +172,21 @@ pub enum TrainPhase {
 }
 
 impl TrainPhase {
+    /// IS THE TRAIN IN TRANSIT — merged, so it is on the track: deploying,
+    /// converging, or arrived and not yet closed. Before the merge a train
+    /// is made up at the dock or under test at the gates (design e765b3fc
+    /// §2a, car R1). THE ONE DEFINITION (backlog 3eddffc4): the map's
+    /// track region (`regions::train_region`) and `boss orient`'s IN
+    /// TRANSIT (through [`in_transit`]) both read it, because on
+    /// 2026-10-01 orient listed a train at its CI verdict IN TRANSIT
+    /// while the track read "no train in transit".
+    pub fn in_transit(self) -> bool {
+        matches!(
+            self,
+            TrainPhase::Deploying | TrainPhase::Converging | TrainPhase::Arrived
+        )
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             TrainPhase::Boarding => "boarding",
@@ -342,6 +357,14 @@ pub fn awaiting_merge(verdict: &str, checks: Option<&str>, gate_line: Option<&st
 /// stands" shares — the yard status, the borders, `boss orient`.
 pub fn standing_at(title: &str, status: &str) -> String {
     format!("{title} ({status}, not yet done)")
+}
+
+/// Whether an open train with these steps is IN TRANSIT — merged, on the
+/// track ([`TrainPhase::in_transit`]). The reader for a caller holding
+/// steps rather than a phase: `boss orient` deserializes the train's
+/// steps and asks this, so the map and orient answer one question.
+pub fn in_transit(steps: &[Step]) -> bool {
+    phase_of(steps).in_transit()
 }
 
 /// The phase a train is in: the furthest step reached. A train whose
@@ -595,6 +618,33 @@ pub struct HeldCar {
     /// Why it cannot board: the `hold` marker's text, or "no reason
     /// recorded" for a bare `hold: true`.
     pub reason: String,
+    /// WHICH brake holds it — an operator's `hold`, or a red dock
+    /// re-gate — decided once, here, by [`dock_lanes`], so the dock
+    /// region names the kind without re-reading the car (backlog
+    /// 3eddffc4). Absent on an older payload → an operator's hold.
+    #[serde(default)]
+    pub kind: CarHoldKind,
+}
+
+/// The two brakes that hold a car on the dock ([`dock_lanes`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CarHoldKind {
+    /// A `hold` marker on the review step — a person put it there.
+    #[default]
+    Operator,
+    /// The car's dock re-gate went red (`dock_red::regate_red`).
+    RegateRed,
+}
+
+impl CarHoldKind {
+    /// The kind as the dock names it: "on an operator's hold".
+    pub fn label(self) -> &'static str {
+        match self {
+            CarHoldKind::Operator => "on an operator's hold",
+            CarHoldKind::RegateRed => "on a red re-gate",
+        }
+    }
 }
 
 /// The dock brake on a car: the `hold` marker on its REVIEW step, read
@@ -679,11 +729,16 @@ pub fn dock_lanes(dock_cars: &[(Job, Vec<Step>)]) -> (Vec<DockCar>, Vec<HeldCar>
     let mut held: Vec<HeldCar> = Vec::new();
     for (job, steps) in dock_cars {
         let brake = car_hold_reason(steps)
-            .or_else(|| crate::dock_red::regate_red(&job.metadata).map(|r| r.reason()));
+            .map(|r| (r, CarHoldKind::Operator))
+            .or_else(|| {
+                crate::dock_red::regate_red(&job.metadata)
+                    .map(|r| (r.reason(), CarHoldKind::RegateRed))
+            });
         match brake {
-            Some(reason) => held.push(HeldCar {
+            Some((reason, kind)) => held.push(HeldCar {
                 car: dock_car(job),
                 reason,
+                kind,
             }),
             None => parked.push(dock_car(job)),
         }
@@ -721,6 +776,16 @@ pub enum Reading {
     /// The read did not answer — no repository wired, or it failed. The
     /// value beside it carries no information.
     Unread,
+    /// The read was not MADE for this caller (backlog d0058c92): its
+    /// policy scope does not read every packet, and the record is not
+    /// scoped by packet — the board rule's firing names when the track
+    /// last boarded, whoever's cars it took. The value beside it carries
+    /// no information, as with `Unread`, but it is a refusal by scope,
+    /// not a failure, and says so: "could not be read" would be a
+    /// failure's words for it (the borders learned that in 493cebf3).
+    /// Only the board firing is ever withheld; the dock and the cadence
+    /// rows are read within the caller's scope or not at all.
+    Withheld,
 }
 
 impl Reading {
@@ -917,7 +982,10 @@ pub struct BoardHold {
     /// Whether those firings could be READ. `unread` says `last_board_at`
     /// and `cooldown_remaining_minutes` are nulls nobody read — not "it
     /// has never boarded" and not "no cooldown is running", which is how
-    /// the pair reads on its own and is the permissive answer.
+    /// the pair reads on its own and is the permissive answer. `withheld`
+    /// says the same nulls were never read for THIS caller, whose scope
+    /// does not read every packet (backlog d0058c92) — a refusal, not a
+    /// failure.
     #[serde(default)]
     pub last_board_reading: Reading,
     /// The sentence. A depth rule has no clock (`next_due` promises it
@@ -956,6 +1024,12 @@ pub const CADENCE_UNREAD: &str = "the boarding cadence could not be read";
 
 /// The same, for the board rule's last firing.
 pub const FIRING_UNREAD: &str = "the board rule's last firing could not be read";
+
+/// The board rule's last firing, NOT READ for this caller
+/// ([`Reading::Withheld`], backlog d0058c92) — the refusal's own words,
+/// so a narrowed caller is never told the record failed.
+pub const FIRING_WITHHELD: &str = "the board rule's last firing is withheld from this caller, \
+                                   whose policy scope does not read every packet";
 
 /// A cadence rule fires by DEPTH when it declares `min_dock_depth`.
 /// Public so the handler reads the board rule's last firing under the
@@ -1274,11 +1348,18 @@ pub fn boarding_hold(
     let mut admissions: Vec<(String, String, &'static str)> = Vec::new();
     // A cooldown term with no firing behind it: the firing read failed,
     // so the three nulls it leaves must not read as "no cooldown in
-    // force" (31783deb).
-    if readings.last_board == Reading::Unread {
+    // force" (31783deb). Or it was withheld from this caller (d0058c92):
+    // the same three nulls, the same refusal to imply a go-ahead, and the
+    // refusal's own words rather than a failure's.
+    let firing_admission = match readings.last_board {
+        Reading::Read => None,
+        Reading::Unread => Some(FIRING_UNREAD),
+        Reading::Withheld => Some(FIRING_WITHHELD),
+    };
+    if let Some(why) = firing_admission {
         admissions.push((
-            format!("{FIRING_UNREAD}, so the cooldown cannot be evaluated"),
-            format!("{FIRING_UNREAD} — the cooldown cannot be evaluated"),
+            format!("{why}, so the cooldown cannot be evaluated"),
+            format!("{why} — the cooldown cannot be evaluated"),
             "the cooldown",
         ));
     }
@@ -2727,7 +2808,23 @@ pub struct ConductorHealth {
     /// was reading.
     pub last_verb: Option<String>,
     pub last_rc: Option<i32>,
+    /// WHY THE FIRING WAS NOT READ, when it was withheld from this
+    /// caller (backlog d0058c92): its policy scope does not read every
+    /// packet, and the heartbeat is the cadence record, which is not
+    /// scoped by packet. `last_seen`, `silent_for_minutes` and `last_rc`
+    /// are then nulls nobody read and `silent` is `false` — no claim
+    /// either way — and this says so, so the block is never read as "no
+    /// firing on record". Absent (not `null`) for a caller who reads
+    /// every packet, so their payload is the one they always had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<String>,
 }
+
+/// Why the conductor's heartbeat is not read for a caller whose scope
+/// does not read every packet — [`ConductorHealth::withheld`].
+pub const HEARTBEAT_WITHHELD: &str = "this caller's policy scope does not read every packet, \
+                                      and the conductor's firing record is not scoped by \
+                                      packet, so it is not read for it";
 
 /// How many declared intervals of silence before the board stops
 /// trusting what the conductor wrote. Two, not one: a single missed
@@ -2763,6 +2860,19 @@ pub fn conductor_health(
         silent,
         last_verb: last_verb.map(str::to_string),
         last_rc,
+        withheld: None,
+    }
+}
+
+/// The conductor block for a caller the firing record is withheld from
+/// (backlog d0058c92): the declared heartbeat — a registry fact, the
+/// same for every reader — and nothing read off a firing. `last_verb`
+/// is null too: it names the verb the conductor last RAN, which is a
+/// firing's fact even where the rule row spells it.
+pub fn conductor_withheld(expected_every_minutes: Option<i64>) -> ConductorHealth {
+    ConductorHealth {
+        withheld: Some(HEARTBEAT_WITHHELD.to_string()),
+        ..conductor_health(None, None, None, expected_every_minutes, None)
     }
 }
 
@@ -3005,9 +3115,11 @@ pub fn build_status_for(
         .count();
     // The depth is the parked lane's length only when the dock was read.
     // Unread, it is no number at all — see [`Reading`].
+    // (No handler withholds the dock — it is read within the caller's
+    // scope — but a withheld dock would be no number either.)
     let dock_depth = match dock_reading {
         Reading::Read => Some(dock.len()),
-        Reading::Unread => None,
+        Reading::Unread | Reading::Withheld => None,
     };
     let boarding = boarding_predicate(
         rules,
@@ -3059,12 +3171,14 @@ pub fn build_status_for(
 
 /// The compiled gate-concurrency fallback, mirrored here for the
 /// no-policy case. It equals `boss-cli`'s `DEFAULT_MAX_CONCURRENT` /
-/// `COMPILED_GATE_MAX_CONCURRENT` (4 since policy v3, backlog 366c2ed5,
-/// 2026-09-28): a page with no policy shows the
-/// same bound a gate obeys with an unreachable registry, and the pin
-/// `the_no_policy_capacity_matches_the_cli_compiled_fallback` names this
-/// if it ever drifts (CLAUDE.md §9a — the two live in different crates,
-/// so equality is the mechanism).
+/// `COMPILED_GATE_MAX_CONCURRENT` (4 since policy v5, backlog e6dc7331,
+/// 2026-09-30 — three under v4 while each gate's workspace, and its
+/// 160Gi request, sat on w-1's install disk; four under v3 before
+/// that): a page with no policy shows the
+/// same bound a gate obeys with an unreachable registry, and boss-cli's
+/// pin `the_yard_no_policy_capacity_equals_the_cli_compiled_bound` names
+/// this if it ever drifts (CLAUDE.md §9a — the two live in different
+/// crates, so equality is the mechanism).
 pub const COMPILED_GATE_MAX_CONCURRENT: i32 = 4;
 
 #[cfg(test)]

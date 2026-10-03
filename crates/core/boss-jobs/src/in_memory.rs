@@ -64,6 +64,9 @@ struct State {
     /// Packets whose own row read fails, set by
     /// [`InMemoryJobs::fail_job_read`].
     unreadable_jobs: BTreeSet<String>,
+    /// Kind/offset list reads that fail, set by
+    /// [`InMemoryJobs::fail_jobs_list`].
+    unreadable_job_pages: BTreeSet<(String, i64)>,
     /// Packets the next `get_job` does not see yet, set by
     /// [`InMemoryJobs::miss_next_job_read`].
     unseen_once: BTreeSet<String>,
@@ -166,6 +169,15 @@ impl InMemoryJobs {
     pub fn fail_job_read(&self, job_id: &JobId) {
         if let Ok(mut state) = self.inner.lock() {
             state.unreadable_jobs.insert(job_key(job_id));
+        }
+    }
+
+    /// Fail a named kind's list page with a storage error. A later
+    /// page can fail after a reader has already received rows; the
+    /// yard must refuse that partial cross-reference (d59c4a37).
+    pub fn fail_jobs_list(&self, kind: &str, offset: i64) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.unreadable_job_pages.insert((kind.into(), offset));
         }
     }
 
@@ -433,6 +445,13 @@ fn matches_filter(job: &Job, filter: &JobFilter) -> bool {
             }
         }
     }
+    // Live or terminal, ANDed with the window above: the SQL adapter
+    // spells the same line as `status IN ('closed','cancelled')`.
+    if let Some(terminal) = filter.terminal
+        && matches!(job.status, JobStatus::Closed | JobStatus::Cancelled) != terminal
+    {
+        return false;
+    }
     if let Some(priority) = filter.priority
         && job.priority != priority
     {
@@ -484,32 +503,7 @@ fn matches_filter(job: &Job, filter: &JobFilter) -> bool {
         // null.
         return false;
     }
-    match &filter.scope {
-        JobScope::All => {}
-        JobScope::None => return false,
-        JobScope::OwnerIs(u) => {
-            if &job.owner_id != u {
-                return false;
-            }
-        }
-        JobScope::OwnerIn(us) => {
-            if !us.contains(&job.owner_id) {
-                return false;
-            }
-        }
-        JobScope::AccountIn(ps) => {
-            // Same territory-scope shape as policy_glue::territory_matches
-            // (Wave 3): only Account/Employee subjects carry an id
-            // that maps into the account list; all others deny.
-            let kind = boss_core::primitives::Subject::kind(&job.subject);
-            let id = boss_core::primitives::Subject::id(&job.subject);
-            let matches = matches!(kind, "account" | "employee") && ps.iter().any(|p| p == id);
-            if !matches {
-                return false;
-            }
-        }
-    }
-    true
+    filter.scope.admits(job)
 }
 
 /// The ONE in-memory step insert, under a lock the caller holds:
@@ -1189,6 +1183,13 @@ impl JobsRepository for InMemoryJobs {
         offset: i64,
     ) -> Result<(Vec<Job>, i64), JobsError> {
         let state = self.inner.lock().expect("poisoned");
+        if let Some(kind) = &filter.kind
+            && state.unreadable_job_pages.contains(&(kind.clone(), offset))
+        {
+            return Err(JobsError::Storage(format!(
+                "{kind} list at offset {offset} unreadable (injected by fail_jobs_list)"
+            )));
+        }
         let mut jobs: Vec<&Job> = state
             .jobs
             .values()

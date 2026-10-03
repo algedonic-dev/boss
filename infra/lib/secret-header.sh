@@ -56,7 +56,17 @@
 # POSIX sh, because infra/ops/ops-runner.sh is `#!/bin/sh` (dash on the
 # hosts) and the other callers are bash: nothing here may be a bashism
 # (infra/lint/a-sh-script-parses-under-sh.sh). Every name it sets begins
-# `_secret_header_`, except the VAR you name.
+# `_secret_header_`, except the VAR you name and the two machine-token
+# functions at the end of this file.
+#
+# THE MACHINE TOKEN (design 6805c764 car 4; backlog 1876bbdb INFO-6 and
+# INFO-7). Every shell sender of the estate machine token takes it here:
+#
+#   machine_token_header MT_HDR "$BASE"
+#   curl -fsS ${MT_HDR:+-H "$MT_HDR"} "$BASE/api/…"
+#
+# See machine_token_header below for where it reads the token and which
+# hosts it stamps.
 
 # Sourced twice (a lib that sources this, inside a script that did too),
 # the second source must not forget the directory the first one opened.
@@ -164,4 +174,194 @@ secret_header() {
         return 1
     }
     eval "$1=\"@\$_secret_header_dir/\$1\""
+}
+
+# ---------------------------------------------------------------------
+# machine_token_header VAR URL [LIST] — the estate machine token's header
+# for a request to URL, handed over as secret_header does (VAR is
+# `@<0600 file>`), or VAR empty when this request carries none.
+#
+# WHERE THE TOKEN IS READ. The `current` file of the directory the
+# `boss-machine-token` Secret is mounted at: $BOSS_MACHINE_TOKEN_DIR,
+# default /etc/boss/machine-token — the one definition boss-core's
+# callers and every service's gate read (machine_token.rs TOKEN_DIR_ENV,
+# DEFAULT_TOKEN_DIR). Until car 4 every script here stamped the env var
+# BOSS_MACHINE_TOKEN, which a `secretKeyRef` fixed at process start and
+# which the mount replaces; it is NOT read any longer, because two
+# sources for one fact drift (design choice 2, CLAUDE.md §9a). And
+# infra/dev/boss-api read /etc/boss/machine-token as a FILE while core
+# reads it as this directory, so the day it was mounted every door write
+# would have gone out unstamped (backlog 1876bbdb, INFO-6).
+#
+# WHICH HOSTS. Loopback (localhost, ::1, a full 127.x.y.z quad), and the
+# hosts LIST names — commas or whitespace; an entry with a leading dot is
+# a suffix, `.boss.svc.cluster.local` = every Service in that one
+# namespace and no other. LIST is $BOSS_MACHINE_TOKEN_HOSTS when it is
+# SET (even empty); else the third argument, when given; else the
+# `BOSS_MACHINE_TOKEN_HOSTS=` line of the rendered sor.env
+# ($BOSS_SOR_ENV, default /etc/boss/sor.env) — the order boss-core's
+# `Hosts::from_env` takes, held equal to it on the rows of the table in
+# crates/core/boss-testing/tests/secret_header_sh.rs. Off those rows the
+# two can differ (a backslash before `@`, malformed IPv6, the short and
+# octal IPv4 spellings Url::parse expands); review ef2da426 F4 measured
+# each against where curl actually connects, and every difference either
+# withholds or stamps a host curl reaches as loopback. Until car 4 a
+# script sent the token to whatever $BASE held, so a hand run with
+# BOSS_JOBS_URL pointed at the public edge sent it there (INFO-7, the
+# shell half of 2ee29275 F1).
+#
+# NEVER A REFUSAL. No mount, an empty mount, or a blank slot is no token:
+# VAR is empty and nothing is said — every host is in that state until
+# the broker's first mint. A slot boss-core would refuse (the directory
+# is a file, `current` is not a regular file, is larger than 4096 bytes
+# — MAX_SLOT_BYTES — or holds a line break) and a host that is not the
+# estate's are both said on stderr and sent WITHOUT the token, exit 0:
+# a gate in `report` admits the request and tallies it, which is how a
+# missed caller is found (design 6805c764, the report phase). The only
+# non-zero return is secret_header's own: the header file could not be
+# written, and the caller decides what that stops.
+machine_token_header() {
+    case "${1:-}" in
+        '' | [0-9]* | *[!A-Za-z0-9_]*)
+            echo "machine_token_header: '${1:-}' is not a variable name" >&2
+            return 2
+            ;;
+    esac
+    eval "$1="
+    _secret_header_mt_dir="${BOSS_MACHINE_TOKEN_DIR:-/etc/boss/machine-token}"
+    _secret_header_mt_me="${0##*/}"
+    if [ -e "$_secret_header_mt_dir" ] && [ ! -d "$_secret_header_mt_dir" ]; then
+        echo "$_secret_header_mt_me: the machine token's mount $_secret_header_mt_dir is not a directory — the token is the \`current\` file of the mounted Secret (design 6805c764); this request goes out without it" >&2
+        return 0
+    fi
+    _secret_header_mt_slot="$_secret_header_mt_dir/current"
+    if [ ! -e "$_secret_header_mt_slot" ] && [ ! -L "$_secret_header_mt_slot" ]; then
+        return 0
+    fi
+    # -f is false for a FIFO, a device and a directory: never opened, so
+    # a FIFO at the path cannot hang the caller (core's review S7).
+    if [ ! -f "$_secret_header_mt_slot" ] || [ ! -r "$_secret_header_mt_slot" ]; then
+        echo "$_secret_header_mt_me: the machine token's slot $_secret_header_mt_slot is not a readable regular file; this request goes out without it" >&2
+        return 0
+    fi
+    _secret_header_mt_size=$(wc -c < "$_secret_header_mt_slot" | tr -d ' ') || _secret_header_mt_size=""
+    case "$_secret_header_mt_size" in
+        '' | *[!0-9]*)
+            echo "$_secret_header_mt_me: the machine token's slot $_secret_header_mt_slot could not be measured; this request goes out without it" >&2
+            return 0
+            ;;
+    esac
+    if [ "$_secret_header_mt_size" -gt 4096 ]; then
+        echo "$_secret_header_mt_me: the machine token's slot $_secret_header_mt_slot is larger than 4096 bytes, which is not a token; this request goes out without it" >&2
+        return 0
+    fi
+    _secret_header_mt_tok=$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$_secret_header_mt_slot") || _secret_header_mt_tok=""
+    # Leading and trailing blank lines, as core's trim drops them.
+    _secret_header_mt_tok=$(printf '%s\n' "$_secret_header_mt_tok" | sed -e '/./,$!d')
+    case "$_secret_header_mt_tok" in
+        '') return 0 ;;
+        *"
+"* | *"$(printf '\r')"*)
+            echo "$_secret_header_mt_me: the machine token's slot $_secret_header_mt_slot holds a line break, which no header can carry; this request goes out without it" >&2
+            _secret_header_mt_tok=""
+            return 0
+            ;;
+    esac
+    if [ -n "${BOSS_MACHINE_TOKEN_HOSTS+set}" ]; then
+        _secret_header_mt_list="$BOSS_MACHINE_TOKEN_HOSTS"
+    elif [ "$#" -ge 3 ]; then
+        _secret_header_mt_list="$3"
+    else
+        _secret_header_mt_list=$(sed -n 's/^BOSS_MACHINE_TOKEN_HOSTS=//p' "${BOSS_SOR_ENV:-/etc/boss/sor.env}" 2>/dev/null | sed -n '1p') || _secret_header_mt_list=""
+    fi
+    _secret_header_mt_host=$(machine_token_host "${2:-}")
+    if ! _secret_header_mt_allowed "$_secret_header_mt_host" "$_secret_header_mt_list"; then
+        # The scheme and host, never the path or query (a login's state
+        # rides there) and never the userinfo.
+        case "${2:-}" in
+            *://*) _secret_header_mt_scheme="${2%%://*}" ;;
+            *) _secret_header_mt_scheme="(no scheme)" ;;
+        esac
+        echo "$_secret_header_mt_me: machine token withheld from $_secret_header_mt_scheme://$_secret_header_mt_host — not loopback and not in BOSS_MACHINE_TOKEN_HOSTS, so this request goes out without it" >&2
+        _secret_header_mt_tok=""
+        return 0
+    fi
+    secret_header "$1" "x-boss-machine-token: $_secret_header_mt_tok"
+    _secret_header_mt_rc=$?
+    _secret_header_mt_tok=""
+    return "$_secret_header_mt_rc"
+}
+
+# machine_token_host URL — the host a request to URL goes to, as the
+# decision above reads it: lowercased, no port, no userinfo, no IPv6
+# brackets, one trailing dot dropped. The authority ends at the first
+# `/`, `?` or `#`, cut BEFORE the userinfo is, or `http://evil.com#@127.0.0.1`
+# reads as loopback while curl and boss-core both send it to evil.com
+# (review of 54d9a23a, MEDIUM-2). Printed without a newline.
+machine_token_host() {
+    _secret_header_h="${1#*://}"
+    _secret_header_h="${_secret_header_h%%[/?#]*}"
+    _secret_header_h="${_secret_header_h##*@}"
+    case "$_secret_header_h" in
+        \[*)
+            _secret_header_h="${_secret_header_h#\[}"
+            _secret_header_h="${_secret_header_h%%\]*}"
+            ;;
+        *) _secret_header_h="${_secret_header_h%%:*}" ;;
+    esac
+    _secret_header_h="${_secret_header_h%.}"
+    printf '%s' "$_secret_header_h" | tr '[:upper:]' '[:lower:]'
+}
+
+# _secret_header_octet N — 0-255 with no leading zero, what Rust's
+# Ipv4Addr parses. A looser pattern stamped 127.0.0.999, which
+# Url::parse refuses and curl hands to DNS (delta review of ddfa1032, N1).
+_secret_header_octet() {
+    case "$1" in
+        [0-9] | [1-9][0-9] | 1[0-9][0-9] | 2[0-4][0-9] | 25[0-5]) return 0 ;;
+    esac
+    return 1
+}
+
+# _secret_header_mt_allowed HOST LIST — may a request to HOST carry the
+# token? The rule of machine_token_header's header.
+_secret_header_mt_allowed() {
+    [ -n "$1" ] || return 1
+    case "$1" in
+        localhost | ::1) return 0 ;;
+        *.*.*.*.*) ;;
+        127.*.*.*)
+            _secret_header_q="${1#127.}"
+            _secret_header_q1="${_secret_header_q%%.*}"
+            _secret_header_q="${_secret_header_q#*.}"
+            _secret_header_q2="${_secret_header_q%%.*}"
+            _secret_header_q3="${_secret_header_q#*.}"
+            if _secret_header_octet "$_secret_header_q1" \
+                && _secret_header_octet "$_secret_header_q2" \
+                && _secret_header_octet "$_secret_header_q3"; then
+                return 0
+            fi
+            ;;
+    esac
+    _secret_header_hit=1
+    _secret_header_flags="$-"
+    set -f
+    # Split on the space the `tr` below leaves, whatever IFS the caller
+    # set for itself (review ef2da426 F8: a comma or newline IFS read a
+    # two-host list as one word and withheld every host). POSIX has no
+    # `local`, so the caller's IFS — set, empty or unset — is put back.
+    if [ -n "${IFS+set}" ]; then _secret_header_ifs="$IFS"; else _secret_header_ifs="(unset)"; fi
+    IFS=' '
+    _secret_header_words=$(printf '%s' "$2" | tr ',\n\t' '   ')
+    for _secret_header_l in $_secret_header_words; do
+        _secret_header_l=$(printf '%s' "${_secret_header_l%.}" | tr '[:upper:]' '[:lower:]')
+        case "$_secret_header_l" in
+            '') ;;
+            .*) case "$1" in *"$_secret_header_l") _secret_header_hit=0 ;; esac ;;
+            *) if [ "$_secret_header_l" = "$1" ]; then _secret_header_hit=0; fi ;;
+        esac
+    done
+    if [ "$_secret_header_ifs" = "(unset)" ]; then unset IFS; else IFS="$_secret_header_ifs"; fi
+    case "$_secret_header_flags" in *f*) ;; *) set +f ;; esac
+    return "$_secret_header_hit"
 }

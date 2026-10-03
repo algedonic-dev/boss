@@ -25,6 +25,7 @@ const schedule = (over: Partial<ScheduleRead> = {}): ScheduleRead => ({
     { name: 'monthly-close', next_due: null, next_due_why: 'business calendar `us-banking` could not be read (x)' },
   ],
   schedule_error: null,
+  withheld: false,
   ...over,
 });
 
@@ -54,6 +55,7 @@ describe('parseDispatcherSchedule', () => {
       now: NOW,
       schedule: [{ name: 'cadence-silence-sweep-daily', next_due: '2026-09-27T15:00:00Z', next_due_why: null }],
       schedule_error: null,
+      withheld: false,
     });
   });
 
@@ -61,6 +63,9 @@ describe('parseDispatcherSchedule', () => {
     const read = parseDispatcherSchedule({ now: NOW, schedule: null, schedule_error: 'withheld: scope' });
     expect(read.schedule).toBeNull();
     expect(read.schedule_error).toBe('withheld: scope');
+    // The flag is read off the wire, never off the reason (1805bac0).
+    expect(read.withheld).toBe(false);
+    expect(parseDispatcherSchedule({ now: NOW, schedule: null, schedule_error: 'x', withheld: true }).withheld).toBe(true);
   });
 
   test('a body without the schedule key is a wrong server, not an empty schedule', () => {
@@ -89,6 +94,21 @@ describe('nextDue', () => {
       text: 'unknown',
       why: 'withheld',
     });
+  });
+
+  // Backlog bd506215: the server's refusal by scope (d0058c92) is said
+  // as the scope; a policy service that could not answer stays unknown.
+  // Since 1805bac0 the dispatcher's `withheld` flag says which.
+  test('a schedule withheld by policy scope says so, never unknown', () => {
+    const why = "this caller's policy scope does not read every packet, and the schedule is not scoped by packet, so it is withheld from it";
+    expect(nextDue('cadence-silence-sweep-daily', schedule({ schedule: null, schedule_error: why, withheld: true }))).toEqual({
+      text: 'not in your policy scope',
+      why,
+    });
+    const failed = 'policy check failed, so the schedule is withheld until policy can answer';
+    expect(nextDue('cadence-silence-sweep-daily', schedule({ schedule: null, schedule_error: failed })).text).toBe('unknown');
+    // The refusal's words without the flag decide nothing (CLAUDE.md 9a).
+    expect(nextDue('cadence-silence-sweep-daily', schedule({ schedule: null, schedule_error: why })).text).toBe('unknown');
   });
 
   test('a rule the schedule does not list says so', () => {

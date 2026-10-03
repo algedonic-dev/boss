@@ -72,7 +72,7 @@ async function install(page: Page, deptJobs: (r: Route) => Promise<void>): Promi
   return urls;
 }
 
-test('mount reads the finance department once and draws In / Working / Out, naming where each waits', async ({ page }) => {
+test('mount reads the finance live packets and departures once each and draws In / Working / Out, naming where each waits', async ({ page }) => {
   const urls = await install(page, (r) => json(r, { data: JOBS, total: JOBS.length }));
   await mountPage(page, PATH);
 
@@ -93,9 +93,16 @@ test('mount reads the finance department once and draws In / Working / Out, nami
     'href', `/ux/jobs/${PAYOUT.id}`,
   );
 
-  expect(await settledReads(page, () => urls.length, 1)).toBe(1);
-  const q = new URL(urls[0]!).searchParams;
-  expect([q.get('department'), q.get('closed_within'), q.get('limit')]).toEqual(['finance', '30', '200']);
+  // Two reads, live and departed, each its own page (backlog a22311a1).
+  expect(await settledReads(page, () => urls.length, 2)).toBe(2);
+  const reads = urls
+    .map((u) => new URL(u).searchParams)
+    .map((q) => [q.get('department'), q.get('terminal'), q.get('closed_within'), q.get('limit')])
+    .sort();
+  expect(reads).toEqual([
+    ['finance', 'false', null, '500'],
+    ['finance', 'true', '30', '100'],
+  ]);
 });
 
 // ---------------------------------------------------------------------
@@ -168,7 +175,7 @@ test('the packets stand under every tab, and a tab click does not re-read them',
 
   await page.getByRole('tab', { name: 'Invoices', exact: true }).click();
   await expect(panel(page).locator('h3')).toHaveText(['In (1)', 'Working (1)', 'Out (1)']);
-  expect(await settledReads(page, () => urls.length, 1)).toBe(1);
+  expect(await settledReads(page, () => urls.length, 2)).toBe(2);
 });
 
 test('a department with no packets says so, and is not a failure', async ({ page }) => {
@@ -179,6 +186,30 @@ test('a department with no packets says so, and is not a failure', async ({ page
   );
   await expect(panel(page).locator('table')).toHaveCount(0);
   await expect(panel(page).locator(FAILURE_MARKER)).toHaveCount(0);
+});
+
+// Backlog a22311a1: the live packets and the window's departures were one
+// page of 200, newest first, so a department closing ~1,230 packets a day
+// (IT, once its 61 kinds are published) would fill the page with four hours
+// of departures and its open work would fall off it. Two reads now: a full
+// page of departures stands beside the live work, and each read that is
+// short of its total says so by name.
+test('a flood of departures cannot push the live work off the page, and each short read says so', async ({ page }) => {
+  const flood = Array.from({ length: 100 }, (_, i) =>
+    job(`d${String(i).padStart(7, '0')}-0000-0000-0000-000000000000`, 'receive-a-payout', `Chore ${i}`, 'closed',
+      [{ title: 'Post the payout', status: 'completed' }], '2026-09-30'));
+  await install(page, (r) => {
+    const live = new URL(r.request().url()).searchParams.get('terminal') === 'false';
+    return live
+      ? json(r, { data: [PAYOUT, JOBS[1]], total: 2 })
+      : json(r, { data: flood, total: 8_600 });
+  });
+  await mountPage(page, PATH);
+
+  await expect(panel(page).locator('h3')).toHaveText(['In (1)', 'Working (1)', 'Out (100)']);
+  await expect(panel(page).locator('p.truncated')).toHaveText([
+    'Showing 100 of 8600 departures (Out) — that read is one page; its thirds below are of the page, not of the department.',
+  ]);
 });
 
 test('a failed department read is said, and the statements still render', async ({ page }) => {

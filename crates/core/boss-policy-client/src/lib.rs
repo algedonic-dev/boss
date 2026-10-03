@@ -24,16 +24,20 @@
 //! empty page (backlog 45553536). Only decisions the service made are
 //! cached.
 
+pub mod controls;
 pub mod coverage;
 pub mod defaults;
 pub mod engine;
 pub mod in_memory;
 pub mod port;
 pub mod predicates;
+pub mod role_reader;
+pub mod role_reporting;
 pub mod seed_loader;
 pub mod types;
 pub mod writes;
 
+pub use controls::Pair;
 pub use engine::PolicyEngine;
 pub use in_memory::InMemoryPolicy;
 pub use port::{PolicyError, PolicyRepository, ReconcileStats};
@@ -201,6 +205,23 @@ pub trait PolicyClient: Send + Sync {
         user: &User,
         resource: Resource,
     ) -> Result<Predicate, PolicyClientError>;
+
+    /// Ask for a declared control — how every door asks for a static
+    /// pair (design 1c4e42e1 decision 8, backlog 47aed706). The const is
+    /// the declaration coverage reads ([`controls::CONTROLS`]), so a door
+    /// asking through one cannot ask for a pair the coverage read does
+    /// not know. [`Self::check`] stays for a resource only data names
+    /// (`step-signoff:<role>`, `job:<kind>`, a View's source).
+    async fn ask(&self, user: &User, control: Pair) -> Result<Decision, PolicyClientError> {
+        self.check(user, control.action(), control.resource()).await
+    }
+
+    /// The read-scope predicate for a declared Read control — a list
+    /// door's [`Self::ask`]. [`Self::scope_predicate`] is always a Read,
+    /// so only a `READ_*` const belongs here.
+    async fn scope_of(&self, user: &User, control: Pair) -> Result<Predicate, PolicyClientError> {
+        self.scope_predicate(user, control.resource()).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -448,8 +469,9 @@ impl ReqwestPolicyClient {
         )
     }
 
-    /// `with_timeout` stamping from a given source (the tests' own).
-    fn with_source(
+    /// `with_timeout` stamping from an explicit source. Composed HTTP
+    /// adapter tests supply their own source instead of reading credentials.
+    pub fn with_source(
         service: &str,
         base_url: impl Into<String>,
         timeout: std::time::Duration,

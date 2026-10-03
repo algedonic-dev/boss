@@ -24,6 +24,7 @@ pub mod postgres;
 #[cfg(feature = "postgres")]
 pub mod rebuild;
 pub mod types;
+pub mod validate;
 
 pub use in_memory::InMemoryKb;
 pub use port::{KbError, KbRepository};

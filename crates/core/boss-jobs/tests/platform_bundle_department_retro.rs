@@ -197,3 +197,61 @@ fn the_it_retro_collects_ranks_and_files_the_agent_work_profile() {
         "gaps files the top of the ranking"
     );
 }
+
+/// THE COLLECT PROCEDURE IS TRUE, AND BOUNDED, FOR A DEPARTMENT OF MANY
+/// KINDS (backlog a22311a1). Once 61 platform workflows declare `it`,
+/// the v6 procedure was false and too costly for the IT retro that
+/// opens every Monday: it said ops-requests belong to no department
+/// (`ops-request` is one of the 61), asked for a terminal-report for
+/// EACH kind the readiness read named (61 reads), and paged every
+/// packet closed in the window (~8,600 a week) — inside one $2
+/// analyst run. Collect now takes its per-kind counts from ONE
+/// readiness read with a window, reads totals rather than pages, and
+/// samples a terminal report or a page only where a number surprises.
+#[test]
+fn the_collect_procedure_reads_counts_once_and_samples_only_surprises() {
+    let wf = bundled("department-retro");
+    let collect = wf
+        .steps
+        .iter()
+        .find(|s| s.title == "collect")
+        .expect("a collect step");
+    let procedure = collect.metadata_defaults["procedure"]
+        .as_str()
+        .expect("collect carries a procedure");
+
+    // One read answers every kind's counts for the window.
+    assert!(
+        procedure.contains("/api/departments/{department}/readiness?since="),
+        "collect asks readiness for the window's per-kind counts"
+    );
+    // The departures and the live are counted apart, as totals.
+    assert!(
+        procedure.contains("terminal=true") && procedure.contains("terminal=false"),
+        "collect reads the departed and the live as two totals"
+    );
+    assert!(
+        procedure.contains("limit=1"),
+        "a total is read off a one-row page, not by paging"
+    );
+
+    // The three false or unbounded instructions are gone.
+    for gone in [
+        "terminal-report for each kind",
+        "page with offset= before counting",
+        "NOT attributable to a department",
+        "status=open&limit=500",
+        "closed_within=<days>&limit=500",
+    ] {
+        assert!(
+            !procedure.contains(gone),
+            "collect still says `{gone}`: {procedure}"
+        );
+    }
+    // Ops-requests are counted where their workflow row puts them —
+    // by the readiness read, never by a read of their own.
+    assert!(
+        procedure.contains("ops-request"),
+        "collect says where ops-requests are counted"
+    );
+}

@@ -1,0 +1,86 @@
+-- 20261001183105-codex-and-gemini-are-priced-at-their-published-rates.sql
+-- — one rate-card row per model the Codex and Gemini CLIs are pinned to
+-- on the dev pod, so the agents that run them can be registered at all.
+--
+-- WHAT WAS MEASURED (backlog 5840c068, David 2026-10-01; run 3f46595c).
+-- agents.default_model is TEXT NOT NULL REFERENCES agent_rate_card
+-- (model) (20260915212644), and GET /api/agent-rate-card held only
+-- Claude models, so a row for agent-codex or agent-gemini could not be
+-- inserted: a default that cannot be priced cannot be registered. The
+-- declarations themselves are infra/dev/cli/agents.json, which the
+-- operator POSTs to /api/agents/batch?mode=insert-if-absent after this
+-- lands.
+--
+-- WHICH MODEL, AND WHY THAT ONE. Each CLI is pinned to ONE named model
+-- in its versioned config (infra/dev/cli/codex-config.toml `model`,
+-- gemini-settings.json `model.name`), so the row below prices what
+-- actually runs; a test holds each config equal to its agent's
+-- default_model (boss-jobs the_cli_agents_are_registrable_and_priced).
+-- Both were read off the INSTALLED packages, 2026-10-01:
+--
+--   gpt-6.1-sol     codex-cli 0.159.3's bundled model catalog (in the
+--                   binary, models-manager): priority 1, visibility
+--                   "list", supported_in_api, "Latest workhorse model
+--                   for coding and everyday work", no upgrade target.
+--                   Listed without qualification on OpenAI's pricing
+--                   page, read the same day.
+--   gemini-2.5-pro  gemini-cli 0.62.0's DEFAULT_GEMINI_MODEL
+--                   (packages/core/src/config/models.ts in the bundle),
+--                   the one Pro model that is not a preview: 3-pro and
+--                   3.1-pro are both `-preview`. It is also the one name
+--                   resolveModel() passes through untouched — a pinned
+--                   flash name (3.5-flash, 3-flash) is REMAPPED by the
+--                   CLI to 3.8-flash or 3-flash depending on the
+--                   account's access, so pinning one would not state
+--                   what runs. The pricing page prices it under that
+--                   bare id, with no preview label.
+--
+-- WHERE THE NUMBERS CAME FROM, each read 2026-10-01 by the builder of
+-- this car (agent-run 2dbc853b) from the raw page, not from memory:
+--
+--   https://developers.openai.com/api/docs/pricing (where
+--   platform.openai.com/docs/pricing 301s), Standard tier, "Short
+--   context" columns, per 1M tokens:
+--     gpt-6.1-sol  input $2.00 / cached input $0.10 /
+--                  cache writes $2.50 / output $10.00
+--
+--   https://ai.google.dev/gemini-api/docs/pricing ("Last updated
+--   2026-10-01 UTC"), Gemini 2.5 Pro, Paid Tier, per 1M tokens:
+--     input $1.25 (prompts <= 200k) / output $10.00 (incl. thinking,
+--     prompts <= 200k) / context caching $0.125 (prompts <= 200k)
+--
+-- TWO THINGS THE CARD CANNOT SAY, stated so nobody reads them as said:
+--
+--   * Both pages price by prompt size: gpt-6.1-sol doubles its input
+--     past 272K tokens ($4.00 / $0.20 / $5.00 / $15.00) and Gemini 2.5
+--     Pro past 200k ($2.50 / $15.00 / $0.25). A row has one rate, so it
+--     carries the SHORT-context one, and a run whose prompts cross the
+--     line is priced at a floor — the same treatment the card already
+--     gives a 1-hour Claude cache write. Codex's catalog gives
+--     gpt-6.1-sol a 272,000-token default context window, so a Codex
+--     session left at its default does not cross it.
+--
+--   * Gemini publishes NO cache-write price. Its caching page
+--     (https://ai.google.dev/gemini-api/docs/caching, read the same
+--     day) describes implicit caching as on by default for Gemini 2.5
+--     and newer with nothing to enable, and passes on savings only for
+--     tokens that HIT a cache; a token that does not hit is billed as
+--     ordinary input. So a token a run counts as written to the cache
+--     is priced at the input rate. Leaving the column NULL instead would
+--     leave every metered Gemini run unpriced (price_run needs all four
+--     rates), which would hide its whole cost in exactly the comparison
+--     against Claude these agents exist for. Explicit caching's hourly
+--     storage fee ($4.50 / 1M tokens / hour) has no column, and the CLI
+--     does not create explicit caches.
+--
+-- No blend is declared (20260924001627 retired the blend), so a
+-- total-only run on either model stays unpriced.
+--
+-- boss_jobs::agent_spec::known_models reads this file beside the seed
+-- and Opus 5.5's, so a Workflow agent block may name either model;
+-- every_rate_card_insert_in_the_schema_directory_is_known pins that.
+
+INSERT INTO agent_rate_card (model, input_usd_micros_per_mtok, output_usd_micros_per_mtok, cache_read_usd_micros_per_mtok, cache_write_usd_micros_per_mtok, note) VALUES
+  ('gpt-6.1-sol',     2000000, 10000000, 100000, 2500000, 'OpenAI GPT-6.1-Sol (the Codex CLI''s pinned model) — $2.00 in / $10.00 out / $0.10 cached input / $2.50 cache writes per MTok, Standard tier, short context (<=272K); long context priced at this floor (developers.openai.com/api/docs/pricing, read 2026-10-01; backlog 5840c068)'),
+  ('gemini-2.5-pro',  1250000, 10000000, 125000, 1250000, 'Google Gemini 2.5 Pro (the Gemini CLI''s pinned model) — $1.25 in / $10.00 out / $0.125 context caching per MTok, Paid Tier, prompts <=200k; no cache-write price is published, a non-hit token is input, so writes are at the input rate (ai.google.dev/gemini-api/docs/pricing, read 2026-10-01; backlog 5840c068)')
+ON CONFLICT (model) DO NOTHING;

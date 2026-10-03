@@ -1022,3 +1022,111 @@ async fn the_rule_check_is_the_tables_check() {
         disagree.join("\n")
     );
 }
+
+// ----- two overlapping publishes (Postgres only) ---------------------------
+
+/// Sessions of this database currently waiting on a lock.
+async fn lock_waiters(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity
+         WHERE datname = current_database() AND wait_event_type = 'Lock'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read pg_stat_activity")
+}
+
+/// Wait until `n` sessions wait on a lock, or `racer` has finished —
+/// which it does at once when it takes no lock at all, and then the
+/// assertions after the release say so rather than a timeout.
+async fn until_waiting<T>(pool: &sqlx::PgPool, n: i64, racer: &tokio::task::JoinHandle<T>) {
+    for _ in 0..500 {
+        if lock_waiters(pool).await >= n || racer.is_finished() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("{n} session(s) never reached a lock and the racer never finished");
+}
+
+/// AN OVERTAKEN OLDER PUBLISH IS REFUSED, NOT LANDED OVER THE NEWER ONE
+/// (backlog 4541d511). The newer publish's `v5` is held before its
+/// commit — a third transaction owns an uncommitted row at the
+/// (name, version) key its insert writes, so the insert waits — and the
+/// older publish, declared `v4` against the live `v3`, is observed
+/// WAITING before the hold is released. Let through, it must read the
+/// `v5` that committed ahead of it and answer the 409.
+///
+/// The shape this adapter had, `MAX(version)` over rows locked
+/// `FOR UPDATE` in ONE statement, waited on `v3`'s row lock and then
+/// re-read `v3` alone: `v5` was inserted after that statement's
+/// snapshot, so it answered `3`, the older publish passed its floor and
+/// retired the committed `v5` — a silent downgrade of the train's
+/// schedule. The floor is now `declared_version::lock_and_read_newest`,
+/// the step-plugin registry's: an advisory lock on the lineage, then
+/// the read in a statement that starts after it is held
+/// (`pg_an_older_seed_waiting_on_a_newer_one_is_refused` there).
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_an_older_publish_waiting_on_a_newer_one_is_refused() {
+    let db = boss_testing::TestDb::new().await;
+    let repo = PgCadence::new(db.pool.clone());
+    let name = "suite-concurrent";
+    repo.publish_declared(declared(wall(name, 10), 3), &actor(), at(6, 0))
+        .await
+        .expect("v3 is live");
+
+    let mut hold = db.pool.begin().await.expect("hold tx");
+    sqlx::query(
+        "INSERT INTO cadence_rules (name, version, status, verb, basis, every_minutes)
+         VALUES ($1, 5, 'draft', 'reconcile', 'wall', 10)",
+    )
+    .bind(name)
+    .execute(&mut *hold)
+    .await
+    .expect("hold the newer publish's key");
+
+    let newer_repo = PgCadence::new(db.pool.clone());
+    let newer = tokio::spawn(async move {
+        newer_repo
+            .publish_declared(declared(wall(name, 5), 5), &actor(), at(7, 0))
+            .await
+    });
+    until_waiting(&db.pool, 1, &newer).await;
+    assert!(
+        !newer.is_finished(),
+        "case error: the newer publish must be held before its commit"
+    );
+
+    let older_repo = PgCadence::new(db.pool.clone());
+    let older = tokio::spawn(async move {
+        older_repo
+            .publish_declared(declared(wall(name, 4), 4), &actor(), at(8, 0))
+            .await
+    });
+    until_waiting(&db.pool, 2, &older).await;
+
+    hold.rollback().await.expect("release the newer publish");
+    newer
+        .await
+        .expect("newer task")
+        .expect("the newer publish lands");
+    match older.await.expect("older task") {
+        Err(CadenceError::Conflict(msg)) => assert!(
+            msg.contains("(v5)"),
+            "the refusal names the version that overtook it: {msg}"
+        ),
+        other => panic!("the older publish must be refused behind the newer, got {other:?}"),
+    }
+    let versions: Vec<(i32, WorkflowStatus)> = repo
+        .live_versions(name)
+        .await
+        .expect("live_versions")
+        .into_iter()
+        .map(|s| (s.version, s.status))
+        .collect();
+    assert_eq!(
+        versions,
+        vec![(3, WorkflowStatus::Retired), (5, WorkflowStatus::Active)],
+        "the newer publish's row stays live"
+    );
+}

@@ -149,7 +149,7 @@ RUN --mount=type=cache,id=boss-cargo-target,target=/build/target \
     # gateway 502s on /api/accounts and the brewery data-seed can't
     # land accounts/vendors.
     cargo build --release -p boss-accounts --bin boss-accounts-api --features accounts-api && \
-    cargo build --release -p boss-events --bin boss-events-api --features events-api && \
+    cargo build --release -p boss-events-api --bin boss-events-api --features events-api && \
     mkdir -p /out && \
     # Copy every workspace binary to /out — the runtime stage's COPY
     # source. Strict mode (set -e) means the build fails if the
@@ -259,6 +259,18 @@ FROM debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf8
 # The lesson both entries share: a component moved into this image
 # loses every host tool it never declared, and it discovers which ones
 # only when it next needs them.
+#
+# openssh-client: the break-glass deposit CronJob (backlog 7336cb5f,
+# infra/cluster/manifests/boss-break-glass-deposit.yaml) ships the
+# scoped kubeconfig to boss-gcp over a forced-command key, as uid 1500.
+# Design b08725c2 Q3 asked for ONE image carrying kubectl and an ssh
+# client with no package install at run time — boss-backup's `apk add`
+# is a root-only step — and this image already carries kubectl. The
+# alternative, alpine/k8s, was measured on 2026-09-30: uid 0, no ssh.
+# It installs /usr/lib/openssh/ssh-keysign setuid root (4755, measured
+# on the dev pod), in the image deploy/boss runs too; the deposit never
+# signs with a HOST key, so the bit is cleared in this same layer and no
+# layer of the image carries it (review b6d2a716 of 7336cb5f, N5).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
@@ -270,6 +282,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     git \
     python3 \
+    openssh-client \
+    && chmod u-s /usr/lib/openssh/ssh-keysign \
     && rm -rf /var/lib/apt/lists/*
 
 # BOSS runs as a non-root user. UID 1500 matches the systemd-deploy
@@ -401,6 +415,7 @@ COPY infra/oss-quickstart/tenant-modules.sh /usr/local/bin/tenant-modules.sh
 # crates/core/boss-testing/tests/a_chore_records_ok_and_failed.rs pins
 # the pairing; the gate never builds the image.
 COPY infra/boss-maintenance-wrap.sh infra/boss-step.sh infra/boss-api-curl.sh infra/boss-chore.sh /usr/local/bin/
+COPY infra/boss-filesystem-sample.sh /usr/local/bin/
 # boss-api-curl.sh sources the one roll wait from lib/ beside itself and
 # refuses without it (backlog c51967b5);
 # crates/core/boss-testing/tests/a_chore_write_is_sent_once.rs pins it.
@@ -410,6 +425,12 @@ COPY infra/lib/curl-through-a-roll.sh /usr/local/bin/lib/curl-through-a-roll.sh
 # them, and refuse without it (backlog 5f3ad356);
 # crates/core/boss-testing/tests/secret_header_sh.rs pins this line.
 COPY infra/lib/secret-header.sh /usr/local/bin/lib/secret-header.sh
+COPY infra/lib/jq.sh /usr/local/bin/lib/jq.sh
+# The break-glass deposit CronJob's one script (backlog 7336cb5f): it
+# runs as the manifest's `command`, so the name here is the name there;
+# crates/core/boss-testing/tests/break_glass_deposit_sh.rs pins the two
+# equal, because the gate never builds the image.
+COPY infra/cluster/break-glass-deposit.sh /usr/local/bin/boss-break-glass-deposit
 # The platform's conservation-invariant sweep and the helper it sources,
 # for the hourly boss-conservation-invariants CronJob (H12, backlog
 # 236529aa) — the brewery's own sweep rides in with `COPY examples`

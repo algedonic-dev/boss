@@ -32,7 +32,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "Every 90 days, confirm the printed recovery sheet still exists where it is kept (design 125d405d Q2). Filed by the daily recovery-sheet check, naming the version the record says is on paper and the print job that signed for it. The platform owner finds the paper and approves `confirm` with a passkey; a rejection closes it `missing`, and the next daily check files a reprint."
-metadata = { owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "due"

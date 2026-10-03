@@ -671,21 +671,38 @@ fn session_end_completes_active_as_clean_through_boss_api() {
         calls[0].0,
         ["GET".to_string(), format!("/api/jobs/{SESSION}")]
     );
-    assert_eq!(calls[1].0[0], "PUT");
+    // Two writes, the key through the step merge door and then the
+    // status alone (backlog e39a9d2a, Stage 2): the step PUT used to
+    // carry the step's whole read metadata back beside `ended`.
     assert_eq!(
-        calls[1].0[1],
-        format!("/api/jobs/{SESSION}/steps/st-active")
+        calls[1].0[..2],
+        [
+            "PATCH".to_string(),
+            format!("/api/jobs/{SESSION}/steps/st-active/metadata")
+        ]
     );
-    let body: serde_json::Value = serde_json::from_str(&calls[1].1).expect("PUT body is JSON");
-    assert_eq!(body["status"], "completed");
-    assert_eq!(body["metadata"]["ended"], "clean");
+    let merged: serde_json::Value = serde_json::from_str(&calls[1].1).expect("merge body is JSON");
     assert_eq!(
-        body["metadata"]["authority_role"], "platform-admin",
-        "the step's own keys are kept"
+        merged,
+        serde_json::json!({"ended": "clean"}),
+        "only the hook's own key rides the merge door"
+    );
+    assert_eq!(
+        calls[2].0[..2],
+        [
+            "PUT".to_string(),
+            format!("/api/jobs/{SESSION}/steps/st-active")
+        ]
+    );
+    let body: serde_json::Value = serde_json::from_str(&calls[2].1).expect("PUT body is JSON");
+    assert_eq!(
+        body,
+        serde_json::json!({"status": "completed"}),
+        "the step PUT carries the status alone, never a metadata body"
     );
     let patch = calls
         .iter()
-        .find(|(a, _)| a[0] == "PATCH")
+        .find(|(a, _)| a[0] == "PATCH" && a[1] == format!("/api/jobs/{SESSION}/metadata"))
         .expect("ended_at is written");
     let md: serde_json::Value = serde_json::from_str(&patch.1).expect("PATCH body is JSON");
     assert_eq!(md["end_reason"], "prompt_input_exit");

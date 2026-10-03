@@ -1,0 +1,64 @@
+# The merge-publish-pr verb's answer reaches the publish step it was
+# filed for — on success AND on failure (backlog 602fe95f, 2026-09-30;
+# the shape of complete-publish-pr-step-on-publish-github-pr-answered,
+# two machine steps later).
+#
+# publish-to-github's `merge` step is a MACHINE step: the filing
+# rule (merge-publish-pr-on-merge-ready) spawns an ops-request for the
+# forge the moment the reading allows a merge, and the verb
+# (publish-github-pr.sh --merge) fast-forwards the mirror's main to the
+# approved snapshot as the GitHub App, reads main and the PR back, and
+# completes the step itself. Its last line is the answer:
+#
+#   publish-github-pr: merged https://github.com/algedonic-dev/boss/pull/250 — main reads <40-hex sha>
+#
+# This rule is the reader. The request carries `for_publish`, so
+# `jobs.complete_linked_step` follows that edge:
+#
+# - exit 0 and a `merged <url> — main reads <sha>` line: complete
+#   `merge` with `merged_sha` COPIED from the verb's own line. The verb
+#   prints that line only AFTER it has completed the step itself, so this
+#   leg finds the step done and writes nothing: it is a second writer of
+#   the same fact, never the only one. (Until backlog 16a9c5ae this said
+#   it was the record for the day the verb's own PUT fails after main
+#   has moved; that day the verb exits non-zero and prints no answer
+#   line, so only the failure leg below runs — review 01561b13 N5.)
+# - a non-zero exit — a check that is not green, an approval that no
+#   longer reads, main moved, a push GitHub refused, or a write after
+#   the push: `on_failure = "annotate-and-alert"` files an URGENT
+#   backlog-item naming the verb, the request and the verb's last FAILED
+#   or REFUSED line, then writes that line onto the still-open step as
+#   `failed`, with the exit as `failed_exit`. What happens next is the
+#   PROTOCOL's (publish-to-github's `merge-refused` terminal, a
+#   whitelist): exit 1 or 2 — given only after the verb READ main not at
+#   the snapshot, before any push — merged nothing, and the annotation
+#   closes the packet so the daily rule files tomorrow's publish, which
+#   supersedes this PR. Every other exit leaves it open and troubled: 3
+#   (main MOVED and the record did not follow; a merge-publish-pr
+#   request for it proves the merge again), 4 (main not read), and any
+#   exit the verb did not choose, such as the runner's timeout.
+#
+# The pattern is written without a backslash: the arg passes through
+# two string lexers (TOML, then boss-expr's), and boss-expr reads `\d`
+# as `d` (ops_judge.rs). `.` stands for the em dash in the answer line.
+[[rule]]
+name = "complete-publish-merge-step-on-merge-publish-pr-answered"
+why = """
+A CROSS-PROTOCOL REACTOR closing the loop merge-publish-pr-on-merge-
+ready opened: ops-request -> publish-to-github, which no single Workflow
+consequence can express — the request's protocol cannot know which
+publish asked, and the publish's cannot read another packet's execute
+step. The class it guards against was measured on the first machine
+step (f47861a5, 2026-09-19): an ops-request that closed `answered` on a
+FAILED verb and a publish step that sat ready for five hours with
+nothing on it. No authority widened: on success the only write is the
+step's own required field, copied from the verb's line; on failure the
+step is ANNOTATED, never completed, and the alert is a backlog-item at
+the platform owner's queue. Self-filters to this one verb.
+"""
+version = 1
+on_event = "jobs.job.closed"
+when = 'kind = "ops-request" AND outcome = "answered"'
+[[rule.do]]
+handler = "jobs.complete_linked_step"
+args = { verb = '"merge-publish-pr"', verdict_pattern = '"^publish-github-pr: merged (?P<pr_url>https://github[.]com/[^ ]+) . main reads (?P<merged_sha>[0-9a-f]+)$"', link = '"for_publish"', steps = '"merge"', done_metadata = '"{\"merged_sha\": \"{merged_sha}\", \"pr_url\": \"{pr_url}\"}"', evidence_key = '"merged_by"', on_failure = '"annotate-and-alert"' }

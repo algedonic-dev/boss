@@ -1,13 +1,8 @@
 # Nightly pg_dump of the cluster BOSS database — the system of
 # record gets backups on day one (David, 2026-08-12).
 #
-# Dump to a Longhorn PVC (14-day retention), then ship the fresh
-# dump offsite to the playground box via the kanidm backup-shipper
-# pattern: a deposit-only forced-command SSH key (secret
-# boss-backup-key) whose entire blast radius is 'can write files
-# into /var/backups/boss-cluster-pg on boss-gcp'. The receiver
-# (boss-cluster-pg-recv.sh there) stamps names server-side and
-# keeps the most recent 21. A failed ship fails the Job loudly —
+# Dump to a Longhorn PVC (14-day retention), then upload the fresh
+# dump offsite to a GCS bucket. A failed upload fails the Job loudly —
 # an offsite copy that silently stops is worse than none.
 #
 # The dump is plain SQL of the whole database. audit_log is the
@@ -16,24 +11,30 @@
 # restore path dumb, which is what you
 # want at 03:00.
 #
-# SECOND OFFSITE LEG — GCS (David, 2026-08-29, option (c)).
-# One offsite copy on one box means boss-gcp was both the backup
-# basket and a single point of loss: lose it and the dumps go with
-# it. The obvious fix — have boss-gcp push to GCS — is not available,
-# because that VM's access scopes grant devstorage.READ_ONLY and an
-# instance token cannot write to a bucket no matter what IAM says.
-# So the flow is REVERSED: the cluster, which has no such scope
-# ceiling, uploads directly with a service-account key. boss-gcp
-# keeps its copy and stops being the only one.
+# THE OFFSITE LEG — GCS (David, 2026-08-29, option (c)). The cluster,
+# not boss-gcp, uploads: that VM's access scopes grant
+# devstorage.READ_ONLY, and an instance token cannot write to a bucket
+# no matter what IAM says, while the cluster has no such ceiling and
+# uploads with a service-account key.
 #
-# Pins: no LAN door of its own; ships offsite to boss-gcp
-# (david@34.45.110.40, the playground box) with the deposit-only key
-# in secret boss-backup-key, and uploads to the bucket named in
-# secret boss-gcs-offsite (keys: sa.json, bucket). Secrets are
-# referenced by name only — they are created out-of-band and never
-# live in this tree. Until that secret exists the CronJob's upload
-# leg fails loudly, which is the intended state: a backup leg that
-# degrades quietly is the failure this whole file is written against.
+# THE ONLY OFFSITE LEG (David, 2026-10-01, backlog 4bf7bdd1: "boss-gcp
+# doesn't need to be storage backup"). Until then each dump was ALSO
+# shipped to boss-gcp over a deposit-only forced-command ssh key, into
+# a receiver that kept 21 there. That copy held dumps only (the
+# file-store archive rode GCS alone, so a restore from it brought back
+# rows without their files) and it filled boss-gcp's root — 9.5 GB of
+# a 47 GB disk, 16 GB free against its 17 GB floor (estate alarm
+# a9476cbf). The leg is deleted here; what it left on boss-gcp goes
+# through the bounded reclaim-gcp-root verb (bound 8), never by hand.
+# The recovery sheet's backups road names the bucket as THE offsite
+# copy and prints how to fetch a dump from it.
+#
+# Pins: no LAN door of its own; uploads to the bucket named in secret
+# boss-gcs-offsite (keys: sa.json, bucket). The Secret is referenced by
+# name only — it is created out-of-band and never lives in this tree.
+# Until it exists the CronJob's upload leg fails loudly, which is the
+# intended state: a backup leg that degrades quietly is the failure
+# this whole file is written against.
 #
 # THE FILE STORE (backlog 6280be03, 2026-09-23). file_refs keeps its
 # rows in Postgres and its BYTES on the boss-files claim (boss.yaml). A
@@ -48,14 +49,10 @@
 # boss-files-gc deletes bytes only when their last ref was soft-deleted
 # more than 30 days earlier (DEFAULT_GC_GRACE_DAYS). So the newest
 # archive holds every object any dump younger than 30 days points to —
-# and every dump either copy keeps (14 days here, 21 offsite) is. Each
+# and every dump either copy keeps (14 days here, 21 in the bucket) is. Each
 # archive is a FULL copy, so keeping 14 of them would fill this volume
 # long before the dumps did; three are kept on each side, enough to
 # survive a bad night.
-#
-# NOT on the boss-gcp leg: that receiver is a deposit-only forced
-# command that names what it receives as a SQL dump, so the archive
-# rides GCS only. A restore from boss-gcp alone gets rows without bytes.
 #
 # boss-files is ReadWriteOnce, so this pod runs beside deploy/boss (the
 # podAffinity below); a run while that pod is down waits until it is
@@ -143,16 +140,33 @@ spec:
                   # keeps the pile at one open Job per chore.
                   /usr/local/bin/boss-maintenance-wrap.sh maintenance-backup "Nightly backup" \
                     || echo "open-packet: the packet did not open (exit $?) — the backup runs anyway; only this run's visibility is lost" >&2
+                  bash /usr/local/bin/boss-filesystem-sample.sh maintenance-backup run boss-backups /backup start \
+                    || echo 'WARNING: mounted start sample was not recorded; filesystem health remains blind' >&2
                   exit 0
               env:
+                - name: BOSS_FS_NAMESPACE
+                  valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+                - name: BOSS_FS_POD_UID
+                  valueFrom: {fieldRef: {fieldPath: metadata.uid}}
+                - name: BOSS_FS_POD
+                  valueFrom: {fieldRef: {fieldPath: metadata.name}}
+                - name: BOSS_FS_NODE
+                  valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+                - name: BOSS_FS_JOB_UID
+                  valueFrom: {fieldRef: {fieldPath: "metadata.labels['batch.kubernetes.io/controller-uid']"}}
                 - name: BOSS_JOBS_URL
                   value: http://boss-jobs-internal.boss.svc.cluster.local:7900
-                - name: BOSS_MACHINE_TOKEN
-                  valueFrom:
-                    secretKeyRef:
-                      name: boss-secrets
-                      key: machine-token
-                      optional: true
+                # The hosts its packet writes may carry the estate machine
+                # token to, besides loopback: this namespace's Services, by
+                # suffix (backlog 2ee29275; the car-4 checklist on 2710c8fc
+                # — without it the token reaches boss-jobs-internal unstamped).
+                - name: BOSS_MACHINE_TOKEN_HOSTS
+                  value: ".boss.svc.cluster.local"
+              # The estate machine token, read by boss-maintenance-wrap.sh
+              # (design 6805c764 car 4).
+              volumeMounts:
+                - {name: backups, mountPath: /backup, readOnly: true}
+                - {name: machine-token, mountPath: /etc/boss/machine-token, readOnly: true}
             - name: dump
               image: 10.20.0.15:3000/david/postgres:16-alpine
               command: ["/bin/sh", "-c"]
@@ -184,14 +198,6 @@ spec:
                   echo "$OUT" > /backup/.latest
                   # Retention: 14 days. Prune loudly, never silently.
                   find /backup -name 'boss-*.sql.gz' -mtime +14 -print -delete
-                  # Offsite: ship tonight's dump to the playground box.
-                  # The key is deposit-only (forced command + restrict);
-                  # the receiver stamps the name and prunes its own set.
-                  apk add --no-cache openssh-client >/dev/null 2>&1
-                  install -m 600 /keys/id_ed25519 ${TMPDIR:-/tmp}/k
-                  cat "$OUT" | ssh -i ${TMPDIR:-/tmp}/k \
-                    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                    -o ConnectTimeout=20 david@34.45.110.40
                   echo "backups on volume:"; ls -lh /backup | tail -8
               env:
                 - name: DATABASE_URL
@@ -201,7 +207,6 @@ spec:
                       key: database-url
               volumeMounts:
                 - {name: backups, mountPath: /backup}
-                - {name: ship-key, mountPath: /keys, readOnly: true}
             # THE FILE STORE (see the header). After the dump, never
             # before: an object's bytes are written before its ref row
             # commits, so an archive taken after the dump holds every
@@ -240,7 +245,7 @@ spec:
               volumeMounts:
                 - {name: backups, mountPath: /backup}
                 - {name: file-store, mountPath: /var/lib/boss/files, readOnly: true}
-            # SECOND OFFSITE LEG. This was the Pod's one main container
+            # THE OFFSITE LEG. This was the Pod's one main container
             # until the packet wiring landed; it is an initContainer now
             # for one reason — so a container that runs AFTER it can
             # vouch for it. Its script, its image and its volumes are
@@ -264,9 +269,10 @@ spec:
                   test -s "$FOUT"
                   gcloud storage cp "$FOUT" "gs://${BUCKET}/$(basename "$FOUT")"
                   echo "uploaded $(basename "$FOUT") to gs://${BUCKET}"
-                  # prune PATTERN KEEP. Dumps keep 21, mirroring the
-                  # playground receiver, so the two offsite copies age out
-                  # together; file-store archives keep 3 (see the header).
+                  # prune PATTERN KEEP. Dumps keep 21 — three weeks, the
+                  # count the retired boss-gcp receiver kept, so the leg's
+                  # retirement shortened no history; file-store archives
+                  # keep 3 (see the header).
                   # Prune by NAME order, which is chronological because the
                   # stamp is %Y%m%d-%H%M%S — never by listing order.
                   prune() {
@@ -288,7 +294,7 @@ spec:
           # THE VERDICT, and the only main container. It runs if and
           # only if every initContainer above passed, so `result=ok` is
           # the Pod's own structure saying so rather than a claim this
-          # script makes. A dump that dies, a ship that dies, an upload
+          # script makes. A dump that dies, an archive that dies, an upload
           # that dies: the Pod stops there, this never runs, and the
           # packet stays OPEN — where the next successful run's wrap
           # reuses it (recovery) and the silence sweep can see it
@@ -298,7 +304,7 @@ spec:
           # AND IT NEVER FAILS THE JOB. The backup is finished and
           # verified by the time this runs. If the jobs API is dark, a
           # non-zero exit here would report a good backup as failed AND
-          # spend backoffLimit re-running the entire dump-and-ship for a
+          # spend backoffLimit re-running the entire dump-and-upload for a
           # lost HTTP call. So the close is best-effort and loud, like
           # the open.
           containers:
@@ -319,40 +325,52 @@ spec:
                   # The file-store archive paired with it (gcs only).
                   FOUT=$(cat /backup/.latest-files 2>/dev/null || true)
                   FILES=$(basename "${FOUT:-unknown}")
-                  echo "close-packet: $DUMP ($SIZE), offsite boss-gcp + gcs; $FILES to gcs"
+                  echo "close-packet: $DUMP ($SIZE), offsite gcs; $FILES to gcs"
+                  bash /usr/local/bin/boss-filesystem-sample.sh maintenance-backup run boss-backups /backup final \
+                    || echo 'WARNING: mounted final sample was not recorded; filesystem health remains blind' >&2
                   /usr/local/bin/boss-step.sh maintenance-backup run \
-                      result=ok dump="$DUMP" size="$SIZE" offsite="boss-gcp,gcs" files="$FILES" \
-                    || echo "close-packet: the packet did not close (exit $?) — the dump is written, verified and shipped; only this run's visibility is lost" >&2
+                      result=ok dump="$DUMP" size="$SIZE" offsite="gcs" files="$FILES" \
+                    || echo "close-packet: the packet did not close (exit $?) — the dump is written, verified and uploaded; only this run's visibility is lost" >&2
                   exit 0
               env:
+                - name: BOSS_FS_NAMESPACE
+                  valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+                - name: BOSS_FS_POD_UID
+                  valueFrom: {fieldRef: {fieldPath: metadata.uid}}
+                - name: BOSS_FS_POD
+                  valueFrom: {fieldRef: {fieldPath: metadata.name}}
+                - name: BOSS_FS_NODE
+                  valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+                - name: BOSS_FS_JOB_UID
+                  valueFrom: {fieldRef: {fieldPath: "metadata.labels['batch.kubernetes.io/controller-uid']"}}
                 - name: BOSS_JOBS_URL
                   value: http://boss-jobs-internal.boss.svc.cluster.local:7900
-                - name: BOSS_MACHINE_TOKEN
-                  valueFrom:
-                    secretKeyRef:
-                      name: boss-secrets
-                      key: machine-token
-                      optional: true
+                # The hosts its packet writes may carry the estate machine
+                # token to, besides loopback: this namespace's Services, by
+                # suffix (backlog 2ee29275; the car-4 checklist on 2710c8fc
+                # — without it the token reaches boss-jobs-internal unstamped).
+                - name: BOSS_MACHINE_TOKEN_HOSTS
+                  value: ".boss.svc.cluster.local"
               volumeMounts:
                 - {name: backups, mountPath: /backup, readOnly: true}
+                # The estate machine token, read by boss-step.sh.
+                - {name: machine-token, mountPath: /etc/boss/machine-token, readOnly: true}
           volumes:
+            # The estate machine token, Secret boss-machine-token, whole —
+            # the broker writes it (design 6805c764 car 4). Optional: until
+            # its first mint the directory is empty and the packet legs send
+            # no token, which every gate in `report` admits; a backup never
+            # waits on it. 0444: this pod sets no fsGroup.
+            - name: machine-token
+              secret: {secretName: boss-machine-token, optional: true, defaultMode: 0444}
             - name: backups
               persistentVolumeClaim: {claimName: boss-backups}
-            - name: ship-key
-              # 0o400, matching the GCS key below. It was 0o256, which
-              # kubectl confirms the API stored as decimal 174 — the
-              # octal was parsed correctly and the NUMBER was the
-              # problem: owner write-only, group read-execute, other
-              # read-write. The dump container reads this key to ship
-              # offsite and only ever succeeded because it runs as
-              # root, which ignores the bits. The moment anything gives
-              # this Pod runAsNonRoot — which the cluster's restricted
-              # profile already warns about elsewhere in this estate —
-              # an owner-unreadable key stops being readable and the
-              # offsite leg fails, loudly but as an SSH problem rather
-              # than as a file mode set months earlier (backlog
-              # a05835da).
-              secret: {secretName: boss-backup-key, defaultMode: 0o400}
+            # 0o400, root's alone: the upload leg reads it as root (the
+            # cloud-sdk image's default user). The moment anything gives
+            # this Pod runAsNonRoot, the key stops being readable and the
+            # upload fails — loudly, but as a gcloud auth problem rather
+            # than as a file mode (the trap backlog a05835da found on the
+            # retired boss-gcp leg's ship key).
             - name: gcs-key
               secret: {secretName: boss-gcs-offsite, defaultMode: 0o400}
             # The file_refs bytes (boss.yaml's boss-files claim), read-only

@@ -5,13 +5,17 @@
 # collapses the pair when the ready path already told the same person.
 [[rule]]
 name = "notify-assignee-on-step-assigned"
+version = 2
 why = """
 The other order of the same cross-domain fact: steps usually
 materialize ready and unassigned (backlog 534a8dc8), so the
 ASSIGNMENT is the moment there is somebody to tell. Same handler; the
 deterministic message id collapses the pair when the ready path
 already told the same person.
+Agents and automations read their queues, so assignment awareness
+skips them and their registered aliases (efd5a07d).
 """
 on_event = "step.assigned.*"
 [[rule.do]]
 handler = "messages.notify"
+args = { skip_machine_recipients = "true" }

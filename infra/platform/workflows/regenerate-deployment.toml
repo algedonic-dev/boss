@@ -5,7 +5,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "Drop a deployment's database and rebuild it: schema, seed, backfilled history, then live. The Subject is the deployment, so \"what regens has this box had, and why\" answers from Subject history. Two steps are gated on a person \u2014 declaring why it is happening, and the destructive reset itself \u2014 and the rest record what was done at each stage. Note the bootstrap gap: a deployment cannot run the Workflow that regenerates it, so the Job lives wherever the operator is."
-metadata = { owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "requested"

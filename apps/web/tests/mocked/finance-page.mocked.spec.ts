@@ -25,7 +25,6 @@
 //             was folded into it)
 //   b7263ac5  the nightly ledger recognize / replay runs declare no department, so the
 //             page's department panel cannot show them
-//   e0b754d3  a ledger entry sourced from a packet renders "jobs · <id>", not a link
 //   e536e91a  Lock and Unlock are one confirm and one POST: no protocol, no reason recorded
 //   c8b71886  the Tax liability tab describes the brewery simulator's generator and
 //             hard-codes the account descriptions
@@ -160,7 +159,7 @@ const PERIOD_LOCKED = {
 };
 
 /// The ledger's only entry on the live instance (73acb2e8), sourced from
-/// a packet; and one sourced from an invoice, the only kind that links.
+/// a packet; and one sourced from an invoice.
 const PACKET_ID = '49cd9cc9-0000-0000-0000-000000000001';
 const ENTRIES = [
   { id: 'ent-0001', fact_id: 'fact-0001', posted_on: '2026-09-17', memo: 'Sponsorship received', rule_version: 1,
@@ -824,18 +823,16 @@ test.describe('/ux/finance — Trial Balance', () => {
   });
 
   test('an account opens the entries that touch it; an entry opens its lines and its fact', async ({ page }) => {
-    await install(page);
+    const sent = await install(page);
     await mountPage(page, `${PATH}?tab=trial-balance`);
     await accountRow(page, '4200').click();
     const drill = panel(page).locator('section.tab-section', { hasText: 'Entries touching 4200 — Sponsorship revenue' });
     await expect(drill.locator('h3')).toHaveText('Entries touching 4200 — Sponsorship revenue');
     await expect(drill.locator('table.tb-entries tbody tr')).toHaveCount(2);
 
-    // A packet-sourced entry — the only kind Algedonic's ledger holds —
-    // renders its source as text. e0b754d3: it should link the packet.
+    // e0b754d3: packet sources link the packet in both the row and fact.
     const fromPacket = drill.locator('table.tb-entries tr.tb-row', { hasText: 'Sponsorship received' });
-    await expect(fromPacket.locator('td:nth-child(4)')).toHaveText(`jobs · ${PACKET_ID}`);
-    await expect(fromPacket.getByRole('link')).toHaveCount(0);
+    await expect(fromPacket.getByRole('link', { name: PACKET_ID })).toHaveAttribute('href', `/ux/jobs/${PACKET_ID}`);
     // An invoice-sourced one links the invoice, under the finance entry.
     const fromInvoice = drill.locator('table.tb-entries tr.tb-row', { hasText: 'Invoice paid' });
     await expect(fromInvoice.getByRole('link', { name: 'inv-0001' })).toHaveAttribute('href', '/ux/finance/inv-0001');
@@ -847,16 +844,56 @@ test.describe('/ux/finance — Trial Balance', () => {
     await expect(detail.locator('table.tb-entry-lines tbody tr')).toHaveText([
       /1010\s*Cash in Transit\s*\$1\.00/, /4200\s*Sponsorship revenue\s*\$1\.00/,
     ]);
-    // e0b754d3 again, in the fact line.
-    await expect(detail.locator('summary')).toHaveText(`Fact: finance.sponsorship.received · jobs · ${PACKET_ID}`);
+    await expect(detail.locator('summary').getByRole('link', { name: PACKET_ID })).toHaveAttribute('href', `/ux/jobs/${PACKET_ID}`);
     await expect(detail.locator('pre')).toBeHidden();
-    await detail.locator('summary').click();
+    await detail.locator('summary code').click();
     await expect(detail.locator('pre')).toContainText('"amount_cents": 100');
 
     await fromPacket.click();
     await expect(detail).toHaveCount(0);
     await accountRow(page, '4200').click();
     await expect(drill).toHaveCount(0);
+    expect(writes(sent)).toEqual([]);
+  });
+
+  for (const source of ['row', 'fact'] as const) {
+    test(`a packet source in the ${source} navigates once without toggling its enclosing control`, async ({ page }) => {
+      const sent = await install(page);
+      await page.route(new RegExp(`/api/jobs/${PACKET_ID}$`), (r) => json(r, {
+        id: PACKET_ID, kind: 'receive-a-sponsorship', title: 'Recorded sponsorship packet', status: 'open',
+        subject: { subject_kind: 'account', id: 'acct-1' }, metadata: {}, steps: [],
+        priority: 'standard', owner_id: 'emp-001', opened_on: '2026-09-17', due_on: null, closed_on: null, tags: [],
+      }));
+      await mountPage(page, `${PATH}?tab=trial-balance`);
+      await accountRow(page, '4200').click();
+      const drill = panel(page).locator('section.tab-section', { hasText: 'Entries touching 4200 — Sponsorship revenue' });
+      const row = drill.locator('table.tb-entries tr.tb-row', { hasText: 'Sponsorship received' });
+      if (source === 'fact') await row.click();
+      const container = source === 'row' ? row : drill.locator('.tb-entry-detail summary');
+      const before = await page.evaluate(() => window.history.length);
+      await container.getByRole('link', { name: PACKET_ID }).click();
+      await expect(page).toHaveURL(new RegExp(`/ux/jobs/${PACKET_ID}$`));
+      await expect(page.getByRole('heading', { name: 'Recorded sponsorship packet', exact: true })).toBeVisible();
+      expect(await page.evaluate(() => window.history.length)).toBe(before + 1);
+      await page.goBack();
+      await expect(page).toHaveURL(new RegExp('/ux/finance\\?tab=trial-balance$'));
+      expect(writes(sent)).toEqual([]);
+    });
+  }
+
+  test('an unknown source remains text in both the row and fact', async ({ page }) => {
+    const unknown = { ...ENTRIES[0], fact_source_table: 'unregistered-source' };
+    const sent = await install(page, { entries: [unknown], entryDetail: { ...ENTRY_DETAIL, ...unknown } });
+    await mountPage(page, `${PATH}?tab=trial-balance`);
+    await accountRow(page, '4200').click();
+    const row = panel(page).locator('table.tb-entries tr.tb-row', { hasText: 'Sponsorship received' });
+    await expect(row.locator('td:nth-child(4)')).toHaveText(`unregistered-source · ${PACKET_ID}`);
+    await expect(row.getByRole('link')).toHaveCount(0);
+    await row.click();
+    const summary = panel(page).locator('.tb-entry-detail summary');
+    await expect(summary).toContainText(`unregistered-source · ${PACKET_ID}`);
+    await expect(summary.getByRole('link')).toHaveCount(0);
+    expect(writes(sent)).toEqual([]);
   });
 
   test('Refresh re-reads the periods and the trial balance', async ({ page }) => {

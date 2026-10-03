@@ -18,9 +18,10 @@
 //! skipped, `#[cfg(test)]` items blanked) puts `x-boss-user` on a
 //! request must also name a stamping door: `machine_token::Client` (or
 //! its blocking twin, `machine_token::BlockingClient`),
-//! `http_client::base`, the gateway's `MachineClient`, or one of the
-//! doors the sibling pin `no_client_bakes_the_machine_token_in` governs
-//! (`machine_token::attach`, `machine_token::HEADER`). A file that does
+//! `http_client::base`, the gateway's `MachineClient`, or the door the
+//! sibling pin `no_client_bakes_the_machine_token_in` governs
+//! (`machine_token::HEADER`; its read-once `attach` was deleted with the
+//! last baked client, 2026-09-29). A file that does
 //! not is refused, naming it and its lines; a [`NOT_YET`] row whose file
 //! no longer sends the header, or now stamps it, is refused as stale; and
 //! the list may not grow past [`NOT_YET_CEILING`].
@@ -42,51 +43,30 @@ use boss_testing::repo_root;
 use regex::Regex;
 use std::path::{Path, PathBuf};
 
-const BLOCKING: &str = "a reqwest::blocking client (a seed or bootstrap walk). Moves with \
-     the blocking senders, onto machine_token::BlockingClient (the `blocking` feature of \
-     boss-core, built for the CLI's walks in car 2's CLI slice).";
-const TENANT_SEED: &str = "the brewery tenant's seed/prepare walk on a blocking client; \
-     moves with the blocking senders.";
-
 /// Files that send `x-boss-user` with no stamping door yet, and why.
-const NOT_YET: &[(&str, &str)] = &[
-    ("crates/core/boss-policy/src/bootstrap.rs", BLOCKING),
-    (
-        "crates/modules/boss-people/src/operator_baseline.rs",
-        BLOCKING,
-    ),
-    (
-        "crates/orchestrators/boss-sim/src/workforce.rs",
-        "the simulated workforce's claims on a client it builds per actor with default headers; \
-         moves with boss-sim's output.rs client (BAKED), the blocking senders' slice.",
-    ),
-    (
-        "crates/orchestrators/boss-simulator/src/bin/boss_simulator.rs",
-        "a RELAY: it forwards its own caller's x-boss-user upstream. Stamping the estate token \
+/// The blocking senders — the policy and operator-baseline bootstraps,
+/// boss-sim's workforce, the brewery's prepare walk — left it in car 2's
+/// blocking-senders slice (2026-09-29), onto
+/// `machine_token::BlockingClient`. What remains is not a client that
+/// has not moved but a trust question that has not been built.
+const NOT_YET: &[(&str, &str)] = &[(
+    "crates/orchestrators/boss-simulator/src/bin/boss_simulator.rs",
+    "a RELAY: it forwards its own caller's x-boss-user upstream. Stamping the estate token \
          on a caller's ASSERTED identity would launder that assertion into a machine one. \
          Decided (review of 39949355, 2026-09-28), not yet built: stamp outbound ONLY when the \
          inbound request passed machine_gate with a verified token; otherwise forward it \
          unstamped, or sign as the simulator's own actor — never stamp a caller-asserted \
          identity.",
-    ),
-    ("crates/tenants/boss-brewery-engine/src/lib.rs", TENANT_SEED),
-    (
-        "crates/tenants/boss-brewery-engine/src/prepare/model.rs",
-        TENANT_SEED,
-    ),
-    (
-        "crates/tenants/boss-brewery-engine/src/prepare/tenant_data.rs",
-        TENANT_SEED,
-    ),
-];
+)];
 
 /// The most [`NOT_YET`] may hold: its length when it was written (41),
 /// less the 23 dispatcher handlers that now hold their jobs-API client
 /// as a `machine_token::Client` (car 2's handlers slice), less the 11
 /// boss verbs whose jobs-API helpers now take one, the conductor's with
-/// them (car 2's CLI slice, 2026-09-29). Lower it as rows go; never
+/// them (car 2's CLI slice), less the six blocking senders (car 2's
+/// blocking-senders slice, 2026-09-29). Lower it as rows go; never
 /// raise it.
-const NOT_YET_CEILING: usize = 7;
+const NOT_YET_CEILING: usize = 1;
 
 /// Names that mean the file stamps the token on what it sends.
 const STAMPING_DOORS: &[&str] = &[
@@ -97,7 +77,6 @@ const STAMPING_DOORS: &[&str] = &[
     "gate::machine_client",
     "http_client::base",
     "MachineClient",
-    "machine_token::attach",
     "machine_token::HEADER",
 ];
 
@@ -112,6 +91,13 @@ const NOT_SENDERS: &[(&str, &str)] = &[
         "crates/core/boss-jobs/src/agents/door.rs",
         "the login door: a middleware rewriting the INBOUND request's x-boss-user id to the \
          agent it aliases, before the handler reads it.",
+    ),
+    (
+        "crates/core/boss-core/src/machine_gate.rs",
+        "the machine gate: on a probe-reader match it rewrites the INBOUND request's \
+         x-boss-user to the probe reader before any handler reads it (design b35c22b4, Q2). \
+         It sends nothing; listed so it is not passed by naming machine_token::HEADER, which \
+         it reads rather than stamps.",
     ),
 ];
 

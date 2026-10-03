@@ -315,17 +315,5 @@ async fn upsert_contract(
 // --- error mapping ------------------------------------------------------
 
 fn err(e: InventoryError) -> Response {
-    match e {
-        InventoryError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
-        InventoryError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
-        InventoryError::InsufficientStock(sku, on_hand, need) => (
-            StatusCode::CONFLICT,
-            format!("insufficient stock: {sku} has {on_hand}, need {need}"),
-        )
-            .into_response(),
-        e @ InventoryError::InvalidAccount(_) => {
-            (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response()
-        }
-        InventoryError::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
-    }
+    crate::http::error_response(e)
 }

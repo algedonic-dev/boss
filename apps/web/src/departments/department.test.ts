@@ -4,10 +4,14 @@
 import { describe, expect, it } from 'bun:test';
 import type { Job, Step, StepStatus } from '../jobs/types';
 import {
+  LIVE_PAGE,
+  OUT_PAGE,
   OUT_WINDOW_DAYS,
-  PAGE,
-  departmentJobsUrl,
+  departmentThirds,
+  departuresUrl,
+  liveJobsUrl,
   parseJobsPage,
+  truncatedReads,
   thirdOf,
   thirds,
   waitedFor,
@@ -203,20 +207,88 @@ describe('waitedFor — since when, from the queue-age lens (66a5d5be)', () => {
   });
 });
 
-describe('the one read', () => {
-  it('asks the server for the department, the window, and one page', () => {
-    const url = departmentJobsUrl('sales');
-    expect(url).toBe(`/api/jobs?department=sales&closed_within=${OUT_WINDOW_DAYS}&limit=${PAGE}`);
-    // A code the URL would eat survives.
-    expect(departmentJobsUrl('front of house')).toContain('department=front%20of%20house');
+// Backlog a22311a1: the live packets and the window's departures were
+// ONE page of 200, newest first. Once 61 platform kinds declared `it`,
+// ~1,230 chores a day would close inside IT's window, so the page would
+// hold four hours of departures and the 429 open backlog-items would
+// fall off it — In and Working near-empty on a department with the
+// most open work of any. Two reads now, each bounded, each with its
+// own total.
+describe('the two reads', () => {
+  it('reads the live packets apart from the departures, each its own bounded page', () => {
+    expect(liveJobsUrl('sales')).toBe(`/api/jobs?department=sales&terminal=false&limit=${LIVE_PAGE}`);
+    expect(departuresUrl('sales')).toBe(
+      `/api/jobs?department=sales&terminal=true&closed_within=${OUT_WINDOW_DAYS}&limit=${OUT_PAGE}`,
+    );
+    // A code the URL would eat survives, in both.
+    expect(liveJobsUrl('front of house')).toContain('department=front%20of%20house');
+    expect(departuresUrl('front of house')).toContain('department=front%20of%20house');
+  });
+
+  it('a flood of departures cannot push a live packet off the page', () => {
+    // The departures read answers a full page of newer packets; the
+    // open backlog-item opened long before every one of them.
+    const flood = Array.from({ length: OUT_PAGE }, (_, i) =>
+      job(`chore-${i}`, 'closed', ['completed'], { opened: '2026-09-30', closed: '2026-09-30' }),
+    );
+    const t = departmentThirds({
+      live: { rows: [job('old-item', 'open', ['ready'], { opened: '2026-08-01' })], total: 1 },
+      out: { rows: flood, total: 8_600 },
+    });
+    expect(t.in.map((j) => j.id)).toEqual(['old-item']);
+    expect(t.out.length).toBe(OUT_PAGE);
+  });
+
+  it('each third takes its rows from its own read only', () => {
+    // A server (or a stub) that answers both reads with one mixed page
+    // must not draw a packet twice: live rows feed In and Working,
+    // departed rows feed Out.
+    const mixed = [
+      job('live-1', 'open', ['ready']),
+      job('gone-1', 'closed', ['completed'], { opened: '2026-09-01', closed: '2026-09-02' }),
+    ];
+    const t = departmentThirds({ live: { rows: mixed, total: 2 }, out: { rows: mixed, total: 2 } });
+    expect(t.in.map((j) => j.id)).toEqual(['live-1']);
+    expect(t.working).toEqual([]);
+    expect(t.out.map((j) => j.id)).toEqual(['gone-1']);
+  });
+
+  it('a page smaller than its total is named, per read', () => {
+    const d = {
+      live: { rows: [job('a', 'open', [])], total: 1 },
+      out: { rows: [job('b', 'closed', [])], total: 40 },
+    };
+    expect(truncatedReads(d)).toEqual([{ read: 'out', shown: 1, total: 40 }]);
+    expect(truncatedReads({ ...d, out: { rows: d.out.rows, total: 1 } })).toEqual([]);
   });
 
   it('keeps total beside the rows, so a truncated read is visible', () => {
     const page = parseJobsPage({ data: [job('a', 'open', [])], total: 201 });
     expect(page.rows.length).toBe(1);
     expect(page.total).toBe(201);
-    // A malformed envelope is an empty page that says so, never a throw.
-    expect(parseJobsPage(null)).toEqual({ rows: [], total: 0 });
-    expect(parseJobsPage({ data: 'nope' })).toEqual({ rows: [], total: 0 });
+    expect(parseJobsPage({ data: [], total: 0 })).toEqual({ rows: [], total: 0 });
+  });
+
+  it('a malformed or contradictory counted envelope is unread, never an empty department', () => {
+    for (const raw of [null, { data: 'nope' }, { data: [] }, { data: [], total: 'unknown' },
+      { data: [null], total: 1 }, { data: [{}], total: 1 },
+      { data: [], total: 1 },
+      { data: [], total: -1 }, { data: [], total: 0.5 }, { data: [job('a', 'open', [])], total: 0 }]) {
+      expect(() => parseJobsPage(raw)).toThrow();
+    }
+  });
+
+  it('a row with unread control identity or lifecycle is refused instead of silently placed in In', () => {
+    const good = job('a', 'open', ['ready']);
+    for (const row of [
+      { ...good, subject: { subject_kind: 'custom', id: '' } },
+      { ...good, opened_on: '' },
+      { ...good, priority: undefined },
+      { ...good, steps: undefined },
+      { ...good, steps: [{ ...step('ready'), status: 'unknown' }] },
+      { ...good, steps: [{ ...step('ready'), id: '' }] },
+    ]) {
+      expect(() => parseJobsPage({ data: [row], total: 1 })).toThrow();
+    }
   });
 });

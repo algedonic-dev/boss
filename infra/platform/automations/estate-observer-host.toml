@@ -1,0 +1,7 @@
+# automation:estate-observer-host — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 2,743 audit-log facts.
+# Signs as platform-admin today: infra/estate/observe-lib.sh.
+
+[[automation]]
+id = "automation:estate-observer-host"
+role = "platform-admin"
+description = 'Observes each estate host (disk, load) and records it (infra/estate/observe-lib.sh).'

@@ -43,8 +43,10 @@ describe('the roster is the catalog', () => {
     // (2026-09-27): the Agents tab on Registry, the agents registry as
     // a directory, joined the catalog and so the march. 44 since backlog
     // 851259b9 (2026-09-27): the Credentials tab on Registry, the
-    // credentials registry with its lifecycle as packets.
-    expect(paths.length).toBe(44);
+    // credentials registry with its lifecycle as packets. 45 since
+    // approved design d4dada70 (2026-10-02): the company System Network
+    // Map is a Home-owned orientation surface with its own catalog row.
+    expect(paths.length).toBe(45);
   });
 
   it('a parameterised catalog path is a page the march audits', () => {

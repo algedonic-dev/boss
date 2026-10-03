@@ -13,7 +13,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
-use boss_policy_client::{CurrentUser, Resource};
+use boss_policy_client::{CurrentUser, controls};
 
 use super::*;
 use crate::chart::AccountInput;
@@ -29,11 +29,11 @@ pub(super) async fn declare_accounts_batch(
     CurrentUser(user): CurrentUser,
     Json(rows): Json<Vec<AccountInput>>,
 ) -> Response {
-    let stamp = match super::authorize_declaration(&state, &user, Resource::ledger_account()).await
-    {
-        Ok(stamp) => stamp,
-        Err(refusal) => return refusal,
-    };
+    let stamp =
+        match super::authorize_declaration(&state, &user, controls::CREATE_LEDGER_ACCOUNT).await {
+            Ok(stamp) => stamp,
+            Err(refusal) => return refusal,
+        };
     match crate::chart::declare_accounts(&state.pool, &rows, &stamp).await {
         Ok(outcome) => Json(outcome).into_response(),
         Err(e) => ledger_err(e),

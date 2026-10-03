@@ -21,8 +21,9 @@
 //!
 //! UNREAD IS NOT EMPTY. Each half is `null` with its reason when it
 //! cannot be read — no record wired, a failed read, a caller whose
-//! policy reads no packets, or more dead-lettered packets than one page
-//! holds — because an empty list would paint every rule "no firing" or
+//! policy does not read every packet (withheld, d0058c92), or more
+//! dead-lettered packets than one page holds — because an empty list
+//! would paint every rule "no firing" or
 //! "no failures" on no evidence, which is how a dead machine reads
 //! healthy.
 
@@ -44,33 +45,59 @@ pub(super) async fn yard_rule_firings<R: JobsRepository + 'static, B: EventBus +
     // beside them answered every rule's name and newest instant to a
     // caller with no identity at all. A caller whose scope reads no
     // packets reads nothing about the machinery that moves them either.
-    let predicate = match state.policy.scope_predicate(&user, Resource::job()).await {
-        Ok(boss_policy_client::Predicate::None) => Err(
-            "this caller's policy scope reads no packets, so neither the firing record \
-             nor the dead-letters on them are read for it"
-                .to_string(),
-        ),
-        Ok(p) => Ok(p),
+    //
+    // NOR DOES ONE WHOSE SCOPE READS SOME PACKETS BUT NOT ALL (backlog
+    // d0058c92, review abebd39c B1). The firing record names when every
+    // rule last fired, whoever's packets it moved — the record the map's
+    // borders and the dispatcher's schedule withhold below a full scope —
+    // so this door withholds it too. JUDGED ON THE TRANSLATED SCOPE
+    // (`JobScope::from_predicate`): a department grant held outside its
+    // department is a predicate, not `Predicate::None`, and reads no
+    // packets; it was served the record here until then. The dead-letters
+    // go with it, BOTH halves: the unrouted ones are that same record, and
+    // serving only the packet half would break the both-or-neither rule
+    // below (4b175523).
+    let asked = state.policy.scope_of(&user, controls::READ_JOB).await;
+    let scope = match &asked {
+        Ok(p) => match JobScope::from_predicate(&user, p) {
+            JobScope::All => Ok(JobScope::All),
+            JobScope::None => Err(
+                "this caller's policy scope reads no packets, so neither the firing record \
+                 nor the dead-letters on them are read for it"
+                    .to_string(),
+            ),
+            JobScope::OwnerIs(_) | JobScope::OwnerIn(_) | JobScope::AccountIn(_) => Err(
+                "this caller's policy scope does not read every packet, and the firing record \
+                 is not scoped by packet, so neither it nor the dead-letters beside it are \
+                 read for it — withheld"
+                    .to_string(),
+            ),
+        },
         Err(e) => Err(format!("policy check failed: {e}")),
     };
-    let (firings, firings_error) = split(match &predicate {
+    // Withheld BY SCOPE, said as a flag (backlog 1805bac0): the web told
+    // a refusal from a failed read by matching the reason's opening
+    // words, one fact kept twice in prose (CLAUDE.md 9a). A policy check
+    // that failed is a fault, not a refusal, and carries no flag.
+    let withheld = asked.is_ok() && scope.is_err();
+    let (firings, firings_error) = split(match &scope {
         Ok(_) => last_firings(&state).await,
         Err(why) => Err(why.clone()),
     });
     // Both kinds of dead-letter or neither: a count missing the half
     // that names no packet would say "none" of a rule failing only on
     // invoice topics (4b175523).
-    let (dead_letters, dead_letters_error) = split(match &predicate {
+    let (dead_letters, dead_letters_error) = split(match &scope {
         Err(why) => Err(why.clone()),
-        Ok(predicate) => match (
-            dead_letters(&state, &user, predicate, since).await,
+        Ok(scope) => match (
+            dead_letters(&state, scope.clone(), since).await,
             unrouted_dead_letters(&state, since).await,
         ) {
             (Ok(packets), Ok(unrouted)) => Ok(with_unrouted(packets, &unrouted)),
             (Err(e), _) | (_, Err(e)) => Err(e),
         },
     });
-    Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "now": now,
         // The window both halves answer: the firing record prunes past
         // it, and the dead-letters are cut to it, so "no firing" means
@@ -80,8 +107,12 @@ pub(super) async fn yard_rule_firings<R: JobsRepository + 'static, B: EventBus +
         "firings_error": firings_error,
         "dead_letters": dead_letters,
         "dead_letters_error": dead_letters_error,
-    }))
-    .into_response()
+    });
+    // Present only when withheld, so a full scope's payload is unchanged.
+    if withheld && let Some(o) = body.as_object_mut() {
+        o.insert("withheld".into(), serde_json::Value::Bool(true));
+    }
+    Json(body).into_response()
 }
 
 fn split<T>(r: Result<T, String>) -> (Option<T>, Option<String>) {
@@ -105,8 +136,8 @@ async fn last_firings<R: JobsRepository + 'static, B: EventBus + 'static>(
 
 /// The dead-letters that named no packet, per rule, from the firing
 /// record (4b175523). Not scoped row by row — they are about no packet —
-/// but read only for a caller whose scope reads packets at all, as the
-/// handler gates every half (e5f7b51e).
+/// but read only for a caller whose scope reads every packet (d0058c92),
+/// as the handler gates every half (e5f7b51e).
 async fn unrouted_dead_letters<R: JobsRepository + 'static, B: EventBus + 'static>(
     state: &Arc<JobsApiState<R, B>>,
     since: chrono::DateTime<chrono::Utc>,
@@ -122,18 +153,17 @@ async fn unrouted_dead_letters<R: JobsRepository + 'static, B: EventBus + 'stati
 
 /// The dead-letter annotations the caller can see, rolled up per rule.
 /// Scoped by the caller's read policy like every packet read here — the
-/// predicate the handler asked for; a caller the policy grants no
-/// packets never reaches this, and is told the count is unknown, not
-/// that it is zero.
+/// scope the handler translated; since d0058c92 only a caller who reads
+/// every packet reaches this, and any other is told the count was not
+/// read for it, never that it is zero.
 async fn dead_letters<R: JobsRepository + 'static, B: EventBus + 'static>(
     state: &Arc<JobsApiState<R, B>>,
-    user: &boss_policy_client::User,
-    predicate: &boss_policy_client::Predicate,
+    scope: JobScope,
     since: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<DeadLetterRollup>, String> {
     let filter = JobFilter {
         metadata_has: Some(DEAD_LETTER_KEY.to_string()),
-        scope: job_scope_from_predicate(user, predicate),
+        scope,
         ..Default::default()
     };
     let (rows, total) = state

@@ -49,20 +49,16 @@ fn tech(id: &str) -> User {
 fn open_job(id: &str) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
-        kind: "backlog-item".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "/it/backlog"),
-        title: "A packet whose completed step says something wrong".into(),
-        owner_id: "emp-1".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 19).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: json!({ "area": "boss-jobs" }),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "backlog-item",
+            Subject::new("custom", "/it/backlog"),
+            "A packet whose completed step says something wrong",
+            "emp-1",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 19).unwrap(),
+        )
     }
 }
 

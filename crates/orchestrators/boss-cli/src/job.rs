@@ -1998,14 +1998,164 @@ mod tests {
         /// and `vouches` board the car.
         #[tokio::test(flavor = "multi_thread")]
         async fn a_human_alone_releases_a_review_held_car_through_the_three_verbs() {
-            const HUMAN: &str = "emp-david";
-            const CAR: &str = "c0ffee00-0000-4000-8000-00000000ca25";
             const BUILDER: &str = "b0b0b0b0-0000-4000-8000-000000000000";
-            const HEAD: &str = "1111111111111111111111111111111111111111";
-            const MAIN: &str = "2222222222222222222222222222222222222222";
             let (base, jobs) = serve().await;
-            // The car at the dock: gated green, its review held for a
-            // finding at HEAD, built by an agent run.
+            a_held_car_at_the_dock(&jobs, BUILDER).await;
+            let wire = crate::steps::Wire::at(
+                base,
+                Some(crate::identity::Caller {
+                    id: HUMAN.into(),
+                    source: crate::identity::Source::Env,
+                }),
+            )
+            .unwrap();
+
+            // 1. `boss job file --kind agent-run --title '…'`
+            let run = a_review_run_filed_by(&wire).await;
+            // 2. `BOSS_AGENT_RUN=<run> boss review feat/held --verdict release`
+            crate::review_verdict::record(&wire, "feat/held", "release", "", Some(&run), forge)
+                .await
+                .expect("a human records a verdict on the run they opened");
+            // 3. `boss release feat/held --review <run>`
+            crate::review_verdict::release(
+                &wire,
+                "feat/held",
+                &run,
+                &crate::review_verdict::Releaser::default(),
+                forge,
+            )
+            .await
+            .expect("a human releases on that verdict");
+
+            // The dock: the conductor's own two readers board the car.
+            let after = wire.packet(CAR).await.expect("the car");
+            assert!(crate::train::parked_ready(&after), "unheld: {after}");
+            let never = || -> crate::mutating_verb::Judgement {
+                panic!("a car with a release is not judged")
+            };
+            let unasked = |_: &str, _: &str| -> Result<String, String> {
+                panic!("a release at the head it reviewed proves nothing further")
+            };
+            assert_eq!(
+                crate::mutating_verb::dock(&after, HEAD, never, unasked),
+                crate::mutating_verb::Dock::Check {
+                    review: run.clone(),
+                    reviewed: HEAD.into(),
+                    carry: None,
+                }
+            );
+            let run_packet = wire.packet(&run).await.expect("the run");
+            assert_eq!(
+                crate::review_verdict::vouches(&run_packet, &after, HEAD),
+                Ok(()),
+                "the dock's check passes a run a human opened: {run_packet}"
+            );
+        }
+
+        /// WHEN DAVID GATED THE HEAD HIMSELF (backlog b7b02024 car 3,
+        /// design b08725c2 row A). Gated by hand with no run exported,
+        /// the car names no builder run and the road above is untouched.
+        /// Gated INSIDE a run of his own, the car's `agent_run` is that
+        /// run, and a release from a shell still carrying it is refused
+        /// like any builder's — but the refusal names the road, and the
+        /// road is the three verbs above with step 3 run from a shell
+        /// without that run: no dead end on the operator's path.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_human_who_gated_the_car_in_his_own_run_releases_it_from_outside_that_run() {
+            const HIS_GATING_RUN: &str = "da71d000-0000-4000-8000-000000000000";
+            let (base, jobs) = serve().await;
+            a_held_car_at_the_dock(&jobs, HIS_GATING_RUN).await;
+            let wire = crate::steps::Wire::at(
+                base,
+                Some(crate::identity::Caller {
+                    id: HUMAN.into(),
+                    source: crate::identity::Source::Env,
+                }),
+            )
+            .unwrap();
+            let run = a_review_run_filed_by(&wire).await;
+            crate::review_verdict::record(&wire, "feat/held", "release", "", Some(&run), forge)
+                .await
+                .expect("his review is a run other than the one that gated the car");
+
+            // Step 3 from the shell that still exports his gating run.
+            let refused = crate::review_verdict::release(
+                &wire,
+                "feat/held",
+                &run,
+                &crate::review_verdict::Releaser {
+                    run: Some(HIS_GATING_RUN.into()),
+                    ..Default::default()
+                },
+                forge,
+            )
+            .await
+            .expect_err("the gating run does not release its car")
+            .to_string();
+            for want in [
+                HIS_GATING_RUN,
+                "c0ffee00",
+                "env -u BOSS_AGENT_RUN boss release feat/held",
+            ] {
+                assert!(refused.contains(want), "{want} in {refused}");
+            }
+            let held = wire.packet(CAR).await.expect("the car");
+            assert!(!crate::train::parked_ready(&held), "still held: {held}");
+
+            // The road the refusal named: the same release, outside it.
+            crate::review_verdict::release(
+                &wire,
+                "feat/held",
+                &run,
+                &crate::review_verdict::Releaser::default(),
+                forge,
+            )
+            .await
+            .expect("released from a shell that is not the gating run");
+            let after = wire.packet(CAR).await.expect("the car");
+            assert!(crate::train::parked_ready(&after), "unheld: {after}");
+        }
+
+        const HUMAN: &str = "emp-david";
+        const CAR: &str = "c0ffee00-0000-4000-8000-00000000ca25";
+        const HEAD: &str = "1111111111111111111111111111111111111111";
+        const MAIN: &str = "2222222222222222222222222222222222222222";
+
+        fn forge(r: &str) -> anyhow::Result<String> {
+            Ok(if r == "refs/heads/main" { MAIN } else { HEAD }.to_string())
+        }
+
+        /// `boss job file --kind agent-run`, as the wire's signer: the
+        /// review run of the human road, its full id read off the report.
+        async fn a_review_run_filed_by(wire: &crate::steps::Wire) -> String {
+            let report = file_on(
+                wire,
+                Filing {
+                    kind: "agent-run",
+                    title: "Review of feat/held by emp-david",
+                    priority: None,
+                    subject_id: None,
+                    channel: None,
+                    metadata: None,
+                },
+                Origin {
+                    source: None,
+                    area: None,
+                },
+            )
+            .await
+            .expect("admission takes an agent-run a human files");
+            report
+                .split_whitespace()
+                .skip_while(|w| *w != "filed")
+                .nth(1)
+                .expect("the report names the run")
+                .to_string()
+        }
+
+        /// The car at the dock: gated green by `builder`, its review held
+        /// for a finding at HEAD.
+        async fn a_held_car_at_the_dock(jobs: &InMemoryJobs, builder: &str) {
             let mut car = boss_core::job::Job::new(
                 "ship-a-change",
                 boss_core::job::Subject::new("custom", "bosspipeline"),
@@ -2016,7 +2166,7 @@ mod tests {
             );
             car.id = serde_json::from_value(json!(CAR)).expect("a car id");
             car.status = boss_core::job::JobStatus::Open;
-            car.metadata = json!({"branch": "feat/held", "agent_run": BUILDER});
+            car.metadata = json!({"branch": "feat/held", "agent_run": builder});
             let step = |slug: &str, status: &str, md: serde_json::Value| {
                 serde_json::from_value::<boss_core::job::Step>(json!({
                     "id": uuid::Uuid::new_v4().to_string(), "job_id": CAR,
@@ -2050,77 +2200,9 @@ mod tests {
                 .create_job_with_steps_at(&car, &steps, stamp.timestamp, &[], &step_events)
                 .await
                 .expect("the car stands at the dock");
-            let wire = crate::steps::Wire::at(
-                base,
-                Some(crate::identity::Caller {
-                    id: HUMAN.into(),
-                    source: crate::identity::Source::Env,
-                }),
-            )
-            .unwrap();
-            let forge = |r: &str| -> anyhow::Result<String> {
-                Ok(if r == "refs/heads/main" { MAIN } else { HEAD }.to_string())
-            };
-
-            // 1. `boss job file --kind agent-run --title '…'`
-            let report = file_on(
-                &wire,
-                Filing {
-                    kind: "agent-run",
-                    title: "Review of feat/held by emp-david",
-                    priority: None,
-                    subject_id: None,
-                    channel: None,
-                    metadata: None,
-                },
-                Origin {
-                    source: None,
-                    area: None,
-                },
-            )
-            .await
-            .expect("admission takes an agent-run a human files");
-            let run = report
-                .split_whitespace()
-                .skip_while(|w| *w != "filed")
-                .nth(1)
-                .expect("the report names the run")
-                .to_string();
-            // 2. `BOSS_AGENT_RUN=<run> boss review feat/held --verdict release`
-            crate::review_verdict::record(&wire, "feat/held", "release", "", Some(&run), forge)
-                .await
-                .expect("a human records a verdict on the run they opened");
-            // 3. `boss release feat/held --review <run>`
-            crate::review_verdict::release(&wire, "feat/held", &run, forge)
-                .await
-                .expect("a human releases on that verdict");
-
-            // The dock: the conductor's own two readers board the car.
-            let after = wire.packet(CAR).await.expect("the car");
-            assert!(crate::train::parked_ready(&after), "unheld: {after}");
-            let never = || -> crate::mutating_verb::Judgement {
-                panic!("a car with a release is not judged")
-            };
-            let unasked = |_: &str, _: &str| -> Result<String, String> {
-                panic!("a release at the head it reviewed proves nothing further")
-            };
-            assert_eq!(
-                crate::mutating_verb::dock(&after, HEAD, never, unasked),
-                crate::mutating_verb::Dock::Check {
-                    review: run.clone(),
-                    reviewed: HEAD.into(),
-                    carry: None,
-                }
-            );
-            let run_packet = wire.packet(&run).await.expect("the run");
-            assert_eq!(
-                crate::review_verdict::vouches(&run_packet, &after, HEAD),
-                Ok(()),
-                "the dock's check passes a run a human opened: {run_packet}"
-            );
         }
 
-        /// The road the test above walks is the road `boss release --help`
+        /// The road the human-alone test walks is the road `boss release --help`
         /// tells the operator to walk — the three verbs, in order, and the
         /// test that pins them. A help line that drifts from the chain is
         /// a dead end found at exactly the wrong moment.

@@ -151,7 +151,8 @@ async fn rebuild_reproduces_projection_after_drop() {
             .send(router)
             .await;
         resp.assert_status(StatusCode::OK);
-        let rows: Vec<serde_json::Value> = resp.assert_json();
+        let page: serde_json::Value = resp.assert_json();
+        let rows = page["data"].as_array().expect("the inbox envelope").clone();
         let mut ids: Vec<String> = rows
             .iter()
             .map(|r| r["id"].as_str().unwrap().to_string())
@@ -469,7 +470,8 @@ async fn archiving_twice_records_one_event_and_keeps_the_kind_through_a_rebuild(
         .send(&router)
         .await;
     resp.assert_status(StatusCode::OK);
-    let rows: Vec<serde_json::Value> = resp.assert_json();
+    let page: serde_json::Value = resp.assert_json();
+    let rows = page["data"].as_array().expect("the inbox envelope").clone();
     assert!(rows.is_empty(), "both left the inbox: {rows:?}");
     let resp = TestRequest::get("/api/messages/unread/emp-b?kind=direct")
         .header("x-boss-user", OPERATOR)
@@ -615,4 +617,160 @@ async fn the_migration_backfills_a_legacy_archived_row_the_way_the_rebuild_does(
     .await
     .unwrap();
     assert!(retired, "the `archived` message kind is retired");
+}
+
+/// Backlog 624e92eb, the read half of 9bda9726, against the real
+/// adapter: marking a read message read again rewrote `read_at` and
+/// recorded a second `messages.message.read`. It is now a no-op — the
+/// door still answers 200, the first `read_at` stands, the log holds
+/// ONE read event — and a rebuild from the log lands on the same row.
+#[tokio::test(flavor = "multi_thread")]
+async fn marking_read_twice_records_one_event_and_keeps_the_first_read_through_a_rebuild() {
+    let db = TestDb::new().await;
+    let router = build_app(db.pool.clone());
+    let id = send_message(&router, "emp-a", "emp-b", "read me").await;
+
+    let mark = || async {
+        TestRequest::post(format!("/api/messages/{id}/read"))
+            .header("x-boss-user", signed_in("emp-b"))
+            .send(&router)
+            .await
+            .assert_status(StatusCode::OK);
+        snapshot_messages(&db.pool).await
+    };
+    let after_first = mark().await;
+    assert!(after_first[0].read_at.is_some());
+    let after_second = mark().await;
+    assert_eq!(
+        after_second, after_first,
+        "a repeat mark-read changes nothing"
+    );
+
+    let delivered = drain_outbox(&db.pool).await;
+    assert_eq!(delivered, 2, "1 sent + ONE read");
+    let reads: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE kind = 'messages.message.read'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(reads, 1, "marking read twice records one event");
+
+    let report = rebuild_messages(&db.pool).await.expect("rebuild succeeds");
+    assert_eq!(report.rows_marked_read, 1);
+    assert_eq!(snapshot_messages(&db.pool).await, after_first);
+}
+
+const READ_MIGRATION: &str =
+    "infra/postgres/schema/20261001063831-a-message-keeps-its-first-read.sql";
+
+/// Backlog 624e92eb: the old doors left a message marked read more than
+/// once holding its LAST read time, while the rebuild now replays the
+/// live guard and keeps the FIRST — so without a backfill the next
+/// rebuild would move every such row. The migration sets each one to
+/// its first read after its last send, truncated to the microsecond as
+/// a bind is, and must land exactly where the rebuild lands.
+///
+/// Shapes planted: a message read twice with nanosecond times (the wall
+/// clock's precision; Postgres ROUNDS a text cast where sqlx TRUNCATES a
+/// bind), a message read once (untouched), and a message read, deleted,
+/// sent again and read twice (its first read after the LAST send).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_read_migration_keeps_the_first_read_the_way_the_rebuild_does() {
+    let db = TestDb::new().await;
+    let sent = |id: &str| {
+        serde_json::json!({
+            "id": id, "sender_id": "emp-a", "recipient_id": "emp-b",
+            "subject": format!("s {id}"), "body": "b", "kind": "direct",
+            "sent_at": "2026-09-20T10:00:00.123456Z", "read_at": null, "reply_to": null,
+        })
+    };
+    let read = |id: &str, at: &str| serde_json::json!({ "id": id, "read_at": at });
+    let events = [
+        ("messages.message.sent", sent("twice")),
+        ("messages.message.sent", sent("once")),
+        ("messages.message.sent", sent("resent")),
+        (
+            "messages.message.read",
+            read("twice", "2026-09-21T09:00:00.123456789Z"),
+        ),
+        (
+            "messages.message.read",
+            read("twice", "2026-09-21T09:30:00Z"),
+        ),
+        (
+            "messages.message.read",
+            read("once", "2026-09-21T10:00:00Z"),
+        ),
+        (
+            "messages.message.read",
+            read("resent", "2026-09-21T08:00:00Z"),
+        ),
+        (
+            "messages.message.deleted",
+            serde_json::json!({ "id": "resent" }),
+        ),
+        ("messages.message.sent", sent("resent")),
+        (
+            "messages.message.read",
+            read("resent", "2026-09-22T08:00:00Z"),
+        ),
+        (
+            "messages.message.read",
+            read("resent", "2026-09-22T09:00:00Z"),
+        ),
+    ];
+    for (kind, payload) in &events {
+        sqlx::query(
+            "INSERT INTO audit_log (event_id, source, kind, payload) \
+             VALUES (gen_random_uuid(), 'messages', $1, $2)",
+        )
+        .bind(kind)
+        .bind(payload)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    rebuild_messages(&db.pool).await.expect("rebuild succeeds");
+    let rebuilt = snapshot_messages(&db.pool).await;
+    let row = |rows: &[MessageRow], id: &str| rows.iter().find(|r| r.id == id).unwrap().clone();
+    assert_eq!(
+        row(&rebuilt, "twice").read_at,
+        Some("2026-09-21T09:00:00.123456Z".parse().unwrap()),
+        "the rebuild keeps the FIRST read, truncated to the microsecond"
+    );
+    assert_eq!(
+        row(&rebuilt, "resent").read_at,
+        Some("2026-09-22T08:00:00Z".parse().unwrap()),
+        "the first read after the LAST send"
+    );
+
+    // The projection the OLD doors left: each row holds its LAST read.
+    sqlx::query(
+        "UPDATE messages SET read_at = CASE id \
+           WHEN 'twice'  THEN '2026-09-21T09:30:00Z'::timestamptz \
+           WHEN 'resent' THEN '2026-09-22T09:00:00Z'::timestamptz END \
+         WHERE id IN ('twice', 'resent')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let migration = std::fs::read_to_string(boss_testing::repo_root().join(READ_MIGRATION))
+        .unwrap_or_else(|e| panic!("reading {READ_MIGRATION}: {e}"));
+    sqlx::raw_sql(&migration)
+        .execute(&db.pool)
+        .await
+        .expect("the migration applies to a legacy projection");
+    assert_eq!(
+        snapshot_messages(&db.pool).await,
+        rebuilt,
+        "the backfill lands where the rebuild lands"
+    );
+
+    sqlx::raw_sql(&migration)
+        .execute(&db.pool)
+        .await
+        .expect("the migration re-applies");
+    assert_eq!(snapshot_messages(&db.pool).await, rebuilt);
 }

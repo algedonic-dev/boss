@@ -29,6 +29,8 @@ use boss_dispatcher_handlers::handlers::{
     credential_rotate_cloudflare_tunnel::CredentialRotateCloudflareTunnel,
     credential_rotate_forgejo::CredentialRotateForgejo,
     credential_rotate_github_app::CredentialRotateGitHubApp,
+    credential_rotate_ops_runner::CredentialRotateOpsRunner,
+    credential_rotate_self_issued::{self, CredentialRotateSelfIssued},
     dns_observe::DnsObserve,
     estate_alarm::EstateAlarm,
     estate_compare::EstateCompare,
@@ -63,12 +65,14 @@ use boss_dispatcher_handlers::handlers::{
     messages_notify::MessagesNotify,
     messages_notify_job_terminal::MessagesNotifyJobTerminal,
     network_census::NetworkCensus,
+    ops_file_remedies::OpsFileRemedies,
     ops_file_tag_release::OpsFileTagRelease,
     ops_judge::OpsJudge,
     ops_queue_alarm::OpsQueueAlarm,
     packaging_allocate::PackagingAllocate,
     people_hire::PeopleHire,
     people_terminate::PeopleTerminate,
+    policy_check_refusals_alarm::PolicyCheckRefusalsAlarm,
     policy_coverage_alarm::PolicyCoverageAlarm,
     products_consume::ProductsConsume,
     products_consume_from_invoice::ProductsConsumeFromInvoice,
@@ -461,6 +465,16 @@ async fn main() -> Result<()> {
                 cfg.jobs_api_url.clone(),
                 platform_owner.clone(),
             ));
+            // The lapsed-grant watch (backlog b8e75382 R3): hourly, read
+            // the policy check's refusal tally and file one alarm when a
+            // service's Read on policy-rule has lapsed — answered today,
+            // every door 503 under `enforce` — and one when the tally is
+            // full. It refuses nothing.
+            handlers.register(PolicyCheckRefusalsAlarm::new(
+                cfg.policy_api_url.clone(),
+                cfg.jobs_api_url.clone(),
+                platform_owner.clone(),
+            ));
             // A release packet's `tag` step going ready files the
             // forge's tag-release request itself — v<version> off the
             // packet, the newest closed train's merge_ref off the
@@ -469,6 +483,12 @@ async fn main() -> Result<()> {
             // a release). Inert until a rule on step.ready.task names
             // it with the packet kind and step slug.
             handlers.register(OpsFileTagRelease::new(cfg.jobs_api_url.clone()));
+            // An estate finding files the passkey-gated request of
+            // every verb whose file declares it remedies that finding
+            // (backlog 3df309bf): the pairing is data on the verb, so a
+            // new remedy is a verb-file edit, not a rule. Files only a
+            // verb that runs under a passkey on its rendered plan.
+            handlers.register(OpsFileRemedies::new(cfg.jobs_api_url.clone()));
             // A chore that closed red opens one backlog-item per RED
             // route on its recorded step (ac3270c7): on the close, parse
             // `RED <route> <kind>: <error>` lines off the step the rule
@@ -668,6 +688,28 @@ async fn main() -> Result<()> {
                     github,
                     secrets.clone(),
                 ));
+                // The ops runner's credential (design f623e425 Q1, backlog
+                // 1e50e66b): no issuer outside the estate — the handler
+                // mints 32 random bytes into its host's `next` slot of the
+                // Secret the jobs API's credential door mounts, verifies
+                // through that door, and promotes to `current` once the
+                // host records delivery. It needs only the Secret store.
+                handlers.register(CredentialRotateOpsRunner::new(
+                    cfg.jobs_api_url.clone(),
+                    secrets.clone(),
+                ));
+                // The self-issued estate machine token (design 6805c764,
+                // car 3): no issuer and no root, so nothing to configure
+                // but the Secret store — the value is generated here and
+                // staged, promoted and revoked through the three slots
+                // every service's machine gate accepts, read back from
+                // those gates at 127.0.0.1 (this process runs in the pod
+                // they run in).
+                handlers.register(CredentialRotateSelfIssued::new(
+                    cfg.jobs_api_url.clone(),
+                    secrets.clone(),
+                    credential_rotate_self_issued::LocalGates::from_ports(),
+                ));
                 // The zone observer (5e58922c, 198c5fe9): on a
                 // dns-zone-observation packet's observe step, read the
                 // account's Access applications and the zone with the
@@ -819,6 +861,7 @@ async fn main() -> Result<()> {
             // — the raiser comes later, calibrated on this series.
             handlers.register(EstateCompare::new(cfg.jobs_api_url.clone()));
             handlers.register(MessagesNotify::new(
+                cfg.jobs_api_url.clone(),
                 cfg.people_api_url.clone(),
                 cfg.messages_api_url.clone(),
             ));
@@ -998,7 +1041,7 @@ async fn main() -> Result<()> {
         ));
     let app = router(HttpState {
         live,
-        pool,
+        pool: pool.clone(),
         authored_rules_dir: cfg.authored_rules_dir.clone(),
         // What the handlers registered above emit — declared beside their
         // code, not in core (backlog ec40e269).
@@ -1023,7 +1066,12 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding HTTP listener on {bind}"))?;
     info!(addr = %bind, "boss-dispatcher HTTP listening (health-only surface)");
-    let app = boss_core::machine_gate::mount(app, "dispatcher", &["/api/dispatcher/health"]);
+    let app = boss_core::machine_gate::mount(
+        app,
+        "dispatcher",
+        &["/api/dispatcher/health"],
+        Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }

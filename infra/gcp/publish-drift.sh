@@ -148,7 +148,7 @@ trap 'rm -rf "$TMP"' EXIT
 # trap above, so the lib's cleanup is chained in front of it.
 # shellcheck source=infra/lib/secret-header.sh
 . "$SELF_DIR/../lib/secret-header.sh" || { echo "$NAME: $SELF_DIR/../lib/secret-header.sh is missing — nothing compared, nothing published" >&2; exit 78; }
-secret_header MT_HDR ${BOSS_MACHINE_TOKEN:+"x-boss-machine-token: $BOSS_MACHINE_TOKEN"} || exit 78
+machine_token_header MT_HDR "$BOSS_JOBS_URL" || exit 78
 
 # --- git, as the checkout's owner -------------------------------------------
 OWNER="$(stat -c %U "$REPO" 2>/dev/null)"

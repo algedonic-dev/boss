@@ -157,7 +157,7 @@ BOSS_USER='{"id":"automation:surface-usage","role":"platform-admin","access_tier
 # The machine token rides to curl in a 0600 file, never in its argv
 # (infra/lib/secret-header.sh; backlog 5f3ad356). Made here, in the
 # script's own shell, because api() runs inside $(…).
-secret_header MT_HDR ${BOSS_MACHINE_TOKEN:+"x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+machine_token_header MT_HDR "$BOSS_JOBS_URL" \
     || { echo "$(basename "$0"): the machine token's header file could not be written — nothing filed, never an unsigned write" >&2; exit 78; }
 
 api() { # <method> <path> [body]

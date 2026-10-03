@@ -30,7 +30,7 @@ impl PgCommerce {
         let lines: Vec<LineItemRow> = sqlx::query_as(
             "SELECT id, invoice_id, revenue_category, amount_cents, currency, description, ref_id, \
                     sku, qty, cost_basis_cents, cost_total_cents \
-             FROM invoice_line_items WHERE invoice_id = ANY($1) ORDER BY id",
+             FROM invoice_line_items WHERE invoice_id = ANY($1) ORDER BY id COLLATE \"C\"",
         )
         .bind(&ids)
         .fetch_all(&self.pool)
@@ -72,7 +72,7 @@ impl CommerceRepository for PgCommerce {
              FROM invoice_line_items l \
              JOIN invoices i ON i.id = l.invoice_id \
              GROUP BY month, l.revenue_category \
-             ORDER BY month DESC, l.revenue_category",
+             ORDER BY month DESC, l.revenue_category COLLATE \"C\"",
         )
         .fetch_all(&self.pool)
         .await
@@ -83,7 +83,7 @@ impl CommerceRepository for PgCommerce {
 
     async fn all_invoices(&self) -> Result<Vec<Invoice>, CommerceError> {
         let rows: Vec<InvoiceRow> =
-            sqlx::query_as("SELECT * FROM invoices ORDER BY issued_on DESC")
+            sqlx::query_as("SELECT * FROM invoices ORDER BY issued_on DESC, id COLLATE \"C\"")
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| CommerceError::Storage(e.to_string()))?;
@@ -99,6 +99,19 @@ impl CommerceRepository for PgCommerce {
         offset: i64,
         account_id: Option<&str>,
     ) -> Result<(Vec<Invoice>, i64), CommerceError> {
+        // Every list orders newest issue first with ties in BYTE order of
+        // id, and lines in byte order of theirs; ties had no order and
+        // the lines took the database's locale (backlog be459ab9, found
+        // by the adapters-agree suite). A negative bound is the caller's
+        // mistake, refused here rather than as the database's error (a
+        // 500); an account keyed by a NUL byte holds nothing, and TEXT
+        // cannot be asked about one.
+        if let Some(refused) = CommerceError::negative_page_bound(limit, offset) {
+            return Err(refused);
+        }
+        if account_id.is_some_and(|a| a.contains('\0')) {
+            return Ok((Vec::new(), 0));
+        }
         let (total,): (i64,) = match account_id {
             Some(cid) => {
                 sqlx::query_as("SELECT count(*) FROM invoices WHERE account_id = $1")
@@ -118,7 +131,7 @@ impl CommerceRepository for PgCommerce {
             Some(cid) => {
                 sqlx::query_as(
                     "SELECT * FROM invoices WHERE account_id = $1 \
-                 ORDER BY issued_on DESC LIMIT $2 OFFSET $3",
+                 ORDER BY issued_on DESC, id COLLATE \"C\" LIMIT $2 OFFSET $3",
                 )
                 .bind(cid)
                 .bind(limit)
@@ -127,7 +140,9 @@ impl CommerceRepository for PgCommerce {
                 .await
             }
             None => {
-                sqlx::query_as("SELECT * FROM invoices ORDER BY issued_on DESC LIMIT $1 OFFSET $2")
+                sqlx::query_as(
+                    "SELECT * FROM invoices ORDER BY issued_on DESC, id COLLATE \"C\" LIMIT $1 OFFSET $2",
+                )
                     .bind(limit)
                     .bind(offset)
                     .fetch_all(&self.pool)
@@ -156,7 +171,7 @@ impl CommerceRepository for PgCommerce {
              FROM invoices \
              WHERE status <> ALL($1) \
              GROUP BY account_id \
-             ORDER BY account_id",
+             ORDER BY account_id COLLATE \"C\"",
         )
         .bind(&not_owed)
         .fetch_all(&self.pool)
@@ -173,6 +188,11 @@ impl CommerceRepository for PgCommerce {
     }
 
     async fn invoice_by_id(&self, id: &str) -> Result<Option<Invoice>, CommerceError> {
+        // No stored id holds a NUL byte, and TEXT cannot be asked about
+        // one: the miss it is, not the encoding error (backlog be459ab9).
+        if id.contains('\0') {
+            return Ok(None);
+        }
         let row: Option<InvoiceRow> = sqlx::query_as("SELECT * FROM invoices WHERE id = $1")
             .bind(id)
             .fetch_optional(&self.pool)
@@ -184,7 +204,7 @@ impl CommerceRepository for PgCommerce {
         let lines: Vec<LineItemRow> = sqlx::query_as(
             "SELECT id, invoice_id, revenue_category, amount_cents, currency, description, ref_id, \
                     sku, qty, cost_basis_cents, cost_total_cents \
-             FROM invoice_line_items WHERE invoice_id = $1 ORDER BY id",
+             FROM invoice_line_items WHERE invoice_id = $1 ORDER BY id COLLATE \"C\"",
         )
         .bind(&invoice.id)
         .fetch_all(&self.pool)
@@ -201,46 +221,18 @@ impl CommerceRepository for PgCommerce {
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<InvoiceCreate, CommerceError> {
         // Invariant: line-item revenue + sales tax must equal the
-        // header rollup. Enforce in the adapter so a buggy caller
-        // can't persist a document whose total lies about its
-        // contents. An invoice with tax_cents=0 reduces this to
-        // `line_sum == amount_cents`; a tax-bearing invoice adds
-        // tax_cents to the RHS.
-        let line_sum: i64 = inv.line_items.iter().map(|l| l.amount_cents).sum();
-        if inv.line_items.is_empty() {
-            return Err(CommerceError::Storage(format!(
-                "invoice {} has no line items",
-                inv.id
-            )));
+        // header rollup, and much else — one statement of a malformed
+        // body for both adapters (`Invoice::malformed`), refused
+        // `Invalid` (a 400). These were `Storage` (a 500), and the
+        // currency, payment method, a repeated line id and a NUL byte
+        // were left to the column's constraints and encoding (backlog
+        // be459ab9, found by the adapters-agree suite).
+        if let Some(why) = inv.malformed() {
+            return Err(CommerceError::Invalid(why));
         }
-        if inv.tax_cents < 0 {
-            return Err(CommerceError::Storage(format!(
-                "invoice {} tax_cents={} must be non-negative",
-                inv.id, inv.tax_cents
-            )));
-        }
-        if inv.tax_cents > 0 && inv.tax_jurisdiction.is_none() {
-            return Err(CommerceError::Storage(format!(
-                "invoice {} has tax_cents={} but no tax_jurisdiction",
-                inv.id, inv.tax_cents
-            )));
-        }
-        if line_sum + inv.tax_cents != inv.amount_cents {
-            return Err(CommerceError::Storage(format!(
-                "invoice {} amount_cents={} but line items ({}) + tax ({}) sum to {}",
-                inv.id,
-                inv.amount_cents,
-                line_sum,
-                inv.tax_cents,
-                line_sum + inv.tax_cents
-            )));
-        }
-        if inv.line_items.iter().any(|l| l.currency != inv.currency) {
-            return Err(CommerceError::Storage(format!(
-                "invoice {} line items disagree on currency with header {}",
-                inv.id, inv.currency
-            )));
-        }
+        // The invoice as stored — lines under the header's id, in id
+        // order — is what is written, answered and recorded.
+        let inv = &inv.as_stored();
 
         // Transparent newtype — the bare kebab code the column stores.
         let status = inv.status.as_str();
@@ -346,7 +338,15 @@ impl CommerceRepository for PgCommerce {
             .bind(now)
             .execute(&mut *tx)
             .await
-            .map_err(|e| CommerceError::Storage(e.to_string()))?;
+            .map_err(|e| match &e {
+                // A line id another invoice holds: the caller's conflict
+                // (a 409), not a storage failure (backlog be459ab9). The
+                // transaction drops with this return, the header with it.
+                sqlx::Error::Database(db) if db.constraint() == Some("invoice_line_items_pkey") => {
+                    CommerceError::line_id_taken(&inv.id, &enriched.id)
+                }
+                _ => CommerceError::Storage(e.to_string()),
+            })?;
         }
 
         // Assemble the invoice (line_items carry sku + qty for the
@@ -567,7 +567,7 @@ impl CommerceRepository for PgCommerce {
         let lines: Vec<LineItemRow> = sqlx::query_as(
             "SELECT id, invoice_id, revenue_category, amount_cents, currency, description, ref_id, \
                     sku, qty, cost_basis_cents, cost_total_cents \
-             FROM invoice_line_items WHERE invoice_id = $1 ORDER BY id",
+             FROM invoice_line_items WHERE invoice_id = $1 ORDER BY id COLLATE \"C\"",
         )
         .bind(id)
         .fetch_all(&mut *tx)
@@ -870,6 +870,10 @@ async fn transition_in_tx(
     to: &str,
     paid_on: Option<chrono::NaiveDate>,
 ) -> Result<bool, CommerceError> {
+    // No stored id holds a NUL byte: the miss it is (backlog be459ab9).
+    if id.contains('\0') {
+        return Err(CommerceError::NotFound(format!("invoice {id:?}")));
+    }
     let not_owed: Vec<String> = InvoiceStatus::NOT_OWED
         .iter()
         .map(|s| s.to_string())
@@ -922,7 +926,7 @@ async fn fetch_invoice_in_tx(
         .map_err(|e| CommerceError::Storage(e.to_string()))?;
     let mut invoice = row.into_invoice();
     let lines: Vec<LineItemRow> = sqlx::query_as(
-        "SELECT id, invoice_id, revenue_category, amount_cents, currency, description, ref_id,                 sku, qty, cost_basis_cents, cost_total_cents          FROM invoice_line_items WHERE invoice_id = $1 ORDER BY id",
+        "SELECT id, invoice_id, revenue_category, amount_cents, currency, description, ref_id,                 sku, qty, cost_basis_cents, cost_total_cents          FROM invoice_line_items WHERE invoice_id = $1 ORDER BY id COLLATE \"C\"",
     )
     .bind(id)
     .fetch_all(&mut **tx)

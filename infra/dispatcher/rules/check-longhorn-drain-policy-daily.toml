@@ -1,0 +1,45 @@
+# Read Longhorn's node-drain-policy every day, so a policy relaxed for a
+# maintenance window cannot be left relaxed in silence.
+#
+# THE GAP (backlog 46584350). set-longhorn-drain-policy relaxes the
+# policy for the w-1 NVMe window of 2026-09-30 (backlog 52ea56ac, David's
+# option (a)): allow-if-replica-is-stopped lets a drain pass a node that
+# holds a volume's last healthy replica. It is meant to be set back after
+# w-1 boots, and "meant to" is a belief: nothing read the setting unless
+# a person ran node-status. Left relaxed, the next drain of w-1 — a
+# Talos upgrade, a reboot — takes the only copy of /work and
+# gate-runner-disk offline without anyone deciding so.
+#
+# THE READER. This rule files the read-only check-longhorn-drain-policy
+# once a day; watch-check-longhorn-drain-policy-daily judges its verdict
+# line and files an urgent alarm once a non-default value has stood 24
+# hours (the threshold lives in that rule's `when`), or when the check
+# could not read. The age is the API server's own managedFields time for
+# the write of `value`, not a clock this rule keeps, so a window that ends
+# on time costs nothing and one that does not is an alarm a day later at
+# most.
+#
+# NO GUARD. The check is read-only and idempotent; a `NOT open_*` guard
+# would let one unfinished request retire the cadence
+# (`a-dedup-guard-silently-retires-a-cadence`).
+#
+# The packet's subject is the SETTING, an identity this rule alone files,
+# so `cadence_roster::clock_cadences` derives a daily
+# `ops-request/longhorn-drain-policy` the silence sweep can measure.
+[[rule]]
+name = "check-longhorn-drain-policy-daily"
+why = """
+A TIMER, the standing exemption: "a day passed with the policy still
+relaxed" is no packet's event, so no Workflow consequence can fire it.
+Asked for on backlog 46584350 (David, 2026-09-30, for the w-1 NVMe
+window): an alarm if node-drain-policy stays non-default for more than
+24 hours after the window. It files the read-only
+check-longhorn-drain-policy verb; watch-check-longhorn-drain-policy-daily
+turns a verdict past the threshold into an alarm. It adds no routing:
+one firing spawns one ops-request, and what happens next is that
+protocol's row.
+"""
+schedule = { cadence = "daily", anchor_date = "2026-09-30" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"ops-request\"", subject_kind = "\"custom\"", subject = "\"longhorn-drain-policy\"", title = "\"read how long Longhorn's node-drain-policy has stood non-default\"", "metadata.host" = "\"forge\"", "metadata.verb" = "\"check-longhorn-drain-policy\"", "metadata.area" = "\"platform\"" }

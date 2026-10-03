@@ -129,8 +129,27 @@ pub fn router(state: AgentsApiState) -> Router {
     let shared = Arc::new(state);
     Router::new()
         .route("/api/agents", get(list))
+        .route("/api/agents/automations", get(list_automations))
         .route("/api/agents/batch", post(publish))
         .with_state(shared)
+}
+
+/// `GET /api/agents/automations` — every writing automation's row and
+/// the role it signs as (backlog ddf0773e, design abf9eeae car 1). The
+/// same reader posture as the roster: `can_read`, refused without an
+/// identity. Read-only by design — the rows land from the platform
+/// bundle, and no door writes a role here.
+async fn list_automations(
+    State(state): State<Arc<AgentsApiState>>,
+    CurrentUser(user): CurrentUser,
+) -> Response {
+    if !can_read(&user) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match state.registry.list_automations().await {
+        Ok(rows) => Json(serde_json::json!({ "data": rows, "total": rows.len() })).into_response(),
+        Err(e) => err_response(e),
+    }
 }
 
 fn err_response(e: AgentsError) -> Response {
@@ -700,5 +719,47 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// The automation half reads back what the platform seed landed —
+    /// to the probe reader, never to a caller with no identity — and is
+    /// not part of the roster: an automation holding platform-admin is
+    /// not a role holder the dispatcher could nominate (backlog
+    /// ddf0773e, design abf9eeae car 1).
+    #[tokio::test]
+    async fn the_automations_read_back_and_stay_off_the_roster() {
+        use crate::agents::automations::AutomationActor;
+        let registry = Arc::new(InMemoryAgents::new());
+        let row = AutomationActor {
+            id: "automation:dispatcher".into(),
+            role: "platform-admin".into(),
+            description: "the dispatcher".into(),
+            signs_for: Some("automation:rule:".into()),
+        };
+        let stamp = boss_core::publisher::EventStamp::new(
+            "jobs",
+            boss_core::actor::ActorId::Automation("platform-workflow-seed".into()),
+        );
+        registry
+            .declare_automations(std::slice::from_ref(&row), &stamp)
+            .await
+            .unwrap();
+        let (status, body) = send(
+            app(&registry),
+            "GET",
+            "/api/agents/automations",
+            None,
+            probe_reader(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["total"], 1);
+        assert_eq!(v["data"][0], serde_json::to_value(&row).unwrap());
+        let (status, _) = send(app(&registry), "GET", "/api/agents/automations", None, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (_, roster) = send(app(&registry), "GET", "/api/agents", None, probe_reader()).await;
+        let roster: Value = serde_json::from_str(&roster).unwrap();
+        assert_eq!(roster["total"], 0, "{roster}");
     }
 }

@@ -24,8 +24,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use boss_core::machine_token::BlockingClient;
 use boss_inventory::types::VendorBehavior;
-use reqwest::blocking::Client;
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -299,9 +299,14 @@ pub fn seed_tenant_data(
             .with_context(|| "x-boss-user header value")?,
     );
 
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
+    // Stamps the estate machine token on every request from the
+    // process's watched source and follows no redirect (design 6805c764
+    // car 2, the blocking-senders slice, 2026-09-29) — every write below
+    // lands on a service port the machine gate guards, and until then
+    // this seed carried no token at all.
+    let client = BlockingClient::build(
+        reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(15)),
+    )?;
 
     // Rebase the formula clock to the brewery epoch so opening-balance
     // JEs + account/vendor creates stamp at 2025-04-01 (or
@@ -483,7 +488,7 @@ fn brewery_data_dir(seeds_dir: &Path) -> std::path::PathBuf {
 /// error only warns (opening JEs then land on wallclock if clock-api
 /// is in wall mode). Hard-fails only when BOSS_EPOCH_START is set but
 /// not parseable as YYYY-MM-DD.
-fn configure_clock_to_epoch(client: &Client) -> Result<()> {
+fn configure_clock_to_epoch(client: &BlockingClient) -> Result<()> {
     // Pin every seed-side write to the brewery's epoch start so
     // opening-balance JEs (raw 1300, cash 1000, FG 1320 via
     // products PUT) get stamped at 2025-04-01 rather than wall-
@@ -559,7 +564,7 @@ fn configure_clock_to_epoch(client: &Client) -> Result<()> {
 /// customer cluster, it's the placeholder Subject that pre-
 /// email-OTP guest orders open against.
 fn ensure_direct_shop_account(
-    client: &Client,
+    client: &BlockingClient,
     api_base: &str,
     headers: &reqwest::header::HeaderMap,
 ) -> Result<()> {
@@ -616,7 +621,7 @@ fn ensure_direct_shop_account(
 /// label so it's visually distinguishable on AccountsList until
 /// the deeper account-stage UI lands).
 fn ensure_prospect_account(
-    client: &Client,
+    client: &BlockingClient,
     api_base: &str,
     headers: &reqwest::header::HeaderMap,
     id: &str,
@@ -685,7 +690,7 @@ fn ensure_prospect_account(
 }
 
 fn ensure_account_with_id(
-    client: &Client,
+    client: &BlockingClient,
     api_base: &str,
     headers: &reqwest::header::HeaderMap,
     id: &str,
@@ -753,7 +758,7 @@ fn ensure_account_with_id(
 }
 
 fn ensure_vendor(
-    client: &Client,
+    client: &BlockingClient,
     api_base: &str,
     headers: &reqwest::header::HeaderMap,
     i: u32,
@@ -872,7 +877,7 @@ fn load_vendor_behavior_templates(seeds_dir: &Path) -> HashMap<String, serde_jso
 /// and are loaded via the public API like every other external
 /// caller. Idempotent via 409-tolerant POSTs.
 fn seed_brewery_operator_hires(
-    client: &Client,
+    client: &BlockingClient,
     people_base: &str,
     headers: &reqwest::header::HeaderMap,
     seeds_dir: &Path,
@@ -951,7 +956,7 @@ fn seed_brewery_operator_hires(
 /// Idempotent: a 409 Conflict on duplicate id is treated as
 /// success, so re-running the seeder is a no-op.
 fn seed_employees(
-    client: &Client,
+    client: &BlockingClient,
     people_base: &str,
     headers: &reqwest::header::HeaderMap,
 ) -> Result<()> {
@@ -1105,29 +1110,52 @@ fn seed_employees(
     Ok(())
 }
 
+/// One page of the inbox read's `{data, total, …}` envelope: the
+/// subjects on it, how many rows it held, and the total. Any other body
+/// is refused naming `url` — an empty answer here would read as "nothing
+/// posted yet" and post every scripted thread again.
+fn read_inbox_page(url: &str, body: &serde_json::Value) -> Result<(Vec<String>, usize, u64)> {
+    let (Some(rows), Some(total)) = (body["data"].as_array(), body["total"].as_u64()) else {
+        anyhow::bail!("GET {url}: the body is not the inbox's {{data, total}} envelope");
+    };
+    let subjects = rows
+        .iter()
+        .filter_map(|m| m["subject"].as_str().map(String::from))
+        .collect();
+    Ok((subjects, rows.len(), total))
+}
+
 fn ensure_messages(
-    client: &Client,
+    client: &BlockingClient,
     base: &str,
     headers: &reqwest::header::HeaderMap,
 ) -> Result<()> {
     // Idempotence by sender+subject — refuse to double-post the
     // same scripted thread on reruns. Archived threads included: the
     // inbox read leaves them out by default (backlog 8578b91e), and a
-    // thread the operator archived was still posted.
-    let inbox_url = format!(
-        "{base}/api/messages/inbox/{}?include_archived=true",
-        OPERATORS[0]
-    );
-    let existing_subjects: std::collections::HashSet<String> =
-        match client.get(&inbox_url).headers(headers.clone()).send() {
-            Ok(r) if r.status().is_success() => {
-                let body: Vec<serde_json::Value> = r.json().unwrap_or_default();
-                body.iter()
-                    .filter_map(|m| m.get("subject").and_then(|v| v.as_str()).map(String::from))
-                    .collect()
-            }
-            _ => Default::default(),
+    // thread the operator archived was still posted. The read is paged
+    // (backlog 74da899d), so this reads page after page to the total:
+    // a subject on an unread page would be posted again.
+    let mut existing_subjects = std::collections::HashSet::<String>::new();
+    let mut offset = 0usize;
+    loop {
+        let inbox_url = format!(
+            "{base}/api/messages/inbox/{}?include_archived=true&limit=1000&offset={offset}",
+            OPERATORS[0]
+        );
+        let body: serde_json::Value = match client.get(&inbox_url).headers(headers.clone()).send() {
+            Ok(r) if r.status().is_success() => r
+                .json()
+                .with_context(|| format!("GET {inbox_url}: the body is not JSON"))?,
+            _ => break,
         };
+        let (subjects, rows, total) = read_inbox_page(&inbox_url, &body)?;
+        existing_subjects.extend(subjects);
+        offset += rows;
+        if rows == 0 || offset as u64 >= total {
+            break;
+        }
+    }
 
     let url = format!("{base}/api/messages/send");
     for thread in &fixtures::messages().threads {
@@ -1186,7 +1214,7 @@ fn ensure_messages(
 // — see `fixtures::bulletins()`.
 
 fn ensure_bulletins(
-    client: &Client,
+    client: &BlockingClient,
     base: &str,
     headers: &reqwest::header::HeaderMap,
 ) -> Result<()> {
@@ -1242,7 +1270,7 @@ fn ensure_bulletins(
 // ---------------------------------------------------------------------------
 
 fn ensure_reservations(
-    client: &Client,
+    client: &BlockingClient,
     base: &str,
     headers: &reqwest::header::HeaderMap,
 ) -> Result<()> {
@@ -1381,7 +1409,7 @@ fn ensure_reservations(
 /// `examples/brewery/data/catalog.json`. Each row becomes a
 /// AssetModel — POST /api/catalog/models.
 fn ensure_equipment_catalog(
-    client: &Client,
+    client: &BlockingClient,
     api_base: &str,
     headers: &reqwest::header::HeaderMap,
     seeds_dir: &Path,
@@ -1417,7 +1445,7 @@ fn ensure_equipment_catalog(
 /// upsert (ON CONFLICT (id) DO UPDATE), so reruns are idempotent
 /// without needing 409-swallow plumbing on the seeder side.
 fn ensure_marketing_assets(
-    client: &Client,
+    client: &BlockingClient,
     api_base: &str,
     headers: &reqwest::header::HeaderMap,
     seeds_dir: &Path,
@@ -1457,7 +1485,7 @@ fn ensure_marketing_assets(
 /// (DR 1500 / CR 2100) come from the runtime `equipment-purchase`
 /// Workflow, not this seed pass.
 fn ensure_asset_opening_balances(
-    client: &Client,
+    client: &BlockingClient,
     ledger_base: &str,
     headers: &reqwest::header::HeaderMap,
     seeds_dir: &Path,
@@ -1554,7 +1582,7 @@ fn ensure_asset_opening_balances(
 /// Month end-dates: 2025-04-30 … 2026-03-31 (matches the
 /// 2025-04-01 → 2026-03-31 sim window).
 fn ensure_asset_depreciation_schedule(
-    client: &Client,
+    client: &BlockingClient,
     ledger_base: &str,
     headers: &reqwest::header::HeaderMap,
     seeds_dir: &Path,
@@ -1668,7 +1696,7 @@ fn ensure_asset_depreciation_schedule(
 /// `examples/brewery/data/assets.json`. Each row becomes an asset
 /// (per-unit Subject) — POST /api/assets.
 fn ensure_brewhouse_assets(
-    client: &Client,
+    client: &BlockingClient,
     api_base: &str,
     headers: &reqwest::header::HeaderMap,
     seeds_dir: &Path,
@@ -1769,7 +1797,7 @@ fn ensure_brewhouse_assets(
 /// finished_product_inventory POSTs". Those POSTs are this
 /// function.
 fn ensure_finished_product_inventory(
-    client: &Client,
+    client: &BlockingClient,
     api_base: &str,
     headers: &reqwest::header::HeaderMap,
 ) -> Result<()> {
@@ -1940,7 +1968,7 @@ fn ensure_finished_product_inventory(
 /// Consolidated here from the offline engine's `seed_parts` so ONE seed
 /// path owns raw materials for both the live demo and the CI regen.
 fn ensure_raw_inventory_opening_balances(
-    client: &Client,
+    client: &BlockingClient,
     inventory_base: &str,
     headers: &reqwest::header::HeaderMap,
     seeds_dir: &std::path::Path,
@@ -2000,7 +2028,7 @@ fn ensure_raw_inventory_opening_balances(
 const CASH_OPENING_BALANCE_CENTS: i64 = 1_000_000_000; // $10,000,000
 
 fn ensure_cash_opening_balance(
-    client: &Client,
+    client: &BlockingClient,
     ledger_base: &str,
     headers: &reqwest::header::HeaderMap,
 ) -> Result<()> {
@@ -2043,7 +2071,7 @@ fn ensure_cash_opening_balance(
 /// $3.50/bbl, which understates real TTB liability ~3.7× at the
 /// tenant's stated volume.
 fn ensure_excise_rate_schedules(
-    client: &Client,
+    client: &BlockingClient,
     ledger_base: &str,
     headers: &reqwest::header::HeaderMap,
     seeds_dir: &Path,
@@ -2101,7 +2129,7 @@ fn ensure_excise_rate_schedules(
 /// Best-effort reachability probe. Returns false on any error
 /// (connection refused, timeout, non-2xx) so callers can skip a
 /// seed step without raising.
-fn base_reachable(client: &Client, base: &str, health_path: &str) -> bool {
+fn base_reachable(client: &BlockingClient, base: &str, health_path: &str) -> bool {
     let url = format!("{base}{health_path}");
     matches!(
         client
@@ -2110,4 +2138,31 @@ fn base_reachable(client: &Client, base: &str, health_path: &str) -> bool {
             .send(),
         Ok(r) if r.status().is_success()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The seed's idempotence read takes the inbox envelope a page at a
+    /// time (backlog 74da899d): the subjects, how many rows the page held,
+    /// and the total — and refuses any other body, naming the read, since
+    /// an empty set here would post every scripted thread twice.
+    #[test]
+    fn an_inbox_page_gives_its_subjects_and_the_total_and_any_other_body_is_refused() {
+        let body = json!({
+            "data": [{"id": "m1", "subject": "Hello"}, {"id": "m2", "subject": "Again"}],
+            "total": 5, "limit": 2, "offset": 0, "kinds": [],
+        });
+        let page = read_inbox_page("/api/messages/inbox/x", &body).unwrap();
+        assert_eq!(page, (vec!["Hello".to_string(), "Again".to_string()], 2, 5));
+        for bad in [
+            json!([{"subject": "Hello"}]),
+            json!({"data": []}),
+            json!(null),
+        ] {
+            let err = read_inbox_page("/api/messages/inbox/x", &bad).unwrap_err();
+            assert!(err.to_string().contains("/api/messages/inbox/x"), "{err}");
+        }
+    }
 }

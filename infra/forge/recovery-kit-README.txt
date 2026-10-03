@@ -80,7 +80,6 @@ above it.
 
 4. THE FORGE HOST'S OWN CREDENTIALS, then its converge
 
-     secrets/github.token  -> /etc/boss-publish/github.token  root:root 0600
      runner/.runner        -> the forgejo-runner unit's WorkingDirectory
                               (the MANIFEST says where it was read from)
      sudoers/*             -> /etc/sudoers.d/  root:root 0440, then
@@ -110,13 +109,30 @@ above it.
 
    The service-account key to the offsite bucket that holds the nightly
    Postgres dumps (boss-<stamp>.sql.gz) and file-store archives
-   (boss-files-<stamp>.tar.gz):
+   (boss-files-<stamp>.tar.gz). The bucket is the ONE offsite copy:
+   boss-gcp keeps none since 2026-10-01.
+
+   The live estate records remote archive validation with:
+     boss ops forge check-gcs-backup --wait
+   It also runs weekly. Its receipt names the newest database object's
+   generation, metadata, downloaded byte count and SHA-256, then proves
+   gzip integrity and the completion trailer. It reads the existing
+   Secret; no key is copied from this kit to perform the routine check.
+   This proves remote archive integrity, not a database restore. Older
+   boss-gcp dumps may have no bucket copy: dumps modified before
+   2026-09-11 09:10 UTC need David's decision on a signed reclaim plan
+   that lists each dump's mtime. A successful check authorizes no reclaim.
 
      gcloud auth activate-service-account --key-file gcs/sa.json
      gcloud storage ls "gs://$(cat gcs/bucket)/"
 
-   Restore the newest dump and the archive stamped beside it. Put the
-   key back where the backup reads it:
+   Fetch the newest dump and the archive stamped beside it, the stamp
+   read from that list:
+
+     gcloud storage cp "gs://$(cat gcs/bucket)/boss-<stamp>.sql.gz" .
+     gcloud storage cp "gs://$(cat gcs/bucket)/boss-files-<stamp>.tar.gz" .
+
+   Restore those two. Put the key back where the backup reads it:
 
      kubectl -n boss create secret generic boss-gcs-offsite \
          --from-file=sa.json=gcs/sa.json --from-file=bucket=gcs/bucket
@@ -129,8 +145,10 @@ above it.
 WHAT IS NOT ON THIS STICK
 -------------------------
 The passphrase. Hardware keys and passkeys. The Google, GitHub and
-Cloudflare accounts and their second factors -- docs/runbooks/
-access-recovery.md in the repository is the map of those. The cluster's
+Cloudflare accounts and their second factors -- the printed recovery
+sheet maps those, under its road
+"The accounts outside the system: Google, GitHub, Cloudflare"
+(its source is infra/recovery/re-entry.toml). The cluster's
 etcd state (the Postgres dump is the data; the repository is the
 configuration). The credential broker's root tokens, which live in
 cluster Secrets and are re-placed by hand.

@@ -13,8 +13,8 @@ use boss_classes_client::ClassesClient;
 use boss_core::primitives::ClassRef;
 use boss_core::publisher::DomainPublisher;
 use boss_people_client::PeopleClient;
-use boss_policy::{Action, Decision, Resource, Scope};
-use boss_policy_client::{CurrentUser, PolicyClient};
+use boss_policy::{Decision, Scope};
+use boss_policy_client::{CurrentUser, Pair, PolicyClient, controls};
 
 use crate::port::{CommerceError, CommerceRepository, InvoiceCreate};
 
@@ -22,6 +22,7 @@ fn error_response(err: CommerceError) -> Response {
     match err {
         CommerceError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
         CommerceError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
+        CommerceError::Invalid(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
         CommerceError::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
     }
 }
@@ -275,7 +276,7 @@ async fn check_revenue_category(
     }
 }
 
-/// Ask policy for `action` on `Resource::invoice()`, answering the
+/// Ask policy for an invoice control (`CREATE_INVOICE`, `UPDATE_INVOICE`), answering the
 /// response that refuses. Every write handler here asks it, so the
 /// batch door and the status moves ask exactly what create asks —
 /// until backlog 6c0f6547 (2026-09-26) create was the only one that
@@ -283,9 +284,9 @@ async fn check_revenue_category(
 async fn require<R: CommerceRepository>(
     state: &CommerceApiState<R>,
     user: &boss_policy_client::User,
-    action: Action,
+    control: Pair,
 ) -> Result<(), Response> {
-    require_on(state.policy.as_ref(), user, action, Resource::invoice()).await
+    require_on(state.policy.as_ref(), user, control).await
 }
 
 /// One policy question for a commerce write, and the response that
@@ -305,17 +306,17 @@ async fn require<R: CommerceRepository>(
 pub(crate) async fn require_on(
     policy: &dyn PolicyClient,
     user: &boss_policy_client::User,
-    action: Action,
-    resource: Resource,
+    control: Pair,
 ) -> Result<(), Response> {
-    match policy.check(user, action, resource.clone()).await {
+    match policy.ask(user, control).await {
         Ok(Decision::Allow { scope: Scope::All }) => Ok(()),
         Ok(Decision::Allow { scope }) => Err((
             StatusCode::FORBIDDEN,
             format!(
-                "{} on {resource} is granted to role {} only at scope {}; this write has no \
+                "{} on {} is granted to role {} only at scope {}; this write has no \
                  row predicate, so only scope all admits it",
-                action.as_str(),
+                control.action().as_str(),
+                control.resource_name(),
                 user.role,
                 scope.to_db_string(),
             ),
@@ -338,7 +339,7 @@ async fn create_invoice<R: CommerceRepository + 'static>(
     // status or category (403) from an unregistered one (400) — the
     // assets batch door had the same order (backlog f922edea). A
     // refused caller now learns nothing and costs the registry nothing.
-    if let Err(resp) = require(&state, &user, Action::Create).await {
+    if let Err(resp) = require(&state, &user, controls::CREATE_INVOICE).await {
         return resp;
     }
     // Class-registry gate: the invoice status must be a registered
@@ -413,7 +414,7 @@ async fn batch_invoices<R: CommerceRepository + 'static>(
     // One question for the whole batch, before any row: the same
     // Create on invoice that /create asks. A refusal is the batch's,
     // not a per-row skip — the caller asked for all of it.
-    if let Err(resp) = require(&state, &user, Action::Create).await {
+    if let Err(resp) = require(&state, &user, controls::CREATE_INVOICE).await {
         return resp;
     }
     let mut inserted = 0u64;
@@ -554,7 +555,7 @@ async fn mark_invoice_paid<R: CommerceRepository + 'static>(
     CurrentUser(user): CurrentUser,
     body: Option<axum::Json<MarkPaidBody>>,
 ) -> Response {
-    if let Err(resp) = require(&state, &user, Action::Update).await {
+    if let Err(resp) = require(&state, &user, controls::UPDATE_INVOICE).await {
         return resp;
     }
     let now = boss_clock_client::now_from(&state.clock).await;
@@ -579,7 +580,7 @@ async fn mark_invoice_past_due<R: CommerceRepository + 'static>(
     Path(id): Path<String>,
     CurrentUser(user): CurrentUser,
 ) -> Response {
-    if let Err(resp) = require(&state, &user, Action::Update).await {
+    if let Err(resp) = require(&state, &user, controls::UPDATE_INVOICE).await {
         return resp;
     }
     // Outbox phase 2: recorded in the adapter's transaction.
@@ -598,7 +599,7 @@ async fn mark_invoice_written_off<R: CommerceRepository + 'static>(
     // A write-off is a status move like paid and past-due, so it asks
     // Update rather than Close; every live caller holding one holds
     // the other (triage of 6c0f6547).
-    if let Err(resp) = require(&state, &user, Action::Update).await {
+    if let Err(resp) = require(&state, &user, controls::UPDATE_INVOICE).await {
         return resp;
     }
     // Outbox phase 2: the adapter records the event in the flip's own
@@ -634,7 +635,7 @@ async fn write_off_invoice_from_past_due<R: CommerceRepository + 'static>(
 ) -> Response {
     // Policy before the trigger is read: a refused caller learns
     // nothing about which shapes resolve to an invoice.
-    if let Err(resp) = require(&state, &user, Action::Update).await {
+    if let Err(resp) = require(&state, &user, controls::UPDATE_INVOICE).await {
         return resp;
     }
     let invoice_id = if let Some(step_id) = body
@@ -687,6 +688,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use boss_people_client::PeopleClientError;
+    use boss_policy::{Action, Resource};
     use tower::ServiceExt;
 
     use crate::in_memory::InMemoryCommerce;

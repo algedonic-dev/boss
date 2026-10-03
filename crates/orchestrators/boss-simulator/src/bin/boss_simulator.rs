@@ -313,7 +313,10 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding HTTP listener on {addr}"))?;
     info!(addr = %addr, static_dir = %static_dir, "boss-simulator listening");
-    let app = boss_core::machine_gate::mount(app, "simulator", &["/simulator/api/health"]);
+    // No database here, so no outbox: this gate's facts reach no log,
+    // and a clean window that names `simulator` is never clean (design
+    // 21946380) — said at WARN by the mount.
+    let app = boss_core::machine_gate::mount(app, "simulator", &["/simulator/api/health"], None);
     axum::serve(listener, app).await.context("serving HTTP")?;
     Ok(())
 }

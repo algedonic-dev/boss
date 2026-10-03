@@ -74,6 +74,7 @@ label = "Replace a disk"
 category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
+metadata = { department = "it" }
 description = "Changing the storage under an estate host without losing what only that host holds. Every step demands the evidence that a swap which looks clean can still have lost something: a credential no tree holds, a registration nothing re-issues, a service that starts but cannot do its work. The protocol refuses to reach the physical act until a restorable backup exists and the work aimed at the host has been held."
 
 [[workflow.step]]

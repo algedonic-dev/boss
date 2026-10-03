@@ -40,7 +40,7 @@ const wireThird = (third: string, regions: ReadonlyArray<string>): Wire => ({
 
 /** The partition the server sends (boss_jobs::regions::THIRDS). */
 const SERVED: ReadonlyArray<Wire> = [
-  wireThird('queue-management', ['receiving', 'marshalling']),
+  wireThird('queue-management', ['sensors', 'receiving', 'marshalling']),
   wireThird('actors-building', ['shop-floor', 'gates', 'garage']),
   wireThird('delivery', ['dock', 'track', 'arrivals', 'shed', 'publish']),
 ];
@@ -66,7 +66,7 @@ const wireBorder = (from: string, to: string, over: Wire = {}): Wire => ({
   last_crossed: null,
   waiting: 0,
   holds: [],
-  machine: { name: 'm', kind: 'actors', last_fired: null, silent_for_minutes: null, expected_every_minutes: null, silent: null, why: '' },
+  machine: { name: 'm', kind: 'actors', last_fired: null, silent_for_minutes: null, expected_every_minutes: null, silent: null, why: '', withheld: false },
   state: 'clear',
   why: '',
   ...over,
@@ -84,7 +84,7 @@ const names = (groups: ReturnType<typeof stripGroups>) =>
 describe('the strip’s rows', () => {
   it('groups by the server’s thirds, in their order and each third’s own order', () => {
     expect(names(stripGroups(regions(), null))).toEqual([
-      ['queue-management', ['receiving', 'marshalling']],
+      ['queue-management', ['sensors', 'receiving', 'marshalling']],
       ['actors-building', ['shop-floor', 'gates', 'garage']],
       ['delivery', ['dock', 'track', 'arrivals', 'shed', 'publish']],
     ]);
@@ -105,7 +105,7 @@ describe('the strip’s rows', () => {
     expect(last.third).toBe('unplaced');
     expect(last.label).toBe('In no third');
     // The line as a car walks it, then the sidings — not the payload's order.
-    expect(last.rows.map((r) => r.name)).toEqual(['shop-floor', 'gates', 'track', 'arrivals', 'shed', 'garage', 'publish']);
+    expect(last.rows.map((r) => r.name)).toEqual(['shop-floor', 'gates', 'track', 'arrivals', 'shed', 'garage', 'publish', 'sensors']);
   });
 
   it('a server older than the thirds block still draws every region, under one heading that says so', () => {

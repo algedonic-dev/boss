@@ -52,15 +52,17 @@
   import { onMount, untrack } from 'svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { navigate } from '@boss/web-kit/nav';
+  import { safeLinkHref } from '@boss/web-kit/links';
   import { fetchRemote, type Remote } from '../../data/remote';
-  import { countText, fetchRegions, lampOf, stateText, type Regions } from './regions';
+  import { countText, fetchRegions, lampOf, regionHref, sectionHref, stateText, type Regions } from './regions';
   import { markOf, selectionOf, unreadStationOf, type MapSelection } from './selection';
   import { boardsOf, sectionCells, stationCells, type PanelCell } from './panel';
   import { hasInterior } from './region-contents';
   import { hasPlatforms } from './world-interior';
   import { fetchBorders, type Borders } from './borders';
   import { fetchRoutes, type Routes } from './routes';
-  import { NEEDS_YOU_URL, parseNeedsYou, type LastGood, type NeedsYou } from './hud';
+  import { NEEDS_YOU_URL, parseNeedsYou, outranksBoard, needsYouBoard, type Figure, type LastGood, type NeedsYou } from './hud';
+  import { presentationHref } from './map-navigation';
   import HudFrame from './HudFrame.svelte';
   import WorldMap from './WorldMap.svelte';
   import TransitMap from './TransitMap.svelte';
@@ -70,6 +72,7 @@
   import YardStatusPanel from './YardStatusPanel.svelte';
   import ConductorFeed from '../monitoring/ConductorFeed.svelte';
   import CrewBoardPage from '../crew/CrewBoardPage.svelte';
+  import SensorsPanel from '../sensors/SensorsPanel.svelte';
   import ReceivingYardPage from '../receiving/ReceivingYardPage.svelte';
   import MarshallingYardPage from '../marshalling/MarshallingYardPage.svelte';
   import FeedbackTriagePage from '../feedback/FeedbackTriagePage.svelte';
@@ -82,8 +85,10 @@
     /** The Department Map's selection — `/it?at=<name>`. Absent, nothing
      *  is selected and no panel opens. */
     at?: string;
+    overview?: boolean;
+    detail?: boolean;
   }>;
-  let { at = undefined }: Props = $props();
+  let { at = undefined, overview = false, detail = false }: Props = $props();
 
   /** A phone: the world is drawn as the strip map rather than the SVG
    *  shrunk (design 62de32ae decision 12, car G). ONE of the two is
@@ -98,7 +103,7 @@
    *  design e765b3fc car M2) ride the transit map, so that flight
    *  draws it too — and the world map's rate-replay tokens are never
    *  shown under it. */
-  const transit = $derived(flightOn('it-map-transit') || flightOn('it-map-live'));
+  const transit = $derived(overview || flightOn('it-map-transit') || flightOn('it-map-live'));
 
   let regions = $state<Remote<Regions>>({ kind: 'loading' });
   let borders = $state<Remote<Borders>>({ kind: 'loading' });
@@ -178,6 +183,7 @@
                   route: picked.route,
                   windowHours: routes.kind === 'ready' ? routes.data.window_hours : 24,
                   bordersRead: borders.kind === 'ready',
+                  observedWithheld: routes.kind === 'ready' ? routes.data.observed_withheld : null,
                 },
           )
         : [],
@@ -216,11 +222,12 @@
    *  bound height is still 0 on the first paint of a linked selection. */
   let panel = $state<HTMLElement | null>(null);
   $effect(() => {
-    const key = at;
+    const selection = { at, detail };
     const el = panel;
     const map = pinned ? pin : null;
-    if (key === undefined || el === null) return;
+    if (selection.at === undefined || el === null) return;
     untrack(() => {
+      if (overview) el.focus({ preventScroll: true });
       if (map === null) {
         el.scrollIntoView({ block: 'nearest' });
         return;
@@ -241,16 +248,21 @@
    *  newcomer loses nothing). panel.ts `STATION_BOARDS` is the table. */
   const WHERE =
     'Feedback and the IT backlog are in the Receiving station\'s panel (the backlog in Marshalling\'s too), the Crew Board in the Shop floor\'s, and yard status and the conductor\'s activity in the Track\'s, with the Dock\'s and the Garage\'s lanes in theirs.';
+  const figureText = (figure: Figure): string => figure.kind === 'zero' ? '0' : figure.kind === 'unread' ? 'unread' : figure.text;
+  const urgent = $derived(outranksBoard(regions));
+  const personal = $derived(needsYouBoard(needs, readAt ?? 0));
+  const inspectionHref = $derived(picked.kind === 'station' ? regionHref(picked.name) : picked.kind === 'section' ? sectionHref(picked.from, picked.to) : '/it');
 </script>
 
 <div class="theme-exec yard-root">
   <!-- Named what its sidebar row is named (design e765b3fc, car N1):
        it answered to "Train Yard", "The IT world" and "IT · Forge
        line" at once (page audit gap f9850601). -->
+  <a class="company-back" href="/map" onclick={(e) => go(e, '/map')}>Company System Map</a>
   <PageHeader
     eyebrow="IT"
-    title="Department Map"
-    subtitle={(transit
+    title={overview ? 'IT · Transit map' : 'Department Map'}
+    subtitle={overview ? 'Follow recorded work. Select a station or route to orient, then open its detailed board.' : (transit
       ? 'The network as a transit monitor: each region a station on its line, each border a section of track with what waits on it, and the alarms board beside it. Select a station or a section to open its detail below the map. '
       : 'The territories along the packet flow, and the borders between them carrying what crosses, what waits and the machine that moves it. Select a territory to open its detail below the map. ') + WHERE}
   />
@@ -260,7 +272,14 @@
        next up and the machines, above the map. It stands whatever the
        reads did: a failed read turns its rows to `?` rather than taking
        the frame away, and each row fails alone. -->
-  <HudFrame read={regions} {readAt} {lastGood} {needs} />
+  {#if overview}
+    <details class="map-context">
+      <summary>Outranks regular order: {urgent.kind === 'unread' ? 'unread' : figureText(urgent.count)} · Needs you: {personal.kind === 'unread' ? 'unread' : figureText(personal.count)} · priorities and machines</summary>
+      <HudFrame read={regions} {readAt} {lastGood} {needs} />
+    </details>
+  {:else}
+    <HudFrame read={regions} {readAt} {lastGood} {needs} />
+  {/if}
 
   {#if regions.kind === 'loading'}
     <div class="yard-empty">Reading the regions…</div>
@@ -286,11 +305,15 @@
         <header class="panel-head">
           <span class="panel-kind">Station</span>
           <h2 class="panel-title">{unread.title}</h2>
-          <a class="panel-close" data-close href="/it" aria-label="close the {unread.name} selection"
-            onclick={(e) => go(e, '/it')}>close</a>
+          <a class="panel-close" data-close href={safeLinkHref(presentationHref('/it', overview))} aria-label="close the {unread.name} selection"
+            onclick={(e) => go(e, presentationHref('/it', overview))}>close</a>
         </header>
         <p class="panel-none">Its readings come with the regions read, which failed; what stands in it reads on its own, below.</p>
-        {@render station(unread.name)}
+        {#if overview && !detail}
+          <a href={safeLinkHref(`${presentationHref(regionHref(unread.name), true)}&detail=1`)} onclick={(e) => go(e, `${presentationHref(regionHref(unread.name), true)}&detail=1`)}>Open detailed board</a>
+        {:else}
+          {@render station(unread.name)}
+        {/if}
       </section>
     {/if}
   {:else}
@@ -299,7 +322,7 @@
       {#if phone.current}
         <PhoneStrip
           regions={regions.data}
-          borders={borders.kind === 'ready' ? borders.data : null} />
+          borders={borders.kind === 'ready' ? borders.data : null} {overview} />
       {:else if transit}
         <!-- The same two reads, drawn as a transit map (design 16091dfb):
              stations, sections and the alarms board, with the selection
@@ -308,7 +331,7 @@
           regions={regions.data}
           routes={routes.kind === 'ready' ? routes.data : null}
           borders={borders.kind === 'ready' ? borders.data : null}
-          selected={markOf(picked)} />
+          selected={markOf(picked)} {overview} />
       {:else}
         <WorldMap
           regions={regions.data}
@@ -316,7 +339,7 @@
           {bordersAt} />
       {/if}
     </div>
-    {#if !phone.current}
+    {#if !phone.current && !overview}
       <!-- THE PLANT along the map's edge (design 62de32ae, decision 11):
            the host runners serve every region, so they stand under the
            map rather than in one of its stations. -->
@@ -338,6 +361,8 @@
         class="map-panel"
         bind:this={panel}
         data-map-panel
+        data-map-overview={overview && !detail ? 'true' : undefined}
+        tabindex="-1"
         data-selection={name}
         data-kind={picked.kind}
         data-state={state}
@@ -346,10 +371,13 @@
           {#if state !== 'unknown'}
             <span class="panel-lamp {lampOf(state)}" aria-hidden="true"></span>
           {/if}
-          <span class="panel-kind">{picked.kind === 'station' ? 'Station' : picked.kind === 'section' ? 'Section' : 'Selection'}</span>
+          <span class="panel-kind">{picked.kind === 'station' ? overview ? 'IT area' : 'Station' : picked.kind === 'section' ? overview ? 'Route' : 'Section' : 'Selection'}</span>
           <h2 class="panel-title">{picked.kind === 'unknown' ? name : picked.title}</h2>
-          <a class="panel-close" data-close href="/it" aria-label="close the {name} selection"
-            onclick={(e) => go(e, '/it')}>close</a>
+          {#if overview && detail}
+            <a href={safeLinkHref(presentationHref(inspectionHref, true))} onclick={(e) => go(e, presentationHref(inspectionHref, true))}>Back to overview</a>
+          {/if}
+          <a class="panel-close" data-close href={safeLinkHref(presentationHref('/it', overview))} aria-label="close the {name} selection"
+            onclick={(e) => go(e, presentationHref('/it', overview))}>close</a>
         </header>
         {#if picked.kind === 'unknown'}
           <p class="panel-none">Nothing on this map is named “{name}”.</p>
@@ -360,6 +388,13 @@
               <span class="panel-state">{stateText(picked.region)}</span>
             </div>
           {/if}
+          {#if overview && !detail}
+            <div class="orientation">
+              <p>{picked.kind === 'station' ? picked.region.why : picked.border?.why ?? 'The route reading is unavailable; its condition cannot be judged.'}</p>
+              <p class="scope-note">{picked.kind === 'station' ? 'Department aggregate; detailed boards identify its queues or machinery.' : 'Protocol route; detailed inspection preserves its crossings and evidence.'} Observation: {picked.kind === 'station' ? regions.data.now || 'unknown' : borders.kind === 'ready' ? borders.data.now || 'unknown' : 'unread'}</p>
+              <a class="board-door" href={safeLinkHref(`${presentationHref(inspectionHref, true)}&detail=1`)} onclick={(e) => go(e, `${presentationHref(inspectionHref, true)}&detail=1`)}>Open detailed board</a>
+            </div>
+          {:else}
           <div class="panel-cells">
             {#each cells as c (c.field)}
               <div class="panel-cell" data-field={c.field}>
@@ -374,6 +409,7 @@
           </div>
           {#if picked.kind === 'station'}
             {@render station(picked.name)}
+          {/if}
           {/if}
         {/if}
       </section>
@@ -434,6 +470,8 @@
       {:else}
         <MarshallingYardPage embedded />
       {/if}
+    {:else if region === 'sensors'}
+      <SensorsPanel />
     {/if}
     {#each boardsOf(region) as board (board)}
       <div class="panel-board" data-station-board={board}>
@@ -452,6 +490,12 @@
 {/snippet}
 
 <style>
+  .company-back { display: inline-block; margin-bottom: var(--s2); color: var(--map-ink); font-size: 13px; }
+  .map-context { margin-bottom: var(--s3); color: var(--map-muted); font-size: 13px; }
+  .map-context summary { cursor: pointer; }
+  .orientation { padding: var(--s3); background: var(--map-surface); border: 1px solid var(--map-rule); border-radius: var(--radius); }
+  .scope-note { color: var(--map-muted); font-size: 12px; overflow-wrap: anywhere; }
+  .board-door { display: inline-block; margin-top: var(--s2); padding: var(--s2) var(--s3); color: var(--map-ink); border: 1px solid var(--map-rule); border-radius: var(--radius); }
   /* The yard's classes, as FloorDeck.svelte declares them (Svelte scopes
      a component's styles, so the page carries its own copy of the ones
      it uses — same names, nothing new). The colours are the map's own

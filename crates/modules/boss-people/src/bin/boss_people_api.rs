@@ -183,7 +183,7 @@ async fn main() -> Result<()> {
     //   - boss-accounts-api  (port 7550) — see
     //     crates/modules/boss-accounts/src/bin/boss_accounts_api.rs
     //   - boss-events-api    (port 7150) — see
-    //     crates/core/boss-events/src/bin/boss_events_api.rs
+    //     crates/orchestrators/boss-events-api/src/main.rs
 
     // Wire the calendar client if configured. The PTO endpoint
     // returns 503 when calendar isn't set up; everything else
@@ -246,7 +246,12 @@ async fn main() -> Result<()> {
         .with_context(|| format!("binding HTTP listener on {http_addr}"))?;
     info!(addr = %http_addr, "people HTTP API listening");
 
-    let app = boss_core::machine_gate::mount(app, "people", &["/api/people/health"]);
+    let app = boss_core::machine_gate::mount(
+        app,
+        "people",
+        &["/api/people/health"],
+        Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }

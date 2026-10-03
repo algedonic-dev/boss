@@ -1,0 +1,7 @@
+# automation:surface-usage — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 7 audit-log facts.
+# Signs as platform-admin today: infra/surface-usage.sh.
+
+[[automation]]
+id = "automation:surface-usage"
+role = "platform-admin"
+description = 'Rolls up which surfaces each operator opened, daily, and files it as a packet (infra/surface-usage.sh).'

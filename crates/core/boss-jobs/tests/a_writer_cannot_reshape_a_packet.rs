@@ -40,16 +40,9 @@ const KIND: &str = "reshape-guard";
 
 fn required(name: &str) -> boss_core::job::StepField {
     boss_core::job::StepField {
-        name: name.into(),
-        field_type: "string".into(),
         required: true,
         filled_by: Default::default(),
-        item_keys: Vec::new(),
-        covers: None,
-        binds: None,
-        item_value_max_bytes: None,
-        item_one_of: Vec::new(),
-        writer: None,
+        ..boss_core::job::StepField::new(name, "string")
     }
 }
 
@@ -269,15 +262,18 @@ fn job_body(job: &Value) -> Value {
 async fn finish_the_work(app: &axum::Router, job_id: &str) -> Value {
     let job = get_job(app, job_id).await;
     let work = step_by_slug(&job, "work");
-    let mut metadata = work["metadata"].clone();
-    metadata["evidence"] = json!("measured");
-    let (status, body) = put_step(
+    // The evidence through the merge door, the status alone through the
+    // PUT: the PUT writes no metadata (e39a9d2a).
+    let work_id = work["id"].as_str().expect("step id");
+    let (status, body) = send(
         app,
-        job_id,
-        &work,
-        json!({ "status": "completed", "metadata": metadata }),
+        "PATCH",
+        &format!("/api/jobs/{job_id}/steps/{work_id}/metadata"),
+        Some(json!({ "evidence": "measured" })),
     )
     .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "the evidence lands: {body}");
+    let (status, body) = put_step(app, job_id, &work, json!({ "status": "completed" })).await;
     assert_eq!(
         status,
         StatusCode::NO_CONTENT,
@@ -412,9 +408,12 @@ async fn a_step_put_cannot_choose_which_terminal_closes_the_packet() {
     assert_eq!(step_by_slug(&still, "done")["status"], "ready");
 
     // Control: the whole step sent back as read, status flipped — the
-    // packet closes on the terminal it actually reached.
+    // packet closes on the terminal it actually reached. Every field but
+    // `metadata`: the PUT refuses any metadata body since e39a9d2a, and a
+    // whole-row write-back is not a metadata write.
     let mut whole = step_by_slug(&still, "done");
     whole["status"] = json!("completed");
+    whole.as_object_mut().unwrap().remove("metadata");
     let (status, answer) = put_step(&app, &job_id, &done, whole).await;
     assert_eq!(
         status,
@@ -579,18 +578,37 @@ async fn the_merge_door_cannot_write_outcome_kind() {
 /// The same key through the PUT, in a write that does NOT complete (the
 /// completing one is already held by `a_body_cannot_claim_aborted_to_
 /// pass_the_gate`): stored, it would open the gate for the next PUT.
+/// Since e39a9d2a (Stage 2's last car) the PUT writes no metadata at
+/// all, so it refuses the body before the protocol-key guard is reached
+/// and sends the writer to the merge door — where that guard lives,
+/// held by `the_merge_door_cannot_write_outcome_kind` above.
 #[tokio::test]
-async fn a_step_put_cannot_write_outcome_kind_ahead_of_the_completion() {
+async fn a_step_put_carrying_outcome_kind_is_sent_to_the_merge_door() {
     let app = app();
     let job_id = open_job(&app).await;
     let job = get_job(&app, &job_id).await;
     let done = step_by_slug(&job, "done");
+    let step_id = done["id"].as_str().unwrap();
     let mut metadata = done["metadata"].clone();
     metadata["outcome_kind"] = json!("aborted");
 
     let (status, answer) = put_step(&app, &job_id, &done, json!({ "metadata": metadata })).await;
     assert_eq!(status, StatusCode::CONFLICT, "{answer}");
-    assert_eq!(answer["refused_keys"], json!(["outcome_kind"]));
+    assert_eq!(
+        answer["merge_door"],
+        format!("/api/jobs/{job_id}/steps/{step_id}/metadata"),
+        "{answer}"
+    );
+    assert_eq!(
+        answer["hint"],
+        boss_jobs::step_metadata_write::METADATA_BODY_HINT
+    );
+    let still = get_job(&app, &job_id).await;
+    assert_eq!(
+        step_by_slug(&still, "done")["metadata"]["outcome_kind"],
+        "completed",
+        "nothing was written"
+    );
 
     let (status, answer) = put_step(&app, &job_id, &done, json!({ "status": "completed" })).await;
     assert_eq!(

@@ -192,6 +192,10 @@ pub async fn rebuild_inventory(pool: &PgPool) -> Result<RebuildReport, RebuildEr
                 // projection has nothing to update — the on_hand decrement
                 // already arrived via `inventory.item.consumed`.
                 "inventory.transferred" => Ok(Applied::Skipped),
+                // A valueless consume's proof of delivery (backlog
+                // 55f69172): it rebuilds a GL-inert fact on the ledger's
+                // side; the row arrived via `inventory.item.consumed`.
+                "inventory.item.consume_recorded" => Ok(Applied::Skipped),
                 // Procurement (vendor CRM) — six event kinds. Each
                 // replays via the canonical adapter helper so the SQL
                 // stays in one place.

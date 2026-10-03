@@ -148,16 +148,34 @@ impl NewestTerminal {
 }
 
 /// One of the department's protocols, with what its packets say.
+///
+/// Every count is of the kind's packets IN the department — the rule
+/// the department jobs view lists by (`crate::port::DepartmentFilter`):
+/// a packet naming another department is that department's, whatever
+/// its kind declares (backlog a22311a1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct KindReadiness {
     pub kind: String,
     pub version: i32,
     pub label: String,
-    /// Every packet of the kind, any status.
+    /// Every packet of the kind in the department, any status.
     pub packets: i64,
-    /// Packets still open.
+    /// Those still open.
     pub open: i64,
+    /// Those closed or cancelled on or after the read's `since` day;
+    /// `null` when the read named no window.
+    pub departed: Option<i64>,
     pub newest_terminal: Option<NewestTerminal>,
+}
+
+/// The same three counts for the whole department, any kind — the
+/// `total`s `GET /api/jobs?department=<code>` answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Counts {
+    pub packets: i64,
+    pub open: i64,
+    /// `null` without a window — never a zero nobody counted.
+    pub departed: Option<i64>,
 }
 
 /// The kinds whose active row declares `code` — the same join the

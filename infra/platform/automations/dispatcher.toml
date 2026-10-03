@@ -1,0 +1,8 @@
+# automation:dispatcher — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 14,684 (plus 235,788 by 74 rule ids under automation:rule:) audit-log facts.
+# Signs as platform-admin today: crates/core/boss-dispatcher/src/dispatcher.rs (default header) and src/rules/actor.rs (each rule as rule:<name>).
+
+[[automation]]
+id = "automation:dispatcher"
+role = "platform-admin"
+description = 'The dispatcher: runs the dispatcher_rules registry. Every write a rule fires is signed as automation:rule:<name> (rule:<name> on the wire), so that family, tenant-declared rules included, signs as this row.'
+signs_for = "automation:rule:"

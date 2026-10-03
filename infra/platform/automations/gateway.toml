@@ -1,0 +1,7 @@
+# automation:gateway — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 36 audit-log facts.
+# Signs as platform-admin today: crates/core/boss-gateway/src/passkey.rs (sign_as_gateway).
+
+[[automation]]
+id = "automation:gateway"
+role = "platform-admin"
+description = 'The gateway own server-side calls: passkey promotion, break-glass, site inquiries (crates/core/boss-gateway/src/passkey.rs sign_as_gateway).'

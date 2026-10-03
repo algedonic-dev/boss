@@ -27,6 +27,61 @@
 # same way. Nothing here resolves a device by number at runtime — the
 # PV below is a PATH (/var/local/gate-seed) bound by nodeAffinity — so
 # this is a correction to the record, not to behaviour.
+# (2026-09-30: w-1 got that second disk. Its Talos declaration picks it
+# by a selector — not the system disk, NVMe, over 500 GB — and never by
+# a name; see THE GATE VOLUME below.)
+#
+# THE GATE VOLUME (backlog 52ea56ac, design 8457c07b, 2026-09-30).
+# The measured bound on parallel gates is w-1's ONE NVMe, not its CPU
+# (2026-08-26: five gates, I/O pressure 65%, CPU idle, a ~35-min gate
+# took ~93): the seed, every workspace, containerd, the kubelet and
+# Longhorn all write the same device. David fitted a second NVMe on
+# 2026-09-30, and ALL the gate's disk I/O — the seed AND the per-run
+# workspaces — moves onto it as ONE xfs filesystem, because a reflink
+# is only possible inside one: seed on the new disk and workspaces on
+# the old would restore the 184 s full copy measured above. The disk is
+# a Talos USER VOLUME named `gate`, which Talos mounts at /var/mnt/gate,
+# declared in infra/cluster/talos/patches/w-1.yaml — the node's own
+# filesystem again, the node's own declaration again, for every reason
+# the seed directory's paragraph below gives. The
+# install disk keeps containerd, the kubelet, Longhorn and the dev
+# pod's /scratch; EPHEMERAL is not moved (that wipes w-1's Longhorn
+# replicas, dev /work among them).
+#
+# Declared here as a SECOND PV (gate-w-1, path /var/mnt/gate) and its
+# claim `gate` in boss-dev, because a local PV's path is immutable —
+# editing gate-seed-w-1's path would fail every converge's apply — and
+# because gates on an older checkout still render the old runner and
+# mount the old claim until they rebase. The claim is declared HERE,
+# converged with the PV, rather than beside the Job in
+# infra/gate-runner/gate-runner.yaml: nothing converges that file's
+# claims (`boss gate` creates only the Job), so a claim declared there
+# exists only after someone applies it by hand.
+#
+# ORDER. The PV and claim are inert until a pod mounts them, so they
+# land first, before the node has the volume; the runner moves onto the
+# claim in a SEPARATE car (gate-runner.yaml, run.sh), whose own gate is
+# the first pod to mount it. Between the two, David applies the Talos
+# patch and PROVES it the way the seed directory was proven: a pod in
+# boss-dev mounting claim `gate`, writing a file, `cp --reflink=always`
+# succeeding on it — and its device read and compared, because
+# EPHEMERAL is xfs and reflinks too, so a write and a reflink alone
+# cannot tell the gate disk from the install disk (review a79746c6).
+#
+# A MISSING DISK IS NOT LOUD BY ITSELF, and an earlier version of this
+# comment said it was. Once the volume has ever mounted, its mountpoint
+# directory /var/mnt/gate stays on EPHEMERAL; a later boot without the
+# disk (dead, unenumerated) leaves that empty directory, the PV mounts
+# it, and every gate would write the seed and its workspace onto the
+# install disk — with nothing evicting, because writes through a PV are
+# not the pod's ephemeral storage. What makes it loud is the gate
+# itself, from the runner car that followed this one (this paragraph
+# named the refusal before that car had landed; review 635317c5):
+# infra/gate-runner/run.sh, armed by GATE_DISK=required in the runner
+# manifest, refuses to start when /gate-seed or /gate-target sits on the
+# same device as the pod's EPHEMERAL files, when the two are on
+# different devices, or when the marker /gate-runs/.gate-volume that
+# the proof Job writes is absent.
 #
 # WHAT THIS DECLARES, cluster-scoped, so it is converged from here and
 # not applied by `boss gate` (whose credential is namespaced) — and the
@@ -72,6 +127,16 @@
 #     on.
 #     infra/lint/no-manifest-mounts-a-hostpath.sh refuses the hostPath
 #     mount coming back.
+#   - The gate volume below differs in both halves: its path,
+#     /var/mnt/gate, is the volume's MOUNTPOINT, which Talos makes when
+#     it mounts the disk, so it needs no `machine.files` entry; and it
+#     carries NO kubelet extraMounts entry, because Talos already binds
+#     /var/mnt into the kubelet (`rbind, rslave, ro`) and an extraMounts entry would have the
+#     kubelet MkdirAll the path on EPHEMERAL whenever the volume is
+#     absent (review a79746c6; the reasoning is in w-1.yaml). Whether
+#     Talos's own bind suffices is what the proof pod decides. The
+#     directories the runner puts under it are made by the kubelet for
+#     the pod's subPath mounts.
 #
 # WHAT IT COSTS. The PV's node affinity makes gating REQUIRE w-1: the
 # gate-runner's "preferred, not required" build-node affinity is now
@@ -86,6 +151,11 @@
 # gate on, the copy is metadata. The old Longhorn claim
 # `gate-runner-disk` stays declared in infra/gate-runner/gate-runner.yaml
 # until the new seed is warm, then a car retires it (delete-orphan-object).
+# The move to the gate volume is the same migration, decided the same
+# way (design 8457c07b): no seed is copied across; the first gate on the
+# new layout runs cold once and its green refresh writes the new seed.
+# gate-seed-w-1 and its claim then stay declared until no gate mounts
+# them, and a car retires them like gate-runner-disk.
 ---
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -114,3 +184,51 @@ spec:
       nodeSelectorTerms:
         - matchExpressions:
             - {key: kubernetes.io/hostname, operator: In, values: ["w-1"]}
+---
+# THE GATE VOLUME: the whole second NVMe (see THE GATE VOLUME above).
+# The capacity is a label, not a quota — a local PV has no way to bound
+# what is written to it, and the filesystem's size is the disk's. 450Gi
+# is under the smallest disk the Talos selector admits (> 500 GB), so
+# the claim below binds whichever disk David fitted. Retain, bound by
+# nodeAffinity to w-1, the same class as the seed, for the seed's
+# reasons.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: gate-w-1
+  labels: {app.kubernetes.io/part-of: boss, boss.dev/purpose: build}
+spec:
+  capacity:
+    storage: 450Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: gate-seed-local
+  # Pre-bound BOTH ways (review a79746c6, finding 5): the claim names
+  # this PV, and this PV names the claim, so no other claim of the class
+  # can take it first.
+  claimRef: {namespace: boss-dev, name: gate}
+  local:
+    path: /var/mnt/gate
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - {key: kubernetes.io/hostname, operator: In, values: ["w-1"]}
+---
+# Bound BY NAME to the one PV above; the class has no provisioner, so a
+# typo binds nothing and a pod waits Pending rather than writing to the
+# wrong disk. RWO is a placement rule here as it is for the seed claim:
+# every concurrent gate co-mounts it, on w-1 only.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gate
+  namespace: boss-dev
+  labels: {app.kubernetes.io/part-of: boss, boss.dev/purpose: build}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: gate-seed-local
+  volumeName: gate-w-1
+  resources:
+    requests:
+      storage: 450Gi

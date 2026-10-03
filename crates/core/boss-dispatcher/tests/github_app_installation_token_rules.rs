@@ -57,9 +57,24 @@ const PER_ACT: &[(&str, &str)] = &[(
     "broker-re-mints-the-algedonic-dev-admin-token-when-a-github-request-is-approved",
 )];
 
+/// Per-request mints with NO approval twin (backlog d2b7c947): the
+/// publish verb's approval is David's passkey on the publish packet, which
+/// completes BEFORE its ops-request is filed, so the filing is the only
+/// moment to mint at. Each is judged by the `a_publish_*` pins below.
+const PER_REQUEST_ONLY: &[&str] =
+    &["broker-mints-the-algedonic-dev-publish-token-when-a-publish-request-is-filed"];
+
 /// The script every per-act GitHub verb runs (its `argv[0]` in
 /// `infra/ops/verbs/<verb>.json`) — the roster the filing rule must match.
 const GITHUB_ACT: &str = "infra/forge/github-act.sh";
+
+/// The verb the publish mint serves, and the script that renders its
+/// token by naming the rule's file.
+const PUBLISH_VERB: &str = "publish-github-pr";
+const PUBLISH_SCRIPT: &str = "infra/forge/publish-github-pr.sh";
+/// The merge of the PR the publish opened (backlog 602fe95f): the same
+/// script with `--merge` fixed in its argv, minting under the same rule.
+const MERGE_VERB: &str = "merge-publish-pr";
 
 /// The widest window the handler accepts (`Declaration::parse` in
 /// credential_rotate_github_app.rs refuses anything outside 1..=59, since
@@ -105,7 +120,8 @@ fn every_installation_token_rule_has_its_twin() {
             PAIRS
                 .iter()
                 .chain(PER_ACT)
-                .any(|(a, b)| a == name || b == name),
+                .any(|(a, b)| a == name || b == name)
+                || PER_REQUEST_ONLY.contains(name),
             "{name} runs {HANDLER} but is in no (rotation, refresh) pair and no per-act \
              (filing, approval) pair here: a credential with an exposure path and no refresh \
              dies within the hour, one with a refresh and no exposure path cannot be rotated \
@@ -116,6 +132,257 @@ fn every_installation_token_rule_has_its_twin() {
         assert!(firing.contains(a), "{a} runs {HANDLER}");
         assert!(firing.contains(b), "{b} runs {HANDLER}");
     }
+    for a in PER_REQUEST_ONLY {
+        assert!(firing.contains(a), "{a} runs {HANDLER}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The publish mint (backlog d2b7c947)
+// ---------------------------------------------------------------------------
+
+/// The publish rule's one do-step.
+fn publish_step(reg: &RawRegistry) -> &RawDoStep {
+    let r = rule(reg, PER_REQUEST_ONLY[0]);
+    assert_eq!(r.do_steps.len(), 1, "{}", r.name);
+    assert_eq!(r.do_steps[0].handler, HANDLER, "{}", r.name);
+    &r.do_steps[0]
+}
+
+fn arg<'a>(step: &'a RawDoStep, key: &str) -> &'a str {
+    step.args
+        .get(key)
+        .map(|v| v.trim_matches('"'))
+        .unwrap_or_else(|| panic!("the publish mint declares `{key}`"))
+}
+
+/// The public mirror, as `infra/estate/estate.toml` declares it — the one
+/// spelling (the_public_mirror_url_lives_once.rs) — as owner/repo.
+fn declared_mirror_slug() -> String {
+    let text = std::fs::read_to_string(repo_root().join("infra/estate/estate.toml"))
+        .expect("read estate.toml");
+    let url = text
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("mirror_url = \"")
+                .and_then(|r| r.strip_suffix('"'))
+        })
+        .expect("estate.toml declares mirror_url");
+    url.split('/').skip(3).collect::<Vec<_>>().join("/")
+}
+
+/// Whether the publish mint fires on `topic` / `payload`, judged by the
+/// real matcher — and never by a predicate that raised.
+fn publish_fires(reg: &Registry, topic: &str, payload: &serde_json::Value) -> bool {
+    let outcome = match_event(reg, topic, payload, &NoHelpers);
+    assert!(
+        !outcome
+            .skipped
+            .iter()
+            .any(|s| s.rule == PER_REQUEST_ONLY[0]),
+        "{} could not be judged on {topic} {payload}: a predicate that raises is redelivered \
+         to a dead letter, not a quiet no",
+        PER_REQUEST_ONLY[0]
+    );
+    outcome
+        .matched
+        .iter()
+        .any(|m| m.rule_name == PER_REQUEST_ONLY[0])
+}
+
+/// It fires when a publish RUN or its MERGE (backlog 602fe95f) is filed
+/// and on nothing else: not on the verb's `--check` (which holds no
+/// token), not on any other verb, not on another kind's job and not on an
+/// approval — and it keys the token on the request being filed, through
+/// the refresh path, with no clock.
+#[test]
+fn a_publish_mint_fires_on_a_filed_publish_run_alone_and_keys_on_it() {
+    const FILED: &str = "cccccccc-0000-4000-8000-00000000000f";
+    let raw = rules();
+    let r = rule(&raw, PER_REQUEST_ONLY[0]);
+    assert!(r.schedule.is_none(), "a per-request token has no clock");
+    assert_eq!(r.on_event.as_deref(), Some("jobs.job.created"));
+    let step = publish_step(&raw);
+    assert_eq!(arg(step, "phase"), "refresh");
+    assert_eq!(
+        arg(step, "refresh_within_minutes").parse::<u32>().ok(),
+        Some(WIDEST_WINDOW),
+        "the filing mints for any token older than a minute, as the admin filing does"
+    );
+
+    let reg = Registry::from_raw(rules()).expect("the shipped rules parse together");
+    // The spawn rule files a publish run with no args at all.
+    let run = naming(filed(PUBLISH_VERB), None);
+    assert!(
+        publish_fires(&reg, "jobs.job.created", &run),
+        "control: the mint fires on a filed `{PUBLISH_VERB}` run"
+    );
+    assert!(
+        publish_fires(
+            &reg,
+            "jobs.job.created",
+            &naming(filed(PUBLISH_VERB), Some(json!([])))
+        ),
+        "a run filed with an empty args list is a run"
+    );
+    assert!(
+        !publish_fires(
+            &reg,
+            "jobs.job.created",
+            &naming(filed(PUBLISH_VERB), Some(json!(["--check"])))
+        ),
+        "`{PUBLISH_VERB} --check` holds no token and must not mint one"
+    );
+    // The merge (backlog 602fe95f): its rule files it with no args, and
+    // it pushes the approved snapshot to main with this same token.
+    assert!(
+        publish_fires(&reg, "jobs.job.created", &naming(filed(MERGE_VERB), None)),
+        "a filed `{MERGE_VERB}` request mints the token its push needs"
+    );
+    let merge_verb = repo_root().join(format!("infra/ops/verbs/{MERGE_VERB}.json"));
+    let merge_argv: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&merge_verb).expect("the merge verb file"))
+            .expect("the merge verb is JSON");
+    assert_eq!(
+        merge_argv["argv"],
+        json!([PUBLISH_SCRIPT, "--merge"]),
+        "the merge verb runs the publish script, whose token this rule declares"
+    );
+    for (verb, _, _) in verbs()
+        .iter()
+        .filter(|(v, _, _)| v != PUBLISH_VERB && v != MERGE_VERB)
+    {
+        assert!(
+            !publish_fires(&reg, "jobs.job.created", &filed(verb)),
+            "the publish mint fired on a filed `{verb}` request"
+        );
+    }
+    let mut other = run.clone();
+    other["kind"] = json!("backlog-item");
+    assert!(!publish_fires(&reg, "jobs.job.created", &other));
+    assert!(
+        !publish_fires(
+            &reg,
+            "step.done.sign-off",
+            &approved(PUBLISH_VERB, "approved")
+        ),
+        "the publish mint fires on the filing, never on an approval"
+    );
+
+    let mut keyed = run;
+    keyed["id"] = json!(FILED);
+    let request = match_event(&reg, "jobs.job.created", &keyed, &NoHelpers)
+        .matched
+        .into_iter()
+        .find(|m| m.rule_name == PER_REQUEST_ONLY[0])
+        .expect("control: it fires")
+        .invocations[0]
+        .args
+        .iter()
+        .find(|(k, _)| k == "request_id")
+        .map(|(_, v)| v.clone());
+    assert_eq!(
+        request,
+        Some(Value::String(FILED.into())),
+        "the publish token is keyed on the request being filed — the OPS_REQUEST_ID the \
+         verb renders by"
+    );
+}
+
+/// NARROWER THAN THE ADMIN TOKEN, ON BOTH AXES. One repository — the
+/// declared mirror, and nothing else — and exactly the four permissions a
+/// publish uses; never administration. The same installation, Secret and
+/// registry id as the admin mint, under a key namespace of its own, so
+/// neither consumer renders the other's token.
+#[test]
+fn a_publish_token_is_narrowed_to_the_mirror_and_a_publishes_permissions() {
+    let raw = rules();
+    let step = publish_step(&raw);
+    let slug = declared_mirror_slug();
+    let name = slug.split('/').nth(1).expect("owner/repo");
+    assert_eq!(
+        arg(step, "verify_repo"),
+        slug,
+        "the publish token proves itself on the declared mirror"
+    );
+    assert_eq!(
+        arg(step, "repositories"),
+        name,
+        "the publish token is narrowed to the declared mirror alone"
+    );
+    let permissions: BTreeSet<&str> = arg(step, "permissions").split(',').collect();
+    assert_eq!(
+        permissions,
+        BTreeSet::from([
+            "contents:write",
+            "metadata:read",
+            "pull_requests:write",
+            "workflows:write"
+        ]),
+        "a publish pushes a branch carrying .github/workflows, opens and closes PRs, and \
+         deletes closed branches — and nothing more"
+    );
+
+    let admin = &rule(&raw, PER_ACT[0].0).do_steps[0];
+    for key in ["secret_namespace", "secret_name", "credential_id"] {
+        assert_eq!(
+            step.args.get(key),
+            admin.args.get(key),
+            "the publish mint and the admin filing mint disagree on `{key}`: one installation, \
+             one Secret, one registry row"
+        );
+    }
+    assert_ne!(
+        step.args.get("secret_key"),
+        admin.args.get("secret_key"),
+        "the publish token must live under a key namespace of its own"
+    );
+    assert_eq!(
+        step.args.get("installation_id"),
+        admin.args.get("installation_id")
+    );
+    assert_eq!(owner_of(step), slug.split('/').next().unwrap());
+}
+
+/// github-act.sh picks its rule as the FIRST file in the directory that
+/// declares `credential_id = github-app-<owner>` — which must stay the
+/// admin filing rule, now that the publish mint declares the same id: a
+/// GitHub act rendering the publish key would find nothing to act with.
+/// And the publish verb names its rule's file, which must exist.
+#[test]
+fn github_act_still_selects_the_admin_rule_and_the_publish_verb_names_its_own() {
+    let owner = owner_of(&rule(&rules(), PER_ACT[0].0).do_steps[0]);
+    let needle = format!("credential_id = \"\\\"github-app-{owner}\\\"\"");
+    let dir = dispatcher_rules_dir();
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .expect("read the rule directory")
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+        .collect();
+    files.sort();
+    let first = files
+        .iter()
+        .find(|p| {
+            std::fs::read_to_string(p)
+                .unwrap_or_default()
+                .contains(&needle)
+        })
+        .expect("a rule declares the installation's credential");
+    assert_eq!(
+        first.file_stem().and_then(|s| s.to_str()),
+        Some(PER_ACT[0].0),
+        "github-act.sh would select {} for github-app-{owner}",
+        first.display()
+    );
+
+    let script =
+        std::fs::read_to_string(repo_root().join(PUBLISH_SCRIPT)).expect("the publish verb");
+    let file = format!("{}.toml", PER_REQUEST_ONLY[0]);
+    assert!(
+        script.contains(&format!("dispatcher/rules/{file}")),
+        "{PUBLISH_SCRIPT} must render its token from {file}"
+    );
+    assert!(dir.join(&file).is_file(), "{file} is in the rule directory");
 }
 
 // ---------------------------------------------------------------------------
@@ -490,6 +757,74 @@ fn the_per_act_mints_fire_for_exactly_the_verbs_that_run_github_act() {
         other["workflow_kind"] = json!("design-doc");
         assert!(fired(&reg, "step.done.sign-off", &other).is_empty());
     }
+}
+
+/// The GitHub push targets of `infra/forge/offsite-push.sh`: every
+/// credential id its manifest names for a target that pushes branches.
+fn pushing_credentials() -> BTreeSet<String> {
+    let path = repo_root().join("infra/forge/offsite-push.json");
+    let text = std::fs::read_to_string(&path).expect("read offsite-push.json");
+    let manifest: serde_json::Value = serde_json::from_str(&text).expect("parse offsite-push.json");
+    manifest["targets"]
+        .as_array()
+        .expect("offsite-push.json has a targets array")
+        .iter()
+        .filter(|t| t["branches"].as_array().is_some_and(|b| !b.is_empty()))
+        .filter_map(|t| t["credential"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Backlog d76cc3ac (2026-09-29): GitHub refused the DR push of forge main
+/// to algedonic-dev/boss-dr — "refusing to allow a GitHub App to create or
+/// update workflow .github/workflows/ci.yml without workflows permission" —
+/// because the token was narrowed to contents:write,metadata:read. A token
+/// that pushes THIS tree must carry workflows:write whenever the tree holds
+/// a workflow file, or every forge converge exits 1 on the push.
+#[test]
+fn a_token_that_pushes_this_tree_may_write_its_workflows() {
+    let workflows = repo_root().join(".github/workflows");
+    let holds_workflows = std::fs::read_dir(&workflows)
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false);
+    if !holds_workflows {
+        return;
+    }
+    let pushers = pushing_credentials();
+    let reg = rules();
+    let mut judged = 0;
+    for r in reg
+        .rules
+        .iter()
+        .filter(|r| r.do_steps.iter().any(|d| d.handler == HANDLER))
+    {
+        let step = &r.do_steps[0];
+        let Some(id) = step.args.get("credential_id").map(|v| v.trim_matches('"')) else {
+            continue;
+        };
+        if !pushers.contains(id) {
+            continue;
+        }
+        judged += 1;
+        let permissions = step
+            .args
+            .get("permissions")
+            .map(|v| v.trim_matches('"'))
+            .unwrap_or_default();
+        assert!(
+            permissions
+                .split(',')
+                .map(str::trim)
+                .any(|p| p == "workflows:write"),
+            "{}: credential {id} pushes this tree to GitHub (infra/forge/offsite-push.json), \
+             and the tree holds .github/workflows, but its permissions {permissions:?} lack \
+             workflows:write — GitHub refuses such a push (backlog d76cc3ac)",
+            r.name
+        );
+    }
+    assert!(
+        judged > 0,
+        "no {HANDLER} rule mints a credential offsite-push.json pushes with: {pushers:?}"
+    );
 }
 
 #[test]

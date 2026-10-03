@@ -203,7 +203,7 @@ async fn a_design_doc_with_filer_fields_admits_and_binds_them_to_the_step() {
 /// FIRST, it does not move the completion check.
 #[tokio::test]
 async fn executor_fields_stay_create_legal_and_required_at_done() {
-    use boss_core::job::{FilledBy, StepField};
+    use boss_core::job::StepField;
     let spec = WorkflowSpec::platform_seed(
         "exec-fields",
         "Executor fields",
@@ -225,16 +225,8 @@ async fn executor_fields_stay_create_legal_and_required_at_done() {
                 title_template: "Do the work".into(),
                 authority_role: Some("platform-admin".into()),
                 fields: vec![StepField {
-                    name: "result".into(),
-                    field_type: "string".into(),
                     required: true,
-                    filled_by: FilledBy::Executor,
-                    item_keys: Vec::new(),
-                    covers: None,
-                    binds: None,
-                    item_value_max_bytes: None,
-                    item_one_of: Vec::new(),
-                    writer: None,
+                    ..StepField::new("result", "string")
                 }],
                 ..Default::default()
             },
@@ -278,13 +270,13 @@ async fn executor_fields_stay_create_legal_and_required_at_done() {
         .iter()
         .find(|s| s.spec_slug.as_deref() == Some("work"))
         .expect("work step materialized");
-    let complete = async |body: serde_json::Value| {
+    let write = async |method: &str, suffix: &str, body: serde_json::Value| {
         let resp = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .method("PUT")
-                    .uri(format!("/api/jobs/{}/steps/{}", job.id, work.id))
+                    .method(method)
+                    .uri(format!("/api/jobs/{}/steps/{}{suffix}", job.id, work.id))
                     .header("content-type", "application/json")
                     .header("x-boss-user", admin_header())
                     .body(Body::from(body.to_string()))
@@ -296,17 +288,21 @@ async fn executor_fields_stay_create_legal_and_required_at_done() {
     };
     // Bare completion — metadata untouched by the overlay, `result`
     // still absent — refuses, exactly as before this change.
-    let refused = complete(json!({ "status": "completed" })).await;
+    let refused = write("PUT", "", json!({ "status": "completed" })).await;
     assert_eq!(
         refused,
         StatusCode::BAD_REQUEST,
         "completion without the executor field must still refuse"
     );
-    // Clients merge metadata (PATCH-on-PUT contract): existing keys +
-    // the filled field.
-    let mut merged = work.metadata.clone();
-    merged["result"] = json!("done it");
-    let accepted = complete(json!({ "status": "completed", "metadata": merged })).await;
+    // The filled field goes through the step merge door (existing keys
+    // kept), then the status alone — the PUT writes no metadata since
+    // backlog e39a9d2a.
+    let filled = write("PATCH", "/metadata", json!({ "result": "done it" })).await;
+    assert!(
+        filled.is_success(),
+        "the merge door took the field: {filled}"
+    );
+    let accepted = write("PUT", "", json!({ "status": "completed" })).await;
     assert!(
         accepted.is_success(),
         "completion with the executor field filled must pass, got {accepted}"

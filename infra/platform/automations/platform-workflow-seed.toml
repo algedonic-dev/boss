@@ -1,0 +1,10 @@
+# automation:platform-workflow-seed — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 19 audit-log facts.
+# Signs as NO role today: it writes straight to Postgres and sends no
+# x-boss-user, so no door resolves this row. It is registered so every
+# writer in the audit log has a row, at platform-admin, the role every
+# write it makes would need through a door.
+
+[[automation]]
+id = "automation:platform-workflow-seed"
+role = "platform-admin"
+description = 'Publishes the infra/platform/ bundles into their registries at every start, insert-if-missing (boss-platform-workflow-seed).'

@@ -48,6 +48,10 @@ tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# `ops.file_remedies` derives a request's id from the board it was filed
+# against (v5), so two firings that raced name one packet (backlog
+# b2f78bb9, review 63bafc11 LOW 2a).
+uuid = { workspace = true }
 
 [dev-dependencies]
 boss-testing = { path = "../../core/boss-testing", features = ["postgres"] }
@@ -56,6 +60,11 @@ tower = { workspace = true }
 # A test key is GENERATED per test binary, never checked in: a PEM
 # private key in the tree would trip the public mirror's secret scanning.
 rsa = { version = "0.9", features = ["sha2", "getrandom"] }
+# Test-only, for `policy_check_refusals_alarm`: the tally the alarm reads
+# is what boss_policy::check_mode serializes, so the test judges a real
+# one rather than a hand-written copy of its shape (CLAUDE.md §9a). No
+# `postgres`: only the check mode is built.
+boss-policy = { path = "../../core/boss-policy", default-features = false }
 
 [lints]
 workspace = true

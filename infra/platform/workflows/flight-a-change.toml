@@ -81,7 +81,7 @@ A change shipped to our own instance behind a flight: turned on for an audience 
 The packet IS the flight - its job metadata carries the declaration under `flight` (code, hypothesis, signal, audience, owner, observe_days), and its state is what its completed steps declare: turn-on is on for the audience, widen is on for everyone, pull is off for good. GET /api/flights/mine answers, for the viewer, the codes that are on; a code it does not list is off.
 
 An agent may file, ship, turn on, record the reading, extend once and pull at any time. Widening to everyone and deciding are a person's (human_only) while one person runs the company: David, 2026-09-24."""
-metadata = { owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin" }
 metadata_schema = { type = "object", required = ["flight"], properties = { flight = { type = "object", required = ["code", "hypothesis", "signal", "audience", "owner", "observe_days"], properties = { code = { type = "string", description = "Kebab-case; the token source names in flightOn('<code>'). Unique among open flights." }, hypothesis = { type = "string" }, signal = { type = "string", description = "The reading that decides, stated before it is taken." }, audience = { type = "object", description = "{actors: [ids], roles: [codes]} - who sees the flight once it is turned on." }, owner = { type = "string" }, observe_days = { type = "number", description = "The declared observe period, in days." } } } } }
 
 [[workflow.step]]

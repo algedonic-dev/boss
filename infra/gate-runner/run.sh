@@ -339,9 +339,168 @@ trap 'fail_lost "line $LINENO"' ERR
 # /gate-seed is the one shared surface left: the warm target snapshot
 # + the crate cache, on the PVC that used to BE the workspace. Reads
 # and writes of it are flock-disciplined below.
+#
+# SINCE 2026-09-30 (backlog 52ea56ac) /gate-target is not an emptyDir
+# but this pod's OWN directory of the gate claim on w-1's second NVMe
+# (`runs/<pod name>`, gate-runner.yaml), because it must share the
+# seed's filesystem for the seeding copy to stay a reflink. No other
+# gate mounts it as ITS workspace, so no two gates share a workspace
+# path and the crossed-receipts shape stays impossible. But every gate
+# also mounts the runs directory read-write at /gate-runs (for the sweep
+# below and the proof marker), so a gate's code CAN reach another run's
+# workspace: isolation is by convention there, not by structure (review
+# 0b9c02f1, F2; the structural fix is 5e77f216). And a directory does
+# not die with its pod, which the emptyDir did. So this script
+# does it: it holds a SHARED flock on /gate-target/.alive for its whole
+# life (fd 8, inherited by everything it runs, released only when the
+# pod's processes are gone), empties its workspace on exit, and at
+# start sweeps the directories of runs that died without exiting (an
+# activeDeadlineSeconds kill, an eviction, w-1 resetting).
+#
+# THE LAYOUT IS DECLARED, NOT INFERRED (review 635317c5, C1/C2). The
+# manifest sets GATE_DISK=required beside the claim mount, and only
+# then does this script empty /gate-target at exit, sweep, and guard.
+# Inferring the layout from which paths happen to be mounted was how
+# an earlier version of this paragraph came to call the exit harmless
+# under "the OLD manifest": it is not under the OLDEST one, whose
+# /gate-target is the shared PVC with the persistent `cargo/` crate
+# cache the skew guard below deliberately keeps. The lock itself is
+# harmless everywhere (one small file), so it is taken unconditionally.
 SEED=/gate-seed
 SEED_LOCK="$SEED/.seed.lock"
 mkdir -p /gate-target
+exec 8>>/gate-target/.alive
+flock -s 8
+empty_workspace() { find /gate-target -mindepth 1 -delete 2>/dev/null || true; }
+
+# --- gate-disk guard (begin) ---
+# A GATE ON THE INSTALL DISK REFUSES; IT DOES NOT RUN (review a79746c6,
+# finding 1). Once the gate volume has ever mounted, its mountpoint
+# /var/mnt/gate stays on EPHEMERAL as an empty directory, so a boot
+# without the disk (dead, unenumerated, a selector that matches nothing)
+# leaves a path the local PV mounts without complaint. Every gate would
+# then write its seed and its workspace onto the install disk — xfs,
+# reflinks, green — and nothing would evict, because writes through a PV
+# are not the pod's ephemeral storage: /var fills beside Longhorn's
+# replicas, silently. So before writing anything the runner compares
+# DEVICES: /gate-target on the same one as the pod's /etc/hosts (a
+# kubelet-made file under /var/lib/kubelet/pods, on EPHEMERAL) refuses,
+# and so does a seed and workspace on two devices (the seeding copy
+# would be a full rewrite, not a reflink).
+#
+# ARMED DELIBERATELY, AND POSITIVE (review 635317c5, C1 and C3). It is
+# keyed on GATE_DISK=required, which the manifest sets beside the claim
+# mount — not on /gate-runs happening to be mounted, which a later car
+# could drop and so disarm the guard with every test green. The gate
+# layout mounted WITHOUT the key refuses too. And "not EPHEMERAL" is
+# only a negative: any third filesystem would pass it. So the disk must
+# also carry /gate-runs/.gate-volume, the marker the proof Job writes
+# once it has shown the claim is the gate disk (its device, not
+# EPHEMERAL's). The empty EPHEMERAL fallback directory never carries
+# it. A replaced or reformatted gate disk carries no marker either, and
+# gates refuse until the proof is run again, which is intended. With
+# neither the key nor /gate-runs, this is the OLD manifest, on
+# EPHEMERAL by design, and it passes untouched.
+#
+# THE WORKSPACE IS THIS POD'S OWN DIRECTORY (review 0b9c02f1, F3). Last,
+# the workspace must be the same inode on the same device as
+# <runs dir>/$POD_NAME. That ties the marker to the workspace: a
+# /gate-runs from the gate disk beside a /gate-target from another
+# volume refuses. It also catches a dropped or renamed POD_NAME, which
+# the kubelet would leave as a literal `$(POD_NAME)` directory shared by
+# every pod — the 2026-08-24 crossed-receipts shape that `boss gate`'s
+# discriminator cannot see, because it reads only the manifest's text.
+# Prints the reason and returns 1 to refuse.
+gate_disk_guard() { # <GATE_DISK> <runs dir> <seed> <workspace> <a file on EPHEMERAL> <POD_NAME>
+    local d_s d_t d_e own ws
+    if [ "$1" != required ]; then
+        if [ -d "$2" ]; then
+            echo "REFUSED: $2 is mounted (the gate-volume layout) but GATE_DISK is '${1}', not 'required' — the manifest mounts claim gate without arming this guard"
+            return 1
+        fi
+        return 0
+    fi
+    if [ ! -d "$2" ]; then
+        echo "REFUSED: GATE_DISK=required but $2 is not mounted — the runner is not on the gate-volume layout it declares"
+        return 1
+    fi
+    if [ ! -f "$2/.gate-volume" ]; then
+        echo "REFUSED: $2/.gate-volume is absent — nothing has proven this is the gate disk (run the gate-volume proof Job, backlog 52ea56ac)"
+        return 1
+    fi
+    if [ -z "${6:-}" ]; then
+        echo "REFUSED: POD_NAME is not set — the workspace's own directory (runs/\$(POD_NAME)) cannot be named, and the kubelet would share one literal directory between every pod"
+        return 1
+    fi
+    d_s=$(stat -c %d "$3" 2>/dev/null || true)
+    d_t=$(stat -c %d "$4" 2>/dev/null || true)
+    d_e=$(stat -c %d "$5" 2>/dev/null || true)
+    if [ -z "$d_s" ] || [ -z "$d_t" ] || [ -z "$d_e" ]; then
+        echo "REFUSED: could not read the device of $3, $4 or $5 — the gate cannot tell which disk it would write"
+        return 1
+    fi
+    if [ "$d_s" != "$d_t" ]; then
+        echo "REFUSED: $3 (device $d_s) and $4 (device $d_t) are on different filesystems — the gate volume is not one mount, and the seeding copy could not be a reflink"
+        return 1
+    fi
+    if [ "$d_t" = "$d_e" ]; then
+        echo "REFUSED: $4 is on the same filesystem as $5 (device $d_t), which is the pod's EPHEMERAL — the gate volume is not mounted on this node, and this gate would write its seed and workspace to the install disk"
+        return 1
+    fi
+    ws=$(stat -c %d:%i "$4" 2>/dev/null || true)
+    own=$(stat -c %d:%i "$2/$6" 2>/dev/null || true)
+    if [ -z "$ws" ] || [ "$ws" != "$own" ]; then
+        echo "REFUSED: $4 (${ws:-unreadable}) is not this pod's own directory $2/$6 (${own:-absent}) — the workspace is not the marked gate disk's runs/\$(POD_NAME)"
+        return 1
+    fi
+    return 0
+}
+# --- gate-disk guard (end) ---
+if ! GATE_DISK_REFUSAL=$(gate_disk_guard "${GATE_DISK:-}" /gate-runs /gate-seed /gate-target /etc/hosts "${POD_NAME:-}"); then
+    echo "=================================================================="
+    echo "gate-runner: $GATE_DISK_REFUSAL"
+    echo "gate-runner: check the node: talosctl get volumestatus u-gate (backlog 52ea56ac)"
+    echo "=================================================================="
+    # THE REFUSAL SHAPE, not prose (review 0b9c02f1, F1): the receipt
+    # gate.sh's disk floor and gate.rs's launch refusals write, so
+    # train_gate::standing and `boss gate --wait` read the reason
+    # rather than "no reason recorded".
+    report refused "$(jq -nc --arg w "gate disk: $GATE_DISK_REFUSAL" '{verdict:"refused",refused_because:$w}')" || true
+    exit 2
+fi
+# Only on the declared gate-volume layout, and only once the guard has
+# passed: the workspace is then this pod's own directory of the gate
+# disk, and emptying it at exit is what an emptyDir did by dying.
+if [ "${GATE_DISK:-}" = required ]; then
+    trap 'empty_workspace' EXIT
+fi
+
+# --- workspace-sweep (begin) ---
+# A dead run's directory is removed only when BOTH hold: nothing in it
+# moved for an hour — which spares the seconds between the kubelet
+# making a new pod's directory and its run.sh taking the lock, and a
+# run under a script older than the lock, whose gate.log still grows —
+# and an EXCLUSIVE flock on its .alive succeeds, which no live run
+# allows. The rm runs inside that lock. Pod names are never reused, so
+# a swept directory can never be one a new gate is about to adopt.
+sweep_dead_workspaces() { # <runs dir> <this pod's own name>
+    local runs="$1" own="$2" d n=0
+    if [ ! -d "$runs" ]; then return 0; fi
+    for d in "$runs"/*; do
+        if [ ! -d "$d" ] || [ "${d##*/}" = "$own" ]; then continue; fi
+        if [ -n "$(find "$d" -maxdepth 1 -mmin -60 -print -quit 2>/dev/null)" ]; then continue; fi
+        if ( flock -x -n 9 && rm -rf "$d" ) 9>>"$d/.alive" 2>/dev/null; then
+            n=$((n + 1))
+        fi
+    done
+    echo "gate-runner: swept $n dead gate workspace(s) from $runs"
+}
+# --- workspace-sweep (end) ---
+sweep_dead_workspaces /gate-runs "${POD_NAME:-}"
+# Which filesystem this run's I/O lands on, on every run's log: the
+# workspace and the seed must be ONE (a reflink cannot cross two), and
+# on w-1 that is the gate disk, not the install disk's /var.
+df -Pk /gate-target /gate-seed 2>/dev/null | sed 's/^/gate-runner: disk /' || true
 
 # SKEW GUARD, the other direction: under an OLD manifest (no /gate-seed
 # mount) this pod's /gate-target is still the shared PVC, which

@@ -170,6 +170,7 @@ describe('yardAlerts — what is wrong right now, each a button to its subject',
           silent: true,
           last_verb: 'reconcile',
           last_rc: 0,
+          withheld: null,
         },
       }),
     );

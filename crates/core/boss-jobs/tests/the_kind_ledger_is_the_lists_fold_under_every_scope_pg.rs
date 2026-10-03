@@ -85,16 +85,8 @@ fn job(n: usize, (kind, version, owner, sk, sid, status, closed): Row) -> Job {
     let id = Uuid::parse_str(&format!("112c0535-0000-0000-0001-{n:012}")).expect("uuid");
     Job {
         id: JobId::from_uuid(id),
-        kind: kind.to_string(),
         workflow_version: version,
-        subject: Subject::new(sk, sid),
-        title: format!("packet {n}"),
-        owner_id: owner.into(),
         status,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 1).expect("day"),
-        opened_at: None,
-        due_on: None,
         closed_on: (status == JobStatus::Closed)
             .then(|| NaiveDate::from_ymd_opt(2026, 9, closed).expect("day")),
         metadata: if status == JobStatus::Closed {
@@ -102,8 +94,14 @@ fn job(n: usize, (kind, version, owner, sk, sid, status, closed): Row) -> Job {
         } else {
             serde_json::Value::Null
         },
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            kind.to_string(),
+            Subject::new(sk, sid),
+            format!("packet {n}"),
+            owner,
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 1).expect("day"),
+        )
     }
 }
 

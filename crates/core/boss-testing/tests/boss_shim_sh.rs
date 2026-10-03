@@ -129,6 +129,8 @@ fn stub(path: &Path, who: &str, built_from: &str) {
              echo \"ran={who}\"\n\
              echo \"jobs_url=${{BOSS_JOBS_URL:-unset}}\"\n\
              echo \"tree=${{BOSS_TREE:-unset}}\"\n\
+             echo \"token_hosts=${{BOSS_MACHINE_TOKEN_HOSTS-unset}}\"\n\
+             echo \"token_dir=${{BOSS_MACHINE_TOKEN_DIR-unset}}\"\n\
              for a in \"$@\"; do echo \"arg=$a\"; done\n"
         ),
     );
@@ -270,6 +272,8 @@ impl Fixture {
             .env_remove("BOSS_SHIM_CLI_POLL")
             .env_remove("BOSS_JOBS_URL")
             .env_remove("BOSS_TREE")
+            .env_remove("BOSS_MACHINE_TOKEN_HOSTS")
+            .env_remove("BOSS_MACHINE_TOKEN_DIR")
             .env_remove("BOSS_SHIM_BUILT")
             .env_remove("BOSS_SHIM_VERBOSE");
         cmd
@@ -346,6 +350,59 @@ fn the_image_cli_at_origin_main_is_execd_and_named() {
             && out.contains(short(&main))
             && out.contains("= origin/main"),
         "verbose names the candidate and its sha: {out}"
+    );
+}
+
+/// The pod's record is a Service name, which boss-core no longer stamps
+/// by default (review of 54d9a23a, MEDIUM-1): the shim hands the CLI
+/// the host of `sor-url` as its token host list when nothing names one,
+/// the same default the pod's boss-api door takes. A caller's own list,
+/// even an empty one, is kept.
+#[test]
+fn the_shim_names_its_records_host_as_the_token_host_list() {
+    let f = Fixture::new("token-hosts");
+    let main = main_sha();
+    f.image(&main);
+    let sor = sor();
+    let host = sor
+        .split_once("://")
+        .map_or(sor.as_str(), |(_, r)| r)
+        .split(['/', ':'])
+        .next()
+        .unwrap()
+        .to_string();
+    let (rc, out) = f.run(&["--version"], &[]);
+    assert_eq!(rc, 0, "the shim failed: {out}");
+    assert!(out.contains(&format!("token_hosts={host}\n")), "{out}");
+    let (rc, out) = f.run(&["--version"], &[("BOSS_MACHINE_TOKEN_HOSTS", "")]);
+    assert_eq!(rc, 0, "the shim failed: {out}");
+    assert!(out.contains("token_hosts=\n"), "a set list is kept: {out}");
+}
+
+/// THE DOORS' COPY OF THE TOKEN (backlog 1876bbdb, INFO-5). The dev pod
+/// mounts the machine token at the directory `infra/dev/machine-token-dir`
+/// names, off boss-core's default so a builder's handler tests never read
+/// it — and the shim hands that directory to the CLI it runs, as
+/// `BOSS_MACHINE_TOKEN_DIR`, so the operator's `boss` verbs still stamp.
+/// A caller's own directory is kept.
+#[test]
+fn the_shim_hands_the_cli_the_doors_token_directory() {
+    let f = Fixture::new("token-dir");
+    let main = main_sha();
+    f.image(&main);
+    let named = std::fs::read_to_string(repo_root().join("infra/dev/machine-token-dir"))
+        .expect("machine-token-dir");
+    let (rc, out) = f.run(&["--version"], &[]);
+    assert_eq!(rc, 0, "the shim failed: {out}");
+    assert!(
+        out.contains(&format!("token_dir={}\n", named.trim())),
+        "{out}"
+    );
+    let (rc, out) = f.run(&["--version"], &[("BOSS_MACHINE_TOKEN_DIR", "/elsewhere")]);
+    assert_eq!(rc, 0, "the shim failed: {out}");
+    assert!(
+        out.contains("token_dir=/elsewhere\n"),
+        "a caller's is kept: {out}"
     );
 }
 

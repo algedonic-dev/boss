@@ -21,6 +21,17 @@ use crate::files::error::FileError;
 use crate::files::port::{FileRepository, FileStorage};
 use crate::files::types::{FileRef, FileRefDraft, ResourceRef};
 
+/// The port's list order: newest `uploaded_at` first, and a tie in id
+/// order. Both adapters stopped at `uploaded_at` until the
+/// adapters-agree suite (backlog be459ab9), so two files uploaded in
+/// one instant answered in HashMap order here and plan order in
+/// Postgres, which now sorts `uploaded_at DESC, id`.
+fn newest_first_then_id(a: &FileRef, b: &FileRef) -> std::cmp::Ordering {
+    b.uploaded_at
+        .cmp(&a.uploaded_at)
+        .then_with(|| a.id.cmp(&b.id))
+}
+
 #[derive(Default)]
 pub struct InMemoryFileRepository {
     rows: Mutex<HashMap<Uuid, FileRef>>,
@@ -39,20 +50,29 @@ impl FileRepository for InMemoryFileRepository {
         draft: FileRefDraft,
         _stamp: &boss_core::publisher::EventStamp,
     ) -> Result<FileRef, FileError> {
+        draft.validate()?;
         let mut rows = self.rows.lock().expect("poisoned");
-        // Live-row dedup check: a different live row already pointing
-        // at this object_key indicates a programming bug — callers
-        // should reuse the existing row, not insert a parallel one.
-        // Soft-deleted rows are exempt because the bytes GC may have
-        // resurrected scenarios.
-        for existing in rows.values() {
-            if existing.deleted_at.is_none()
-                && existing.object_key == draft.object_key
-                && existing.bucket == draft.bucket
-                && existing.id != draft.id
-            {
-                return Err(FileError::DuplicateObject(draft.sha256.clone()));
-            }
+        // A taken id is refused, never replaced. Until the
+        // adapters-agree suite (backlog be459ab9) the dedup below
+        // skipped the row with the draft's own id, so a reused id on a
+        // new key silently rewrote the first row — and revived it if
+        // detached — where Postgres refuses on the primary key.
+        if rows.contains_key(&draft.id) {
+            return Err(FileError::Validation(format!(
+                "file {} already exists",
+                draft.id
+            )));
+        }
+        // Dedup: ANY row already holding this (bucket, object_key),
+        // detached ones included, refuses a second — the table's
+        // UNIQUE (bucket, object_key) covers every row. This double
+        // exempted detached rows until the adapters-agree suite
+        // (backlog be459ab9), so it wrote what production refuses.
+        if rows
+            .values()
+            .any(|r| r.object_key == draft.object_key && r.bucket == draft.bucket)
+        {
+            return Err(FileError::DuplicateObject(draft.sha256.clone()));
         }
         let row = draft.into_ref();
         rows.insert(row.id, row.clone());
@@ -70,7 +90,7 @@ impl FileRepository for InMemoryFileRepository {
             .filter(|r| r.deleted_at.is_none() && &r.target == target)
             .cloned()
             .collect();
-        out.sort_by_key(|r| std::cmp::Reverse(r.uploaded_at));
+        out.sort_by(newest_first_then_id);
         Ok(out)
     }
 
@@ -81,7 +101,7 @@ impl FileRepository for InMemoryFileRepository {
             .filter(|r| r.sha256 == sha256)
             .cloned()
             .collect();
-        out.sort_by_key(|r| std::cmp::Reverse(r.uploaded_at));
+        out.sort_by(newest_first_then_id);
         Ok(out)
     }
 

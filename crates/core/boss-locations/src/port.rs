@@ -30,6 +30,19 @@ pub fn declared_event(stamp: &EventStamp, row: &Location) -> Result<Event, Locat
     Ok(stamp.event(LOCATION_DECLARED, payload))
 }
 
+/// The refusal of a batch that inserts a row whose `parent_id` names a
+/// Location neither the registry nor the batch holds. One constructor
+/// for both adapters, so the refusal reads the same from either
+/// (backlog be459ab9, found by the adapters-agree suite: until
+/// 2026-09-30 the double inserted the orphan and answered the count,
+/// while Postgres refused at commit with a foreign-key message that
+/// did not name the parent).
+pub fn absent_parent(parent_id: &str) -> LocationError {
+    LocationError::Conflict(format!(
+        "parent location {parent_id} is held neither by the registry nor by the batch"
+    ))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LocationError {
     #[error("storage failure: {0}")]
@@ -86,7 +99,11 @@ pub trait LocationRepository: Send + Sync {
     /// whose id exists is left exactly as it was (never overwritten:
     /// a re-run of a tenant's publish must not clobber an operator's
     /// edit). Returns the count actually inserted. One transaction,
-    /// so a parent listed after its child in the same batch lands.
+    /// so a parent listed after its child in the same batch lands —
+    /// and a batch inserting a row whose parent neither the registry
+    /// nor the batch holds is refused WHOLE with [`absent_parent`]
+    /// (the first such parent in byte order), writing nothing. A row
+    /// lands as declared, `retired_at` included.
     ///
     /// Every row inserted records one [`LOCATION_DECLARED`] event
     /// built from `stamp` ([`declared_event`]) in that same

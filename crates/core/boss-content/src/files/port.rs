@@ -28,6 +28,9 @@ pub trait FileRepository: Send + Sync {
     /// can mint it ahead of time and use it as both the row PK and
     /// the audit_log event id (per the design's identity choice).
     /// Returns the persisted row with `deleted_at: None`.
+    /// Refuses, writing nothing: a negative `size_bytes` and a taken
+    /// id as `Validation`, and a (bucket, object_key) any row already
+    /// holds — detached rows included — as `DuplicateObject(sha256)`.
     /// OUTBOX (phase 2): records `content.file.attached` (the full
     /// FileRef) in the same transaction as the row.
     async fn insert(&self, draft: FileRefDraft, stamp: &EventStamp) -> Result<FileRef, FileError>;
@@ -38,14 +41,15 @@ pub trait FileRepository: Send + Sync {
     async fn get(&self, id: Uuid) -> Result<Option<FileRef>, FileError>;
 
     /// All live (deleted_at IS NULL) attachments for one resource,
-    /// newest first by `uploaded_at`. The Session 2 HTTP layer calls
+    /// newest first by `uploaded_at`, a tie in id order (backlog
+    /// be459ab9). The Session 2 HTTP layer calls
     /// this from the `<FileAttachments target_*>` Svelte component.
     async fn list_for(&self, target: &ResourceRef) -> Result<Vec<FileRef>, FileError>;
 
     /// All rows (live + soft-deleted) sharing this sha256. Used by
     /// the Session 3 GC sweep: an object is safe to delete only when
     /// every ref pointing at it is soft-deleted past the grace
-    /// window. Returns rows newest-first.
+    /// window. Returns rows newest-first, a tie in id order.
     async fn list_for_sha256(&self, sha256: &str) -> Result<Vec<FileRef>, FileError>;
 
     /// Mark a row soft-deleted at the given timestamp. Idempotent —

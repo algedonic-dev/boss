@@ -1,4 +1,7 @@
 <script lang="ts">
+  // Approved d4dada70 overview (2026-10-02) keeps the recorded transit
+  // world mounted through orientation and board entry. Legacy links keep
+  // their flights; this explicit entry never substitutes rate replay.
   // THE IT MAP AS A TRANSIT MONITOR (design 16091dfb, answered by David
   // 2026-09-25; backlog ced4ca8b) — behind the flight `it-map-transit`.
   // MapPage mounts this in place of the world map for a viewer the
@@ -57,6 +60,7 @@
   import type { Border, Borders } from './borders';
   import { countText, regionHref, type Region, type Regions } from './regions';
   import type { Routes } from './routes';
+  import { NOT_IN_SCOPE } from '../../policy/withheld';
   import { ledgerOf, linesOf, mapView, sectionKey, sectionsOf, wordsSide } from './route-layout';
   import RouteLayer from './RouteLayer.svelte';
   import {
@@ -70,6 +74,7 @@
     stationLabel,
   } from './transit';
   import { safeLinkHref } from '@boss/web-kit/links';
+  import { presentationHref } from './map-navigation';
 
   type Props = Readonly<{
     regions: Regions;
@@ -84,8 +89,9 @@
      *  name or a section's `from→to` (selection.ts `markOf`); null for
      *  nothing. Marked, never re-read: the page decides what is selected. */
     selected?: string | null;
+    overview?: boolean;
   }>;
-  let { regions, routes = null, borders = null, selected = null }: Props = $props();
+  let { regions, routes = null, borders = null, selected = null, overview = false }: Props = $props();
 
   const prefersReduced = new MediaQuery('(prefers-reduced-motion: reduce)');
   const reduced = $derived(prefersReduced.current);
@@ -93,7 +99,9 @@
    *  the recorded moves ride the sections, and the rate-replay blocks
    *  are off — a replayed rate beside the real moves would draw each
    *  crossing twice, once as a picture of it. */
-  const live = $derived(flightOn('it-map-live'));
+  const live = $derived(overview || flightOn('it-map-live'));
+  let motionSource = $state({ kind: 'connecting', why: '' });
+  function showFeed(kind: string, why: string): void { motionSource = { kind, why }; }
 
   /** How long a live dot takes to cross a section — the viewer's own,
    *  remembered in this browser (transit-choice.ts; David 2026-09-27,
@@ -135,13 +143,14 @@
       : `${stationLabel(name)} · ${countText(r)} · ${r.state}`;
 
   function open(e: MouseEvent, href: string): void {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
     e.preventDefault();
     navigate(href);
   }
 </script>
 
-<section class="transit" data-transit data-motion={reduced ? 'reduced' : 'moving'}>
-  <div class="grid">
+<section class="transit" data-transit data-overview={overview ? 'true' : undefined} data-motion={reduced ? 'reduced' : 'moving'}>
+  <div class="grid" class:overview>
     <div class="board">
       <svg
         viewBox="0 0 {view.width} {view.height}"
@@ -150,7 +159,7 @@
         <!-- THE ROUTES (design e765b3fc, car R3): every section, exit and
              entry the routes read serves, drawn by RouteLayer.svelte from
              route-layout.ts — the layer the moves of car M2 travel. -->
-        <RouteLayer sections={laid.sections} borders={byKey} {reduced} {selected} {live} band={laid.band}
+        <RouteLayer sections={laid.sections} borders={byKey} {reduced} {selected} {live} {overview} band={laid.band}
           width={view.width} height={view.height} />
 
         <!-- THE STATIONS: a ring each in the region's state, pulsing when
@@ -162,15 +171,15 @@
           {@const state = ringOf(r)}
           {@const isSelected = selected === st.name}
           {@const side = wordsSide(st.name, laid.sections)}
-          {@const wx = side === 'left' ? st.x - 14 : st.x + 14}
+          {@const wx = side === 'left' ? st.x - (overview ? 38 : 14) : st.x + (overview ? 38 : 14)}
           {@const anchor = side === 'left' ? 'end' : 'start'}
           {@const led = ledger(st.name)}
-          <a class="station" href={safeLinkHref(regionHref(st.name))} data-station={st.name} data-state={state}
+          <a class="station" href={safeLinkHref(presentationHref(regionHref(st.name), overview))} data-station={st.name} data-state={state}
             data-selected={isSelected ? 'true' : undefined} aria-current={isSelected ? 'true' : undefined}
-            aria-label={stationTitle(st.name, r)} onclick={(e) => open(e, regionHref(st.name))}>
+            aria-label={stationTitle(st.name, r)} onclick={(e) => open(e, presentationHref(regionHref(st.name), overview))}>
             <title>{stationTitle(st.name, r)}</title>
             {#if isSelected}
-              <circle cx={st.x} cy={st.y} r="20" class="sel-ring" data-selected-mark={st.name} />
+              <circle cx={st.x} cy={st.y} r={overview ? 28 : 20} class="sel-ring" data-selected-mark={st.name} />
             {/if}
             {#if state === 'troubled' && !reduced}
               <circle cx={st.x} cy={st.y} r="15" class="pulse" data-pulse={st.name} />
@@ -180,10 +189,10 @@
                  an unpainted plate behind the ring and the name keeps the
                  door's centre on the door (a click at the middle of it
                  lands on it, not on the map behind). -->
-            <rect x={st.below ? (side === 'left' ? st.x - 100 : st.x - 16) : st.x - 45}
-              y={st.below ? st.y - 16 : st.y - NAME_ABOVE - 14} width={st.below ? 116 : 90}
+            <rect x={st.below ? (side === 'left' ? st.x - 100 : st.x - 16) : st.x - (overview ? 75 : 45)}
+              y={st.below ? st.y - 16 : st.y - NAME_ABOVE - 14} width={st.below ? 116 : overview ? 150 : 90}
               height={st.below ? 50 : NAME_ABOVE + 30} class="door" aria-hidden="true" />
-            <circle cx={st.x} cy={st.y} r="12" class="ring {state}" />
+            <circle cx={st.x} cy={st.y} r={overview ? 18 : 12} class="ring {state}" />
             <!-- WORDS OFF THE LINES (design f0313eda E2): the exit's stub
                  drops straight down from the ring, so a station off the
                  line writes its name beside it, and every station its
@@ -195,15 +204,17 @@
               <text x={st.x} y={st.y - NAME_ABOVE} text-anchor="middle" class="stn">{stationLabel(st.name)}</text>
             {/if}
           </a>
-          <text x={wx} y={st.below ? st.y + 41 : st.y + 34} text-anchor={anchor} class="sub words">{stationCount(r)}</text>
-          {#if led !== null}
+          {#if !overview}
+            <text x={wx} y={st.below ? st.y + 41 : st.y + 34} text-anchor={anchor} class="sub words">{stationCount(r)}</text>
+          {/if}
+          {#if led !== null && !overview}
             <text x={wx} y={st.below ? st.y + 53 : st.y + 47} text-anchor={anchor} class="led words" data-ledger={st.name}>{led}</text>
           {/if}
         {/each}
 
         {#if live}
           <!-- THE MOVES (car M2): over the stations, so a ping reads on top. -->
-          <LiveMotion geometry={geometryOf(routes)} {reduced} {transit} />
+          <LiveMotion geometry={geometryOf(routes)} {reduced} {transit} onFeed={overview ? showFeed : undefined} />
         {/if}
       </svg>
     </div>
@@ -214,17 +225,24 @@
     <aside class="alarms" aria-label="alarms">
       <h2>Alarms</h2>
       {#each alarms as a (a.name)}
-        <a class="alarm" href={safeLinkHref(regionHref(a.name))} data-alarm={a.name} data-state={a.state} title={a.why}
-          onclick={(e) => open(e, regionHref(a.name))}>
+        <a class="alarm" href={safeLinkHref(presentationHref(regionHref(a.name), overview))} data-alarm={a.name} data-state={a.state} title={a.why}
+          onclick={(e) => open(e, presentationHref(regionHref(a.name), overview))}>
           <span class="alarm-head"><span class="alarm-name">{a.label}</span><span class="st {a.state}">{a.state}</span></span>
-          <span class="why">{a.why}</span>
+          {#if !overview}<span class="why">{a.why}</span>{/if}
         </a>
       {:else}
         <p class="none" data-alarms-clear>No alarms — every station is clear or full.</p>
       {/each}
     </aside>
   </div>
+  {#if overview}
+    <p class="motion-source" class:load-failed={motionSource.kind === 'down'} data-motion-status>
+      Recorded moves: {motionSource.kind}{motionSource.why ? ` — ${motionSource.why}` : ''}. Display transit is {transit / 1000}s; the record's event time is unchanged.
+    </p>
+  {/if}
 
+  <details open={!overview} class="map-key">
+  <summary>Routes, counts and motion · {routes === null ? 'route reading unavailable' : `${routes.window_hours}h observation window`}</summary>
   <div class="key" aria-label="the lines">
     {#each lines as l (l)}
       <span class="key-item"><svg class="swatch" viewBox="0 0 20 4" aria-hidden="true"><line x1="0" y1="2" x2="20" y2="2" class="line-{l}" /></svg>{LINE_LABEL[l]}</span>
@@ -235,6 +253,12 @@
       <span class="key-item" data-key-exit><svg class="swatch tall" viewBox="0 0 20 12" aria-hidden="true"><path d="M10 0 V4 L4 10 M10 4 V10 M10 4 L16 10" class="line-delivery" /><line x1="1" y1="11" x2="19" y2="11" class="line-delivery" /></svg>an exit: one stub, a branch per terminal, a buffer stop and its count</span>
       <span class="key-item"><svg class="swatch" viewBox="0 0 20 4" aria-hidden="true"><line x1="0" y1="2" x2="20" y2="2" class="line-delivery idle" /></svg>faded: a declared terminal nothing left by in the window</span>
       <span class="key-item" data-key-ledger>in · on · off: moves into a station, on to another, off the map</span>
+    {/if}
+    {#if routes?.observed_withheld}
+      <!-- The moves counts withheld from this caller (bd506215): said in
+           the key, neutral, so a map with no counts never reads as a
+           yard nothing crossed. -->
+      <span class="key-item" data-key-withheld title={routes.observed_withheld}>moves counted: {NOT_IN_SCOPE}</span>
     {/if}
     {#if anyUndeclared}
       <span class="key-item" data-key-undeclared><svg class="swatch" viewBox="0 0 20 4" aria-hidden="true"><line x1="0" y1="2" x2="20" y2="2" class="undeclared" /></svg>dashed red: packets moved this way, and no protocol or hand-off declares it</span>
@@ -261,6 +285,7 @@
   <p class="replay" data-replay>
     {live ? liveText(transit) : REPLAY_TEXT}{reduced && live ? '. Reduced motion is on: a move flashes its count at the station it reached, and nothing travels.' : reduced ? '. Reduced motion is on: nothing moves, and a section\'s panel carries its rate.' : ''}
   </p>
+  </details>
 </section>
 
 <style>
@@ -269,11 +294,20 @@
      ok / warn / bad edges, the words its ink and muted. */
   .transit { margin-top: var(--s3); }
   .grid { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: var(--s3); align-items: start; }
-  @media (max-width: 1100px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+  .grid.overview { grid-template-columns: minmax(0, 1fr) 200px; }
+  .map-key { margin-top: var(--s2); font-size: 12px; color: var(--map-muted); }
+  .map-key summary { cursor: pointer; }
+  @media (max-width: 1100px) { .grid, .grid.overview { grid-template-columns: minmax(0, 1fr); } }
   .board { background: var(--map-bg); border: 1px solid var(--map-rule); border-radius: var(--radius); overflow-x: auto; }
   /* Twice as wide since the exits band (design f0313eda E2), so it keeps
      a legible floor and scrolls across below it rather than shrinking. */
   .board svg { display: block; width: 100%; min-width: 1100px; height: auto; font-family: var(--font-body); }
+  .overview .board svg { min-width: 0; }
+  .overview .board text.stn { font-size: 30px; }
+  .overview .board :global(.live text) { font-size: 30px; }
+  .overview .board :global(.live .mark) { r: 10px; }
+  .motion-source { margin: var(--s2) 0; color: var(--map-muted); font-size: 12px; overflow-wrap: anywhere; }
+  .motion-source.load-failed { color: var(--map-bad-ink); }
   .board text { fill: var(--map-ink); }
   .stn { font-size: 12px; font-weight: 600; }
   .sub { font-size: 10.5px; fill: var(--map-muted); }

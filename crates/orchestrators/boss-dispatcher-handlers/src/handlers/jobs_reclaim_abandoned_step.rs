@@ -239,9 +239,9 @@ fn after_hours(args: &[(String, Value)]) -> Result<f64, HandlerError> {
 /// whole of backlog ce3a4b16. Until 2026-09-22 this was one PUT whose
 /// `metadata` simply left the key out — which reads as a clear and is
 /// not one: from b91a2103 the step PUT CARRIED `agent_run` forward
-/// whenever a body omitted it, and since e39a9d2a it refuses such a
-/// body outright (`crates/core/boss-jobs/src/http/steps.rs`, pinned by
-/// `a_step_put_that_drops_a_stored_key_is_refused.rs`). Under the
+/// whenever a body omitted it, and since e39a9d2a it refuses any
+/// metadata body outright (`crates/core/boss-jobs/src/http/steps.rs`,
+/// pinned by `a_step_put_carrying_metadata_is_refused.rs`). Under the
 /// carry, the release believed it cleared the edge and did not, and the
 /// reclaimed step went back to `ready` still naming the run that
 /// abandoned it. `PATCH .../steps/{id}/metadata` is the only door that
@@ -562,9 +562,8 @@ mod tests {
     /// - **PUT `/steps/{id}` is an OVERLAY**, not a replacement of the
     ///   row: a key absent from the body leaves the stored field alone
     ///   (`crates/core/boss-jobs/src/http/steps.rs`).
-    /// - **AND IT REFUSES A `metadata` BODY THAT DROPS A STORED KEY**
-    ///   (e39a9d2a, pinned by
-    ///   `crates/core/boss-jobs/tests/a_step_put_that_drops_a_stored_key_is_refused.rs`;
+    /// - **AND IT REFUSES ANY `metadata` BODY** (e39a9d2a, pinned by
+    ///   `crates/core/boss-jobs/tests/a_step_put_carrying_metadata_is_refused.rs`;
     ///   until then it carried `agent_run` forward on omission,
     ///   b91a2103), so a PUT can never DELETE the edge.
     /// - **PATCH `/steps/{id}/metadata` merges top-level keys, and a
@@ -641,17 +640,10 @@ mod tests {
                                     }
                                     // The server's own rule, called rather
                                     // than retyped (CLAUDE.md §9a).
-                                    let drops = body.get("metadata").is_some_and(|sent| {
-                                        !boss_jobs::step_metadata_write::omitted_keys(
-                                            &step["metadata"],
-                                            sent,
-                                        )
-                                        .is_empty()
-                                    });
-                                    if drops {
+                                    if boss_jobs::step_metadata_write::put_carries_metadata(&body) {
                                         return (
                                             axum::http::StatusCode::CONFLICT,
-                                            boss_jobs::step_metadata_write::OMITTED_KEYS_HINT,
+                                            boss_jobs::step_metadata_write::METADATA_BODY_HINT,
                                         )
                                             .into_response();
                                     }

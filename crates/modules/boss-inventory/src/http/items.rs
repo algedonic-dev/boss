@@ -150,7 +150,7 @@ pub(super) async fn consume_part<R: InventoryRepository + 'static>(
         Err(InventoryError::NotFound(sku)) => {
             return (StatusCode::NOT_FOUND, format!("part not found: {sku}")).into_response();
         }
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return super::error_response(e),
     };
     let crate::types::ConsumeApplied {
         item,
@@ -334,7 +334,7 @@ pub(super) async fn batch_upsert_items<R: InventoryRepository + 'static>(
             .upsert_item_at(item, stamp.timestamp, &stamp)
             .await
         {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            return super::error_response(e);
         }
         // Atomic opening-balance JE. When a batch upsert lands a row
         // carrying value, post DR 1300 / CR 3000 sized at exactly
@@ -458,7 +458,7 @@ pub(super) async fn receive_part_handler<R: InventoryRepository + 'static>(
         Err(InventoryError::NotFound(sku)) => {
             return (StatusCode::NOT_FOUND, format!("part not found: {sku}")).into_response();
         }
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return super::error_response(e),
     };
     let crate::types::ReceiveApplied {
         item,
@@ -593,7 +593,7 @@ pub(super) async fn overhead_absorbed_handler<R: InventoryRepository + 'static>(
         Err(e @ InventoryError::InvalidAccount(_)) => {
             return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response();
         }
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return super::error_response(e),
     };
     let (canonical_fact_id, _fact_inserted) = canonical_fact_id;
 

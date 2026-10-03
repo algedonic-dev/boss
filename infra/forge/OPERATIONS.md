@@ -143,10 +143,12 @@ No ssh from the pod. Three doors, all read-only:
   the packet before deleting it; `--dry-run` runs every bound and
   deletes nothing), and `publish-github-pr` (the
   machine step of publish-to-github v6: snapshot forge main onto the
-  public mirror as a PR from the dauld fork; reads the dauld token at
-  `/etc/boss-publish/github.token`, credentials registry
-  `dauld-github-token`, and refuses loudly without it; `--check`
-  validates its inputs with no network), `read-publish-checks` (the
+  public mirror as a PR from a `publish/<date>-<snapshot>` branch of
+  the mirror itself, opened as the GitHub App with the one-hour
+  installation token the broker mints for that request (backlog
+  d2b7c947; the personal token and fork it used before are retired),
+  and refuses loudly without a live one; `--check` validates its inputs
+  with no network), `read-publish-checks` (the
   second machine step of publish-to-github v7: takes ONE reading of the
   mirror PR's check-runs per run and never waits (backlog b81ff4ca), and
   completes the step only once EVERY check has completed — a check
@@ -268,8 +270,9 @@ cluster API if it is needed.
    with no watchdog is the wrong time to discover a sick node.
 2. Confirm no train is in flight and no `gate-run` is open, then hold
    the conductor so none starts into the window.
-3. Confirm the nightly backup's three legs (the Longhorn PVC,
-   `boss-gcp:/var/backups/boss-cluster-pg`, GCS). Nothing in this
+3. Confirm the nightly backup's two legs (the Longhorn PVC, and the GCS
+   bucket that is the one offsite copy — boss-gcp has held none since
+   2026-10-01, backlog 4bf7bdd1). Nothing in this
    window should touch the database, which is exactly why an untested
    backup should not be discovered afterwards.
 4. Name the last converged build by digest, so any rollback after the

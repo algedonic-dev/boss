@@ -56,10 +56,12 @@ units = ["boss-ml-inference-batch"]
 # packet). No units row — what this role brings is tooling, installed
 # by infra/forge/install.sh when the converge reads the role, and a
 # credential-presence check reported on the converge packet. The
-# ops verbs that read the cluster (node-status, pod-events, talos-logs)
-# and the bounded act (node-converge) are the next cars, and the forge
-# verbs that are shell twins of CLI verbs retire onto the CLI one at a
-# time.
+# bounded act is built: node-converge applies a node's declared Talos
+# patch (infra/cluster/talos/patches/) through a passkey-signed dry-run
+# plan, plan-a-node-converge, with no reboot (backlog 9d56c616). The
+# reads node-status and talos-get are built; pod-events and talos-logs
+# are the next cars, and the forge verbs that are shell twins of CLI
+# verbs retire onto the CLI one at a time.
 units = []
 
 [roles.ops-runner]

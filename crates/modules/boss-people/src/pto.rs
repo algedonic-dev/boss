@@ -28,7 +28,7 @@ use boss_core::calendar::{
 };
 use boss_core::job::Subject;
 use boss_policy_client::writes::{recorded_author, require_reaching};
-use boss_policy_client::{Action, CurrentUser, PolicyClient, Resource};
+use boss_policy_client::{CurrentUser, PolicyClient, controls};
 
 /// PTO API state — wraps the calendar client. `Option` reflects
 /// the config being optional; if the calendar isn't configured the
@@ -111,8 +111,7 @@ async fn create_pto(
         && let Err(refused) = require_reaching(
             policy.as_ref(),
             &user,
-            Action::Create,
-            Resource::schedule(),
+            controls::CREATE_SCHEDULE,
             Some(&req.employee_id),
         )
         .await

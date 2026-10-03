@@ -182,7 +182,9 @@ async fn open_job(app: &axum::Router, kind: &str) -> String {
 }
 
 /// Complete the packet's one step with the close made to fail, and
-/// return what the step write answered.
+/// return what the step write answered. The completion is status
+/// alone: the step PUT refuses any `metadata` body since e39a9d2a, and
+/// this one only ever re-sent the stored metadata unchanged.
 async fn complete_with_a_failing_close(kind: &str) -> (StatusCode, String, serde_json::Value) {
     let (app, jobs) = app();
     let job_id = open_job(&app, kind).await;
@@ -190,8 +192,7 @@ async fn complete_with_a_failing_close(kind: &str) -> (StatusCode, String, serde
         uuid::Uuid::parse_str(&job_id).expect("uuid"),
     ));
     let job = get_job(&app, &job_id).await;
-    let step = &job["steps"][0];
-    let step_id = step["id"].as_str().expect("step id");
+    let step_id = job["steps"][0]["id"].as_str().expect("step id");
     let (status, body) = send(
         &app,
         Request::builder()
@@ -200,8 +201,7 @@ async fn complete_with_a_failing_close(kind: &str) -> (StatusCode, String, serde
             .header("content-type", "application/json")
             .header("x-boss-user", admin_header())
             .body(Body::from(
-                serde_json::json!({ "status": "completed", "metadata": step["metadata"] })
-                    .to_string(),
+                serde_json::json!({ "status": "completed" }).to_string(),
             ))
             .unwrap(),
     )

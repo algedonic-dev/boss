@@ -13,6 +13,7 @@
 //! without an id derives `cust-<sha256(email)[..12]>` — same buyer,
 //! same row, idempotent re-checkout, no PII in the id.
 
+pub mod events;
 pub mod http;
 pub mod in_memory;
 pub mod port;

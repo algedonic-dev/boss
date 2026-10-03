@@ -18,7 +18,10 @@ use boss_core::publish::PublishMode;
 use boss_core::publisher::EventStamp;
 use sqlx::PgPool;
 
-use super::port::{AgentsError, AgentsRegistry, declared_event, updated_event};
+use super::automations::{AutomationActor, AutomationsSeedOutcome, classify, validate_all};
+use super::port::{
+    AgentsError, AgentsRegistry, automation_declared_event, declared_event, updated_event,
+};
 use super::types::{AgentInput, AgentRow, AgentsBatchOutcome, KeptRow, UpdatedRow};
 
 pub struct PgAgents {
@@ -271,5 +274,85 @@ impl AgentsRegistry for PgAgents {
             kept,
             unchanged,
         })
+    }
+
+    async fn list_automations(&self) -> Result<Vec<AutomationActor>, AgentsError> {
+        let rows: Vec<AutomationDbRow> =
+            sqlx::query_as(&format!("{SELECT_AUTOMATIONS} ORDER BY id COLLATE \"C\""))
+                .fetch_all(&self.pool)
+                .await
+                .map_err(storage)?;
+        Ok(rows.into_iter().map(AutomationActor::from).collect())
+    }
+
+    async fn declare_automations(
+        &self,
+        declared: &[AutomationActor],
+        stamp: &EventStamp,
+    ) -> Result<AutomationsSeedOutcome, AgentsError> {
+        validate_all(declared).map_err(AgentsError::Storage)?;
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        // What the registry held, read inside the transaction, so the
+        // outcome names what this run found rather than what a racing
+        // seed left.
+        let held: Vec<AutomationDbRow> = sqlx::query_as(SELECT_AUTOMATIONS)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(storage)?;
+        let held: Vec<AutomationActor> = held.into_iter().map(AutomationActor::from).collect();
+        let mut outcome = classify(&held, declared);
+        let absent = std::mem::take(&mut outcome.inserted);
+        for d in declared.iter().filter(|d| absent.contains(&d.id)) {
+            // DO NOTHING, never DO UPDATE: the instance is the truth
+            // (design e187198f). A seed racing another seed lands the
+            // row once; only the run whose INSERT landed records it,
+            // and the other counts the row as present.
+            let landed = sqlx::query(
+                "INSERT INTO automation_actors (id, role, description, signs_for) \
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(&d.id)
+            .bind(&d.role)
+            .bind(&d.description)
+            .bind(&d.signs_for)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?
+            .rows_affected();
+            if landed == 1 {
+                boss_events::outbox::record_event_in_tx(
+                    &mut tx,
+                    &automation_declared_event(stamp, d)?,
+                )
+                .await
+                .map_err(AgentsError::Storage)?;
+                outcome.inserted.push(d.id.clone());
+            } else {
+                outcome.present.push(d.id.clone());
+            }
+        }
+        tx.commit().await.map_err(storage)?;
+        Ok(outcome)
+    }
+}
+
+const SELECT_AUTOMATIONS: &str = "SELECT id, role, description, signs_for FROM automation_actors";
+
+#[derive(sqlx::FromRow)]
+struct AutomationDbRow {
+    id: String,
+    role: String,
+    description: String,
+    signs_for: Option<String>,
+}
+
+impl From<AutomationDbRow> for AutomationActor {
+    fn from(r: AutomationDbRow) -> Self {
+        AutomationActor {
+            id: r.id,
+            role: r.role,
+            description: r.description,
+            signs_for: r.signs_for,
+        }
     }
 }

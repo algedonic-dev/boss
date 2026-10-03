@@ -1,0 +1,47 @@
+# publish-to-github's third machine step (backlog 602fe95f, David
+# 2026-09-30: "NOBODY pushes or merges main by hand"). When the
+# protocol's `merge` step becomes READY — the PR's reading was green, or
+# its judgement found nothing real — spawn an ops-request for host=forge
+# verb=merge-publish-pr; the root ops-runner runs
+# infra/forge/publish-github-pr.sh --merge, which re-reads the passkey
+# approval, requires every check main's ruleset names green on the PR
+# head, fast-forwards the mirror's main to the approved snapshot as the
+# GitHub App, reads main and the PR back, and completes `merge` with
+# `merged_sha`.
+#
+# WHY A MERGE BY MACHINE. Measured anonymously 2026-09-30: main carried
+# a classic rule requiring checks (`rust`, `web`) no workflow produces,
+# so every merge was an admin bypass through GitHub's UI, and a UI squash
+# stamped a personal address on the public main (#248). The merge is now
+# the App's, bounded to the one PR the publish opened, and main admits no
+# other writer (its ruleset, applied by github-set-branch-protection
+# under David's passkey).
+#
+# Routed on the STEP's metadata marker, not its slug, exactly as
+# publish-github-pr-on-open-pr-ready is: `step.ready.*` payloads carry
+# the step's metadata_defaults and do not hoist spec_slug. The request
+# carries the publish packet's id back as `metadata.for_publish` — the
+# edge the answer's rule (complete-publish-merge-step-on-merge-publish-
+# pr-answered) follows to the step, on success and on failure.
+[[rule]]
+name = "merge-publish-pr-on-merge-ready"
+version = 1
+why = """
+A CROSS-PROTOCOL REACTOR spanning publish-to-github -> ops-request -> a
+verb on the forge host, which no single Workflow consequence can
+express: the publish protocol cannot name a host verb, and the
+ops-request protocol cannot know which publish asked. Measured
+2026-09-30 (backlog 602fe95f): every merge of the public mirror's main
+was an admin bypass by hand, past a classic rule nothing could satisfy,
+and a UI squash put a personal address on main (#248). This files the
+MERGE the moment the reading allows it; it adds no routing inside the
+protocol, which still owns read-checks -> judge-checks -> merge ->
+merged. No authority widened: the approval is the passkey the publish
+already carries, the verb re-reads it, and its token is minted for the
+one request by the publish mint.
+"""
+on_event = "step.ready.task"
+when = 'metadata.ops_verb = "merge-publish-pr"'
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"ops-request\"", subject_kind = "\"custom\"", subject = "\"forge\"", title = "\"merge the approved mirror PR from the forge — its checks are green\"", "metadata.host" = "\"forge\"", "metadata.verb" = "\"merge-publish-pr\"", "metadata.for_publish" = "job_id" }

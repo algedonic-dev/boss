@@ -119,10 +119,12 @@ export type EveryResult<T> =
  * `limit` or `offset` — this owns both. Rows carrying a string `id`
  * are kept once: offset paging over a list that moves can hand one row
  * to two pages.
+ * `read` lets a caller reuse its explicit JSON read port and validate each
+ * envelope before paging; absent that port, this uses the normal HTTP fetch.
  */
 export async function fetchEvery<T>(
   url: string,
-  opts: Readonly<{ page?: number; ceiling?: number }> = {},
+  opts: Readonly<{ page?: number; ceiling?: number; read?: (url: string) => Promise<unknown> }> = {},
 ): Promise<EveryResult<T>> {
   if (/[?&](limit|offset)=/.test(url)) {
     return { kind: 'failed', error: `${url}: fetchEvery owns limit and offset` };
@@ -135,9 +137,12 @@ export async function fetchEvery<T>(
   let offset = 0;
   try {
     for (;;) {
-      const resp = await fetch(`${url}${sep}limit=${page}&offset=${offset}`);
-      if (!resp.ok) return { kind: 'failed', error: `${url}: HTTP ${resp.status}` };
-      const body = (await resp.json()) as unknown;
+      const pageUrl = `${url}${sep}limit=${page}&offset=${offset}`;
+      const body: unknown = opts.read ? await opts.read(pageUrl) : await (async () => {
+        const resp = await fetch(pageUrl);
+        if (!resp.ok) throw new Error(`${url}: HTTP ${resp.status}`);
+        return resp.json() as Promise<unknown>;
+      })();
       // An envelope under a wrong key answers instead of erroring — the
       // HR page read `payload.jobs` for weeks and showed an empty
       // department (hr-tasks.ts). An object with no `data` array is a

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
-use boss_policy_client::{CurrentUser, Resource};
+use boss_policy_client::{CurrentUser, controls};
 
 use super::*;
 use crate::tax_registry::TaxSeed;
@@ -26,7 +26,8 @@ pub(super) async fn declare_tax_batch(
     CurrentUser(user): CurrentUser,
     Json(seed): Json<TaxSeed>,
 ) -> Response {
-    let stamp = match super::authorize_declaration(&state, &user, Resource::tax_regime()).await {
+    let stamp = match super::authorize_declaration(&state, &user, controls::CREATE_TAX_REGIME).await
+    {
         Ok(stamp) => stamp,
         Err(refusal) => return refusal,
     };

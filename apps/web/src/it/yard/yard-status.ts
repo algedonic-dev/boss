@@ -13,6 +13,7 @@
 // included, computed server-side from the system of record.
 
 import { fetchRemote, type Remote } from '../../data/remote';
+import { NOT_IN_SCOPE } from '../../policy/withheld';
 import { DELIVERY_CHANNELS, type DeliveryChannel } from './yard';
 
 // ---------------------------------------------------------------------
@@ -137,8 +138,13 @@ export type HeldCar = Readonly<{
  *  a registry that was read and "I could not tell you" on one that was
  *  not, and those ask an operator for different things (31783deb).
  *  `dock_depth` can express its own unread state as a null against a
- *  number; a field whose null is ALREADY a legitimate value cannot. */
-export type ReadState = 'read' | 'unread';
+ *  number; a field whose null is ALREADY a legitimate value cannot.
+ *
+ *  `withheld` (backlog d0058c92 on the server, bd506215 here): the read
+ *  was not MADE for this caller, whose policy scope does not read every
+ *  packet. The value beside it carries no information, as with `unread`,
+ *  but it is a refusal and is drawn as one — neutral, never trouble. */
+export type ReadState = 'read' | 'unread' | 'withheld';
 
 export type BoardingPredicate = Readonly<{
   dock_threshold: number | null;
@@ -356,6 +362,13 @@ export type ConductorHealth = Readonly<{
    *  under a "last rule" label; the label now matches the fact. */
   last_verb: string | null;
   last_rc: number | null;
+  /** WHY THE FIRING WAS NOT READ for this caller, when the server
+   *  withheld it (backlog d0058c92): the heartbeat is the cadence record,
+   *  not scoped by packet, and this caller's scope does not read every
+   *  packet. The nulls above are then nobody's reading, and the block is
+   *  drawn as "not in your policy scope" — never "no firing on record"
+   *  (bd506215). Null for a caller who reads every packet. */
+  withheld: string | null;
 }>;
 
 /** Whether a car's channel evidence exists — the server's judgement of
@@ -556,7 +569,7 @@ function parseHeldCar(raw: unknown): HeldCar {
  *  `read`: claiming a read that was never stated is the defect this field
  *  exists to report. */
 function parseReadState(raw: unknown): ReadState | null {
-  return raw === 'read' || raw === 'unread' ? raw : null;
+  return raw === 'read' || raw === 'unread' || raw === 'withheld' ? raw : null;
 }
 
 function parseBoarding(raw: unknown): BoardingPredicate {
@@ -704,6 +717,7 @@ function parseConductor(raw: unknown): ConductorHealth | null {
     silent: o.silent === true,
     last_verb: typeof o.last_verb === 'string' ? o.last_verb : null,
     last_rc: typeof o.last_rc === 'number' ? o.last_rc : null,
+    withheld: typeof o.withheld === 'string' ? o.withheld : null,
   };
 }
 
@@ -931,6 +945,11 @@ export function conductorReading(c: ConductorHealth | null): Reading {
   }
   const every =
     c.expected_every_minutes !== null ? ` · expects every ${c.expected_every_minutes}m` : '';
+  // Withheld by scope (bd506215): a refusal, said as one, in the neutral
+  // tone. It was "no firing on record — liveness unknown" in warn, which
+  // is an alarm's colour on the policy working. The declared heartbeat is
+  // a registry fact every reader gets, so it stays.
+  if (c.withheld !== null) return { tone: 'muted', text: `${NOT_IN_SCOPE}${every}` };
   if (c.silent) {
     const since =
       c.silent_for_minutes !== null
@@ -949,6 +968,7 @@ export function conductorReading(c: ConductorHealth | null): Reading {
  *  is running but FAILING every pass looks identical to a healthy one
  *  unless the exit code is on the surface. */
 export function lastVerbReading(c: ConductorHealth | null): Reading {
+  if (c?.withheld) return { tone: 'muted', text: NOT_IN_SCOPE };
   if (!c || c.last_verb === null) return { tone: 'muted', text: 'no verb on record' };
   if (c.last_rc === null) return { tone: 'muted', text: `${c.last_verb} · rc unknown` };
   if (c.last_rc === 0) return { tone: 'ok', text: `${c.last_verb} · rc 0` };
@@ -992,9 +1012,21 @@ export function boardHold(b: BoardingPredicate): BoardHoldView | null {
   // a non-reading is never painted as health — not green, and not the
   // plain colour a working hold wears. The server's own sentences already
   // say which input; this is the lens agreeing with them.
+  //
+  // A WITHHELD firing (d0058c92) is no reading either, so it is muted
+  // too — the neutral tone, not trouble — and its last board says the
+  // refusal, never "not read", a failure's words (bd506215).
   const unread =
-    b.cadence_reading === 'unread' || b.last_board_reading === 'unread' || b.dock_depth === null;
-  const lastBoard = b.last_board_reading === 'unread' ? 'not read' : clockText(b.last_board_at);
+    b.cadence_reading === 'unread' ||
+    b.last_board_reading === 'unread' ||
+    b.last_board_reading === 'withheld' ||
+    b.dock_depth === null;
+  const lastBoard =
+    b.last_board_reading === 'unread'
+      ? 'not read'
+      : b.last_board_reading === 'withheld'
+        ? NOT_IN_SCOPE
+        : clockText(b.last_board_at);
   if (b.held_because !== null) {
     return {
       primary: { tone: unread ? 'muted' : null, text: `held: ${b.held_because}` },

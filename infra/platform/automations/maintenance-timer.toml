@@ -1,0 +1,7 @@
+# automation:maintenance-timer — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 71,755 audit-log facts.
+# Signs as platform-admin today: infra/boss-maintenance-wrap.sh and infra/wait-out-a-converge.sh.
+
+[[automation]]
+id = "automation:maintenance-timer"
+role = "platform-admin"
+description = 'Ensures the open maintenance packet a timer run completes (infra/boss-maintenance-wrap.sh).'

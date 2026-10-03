@@ -36,6 +36,8 @@
     parseQueueAge,
     waitText,
     waitsCountLine,
+    waitsStatusLine,
+    waitStatusText,
     whyNotMoving,
     windowLine,
     type Siding,
@@ -126,6 +128,9 @@
   );
   const waitsCount = $derived(
     waits.kind === 'ready' ? waitsCountLine(waits.data.waits, WAIT_ROWS) : '',
+  );
+  const waitsStatus = $derived(
+    waits.kind === 'ready' ? waitsStatusLine(waits.data.waits) : '',
   );
 
   function clearText(s: Siding): string {
@@ -277,6 +282,7 @@
     {:else if longest.length === 0}
       <p class="my-quiet">Nothing is outstanding.</p>
     {:else}
+      <p class="my-waits-status">{waitsStatus}</p>
       <table class="my-table">
         <thead>
           <tr>
@@ -284,6 +290,7 @@
             <th>Obligation</th>
             <th>Packet</th>
             <th>On whom</th>
+            <th>Status</th>
           </tr>
         </thead>
         <tbody>
@@ -302,6 +309,7 @@
                 <span class="dim mono"> {w.jobKind}</span>
               </td>
               <td class:nobody={w.assigneeId === null}>{w.assigneeId ?? 'nobody'}</td>
+              <td>{waitStatusText(w)}</td>
             </tr>
           {/each}
         </tbody>
@@ -354,7 +362,7 @@
   }
   .my-section::after { content: ''; flex: 1; border-top: 1px solid var(--hairline); }
   .my-quiet { color: var(--static); font-size: 13px; }
-  .my-overlap, .my-waits-count { color: var(--static); font-size: 12px; margin: 8px 0 0; max-width: 78ch; }
+  .my-overlap, .my-waits-count, .my-waits-status { color: var(--static); font-size: 12px; margin: 8px 0 0; max-width: 78ch; }
   .my-fail {
     color: var(--warn);
     border: 1px solid var(--warn);

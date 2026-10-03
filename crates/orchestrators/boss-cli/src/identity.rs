@@ -290,22 +290,14 @@ pub(crate) fn header(id: &str) -> String {
 }
 
 /// The `x-boss-user` header for a READ-SCOPED identity: [`READER_ROLE`]
-/// at the auditor tier — the tier `boss_jobs::trust::can_read` admits
-/// on an operator door's read and `is_trusted` refuses on its write.
-/// Two callers, one shape: the unidentified reader above, and the
-/// reader a recorded probe is handed as `BOSS_SOR_USER` (prove.rs),
-/// which `boss-sor-read` puts on the wire verbatim.
-pub(crate) fn reader_header(id: &str) -> String {
-    json!({
-        "id": id,
-        "role": READER_ROLE,
-        "access_tier": "auditor",
-        "territory_account_ids": [],
-        "direct_report_ids": [],
-        "department": "platform",
-    })
-    .to_string()
-}
+/// at the auditor tier. Two callers here, one shape: the unidentified
+/// reader above, and the reader a recorded probe is handed as
+/// `BOSS_SOR_USER` (prove.rs), which `boss-sor-read` puts on the wire
+/// verbatim. Its one home is `boss_core::roles` since design b35c22b4,
+/// because every machine gate now writes the same header over a
+/// probe-reader caller's own, and a second copy here would drift from
+/// it (CLAUDE.md §9a).
+pub(crate) use boss_core::roles::reader_header;
 
 #[cfg(test)]
 mod tests {

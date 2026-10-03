@@ -1006,12 +1006,12 @@ pub(crate) fn metadata_map(v: &Value) -> Map<String, Value> {
 /// e39a9d2a, stage 2 of design 93d2bddb). The conductor and the
 /// publish-request drain completed a step with one PUT of `{status,
 /// metadata}`, the metadata a read-merge-write of the step AS THE PASS
-/// READ IT. The live rule refuses only a body that omits a stored key,
-/// so that works today — until a concurrent writer adds a key between
-/// the pass's read and its PUT, when it is refused 409 instead of kept
+/// READ IT. Stage 1's rule refused only a body that omitted a stored
+/// key, so that worked — until a concurrent writer added a key between
+/// the pass's read and its PUT, when it was refused 409 instead of kept
 /// (the conductor's read can be minutes old: a reconcile reads the
-/// train once and completes steps along the way). David's decided end
-/// state refuses ANY metadata body on the PUT. The merge door lands the
+/// train once and completes steps along the way). The PUT now refuses
+/// ANY metadata body, David's decided end state. The merge door lands the
 /// keys against the row as it stands, in one transaction, so it can
 /// neither race nor shed a key it does not name. It goes FIRST because
 /// required-at-done fields are judged when the step flips. If the flip

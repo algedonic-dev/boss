@@ -82,18 +82,7 @@ pub fn declare(source: &Path, gateway: Option<&str>, dry_run: bool) -> Result<St
     if dry_run {
         return Ok(format!("{head}\n  dry run: nothing sent"));
     }
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        "x-boss-user",
-        reqwest::header::HeaderValue::from_static(ESTATE_SEED_USER),
-    );
-    // The machine token is stamped per request, and no redirect is
-    // followed (design 6805c764 car 2, the CLI slice).
-    let client = boss_core::machine_token::BlockingClient::build(
-        reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .default_headers(headers),
-    )?;
+    let client = declare_client(gateway, boss_core::machine_token::shared())?;
     let resp = client
         .post(&url)
         .json(&boss_jobs::port::EstateNodeBatch { nodes: rows })
@@ -110,6 +99,32 @@ pub fn declare(source: &Path, gateway: Option<&str>, dry_run: bool) -> Result<St
         "{head}\n  received {}, inserted {}, roles inserted {} (a node already there is kept)",
         out.received, out.inserted, out.roles_inserted
     ))
+}
+
+/// The declaration's client. No redirect is followed either way (design
+/// 6805c764 car 2, the CLI slice). To the jobs port it stamps the
+/// machine token per request from `token`, under boss-core's host
+/// decision; through a `--gateway` it stamps NOTHING (backlog 2ee29275):
+/// the gateway strips every client `x-boss-*` header at its edge, and
+/// the URL is one the operator typed — the public edge answers with a
+/// 302 to Cloudflare Access.
+fn declare_client(
+    gateway: Option<&str>,
+    token: std::sync::Arc<boss_core::machine_token::Source>,
+) -> Result<boss_core::machine_token::BlockingClient> {
+    use boss_core::machine_token::BlockingClient;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-boss-user",
+        reqwest::header::HeaderValue::from_static(ESTATE_SEED_USER),
+    );
+    let builder = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .default_headers(headers);
+    Ok(match gateway {
+        Some(_) => BlockingClient::unstamped(builder)?,
+        None => BlockingClient::build_with_source(builder, token)?,
+    })
 }
 
 pub fn dispatch(cmd: Cmd) -> Result<()> {
@@ -167,6 +182,24 @@ mod tests {
                 && line.contains("cp-1, forge"),
             "{line}"
         );
+    }
+
+    /// Backlog 2ee29275: `--gateway` never carries the machine token —
+    /// the gateway strips every client `x-boss-*` header, and the URL is
+    /// one the operator typed — while the jobs port the launcher writes
+    /// to keeps it, under boss-core's host decision.
+    #[test]
+    fn a_gateway_declare_never_stamps_and_the_jobs_port_does() {
+        use boss_core::machine_token::{HEADER, Source};
+        let token = || std::sync::Arc::new(Source::fixed(Some("estate-token-value".into())));
+        let stamped = |c: &boss_core::machine_token::BlockingClient, url: &str| {
+            c.post(url).build().unwrap().headers().get(HEADER).is_some()
+        };
+        let url = "http://127.0.0.1:1/api/estate/nodes/batch";
+        let gw = declare_client(Some("http://127.0.0.1:1"), token()).unwrap();
+        assert!(!stamped(&gw, url), "a gateway declare stamps nothing");
+        let port = declare_client(None, token()).unwrap();
+        assert!(stamped(&port, url), "the in-pod jobs port is stamped");
     }
 
     /// The identity is a dedicated automation at operator tier — the

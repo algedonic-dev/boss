@@ -1,0 +1,7 @@
+# automation:ci-disk-reclaim — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 863 audit-log facts.
+# Signs as platform-admin today: infra/forge/request-reclaim-disk.sh.
+
+[[automation]]
+id = "automation:ci-disk-reclaim"
+role = "platform-admin"
+description = 'Files the forge disk reclaim when a build fills the disk, rather than waiting for the timer (infra/forge/request-reclaim-disk.sh).'

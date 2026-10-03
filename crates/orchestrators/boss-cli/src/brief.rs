@@ -385,7 +385,13 @@ pub(crate) fn gate_phases(gate_sh: &str) -> Vec<String> {
 /// copy of the rule §9a forbids, so this shells out: one `ls` and an
 /// awk pass, well under a second.
 fn preflight_lint_count(repo: &Path) -> Result<usize> {
-    let out = std::process::Command::new("bash")
+    // The tree's code: no token in reach of it, whatever this CLI holds
+    // (crate::door_env; review ef2da426 F1 of design 6805c764 car 4). It
+    // only REMOVED the doors' directory name until backlog 844b936e,
+    // which a holder of the token at boss-core's default ignores.
+    let no_token = crate::door_env::NoTokenInReach::new()?;
+    let out = no_token
+        .apply(&mut std::process::Command::new("bash"))
         .arg("infra/gate.sh")
         .arg("--roster")
         .current_dir(repo)
@@ -1531,6 +1537,47 @@ mod tests {
             .join("../../..")
             .canonicalize()
             .expect("the workspace root is above this crate")
+    }
+
+    /// THE ROSTER CHILD RUNS WITH NO TOKEN IN REACH (backlog 2e1f609e,
+    /// review 595d8a89 N1 of car 844b936e). `preflight_lint_count` runs
+    /// the tree's own gate.sh, and only `NoTokenInReach::apply` keeps the
+    /// machine token, the host list and the record's address away from
+    /// it. Nothing held that line but the car's text-grep probe: swapping
+    /// it for a bare `Command::new("bash")` passed all 35 brief tests. So
+    /// this tree's gate.sh is a stand-in that answers the roster ONLY
+    /// when it sees what `apply` hands a child — a token directory that is
+    /// named, exists and is empty, no address, no host list, no old token
+    /// variable, and a sor.env path that does not exist — and otherwise
+    /// exits non-zero naming what it saw. A bare Command inherits this
+    /// test's environment: no token directory named at all (the gate's
+    /// case, which falls back to boss-core's default) or the dev pod's
+    /// door directory holding a live token; either is refused.
+    #[test]
+    fn the_roster_child_sees_an_empty_token_dir_and_no_address() {
+        let tree = boss_testing::scratch::scratch_dir("brief-roster-no-token");
+        boss_testing::scratch::create_dir(&tree.join("infra"));
+        boss_testing::scratch::write_file(
+            &tree.join("infra/gate.sh"),
+            r#"#!/usr/bin/env bash
+[ "${1:-}" = --roster ] || { echo "asked for $* rather than --roster" >&2; exit 2; }
+d="${BOSS_MACHINE_TOKEN_DIR-}"
+[ -n "$d" ] && [ -d "$d" ] || { echo "token dir not named or missing: [$d]" >&2; exit 3; }
+[ -z "$(ls -A "$d")" ] || { echo "token dir holds something: $d" >&2; exit 3; }
+for v in BOSS_JOBS_URL BOSS_MACHINE_TOKEN_HOSTS BOSS_MACHINE_TOKEN; do
+    [ -z "${!v+set}" ] || { echo "$v reached the roster child" >&2; exit 3; }
+done
+case "${BOSS_SOR_ENV-}" in
+    '') echo "BOSS_SOR_ENV unset: the child falls back to /etc/boss/sor.env" >&2; exit 3 ;;
+esac
+[ ! -e "$BOSS_SOR_ENV" ] || { echo "BOSS_SOR_ENV names a file that exists: $BOSS_SOR_ENV" >&2; exit 3; }
+printf 'a-lint.sh\nb-lint.sh\nc-lint.sh\n'
+"#,
+        );
+        let n = preflight_lint_count(&tree).unwrap_or_else(|e| {
+            panic!("the roster child did not run with the token out of reach: {e:#}")
+        });
+        assert_eq!(n, 3, "the stand-in roster names three lints");
     }
 
     #[test]

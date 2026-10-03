@@ -169,15 +169,26 @@ async fn scope_step(app: &axum::Router, job_id: &str) -> serde_json::Value {
         .clone()
 }
 
-/// A read-merge-write completion: the scope step's stored metadata with
-/// the evidence laid over it. The step PUT refuses a metadata body that
-/// omits a stored key (e39a9d2a), so the fixture reads before it writes,
-/// as every live completer must.
+/// Writes the scope step's evidence through its metadata merge door and
+/// returns the completion body, which is status alone: the step PUT
+/// refuses any metadata body since e39a9d2a, so evidence and status
+/// travel as two writes, as every live completer's do.
 async fn completion_body(app: &axum::Router, job_id: &str) -> serde_json::Value {
-    let mut metadata = scope_step(app, job_id).await["metadata"].clone();
-    metadata["summary"] = serde_json::json!("s");
-    metadata["excludes"] = serde_json::json!("e");
-    serde_json::json!({"status": "completed", "metadata": metadata})
+    let scope_id = scope_step(app, job_id).await["id"]
+        .as_str()
+        .expect("step id")
+        .to_string();
+    let (status, body) = send(
+        app,
+        req(
+            "PATCH",
+            &format!("/api/jobs/{job_id}/steps/{scope_id}/metadata"),
+            serde_json::json!({"summary": "s", "excludes": "e"}),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "writing evidence: {status}: {body}");
+    serde_json::json!({"status": "completed"})
 }
 
 /// A plain completion — no stamp in the body — reads back stamped with

@@ -174,8 +174,10 @@ fn step_of<'a>(job: &'a serde_json::Value, slug: &str) -> &'a serde_json::Value 
         .unwrap_or_else(|| panic!("no step `{slug}` on the packet: {job:#?}"))
 }
 
-/// Complete a step, merging `extra` over its current metadata —
-/// never replacing, because `authority_role` shares that object.
+/// Complete a step: `extra`'s keys go through the step's merge door
+/// (`PATCH …/steps/{id}/metadata`, which keeps every unsent key, so
+/// `authority_role` survives), then the status alone through the PUT —
+/// the PUT writes no metadata since backlog e39a9d2a.
 async fn complete(
     app: &axum::Router,
     job_id: &str,
@@ -189,30 +191,51 @@ async fn complete(
         "step `{slug}` is `{}`, not actionable",
         step["status"]
     );
-    let mut metadata = step["metadata"].clone();
-    for (k, v) in extra.as_object().into_iter().flatten() {
-        metadata[k] = v.clone();
-    }
-    let (status, body) = send(
-        app,
-        Request::builder()
-            .method("PUT")
-            .uri(format!(
-                "/api/jobs/{job_id}/steps/{}",
-                step["id"].as_str().expect("step id")
-            ))
-            .header("content-type", "application/json")
-            .header("x-boss-user", admin_header())
-            .body(Body::from(
-                serde_json::json!({ "status": "completed", "metadata": metadata }).to_string(),
-            ))
-            .unwrap(),
-    )
-    .await;
+    let (status, body) = complete_with(app, job_id, step, &extra).await;
     assert!(
         status.is_success(),
         "completing `{slug}` failed {status}: {body}"
     );
+}
+
+/// The two writes behind `complete`: the keys through the merge door
+/// (skipped when there are none), then `{"status":"completed"}` alone.
+async fn complete_with(
+    app: &axum::Router,
+    job_id: &str,
+    step: &serde_json::Value,
+    keys: &serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let step_id = step["id"].as_str().expect("step id");
+    if keys.as_object().is_some_and(|keys| !keys.is_empty()) {
+        let (status, body) = send(
+            app,
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/jobs/{job_id}/steps/{step_id}/metadata"))
+                .header("content-type", "application/json")
+                .header("x-boss-user", admin_header())
+                .body(Body::from(keys.to_string()))
+                .unwrap(),
+        )
+        .await;
+        if !status.is_success() {
+            return (status, body);
+        }
+    }
+    send(
+        app,
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/api/jobs/{job_id}/steps/{step_id}"))
+            .header("content-type", "application/json")
+            .header("x-boss-user", admin_header())
+            .body(Body::from(
+                serde_json::json!({ "status": "completed" }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await
 }
 
 fn triage_design() -> serde_json::Value {
@@ -439,7 +462,10 @@ async fn every_disposition_still_reaches_a_terminal() {
                  routed here would sit on the board forever. Steps: {steps:#?}"
             );
             for step in actionable {
-                let mut metadata = step["metadata"].clone();
+                // Only the filled keys are sent — through the merge
+                // door, since the PUT writes no metadata (e39a9d2a).
+                let stored = &step["metadata"];
+                let mut metadata = serde_json::json!({});
                 let fill = |name: &str, declared: &str, metadata: &mut serde_json::Value| {
                     let value = if declared.split('|').any(|v| v == disposition) {
                         disposition.to_string()
@@ -461,28 +487,12 @@ async fn every_disposition_still_reaches_a_terminal() {
                 if let Some(st) = StepRegistry::v1().get(step["kind"].as_str().unwrap_or_default())
                 {
                     for f in st.fields.iter().filter(|f| f.required) {
-                        if metadata.get(f.name).is_none() {
+                        if stored.get(f.name).is_none() && metadata.get(f.name).is_none() {
                             fill(f.name, f.field_type, &mut metadata);
                         }
                     }
                 }
-                let (status, body) = send(
-                    &app,
-                    Request::builder()
-                        .method("PUT")
-                        .uri(format!(
-                            "/api/jobs/{job_id}/steps/{}",
-                            step["id"].as_str().expect("step id")
-                        ))
-                        .header("content-type", "application/json")
-                        .header("x-boss-user", admin_header())
-                        .body(Body::from(
-                            serde_json::json!({ "status": "completed", "metadata": metadata })
-                                .to_string(),
-                        ))
-                        .unwrap(),
-                )
-                .await;
+                let (status, body) = complete_with(&app, &job_id, step, &metadata).await;
                 assert!(
                     status.is_success(),
                     "`{disposition}`: completing `{}` failed {status}: {body}",

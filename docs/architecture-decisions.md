@@ -439,6 +439,23 @@ each converged on its host before the next; (last) the server refusal,
 which closes the item. Until it lands, the PATCH semantics above hold,
 wipe of unmentioned keys included.
 
+**And then the step PUT refused every metadata body after all** (design
+`93d2bddb`, decided_2026_09_24b on `e39a9d2a`: the same end state, reached
+in two stages). Stage 1 shipped the omission refusal above; Stage 2
+moved every read-merge-write writer — boss-cli, the dispatcher handlers,
+boss-sim, the tenant walk, the web surfaces, the step plugins, the host
+scripts, and last the gateway's break-glass spend and passkey promotion —
+to the merge door, and its last car made `update_step` refuse ANY body
+carrying `metadata`, 409, naming that step's merge door. A read-merge-
+write was correct under Stage 1 but still a second metadata writer that
+raced a concurrent key; with one writer the class is gone rather than
+guarded, and the four metadata guards the PUT carried (the
+`authority_role` carry, the `human_only`, protocol-key and
+declared-writer refusals) now stand only at the merge door. A completion
+is two writes, the keys then the status; the break-glass spend, the one
+writer that had been one PUT for atomicity (review F2), makes a refused
+close fatal and withdraws the spend it followed.
+
 **A Job carries the instant it was admitted, not only the day**
 (design `f2cdff23`, David 2026-09-20, all three questions accepted as
 proposed; landed as backlog `6c2eba00`). `opened_on` is a date, and
@@ -2080,6 +2097,26 @@ exchange, userinfo — stay warn lines: plumbing facts, not
 who-tried-the-door facts. **No per-request events**, ratified as a
 standing constraint rather than a deferral.
 
+**A refusing gate's would-refuse is a first-sighting fact, inside that
+constraint** (design `21946380`, David 2026-10-01, Q2; backlog
+`b0787727`). The machine gate and the policy check's mode earn
+`enforce` on a 72-hour clean window, and their tallies lived in process
+memory, which every train restarts — so each now states, through its
+service's outbox, one fact per new tally KEY per process
+(`<gate>.would_refuse` / `.refused`), one per overflow and one per
+recording start or mode move (`<gate>.recording_began`), never one per
+request: repeats stay in-memory counts. That is a who-tried-the-door
+fact bounded by the tally's key cap, not a per-request event, so it
+does not reopen the line above. The window is a projection over the log
+(`boss_core::gate_evidence::window`) AND every live tally's `not_clean`
+empty — a fact the log did not take is one of its reasons — and a
+refusing flip reads both halves. No fact is forgiven (review
+`e4417d48`): one the recorder refuses is retried, one the queue loses
+is stated on the log as `<gate>.facts_lost` and dirties the window, no
+tally restart clears a loss the log does not yet state, and a process
+joins the next one's watch only across a clean `<gate>.recording_ended`
+stated at SIGTERM — one that died holding facts breaks the watch.
+
 **One actor, one identity: an agent's login resolves to a registered
 id the way a human's does** (design `6fda05ae`, David 2026-09-12; all
 three questions accepted as proposed; folds backlog `adf025df` and
@@ -2304,10 +2341,19 @@ grants, the value lives where every other brokered credential lives,
 and the database never holds one. `runner:ops` stays out of
 `RESOLVABLE_PRINCIPALS` until a credential is delivered, so the
 declaration cannot land first and lock the runner out of the plan the
-founder signs. Not yet built: the credential kind and its broker
-handler (mint, the Secret and its mount, verify through `GET
-/api/jobs/runner-credential`, delivery to each runner host), the
-`signer` and `executor` rules, and the declaration on ops-request. The
+founder signs. The broker half is built for the forge (backlog
+`1e50e66b`, 2026-09-30): `credential.rotate.ops-runner` mints 32 random
+bytes into `<host>.next` of Secret `boss/ops-runner-credential`, which
+the jobs API mounts whole at `/etc/boss/runner-credential` (optional, no
+`subPath`), and verifies it through `GET /api/jobs/runner-credential`;
+the forge's converge (`runner-credential-deposit.sh`) proves the staged
+value through that door, installs it root:root 0600 and records
+delivery; and the promotion writes `current`, blanks `next` and
+`previous`, and confirms the old value resolves to nothing. `previous`
+is never filled, because delivery is recorded before promotion. Not yet
+built: delivery to boss-gcp (the remote deposit, `7336cb5f`), `runner:ops`
+in `RESOLVABLE_PRINCIPALS` (which waits for both hosts), the `signer`
+and `executor` rules, and the declaration on ops-request. The
 write strip below never drops the declared writer's own re-send — its
 write is the record (follow-up of car `f3365343`). What the
 adversarial review of the writer rule required BEFORE that declaration
@@ -2536,7 +2582,80 @@ backstop ship now and only report; the policy write guard, the people
 guard (after `1d9970d1`, landed 2026-09-28, so the register tier is read
 from the key, not the body) and the workflow publish guard wait for
 `62dac114`; the collapse to `Control` consts refuses no human and rides
-whenever it is ready. Not yet built: all of it.
+whenever it is ready. The hold lifted on 2026-09-29 and the three guards
+now release in the order the next paragraph fixes. Built: the coverage core, its read and the
+backstop (car 1, 2026-09-29), and the collapse (car 2): every door asks
+through a const in `boss_policy_client::controls`, whose one declaring
+line lists it in `CONTROLS`, so `DOORS` is gone; a raw ask survives only
+where the resource is data, pinned to a reasoned list. The collapse
+found two pairs the hand table missed (Read on `event` and `subject`,
+asked by global search), and a pair some door admits only at scope
+`all` — the estate, a policy rule, the registry ladder, the commerce and
+asset writes — is declared so and held only at `all` (car 1's release
+review, LOW); the flag tells coverage and never widens a door. Not yet
+built: the three guards.
+
+**The DR hold is lifted; refusing cars release one per train, in a
+fixed order, each naming a way back that does not pass through what it
+refuses** (design `b08725c2`, David 2026-09-29, all four questions
+accepted as proposed; answers `62dac114`). Measured at 1aa025ef: both
+hardware keys opened `/break-glass` (two `auth.login.succeeded
+method=break-glass` events, 2026-09-29 01:36:51Z and 01:37:21Z, closing
+`a9bfc232`); the door's scope and its Cloudflare-free roads are written
+(`a15a1cd2`); the USB kit holds 11 of 11 items, read back from the stick;
+the re-entry sheet is printed and names the "Apple Passkey Delegate"
+role (`41c5ddaf`); and David walked the human-only release road once,
+signing every command. What that does NOT prove is stated: no delegate
+person is enrolled; the log cannot show the two sign-ins were two
+different keys; the hub road from a fresh machine (`0697c8fe`) and the
+LAN TLS road (`8c127e80`) are unwalked; no restore has run from the kit;
+and no host holds the break-glass operator credential, so the
+off-cluster arm observes but cannot act. Above all, **getting IN is not
+getting PAST a refusal that misfires** — break-glass signs David in and
+a misfiring refusal then refuses his signed-in writes — which is why
+each refusal carries its own way back. Decided: (1) **`62dac114` is met**
+(Q4): items 1, 2, 3 and 5 by artifacts, item 4 as a named role with
+nobody enrolled; the item closes as delivered when the last guard (G3)
+lands, and its open gaps ride on their own packets without re-imposing
+the hold — but if any of them regresses to a road not working, no new
+refusal boards until it is repaired; (2) **no refusal waits for an
+enrolled delegate** (Q2): the delegate is continuity of a person, takes
+the ordinary edge road and never break-glass, and every way back is
+David's; instead the people guard must carry a test that enrolling and
+later revoking a person who is the sole holder of nothing passes, and
+the delegate, when enrolled, is emergency-scoped so they never become
+the sole holder of a control, which would make revoking them refusable;
+(3) **report-only work is never held** — the machine-token report mode
+(`2710c8fc`) and its broker mint, the ops runner credential
+(`1e50e66b`), and the break-glass narrowing (`4e1c33b4`) in Warn and
+Audit start now; (4) **one refusal per train** (Q1), boarding only on a
+train that departs in David's Pacific working hours so a misfire meets
+a human, and the next only after the last has run 24 hours with no
+unintended refusal in its own record (its misses tally, refusal events,
+warn count); (5) **the order**: A, a release refuses the agent-run that
+gated its head (`b7b02024` car 3; bypass: another actor releases);
+B, the narrowing to Deny (rollback: delete the binding over the LAN
+kube road); the break-glass credential delivered to boss-gcp
+(`7336cb5f`); G1, the policy-write guard (revert car; it must not sit
+on `bootstrap_reconcile`'s boot path); C, the machine token enforced
+(`2710c8fc` car 4) after a 72-hour clean report window with overflow 0
+(rollback: the mode word back to `report`, by the converge or, if the
+converge is itself refused, the ConfigMap over the LAN kube road); D,
+the signed `/api/policy/check` (`b8e75382` F7), which **ships behind its
+own `off`/`report`/`enforce` mode key** because its misfire denies every
+signed-in write and a revert car may not ride, after its warn count
+reads zero for the same window; G2, the people guard; E, `runner:ops`
+declared the writer of the ops-request approve keys (`6c9183de`) once
+both runners resolve live and one approved ops-request has executed on
+each host (rollback: a row publish without the writer, never in G3's
+window); G3, the workflow-publish guard, last, because it guards the
+publish E's rollback needs. C and D come after `7336cb5f` so the
+off-cluster rollback exists before the two refusals whose misfire could
+block the train; (6) **every refusing car names its rollback and the
+road that applies it in its park prose**, and a first misfire is
+handled by that named rollback, never by improvising. The must-fix lists
+from each car's own review travel with the car and are not re-decided
+here.
 
 ## Calendar
 
@@ -3671,6 +3790,23 @@ and a node are different objects. Built: both kinds
 `bossnet-physical-topology` Q1 and `dev-node-checkout` Q1), the estate
 registry and its observations under `/api/estate/*`, and `/it/estate`.
 
+**PVC intent is an explicit report-only assignment, independent of
+bootstrap, live request and filesystem capacity** (design
+`32e7cf87-7d8e-4764-94a3-3b0cfa8548c4`, Q1 resolved by David,
+2026-10-02; answers child `10effd3f` of `53c8cb72`). Namespace and
+claim identify each declaration in `infra/estate/estate.toml`;
+desired bytes carry the assignment's packet, review step, question,
+actor and time. Q1 explicitly assigns 30 GiB to
+`boss/pgdata-postgres-0` for reporting. Other claims without an
+assignment remain unknown. The pure comparison retains declaration,
+live request, provenance and match, drift or unknown in the existing
+comparison event; the estate page renders that record. Missing,
+malformed or duplicate input cannot match. Filesystem overhead is not
+request drift; free-space floors remain independent. Neither this
+declaration nor its verdict changes storage, bootstrap templates,
+authority or the signed explicit-size approval boundary. This child
+does not complete the parent's remaining automatic remedy work.
+
 **Retiring a unit will mean masking it, because disabling is not
 retiring** (design `7b230ddf`, David 2026-09-23, accepted as proposed;
 answers backlog `9599babc`). Measured through `boss ops boss-gcp
@@ -4008,7 +4144,18 @@ set it is expected to hold** (`BOSS_OPS_CREDENTIALS=kubeconfig` on
 boss-gcp), since a talosconfig has no scoped form and a full one on the
 public edge is the unbounded grant the scoping exists to avoid — so
 the converge reports the truth about that host rather than a
-permanently red absence. The delivery verb is not yet built. Decision
+permanently red absence. The delivery verb is not yet built. When it
+is (`7336cb5f`, design `b08725c2` Q3, David 2026-09-29), the Job that
+reads the token **runs as a measured non-root uid** of ONE image that
+carries both kubectl and openssh-client, with fsGroup set and the
+deposit key mounted 0440 to that group; a rehearsal ssh deposit proves
+OpenSSH accepts the key rather than assuming it, and only if that probe
+fails does root become the answer, as a stated decision with the
+measured reason in the lint declaration, never an exemption entry. It
+lands after the break-glass narrowing (`4e1c33b4`), because the token
+can patch every boss Deployment and so read every credential those
+templates carry, and its verify-the-negative gains one probe: patching
+a Deployment's command must be refused. Decision
 (3) was built as data rather than as that variable (2026-09-29, backlog
 f371c749): the `[ops_credentials.<host>]` tables of
 `infra/estate/estate.toml`, read by the host check and by

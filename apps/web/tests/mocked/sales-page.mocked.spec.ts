@@ -201,8 +201,8 @@ const header = (page: Page) => root(page).locator('header.exec-header');
 const subtitle = (page: Page) => header(page).locator('p');
 const filters = (page: Page) => root(page).locator('.job-filters');
 const kindFilter = (page: Page) => filters(page).locator('label').first().locator('select');
-const statusFilter = (page: Page) => filters(page).getByLabel('Status');
-const subjectFilter = (page: Page) => filters(page).getByLabel('Subject id');
+const statusFilter = (page: Page) => filters(page).getByRole('combobox', { name: /^Status/ });
+const subjectFilter = (page: Page) => filters(page).getByRole('textbox', { name: 'Subject id' });
 const clear = (page: Page) => filters(page).getByRole('button', { name: /Clear/ });
 const statusButtons = (page: Page) => root(page).locator('aside.catalog-filters button');
 const rows = (page: Page) => root(page).locator('table.data-table tbody tr');
@@ -212,7 +212,8 @@ const form = (page: Page) => root(page).locator('form.new-job-form');
 /// (kindFilter above). A label wrapping a select takes the options into
 /// its accessible name, so getByLabel cannot tell "Kind" from "Subject
 /// kind" exactly; position can.
-const formKind = (page: Page) => form(page).locator('label').first().locator('select');
+const formKindField = (page: Page) => form(page).locator('label').first();
+const formKind = (page: Page) => formKindField(page).locator('select');
 const startNew = (page: Page) => root(page).getByRole('button', { name: 'Start a new Job' });
 const adHocButton = (page: Page) => root(page).getByRole('button', { name: 'Create Ad Hoc Job' });
 
@@ -241,7 +242,7 @@ test.describe('/ux/sales — mount', () => {
     // GAP 3 (887c6b42): the generic list's header — the eyebrow is
     // "Work", not the department's name.
     await expect(header(page).locator('.exec-eyebrow')).toHaveText('Work');
-    await expect(header(page).locator('h1.exec-title')).toHaveText('Sales pipeline');
+    await expect(header(page).locator('h1.exec-title')).toHaveText('Sales pipeline — filtered');
     await expect(subtitle(page)).toHaveText('2 open');
 
     await expect(filters(page).locator('label > span')).toHaveText(['Kind', 'Status', 'Subject id']);
@@ -256,7 +257,7 @@ test.describe('/ux/sales — mount', () => {
     await expect(subjectFilter(page)).toHaveValue('');
     // d0b93b80: it named a brewery account id.
     await expect(subjectFilter(page)).toHaveAttribute('placeholder', 'An exact subject id');
-    await expect(clear(page)).toHaveCount(0);
+    await expect(clear(page)).toBeVisible();
 
     await expect(root(page).locator('.job-actions button')).toHaveText(['Start a new Job', 'Create Ad Hoc Job']);
     await expect(form(page)).toHaveCount(0);
@@ -275,10 +276,10 @@ test.describe('/ux/sales — mount', () => {
     await expect(rows(page).nth(1).locator('td')).toHaveText(cells(SPONSOR_OPEN));
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
 
-    // The inventory at mount: 5 buttons (2 actions + 3 status; Clear is
-    // hidden), 2 selects, 1 input, 0 forms, 2 links per row, each row
+    // The inventory at mount: 7 buttons (2 actions + 3 status + the
+    // removable Open chip and Clear), 2 selects, 1 input, 0 forms, 2 links per row, each row
     // itself a link.
-    await expect(root(page).locator('button')).toHaveCount(5);
+    await expect(root(page).locator('button')).toHaveCount(7);
     await expect(root(page).locator('select')).toHaveCount(2);
     await expect(root(page).locator('input')).toHaveCount(1);
     await expect(root(page).locator('form')).toHaveCount(0);
@@ -309,7 +310,7 @@ test.describe('/ux/sales — links, and back', () => {
 
     await page.goBack();
     await expect.poll(() => new URL(page.url()).pathname).toBe(PATH);
-    await expect(page.locator('h1.exec-title')).toHaveText('Sales pipeline');
+    await expect(page.locator('h1.exec-title')).toHaveText('Sales pipeline — filtered');
     await expect(titles(page)).toHaveText([INQUIRY.title, SPONSOR_OPEN.title]);
   });
 
@@ -330,7 +331,7 @@ test.describe('/ux/sales — links, and back', () => {
     await expect.poll(() => new URL(page.url()).pathname).toBe(target);
     await page.goBack();
     await expect.poll(() => new URL(page.url()).pathname).toBe(PATH);
-    await expect(page.locator('h1.exec-title')).toHaveText('Sales pipeline');
+    await expect(page.locator('h1.exec-title')).toHaveText('Sales pipeline — filtered');
   });
 
   // subjectPath answers the catalogued /ux/ spelling. d0b93b80: it
@@ -352,18 +353,18 @@ test.describe('/ux/sales — links, and back', () => {
 
     await custom.click();
     await expect.poll(() => new URL(page.url()).searchParams.get('subject_id')).toBe('sponsor-zed');
-    await expect(page.locator('h1.exec-title')).toHaveText('All jobs');
+    await expect(page.locator('h1.exec-title')).toHaveText('Filtered jobs');
     await expect(titles(page)).toHaveText([SPONSOR_OPEN.title]);
 
     await page.goBack();
     await expect.poll(() => new URL(page.url()).pathname).toBe(PATH);
-    await expect(page.locator('h1.exec-title')).toHaveText('Sales pipeline');
+    await expect(page.locator('h1.exec-title')).toHaveText('Sales pipeline — filtered');
     await expect(titles(page)).toHaveText([INQUIRY.title, SPONSOR_OPEN.title]);
   });
 });
 
 test.describe('/ux/sales — the filters', () => {
-  test('the status buttons and the Status select re-read with the department kept; Clear goes back to Open; the URL never changes', async ({ page }) => {
+  test('the status buttons and the Status select re-read with the department kept; Clear removes status; the URL never changes', async ({ page }) => {
     const seen = watch(page);
     await installSales(page);
     await mountSales(page);
@@ -389,14 +390,14 @@ test.describe('/ux/sales — the filters', () => {
     await statusFilter(page).selectOption('open');
     await expect(rows(page)).toHaveCount(2);
     await expect(subtitle(page)).toHaveText('2 open');
-    await expect(clear(page)).toHaveCount(0);
+    await expect(clear(page)).toBeVisible();
 
     await statusFilter(page).selectOption('closed');
     await expect(titles(page)).toHaveText([SPONSORED.title]);
     await clear(page).click();
-    await expect(rows(page)).toHaveCount(2);
-    expect(params(seen.lists.at(-1))).toEqual({ department: DEPARTMENT, status: 'open', limit: '200' });
-    await expect(statusButtons(page).nth(0)).toHaveAttribute('aria-pressed', 'true');
+    await expect(rows(page)).toHaveCount(3);
+    expect(params(seen.lists.at(-1))).toEqual({ department: DEPARTMENT, limit: '200' });
+    await expect(statusButtons(page).nth(2)).toHaveAttribute('aria-pressed', 'true');
     await expect(clear(page)).toHaveCount(0);
 
     // The filters live in page state only here: /ux/sales parses no
@@ -418,7 +419,7 @@ test.describe('/ux/sales — the filters', () => {
       kind: 'receive-an-inquiry', department: DEPARTMENT, status: 'open', limit: '200',
     });
     // The page's own title stands; the generic "<kind> jobs" does not.
-    await expect(header(page).locator('h1.exec-title')).toHaveText('Sales pipeline');
+    await expect(header(page).locator('h1.exec-title')).toHaveText('Sales pipeline — filtered');
     await expect(subtitle(page)).toHaveText('1 open');
     await expect(clear(page)).toBeVisible();
 
@@ -434,9 +435,9 @@ test.describe('/ux/sales — the filters', () => {
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
 
     await clear(page).click();
-    await expect(rows(page)).toHaveCount(2);
+    await expect(rows(page)).toHaveCount(3);
     await expect(kindFilter(page)).toHaveValue('');
-    expect(params(seen.lists.at(-1))).toEqual({ department: DEPARTMENT, status: 'open', limit: '200' });
+    expect(params(seen.lists.at(-1))).toEqual({ department: DEPARTMENT, limit: '200' });
 
     // Focusing the filter asks the registry again only after a failure;
     // with the registry loaded it reads nothing.
@@ -460,8 +461,8 @@ test.describe('/ux/sales — the filters', () => {
 
     await clear(page).click();
     await expect(subjectFilter(page)).toHaveValue('');
-    await expect(rows(page)).toHaveCount(2);
-    expect(params(seen.lists.at(-1))).toEqual({ department: DEPARTMENT, status: 'open', limit: '200' });
+    await expect(rows(page)).toHaveCount(3);
+    expect(params(seen.lists.at(-1))).toEqual({ department: DEPARTMENT, limit: '200' });
   });
 });
 
@@ -496,7 +497,7 @@ test.describe('/ux/sales — empty, loading, and failed reads', () => {
     await mountPage(page, PATH);
 
     await expect(root(page).locator('p.empty')).toHaveText('Loading…');
-    await expect(header(page).locator('h1.exec-title')).toHaveText('Sales pipeline');
+    await expect(header(page).locator('h1.exec-title')).toHaveText('Sales pipeline — filtered');
     release();
     await expect(rows(page)).toHaveCount(2);
     await expect(root(page).getByText('Loading…', { exact: true })).toHaveCount(0);
@@ -579,7 +580,7 @@ test.describe('/ux/sales — the new-Job form', () => {
     // name (d0b93b80), so choosing one first still narrows.
     await expect(subjectKind).toHaveValue('');
     await expect(subjectKind.locator('option')).toHaveText(['— select —', 'custom', 'account']);
-    await expect(form(page).locator('small.hint')).toHaveCount(0);
+    await expect(formKindField(page).locator('small.hint')).toHaveCount(0);
     // GAP 4 (dc06c0fc): the picker is the department's two protocols
     // and the ad-hoc row the page's own button opens — not the
     // registry, so page-audit (IT's) is not offered from "Sales
@@ -604,7 +605,7 @@ test.describe('/ux/sales — the new-Job form', () => {
       '— select —', 'Receive an inquiry (receive-an-inquiry)', 'Ad hoc (ad-hoc)',
     ]);
     // d0b93b80: it read "accept a account subject".
-    await expect(form(page).locator('small.hint').first()).toHaveText(
+    await expect(formKindField(page).locator('small.hint')).toHaveText(
       'Filtered to kinds that accept account subjects (2 of 3)',
     );
     await subjectKind.selectOption('');
@@ -663,11 +664,22 @@ test.describe('/ux/sales — the new-Job form', () => {
     await installSales(page);
     await page.route(REGISTRY, (r) => json(r, WORKFLOWS.filter((w) => w.kind === 'page-audit')));
     await mountSales(page);
+    // Keep the independent Owner read pending so its loading hint
+    // coexists with the empty Kind explanation throughout the assertion.
+    const ownerReads: Route[] = [];
+    await page.route(/\/api\/people$/, (r) => { ownerReads.push(r); });
 
     await startNew(page).click();
+    await expect(form(page).getByRole('status')).toHaveText('Loading owners…');
     await expect(formKind(page).locator('option')).toHaveText(['— select —']);
-    await expect(form(page).locator('small.hint')).toHaveText(`No kind declares the ${DEPARTMENT} department`);
+    await expect(formKindField(page).locator('small.hint')).toHaveText(`No kind declares the ${DEPARTMENT} department`);
     await expect(form(page).getByRole('button', { name: 'Create Job' })).toBeDisabled();
+    await expect.poll(() => ownerReads.length).toBe(1);
+    const ownerRead = ownerReads[0];
+    if (!ownerRead) throw new Error('Expected the intercepted Owner read');
+    await json(ownerRead, []);
+    await expect(form(page).getByLabel('Owner').locator('..')).toContainText('No owners returned by this read.');
+    await expect(formKindField(page).locator('small.hint')).toHaveText(`No kind declares the ${DEPARTMENT} department`);
   });
 
   // A REFUSED write is said in the form, above its own buttons — where

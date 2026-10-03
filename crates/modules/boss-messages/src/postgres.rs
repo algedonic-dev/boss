@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
-use crate::port::{MessageError, MessageRepository};
+use crate::port::{InboxPage, InboxQuery, KindCount, MessageError, MessageRepository};
 use crate::types::{EntityRef, Message, MessageKind};
 
 pub struct PgMessages {
@@ -24,20 +24,86 @@ impl MessageRepository for PgMessages {
     async fn inbox(
         &self,
         recipient_id: &str,
-        include_archived: bool,
-    ) -> Result<Vec<Message>, MessageError> {
-        let rows: Vec<MessageRow> = sqlx::query_as(
-            "SELECT * FROM messages \
+        query: &InboxQuery,
+    ) -> Result<InboxPage, MessageError> {
+        // No stored recipient or kind can hold a NUL, and TEXT refuses
+        // one as a parameter: the miss it is, not a 500 (backlog
+        // be459ab9).
+        if recipient_id.contains('\0') || query.kind.as_deref().is_some_and(|k| k.contains('\0')) {
+            return Ok(InboxPage {
+                rows: vec![],
+                total: 0,
+            });
+        }
+        // The page and its total are one narrowing, so the two
+        // statements share one WHERE (backlog 74da899d). The total is
+        // the narrowing's, never the page's: a reader holding a full
+        // page tells it from the whole by `rows.len() < total`.
+        const NARROWED: &str = "FROM messages \
              WHERE recipient_id = $1 AND ($2 OR archived_at IS NULL) \
-             ORDER BY sent_at DESC",
+               AND ($3::text IS NULL OR kind = $3) \
+               AND (NOT $4 OR read_at IS NULL)";
+        let total: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) {NARROWED}"))
+            .bind(recipient_id)
+            .bind(query.include_archived)
+            .bind(query.kind.as_deref())
+            .bind(query.unread_only)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| MessageError::Storage(e.to_string()))?;
+        // A tie on the instant breaks by BYTE order of id — the double's
+        // order; the database's locale would order `suite-B` after
+        // `suite-ab` (backlog be459ab9, 2987fb2d's class). A stated
+        // order is also what makes LIMIT/OFFSET pages disjoint.
+        let rows: Vec<MessageRow> = sqlx::query_as(&format!(
+            "SELECT * {NARROWED} \
+             ORDER BY sent_at DESC, id COLLATE \"C\" \
+             LIMIT $5 OFFSET $6"
+        ))
+        .bind(recipient_id)
+        .bind(query.include_archived)
+        .bind(query.kind.as_deref())
+        .bind(query.unread_only)
+        .bind(i64::from(query.limit))
+        .bind(i64::from(query.offset))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| MessageError::Storage(e.to_string()))?;
+
+        Ok(InboxPage {
+            rows: rows.into_iter().map(|r| r.into_message()).collect(),
+            total: total.0.max(0) as u64,
+        })
+    }
+
+    async fn inbox_counts(
+        &self,
+        recipient_id: &str,
+        include_archived: bool,
+    ) -> Result<Vec<KindCount>, MessageError> {
+        if recipient_id.contains('\0') {
+            return Ok(vec![]);
+        }
+        // BYTE order of kind, as the double's BTreeMap orders it.
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT kind, COUNT(*), COUNT(*) FILTER (WHERE read_at IS NULL) \
+             FROM messages \
+             WHERE recipient_id = $1 AND ($2 OR archived_at IS NULL) \
+             GROUP BY kind ORDER BY kind COLLATE \"C\"",
         )
         .bind(recipient_id)
         .bind(include_archived)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| MessageError::Storage(e.to_string()))?;
-
-        Ok(rows.into_iter().map(|r| r.into_message()).collect())
+        Ok(rows
+            .into_iter()
+            .map(|(kind, all, unread)| KindCount {
+                kind,
+                all: all.max(0) as u64,
+                unread: unread.max(0) as u64,
+            })
+            .collect())
     }
 
     async fn unread_count(
@@ -51,6 +117,9 @@ impl MessageRepository for PgMessages {
         // leaves out the archived rows the inbox read leaves out — by
         // `archived_at`, since archiving keeps the kind (backlog
         // 9bda9726), so `?kind=direct` must not count them back in.
+        if recipient_id.contains('\0') || kind.is_some_and(|k| k.contains('\0')) {
+            return Ok(0);
+        }
         let row: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM messages \
              WHERE recipient_id = $1 AND read_at IS NULL \
@@ -67,6 +136,9 @@ impl MessageRepository for PgMessages {
     }
 
     async fn message_by_id(&self, id: &str) -> Result<Option<Message>, MessageError> {
+        if id.contains('\0') {
+            return Ok(None);
+        }
         let row: Option<MessageRow> = sqlx::query_as("SELECT * FROM messages WHERE id = $1")
             .bind(id)
             .fetch_optional(&self.pool)
@@ -82,21 +154,31 @@ impl MessageRepository for PgMessages {
         read_at: DateTime<Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), MessageError> {
+        // A phantom id is Ok and records nothing; a NUL id is one.
+        if id.contains('\0') {
+            return Ok(());
+        }
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| MessageError::Storage(e.to_string()))?;
-        let result = sqlx::query("UPDATE messages SET read_at = $1 WHERE id = $2")
-            .bind(read_at)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| MessageError::Storage(e.to_string()))?;
+        // Backlog 624e92eb (the read half of 9bda9726): `read_at IS
+        // NULL` is the idempotency guard — a repeat mark of a read
+        // message updates no row, so the first read_at stands and no
+        // second `messages.message.read` is recorded.
+        let result =
+            sqlx::query("UPDATE messages SET read_at = $1 WHERE id = $2 AND read_at IS NULL")
+                .bind(read_at)
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| MessageError::Storage(e.to_string()))?;
         // OUTBOX (phase 2): the read event records with the update —
-        // and only when a row actually updated. A phantom id keeps
-        // the endpoint's tolerant 200 but records no event (before,
-        // it published a read event for a nonexistent message).
+        // and only when a row actually updated. A phantom id or an
+        // already-read message keeps the endpoint's tolerant 200 but
+        // records no event (before, it published a read event for a
+        // nonexistent message).
         if result.rows_affected() > 0 {
             let event = stamp.event(
                 crate::events::MESSAGE_READ,
@@ -118,6 +200,7 @@ impl MessageRepository for PgMessages {
         msg: &Message,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), MessageError> {
+        crate::port::refuse_nul(msg)?;
         // Transparent newtype — the bare kebab code the column stores.
         let kind_str = msg.kind.as_str();
         let (entity_type, entity_id, entity_path) = match &msg.entity_ref {
@@ -138,9 +221,14 @@ impl MessageRepository for PgMessages {
         boss_subject_kinds::subjects::record_subject_in_tx(&mut tx, "message", &msg.id, None)
             .await
             .map_err(MessageError::Storage)?;
+        // `read_at` and `archived_at` are stored as sent: the sent fact
+        // carries the full row, and the rebuild replays it. Until the
+        // adapters-agree suite (backlog be459ab9) this INSERT dropped
+        // both, so a message sent read came back unread until a rebuild
+        // made it read.
         let result = sqlx::query(
-            "INSERT INTO messages (id, sender_id, recipient_id, subject, body, entity_type, entity_id, entity_path, kind, sent_at, reply_to) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+            "INSERT INTO messages (id, sender_id, recipient_id, subject, body, entity_type, entity_id, entity_path, kind, sent_at, reply_to, read_at, archived_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(&msg.id)
@@ -154,9 +242,20 @@ impl MessageRepository for PgMessages {
         .bind(kind_str)
         .bind(msg.sent_at)
         .bind(&msg.reply_to)
+        .bind(msg.read_at)
+        .bind(msg.archived_at)
         .execute(&mut *tx)
         .await
-        .map_err(|e| MessageError::Storage(e.to_string()))?;
+        .map_err(|e| match (&e, msg.reply_to.as_deref()) {
+            // The reply_to foreign key: a reply to a message nobody
+            // sent is the caller's error, not a 500 (backlog be459ab9).
+            (sqlx::Error::Database(d), Some(parent))
+                if d.code().as_deref() == Some("23503") =>
+            {
+                crate::port::no_such_parent(parent)
+            }
+            _ => MessageError::Storage(e.to_string()),
+        })?;
         // OUTBOX (phase 2): the sent event (full row state) records
         // with the row — and only when the INSERT actually inserted.
         // The ON CONFLICT (id) DO NOTHING idempotency guard doubles
@@ -185,6 +284,9 @@ impl MessageRepository for PgMessages {
         now: DateTime<Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), MessageError> {
+        if id.contains('\0') {
+            return Err(MessageError::NotFound(format!("no message with ID {id}")));
+        }
         let mut tx = self
             .pool
             .begin()
@@ -218,9 +320,14 @@ impl MessageRepository for PgMessages {
         // Find the root of the thread, then fetch all messages with that root.
         // A thread is: the root message + all messages whose reply_to chain leads to it.
         // For simplicity, we fetch the root (reply_to IS NULL or equals itself) and
-        // all direct replies. Deep threading can be added later.
+        // all direct replies. Deep threading can be added later. A tie
+        // on the instant breaks by BYTE order of id (backlog be459ab9).
+        if message_id.contains('\0') {
+            return Ok(vec![]);
+        }
         let rows: Vec<MessageRow> = sqlx::query_as(
-            "SELECT * FROM messages WHERE id = $1 OR reply_to = $1 ORDER BY sent_at ASC",
+            "SELECT * FROM messages WHERE id = $1 OR reply_to = $1 \
+             ORDER BY sent_at ASC, id COLLATE \"C\"",
         )
         .bind(message_id)
         .fetch_all(&self.pool)
@@ -249,12 +356,17 @@ impl MessageRepository for PgMessages {
         // property protocol's determinism clause is the thing that
         // breaks. Per-job this is a handful of rows.
         //
-        // `LIKE prefix || '%'` matches both shapes the senders use:
-        // `/jobs/{id}` from job-level notifications and
-        // `/jobs/{id}/steps/{step}` from the step notifier.
-        let ids: Vec<(String,)> = sqlx::query_as(
+        // A prefix matches both shapes the senders use: `/jobs/{id}`
+        // from job-level notifications and `/jobs/{id}/steps/{step}`
+        // from the step notifier. `starts_with`, not `LIKE $1 || '%'`:
+        // LIKE read a `_` or `%` in the prefix as a wildcard, where the
+        // port (and the double) read it literally (backlog be459ab9).
+        if path_prefix.contains('\0') {
+            return Ok(0);
+        }
+        let mut ids: Vec<(String,)> = sqlx::query_as(
             "UPDATE messages SET archived_at = $2 \
-             WHERE entity_path LIKE $1 || '%' \
+             WHERE starts_with(entity_path, $1) \
                AND kind = 'signal' \
                AND archived_at IS NULL \
                AND read_at IS NULL \
@@ -265,6 +377,9 @@ impl MessageRepository for PgMessages {
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| MessageError::Storage(e.to_string()))?;
+        // RETURNING states no order: one fact per row, in BYTE order of
+        // id on both adapters.
+        ids.sort();
 
         for (id,) in &ids {
             let event = stamp.event(
@@ -302,9 +417,13 @@ impl MessageRepository for PgMessages {
         // wildcard. Any kind: an assignee's notice is a `direct`, which
         // is the whole point (backlog 0b2bac00). Not yet archived, so a
         // second pass moves nothing and records nothing.
-        let ids: Vec<(String,)> = sqlx::query_as(
+        // `starts_with` for the path too, for the reason above.
+        if path_prefix.contains('\0') || id_prefix.contains('\0') {
+            return Ok(0);
+        }
+        let mut ids: Vec<(String,)> = sqlx::query_as(
             "UPDATE messages SET archived_at = $3 \
-             WHERE entity_path LIKE $1 || '%' \
+             WHERE starts_with(entity_path, $1) \
                AND starts_with(id, $2) \
                AND archived_at IS NULL \
                AND read_at IS NULL \
@@ -316,6 +435,7 @@ impl MessageRepository for PgMessages {
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| MessageError::Storage(e.to_string()))?;
+        ids.sort();
 
         for (id,) in &ids {
             let event = stamp.event(
@@ -339,6 +459,9 @@ impl MessageRepository for PgMessages {
         now: DateTime<Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), MessageError> {
+        if id.contains('\0') {
+            return Err(MessageError::NotFound(format!("no message with ID {id}")));
+        }
         let mut tx = self
             .pool
             .begin()

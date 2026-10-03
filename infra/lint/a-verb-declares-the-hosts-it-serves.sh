@@ -174,10 +174,24 @@ GCP_MUTATING_ADMITTED = {
     # data and David's call, out of reach by construction — but for one
     # file David decided on 2026-09-28 (backlog f44ca628): the retired
     # second stack's capture, /var/backups/boss/second-stack/
-    # second-stack-<stamp>.sql, its size and sha256 in the plan. Admitted
+    # second-stack-<stamp>.sql, its size and sha256 in the plan — and,
+    # since 2026-10-01 (backlog 4bf7bdd1, the GCS bucket is the off-site
+    # copy), the dumps the retired boss-gcp leg left,
+    # /var/backups/boss-cluster-pg/boss-<stamp>.sql.gz, each one's
+    # identity (size, inode, mtime, ctime) in the plan. Admitted
     # when David authorises this verb: the car stands at the dock under
     # a hold until he does.
     "reclaim-gcp-root": "admitted when David authorises this verb (backlog d3c7eada); each run needs his passkey on the rendered plan",
+    # design a79a8067, decided by David 2026-10-01 (Q1: "Admit
+    # retire-ops-runner as a MUTATING verb on forge and boss-gcp,
+    # declaring requires_approval with plan-retire-ops-runner and
+    # approvers emp-david"); backlog 98eb9349. The runner retires
+    # itself: it stops+disables exactly boss-ops-runner.timer (a literal,
+    # never a param) and never the service running it; refuses unless
+    # the role is undeclared on a live read, another host still runs a
+    # door, and no other ops-request is open for the host. Each run needs
+    # David's passkey on the plan plan-retire-ops-runner renders.
+    "retire-ops-runner": "David 2026-10-01, design a79a8067",
 }
 
 problems = []

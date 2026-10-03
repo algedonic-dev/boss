@@ -34,7 +34,7 @@ const border = (from: string, to: string, over: Partial<Border> = {}): Border =>
   flowing: true,
   held_since: null,
   flowing_why: 'last crossed 1m ago',
-  machine: { name: 'a rule', kind: 'dispatcher-rule', last_fired: null, silent_for_minutes: null, expected_every_minutes: null, silent: null, why: '' },
+  machine: { name: 'a rule', kind: 'dispatcher-rule', last_fired: null, silent_for_minutes: null, expected_every_minutes: null, silent: null, why: '', withheld: false },
   state: 'clear',
   why: 'flowing',
   ...over,

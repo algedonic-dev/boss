@@ -21,22 +21,30 @@
 # WHAT IT DELIBERATELY WITHHOLDS, in the shape boss-dev-access.yaml
 # uses for the same reason: no `delete` on anything, no secrets, no
 # create/update on workloads, no exec. A holder can SEE the cluster and
-# can UNDO a bad rollout. It cannot create a workload and cannot remove
-# anything.
+# can roll a workload to a named build. It cannot create a workload, and
+# it holds no `delete` — a patch that sets an ownerReference would hand
+# a workload to the garbage collector, and the admission policy at the
+# foot of this file refuses it (review 89c716e0, N1).
 #
 # IT CAN READ A CREDENTIAL, and this header said otherwise until
 # 2026-09-29 (review 978b; backlog cbb56130). RBAC scopes `patch` to an
 # object, never to a field: the patch on deployments/statefulsets below
 # can rewrite a pod TEMPLATE — its command, its env, its
-# serviceAccountName — and the controller, not the holder, starts the
-# pod, so every Secret the namespace holds (the broker's root tokens
+# serviceAccountName, its IMAGE (a foreign image's own entrypoint runs
+# with the template's env) — and the controller, not the holder, starts
+# the pod, so every Secret the namespace holds (the broker's root tokens
 # deploy/boss already names in its env, the `boss` account's token) is
 # one patch and one `pods/log` read (cluster-wide, above) away. The
 # same grant was removed from the dev session for exactly this
-# (978bbd7d). It stays here on purpose, for now: narrowing this Role
-# waits on the one-person DR proof (62dac114; item 4e1c33b4), because
-# this credential is the road back when the forge is down. This comment
-# changes no grant.
+# (978bbd7d). It stays here on purpose: this credential is the road
+# back when the forge is down. The narrowing is an admission policy at
+# the foot of this file (break-glass-operator-image-only; item 4e1c33b4,
+# design b08725c2 row B): it allows only a move of each image to another
+# tag or digest in the repository that workload already pulls from, and
+# REFUSES everything else (its Deny car, backlog e4a9a9b3). What that
+# closes and what it does not is written beside the policy; with the
+# binding deleted — its misfire rollback — the reach described here is
+# the grant's real reach again.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -85,14 +93,21 @@ subjects:
 # `kubectl rollout undo` and `kubectl set image` are both patches. It is
 # also, deliberately, the only write — with no `create` and no `delete`,
 # a holder can move a workload back to an image that booted and cannot
-# introduce one or remove a workload.
+# introduce one; removing one through an ownerReference is the gap the
+# admission policy below refuses.
 #
 # CLAUDE.md is explicit that "roll back" is a target and not a verb:
 # `rollout undo` moved between two revisions carrying the SAME broken
 # image on 2026-09-05, so the first rollback read as a rollback and was
-# a no-op. The intended use of this grant is `set image` to a NAMED
-# last-converged build, which is why the read half above includes
-# replicasets — that is where the previous image digests are legible.
+# a no-op. The intended use of this grant is the estate's roll to a
+# NAMED last-converged build — for deploy/boss, ONE patch moving the
+# image of containers/0 AND initContainers/0 (`_patch_boss_image` in
+# infra/forge/cluster-deploy-lib.sh; cluster-watchdog.sh and
+# rollback-to.sh send the same), because a main-only roll leaves a
+# boss-init on another build — which is why the read half above includes
+# replicasets: that is where the previous image digests are legible.
+# RBAC cannot hold the patch to those fields; the admission policy at
+# the foot of this file is what judges it.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -126,7 +141,8 @@ subjects:
 # The blast radius of the non-expiry is exactly the grant above: read
 # the cluster, patch two workload kinds in one namespace, no direct
 # Secret read — and, through that patch, every Secret the namespace
-# holds (see the header: the patch is a credential read).
+# holds wherever the policy at the foot of this file does not deny (see
+# the header: the patch is a credential read).
 # That is what makes a long-lived token acceptable here and would not
 # make an admin one acceptable.
 apiVersion: v1
@@ -137,3 +153,221 @@ metadata:
   annotations:
     kubernetes.io/service-account.name: break-glass-operator
 type: kubernetes.io/service-account-token
+---
+# THE PATCH, JUDGED FIELD BY FIELD — AND REFUSED (item 4e1c33b4, which
+# bound it to report; design b08725c2 row B, decided by David 2026-09-29
+# 23:33Z; review 89c716e0; the Deny car is backlog e4a9a9b3).
+#
+# RBAC scopes `patch` to an object, never to a field (header), so this
+# is where the API server holds the rollback grant to what a rollback
+# spends. For the break-glass operator ONLY, an update to a Deployment
+# or StatefulSet in `boss`:
+#   * must be on one of the three workloads a rollback moves —
+#     Deployment boss, StatefulSets postgres and nats;
+#   * may change nothing in `spec` but the `image` of a container or an
+#     initContainer (matched by name; none added, none removed);
+#   * and every image in the new template must be a tag or a digest IN
+#     THE REPOSITORY that workload already pulls from (the `repositories`
+#     variable below: the forge registry's david/boss and david/postgres,
+#     and `nats`). THE IMAGE IS A CREDENTIAL READ TOO: a foreign image's
+#     own entrypoint runs with every env secretKeyRef the template names,
+#     and `pods/log` hands them back (review 89c716e0, B1). A same-
+#     repository image is one this estate built and pushed — the break-
+#     glass holder cannot push to the forge registry, and `nats` on
+#     Docker Hub is its official image. The match is exact: the
+#     repository followed by `:<tag>`, `@sha256:<digest>` or both, so
+#     `…/david/boss-ci` (the CI image, which sits beside boss), the same
+#     path on another registry host, and Docker Hub's longer spelling of
+#     `nats` are all outside it;
+#   * and may not change the workload's own metadata.ownerReferences or
+#     metadata.finalizers: an ownerReference to an object that does not
+#     exist hands the workload to the garbage collector, which deletes
+#     it — a `delete` this grant does not otherwise carry; a finalizer
+#     deletes nothing, it BLOCKS a deletion, and removing one lets a
+#     pending deletion finish, so neither is a rollback. The rest of
+#     that metadata is not judged: every patch changes generation and
+#     managedFields, and labels or annotations on the workload object
+#     start no pod and name no credential.
+# The estate's roll to a named build is ONE patch moving BOTH images of
+# deploy/boss (containers/0 and initContainers/0: `_patch_boss_image` in
+# infra/forge/cluster-deploy-lib.sh, the same patch in
+# cluster-watchdog.sh and rollback-to.sh), and it passes. So does `kubectl
+# set image` of every container of a target to the same named build.
+#
+# WHAT DENY CLOSES, AND WHAT IT DOES NOT. Bound with Deny,
+# this refuses every template write that reads a credential — a command,
+# an env var, an envFrom, a serviceAccountName, a volume, a sidecar, an
+# initContainer, a foreign or lookalike image — and the ownerReference
+# road to deleting a workload. It does NOT close: running an OLDER build
+# from the same repository, with whatever bug that build carried (that
+# is the rollback this grant exists for); the cluster-wide `pods/log`
+# read, which still shows whatever the boss build itself logs; or a
+# credential read through a build in the forge registry that someone
+# with a forge WRITE credential pushed — that is the forge's boundary,
+# not this one.
+#
+# IT REFUSES (backlog e4a9a9b3). The binding's validationActions are
+# Deny and Audit: a patch the policy judges out is REFUSED, the
+# holder's kubectl prints the policy's message as the error, and the API
+# server's audit log records it. It reported first, as [Warn, Audit],
+# from car c073ba30; the one reader of that phase was the deposit Job's
+# nightly dry runs, and on 2026-09-30 17:20Z (packet 9cb136a0) all three
+# of its must-refuse patches were flagged by this policy. Deny is the
+# second refusal in b08725c2's order — its own car, one refusal per
+# train, on a train that departs during Pacific working hours.
+#
+# WHAT IT REFUSES THAT A ROLLBACK MIGHT REACH FOR, so a refusal is read
+# right: `kubectl rollout undo` (it copies an older ReplicaSet's whole
+# template, so any difference beyond the images is refused — and undo
+# is the verb that moved between two copies of one broken image on
+# 2026-09-05); `kubectl rollout restart` (a template annotation);
+# scaling or pausing; any workload but the three (cloudflared holds the
+# tunnel's credentials and is no rollback target). A set image of the
+# main container ALONE on deploy/boss is NOT refused, but leaves a mixed
+# template (a boss-init on another build) that the estate's roll never
+# mints — move both.
+#
+# failurePolicy Fail: an expression that errors on an odd object is a
+# failure, so it refuses and is audited rather than waving the patch
+# through.
+#
+# ROLLBACK, if it misfires (design b08725c2, row B's named way back):
+# delete the binding over the LAN kube road, with David's admin
+# kubeconfig — the recovery sheet's cluster-admin road prints the whole
+# command, every value in it read from this file —
+#   kubectl delete validatingadmissionpolicybinding break-glass-operator-image-only
+# It needs neither the break-glass credential it narrows, the conductor
+# nor the jobs API; a policy with no binding judges nothing. The next
+# converge applies the binding again, so a misfire that outlives the
+# next train is a revert car of this line (back to [Warn, Audit]) too.
+# While the binding is gone or off Deny, the deposit Job's nightly run
+# refuses on a RED line naming it (infra/cluster/break-glass-deposit.sh)
+# and check-manifests-applied.sh reports it on the converge: the way
+# back is loud, never a quiet state.
+#
+# PINNED by crates/core/boss-testing/tests/the_break_glass_patch_is_image_only.rs,
+# which EVALUATES these expressions against boss.yaml's own workloads:
+# the estate's two-image roll, replayed from the scripts that send it,
+# passes; a same-repository tag or digest passes; every foreign and
+# lookalike image, each credential-reading write and an ownerReference
+# are flagged; another user is not judged; the `repositories` below
+# equal the ones boss.yaml's images name and the one forge-defaults.sh
+# derives from estate.toml; and the binding is exactly [Deny, Audit].
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: break-glass-operator-image-only
+spec:
+  failurePolicy: Fail
+  # The MATCH is every workload of both kinds in `boss`, with no
+  # resourceNames: narrowing the match to the three targets would leave a
+  # patch on any other workload unjudged, where it must be refused.
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: boss
+    resourceRules:
+      - apiGroups: [apps]
+        apiVersions: ["*"]
+        operations: [UPDATE]
+        resources: [deployments, statefulsets]
+  # Only this ServiceAccount: the converge rewrites every field of the
+  # template on every train, as the forge's admin, and is not judged.
+  matchConditions:
+    - name: only-the-break-glass-operator
+      expression: request.userInfo.username == 'system:serviceaccount:boss:break-glass-operator'
+  variables:
+    # The repository each rollback target pulls from, spelled as boss.yaml
+    # spells its images. One fact in three files — this map, boss.yaml's
+    # image lines, and forge-defaults.sh's REGISTRY (from estate.toml) —
+    # held equal by the pin named above (CLAUDE.md §9a).
+    - name: repositories
+      expression: |
+        {'Deployment/boss': '10.20.0.15:3000/david/boss',
+         'StatefulSet/postgres': '10.20.0.15:3000/david/postgres',
+         'StatefulSet/nats': 'nats'}
+    - name: target
+      expression: request.kind.kind + '/' + object.metadata.name
+    # '' for a workload that is no target: the first validation flags it,
+    # and no image can match an empty repository's pattern below.
+    - name: repository
+      expression: |
+        variables.target in variables.repositories ? variables.repositories[variables.target] : ''
+    # A reference is the repository, then `:<tag>`, `@sha256:<digest>`,
+    # or both — nothing else. `.{N}` steps over the repository (already
+    # held equal by startsWith) so no character of it is read as a regex.
+    - name: imagePattern
+      expression: |
+        '^.{' + string(size(variables.repository)) + '}(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}(@sha256:[a-f0-9]{64})?|@sha256:[a-f0-9]{64})$'
+  validations:
+    - expression: variables.repository != ''
+      message: 'break-glass-operator may roll back only Deployment boss and StatefulSets postgres and nats'
+    # One validation per field, each saying what that field DOES: the
+    # two shared one message until backlog e4a9a9b3, and it said a
+    # finalizer lets the garbage collector delete the workload — a
+    # finalizer blocks a deletion, and removing one lets a pending
+    # deletion finish (reviews 89c716e0 and 87fc0e0c, n1).
+    - expression: |
+        ('ownerReferences' in object.metadata) == ('ownerReferences' in oldObject.metadata) &&
+        (!('ownerReferences' in oldObject.metadata) || object.metadata.ownerReferences == oldObject.metadata.ownerReferences)
+      message: 'break-glass-operator may not change a workload ownerReferences (an owner that does not exist hands the workload to the garbage collector, which deletes it)'
+    - expression: |
+        ('finalizers' in object.metadata) == ('finalizers' in oldObject.metadata) &&
+        (!('finalizers' in oldObject.metadata) || object.metadata.finalizers == oldObject.metadata.finalizers)
+      message: 'break-glass-operator may not change a workload finalizers (a finalizer blocks a deletion, and removing one lets a pending deletion finish; neither is a rollback)'
+    # Each level below is "every key but the one a roll moves is
+    # unchanged": iterate the OLD keys (none removed, none changed) and the
+    # NEW ones (none added), so a field Kubernetes adds next year is
+    # judged without naming it.
+    - expression: |
+        oldObject.spec.all(k, k == 'template' || (k in object.spec && object.spec[k] == oldObject.spec[k])) &&
+        object.spec.all(k, k in oldObject.spec)
+      message: 'break-glass-operator may change only an image; this patch changes the workload spec outside its pod template'
+    - expression: |
+        oldObject.spec.template.all(k, k == 'spec' || (k in object.spec.template && object.spec.template[k] == oldObject.spec.template[k])) &&
+        object.spec.template.all(k, k in oldObject.spec.template)
+      message: 'break-glass-operator may change only an image; this patch changes the pod template metadata'
+    - expression: |
+        oldObject.spec.template.spec.all(k, k == 'containers' || k == 'initContainers' || (k in object.spec.template.spec && object.spec.template.spec[k] == oldObject.spec.template.spec[k])) &&
+        object.spec.template.spec.all(k, k in oldObject.spec.template.spec)
+      message: 'break-glass-operator may change only an image; this patch changes the pod spec (a volume, the serviceAccountName)'
+    # Containers and initContainers are matched by NAME, which is unique
+    # in a pod: the same count, and every old one has exactly one new one
+    # of its name that differs from it in `image` alone.
+    - expression: |
+        size(object.spec.template.spec.containers) == size(oldObject.spec.template.spec.containers) &&
+        oldObject.spec.template.spec.containers.all(o,
+          object.spec.template.spec.containers.exists_one(n,
+            n.name == o.name &&
+            o.all(k, k == 'image' || (k in n && n[k] == o[k])) &&
+            n.all(k, k in o)))
+      message: 'break-glass-operator may change only an image; this patch changes a container command, args, env or other field, or adds or removes a container'
+    - expression: |
+        ('initContainers' in object.spec.template.spec) == ('initContainers' in oldObject.spec.template.spec) &&
+        (!('initContainers' in oldObject.spec.template.spec) || (
+          size(object.spec.template.spec.initContainers) == size(oldObject.spec.template.spec.initContainers) &&
+          oldObject.spec.template.spec.initContainers.all(o,
+            object.spec.template.spec.initContainers.exists_one(n,
+              n.name == o.name &&
+              o.all(k, k == 'image' || (k in n && n[k] == o[k])) &&
+              n.all(k, k in o)))))
+      message: 'break-glass-operator may change only an image; this patch changes an initContainer command, args, env or other field, or adds or removes one'
+    # The image a roll moves TO: in the workload's own repository.
+    - expression: |
+        object.spec.template.spec.containers.all(n,
+          n.image.startsWith(variables.repository) && n.image.matches(variables.imagePattern)) &&
+        (!('initContainers' in object.spec.template.spec) ||
+          object.spec.template.spec.initContainers.all(n,
+            n.image.startsWith(variables.repository) && n.image.matches(variables.imagePattern)))
+      message: 'break-glass-operator may roll only to a tag or digest in the repository the workload already pulls from; a foreign image runs its own entrypoint with every credential the template names'
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: break-glass-operator-image-only
+spec:
+  policyName: break-glass-operator-image-only
+  # DENY (backlog e4a9a9b3, row B's refusing car), and Audit keeps each
+  # refusal in the API server's audit log. The way back if it misfires
+  # is above ("ROLLBACK"), never an edit of this line on a train.
+  validationActions: [Deny, Audit]

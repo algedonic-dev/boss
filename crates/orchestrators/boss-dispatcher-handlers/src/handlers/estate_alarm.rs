@@ -104,7 +104,7 @@ use serde_json::{Value, json};
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 
 use super::common::{api_client, get_json, owner_for_filing, post_json, rows_or_refuse};
-use super::estate_compare::{DOOR_SCOPE, HOST_SCOPE, KNOWN_SCOPE, UNITS_SCOPE};
+use super::estate_compare::{DOOR_SCOPE, HOST_SCOPE, KNOWN_SCOPE, UNITS_SCOPE, VOLUMES_SCOPE};
 
 /// Consecutive same-series comparisons a hard finding must survive to
 /// raise. Three: at the tightened 15-minute observer cadence that is
@@ -150,11 +150,18 @@ const SILENCE_MEMORY_DAYS: i64 = 7;
 /// the cluster's: an observer that stops probing the door is
 /// `unobserved:door`, or the door watch would die as quietly as the
 /// door did.
-const WATCHED_SERIES: [(&str, bool); 4] = [
+///
+/// The instance-volumes series (backlog 21ee3b4e) is one series too: the
+/// forge reads every claim in one pass, and a reading that stops
+/// arriving is `unobserved:instance-volumes` — the database volume
+/// filled unobserved once (incident d3c0a67c), and an observer that dies
+/// must not make that the steady state again.
+const WATCHED_SERIES: [(&str, bool); 5] = [
     (KNOWN_SCOPE, false),
     (HOST_SCOPE, true),
     (UNITS_SCOPE, true),
     (DOOR_SCOPE, false),
+    (VOLUMES_SCOPE, false),
 ];
 
 pub struct EstateAlarm {
@@ -2260,6 +2267,100 @@ mod per_host_series_tests {
             .expect_err("no instant to measure at");
         assert!(err.is_permanent(), "{err}");
         assert!(raised(&dark).is_empty(), "{:?}", raised(&dark));
+    }
+
+    // ----- the instance volumes (backlog 21ee3b4e, incident d3c0a67c) -----
+
+    /// One instance-volumes comparison as `estate.compare` records it,
+    /// wrapped as the comparisons reader returns it: the SoR's database
+    /// volume `free_gib` free of 30, and boss-files unread.
+    fn volumes_row(at: DateTime<Utc>, free_gib: f64) -> Value {
+        use crate::handlers::estate_compare::{VOLUMES_SCOPE, compare_volumes};
+        let gib = 1_073_741_824.0_f64;
+        let cap = (30.0 * gib) as i64;
+        let free = (free_gib * gib) as i64;
+        let mut c = compare_volumes(&json!({
+            "scope": VOLUMES_SCOPE,
+            "observed_at": at.to_rfc3339(),
+            "nodes": [
+                {"id": "boss/pgdata-postgres-0", "namespace": "boss",
+                 "claim": "pgdata-postgres-0", "volume": "pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56",
+                 "capacity_bytes": cap, "used_bytes": cap - free, "free_bytes": free},
+                {"id": "boss/boss-files", "namespace": "boss", "claim": "boss-files",
+                 "capacity_bytes": null, "free_bytes": null,
+                 "unread": "the kubelet stats of w-2 could not be read: connection refused"},
+            ],
+        }));
+        c["scope"] = json!(VOLUMES_SCOPE);
+        c["observed_at"] = json!(at.to_rfc3339());
+        json!({
+            "event_id": format!("vol-{}", at.timestamp()), "timestamp": at.to_rfc3339(),
+            "kind": "jobs.estate.compared", "payload": c,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_volume_under_its_floor_on_three_comparisons_files_disk_tight_for_its_claim() {
+        let now = Utc::now();
+        let rows: Vec<Value> = (0..3)
+            .map(|i| volumes_row(now - chrono::Duration::minutes(15 * i), 2.5))
+            .collect();
+        let stub = serve(vec![
+            (
+                "/api/estate/comparisons?scope=instance-volumes",
+                json!({"data": rows, "total": 3}),
+            ),
+            ("/api/estate/comparisons", empty_listing()),
+            ("/api/estate/observations", empty_listing()),
+            ("/api/jobs", empty_listing()),
+        ])
+        .await;
+        let trigger = rows[0]["payload"].clone();
+        let res = handler(stub.base.clone())
+            .invoke(&[], &firing_at(trigger, now))
+            .await;
+        assert!(res.is_ok(), "{res:?}");
+        let raised = raised(&stub);
+        assert!(
+            raised.contains(&"disk_tight:boss/pgdata-postgres-0".to_string()),
+            "{raised:?}"
+        );
+        // The unread volume is not fine: three readings that could not see
+        // it are a class nobody can see, and that is its own alarm.
+        assert!(
+            raised.contains(&"blind:disk_tight/boss/boss-files".to_string()),
+            "{raised:?}"
+        );
+        let packet = stub
+            .sent()
+            .into_iter()
+            .find(|(w, b)| {
+                w == "POST /api/jobs"
+                    && b["metadata"]["estate_finding"] == "disk_tight:boss/pgdata-postgres-0"
+            })
+            .map(|(_, b)| b)
+            .expect("the disk_tight packet");
+        let detail = packet["metadata"]["detail"].as_str().unwrap_or("");
+        for named in [
+            "pgdata-postgres-0",
+            "pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56",
+            "requests.storage",
+        ] {
+            assert!(
+                detail.contains(named),
+                "the alarm names the claim, its volume and the remedy: {detail}"
+            );
+        }
+        assert!(
+            packet["metadata"].get("host").is_none(),
+            "one series for the scope, so no host: {packet}"
+        );
+    }
+
+    #[test]
+    fn the_volume_series_is_watched_for_silence_as_one_series() {
+        use crate::handlers::estate_compare::VOLUMES_SCOPE;
+        assert!(WATCHED_SERIES.contains(&(VOLUMES_SCOPE, false)));
     }
 }
 

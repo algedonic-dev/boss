@@ -18,6 +18,7 @@
   import { onMount } from 'svelte';
   import StepPluginMount from './StepPluginMount.svelte';
   import StepSurface from './StepSurface.svelte';
+  import StepFiles from './StepFiles.svelte';
   import { getStepPluginMount } from './pluginHost';
   import type { StepStatus } from '../jobs/types';
   import type { StepPluginProps } from './pluginHost';
@@ -149,6 +150,11 @@
       <p>{jobBrief}</p>
     </details>
   {/if}
+
+  <!-- Every kind, outside the plugin branch below: a step's files
+       are chrome, and a plugin that never heard of them still has
+       them shown (user-feedback 2b7116ca). -->
+  <StepFiles {stepId} />
 
   <div class="step-focus-body">
     {#if loading}

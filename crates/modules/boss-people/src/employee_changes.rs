@@ -20,8 +20,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use boss_clock_client::ClockClient;
 use boss_core::publisher::DomainPublisher;
-use boss_policy::{Action, Resource};
-use boss_policy_client::{CurrentUser, PolicyClient};
+use boss_policy_client::{CurrentUser, PolicyClient, controls};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -119,13 +118,8 @@ async fn create_change(
     CurrentUser(user): CurrentUser,
     Json(req): Json<EmployeeChange>,
 ) -> Response {
-    if let Err(refused) = crate::grants::require(
-        state.policy.as_ref(),
-        &user,
-        Action::Update,
-        Resource::employee(),
-    )
-    .await
+    if let Err(refused) =
+        crate::grants::require(state.policy.as_ref(), &user, controls::UPDATE_EMPLOYEE).await
     {
         return refused;
     }
@@ -194,6 +188,7 @@ mod tests {
     //! would fail here rather than read any database.
     use super::*;
     use boss_policy::Scope;
+    use boss_policy::{Action, Resource};
     use boss_policy_client::FakePolicyClient;
     use boss_testing::TestRequest;
 

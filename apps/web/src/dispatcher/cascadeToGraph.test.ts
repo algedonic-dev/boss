@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { buildCascade, describeTrigger, filterCascadeFromEvents, topicMatch, triggerTopics } from './cascadeToGraph';
+import { buildCascade, describeTrigger, filterCascadeFrom, filterStarts, topicMatch, triggerTopics } from './cascadeToGraph';
 import type { DispatcherRules } from './types';
 
 describe('topicMatch', () => {
@@ -103,7 +103,7 @@ describe('a handler no live rule invokes', () => {
   });
 });
 
-describe('filterCascadeFromEvents', () => {
+describe('filterCascadeFrom', () => {
   // a → r1 → h1 → (emit) b → r2 → h2(sink)
   const data: DispatcherRules = {
     rules: [
@@ -116,18 +116,18 @@ describe('filterCascadeFromEvents', () => {
 
   test('empty selection returns the full cascade unchanged', () => {
     const full = buildCascade(data);
-    expect(filterCascadeFromEvents(full, [])).toBe(full);
+    expect(filterCascadeFrom(full, [])).toBe(full);
   });
 
   test('forward cascade from a trigger keeps its whole downstream chain', () => {
-    const f = filterCascadeFromEvents(buildCascade(data), ['a']);
+    const f = filterCascadeFrom(buildCascade(data), ['evt:a']);
     const ids = new Set(f.nodes.map((n) => n.id));
     expect(ids).toEqual(new Set(['evt:a', 'rule:r1', 'hdl:h1', 'evt:b', 'rule:r2', 'hdl:h2']));
     expect(f.edges.every((e) => ids.has(e.source) && ids.has(e.target))).toBe(true);
   });
 
   test('a downstream trigger excludes upstream-only nodes', () => {
-    const f = filterCascadeFromEvents(buildCascade(data), ['b']);
+    const f = filterCascadeFrom(buildCascade(data), ['evt:b']);
     const ids = new Set(f.nodes.map((n) => n.id));
     expect(ids).toEqual(new Set(['evt:b', 'rule:r2', 'hdl:h2']));
     expect(ids.has('evt:a')).toBe(false);
@@ -171,6 +171,26 @@ describe('a scheduled rule (no on_event)', () => {
 
   test('the trigger list holds only real topics', () => {
     expect(triggerTopics(data.rules)).toEqual(['tick.*']);
+  });
+
+  // The page's filter offered only triggerTopics, so a clock-driven rule
+  // — a graph source with no trigger node — could not be chosen, and every
+  // filtered view dropped it (backlog d3734028; measured 2026-10-01 on the
+  // system of record: 31 of 104 rules are scheduled).
+  test('the filter can start from it: topics first, then each scheduled rule', () => {
+    expect(filterStarts(data.rules)).toEqual([
+      { id: 'evt:tick.*', label: 'tick.*', group: 'event' },
+      { id: 'rule:sweep-daily', label: 'sweep-daily', group: 'schedule' },
+    ]);
+  });
+
+  test('its forward cascade is everything the clock sets moving', () => {
+    const f = filterCascadeFrom(buildCascade(data), ['rule:sweep-daily']);
+    const ids = new Set(f.nodes.map((n) => n.id));
+    expect(ids).toEqual(
+      new Set(['rule:sweep-daily', 'hdl:sweep', 'evt:tick.swept', 'evt:tick.*', 'rule:on-tick', 'hdl:emit_tick']),
+    );
+    expect(f.edges.every((e) => ids.has(e.source) && ids.has(e.target))).toBe(true);
   });
 
   test('a schedule is described in words, not as a missing topic', () => {
