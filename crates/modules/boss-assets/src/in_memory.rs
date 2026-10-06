@@ -8,13 +8,24 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use crate::port::{AssetsError, AssetsRepository};
+use crate::port::{
+    AssetsError, AssetsRepository, BatchAppendStats, model_named,
+    refuse_an_actor_that_reads_back_as_another, refuse_negative_page, refuse_nul_in_event,
+};
 use crate::project::project;
-use crate::types::{AssetCurrentState, AssetEvent, AssetEventKind, AssetId};
+use crate::types::{AssetCurrentState, AssetEvent, AssetId};
 
 #[derive(Default)]
 pub struct InMemoryAssets {
     inner: Mutex<State>,
+    /// The catalog models this store holds, when one is declared
+    /// (`with_models`). `None` is a double with no catalog wired, which
+    /// admits every sku — the same "permissive when no registry is
+    /// wired" this crate's HTTP layer keeps for its Class registry. The
+    /// adapters-agree suite declares the catalog Postgres holds, and a
+    /// declared catalog refuses a model it lacks `UnknownModel`, as
+    /// Postgres's foreign key does (backlog be459ab9).
+    models: Option<HashSet<String>>,
 }
 
 #[derive(Default)]
@@ -23,9 +34,24 @@ struct State {
     seen_ids: HashSet<String>,
 }
 
+/// The order a log is kept and read in: by day, one day's events in
+/// byte order of id — the order `project` folds them in.
+fn by_day_then_id(a: &AssetEvent, b: &AssetEvent) -> std::cmp::Ordering {
+    a.ts.cmp(&b.ts).then_with(|| a.id.0.cmp(&b.id.0))
+}
+
 impl InMemoryAssets {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A store whose catalog holds exactly `models`: an event naming any
+    /// other sku is refused `UnknownModel`.
+    pub fn with_models(models: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            inner: Mutex::default(),
+            models: Some(models.into_iter().map(Into::into).collect()),
+        }
     }
 
     /// Seed from a prebuilt list of events (for demo data). Events are
@@ -42,24 +68,86 @@ impl InMemoryAssets {
             }
             // Keep per-asset logs chronologically sorted.
             for log in state.events.values_mut() {
-                log.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.0.cmp(&b.id.0)));
+                log.sort_by(by_day_then_id);
             }
         }
         Ok(assets)
     }
+
+    /// Refuse a model the declared catalog does not hold.
+    fn refuse_unknown_model(&self, event: &AssetEvent) -> Result<(), AssetsError> {
+        match (model_named(&event.kind), &self.models) {
+            (Some(sku), Some(models)) if !models.contains(sku) => {
+                Err(AssetsError::UnknownModel(sku.to_string()))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Every asset's projection.
+    fn projections(state: &State) -> Vec<AssetCurrentState> {
+        state
+            .events
+            .iter()
+            .filter_map(|(asset_id, events)| project(asset_id, events))
+            .collect()
+    }
+}
+
+/// Store an event already judged storable and new.
+fn store(state: &mut State, event: AssetEvent) {
+    state.seen_ids.insert(event.id.0.clone());
+    let log = state.events.entry(event.asset_id.clone()).or_default();
+    log.push(event);
+    log.sort_by(by_day_then_id);
+}
+
+/// A key holding a NUL byte names nothing Postgres can hold, so a read
+/// keyed by one is the miss it is on both adapters.
+fn holds_nul(key: &str) -> bool {
+    key.contains('\0')
 }
 
 #[async_trait]
 impl AssetsRepository for InMemoryAssets {
     async fn append(&self, event: AssetEvent) -> Result<(), AssetsError> {
+        refuse_nul_in_event(&event)?;
+        refuse_an_actor_that_reads_back_as_another(&event)?;
         let mut state = self.inner.lock().expect("poisoned lock");
-        if !state.seen_ids.insert(event.id.0.clone()) {
+        if state.seen_ids.contains(&event.id.0) {
             return Err(AssetsError::DuplicateEvent(event.id.0.clone()));
         }
-        let log = state.events.entry(event.asset_id.clone()).or_default();
-        log.push(event);
-        log.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.0.cmp(&b.id.0)));
+        self.refuse_unknown_model(&event)?;
+        store(&mut state, event);
         Ok(())
+    }
+
+    /// All or nothing, as the Postgres adapter's one transaction is: the
+    /// whole batch is judged before any of it is stored. The port's
+    /// default loop stored every event ahead of a refusal (backlog
+    /// be459ab9).
+    async fn batch_append(&self, events: Vec<AssetEvent>) -> Result<BatchAppendStats, AssetsError> {
+        for event in &events {
+            refuse_nul_in_event(event)?;
+            refuse_an_actor_that_reads_back_as_another(event)?;
+        }
+        let mut state = self.inner.lock().expect("poisoned lock");
+        let mut fresh: Vec<AssetEvent> = Vec::new();
+        let mut taken: HashSet<String> = HashSet::new();
+        let mut stats = BatchAppendStats::default();
+        for event in events {
+            if state.seen_ids.contains(&event.id.0) || !taken.insert(event.id.0.clone()) {
+                stats.duplicates += 1;
+                continue;
+            }
+            self.refuse_unknown_model(&event)?;
+            fresh.push(event);
+        }
+        stats.inserted = fresh.len() as u64;
+        for event in fresh {
+            store(&mut state, event);
+        }
+        Ok(stats)
     }
 
     async fn events_for(&self, asset_id: &AssetId) -> Result<Vec<AssetEvent>, AssetsError> {
@@ -85,13 +173,12 @@ impl AssetsRepository for InMemoryAssets {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<AssetId>, i64), AssetsError> {
+        refuse_negative_page(limit, offset)?;
         let state = self.inner.lock().expect("poisoned lock");
         let mut all: Vec<AssetId> = state.events.keys().cloned().collect();
         all.sort_by(|a, b| a.0.cmp(&b.0));
         let total = all.len() as i64;
-        let start = (offset as usize).min(all.len());
-        let end = (start + limit as usize).min(all.len());
-        Ok((all[start..end].to_vec(), total))
+        Ok((page(all, limit, offset), total))
     }
 
     async fn list_assets(
@@ -100,105 +187,85 @@ impl AssetsRepository for InMemoryAssets {
         offset: i64,
         account_id: Option<&str>,
     ) -> Result<(Vec<AssetCurrentState>, i64), AssetsError> {
+        refuse_negative_page(limit, offset)?;
         let state = self.inner.lock().expect("poisoned lock");
-        let mut assets: Vec<AssetCurrentState> = Vec::new();
-        for (asset_id, events) in &state.events {
-            if let Some(cs) = project(asset_id, events) {
-                if account_id.is_some_and(|p| {
-                    cs.holder_kind.as_deref() != Some("account")
-                        || cs.holder_id.as_deref() != Some(p)
-                }) {
-                    continue;
-                }
-                assets.push(cs);
-            }
-        }
-        assets.sort_by_key(|s| std::cmp::Reverse(s.last_event_at));
+        let mut assets: Vec<AssetCurrentState> = Self::projections(&state)
+            .into_iter()
+            .filter(|cs| {
+                account_id.is_none_or(|p| {
+                    cs.holder_kind.as_deref() == Some("account")
+                        && cs.holder_id.as_deref() == Some(p)
+                })
+            })
+            .collect();
+        // Newest first; one day's assets in byte order of id. The tie
+        // order was the HashMap's until backlog be459ab9 (and Postgres's
+        // heap order), and a day is a common tie.
+        assets.sort_by(|a, b| {
+            b.last_event_at
+                .cmp(&a.last_event_at)
+                .then_with(|| a.asset_id.0.cmp(&b.asset_id.0))
+        });
         let total = assets.len() as i64;
-        let start = (offset as usize).min(assets.len());
-        let end = (start + limit as usize).min(assets.len());
-        Ok((assets[start..end].to_vec(), total))
+        Ok((page(assets, limit, offset), total))
     }
 
     async fn active_asset_count_for_sku(&self, sku: &str) -> Result<u64, AssetsError> {
         let state = self.inner.lock().expect("poisoned lock");
-        let mut count: u64 = 0;
-        for events in state.events.values() {
-            let Some(first) = events.first() else {
-                continue;
-            };
-            let Some(cs) = project(&first.asset_id, events) else {
-                continue;
-            };
-            if cs.sku.as_deref() == Some(sku) && !cs.phase.is_decommissioned() {
-                count += 1;
-            }
-        }
-        Ok(count)
+        Ok(Self::projections(&state)
+            .iter()
+            .filter(|cs| cs.sku.as_deref() == Some(sku) && !cs.phase.is_decommissioned())
+            .count() as u64)
     }
 
+    /// The open tickets of every asset the account holds that is not
+    /// decommissioned — what Postgres counts off `asset_open_tickets`.
+    /// Until backlog be459ab9 the double counted every `ServiceJobOpened`
+    /// EVENT not closed anywhere, a decommissioned asset's and a
+    /// redelivered open's included.
     async fn open_ticket_count_for_account(&self, account_id: &str) -> Result<u64, AssetsError> {
+        if holds_nul(account_id) {
+            return Ok(0);
+        }
         let state = self.inner.lock().expect("poisoned lock");
-
-        let mut closed_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for events in state.events.values() {
-            for e in events {
-                if let AssetEventKind::ServiceJobClosed { job_id, .. } = &e.kind {
-                    closed_ids.insert(job_id);
-                }
-            }
-        }
-
-        let mut count: u64 = 0;
-        for events in state.events.values() {
-            let Some(first) = events.first() else {
-                continue;
-            };
-            let cs = project(&first.asset_id, events);
-            let held_by_account = cs.and_then(|c| {
-                (c.holder_kind.as_deref() == Some("account"))
-                    .then_some(c.holder_id)
-                    .flatten()
-            });
-            if held_by_account.as_deref() != Some(account_id) {
-                continue;
-            }
-            for e in events {
-                if let AssetEventKind::ServiceJobOpened { job_id, .. } = &e.kind
-                    && !closed_ids.contains(job_id.as_str())
-                {
-                    count += 1;
-                }
-            }
-        }
-        Ok(count)
+        Ok(Self::projections(&state)
+            .iter()
+            .filter(|cs| {
+                cs.holder_kind.as_deref() == Some("account")
+                    && cs.holder_id.as_deref() == Some(account_id)
+                    && !cs.phase.is_decommissioned()
+            })
+            .map(|cs| u64::from(cs.open_ticket_count))
+            .sum())
     }
 
     async fn assets_summary(
         &self,
-        _today: chrono::NaiveDate,
+        today: chrono::NaiveDate,
     ) -> Result<crate::types::AssetsSummary, AssetsError> {
-        // In-memory test stub: walk the in-memory projections and tally
-        // phases + skus. Not used in production, but keeps the tests
-        // runnable without requiring a Postgres backend.
         use crate::types::{AssetLifecyclePhase, AssetsSummary, PhaseRollup, SkuRollup};
         let state = self.inner.lock().expect("poisoned lock");
-        let mut phase_map: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
-        let mut sku_map: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-        for events in state.events.values() {
-            let Some(first) = events.first() else {
-                continue;
-            };
-            let Some(cs) = project(&first.asset_id, events) else {
-                continue;
-            };
+        let assets = Self::projections(&state);
+        let mut phase_map: HashMap<String, i64> = HashMap::new();
+        let mut sku_map: HashMap<String, i64> = HashMap::new();
+        let mut open_tickets_total: i64 = 0;
+        let mut warranty_expiring_30d: i64 = 0;
+        let horizon = today + chrono::Days::new(30);
+        for cs in &assets {
             *phase_map.entry(cs.phase.as_str().to_string()).or_insert(0) += 1;
+            if cs
+                .warranty_through
+                .is_some_and(|w| w >= today && w < horizon)
+            {
+                warranty_expiring_30d += 1;
+            }
+            if cs.phase.is_decommissioned() {
+                continue;
+            }
+            open_tickets_total += i64::from(cs.open_ticket_count);
             // Only identified assets bucket into a per-model rollup; an
             // unidentified (Registered) asset has no model to count under.
-            if !cs.phase.is_decommissioned()
-                && let Some(sku) = &cs.sku
-            {
+            if let Some(sku) = &cs.sku {
                 *sku_map.entry(sku.clone()).or_insert(0) += 1;
             }
         }
@@ -219,16 +286,24 @@ impl AssetsRepository for InMemoryAssets {
             .into_iter()
             .map(|(sku, count)| SkuRollup { sku, count })
             .collect();
-        sku_counts.sort_by_key(|s| std::cmp::Reverse(s.count));
+        sku_counts.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.sku.cmp(&b.sku)));
         Ok(AssetsSummary {
             phase_counts,
             total_systems,
             in_field_count,
-            open_tickets_total: 0,
+            open_tickets_total,
             sku_counts,
-            warranty_expiring_30d: 0,
+            warranty_expiring_30d,
         })
     }
+}
+
+/// `limit` items from `offset`, both already judged non-negative.
+fn page<T>(all: Vec<T>, limit: i64, offset: i64) -> Vec<T> {
+    all.into_iter()
+        .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+        .take(usize::try_from(limit).unwrap_or(usize::MAX))
+        .collect()
 }
 
 #[cfg(test)]

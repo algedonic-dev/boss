@@ -17,6 +17,7 @@
 pub mod chart;
 pub mod error;
 pub mod excise;
+pub mod fact_id;
 pub mod posting_rules;
 pub mod recognize;
 pub mod revenue_accounts;
@@ -110,4 +111,5 @@ pub use supersede::{
 };
 
 #[cfg(feature = "postgres")]
-pub use events::{FactWrite, deterministic_fact_id, record_fact_in_tx, record_ledger_event_in_tx};
+pub use events::{FactWrite, record_fact_in_tx, record_ledger_event_in_tx};
+pub use fact_id::deterministic_fact_id;

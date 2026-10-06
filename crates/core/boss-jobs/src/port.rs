@@ -246,6 +246,20 @@ pub struct JobFilter {
     /// window means "live OR recently closed", which is the useful
     /// question and the only one a board asks.
     pub closed_since: Option<chrono::NaiveDate>,
+    /// `Some(true)` keeps only TERMINAL packets (closed or cancelled),
+    /// `Some(false)` only LIVE ones (draft or open); `None` either.
+    /// ANDed with every other field — `status` and `closed_since`
+    /// included — so `terminal = true` plus the retention window is
+    /// the window's departures with its live half taken away.
+    ///
+    /// Why it exists (backlog a22311a1): the department jobs view read
+    /// live packets and the window's departures as ONE page of 200,
+    /// newest first. Once 61 platform kinds declared `it`, about 1,230
+    /// chores a day would close inside IT's window, the page would hold
+    /// four hours of them, and the 429 open backlog-items would fall
+    /// off it. The live and the departed are now two reads, each with
+    /// its own `total`.
+    pub terminal: Option<bool>,
     pub priority: Option<Priority>,
     pub owner_id: Option<String>,
     /// Filter by subject reference (e.g., device serial, account id).
@@ -320,10 +334,12 @@ pub struct JobFilter {
 ///
 /// Why the packet's word counts at all (backlog 481d7939, measured
 /// 2026-09-23): the kinds every department has — `department-retro`,
-/// `page-audit`, the `backlog-item`s a page audit files — are platform
-/// rows that declare no department, because they serve all of them;
-/// each packet carries the department it is about, and its schema
-/// requires it. Joined over kinds alone, the warehouse's retro and two
+/// `page-audit`, the `backlog-item`s a page audit files — were platform
+/// rows that declared no department, because they serve all of them;
+/// each packet carries the department it is about, and the retro and
+/// audit schemas require it (`backlog-item` declares `it` since
+/// a8458043, and its audited packets still carry their own word).
+/// Joined over kinds alone, the warehouse's retro and two
 /// page-audits answered `?department=warehouse` with total 0, and the
 /// finance retro was absent from finance's view. Membership stays data
 /// — the handler resolves `declaring_kinds` from the registry and the
@@ -373,6 +389,65 @@ pub enum JobScope {
     /// `Subject::Employee { id }` — the policy convention treats
     /// an employee's account_id bucket the same as a account row.
     AccountIn(Vec<String>),
+}
+
+impl JobScope {
+    /// The caller's read-scope `Predicate`, translated into the scope
+    /// the adapters can push into a query. `DepartmentIs` is the odd one
+    /// out: packets carry no department column, so it is either `All`
+    /// (the caller's department matches) or `None` (it does not).
+    ///
+    /// THE ONE TRANSLATION. Every packet read asks it, and so does every
+    /// door that withholds a record not scoped by packet from a caller
+    /// who does not read every packet — the yard reads, the map, and the
+    /// dispatcher's schedule and rule reads (backlog d0058c92). "Every
+    /// packet" is this translation's `All`, never the policy's own
+    /// answer: a department grant held outside its department is a
+    /// predicate, not `Predicate::None`, and reads nothing. It lives
+    /// beside the port type it produces, not in the HTTP adapter, so
+    /// another service imports a port function rather than this one's
+    /// HTTP module (review abebd39c, N1).
+    pub fn from_predicate(
+        user: &boss_policy_client::User,
+        predicate: &boss_policy_client::Predicate,
+    ) -> Self {
+        use boss_policy_client::Predicate;
+        match predicate {
+            Predicate::Unrestricted => JobScope::All,
+            Predicate::None => JobScope::None,
+            Predicate::OwnerIs { user_id } => JobScope::OwnerIs(user_id.clone()),
+            Predicate::OwnerIn { user_ids } => JobScope::OwnerIn(user_ids.clone()),
+            Predicate::AccountIn { account_ids } => JobScope::AccountIn(account_ids.clone()),
+            Predicate::DepartmentIs { department } => {
+                if user.department.as_deref() == Some(department.as_str()) {
+                    JobScope::All
+                } else {
+                    JobScope::None
+                }
+            }
+        }
+    }
+
+    /// Whether ONE row falls inside this scope — the in-memory adapter's
+    /// listing rule and the map's by-id predecessor read (backlog
+    /// 0964ba80) both ask it here, so the two cannot disagree about what
+    /// a scope admits. The Postgres adapter spells the same rule in SQL.
+    pub fn admits(&self, job: &Job) -> bool {
+        match self {
+            JobScope::All => true,
+            JobScope::None => false,
+            JobScope::OwnerIs(u) => &job.owner_id == u,
+            JobScope::OwnerIn(us) => us.contains(&job.owner_id),
+            JobScope::AccountIn(ps) => {
+                // Same territory-scope shape as policy_glue::territory_matches
+                // (Wave 3): only Account/Employee subjects carry an id
+                // that maps into the account list; all others deny.
+                let kind = boss_core::primitives::Subject::kind(&job.subject);
+                let id = boss_core::primitives::Subject::id(&job.subject);
+                matches!(kind, "account" | "employee") && ps.iter().any(|p| p == id)
+            }
+        }
+    }
 }
 
 /// Every packet pinned to one Workflow row, `(kind, version)`, in ANY
@@ -1772,13 +1847,25 @@ pub trait JobsRepository: Send + Sync {
     /// packets are terminal but not closed, so they do not count — the
     /// same line `workflow_terminal_report` draws.
     ///
+    /// `department`, when given, keeps only the kind's packets IN that
+    /// department by the listing's own rule ([`DepartmentFilter::keeps`]),
+    /// so readiness names the newest terminal of the packets the
+    /// department's jobs view shows — not a packet of a declaring kind
+    /// that names another department (backlog a22311a1). Held on both
+    /// adapters by tests/the_adapters_agree_on_a_kinds_newest_terminal_pg.rs.
+    ///
     /// The default impl is the pure [`newest_closed_from_jobs`] over
     /// every closed packet of the kind — honest but O(packets); the
     /// Postgres adapter answers with one ordered `LIMIT 1`.
-    async fn newest_closed_job(&self, kind: &str) -> Result<Option<Job>, JobsError> {
+    async fn newest_closed_job(
+        &self,
+        kind: &str,
+        department: Option<&DepartmentFilter>,
+    ) -> Result<Option<Job>, JobsError> {
         let filter = JobFilter {
             kind: Some(kind.to_string()),
             status: Some(JobStatus::Closed),
+            department: department.cloned(),
             ..Default::default()
         };
         let (jobs, _total) = self.list_jobs(&filter, i64::MAX, 0).await?;

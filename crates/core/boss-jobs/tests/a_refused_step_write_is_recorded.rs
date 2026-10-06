@@ -94,28 +94,20 @@ fn build_app() -> (Router, Arc<InMemoryJobs>) {
 fn step(id: &str, status: StepStatus, metadata: serde_json::Value) -> Step {
     Step {
         id: StepId::from_uuid(Uuid::parse_str(id).expect("step uuid")),
-        job_id: JobId::from_uuid(Uuid::parse_str(JOB).expect("job uuid")),
-        kind: "generic".into(),
-        title: "Reproduce and investigate".into(),
         spec_slug: Some("investigate".into()),
         assignee_id: Some("emp-op".into()),
         status,
-        sort_order: 1,
-        blocked_by: vec![],
-        sign_offs_required: Vec::new(),
-        assurance_required: None,
-        sign_offs: Vec::new(),
-        fields: Vec::new(),
         completed_on: match status {
             StepStatus::Completed => NaiveDate::from_ymd_opt(2026, 8, 20),
             _ => None,
         },
-        completed_by: None,
-        completed_at: None,
         metadata,
-        notes: None,
-        step_plugin_version: 0,
-        embedded_job: None,
+        ..Step::new(
+            JobId::from_uuid(Uuid::parse_str(JOB).expect("job uuid")),
+            "generic",
+            "Reproduce and investigate",
+            1,
+        )
     }
 }
 
@@ -123,20 +115,16 @@ async fn seed() -> (Router, Arc<InMemoryJobs>) {
     let (app, jobs) = build_app();
     let job = Job {
         id: JobId::from_uuid(Uuid::parse_str(JOB).expect("job uuid")),
-        kind: "incident".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "bosspipeline"),
-        title: "The CI runner lost outbound network".into(),
-        owner_id: "emp-op".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 8, 18).expect("date"),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "incident",
+            Subject::new("custom", "bosspipeline"),
+            "The CI runner lost outbound network",
+            "emp-op",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 8, 18).expect("date"),
+        )
     };
     jobs.create_job(&job).await.expect("create job");
     jobs.add_step(&step(

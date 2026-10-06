@@ -233,8 +233,8 @@ container image on Kubernetes, with a backup CronJob**. One pod
 runs the full stack — every `boss-*-api`, the gateway, the static
 SPA, the dispatcher — beside a Postgres and a NATS StatefulSet;
 [`infra/cluster/manifests/`](infra/cluster/manifests/) is the
-declared shape, and the nightly `boss-pg-backup` CronJob ships
-pg_dump snapshots to two offsite legs. The `audit_log` is the
+declared shape, and the nightly `boss-pg-backup` CronJob uploads
+pg_dump snapshots to an offsite GCS bucket. The `audit_log` is the
 disaster-recovery primitive (any snapshot replays cleanly via
 `boss-rebuild-all`).
 

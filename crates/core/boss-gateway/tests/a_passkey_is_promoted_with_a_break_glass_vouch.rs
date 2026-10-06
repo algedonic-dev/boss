@@ -292,8 +292,9 @@ fn router(base: &str, glass: &SoftKey, store: &Path) -> Router {
     )
     .unwrap();
     let origin = Url::parse(ORIGIN).unwrap();
-    let http =
-        || boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder()).unwrap();
+    let http = || {
+        boss_gateway::machine_client::MachineClient::unstamped(reqwest::Client::builder()).unwrap()
+    };
     let passkey = Arc::new(PasskeyState {
         session_key: KEY.to_vec(),
         http: http(),
@@ -377,7 +378,8 @@ fn writes(seen: &Seen) -> Vec<(String, String, Value)> {
         .unwrap()
         .iter()
         .filter(|(m, p, _)| {
-            (m == "POST" && p.ends_with("/promote")) || (m == "PUT" && p.contains("/steps/"))
+            (m == "POST" && p.ends_with("/promote"))
+                || ((m == "PUT" || m == "PATCH") && p.contains("/steps/"))
         })
         .cloned()
         .collect()
@@ -416,8 +418,10 @@ async fn fixture(approver: &str, extra_keys: &[&SoftKey]) -> Fixture {
 /// THE ROAD. The owner's approved packet, the key being promoted
 /// asserts, a committed break-glass key vouches: people is asked ONCE,
 /// with a ticket signed by the session key naming the packet, the owner,
-/// the key and the break-glass label; THEN the packet's `promote` step is
-/// completed with what was spent, its own keys kept.
+/// the key and the break-glass label; THEN what was spent goes onto the
+/// packet's `promote` step through the step merge door, and the step is
+/// completed by a PUT of the status alone (backlog e39a9d2a: the step PUT
+/// refuses any metadata body, and the door keeps the step's own keys).
 #[tokio::test]
 async fn the_owner_promotes_his_key_with_a_break_glass_vouch() {
     let f = fixture(OWNER, &[]).await;
@@ -437,7 +441,11 @@ async fn the_owner_promotes_his_key_with_a_break_glass_vouch() {
     assert_eq!(out["vouched_by"], "primary");
 
     let w = writes(&f.seen);
-    assert_eq!(w.len(), 2, "one promote, then one step write: {w:?}");
+    assert_eq!(
+        w.len(),
+        3,
+        "one promote, then the spend, then the status: {w:?}"
+    );
     let (_, promote_path, promote_body) = &w[0];
     assert_eq!(
         promote_path,
@@ -454,20 +462,25 @@ async fn the_owner_promotes_his_key_with_a_break_glass_vouch() {
     assert_eq!(ticket.i, OWNER);
     assert_eq!(ticket.c, f.promoted.credential_id());
     assert_eq!(ticket.v, "primary");
-    let (_, step_path, step_body) = &w[1];
+    let step_path = format!("/api/jobs/{PACKET}/steps/{PROMOTE_STEP_ID}");
+    let (method, spend_path, m) = &w[1];
     assert_eq!(
-        step_path,
-        &format!("/api/jobs/{PACKET}/steps/{PROMOTE_STEP_ID}")
+        (method.as_str(), spend_path.as_str()),
+        ("PATCH", format!("{step_path}/metadata").as_str())
     );
-    assert_eq!(step_body["status"], "completed");
-    let m = &step_body["metadata"];
     assert_eq!(m["credential_id"], f.promoted.credential_id());
     assert_eq!(m["vouched_by"], "primary");
     assert!(m["promoted_at"].is_string());
-    assert_eq!(
-        m["procedure"], "Completed by the gateway.",
-        "the step keeps its keys"
+    assert!(
+        m.get("procedure").is_none(),
+        "only the spend: the door keeps the step's own keys: {m}"
     );
+    let (method, close_path, close_body) = &w[2];
+    assert_eq!(
+        (method.as_str(), close_path.as_str()),
+        ("PUT", step_path.as_str())
+    );
+    assert_eq!(close_body, &json!({ "status": "completed" }));
 }
 
 /// F3 (review of car 1d9970d1). The approval is live and the key being

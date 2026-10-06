@@ -6,11 +6,10 @@
 //! from the log.
 
 use async_trait::async_trait;
-use boss_core::event::Event;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
-use crate::port::{CampaignsError, CampaignsRepository};
+use crate::port::{CampaignsError, CampaignsRepository, refuse_nul};
 use crate::types::Campaign;
 
 pub struct PgCampaigns {
@@ -34,6 +33,7 @@ impl CampaignsRepository for PgCampaigns {
         campaign: &Campaign,
         now: DateTime<Utc>,
     ) -> Result<bool, CampaignsError> {
+        refuse_nul(campaign)?;
         let mut tx = self.pool.begin().await.map_err(storage)?;
         let inserted = sqlx::query(
             "INSERT INTO campaigns (id, name, status, starts_on, ends_on, metadata, created_at) \
@@ -63,15 +63,8 @@ impl CampaignsRepository for PgCampaigns {
             .await
             .map_err(CampaignsError::Storage)?;
 
-            let payload = serde_json::json!({
-                "id": campaign.id,
-                "name": campaign.name,
-                "status": campaign.status,
-                "starts_on": campaign.starts_on,
-                "ends_on": campaign.ends_on,
-                "metadata": campaign.metadata,
-            });
-            let event = Event::new("boss-campaigns", "campaigns.campaign.created", payload, now);
+            // The one birth fact both adapters record (events.rs).
+            let event = crate::events::campaign_created(campaign, now);
             boss_events::outbox::record_event_in_tx(&mut tx, &event)
                 .await
                 .map_err(CampaignsError::Storage)?;
@@ -82,6 +75,12 @@ impl CampaignsRepository for PgCampaigns {
     }
 
     async fn get_campaign(&self, id: &str) -> Result<Option<Campaign>, CampaignsError> {
+        // No stored id can hold a NUL byte, and binding one is an
+        // encoding error Postgres answers as a 500 — so it is the miss
+        // it is (backlog be459ab9, found by the adapters-agree suite).
+        if id.contains('\0') {
+            return Ok(None);
+        }
         let row = sqlx::query_as::<_, CampaignRow>(
             "SELECT id, name, status, starts_on, ends_on, metadata, created_at \
              FROM campaigns WHERE id = $1",
@@ -94,9 +93,13 @@ impl CampaignsRepository for PgCampaigns {
     }
 
     async fn list_campaigns(&self) -> Result<Vec<Campaign>, CampaignsError> {
+        // A tie on created_at breaks by id in BYTE order, as the double
+        // does: the database's locale put `suite-ab` before `suite-B`
+        // (backlog be459ab9, found by the adapters-agree suite; the
+        // class is 2987fb2d's).
         let rows = sqlx::query_as::<_, CampaignRow>(
             "SELECT id, name, status, starts_on, ends_on, metadata, created_at \
-             FROM campaigns ORDER BY created_at DESC, id",
+             FROM campaigns ORDER BY created_at DESC, id COLLATE \"C\"",
         )
         .fetch_all(&self.pool)
         .await

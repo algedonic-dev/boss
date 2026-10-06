@@ -194,7 +194,11 @@ fn step_uri(job_id: &str, job: &Value, slug: &str) -> String {
     )
 }
 
-/// Complete `slug` as `as_id`, merging `extra` over its current metadata.
+/// Complete `slug` as `as_id`, writing `extra` first. Since e39a9d2a
+/// (Stage 2's last car) the step PUT writes no metadata, so the keys go
+/// through the step's merge door — only the keys named, a `null`
+/// deleting one — and the completion is the status alone. A refused
+/// merge is returned as the answer, so a caller sees the first refusal.
 async fn try_complete(
     app: &axum::Router,
     job_id: &str,
@@ -203,16 +207,20 @@ async fn try_complete(
     extra: Value,
 ) -> (StatusCode, Value) {
     let job = read(app, job_id).await;
-    let mut metadata = step_of(&job, slug)["metadata"].clone();
-    for (k, v) in extra.as_object().into_iter().flatten() {
-        metadata[k] = v.clone();
+    let uri = step_uri(job_id, &job, slug);
+    if extra.as_object().is_some_and(|keys| !keys.is_empty()) {
+        let (status, body) =
+            send(app, "PATCH", &format!("{uri}/metadata"), as_id, Some(extra)).await;
+        if !status.is_success() {
+            return (status, body);
+        }
     }
     send(
         app,
         "PUT",
-        &step_uri(job_id, &job, slug),
+        &uri,
         as_id,
-        Some(json!({ "status": "completed", "metadata": metadata })),
+        Some(json!({ "status": "completed" })),
     )
     .await
 }
@@ -369,8 +377,11 @@ async fn a_measurement_that_names_no_tree_is_refused() {
         complete(&app, &job_id, "opened", PERSON, json!({})).await;
     }
     for missing in ["source_sha", "scanned_sha"] {
+        // `null` deletes the key at the merge door: the attempt before
+        // this one wrote it, and a completion must meet the step without
+        // it, not with the value a refused attempt left behind.
         let mut md = measured();
-        md.as_object_mut().unwrap().remove(missing);
+        md[missing] = Value::Null;
         let (status, body) = try_complete(&app, &job_id, "measure", AGENT, md).await;
         assert!(
             !status.is_success(),

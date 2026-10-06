@@ -1,0 +1,48 @@
+[package]
+name = "boss-events-api"
+description = "Apps read adapter for the existing BOSS events service"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+postgres = ["dep:sqlx", "boss-events/postgres"]
+# Keep the existing explicit image-build feature and executable name.
+events-api = ["postgres", "boss-events/events-api"]
+
+[[bin]]
+name = "boss-events-api"
+path = "src/main.rs"
+required-features = ["events-api"]
+
+[dependencies]
+boss-core = { path = "../../core/boss-core" }
+boss-events = { path = "../../core/boss-events", default-features = false }
+boss-policy-client = { path = "../../core/boss-policy-client" }
+boss-ports = { path = "../../core/boss-ports" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres"], optional = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+boss-policy = { path = "../../core/boss-policy", default-features = false }
+boss-testing = { path = "../../core/boss-testing", features = ["postgres"] }
+tower = { workspace = true, features = ["util"] }
+uuid = { workspace = true }
+
+[[test]]
+name = "gate_window_http"
+required-features = ["postgres"]
+
+[lints]
+workspace = true

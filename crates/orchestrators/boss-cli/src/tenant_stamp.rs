@@ -107,12 +107,18 @@ pub struct HttpStamps {
 }
 
 impl HttpStamps {
-    pub fn new(base: &str) -> Result<Self> {
+    /// The stamp door on `bases.jobs`. Through a gateway its client
+    /// stamps no machine token, the rule the publish walk itself takes
+    /// (`tenant_publish::walk_client`, backlog 2ee29275).
+    pub fn new(bases: &crate::tenant_publish::Bases) -> Result<Self> {
+        let builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
         Ok(Self {
-            base: base.trim_end_matches('/').to_string(),
-            client: crate::gate::machine_client_with(
-                reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)),
-            )?,
+            base: bases.jobs.trim_end_matches('/').to_string(),
+            client: if bases.through_gateway {
+                boss_core::machine_token::Client::unstamped(builder)?
+            } else {
+                crate::gate::machine_client_with(builder)?
+            },
         })
     }
 }
@@ -321,29 +327,110 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn an_unstamped_store_answers_none_and_exit_1() {
-        let s = InMemoryStamps::default();
-        assert_eq!(s.published().await.unwrap(), None);
-        let (line, code) = published_verdict(&s).await.unwrap();
-        assert_eq!(code, 1);
-        assert!(line.starts_with("no tenant publish stamped"), "{line}");
-    }
+    // THE READ'S TWO ADAPTERS RUN ONE SUITE (backlog be459ab9, design
+    // 3036296f mechanism C). The launcher's guard reads PgStamps; every
+    // verdict test above and below reads InMemoryStamps. Until this car
+    // the two were held to each other by two tests written twice — one
+    // per adapter, the same fixture typed in each — which is the drift
+    // the suite exists to refuse. Each case is now written once and run
+    // against both, and the census pin
+    // (boss-testing/tests/every_port_with_two_adapters_runs_one_suite.rs)
+    // reads this module as PublishedStamps' suite. It is a module of its
+    // own because the pin reads the module that invokes the suite, and
+    // the door test below names the jobs API's adapters, not these.
+    mod the_read_adapters_agree {
+        use super::*;
 
-    #[tokio::test]
-    async fn the_first_publish_is_the_stamp_and_later_ones_are_counted() {
-        let s = InMemoryStamps::default();
-        // Recorded out of order: the FIRST by date is the stamp, not
-        // the first written.
-        s.push(stamp("acme", "2026-09-19T08:00:00", &["agents"]));
-        s.push(stamp("acme", "2026-09-18T19:00:00", &[]));
-        let p = s.published().await.unwrap().unwrap();
-        assert_eq!(p.first, stamp("acme", "2026-09-18T19:00:00", &[]));
-        assert_eq!(p.count, 2);
-        assert_eq!(
-            p.last_at,
-            stamp("acme", "2026-09-19T08:00:00", &[]).published_at
-        );
+        /// How a case writes a stamp into each adapter's world: the double
+        /// pushes the row; the Postgres read's table is filled through the
+        /// jobs API's own Pg adapter, the one writer it has in production.
+        #[async_trait]
+        trait Seed: PublishedStamps {
+            async fn seed(&self, stamp: Stamp);
+        }
+
+        #[async_trait]
+        impl Seed for InMemoryStamps {
+            async fn seed(&self, stamp: Stamp) {
+                self.push(stamp);
+            }
+        }
+
+        #[async_trait]
+        impl Seed for PgStamps {
+            async fn seed(&self, stamp: Stamp) {
+                use boss_jobs::tenant_publishes::{PgTenantPublishes, TenantPublishes};
+                PgTenantPublishes::new(self.0.clone())
+                    .record(&stamp)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        async fn an_unstamped_store_answers_none_and_exit_1<S: Seed>(s: &S, adapter: &str) {
+            assert_eq!(s.published().await.unwrap(), None, "{adapter}");
+            let (line, code) = published_verdict(s).await.unwrap();
+            assert_eq!(code, 1, "{adapter}");
+            assert!(
+                line.starts_with("no tenant publish stamped"),
+                "{adapter}: {line}"
+            );
+        }
+
+        async fn the_first_publish_is_the_stamp_and_later_ones_are_counted<S: Seed>(
+            s: &S,
+            adapter: &str,
+        ) {
+            // Recorded out of order: the FIRST by date is the stamp, not
+            // the first written.
+            s.seed(stamp("acme", "2026-09-19T08:00:00", &["agents"]))
+                .await;
+            s.seed(stamp("acme", "2026-09-18T19:00:00", &[])).await;
+            let p = s.published().await.unwrap().unwrap();
+            assert_eq!(
+                p.first,
+                stamp("acme", "2026-09-18T19:00:00", &[]),
+                "{adapter}"
+            );
+            assert_eq!(p.count, 2, "{adapter}");
+            assert_eq!(
+                p.last_at,
+                stamp("acme", "2026-09-19T08:00:00", &[]).published_at,
+                "{adapter}"
+            );
+            let (line, code) = published_verdict(s).await.unwrap();
+            assert_eq!(code, 0, "{adapter}");
+            assert!(
+                line.starts_with("2026-09-18T19:00:00Z tenant acme"),
+                "{adapter}: {line}"
+            );
+        }
+
+        /// Two publishes in the same second: the first WRITTEN is the stamp
+        /// — the SQL's `ORDER BY published_at, id` and the double's stable
+        /// sort, stated once for both.
+        async fn a_tie_on_the_date_answers_the_first_written<S: Seed>(s: &S, adapter: &str) {
+            s.seed(stamp("first", "2026-09-18T19:00:00", &[])).await;
+            s.seed(stamp("second", "2026-09-18T19:00:00", &[])).await;
+            let p = s.published().await.unwrap().unwrap();
+            assert_eq!(p.first.tenant_id, "first", "{adapter}");
+            assert_eq!(p.count, 2, "{adapter}");
+        }
+
+        boss_testing::adapters_agree! {
+            adapters {
+                in_memory => (InMemoryStamps::default(), ()),
+                postgres => {
+                    let db = boss_testing::TestDb::new().await;
+                    (PgStamps::from_pool(db.pool.clone()), db)
+                },
+            }
+            cases {
+                an_unstamped_store_answers_none_and_exit_1,
+                the_first_publish_is_the_stamp_and_later_ones_are_counted,
+                a_tie_on_the_date_answers_the_first_written,
+            }
+        }
     }
 
     #[tokio::test]
@@ -405,7 +492,19 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let http = HttpStamps::new(&base).unwrap();
+        // Routed the way `--gateway` routes, so the client stamps no
+        // token: this test never reads the process's mounted Secret.
+        let http = HttpStamps::new(&crate::tenant_publish::Bases::resolve(Some(&base))).unwrap();
+        assert!(
+            http.client
+                .get(&base)
+                .build()
+                .unwrap()
+                .headers()
+                .get(boss_core::machine_token::HEADER)
+                .is_none(),
+            "a stamp through a gateway carries no machine token (backlog 2ee29275)"
+        );
         let line = stamp_after_publish(&http, &new_stamp(&["departments"]), "agent-claude")
             .await
             .unwrap();
@@ -426,39 +525,5 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("400"), "{err:#}");
         assert_eq!(repo.rows().len(), 1);
-    }
-
-    /// The read the launcher's guard makes, against the real table the
-    /// jobs API's Pg adapter writes: the SQL's first-by-date, count and
-    /// max agree with the in-memory answer.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn pg_stamps_read_what_the_door_adapter_wrote() {
-        use boss_jobs::tenant_publishes::{PgTenantPublishes, TenantPublishes};
-        let db = boss_testing::TestDb::new().await;
-        let pg = PgStamps::from_pool(db.pool.clone());
-        assert_eq!(pg.published().await.unwrap(), None);
-        let (_, code) = published_verdict(&pg).await.unwrap();
-        assert_eq!(code, 1);
-
-        let door = PgTenantPublishes::new(db.pool.clone());
-        door.record(&stamp("acme", "2026-09-19T08:00:00", &["agents"]))
-            .await
-            .unwrap();
-        door.record(&stamp("acme", "2026-09-18T19:00:00", &[]))
-            .await
-            .unwrap();
-        let p = pg.published().await.unwrap().unwrap();
-        assert_eq!(p.first, stamp("acme", "2026-09-18T19:00:00", &[]));
-        assert_eq!(p.count, 2);
-        assert_eq!(
-            p.last_at,
-            stamp("acme", "2026-09-19T08:00:00", &[]).published_at
-        );
-        let (line, code) = published_verdict(&pg).await.unwrap();
-        assert_eq!(code, 0);
-        assert!(
-            line.starts_with("2026-09-18T19:00:00Z tenant acme"),
-            "{line}"
-        );
     }
 }

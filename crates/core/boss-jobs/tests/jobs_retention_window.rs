@@ -94,20 +94,17 @@ fn feedback(n: u8, status: JobStatus, closed_on: Option<NaiveDate>) -> Job {
         id: JobId::from_uuid(
             Uuid::parse_str(&format!("00000000-0000-0000-0000-0000000000{n:02}")).expect("uuid"),
         ),
-        kind: "user-feedback".into(),
-        workflow_version: 1,
-        subject: Subject::new("asset", "BOSSNET"),
-        title: format!("feedback {n}"),
-        owner_id: "emp-david".into(),
         status,
-        priority: Priority::Standard,
-        opened_on: day(2026, 1, 1),
-        opened_at: None,
-        due_on: None,
         closed_on,
         metadata: serde_json::Value::Null,
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "user-feedback",
+            Subject::new("asset", "BOSSNET"),
+            format!("feedback {n}"),
+            "emp-david",
+            Priority::Standard,
+            day(2026, 1, 1),
+        )
     }
 }
 
@@ -263,4 +260,31 @@ async fn out_of_range_days_clamp_instead_of_erroring() {
         absurd["total"], 7,
         "ten years reaches every packet seeded here"
     );
+}
+
+/// `terminal=` splits the window's one read into the two a department
+/// page needs (backlog a22311a1): its live packets, and its departures
+/// inside the window — each with a `total` of its own. One page of 200
+/// holding both, newest first, would let the platform's ~1,230 chores
+/// a day push 429 open backlog-items off the IT jobs view.
+#[tokio::test]
+async fn terminal_reads_the_live_and_the_departed_apart() {
+    let (app, jobs) = app_at(day(2026, 8, 16));
+    seed(&jobs).await;
+
+    let live = list(&app, "kind=user-feedback&terminal=false").await;
+    assert_eq!(live["total"], 2, "open and draft: {:?}", titles(&live));
+
+    let departed = list(&app, "kind=user-feedback&terminal=true&closed_within=14").await;
+    let mut got = titles(&departed);
+    got.sort();
+    assert_eq!(
+        got,
+        ["feedback 3", "feedback 4"],
+        "terminal AND inside the window — the live half is not in it"
+    );
+    assert_eq!(departed["total"], 2);
+
+    let ever = list(&app, "kind=user-feedback&terminal=true").await;
+    assert_eq!(ever["total"], 5, "every terminal packet without a window");
 }

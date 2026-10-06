@@ -70,7 +70,9 @@
 # Env:
 #   BOSS_JOBS_URL          (required, no default) the system of record
 #   BOSS_RECLAIM_HOST      (default forge) the estate node id to ask
-#   BOSS_MACHINE_TOKEN     (optional) forwarded as x-boss-machine-token
+#   BOSS_MACHINE_TOKEN_DIR (default /etc/boss/machine-token) the mounted
+#                          machine token, sent to an estate host only
+#                          (infra/lib/secret-header.sh machine_token_header)
 #   BOSS_RECLAIM_DF_CMD    (default df)   the gate.sh BOSS_GATE_DF_CMD idiom
 #   BOSS_RECLAIM_CURL_CMD  (default curl) so the request is testable
 #
@@ -190,7 +192,7 @@ fi
 # where every process on the runner reads it (backlog 5f3ad356).
 # shellcheck source=infra/lib/secret-header.sh
 if ! . "$HERE/../lib/secret-header.sh" \
-    || ! secret_header MT_HDR ${BOSS_MACHINE_TOKEN:+"x-boss-machine-token: $BOSS_MACHINE_TOKEN"}; then
+    || ! machine_token_header MT_HDR "$BOSS_JOBS_URL"; then
     warn "the machine token's header file could not be made ($HERE/../lib/secret-header.sh), and it is never sent in curl's command line — nothing filed."
     floor_still_covered
     exit 0

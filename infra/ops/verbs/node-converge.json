@@ -1,0 +1,33 @@
+{
+  "about": "MUTATING — apply ONE Talos node's declared machine-config patch, live, with no reboot (infra/forge/node-converge.sh <node> <tree_sha> <plan_sha256>): talosctl -n <the registry's address> patch machineconfig --mode=no-reboot --patch=<infra/cluster/talos/patches/<node>.yaml at tree_sha> through the forge's ops_talosctl door (the talosconfig David placed in /etc/boss-ops, infra/estate/ops-credentials.sh). The one bounded Talos act design 1bc4b4ed decided (David 2026-09-12: apply-config --dry-run against the per-node file declared in the repo, the diff recorded on the packet, then apply; reboot, upgrade, reset and etcd membership never become verbs), built as backlog 9d56c616 after David ran talosctl patch by hand for w-1's second NVMe on 2026-09-30 and chose that the next node change be a plan the agent files and he approves. AUTHORISED PER RUN BY DAVID'S PASSKEY in design 17835005's shape, as shutdown-node and set-longhorn-drain-policy are: it declares requires_approval with the read-only plan-a-node-converge (this script's --plan) as its plan_verb, so the runner renders the plan — Talos's own dry-run diff among it — onto the request's approve step, runs this only after a passkey on the approvers list signs those bytes, and hands the script sha256 of the SIGNED plan; the script re-renders, running the dry run again, and applies nothing unless today's plan hashes to it (drift is exit 78). A dry run that changes nothing is refused, so a second run of an applied plan is refused: at most once. THE BOUND IS THE SCRIPT'S, NEVER A PARAM: the node is a registry node with a Talos role and the cluster agrees on its address and its kind (a control plane is admitted — only by this verb — because the design converges every declared node and bounds the act instead); the patch is the tree's file at a full commit on the converged history and the very blob HEAD carries, never a path or patch text from the packet; every declared entry is one check-declared.sh reads back; the dry run and the apply both run --mode=no-reboot and the dry run must read 'Applied configuration without a reboot'; a non-idempotent patch is refused when an entry it would append is already live; and a credential-shaped changed line refuses the plan without printing it — or nothing is done (exit 78). THE EFFECT IS READ BACK, and it is the node, not only its config (review 9cb9af67): every 5 s for up to 120 s, the live machine config piped through check-declared.sh against the declared blob until every declared entry reads MATCH, and then the Node Ready=True with its kubelet lease (kube-node-lease) renewed at least 20 s after the apply — a kubelet running after the restart the change causes — and read again at the END of the bound, so a node back early that goes NotReady a status update later is not an effect (review be5ba8f7); only a read at the end of the bound prints the effect line, so every successful run takes the whole 120 s, and otherwise the run exits 1 saying the node is NOT proven, with what each read said. A non-idempotent patch is refused when ANY declared entry is already live, and the refusal says to keep live entries and narrow the declaration; extraConfig admits only the kubelet keys the tree declares today (the image-GC pair). Timeout 420: the plan's reads and dry runs again, the apply (60 s inside its container), and the script's own 120 s read-back, which gives its verdict before the runner's kill.",
+  "hosts": [
+    "forge"
+  ],
+  "requires_approval": true,
+  "plan_verb": "plan-a-node-converge",
+  "approvers": [
+    "emp-david"
+  ],
+  "argv": [
+    "infra/forge/node-converge.sh",
+    "{1}",
+    "{2}",
+    "{3}"
+  ],
+  "params": [
+    {
+      "name": "node",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    {
+      "name": "tree_sha",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    {
+      "name": "plan_sha256",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  ],
+  "timeout": 420,
+  "effect": "^node-converge: [a-z0-9-]+ reads back its declaration at [0-9a-f]{40} — check-declared\\.sh [a-z0-9-]+ exits 0 against the live machine config, every declared entry MATCH, and Node [a-z0-9-]+ Ready=True with its kubelet lease renewed [0-9]+s after the apply \\(after [0-9]+s\\)$"
+}

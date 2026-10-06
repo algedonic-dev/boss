@@ -16,10 +16,13 @@ required-features = ["postgres"]
 
 [features]
 default = ["postgres"]
-postgres = ["dep:sqlx"]
+postgres = ["dep:sqlx", "dep:boss-events"]
 
 [dependencies]
 boss-core = { path = "../boss-core" }
+# The machine gate states its facts through the outbox, in the binary
+# only (design 21946380).
+boss-events = { path = "../boss-events", default-features = false, features = ["postgres"], optional = true }
 boss-ports = { path = "../boss-ports" }
 boss-expr = { path = "../boss-expr" }
 boss-policy-client = { path = "../boss-policy-client" }
@@ -68,4 +71,8 @@ required-features = ["postgres"]
 
 [[test]]
 name = "event_facts_lock_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_views_registry_pg"
 required-features = ["postgres"]

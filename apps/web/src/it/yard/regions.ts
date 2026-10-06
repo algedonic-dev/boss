@@ -21,7 +21,7 @@ import { fetchRemote, type Remote } from '../../data/remote';
 // Wire types — the shape of GET /api/yard/regions. Parsed once, below.
 // ---------------------------------------------------------------------
 
-/** The ten regions, in map order. The server's
+/** The regions, in map order. The server's
  *  `boss_jobs::regions::REGIONS` is the decision (0524fc95 Q2); this
  *  is the client's copy, pinned equal by regions.test.ts. */
 export const REGION_NAMES = [
@@ -35,6 +35,7 @@ export const REGION_NAMES = [
   'marshalling',
   'shop-floor',
   'publish',
+  'sensors',
 ] as const;
 export type RegionName = (typeof REGION_NAMES)[number];
 
@@ -100,9 +101,13 @@ export type Trend = Readonly<{
  *  `unknown` is not idle. Idle is a reading — the machine is here and
  *  has no work — and the server states it only where presence is a
  *  fact it holds. Everything else is "cannot tell", and the map draws
- *  the two differently. */
-export type MachineState = 'running' | 'idle' | 'failed' | 'unknown';
-const MACHINE_STATES: ReadonlyArray<MachineState> = ['running', 'idle', 'failed', 'unknown'];
+ *  the two differently.
+ *
+ *  `withheld` is neither: the record that would say is withheld from
+ *  this caller by policy scope (backlog 1805bac0) — the policy working,
+ *  drawn neutral and never counted as trouble. */
+export type MachineState = 'running' | 'idle' | 'failed' | 'unknown' | 'withheld';
+const MACHINE_STATES: ReadonlyArray<MachineState> = ['running', 'idle', 'failed', 'unknown', 'withheld'];
 
 export type Machine = Readonly<{
   /** Stable within the region, so a glyph keeps its place between
@@ -193,6 +198,9 @@ export type MachineSummary = Readonly<{
   idle: number;
   failed: number;
   unknown: number;
+  /** Withheld from this caller by policy scope (backlog 1805bac0) —
+   *  never among `failed_or_unknown`. The server omits it when zero. */
+  withheld: number;
   total: number;
   failed_or_unknown: ReadonlyArray<MachineAt>;
 }>;
@@ -234,6 +242,9 @@ export type NextEvent = Readonly<{
   source: string;
   /** The source could not be read, and why. */
   unread: string | null;
+  /** `unread` is a REFUSAL by policy scope, not a failed read — the
+   *  server's flag (backlog 1805bac0), absent on the wire when false. */
+  withheld: boolean;
 }>;
 
 /** A board field as the payload carried it: its rows (possibly none —
@@ -403,6 +414,8 @@ function parseMachineSummary(raw: unknown): MachineSummary | null {
     idle: count('idle'),
     failed: count('failed'),
     unknown: count('unknown'),
+    // Sent only when non-zero (a full scope's payload carries none).
+    withheld: numberOrNull(o.withheld) ?? 0,
     total: count('total'),
     failed_or_unknown: Array.isArray(o.failed_or_unknown)
       ? o.failed_or_unknown.map((m) => {
@@ -454,6 +467,7 @@ function parseNextEvent(raw: unknown): NextEvent {
     basis: String(o.basis ?? ''),
     source: String(o.source ?? ''),
     unread: stringOrNull(o.unread),
+    withheld: o.withheld === true,
   };
 }
 

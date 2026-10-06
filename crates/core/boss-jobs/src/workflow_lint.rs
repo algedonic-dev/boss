@@ -1674,16 +1674,10 @@ mod tests {
         // cannot enforce" a shape declaration exists to replace.
         let reg = StepRegistry::v1();
         let field = |field_type: &str| boss_core::job::StepField {
-            name: "questions".into(),
-            field_type: field_type.into(),
             required: true,
             filled_by: boss_core::job::FilledBy::Filer,
             item_keys: vec!["anchor".into(), "title".into()],
-            covers: None,
-            binds: None,
-            item_value_max_bytes: None,
-            item_one_of: Vec::new(),
-            writer: None,
+            ..boss_core::job::StepField::new("questions", field_type)
         };
         let spec_with = |field_type: &str| {
             WorkflowSpec::platform_seed(
@@ -1738,16 +1732,8 @@ mod tests {
         let spec_with = |field_type: &str| {
             let mut spec = viable_spec("em");
             spec.steps[1].fields = vec![boss_core::job::StepField {
-                name: "receipt_verdict".into(),
-                field_type: field_type.into(),
                 required: true,
-                filled_by: boss_core::job::FilledBy::Executor,
-                item_keys: Vec::new(),
-                covers: None,
-                binds: None,
-                item_value_max_bytes: None,
-                item_one_of: Vec::new(),
-                writer: None,
+                ..boss_core::job::StepField::new("receipt_verdict", field_type)
             }];
             spec
         };
@@ -1776,16 +1762,9 @@ mod tests {
         let spec_with = |writer: &str| {
             let mut spec = viable_spec("carry");
             spec.steps[1].fields = vec![boss_core::job::StepField {
-                name: "plan".into(),
-                field_type: "string".into(),
                 required: true,
-                filled_by: boss_core::job::FilledBy::Executor,
-                item_keys: Vec::new(),
-                covers: None,
-                binds: None,
-                item_value_max_bytes: None,
-                item_one_of: Vec::new(),
                 writer: Some(writer.into()),
+                ..boss_core::job::StepField::new("plan", "string")
             }];
             spec
         };
@@ -1847,16 +1826,9 @@ mod tests {
     fn covers_must_name_another_array_field_on_the_same_step() {
         let reg = StepRegistry::v1();
         let mk = |name: &str, field_type: &str, covers: Option<&str>| boss_core::job::StepField {
-            name: name.into(),
-            field_type: field_type.into(),
             required: true,
-            filled_by: boss_core::job::FilledBy::Executor,
-            item_keys: Vec::new(),
             covers: covers.map(str::to_string),
-            binds: None,
-            item_value_max_bytes: None,
-            item_one_of: Vec::new(),
-            writer: None,
+            ..boss_core::job::StepField::new(name, field_type)
         };
         let spec_with = |fields: Vec<boss_core::job::StepField>| {
             WorkflowSpec::platform_seed(
@@ -2046,16 +2018,8 @@ mod tests {
                         kind: "task".into(),
                         ready_when: "steps.opened.done".into(),
                         fields: vec![boss_core::job::StepField {
-                            name: "route".into(),
-                            field_type: "ship|scrap".into(),
                             required: true,
-                            filled_by: boss_core::job::FilledBy::Executor,
-                            item_keys: Vec::new(),
-                            covers: None,
-                            binds: None,
-                            item_value_max_bytes: None,
-                            item_one_of: Vec::new(),
-                            writer: None,
+                            ..boss_core::job::StepField::new("route", "ship|scrap")
                         }],
                         metadata_defaults: serde_json::json!({ "route": default }),
                         terminal: Some(Terminal {
@@ -2207,16 +2171,8 @@ mod tests {
                     kind: "task".into(),
                     ready_when: "true".into(),
                     fields: vec![boss_core::job::StepField {
-                        name: "route".into(),
-                        field_type: "ship|scrap|investigate".into(),
                         required: true,
-                        filled_by: boss_core::job::FilledBy::Executor,
-                        item_keys: Vec::new(),
-                        covers: None,
-                        binds: None,
-                        item_value_max_bytes: None,
-                        item_one_of: Vec::new(),
-                        writer: None,
+                        ..boss_core::job::StepField::new("route", "ship|scrap|investigate")
                     }],
                     ..Default::default()
                 },
@@ -2225,16 +2181,8 @@ mod tests {
                     kind: "task".into(),
                     ready_when: "steps.decide.metadata.route = \"investigate\"".into(),
                     fields: vec![boss_core::job::StepField {
-                        name: "route".into(),
-                        field_type: "ship|scrap".into(),
                         required: true,
-                        filled_by: boss_core::job::FilledBy::Executor,
-                        item_keys: Vec::new(),
-                        covers: None,
-                        binds: None,
-                        item_value_max_bytes: None,
-                        item_one_of: Vec::new(),
-                        writer: None,
+                        ..boss_core::job::StepField::new("route", "ship|scrap")
                     }],
                     // Stamped at materialization, so the step carries the
                     // key from the moment it exists — which is why the
@@ -2301,16 +2249,8 @@ mod tests {
                     kind: "task".into(),
                     ready_when: "true".into(),
                     fields: vec![boss_core::job::StepField {
-                        name: "route".into(),
-                        field_type: "ship|scrap".into(),
                         required: true,
-                        filled_by: boss_core::job::FilledBy::Executor,
-                        item_keys: Vec::new(),
-                        covers: None,
-                        binds: None,
-                        item_value_max_bytes: None,
-                        item_one_of: Vec::new(),
-                        writer: None,
+                        ..boss_core::job::StepField::new("route", "ship|scrap")
                     }],
                     ..Default::default()
                 },
@@ -2318,18 +2258,7 @@ mod tests {
                     title: "watch".into(),
                     kind: "task".into(),
                     ready_when: "true".into(),
-                    fields: vec![boss_core::job::StepField {
-                        name: "flag".into(),
-                        field_type: "string".into(),
-                        required: false,
-                        filled_by: boss_core::job::FilledBy::Executor,
-                        item_keys: Vec::new(),
-                        covers: None,
-                        binds: None,
-                        item_value_max_bytes: None,
-                        item_one_of: Vec::new(),
-                        writer: None,
-                    }],
+                    fields: vec![boss_core::job::StepField::new("flag", "string")],
                     ..Default::default()
                 },
                 StepSpec {
@@ -2380,18 +2309,7 @@ mod tests {
                     title: "allocate".into(),
                     kind: "task".into(),
                     ready_when: "true".into(),
-                    fields: vec![boss_core::job::StepField {
-                        name: "outcome".into(),
-                        field_type: "package|skip".into(),
-                        required: false,
-                        filled_by: boss_core::job::FilledBy::Executor,
-                        item_keys: Vec::new(),
-                        covers: None,
-                        binds: None,
-                        item_value_max_bytes: None,
-                        item_one_of: Vec::new(),
-                        writer: None,
-                    }],
+                    fields: vec![boss_core::job::StepField::new("outcome", "package|skip")],
                     ..Default::default()
                 },
                 StepSpec {
@@ -2437,18 +2355,7 @@ mod tests {
                     title: "allocate".into(),
                     kind: "task".into(),
                     ready_when: "true".into(),
-                    fields: vec![boss_core::job::StepField {
-                        name: "outcome".into(),
-                        field_type: "package|skip".into(),
-                        required: false,
-                        filled_by: boss_core::job::FilledBy::Executor,
-                        item_keys: Vec::new(),
-                        covers: None,
-                        binds: None,
-                        item_value_max_bytes: None,
-                        item_one_of: Vec::new(),
-                        writer: None,
-                    }],
+                    fields: vec![boss_core::job::StepField::new("outcome", "package|skip")],
                     ..Default::default()
                 },
                 StepSpec {
@@ -2557,16 +2464,8 @@ mod tests {
 
     fn required(name: &str) -> boss_core::job::StepField {
         boss_core::job::StepField {
-            name: name.into(),
-            field_type: "string".into(),
             required: true,
-            filled_by: boss_core::job::FilledBy::Executor,
-            item_keys: Vec::new(),
-            covers: None,
-            binds: None,
-            item_value_max_bytes: None,
-            item_one_of: Vec::new(),
-            writer: None,
+            ..boss_core::job::StepField::new(name, "string")
         }
     }
 
@@ -2611,18 +2510,9 @@ mod tests {
     fn an_optional_field_on_the_predecessor_does_not_satisfy_it() {
         let reg = StepRegistry::v1();
         let mut spec = signoff_spec("optional");
-        spec.steps[1].fields.push(boss_core::job::StepField {
-            name: "sign_off_context".into(),
-            field_type: "string".into(),
-            required: false,
-            filled_by: boss_core::job::FilledBy::Executor,
-            item_keys: Vec::new(),
-            covers: None,
-            binds: None,
-            item_value_max_bytes: None,
-            item_one_of: Vec::new(),
-            writer: None,
-        });
+        spec.steps[1]
+            .fields
+            .push(boss_core::job::StepField::new("sign_off_context", "string"));
         assert!(
             validate_workflow(&spec, &reg)
                 .iter()

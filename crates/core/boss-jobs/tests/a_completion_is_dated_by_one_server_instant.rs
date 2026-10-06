@@ -147,20 +147,16 @@ async fn seed(steps: &[Step]) -> (Router, Arc<InMemoryJobs>) {
     );
     jobs.create_job(&Job {
         id: job_id(),
-        kind: "unregistered-chore".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "chore"),
-        title: "a chore".into(),
-        owner_id: "emp-david".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2031, 3, 1).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "unregistered-chore",
+            Subject::new("custom", "chore"),
+            "a chore",
+            "emp-david",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2031, 3, 1).unwrap(),
+        )
     })
     .await
     .unwrap();
@@ -311,11 +307,15 @@ async fn a_put_that_names_its_own_completion_date_is_refused() {
 
 /// A read-merge-write body sends back what it read — `completed_on:
 /// null` on an open step. That is not a date, and it still completes.
+/// The row goes back without its `metadata`: the step PUT refuses any
+/// metadata body since e39a9d2a, and a whole-row write-back is not a
+/// metadata write.
 #[tokio::test]
 async fn a_re_send_of_the_stored_completion_date_is_not_a_date() {
     let (app, jobs) = seed(&[open_step(OPEN, 0), open_step(LATER, 1)]).await;
     let read = serde_json::to_value(stored(&jobs, OPEN).await).unwrap();
     let mut body = read.as_object().unwrap().clone();
+    body.remove("metadata");
     body.insert("status".into(), serde_json::json!("completed"));
     let (status, resp) = put(&app, OPEN, serde_json::Value::Object(body)).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{resp}");

@@ -64,6 +64,7 @@
   import DispatcherRuleEditPage from './dispatcher/DispatcherRuleEditPage.svelte';
   import SubjectsClassesPage from './it/subjects/SubjectsClassesPage.svelte';
   import MapPage from './it/yard/MapPage.svelte';
+  import CompanyMap from './it/yard/CompanyMap.svelte';
   import EstatePage from './it/estate/EstatePage.svelte';
   import FleetPage from './it/monitoring/FleetPage.svelte';
   import ItTabs from './it/ItTabs.svelte';
@@ -431,13 +432,15 @@
     {:else if route.kind === 'systemDesign'}
       <ItTabs group="design" active="/it/design" />
       <DesignReviewPage />
+    {:else if route.kind === 'companyMap'}
+      <CompanyMap />
     {:else if route.kind === 'systemYard'}
       <!-- THE DEPARTMENT MAP (design e765b3fc): the map on top and the
            selection's panel below it. A selection is a query on this one
            route, so the map is mounted once and never torn down by a
            click — the floor pages that were a second route here retired
            with car N3, their content in the panels. -->
-      <MapPage at={route.at} />
+      <MapPage at={route.at} overview={route.overview === true} detail={route.detail === true} />
     {:else if route.kind === 'systemEstate'}
       <EstatePage />
     {:else if route.kind === 'systemFleet'}

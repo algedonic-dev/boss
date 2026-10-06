@@ -1,0 +1,15 @@
+{
+  "about": "MUTATING — turns GitHub Actions OFF on ONE repository, and nothing else (infra/forge/github-act.sh disable-actions; backlog e727fcfd, 2026-09-29). Every push of forge main to the private DR copy algedonic-dev/boss-dr would otherwise run the pushed tree's own workflows (ci.yml's full gate, codeql, scorecard) on paid GitHub-hosted minutes, and let a holder of the push token run code on a hosted runner; the repositories BOSS keeps on GitHub are copies whose workflows are the forge's. The setting on boss-dr was first made by hand in its Settings and never read back; this verb declares it, and github-create-repository now makes it on every repository it creates. In the shape of design 76155676 decision 4 (David 2026-09-27: GitHub acts are bounded verbs, plan then passkey-approved write, each proving by reading GitHub back). AUTHORISED PER RUN BY DAVID'S PASSKEY in design 17835005's shape: it declares requires_approval with plan-a-github-actions-disable as its plan_verb, so the runner renders the plan onto the request's approve step, runs this only after a passkey on the approvers list signs those bytes, and hands the script sha256 of the SIGNED plan; the script re-renders from GitHub and acts only while the bytes hash alike. Its bound is the script's: ONE call, PUT /repos/<owner>/<repo>/actions/permissions with {\"enabled\":false} — never an enable, a workflow run or any other setting; an archived, moved, forked or invisible repository is refused, and one whose Actions already read disabled is a plan with no act. It authenticates as the GitHub App's INSTALLATION on <owner>, the token the credential broker mints for this request (administration:write) and the verb renders into /etc/boss-publish/github-app/<owner>.token, revoking it after the write; the token is never printed. Proof: GET /repos/<owner>/<repo>/actions/permissions reads back enabled false — one that does not is exit 1. Any other 4xx or 5xx is exit 1 naming GitHub's words.",
+  "hosts": ["forge"],
+  "requires_approval": true,
+  "plan_verb": "plan-a-github-actions-disable",
+  "approvers": ["emp-david"],
+  "argv": ["infra/forge/github-act.sh", "disable-actions", "{1}", "{2}", "{3}"],
+  "params": [
+    { "name": "owner", "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{0,38}$" },
+    { "name": "repo", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$" },
+    { "name": "plan_sha256", "pattern": "^[0-9a-f]{64}$" }
+  ],
+  "timeout": 120,
+  "effect": "^github-act: proven — Actions on .+ reads back as enabled false"
+}

@@ -48,6 +48,21 @@ fn at_step(v: &Value) -> String {
         .to_string()
 }
 
+/// Whether an open train belongs IN TRANSIT: the map's own predicate,
+/// `boss_jobs::yard::in_transit` — merged, on the track — asked of the
+/// train's steps as the API returned them. ONE definition with the map's
+/// track region (backlog 3eddffc4: on 2026-10-01 this list named a train
+/// at its CI verdict IN TRANSIT while the track, which holds it at the
+/// gates by car R1, read "no train in transit"). Steps that will not read
+/// as steps keep the train listed: a train hidden for a parse is the
+/// silence this list exists to end.
+fn in_transit(t: &Value) -> bool {
+    t.get("steps")
+        .cloned()
+        .and_then(|s| serde_json::from_value::<Vec<boss_core::job::Step>>(s).ok())
+        .is_none_or(|steps| boss_jobs::yard::in_transit(&steps))
+}
+
 /// One IN TRANSIT line: the train, and the step it stands at with that
 /// step's status beside the title. `at_step` alone printed
 /// `at: In transit — cluster converged` for a READY step and was read as
@@ -2063,9 +2078,22 @@ pub async fn run(all: bool) -> Result<()> {
         )
         .await?,
     )?;
-    println!("\n  IN TRANSIT — {} train(s)", trains.len());
-    for t in &trains {
+    let (moving, before): (Vec<&Value>, Vec<&Value>) = trains.iter().partition(|t| in_transit(t));
+    println!("\n  IN TRANSIT — {} train(s)", moving.len());
+    for t in moving {
         println!("{}", in_transit_line(t));
+    }
+    // A train not yet merged is made up at the dock or under test at the
+    // gates (car R1): named here, beside the lane, never dropped — its
+    // gate, when one runs, is the GATING lane's train under test below.
+    if !before.is_empty() {
+        println!(
+            "  BEFORE THE TRACK — {} train(s), made up at the dock or under test at the gates",
+            before.len()
+        );
+        for t in before {
+            println!("{}", in_transit_line(t));
+        }
     }
 
     // Gates running now.
@@ -2714,6 +2742,46 @@ mod tests {
         assert_eq!(super::in_transit_line(&nowhere), "    PR train x  at: —");
     }
 
+    /// IN TRANSIT and the map's track ask ONE question of a train —
+    /// `boss_jobs::yard::in_transit`, merged (backlog 3eddffc4: on
+    /// 2026-10-01 this list named PR train 02:41 at its CI verdict while
+    /// the track, holding it at the gates, read "no train in transit"). A
+    /// train at CI or being made up is not in transit; a merged one is;
+    /// steps that do not read keep it listed.
+    #[test]
+    fn in_transit_is_the_maps_predicate_a_merged_train() {
+        use serde_json::json;
+        let at_ci = json!({
+            "title": "PR train 2026-10-01 02:41",
+            "steps": [
+                {"spec_slug": "collect", "title": "Collect", "status": "completed"},
+                {"spec_slug": "pr", "title": "Open the batched PR", "status": "completed"},
+                {"spec_slug": "ci", "title": "Yard inspection — CI verdict", "status": "ready"},
+                {"spec_slug": "merged", "title": "Merged into main", "status": "pending"},
+            ],
+        });
+        assert!(!super::in_transit(&at_ci), "under test at the gates");
+        let merged = json!({
+            "title": "PR train merged",
+            "steps": [
+                {"spec_slug": "pr", "title": "Open the batched PR", "status": "completed"},
+                {"spec_slug": "ci", "title": "Yard inspection — CI verdict", "status": "completed"},
+                {"spec_slug": "merged", "title": "Merged into main", "status": "completed"},
+                {"spec_slug": "deployed", "title": "Deployed", "status": "ready"},
+            ],
+        });
+        assert!(super::in_transit(&merged));
+        let made_up = json!({
+            "title": "PR train being made up",
+            "steps": [
+                {"spec_slug": "collect", "title": "Collect", "status": "active"},
+                {"spec_slug": "pr", "title": "Open the batched PR", "status": "pending"},
+            ],
+        });
+        assert!(!super::in_transit(&made_up));
+        assert!(super::in_transit(&json!({"title": "no steps read"})));
+    }
+
     /// Train f7bd1e9d, 2026-09-24 17:20Z: CI red on a named `CI / web`,
     /// `merged` READY, main unmoved — and this line still read "DEPARTED
     /// — merged into main (ready, not yet done)" (a2d4d842). At the merge
@@ -2966,9 +3034,13 @@ mod tests {
     }
 
     /// A publish packet's open-pr step records the mirror PR's head as
-    /// `<fork owner>:<branch>` beside the pr_url; the forge holds the
-    /// branch under its bare name. A skipped open-pr (declined,
-    /// superseded, held) names no head and claims nothing.
+    /// `<owner>:<branch>` beside the pr_url; the forge holds the branch
+    /// under its bare name. The owner was a personal fork's until backlog
+    /// d2b7c947 and is the organisation's since, and closed packets keep
+    /// the head they recorded — this one is #239's, as recorded — so the
+    /// claim reads the branch after the colon, whoever the owner. A
+    /// skipped open-pr (declined, superseded, held) names no head and
+    /// claims nothing.
     #[test]
     fn a_publish_packet_claims_the_branch_after_the_colon() {
         use serde_json::json;

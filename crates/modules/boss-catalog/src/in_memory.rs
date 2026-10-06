@@ -1,23 +1,123 @@
 //! In-memory adapter for `KbRepository`.
 //!
-//! Useful for tests and as a seed-data fallback.
+//! Useful for tests and as a seed-data fallback. It answers what
+//! `PgKb` answers — the adapters-agree suite
+//! (`tests/the_adapters_agree_on_the_equipment_kb_pg.rs`, backlog
+//! be459ab9) holds the two to one statement of the port.
 
+use std::collections::BTreeMap;
 use std::sync::RwLock;
 
 use async_trait::async_trait;
 
 use crate::port::{KbError, KbRepository};
-use crate::types::AssetModel;
+use crate::types::{AssetModel, PartCatalogRow};
+use crate::validate::{refuse_moved_sku, refuse_unstorable};
+
+/// The double's tables: each model as written, and the ONE parts row
+/// every model naming a part shares.
+///
+/// WHY a parts map (backlog be459ab9, found by the adapters-agree
+/// suite, 2026-10-01): Postgres keeps a part in the shared `parts`
+/// table, so the last model to write a part SKU names it for every
+/// model, and the row outlives a deleted model — the port's `all_parts`
+/// is "independent of any linkage". The double kept a private copy per
+/// model and derived `all_parts` from the live models, so a part
+/// vanished with its model and two models disagreed on its name.
+#[derive(Default)]
+struct Tables {
+    /// Keyed by SKU, so the list is in byte order of SKU as Postgres's
+    /// `ORDER BY sku COLLATE "C"`.
+    models: BTreeMap<String, AssetModel>,
+    parts: BTreeMap<String, PartCatalogRow>,
+}
+
+impl Tables {
+    /// Write a model's parts the way `postgres::insert_satellites`
+    /// does: a spare part writes every field; a consumable writes its
+    /// name, description, price and currency, takes a lead time of 7
+    /// days when it is the first to write the part, and leaves the
+    /// lead time alone otherwise.
+    fn write_parts(&mut self, m: &AssetModel) {
+        for p in &m.spare_parts {
+            self.parts.insert(
+                p.part_sku.clone(),
+                PartCatalogRow {
+                    part_sku: p.part_sku.clone(),
+                    name: p.name.clone(),
+                    description: p.description.clone(),
+                    unit_price_cents: p.unit_price_cents,
+                    currency: p.currency.clone(),
+                    lead_time_days: p.lead_time_days,
+                },
+            );
+        }
+        for c in &m.consumables {
+            let lead_time_days = self.parts.get(&c.part_sku).map_or(7, |p| p.lead_time_days);
+            self.parts.insert(
+                c.part_sku.clone(),
+                PartCatalogRow {
+                    part_sku: c.part_sku.clone(),
+                    name: c.name.clone(),
+                    description: c.description.clone(),
+                    unit_price_cents: c.unit_price_cents,
+                    currency: c.currency.clone(),
+                    lead_time_days,
+                },
+            );
+        }
+    }
+
+    /// A model as `PgKb::assemble` answers it: use cases, failure modes,
+    /// spare parts and consumables in byte order, each part read from
+    /// its shared row; the checklist and documents in the order sent.
+    fn read(&self, m: &AssetModel) -> AssetModel {
+        let mut out = m.clone();
+        out.commerce.use_cases.sort();
+        out.service
+            .common_failure_modes
+            .sort_by(|a, b| a.code.cmp(&b.code));
+        for p in &mut out.spare_parts {
+            if let Some(row) = self.parts.get(&p.part_sku) {
+                p.name = row.name.clone();
+                p.description = row.description.clone();
+                p.unit_price_cents = row.unit_price_cents;
+                p.currency = row.currency.clone();
+                p.lead_time_days = row.lead_time_days;
+            }
+        }
+        out.spare_parts.sort_by(|a, b| a.part_sku.cmp(&b.part_sku));
+        for c in &mut out.consumables {
+            if let Some(row) = self.parts.get(&c.part_sku) {
+                c.name = row.name.clone();
+                c.description = row.description.clone();
+                c.unit_price_cents = row.unit_price_cents;
+                c.currency = row.currency.clone();
+            }
+        }
+        out.consumables.sort_by(|a, b| a.part_sku.cmp(&b.part_sku));
+        out
+    }
+}
 
 pub struct InMemoryKb {
-    models: RwLock<Vec<AssetModel>>,
+    tables: RwLock<Tables>,
     recorded: std::sync::Mutex<Vec<boss_core::event::Event>>,
+}
+
+fn poisoned<T>(_: T) -> KbError {
+    KbError::Storage("in-memory kb lock poisoned".into())
 }
 
 impl InMemoryKb {
     pub fn new(models: Vec<AssetModel>) -> Self {
+        let mut tables = Tables::default();
+        for m in models {
+            tables.write_parts(&m);
+            tables.models.insert(m.sku.clone(), m);
+        }
         Self {
-            models: RwLock::new(models),
+            tables: RwLock::new(tables),
             recorded: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -38,17 +138,13 @@ impl InMemoryKb {
 #[async_trait]
 impl KbRepository for InMemoryKb {
     async fn all_models(&self) -> Result<Vec<AssetModel>, KbError> {
-        Ok(self.models.read().unwrap().clone())
+        let t = self.tables.read().map_err(poisoned)?;
+        Ok(t.models.values().map(|m| t.read(m)).collect())
     }
 
     async fn model_by_sku(&self, sku: &str) -> Result<Option<AssetModel>, KbError> {
-        Ok(self
-            .models
-            .read()
-            .unwrap()
-            .iter()
-            .find(|m| m.sku == sku)
-            .cloned())
+        let t = self.tables.read().map_err(poisoned)?;
+        Ok(t.models.get(sku).map(|m| t.read(m)))
     }
 
     async fn create_model_at(
@@ -57,15 +153,17 @@ impl KbRepository for InMemoryKb {
         _now: chrono::DateTime<chrono::Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<String, KbError> {
+        refuse_unstorable(model)?;
         {
-            let mut models = self.models.write().unwrap();
-            if models.iter().any(|m| m.sku == model.sku) {
+            let mut t = self.tables.write().map_err(poisoned)?;
+            if t.models.contains_key(&model.sku) {
                 return Err(KbError::Conflict(format!(
                     "SKU {} already exists",
                     model.sku
                 )));
             }
-            models.push(model.clone());
+            t.write_parts(model);
+            t.models.insert(model.sku.clone(), model.clone());
         }
         self.record(stamp.event(
             crate::events::MODEL_CREATED,
@@ -81,13 +179,15 @@ impl KbRepository for InMemoryKb {
         _now: chrono::DateTime<chrono::Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), KbError> {
+        refuse_moved_sku(sku, model)?;
+        refuse_unstorable(model)?;
         {
-            let mut models = self.models.write().unwrap();
-            let pos = models
-                .iter()
-                .position(|m| m.sku == sku)
-                .ok_or_else(|| KbError::NotFound(sku.to_string()))?;
-            models[pos] = model.clone();
+            let mut t = self.tables.write().map_err(poisoned)?;
+            if !t.models.contains_key(sku) {
+                return Err(KbError::NotFound(sku.to_string()));
+            }
+            t.write_parts(model);
+            t.models.insert(sku.to_string(), model.clone());
         }
         self.record(stamp.event(
             crate::events::MODEL_UPDATED,
@@ -103,12 +203,12 @@ impl KbRepository for InMemoryKb {
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), KbError> {
         {
-            let mut models = self.models.write().unwrap();
-            let pos = models
-                .iter()
-                .position(|m| m.sku == sku)
-                .ok_or_else(|| KbError::NotFound(sku.to_string()))?;
-            models.remove(pos);
+            let mut t = self.tables.write().map_err(poisoned)?;
+            // The model's satellites go with it; its parts rows stay,
+            // as they do in Postgres.
+            if t.models.remove(sku).is_none() {
+                return Err(KbError::NotFound(sku.to_string()));
+            }
         }
         self.record(stamp.event(
             crate::events::MODEL_DELETED,
@@ -122,45 +222,18 @@ impl KbRepository for InMemoryKb {
         _entity_kind: &str,
         _entity_id: &str,
     ) -> Result<Vec<crate::types::EntityDocument>, KbError> {
-        // In-memory adapter has no `documents` table; tests that
-        // exercise document surfacing drive the postgres adapter.
+        // In-memory adapter has no `documents` table (no port method
+        // writes one); tests that exercise document surfacing drive the
+        // postgres adapter.
         Ok(Vec::new())
     }
 
-    async fn all_parts(&self) -> Result<Vec<crate::types::PartCatalogRow>, KbError> {
-        // The in-memory adapter doesn't carry a separate parts
-        // store — derive from the spare_parts/consumables of
-        // every registered model. Tests that need richer parts
-        // coverage can wrap this with a custom adapter.
-        use crate::types::PartCatalogRow;
-        use std::collections::HashMap;
-        let models = self.models.read().unwrap();
-        let mut by_sku: HashMap<String, PartCatalogRow> = HashMap::new();
-        for m in models.iter() {
-            for p in &m.spare_parts {
-                by_sku.entry(p.part_sku.clone()).or_insert(PartCatalogRow {
-                    part_sku: p.part_sku.clone(),
-                    name: p.name.clone(),
-                    description: p.description.clone(),
-                    unit_price_cents: p.unit_price_cents,
-                    currency: p.currency.clone(),
-                    lead_time_days: p.lead_time_days,
-                });
-            }
-            for c in &m.consumables {
-                by_sku.entry(c.part_sku.clone()).or_insert(PartCatalogRow {
-                    part_sku: c.part_sku.clone(),
-                    name: c.name.clone(),
-                    description: c.description.clone(),
-                    unit_price_cents: c.unit_price_cents,
-                    currency: c.currency.clone(),
-                    lead_time_days: 7,
-                });
-            }
-        }
-        let mut out: Vec<PartCatalogRow> = by_sku.into_values().collect();
-        out.sort_by(|a, b| a.part_sku.cmp(&b.part_sku));
-        Ok(out)
+    async fn all_parts(&self) -> Result<Vec<PartCatalogRow>, KbError> {
+        // Every parts row, in byte order of part SKU. The double holds
+        // no `inventory_items` table, so it has none of the stock-only
+        // stub rows Postgres unions in from boss-inventory.
+        let t = self.tables.read().map_err(poisoned)?;
+        Ok(t.parts.values().cloned().collect())
     }
 }
 
@@ -291,5 +364,15 @@ mod tests {
         let catalog = InMemoryKb::new(vec![]);
         let result = catalog.delete_model("NOPE").await;
         assert!(result.is_err());
+    }
+
+    // Backlog e9ff7ccb: the refusals past each column's width ride the
+    // adapters-agree suite; this pins the ceiling itself as storable.
+    #[tokio::test]
+    async fn create_accepts_the_smallint_ceiling() {
+        let catalog = InMemoryKb::new(vec![]);
+        let mut model = test_model("SKU-EDGE");
+        model.commerce.lead_time_days = Some(32_767);
+        catalog.create_model(&model).await.unwrap();
     }
 }

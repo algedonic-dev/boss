@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use boss_classes::classes_config::ClassesApiConfig;
-use boss_classes::http::{ClassesApiState, router};
+use boss_classes::http::ClassesApiState;
 use boss_classes::port::ClassRepository;
 use clap::Parser;
 use tokio::net::TcpListener;
@@ -40,14 +40,12 @@ async fn main() -> Result<()> {
 
     info!(http_bind = %cfg.http_bind, "boss-classes-api starting");
 
-    let classes: Arc<dyn ClassRepository> = {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(10)
-            .connect(&cfg.postgres_url)
-            .await
-            .with_context(|| "connecting to Postgres")?;
-        Arc::new(boss_classes::PgClasses::new(pool))
-    };
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&cfg.postgres_url)
+        .await
+        .with_context(|| "connecting to Postgres")?;
+    let classes: Arc<dyn ClassRepository> = Arc::new(boss_classes::PgClasses::new(pool.clone()));
 
     // The three write doors ask policy (backlog 553cf479), wired the way
     // boss-subject-kinds-api wires its door: the sim bypass is installed
@@ -61,8 +59,19 @@ async fn main() -> Result<()> {
             ),
         ));
 
-    let state = ClassesApiState { classes, policy };
-    let app = router(state);
+    // Approved abf9eeae precursor: the classes mount reports a role-only
+    // hypothetical policy answer. Registry readers ask the unchanged
+    // policy service, so this dependency graph is acyclic. No role grant,
+    // canonical identity substitution or enforcement happens here.
+    let roles = Arc::new(boss_policy_client::role_reader::HttpRoleReader::new(
+        std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
+        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
+        boss_policy_client::User::service("classes"),
+    )?);
+    let mode = Arc::new(boss_policy_client::role_reader::MountedReportMode::mount());
+    let tally = Arc::new(boss_policy_client::role_reporting::ReportTally::new(512));
+    let app =
+        boss_classes::role_reports::mount(ClassesApiState { classes, policy }, roles, mode, tally);
     // Sim-origin middleware: extract x-sim-origin header and set the
     // per-request task-local so the publisher inherits the sim
     // marker. Closes the gap where a sim chain could trigger a
@@ -80,7 +89,12 @@ async fn main() -> Result<()> {
         .with_context(|| format!("binding HTTP listener on {http_addr}"))?;
     info!(addr = %http_addr, "classes HTTP API listening");
 
-    let app = boss_core::machine_gate::mount(app, "classes", &["/api/classes/health"]);
+    let app = boss_core::machine_gate::mount(
+        app,
+        "classes",
+        &["/api/classes/health"],
+        Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }

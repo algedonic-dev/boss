@@ -1,0 +1,22 @@
+[
+  {
+    "id": "agent-codex",
+    "display_name": "Codex (engineering)",
+    "default_model": "gpt-6.1-sol",
+    "aliases": ["codex@algedonic.dev"],
+    "role": null,
+    "department": "it",
+    "hourly_budget_usd_micros": 10000000,
+    "max_concurrent_runs": 2
+  },
+  {
+    "id": "agent-gemini",
+    "display_name": "Gemini (engineering)",
+    "default_model": "gemini-2.5-pro",
+    "aliases": ["gemini@algedonic.dev"],
+    "role": null,
+    "department": "it",
+    "hourly_budget_usd_micros": 10000000,
+    "max_concurrent_runs": 2
+  }
+]

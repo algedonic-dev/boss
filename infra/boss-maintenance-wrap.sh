@@ -286,7 +286,7 @@ SECRET_LIB="$(dirname "$0")/lib/secret-header.sh"
     || run_unrecorded "$SECRET_LIB is missing, so the machine token could only have been sent in curl's command line and nothing was sent"
 # shellcheck source=infra/lib/secret-header.sh
 . "$SECRET_LIB"
-secret_header MT_HDR ${BOSS_MACHINE_TOKEN:+"x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+machine_token_header MT_HDR "$BOSS_JOBS_URL" \
     || run_unrecorded "the machine token's header file could not be written, so nothing was sent"
 
 reply=""; rc=0

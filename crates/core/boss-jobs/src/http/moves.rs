@@ -68,9 +68,9 @@ async fn refused<R: JobsRepository + 'static, B: EventBus + 'static>(
     state: &JobsApiState<R, B>,
     user: &boss_policy_client::User,
 ) -> Option<Response> {
-    match state.policy.scope_predicate(user, Resource::job()).await {
+    match state.policy.scope_of(user, controls::READ_JOB).await {
         Err(e) => Some(e.into_response()),
-        Ok(p) => match job_scope_from_predicate(user, &p) {
+        Ok(p) => match JobScope::from_predicate(user, &p) {
             JobScope::All => None,
             JobScope::None => Some(
                 (
@@ -421,6 +421,9 @@ pub async fn run_mover<R: JobsRepository + 'static, B: EventBus + 'static>(
             &state,
             &actor,
             JobScope::All,
+            // The service itself, over the whole yard: the estate's hosts
+            // are part of the placement every region is pinned to.
+            super::regions::EstateRead::Granted,
             now,
             crate::regions::DEFAULT_WINDOW_HOURS,
         )

@@ -50,3 +50,7 @@ workspace = true
 [[test]]
 name = "campaigns_pg"
 required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_campaign_store_pg"
+required-features = ["postgres"]

@@ -1,0 +1,17 @@
+{
+  "about": "READ-ONLY: what would hold a drain of one cluster node, read before anyone drains it (infra/forge/node-status.sh <node>; backlog 9fa9f835, review bc33ff50 M1, design 8457c07b §1.5). Through the forge's ops_kubectl door, kubectl get only: the node's estate role and address, the Node's InternalIP, its cordon (spec.unschedulable) and every condition; Longhorn's LIVE node-drain-policy setting (a setting that does not exist says NOT FOUND, never the default); the Longhorn volumes whose only healthy replica is on the node (Longhorn's own test: spec.healthyAt set, spec.failedAt empty), with each volume's state and claim; and the PodDisruptionBudgets whose status allows 0 disruptions that select a pod the drain would evict — the same reading plan-a-node-shutdown signs. The node must be one the estate registry declares, not retired, with a talos-* role (a control plane may be read). Nothing is written. A section that could not be read prints CANNOT ANSWER and the run exits 1: no evidence is not a pass. Timeout 300: the registry read (15 s), six kubectl reads bounded at 20-30 s each (160 s together at worst) and, the first time, the door image's pull bounded at 120 s.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/node-status.sh",
+    "{1}"
+  ],
+  "params": [
+    {
+      "name": "node",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    }
+  ],
+  "timeout": 300
+}

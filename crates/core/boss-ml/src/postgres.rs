@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
 use sqlx::{PgPool, Row, postgres::PgRow};
 
-use crate::port::{MlError, MlRepository};
+use crate::port::{MlError, MlRepository, checked_limit, name_version_taken};
 use crate::types::{
     CreatePredictionInput, MlModel, MlModelSummary, MlPrediction, ModelKind, ModelStatus,
 };
@@ -91,22 +91,53 @@ const SUMMARY_SELECT: &str = "SELECT m.id, m.name, m.kind, m.version, m.status, 
      ) AS latest_prediction_at \
      FROM ml_models m";
 
+const MODEL_ORDER: &str = "ORDER BY m.name COLLATE \"C\", m.id COLLATE \"C\"";
+
+/// SQLSTATE unique_violation.
+const UNIQUE_VIOLATION: &str = "23505";
+
+impl PgMlRepo {
+    /// The id holding `(name, version)`, other than `id` itself.
+    async fn name_version_holder(
+        &self,
+        name: &str,
+        version: &str,
+        id: &str,
+    ) -> Result<Option<String>, MlError> {
+        sqlx::query_scalar(
+            "SELECT id FROM ml_models WHERE name = $1 AND version = $2 AND id <> $3 LIMIT 1",
+        )
+        .bind(name)
+        .bind(version)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage)
+    }
+}
+
 #[async_trait]
 impl MlRepository for PgMlRepo {
     async fn all_model_summaries(
         &self,
         status: Option<ModelStatus>,
     ) -> Result<Vec<MlModelSummary>, MlError> {
+        // Byte order by name, then id. `ORDER BY m.name` alone sorted
+        // in the database's locale (`suite-ab` before `suite-a-z`, case
+        // folded) while the in-memory adapter sorted by byte, and left
+        // two versions of one model in plan order (backlog be459ab9,
+        // found by the adapters-agree suite; the collation class is
+        // 2987fb2d's).
         let rows = match status {
             Some(s) => {
-                let sql = format!("{SUMMARY_SELECT} WHERE m.status = $1 ORDER BY m.name");
+                let sql = format!("{SUMMARY_SELECT} WHERE m.status = $1 {MODEL_ORDER}");
                 sqlx::query(&sql)
                     .bind(s.as_str())
                     .fetch_all(&self.pool)
                     .await
             }
             None => {
-                let sql = format!("{SUMMARY_SELECT} ORDER BY m.name");
+                let sql = format!("{SUMMARY_SELECT} {MODEL_ORDER}");
                 sqlx::query(&sql).fetch_all(&self.pool).await
             }
         }
@@ -131,7 +162,19 @@ impl MlRepository for PgMlRepo {
             .map(serde_json::to_value)
             .transpose()
             .map_err(|e| MlError::Storage(format!("inference_spec serialize: {e}")))?;
-        sqlx::query(
+        // UNIQUE (name, version) answered a second id with the raw
+        // constraint text as a Storage failure — a 500 naming a
+        // constraint — while the in-memory adapter wrote it (backlog
+        // be459ab9, found by the adapters-agree suite). Refuse by name
+        // first; a racing writer that slips past the read still lands
+        // on the constraint, and is answered the same way.
+        if let Some(holder) = self
+            .name_version_holder(&model.name, &model.version, &model.id)
+            .await?
+        {
+            return Err(name_version_taken(&model.name, &model.version, &holder));
+        }
+        let written = sqlx::query(
             "INSERT INTO ml_models (
                 id, name, kind, version, status, accuracy, accuracy_metric,
                 training_data_ref, description, inference_spec,
@@ -162,9 +205,20 @@ impl MlRepository for PgMlRepo {
         .bind(model.created_at)
         .bind(model.updated_at)
         .execute(&self.pool)
-        .await
-        .map_err(storage)?;
-        Ok(())
+        .await;
+        match written {
+            Ok(_) => Ok(()),
+            Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some(UNIQUE_VIOLATION) => {
+                match self
+                    .name_version_holder(&model.name, &model.version, &model.id)
+                    .await?
+                {
+                    Some(holder) => Err(name_version_taken(&model.name, &model.version, &holder)),
+                    None => Err(storage(db)),
+                }
+            }
+            Err(e) => Err(storage(e)),
+        }
     }
 
     async fn create_prediction(
@@ -213,14 +267,19 @@ impl MlRepository for PgMlRepo {
         entity_id: &str,
         limit: i64,
     ) -> Result<Vec<MlPrediction>, MlError> {
+        // Both lists stopped at created_at, so a same-microsecond pair
+        // came back in plan order here and insertion order in the
+        // double; and LIMIT -1 answered Postgres's own text as a
+        // Storage failure while the double answered every row (backlog
+        // be459ab9, found by the adapters-agree suite).
         let rows = sqlx::query(
             "SELECT * FROM ml_predictions
              WHERE entity_type = $1 AND entity_id = $2
-             ORDER BY created_at DESC LIMIT $3",
+             ORDER BY created_at DESC, id COLLATE \"C\" LIMIT $3",
         )
         .bind(entity_type)
         .bind(entity_id)
-        .bind(limit)
+        .bind(checked_limit(limit)?)
         .fetch_all(&self.pool)
         .await
         .map_err(storage)?;
@@ -235,10 +294,10 @@ impl MlRepository for PgMlRepo {
         let rows = sqlx::query(
             "SELECT * FROM ml_predictions
              WHERE model_id = $1
-             ORDER BY created_at DESC LIMIT $2",
+             ORDER BY created_at DESC, id COLLATE \"C\" LIMIT $2",
         )
         .bind(model_id)
-        .bind(limit)
+        .bind(checked_limit(limit)?)
         .fetch_all(&self.pool)
         .await
         .map_err(storage)?;

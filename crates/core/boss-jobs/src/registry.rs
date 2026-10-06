@@ -401,16 +401,8 @@ fn workflow_design_spec() -> WorkflowSpec {
             // human had already opened an empty screen. Phase 4 of the
             // viability lint refuses the alternative.
             fields: vec![boss_core::job::StepField {
-                name: "sign_off_context".into(),
-                field_type: "string".into(),
                 required: true,
-                filled_by: boss_core::job::FilledBy::Executor,
-                item_keys: Vec::new(),
-                covers: None,
-                binds: None,
-                item_value_max_bytes: None,
-                item_one_of: Vec::new(),
-                writer: None,
+                ..boss_core::job::StepField::new("sign_off_context", "string")
             }],
             ..Default::default()
         },
@@ -450,16 +442,11 @@ fn workflow_design_spec() -> WorkflowSpec {
             // left behind would have regressed the live v3 back to
             // field-less on the next boot.
             fields: vec![boss_core::job::StepField {
-                name: "decision".into(),
-                field_type: "pending|approved|rejected|changes-requested".into(),
                 required: true,
-                filled_by: boss_core::job::FilledBy::Executor,
-                item_keys: Vec::new(),
-                covers: None,
-                binds: None,
-                item_value_max_bytes: None,
-                item_one_of: Vec::new(),
-                writer: None,
+                ..boss_core::job::StepField::new(
+                    "decision",
+                    "pending|approved|rejected|changes-requested",
+                )
             }],
             ..Default::default()
         },
@@ -483,16 +470,8 @@ fn workflow_design_spec() -> WorkflowSpec {
             // (tests/a_step_declares_what_its_kind_requires.rs). Rides
             // through BOTH copies for the reason the `approve` note gives.
             fields: vec![boss_core::job::StepField {
-                name: "workflow_spec".into(),
-                field_type: "object".into(),
                 required: true,
-                filled_by: boss_core::job::FilledBy::Executor,
-                item_keys: Vec::new(),
-                covers: None,
-                binds: None,
-                item_value_max_bytes: None,
-                item_one_of: Vec::new(),
-                writer: None,
+                ..boss_core::job::StepField::new("workflow_spec", "object")
             }],
             ..Default::default()
         },
@@ -527,7 +506,7 @@ fn workflow_design_spec() -> WorkflowSpec {
     // step's authority (`workflow-approver`) is a policy CAPABILITY,
     // not an employees.role value, so the step-authority fallback
     // can't resolve it — name the operator-baseline role explicitly.
-    spec.metadata = serde_json::json!({ "owner_role": "platform-admin" });
+    spec.metadata = serde_json::json!({ "department": "it", "owner_role": "platform-admin" });
     spec.description = Some(
         "Meta-kind: every Workflow in the registry is authored by a Job of this kind. \
          The terminal `workflow-publish` step writes the spec into the registry and \
@@ -601,16 +580,8 @@ fn regenerate_deployment_spec() -> WorkflowSpec {
                 None
             },
             fields: vec![boss_core::job::StepField {
-                name: field.into(),
-                field_type: "string".into(),
                 required: true,
-                filled_by: boss_core::job::FilledBy::Executor,
-                item_keys: Vec::new(),
-                covers: None,
-                binds: None,
-                item_value_max_bytes: None,
-                item_one_of: Vec::new(),
-                writer: None,
+                ..boss_core::job::StepField::new(field, "string")
             }],
             ..Default::default()
         }
@@ -638,28 +609,12 @@ fn regenerate_deployment_spec() -> WorkflowSpec {
             authority_role: Some("platform-admin".into()),
             fields: vec![
                 boss_core::job::StepField {
-                    name: "reason".into(),
-                    field_type: "string".into(),
                     required: true,
-                    filled_by: boss_core::job::FilledBy::Executor,
-                    item_keys: Vec::new(),
-                    covers: None,
-                    binds: None,
-                    item_value_max_bytes: None,
-                    item_one_of: Vec::new(),
-                    writer: None,
+                    ..boss_core::job::StepField::new("reason", "string")
                 },
                 boss_core::job::StepField {
-                    name: "destroying".into(),
-                    field_type: "string".into(),
                     required: true,
-                    filled_by: boss_core::job::FilledBy::Executor,
-                    item_keys: Vec::new(),
-                    covers: None,
-                    binds: None,
-                    item_value_max_bytes: None,
-                    item_one_of: Vec::new(),
-                    writer: None,
+                    ..boss_core::job::StepField::new("destroying", "string")
                 },
             ],
             ..Default::default()
@@ -740,7 +695,7 @@ fn regenerate_deployment_spec() -> WorkflowSpec {
         vec!["custom".into()],
         steps,
     );
-    spec.metadata = serde_json::json!({ "owner_role": "platform-admin" });
+    spec.metadata = serde_json::json!({ "department": "it", "owner_role": "platform-admin" });
     spec.description = Some(
         "Drop a deployment's database and rebuild it: schema, seed, backfilled history, \
          then live. The Subject is the deployment, so \"what regens has this box had, and \
@@ -971,7 +926,7 @@ fn design_doc_review_spec() -> WorkflowSpec {
     // review step's authority is platform-admin already, but the
     // explicit owner_role keeps both meta-kinds resolvable even if
     // step shapes change.
-    spec.metadata = serde_json::json!({ "owner_role": "platform-admin" });
+    spec.metadata = serde_json::json!({ "department": "it", "owner_role": "platform-admin" });
     spec.description = Some(
         "Meta-kind: every design doc under docs/design/ gets reviewed via a Job of this kind. \
          The `review-design` step uses a custom Step UX plugin that reads the questions the \
@@ -3825,7 +3780,9 @@ mod tests {
             // all; `metadata_schema` is a protocol's admission contract
             // (publish-request's four required keys) and `entitlements`
             // its policy hooks — neither was compared, so either could
-            // have been dropped by a conversion in silence.
+            // have been dropped by a conversion in silence. The three
+            // literals carry `department = "it"` since backlog a8458043
+            // declared it on every platform row the bundle holds.
             assert_eq!(
                 got.description, want.description,
                 "{}: description — prose belongs in this column, and a conversion \
@@ -3933,40 +3890,18 @@ mod tests {
         step.spec_slug = Some("review".into());
         step.fields = vec![
             StepField {
-                name: "title".into(),
-                field_type: "string".into(),
                 required: true,
                 filled_by: FilledBy::Filer,
-                item_keys: Vec::new(),
-                covers: None,
-                binds: None,
-                item_value_max_bytes: None,
-                item_one_of: Vec::new(),
-                writer: None,
+                ..StepField::new("title", "string")
             },
             StepField {
-                name: "markdown".into(),
-                field_type: "string".into(),
                 required: true,
                 filled_by: FilledBy::Filer,
-                item_keys: Vec::new(),
-                covers: None,
-                binds: None,
-                item_value_max_bytes: None,
-                item_one_of: Vec::new(),
-                writer: None,
+                ..StepField::new("markdown", "string")
             },
             StepField {
-                name: "resolutions".into(),
-                field_type: "array".into(),
                 required: true,
-                filled_by: FilledBy::Executor,
-                item_keys: Vec::new(),
-                covers: None,
-                binds: None,
-                item_value_max_bytes: None,
-                item_one_of: Vec::new(),
-                writer: None,
+                ..StepField::new("resolutions", "array")
             },
         ];
         step.metadata = serde_json::json!({ "title": "Packet loss" });
@@ -3989,16 +3924,9 @@ mod tests {
         let mut step = Step::new(JobId::new(), "review-design", "Answer the questions", 0);
         step.spec_slug = Some("review".into());
         step.fields = vec![StepField {
-            name: "markdown".into(),
-            field_type: "string".into(),
             required: true,
             filled_by: FilledBy::Filer,
-            item_keys: Vec::new(),
-            covers: None,
-            binds: None,
-            item_value_max_bytes: None,
-            item_one_of: Vec::new(),
-            writer: None,
+            ..StepField::new("markdown", "string")
         }];
 
         // An explicit null is not a value.
@@ -4033,16 +3961,10 @@ mod tests {
         let mut step = Step::new(JobId::new(), "review-design", "Answer the questions", 0);
         step.spec_slug = Some("review".into());
         step.fields = vec![StepField {
-            name: "questions".into(),
-            field_type: "array".into(),
             required: true,
             filled_by: FilledBy::Filer,
             item_keys: vec!["anchor".into(), "title".into(), "proposal".into()],
-            covers: None,
-            binds: None,
-            item_value_max_bytes: None,
-            item_one_of: Vec::new(),
-            writer: None,
+            ..StepField::new("questions", "array")
         }];
 
         // A title-less element is named by index and key.
@@ -4097,16 +4019,11 @@ mod tests {
         let mut step = Step::new(JobId::new(), "review-design", "Answer the questions", 0);
         step.spec_slug = Some("review".into());
         step.fields = vec![StepField {
-            name: "exhibits".into(),
-            field_type: "array".into(),
             required: true,
             filled_by: FilledBy::Filer,
             item_keys: vec!["anchor".into()],
-            covers: None,
-            binds: None,
-            item_value_max_bytes: None,
             item_one_of: vec!["html".into(), "file_ref".into()],
-            writer: None,
+            ..StepField::new("exhibits", "array")
         }];
         step.metadata = serde_json::json!({ "exhibits": [
             { "anchor": "E1", "html": "<p>x</p>" },
@@ -4127,16 +4044,8 @@ mod tests {
         use boss_core::job::{FilledBy, StepField};
         let mut step = Step::new(JobId::new(), "review-design", "Answer the questions", 0);
         step.fields = vec![StepField {
-            name: "doc_path".into(),
-            field_type: "string".into(),
-            required: false,
             filled_by: FilledBy::Filer,
-            item_keys: Vec::new(),
-            covers: None,
-            binds: None,
-            item_value_max_bytes: None,
-            item_one_of: Vec::new(),
-            writer: None,
+            ..StepField::new("doc_path", "string")
         }];
         assert!(
             missing_filer_fields(std::slice::from_ref(&step)).is_empty(),

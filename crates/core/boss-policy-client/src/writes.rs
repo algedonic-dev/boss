@@ -10,7 +10,8 @@
 //! typed. Two core services need the same two answers, so they live here
 //! rather than twice (CLAUDE.md §9a).
 //!
-//! [`require_reaching`] is the gate: `action` on `resource`, in a scope
+//! [`require_reaching`] is the gate: a declared control
+//! ([`crate::controls`]), in a scope
 //! that reaches the person the write touches — `all` anyone, `team` the
 //! caller and their direct reports, `self` the caller. A department or
 //! territory grant reaches nobody here: a schedule row carries an
@@ -28,7 +29,7 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-use crate::{Action, Decision, PolicyClient, Resource, Scope, User};
+use crate::{Decision, Pair, PolicyClient, Scope, User};
 
 /// Whether a grant at `scope` reaches the rows of `person` (`None`: a
 /// write that cannot name one person before it runs).
@@ -44,18 +45,17 @@ pub fn scope_reaches(scope: &Scope, user: &User, person: Option<&str>) -> bool {
     }
 }
 
-/// Ask `policy` for `action` on `resource` and require the granted
-/// scope to reach `person`, or answer the response that refuses. A
-/// policy service that cannot be asked answers its own 503: a gate that
-/// cannot be asked is not a gate that passed.
+/// Ask `policy` for `control` and require the granted scope to reach
+/// `person`, or answer the response that refuses. A policy service that
+/// cannot be asked answers its own 503: a gate that cannot be asked is
+/// not a gate that passed.
 pub async fn require_reaching(
     policy: &dyn PolicyClient,
     user: &User,
-    action: Action,
-    resource: Resource,
+    control: Pair,
     person: Option<&str>,
 ) -> Result<(), Response> {
-    let scope = granted(policy, user, action, resource.clone()).await?;
+    let scope = granted(policy, user, control).await?;
     if scope_reaches(&scope, user, person) {
         return Ok(());
     }
@@ -66,8 +66,8 @@ pub async fn require_reaching(
             "{} (role {}) holds {} on `{}` at {}, which does not reach {whom}",
             user.id,
             user.role,
-            action.as_str(),
-            resource.as_str(),
+            control.action().as_str(),
+            control.resource_name(),
             scope.to_db_string()
         ),
     )
@@ -89,17 +89,20 @@ pub async fn require_reaching(
 ///   signed by the service's automation (review of car abc2e9d5, LOW-1).
 ///   A blank id is no caller either: it parsed as a human named `""`
 ///   and would have signed the fact with nothing (f5e0670d point 2);
-/// - policy denies `action` on `resource` → 403 with policy's reason;
+/// - policy denies `control` → 403 with policy's reason;
 /// - a grant narrower than `all` → 403: a registry row belongs to no
 ///   person and no department, so a narrower scope cannot be shown to
 ///   reach it ([`require_reaching`] with no person);
 /// - policy cannot answer → its own 503: a gate that cannot be asked is
 ///   not a gate that passed.
+///
+/// Every control asked here is declared `all` in [`crate::controls`]
+/// (design 1c4e42e1, backlog 47aed706): this ladder refuses a narrower
+/// grant itself, and the flag only tells coverage so.
 pub async fn require_registry_write(
     policy: &dyn PolicyClient,
     user: &User,
-    action: Action,
-    resource: Resource,
+    control: Pair,
 ) -> Result<boss_core::actor::ActorId, Response> {
     let Some(actor) = user
         .ambient_actor()
@@ -110,25 +113,20 @@ pub async fn require_registry_write(
             format!(
                 "a `{}` write is signed by its caller, and this request names no caller \
                  (no x-boss-user identity)",
-                resource.as_str()
+                control.resource_name()
             ),
         )
             .into_response());
     };
-    require_reaching(policy, user, action, resource, None).await?;
+    require_reaching(policy, user, control, None).await?;
     Ok(actor)
 }
 
-/// The scope `policy` grants `user` for `action` on `resource`, or the
-/// response that refuses: 403 for a deny, the client's own 503/500 for a
-/// policy service that could not be asked.
-async fn granted(
-    policy: &dyn PolicyClient,
-    user: &User,
-    action: Action,
-    resource: Resource,
-) -> Result<Scope, Response> {
-    match policy.check(user, action, resource).await {
+/// The scope `policy` grants `user` for `control`, or the response that
+/// refuses: 403 for a deny, the client's own 503/500 for a policy
+/// service that could not be asked.
+async fn granted(policy: &dyn PolicyClient, user: &User, control: Pair) -> Result<Scope, Response> {
+    match policy.ask(user, control).await {
         Ok(Decision::Allow { scope }) => Ok(scope),
         Ok(Decision::Deny { reason }) => Err((StatusCode::FORBIDDEN, reason).into_response()),
         Err(e) => Err(e.into_response()),
@@ -148,26 +146,25 @@ async fn granted(
 pub async fn require_reaching_row(
     policy: &dyn PolicyClient,
     user: &User,
-    action: Action,
-    resource: Resource,
+    control: Pair,
     owner: Option<&str>,
 ) -> Result<(), Response> {
-    let scope = granted(policy, user, action, resource.clone()).await?;
+    let scope = granted(policy, user, control).await?;
     if scope_reaches(&scope, user, owner) {
         return Ok(());
     }
-    Err(row_refusal(action, &resource))
+    Err(row_refusal(control))
 }
 
 /// The one refusal of a write by id: names the action and resource the
 /// caller asked for and nothing about the row.
-pub fn row_refusal(action: Action, resource: &Resource) -> Response {
+pub fn row_refusal(control: Pair) -> Response {
     (
         StatusCode::FORBIDDEN,
         format!(
             "{} on this `{}` row is not in your grant, or there is no such row",
-            action.as_str(),
-            resource.as_str()
+            control.action().as_str(),
+            control.resource_name()
         ),
     )
         .into_response()
@@ -222,7 +219,8 @@ pub fn recorded_author(user: &User, named: Option<&str>) -> Result<String, NotTh
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AccessTier, FakePolicyClient};
+    use crate::controls;
+    use crate::{AccessTier, Action, FakePolicyClient, Resource};
 
     fn user(id: &str, role: &str, reports: &[&str]) -> User {
         User {
@@ -282,35 +280,17 @@ mod tests {
             .build();
         let me = user("emp-1", "staff", &[]);
         assert!(
-            require_reaching(
-                &policy,
-                &me,
-                Action::Create,
-                Resource::schedule(),
-                Some("emp-1")
-            )
-            .await
-            .is_ok()
+            require_reaching(&policy, &me, controls::CREATE_SCHEDULE, Some("emp-1"))
+                .await
+                .is_ok()
         );
-        let other = require_reaching(
-            &policy,
-            &me,
-            Action::Create,
-            Resource::schedule(),
-            Some("emp-2"),
-        )
-        .await
-        .unwrap_err();
+        let other = require_reaching(&policy, &me, controls::CREATE_SCHEDULE, Some("emp-2"))
+            .await
+            .unwrap_err();
         assert_eq!(other.status(), StatusCode::FORBIDDEN);
-        let denied = require_reaching(
-            &policy,
-            &me,
-            Action::Delete,
-            Resource::schedule(),
-            Some("emp-1"),
-        )
-        .await
-        .unwrap_err();
+        let denied = require_reaching(&policy, &me, controls::DELETE_SCHEDULE, Some("emp-1"))
+            .await
+            .unwrap_err();
         assert_eq!(denied.status(), StatusCode::FORBIDDEN);
     }
 
@@ -329,33 +309,20 @@ mod tests {
                 .unwrap();
             (status, String::from_utf8_lossy(&bytes).to_string())
         };
-        let theirs = require_reaching_row(
-            &policy,
-            &me,
-            Action::Delete,
-            Resource::schedule(),
-            Some("emp-ceo"),
-        )
-        .await
-        .unwrap_err();
-        let missing =
-            require_reaching_row(&policy, &me, Action::Delete, Resource::schedule(), None)
-                .await
-                .unwrap_err();
+        let theirs = require_reaching_row(&policy, &me, controls::DELETE_SCHEDULE, Some("emp-ceo"))
+            .await
+            .unwrap_err();
+        let missing = require_reaching_row(&policy, &me, controls::DELETE_SCHEDULE, None)
+            .await
+            .unwrap_err();
         let (theirs, missing) = (text(theirs).await, text(missing).await);
         assert_eq!(theirs.0, StatusCode::FORBIDDEN);
         assert!(!theirs.1.contains("emp-ceo"), "{theirs:?}");
         assert_eq!(theirs, missing);
         assert!(
-            require_reaching_row(
-                &policy,
-                &me,
-                Action::Delete,
-                Resource::schedule(),
-                Some("emp-1")
-            )
-            .await
-            .is_ok()
+            require_reaching_row(&policy, &me, controls::DELETE_SCHEDULE, Some("emp-1"))
+                .await
+                .is_ok()
         );
     }
 
@@ -377,7 +344,7 @@ mod tests {
             .build();
         let ask = |u: User| {
             let policy = &policy;
-            async move { require_registry_write(policy, &u, Action::Update, Resource::class()).await }
+            async move { require_registry_write(policy, &u, controls::UPDATE_CLASS).await }
         };
 
         let actor = ask(user("emp-7", "editor", &[])).await.unwrap();

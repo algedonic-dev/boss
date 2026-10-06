@@ -126,20 +126,16 @@ fn ceo_header() -> String {
 fn job_with_subject(subject: Subject) -> Job {
     Job {
         id: boss_core::job::JobId::from_uuid(Uuid::new_v4()),
-        kind: "ad-hoc".into(),
-        workflow_version: 1,
-        subject,
-        title: "Smoke".into(),
-        owner_id: "emp-cto".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 4, 28).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::Value::Null,
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "ad-hoc",
+            subject,
+            "Smoke",
+            "emp-cto",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 4, 28).unwrap(),
+        )
     }
 }
 

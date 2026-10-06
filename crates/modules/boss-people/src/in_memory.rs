@@ -2,7 +2,9 @@
 
 use async_trait::async_trait;
 
-use crate::port::{PeopleError, PeopleRepository};
+use crate::port::{
+    PeopleError, PeopleRepository, in_read_order, refuse_another_id, refuse_malformed,
+};
 use crate::types::Employee;
 
 pub struct InMemoryPeople {
@@ -31,10 +33,50 @@ impl InMemoryPeople {
     }
 }
 
+/// The roster-wide refusals Postgres states as constraints (the email
+/// unique index, the `manager_id` foreign key), stated here as the port
+/// words them so the double refuses what production refuses (backlog
+/// be459ab9). `emp` is the row about to be written; its own id is not a
+/// clash.
+fn refuse_unholdable(employees: &[Employee], emp: &Employee) -> Result<(), PeopleError> {
+    refuse_malformed(emp)?;
+    if let Some(email) = &emp.email {
+        let lower = email.to_lowercase();
+        if employees.iter().any(|e| {
+            e.id != emp.id
+                && e.email
+                    .as_deref()
+                    .is_some_and(|held| held.to_lowercase() == lower)
+        }) {
+            return Err(PeopleError::Conflict(format!(
+                "email `{email}` is held by another employee"
+            )));
+        }
+    }
+    if let Some(manager) = &emp.manager_id
+        && *manager != emp.id
+        && !employees.iter().any(|e| e.id == *manager)
+    {
+        return Err(PeopleError::Conflict(format!(
+            "manager `{manager}` is not an employee"
+        )));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl PeopleRepository for InMemoryPeople {
     async fn all_employees(&self) -> Result<Vec<Employee>, PeopleError> {
-        Ok(self.employees.read().unwrap().clone())
+        let mut all: Vec<Employee> = self
+            .employees
+            .read()
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(in_read_order)
+            .collect();
+        all.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(all)
     }
 
     async fn employee_by_id(&self, id: &str) -> Result<Option<Employee>, PeopleError> {
@@ -44,18 +86,25 @@ impl PeopleRepository for InMemoryPeople {
             .unwrap()
             .iter()
             .find(|e| e.id == id)
-            .cloned())
+            .cloned()
+            .map(in_read_order))
     }
 
     async fn direct_reports(&self, manager_id: &str) -> Result<Vec<Employee>, PeopleError> {
-        Ok(self
+        let mut reports: Vec<Employee> = self
             .employees
             .read()
             .unwrap()
             .iter()
             .filter(|e| e.manager_id.as_deref() == Some(manager_id))
             .cloned()
-            .collect())
+            .map(in_read_order)
+            .collect();
+        // Nameless last, as Postgres's ascending NULLS LAST.
+        reports.sort_by(|a, b| {
+            (a.name.is_none(), &a.name, &a.id).cmp(&(b.name.is_none(), &b.name, &b.id))
+        });
+        Ok(reports)
     }
 
     async fn create_employee_at(
@@ -72,6 +121,7 @@ impl PeopleRepository for InMemoryPeople {
                     emp.id
                 )));
             }
+            refuse_unholdable(&employees, emp)?;
             employees.push(emp.clone());
         }
         self.record(stamp.event(
@@ -94,6 +144,8 @@ impl PeopleRepository for InMemoryPeople {
                 .iter()
                 .position(|e| e.id == id)
                 .ok_or_else(|| PeopleError::NotFound(id.to_string()))?;
+            refuse_another_id(id, emp)?;
+            refuse_unholdable(&employees, emp)?;
             employees[pos] = emp.clone();
         }
         self.record(stamp.event(
@@ -115,6 +167,16 @@ impl PeopleRepository for InMemoryPeople {
                 .iter()
                 .position(|e| e.id == id)
                 .ok_or_else(|| PeopleError::NotFound(id.to_string()))?;
+            if let Some(report) = employees
+                .iter()
+                .filter(|e| e.id != id && e.manager_id.as_deref() == Some(id))
+                .map(|e| e.id.as_str())
+                .min()
+            {
+                return Err(PeopleError::Conflict(format!(
+                    "employee {id} still manages {report}"
+                )));
+            }
             employees.remove(pos);
         }
         self.record(stamp.event(

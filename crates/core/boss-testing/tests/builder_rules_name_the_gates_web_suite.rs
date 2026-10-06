@@ -25,6 +25,22 @@
 
 use boss_testing::repo_root;
 
+#[test]
+fn comprehensive_validation_belongs_to_gates_not_builder_admission() {
+    let rules =
+        std::fs::read_to_string(repo_root().join("infra/platform/documents/builder-rules.md"))
+            .expect("builder rules");
+    assert!(rules.contains("Comprehensive validation belongs in the gates"));
+    assert!(rules.contains("Targeted TDD"));
+    assert!(rules.contains("Gate failures are evidence"));
+    assert!(!rules.contains("touched crates' WHOLE test suite"));
+    assert!(!rules.contains("Then run WHAT THE GATE RUNS, once, before pushing"));
+    let rerail =
+        std::fs::read_to_string(repo_root().join("infra/platform/workflows/rerail-a-car.toml"))
+            .expect("rerail protocol");
+    assert!(!rerail.contains("Run the touched crates' whole suites"));
+}
+
 /// The `bash -c '<chain>'` body of the web-phase check whose name
 /// starts with `name`, read out of `infra/gate.sh`.
 fn gate_chain(name: &str) -> String {

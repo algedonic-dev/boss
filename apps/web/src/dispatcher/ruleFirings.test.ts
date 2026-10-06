@@ -28,6 +28,7 @@ const read = (over: Partial<RuleFirings> = {}) => ({
     firings_error: null,
     dead_letters: [],
     dead_letters_error: null,
+    withheld: false,
     ...over,
   },
 });
@@ -106,6 +107,26 @@ describe('unread is never none', () => {
   it('each half the server could not read prints unknown on its own', () => {
     const a = ruleActivity(rule(), read({ firings: null, firings_error: 'not wired', dead_letters: null, dead_letters_error: 'no scope' }));
     expect([a.lastFired, a.lastFiredWhy, a.deadLetters, a.deadLettersWhy]).toEqual(['unknown', 'not wired', 'unknown', 'no scope']);
+  });
+
+  // Backlog bd506215: a narrowed scope is refused the firing record
+  // (d0058c92) — a refusal, said as one, never "unknown".
+  it('a half withheld by policy scope prints not in your policy scope, never unknown', () => {
+    const why =
+      "this caller's policy scope does not read every packet, and the firing record is not scoped by packet, so neither it nor the dead-letters beside it are read for it — withheld";
+    const a = ruleActivity(rule(), read({ firings: null, firings_error: why, dead_letters: null, dead_letters_error: why, withheld: true }));
+    expect([a.lastFired, a.deadLetters]).toEqual(['not in your policy scope', 'not in your policy scope']);
+    expect([a.lastFiredWhy, a.deadLettersWhy]).toEqual([why, why]);
+    expect(a.failing).toBe(false);
+    // The server's flag decides, never the reason's words (1805bac0).
+    const words = ruleActivity(rule(), read({ firings: null, firings_error: why, dead_letters: null, dead_letters_error: why }));
+    expect([words.lastFired, words.deadLetters]).toEqual(['unknown', 'unknown']);
+  });
+
+  it('parses the withheld flag, and its absence as false', () => {
+    const body = { now: NOW, retention_days: 30, firings: null, firings_error: 'x', dead_letters: null, dead_letters_error: 'x' };
+    expect(parseRuleFirings({ ...body, withheld: true }).withheld).toBe(true);
+    expect(parseRuleFirings(body).withheld).toBe(false);
   });
 
   // 4b175523: the schedule runner records its firings, so a scheduled

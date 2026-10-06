@@ -1,7 +1,8 @@
-//! File-references — port-conformance tests against both the
-//! in-memory and Postgres adapters. The same tests run against both
-//! to catch any divergence between the test-double and production
-//! adapter (e.g. dedup constraint behavior, soft-delete idempotence).
+//! File-references — the Postgres-only halves: the rebuilder, the GC
+//! sweep and the audit sample. The port's own contract, which both
+//! `FileRepository` adapters must answer alike, is
+//! `the_adapters_agree_on_the_file_store_pg.rs`; the six hand-wired
+//! conformance bodies that lived here moved there (backlog be459ab9).
 
 use chrono::{DateTime, TimeZone, Utc};
 use uuid::Uuid;
@@ -17,9 +18,9 @@ fn test_stamp() -> boss_core::publisher::EventStamp {
 use std::sync::Arc;
 
 use boss_content::files::{
-    AuditMismatchKind, FileError, FileRef, FileRefDraft, FileRepository, FileStorage,
-    InMemoryFileRepository, InMemoryFileStorage, PgFileRepository, ResourceKind, ResourceRef,
-    audit_sample, gc_orphan_objects, rebuild_file_refs,
+    AuditMismatchKind, FileRef, FileRefDraft, FileRepository, FileStorage, InMemoryFileStorage,
+    PgFileRepository, ResourceKind, ResourceRef, audit_sample, gc_orphan_objects,
+    rebuild_file_refs,
 };
 use boss_testing::TestDb;
 use bytes::Bytes;
@@ -49,204 +50,6 @@ fn draft(id: Uuid, target: ResourceRef, sha: &str, bucket: &str) -> FileRefDraft
         uploaded_by: "emp-001".into(),
         uploaded_at: at(0),
     }
-}
-
-// ---- Generic port-conformance suite ---------------------------------------
-//
-// `run_*` helpers take any `&dyn FileRepository` so the same body can
-// drive in-memory + Pg. Each #[tokio::test] just constructs the adapter
-// and calls into the suite.
-
-async fn run_insert_get_round_trips(repo: &dyn FileRepository) {
-    let id = Uuid::new_v4();
-    let row = repo
-        .insert(draft(id, job_target("job-001"), "abc", "bk"), &test_stamp())
-        .await
-        .unwrap();
-    assert_eq!(row.id, id);
-    assert_eq!(row.target.id, "job-001");
-    assert_eq!(row.sha256, "abc");
-    assert_eq!(row.size_bytes, 4096);
-    assert!(row.deleted_at.is_none());
-
-    let fetched = repo.get(id).await.unwrap().expect("present");
-    assert_eq!(fetched, row);
-}
-
-async fn run_list_for_filters_target_and_hides_soft_deleted(repo: &dyn FileRepository) {
-    let a = Uuid::new_v4();
-    let b = Uuid::new_v4();
-    let other = Uuid::new_v4();
-    repo.insert(draft(a, job_target("job-001"), "aaa", "bk"), &test_stamp())
-        .await
-        .unwrap();
-    repo.insert(draft(b, job_target("job-001"), "bbb", "bk"), &test_stamp())
-        .await
-        .unwrap();
-    repo.insert(
-        draft(other, job_target("job-002"), "ccc", "bk"),
-        &test_stamp(),
-    )
-    .await
-    .unwrap();
-
-    let target = job_target("job-001");
-    let live = repo.list_for(&target).await.unwrap();
-    assert_eq!(live.len(), 2);
-
-    repo.soft_delete(a, at(60), "emp-test", &test_stamp())
-        .await
-        .unwrap();
-    let live2 = repo.list_for(&target).await.unwrap();
-    assert_eq!(live2.len(), 1, "soft-deleted row hidden from list_for");
-    assert_eq!(live2[0].id, b);
-
-    let still = repo.get(a).await.unwrap().expect("present");
-    assert_eq!(still.deleted_at, Some(at(60)));
-}
-
-async fn run_list_for_sha256_includes_soft_deleted(repo: &dyn FileRepository) {
-    let live_id = Uuid::new_v4();
-    let dead_id = Uuid::new_v4();
-    repo.insert(
-        draft(live_id, job_target("job-001"), "shr", "bk-a"),
-        &test_stamp(),
-    )
-    .await
-    .unwrap();
-    repo.insert(
-        draft(dead_id, job_target("job-002"), "shr", "bk-b"),
-        &test_stamp(),
-    )
-    .await
-    .unwrap();
-    repo.soft_delete(dead_id, at(0), "emp-test", &test_stamp())
-        .await
-        .unwrap();
-
-    let all = repo.list_for_sha256("shr").await.unwrap();
-    assert_eq!(all.len(), 2, "GC sweep needs to see soft-deleted refs");
-    let live_only: Vec<_> = all.iter().filter(|r| r.deleted_at.is_none()).collect();
-    assert_eq!(live_only.len(), 1);
-}
-
-async fn run_duplicate_object_key_in_same_bucket_is_rejected(repo: &dyn FileRepository) {
-    let a = Uuid::new_v4();
-    let b = Uuid::new_v4();
-    repo.insert(
-        draft(a, job_target("job-001"), "shared", "bk"),
-        &test_stamp(),
-    )
-    .await
-    .unwrap();
-    let err = repo
-        .insert(
-            draft(b, job_target("job-002"), "shared", "bk"),
-            &test_stamp(),
-        )
-        .await
-        .unwrap_err();
-    assert!(matches!(err, FileError::DuplicateObject(_)));
-}
-
-async fn run_soft_delete_is_idempotent_first_timestamp_wins(repo: &dyn FileRepository) {
-    let id = Uuid::new_v4();
-    repo.insert(draft(id, job_target("job-001"), "abc", "bk"), &test_stamp())
-        .await
-        .unwrap();
-    repo.soft_delete(id, at(0), "emp-test", &test_stamp())
-        .await
-        .unwrap();
-    repo.soft_delete(id, at(60), "emp-test", &test_stamp())
-        .await
-        .unwrap();
-    let row = repo.get(id).await.unwrap().expect("present");
-    assert_eq!(
-        row.deleted_at,
-        Some(at(0)),
-        "first delete timestamp preserved"
-    );
-}
-
-async fn run_soft_delete_unknown_id_is_not_found(repo: &dyn FileRepository) {
-    let err = repo
-        .soft_delete(Uuid::new_v4(), at(0), "emp-test", &test_stamp())
-        .await
-        .unwrap_err();
-    assert!(matches!(err, FileError::NotFound(_)));
-}
-
-// ---- In-memory drivers ----------------------------------------------------
-
-#[tokio::test]
-async fn in_memory_insert_get_round_trips() {
-    run_insert_get_round_trips(&InMemoryFileRepository::new()).await;
-}
-
-#[tokio::test]
-async fn in_memory_list_for_filters_target_and_hides_soft_deleted() {
-    run_list_for_filters_target_and_hides_soft_deleted(&InMemoryFileRepository::new()).await;
-}
-
-#[tokio::test]
-async fn in_memory_list_for_sha256_includes_soft_deleted() {
-    run_list_for_sha256_includes_soft_deleted(&InMemoryFileRepository::new()).await;
-}
-
-#[tokio::test]
-async fn in_memory_duplicate_object_key_is_rejected() {
-    run_duplicate_object_key_in_same_bucket_is_rejected(&InMemoryFileRepository::new()).await;
-}
-
-#[tokio::test]
-async fn in_memory_soft_delete_is_idempotent() {
-    run_soft_delete_is_idempotent_first_timestamp_wins(&InMemoryFileRepository::new()).await;
-}
-
-#[tokio::test]
-async fn in_memory_soft_delete_unknown_id_is_not_found() {
-    run_soft_delete_unknown_id_is_not_found(&InMemoryFileRepository::new()).await;
-}
-
-// ---- Pg drivers -----------------------------------------------------------
-
-#[tokio::test]
-async fn pg_insert_get_round_trips() {
-    let db = TestDb::new().await;
-    run_insert_get_round_trips(&PgFileRepository::new(db.pool.clone())).await;
-}
-
-#[tokio::test]
-async fn pg_list_for_filters_target_and_hides_soft_deleted() {
-    let db = TestDb::new().await;
-    run_list_for_filters_target_and_hides_soft_deleted(&PgFileRepository::new(db.pool.clone()))
-        .await;
-}
-
-#[tokio::test]
-async fn pg_list_for_sha256_includes_soft_deleted() {
-    let db = TestDb::new().await;
-    run_list_for_sha256_includes_soft_deleted(&PgFileRepository::new(db.pool.clone())).await;
-}
-
-#[tokio::test]
-async fn pg_duplicate_object_key_is_rejected() {
-    let db = TestDb::new().await;
-    run_duplicate_object_key_in_same_bucket_is_rejected(&PgFileRepository::new(db.pool.clone()))
-        .await;
-}
-
-#[tokio::test]
-async fn pg_soft_delete_is_idempotent() {
-    let db = TestDb::new().await;
-    run_soft_delete_is_idempotent_first_timestamp_wins(&PgFileRepository::new(db.pool.clone()))
-        .await;
-}
-
-#[tokio::test]
-async fn pg_soft_delete_unknown_id_is_not_found() {
-    let db = TestDb::new().await;
-    run_soft_delete_unknown_id_is_not_found(&PgFileRepository::new(db.pool.clone())).await;
 }
 
 // ---- Rebuilder ------------------------------------------------------------

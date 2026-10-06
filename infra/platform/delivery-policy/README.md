@@ -27,7 +27,11 @@ column for column where the versions match — and proves the seed can
 rebuild an emptied table from this directory alone. It leads them since
 2026-09-28: `train-conductor` v3 (gate_max_concurrent 4, backlog
 366c2ed5) is declared here and nowhere else, the edit path this move
-created.
+created, and so is v4 (gate_max_concurrent back to 3 on 2026-09-30,
+backlog 461159e7, until w-1's second NVMe, 52ea56ac, holds four 160Gi
+gate workspaces), and so is v5 (gate_max_concurrent 4 again, backlog
+e6dc7331, once the workspace sat on that disk and a gate's ephemeral
+request came down to 40Gi on a measurement).
 
 **One row is the whole policy** — the `workflows` shape, not the
 `cadence_rules` shape. A Job pins one workflow version; a train pins

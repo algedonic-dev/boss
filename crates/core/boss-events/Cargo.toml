@@ -44,11 +44,6 @@ path = "src/bin/boss_audit_integrity_check.rs"
 required-features = ["bin"]
 
 [[bin]]
-name = "boss-events-api"
-path = "src/bin/boss_events_api.rs"
-required-features = ["events-api"]
-
-[[bin]]
 name = "boss-event-relay"
 path = "src/bin/boss_event_relay.rs"
 required-features = ["bin"]
@@ -62,6 +57,10 @@ tower = { workspace = true, features = ["util"] }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "a_delivered_outbox_row_is_pruned_pg"
+required-features = ["postgres"]
 
 [[test]]
 name = "audit_immutability"
@@ -93,4 +92,8 @@ required-features = ["postgres"]
 
 [[test]]
 name = "tail_http"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_gate_evidence_log_pg"
 required-features = ["postgres"]

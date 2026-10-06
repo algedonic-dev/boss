@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
     info!(%clock_url, "clock client wired");
 
     let state = CustomersApiState {
-        customers: Arc::new(PgCustomers::new(pool)),
+        customers: Arc::new(PgCustomers::new(pool.clone())),
         clock,
     };
 
@@ -73,8 +73,12 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding HTTP listener on {http_addr}"))?;
     info!(addr = %http_addr, "boss-customers-api listening");
-    let app =
-        boss_core::machine_gate::mount(router(state), "customers", &["/api/customers/health"]);
+    let app = boss_core::machine_gate::mount(
+        router(state),
+        "customers",
+        &["/api/customers/health"],
+        Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }

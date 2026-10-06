@@ -31,15 +31,42 @@
 //! the one [`Source`] per process re-reads the file on its own thread,
 //! so a rotation reaches every caller within [`REREAD`] plus kubelet's
 //! Secret refresh, and a read on the request path is a lock, never file
-//! I/O (review S5). [`attach`] is the old bake-it-in door, kept only for
-//! the callers the pin `no_client_bakes_the_machine_token_in` still
-//! names; that list only shrinks. `BlockingClient` (feature
-//! `blocking`) is the same stamp on reqwest's blocking half, for the
-//! seed and publish walks that run on it.
+//! I/O (review S5). `BlockingClient` (feature `blocking`) is the same
+//! stamp on reqwest's blocking half, for the seed, publish and
+//! simulator walks that run on it. The old bake-it-in door, `attach`,
+//! read the value once into a client's `default_headers`; it was
+//! deleted with the last caller the pin
+//! `no_client_bakes_the_machine_token_in` named (car 2's
+//! blocking-senders slice, 2026-09-29), so a new one does not compile.
 //!
 //! DEPLOY-ORDER SAFETY: everything is inert until the Secret is mounted
 //! (car 4). No file means no token, and no token means no header is
 //! attached — and every gate is in mode `off` until then.
+//!
+//! STAMPED ONLY ON THE ESTATE'S OWN HOSTS (backlog 2ee29275, F1). A
+//! stamping client used to stamp whatever URL it was handed, and several
+//! are handed one the operator typed — `BOSS_JOBS_URL`, `boss tenant
+//! publish --gateway`, `boss estate declare --gateway` — so the estate's
+//! token would have gone to Cloudflare's edge (`boss.algedonic.dev`
+//! answers with a 302 to Access) or to another instance. [`token_for`]
+//! is the one decision, for [`Client`], [`BlockingClient`] and the
+//! gateway's reqwest-0.13 twin: loopback is always the deployment's,
+//! plus the hosts [`HOSTS_ENV`] lists, READ AT RUNTIME and never
+//! compiled in — boss-core ships as open source, and a list compiled
+//! from one estate's `estate.toml` would stamp that estate's hosts
+//! inside another deployment's binary. The list is a fact about the
+//! deployment, the same as the token beside it:
+//! `infra/estate/render-sor-env.sh` writes it from the hosts of
+//! `sor_url` and `sor_cluster_url`, and an instance's manifests carry
+//! its own namespace as a suffix entry (`.boss.svc.cluster.local`,
+//! rewritten per instance). `*.svc.cluster.local` is NOT always allowed
+//! (review of 54d9a23a, MEDIUM-1): the cluster runs other instances in
+//! other namespaces with tokens of their own, and a `.local` name off a
+//! cluster resolves over mDNS. Any other host goes out unstamped,
+//! and the process says so once, naming the scheme and host, never the
+//! path or query. A warning, not a refusal: a read without the token
+//! still works wherever the gate is not yet enforcing. The stamped
+//! value is marked sensitive (F8), so no `Debug` of a request prints it.
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -139,23 +166,6 @@ fn clean(raw: &str) -> Result<Option<String>, &'static str> {
     Ok(Some(v.to_string()))
 }
 
-/// Insert the token header into a map that becomes a client's
-/// `default_headers` — the value read ONCE, now. Superseded by
-/// [`Client`] (review S1): a client built this way sends the boot-time
-/// token until its process restarts. Only the callers the pin
-/// `no_client_bakes_the_machine_token_in` names may still use it.
-pub fn attach(headers: &mut reqwest::header::HeaderMap) {
-    attach_value(headers, shared().current());
-}
-
-fn attach_value(headers: &mut reqwest::header::HeaderMap, token: Option<String>) {
-    if let Some(token) = token
-        && let Ok(v) = reqwest::header::HeaderValue::from_str(&token)
-    {
-        headers.insert(HEADER, v);
-    }
-}
-
 /// The process's one watched [`Source`] over [`token_dir`]'s `current`
 /// slot, started on first use.
 ///
@@ -166,19 +176,198 @@ fn attach_value(headers: &mut reqwest::header::HeaderMap, token: Option<String>)
 /// same observation, so no two callers in one process can send
 /// different tokens after a rotation. The same `OnceLock` shape as
 /// `roles::EXECUTIVE_ROLES`.
+///
+/// UNDER `cfg(test)` IT HOLDS NO TOKEN (backlog 2ee29275, F2): a failing
+/// test prints the request head it captured, so boss-core's own tests
+/// must never read a mounted Secret. Another crate's tests are not
+/// compiled under this `cfg`; they build with [`Client::unstamped`] or
+/// a fixed source, and the pin `no_test_builds_a_client_on_the_live_token`
+/// refuses one that reaches for a stamping constructor.
 pub fn shared() -> Arc<Source> {
+    if cfg!(test) {
+        return Arc::new(Source::fixed(None));
+    }
     static SHARED: OnceLock<Arc<Source>> = OnceLock::new();
     Arc::clone(SHARED.get_or_init(|| Source::watch(token_dir())))
 }
 
-/// Stamp `source`'s current value on one request; nothing when it has
-/// none. PRIVATE, [`Client::request`] its one caller: public, it
-/// stamped a builder from ANY client — `stamp(reqwest::Client::new()
+/// The hosts a stamped request may go to besides loopback: host names or
+/// addresses, separated by commas or whitespace, no ports. An entry with
+/// a LEADING DOT is a suffix — `.boss.svc.cluster.local` allows every
+/// Service in that one namespace and no other (review of 54d9a23a,
+/// MEDIUM-1). A host carries it from `/etc/boss/sor.env`, which
+/// `infra/estate/render-sor-env.sh` writes from `estate.toml`; an
+/// instance's manifests carry its own namespace's suffix, which
+/// render-instance.sh rewrites per instance; the dev pod's shim and door
+/// name the host of `infra/dev/sor-url`.
+pub const HOSTS_ENV: &str = "BOSS_MACHINE_TOKEN_HOSTS";
+
+/// The rendered env file [`Hosts::from_env`] falls back to when
+/// [`HOSTS_ENV`] is unset — its path from this variable, else
+/// [`DEFAULT_SOR_ENV`]; the names `infra/lib/sor.sh` reads it by.
+pub const SOR_ENV_FILE_ENV: &str = "BOSS_SOR_ENV";
+pub const DEFAULT_SOR_ENV: &str = "/etc/boss/sor.env";
+
+/// The hosts that may receive the token (see the module's "STAMPED ONLY
+/// ON THE ESTATE'S OWN HOSTS"), and whether this process has already
+/// said that it withheld it.
+#[derive(Debug, Default)]
+pub struct Hosts {
+    listed: Vec<String>,
+    warned: AtomicBool,
+}
+
+impl Hosts {
+    /// [`HOSTS_ENV`] as this process was started with it; when it is
+    /// UNSET, the same key in the rendered sor.env ([`SOR_ENV_FILE_ENV`],
+    /// else [`DEFAULT_SOR_ENV`]). A CLI run by hand on a host inherits
+    /// no unit's `EnvironmentFile=` (review LOW-4), and without the file
+    /// it would stop stamping the record the day the gate enforces.
+    pub fn from_env() -> Self {
+        let file = std::env::var_os(SOR_ENV_FILE_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_SOR_ENV));
+        Self::from_env_or_file(std::env::var(HOSTS_ENV).ok(), &file)
+    }
+
+    /// [`Hosts::from_env`] with its two inputs given: the variable's
+    /// value (`None` when unset — set and empty is a list, loopback only)
+    /// and the env file read when it is unset. A missing or unreadable
+    /// file, or one without the key, is an empty list.
+    pub fn from_env_or_file(var: Option<String>, file: &Path) -> Self {
+        let text = var.unwrap_or_else(|| {
+            std::fs::read_to_string(file)
+                .ok()
+                .and_then(|t| {
+                    t.lines().find_map(|l| {
+                        l.strip_prefix(HOSTS_ENV)
+                            .and_then(|r| r.strip_prefix('='))
+                            .map(str::to_string)
+                    })
+                })
+                .unwrap_or_default()
+        });
+        Self::parse(&text)
+    }
+
+    /// The variable's text: commas or whitespace between hosts, blanks
+    /// dropped.
+    pub fn parse(text: &str) -> Self {
+        Self::listed(text.split(|c: char| c == ',' || c.is_whitespace()))
+    }
+
+    pub fn listed<S: AsRef<str>>(hosts: impl IntoIterator<Item = S>) -> Self {
+        Hosts {
+            listed: hosts
+                .into_iter()
+                .map(|h| normal_host(h.as_ref()))
+                .filter(|h| !h.is_empty())
+                .collect(),
+            warned: AtomicBool::new(false),
+        }
+    }
+
+    /// May a request to `host` carry the token? Loopback always; a listed
+    /// host exactly; a host ENDING WITH a listed `.suffix`.
+    pub fn allows(&self, host: &str) -> bool {
+        let host = normal_host(host);
+        !host.is_empty()
+            && (is_loopback(&host)
+                || self.listed.iter().any(|l| {
+                    if l.starts_with('.') {
+                        host.ends_with(l.as_str())
+                    } else {
+                        *l == host
+                    }
+                }))
+    }
+
+    /// [`Hosts::allows`] for the host of `url`; false when it has none or
+    /// does not parse. What `infra/dev/boss-api`'s shell copy of this
+    /// rule is held equal to.
+    pub fn allows_url(&self, url: &str) -> bool {
+        reqwest::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| self.allows(h)))
+            .unwrap_or(false)
+    }
+}
+
+/// Lowercase, no surrounding space, no IPv6 brackets, no trailing dot:
+/// the spelling `Url::host_str` and a hand-written list are compared in.
+fn normal_host(h: &str) -> String {
+    h.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+/// Loopback — this machine, or this pod's own network namespace — the
+/// one host that is the deployment's own whatever the deployment. NOT a
+/// Kubernetes Service name: one cluster may run several instances, each
+/// in its own namespace with its own token (review of 54d9a23a,
+/// MEDIUM-1), and a `.local` name resolves over mDNS off a cluster, where
+/// any device on the LAN can answer (INFO-5). A namespace is listed.
+fn is_loopback(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The process's [`Hosts`], read from its environment once, on first
+/// use — beside [`shared`], because both are facts about the deployment.
+pub fn hosts() -> Arc<Hosts> {
+    static HOSTS: OnceLock<Arc<Hosts>> = OnceLock::new();
+    Arc::clone(HOSTS.get_or_init(|| Arc::new(Hosts::from_env())))
+}
+
+/// THE ONE DECISION (backlog 2ee29275): the header value a request to
+/// `url` carries, or none. None when `source` holds no token, when the
+/// URL does not parse (reqwest refuses that request on its own), or when
+/// its host is not one `hosts` allows — the last said once per `hosts`,
+/// naming the scheme and host and never the path or query, which may
+/// carry a login's state. The value is marked sensitive (F8).
+pub fn token_for(
+    source: &Source,
+    hosts: &Hosts,
+    url: &str,
+) -> Option<reqwest::header::HeaderValue> {
+    let token = source.current()?;
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    if !hosts.allows(host) {
+        if !hosts.warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                scheme = parsed.scheme(),
+                host,
+                "machine token withheld from {}://{host}: the host is not loopback and \
+                 not in {HOSTS_ENV}, so this process sends its requests there unstamped \
+                 (said once per process)",
+                parsed.scheme()
+            );
+        }
+        return None;
+    }
+    let mut value = reqwest::header::HeaderValue::from_str(&token).ok()?;
+    value.set_sensitive(true);
+    Some(value)
+}
+
+/// Stamp one request to `url` with [`token_for`]'s value; nothing when
+/// it answers none. PRIVATE, [`Client::request`] its one caller: public,
+/// it stamped a builder from ANY client — `stamp(reqwest::Client::new()
 /// .get(u), &shared())` rode reqwest's follow-ten-hops default and
 /// passed both pins (review of 39949355, M4, 2026-09-28).
-fn stamp(rb: reqwest::RequestBuilder, source: &Source) -> reqwest::RequestBuilder {
-    match source.current() {
-        Some(token) => rb.header(HEADER, token),
+fn stamp(
+    rb: reqwest::RequestBuilder,
+    source: &Source,
+    hosts: &Hosts,
+    url: &str,
+) -> reqwest::RequestBuilder {
+    match token_for(source, hosts, url) {
+        Some(value) => rb.header(HEADER, value),
         None => rb,
     }
 }
@@ -200,15 +389,21 @@ fn stamp(rb: reqwest::RequestBuilder, source: &Source) -> reqwest::RequestBuilde
 /// the caller set — a built `reqwest::Client` has no way to change its
 /// policy afterwards, which is why there is no constructor, and no
 /// `From`, that takes one. A 3xx comes back to the caller as a response.
+///
+/// A URL is taken as `impl AsRef<str>` rather than `reqwest::IntoUrl`,
+/// whose conversion is sealed: the host decision ([`token_for`]) must
+/// read the URL before reqwest consumes it. Every `IntoUrl` type — a
+/// `&str`, a `String`, a `Url` — is one.
 #[derive(Clone, Debug)]
 pub struct Client {
     http: reqwest::Client,
     token: Arc<Source>,
+    hosts: Arc<Hosts>,
 }
 
 impl Client {
     /// Finish `builder` with redirects off and stamp from the process's
-    /// [`shared`] source.
+    /// [`shared`] source, on the process's [`hosts`].
     pub fn build(builder: reqwest::ClientBuilder) -> reqwest::Result<Self> {
         Self::build_with_source(builder, shared())
     }
@@ -219,41 +414,65 @@ impl Client {
         builder: reqwest::ClientBuilder,
         token: Arc<Source>,
     ) -> reqwest::Result<Self> {
+        Self::build_scoped(builder, token, hosts())
+    }
+
+    /// A client that NEVER stamps: redirects off like every machine
+    /// client, and a source that holds nothing (backlog 2ee29275). The
+    /// constructor for a test in any crate — it reads no mounted Secret,
+    /// so a failing test cannot print one — and for a sender whose
+    /// target is not the estate's service, such as `--gateway`: the
+    /// gateway strips every client `x-boss-*` header at its edge anyway.
+    pub fn unstamped(builder: reqwest::ClientBuilder) -> reqwest::Result<Self> {
+        Self::build_with_source(builder, Arc::new(Source::fixed(None)))
+    }
+
+    fn build_scoped(
+        builder: reqwest::ClientBuilder,
+        token: Arc<Source>,
+        hosts: Arc<Hosts>,
+    ) -> reqwest::Result<Self> {
         let http = builder
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        Ok(Client { http, token })
+        Ok(Client { http, token, hosts })
     }
 
     pub fn request(
         &self,
         method: reqwest::Method,
-        url: impl reqwest::IntoUrl,
+        url: impl AsRef<str>,
     ) -> reqwest::RequestBuilder {
-        stamp(self.http.request(method, url), &self.token)
+        let url = url.as_ref();
+        stamp(
+            self.http.request(method, url),
+            &self.token,
+            &self.hosts,
+            url,
+        )
     }
 
-    pub fn get(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+    pub fn get(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
         self.request(reqwest::Method::GET, url)
     }
 
-    pub fn post(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+    pub fn post(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
         self.request(reqwest::Method::POST, url)
     }
 
-    pub fn put(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+    pub fn put(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
         self.request(reqwest::Method::PUT, url)
     }
 
-    pub fn patch(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+    pub fn patch(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
         self.request(reqwest::Method::PATCH, url)
     }
 
-    pub fn delete(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+    pub fn delete(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
         self.request(reqwest::Method::DELETE, url)
     }
 
-    pub fn head(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+    pub fn head(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
         self.request(reqwest::Method::HEAD, url)
     }
 }
@@ -271,12 +490,13 @@ impl Client {
 pub struct BlockingClient {
     http: reqwest::blocking::Client,
     token: Arc<Source>,
+    hosts: Arc<Hosts>,
 }
 
 #[cfg(feature = "blocking")]
 impl BlockingClient {
     /// Finish `builder` with redirects off and stamp from the process's
-    /// [`shared`] source.
+    /// [`shared`] source, on the process's [`hosts`].
     pub fn build(builder: reqwest::blocking::ClientBuilder) -> reqwest::Result<Self> {
         Self::build_with_source(builder, shared())
     }
@@ -286,45 +506,59 @@ impl BlockingClient {
         builder: reqwest::blocking::ClientBuilder,
         token: Arc<Source>,
     ) -> reqwest::Result<Self> {
+        Self::build_scoped(builder, token, hosts())
+    }
+
+    /// [`Client::unstamped`] on the blocking half: never stamps.
+    pub fn unstamped(builder: reqwest::blocking::ClientBuilder) -> reqwest::Result<Self> {
+        Self::build_with_source(builder, Arc::new(Source::fixed(None)))
+    }
+
+    fn build_scoped(
+        builder: reqwest::blocking::ClientBuilder,
+        token: Arc<Source>,
+        hosts: Arc<Hosts>,
+    ) -> reqwest::Result<Self> {
         let http = builder
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        Ok(BlockingClient { http, token })
+        Ok(BlockingClient { http, token, hosts })
     }
 
     pub fn request(
         &self,
         method: reqwest::Method,
-        url: impl reqwest::IntoUrl,
+        url: impl AsRef<str>,
     ) -> reqwest::blocking::RequestBuilder {
+        let url = url.as_ref();
         let rb = self.http.request(method, url);
-        match self.token.current() {
-            Some(token) => rb.header(HEADER, token),
+        match token_for(&self.token, &self.hosts, url) {
+            Some(value) => rb.header(HEADER, value),
             None => rb,
         }
     }
 
-    pub fn get(&self, url: impl reqwest::IntoUrl) -> reqwest::blocking::RequestBuilder {
+    pub fn get(&self, url: impl AsRef<str>) -> reqwest::blocking::RequestBuilder {
         self.request(reqwest::Method::GET, url)
     }
 
-    pub fn post(&self, url: impl reqwest::IntoUrl) -> reqwest::blocking::RequestBuilder {
+    pub fn post(&self, url: impl AsRef<str>) -> reqwest::blocking::RequestBuilder {
         self.request(reqwest::Method::POST, url)
     }
 
-    pub fn put(&self, url: impl reqwest::IntoUrl) -> reqwest::blocking::RequestBuilder {
+    pub fn put(&self, url: impl AsRef<str>) -> reqwest::blocking::RequestBuilder {
         self.request(reqwest::Method::PUT, url)
     }
 
-    pub fn patch(&self, url: impl reqwest::IntoUrl) -> reqwest::blocking::RequestBuilder {
+    pub fn patch(&self, url: impl AsRef<str>) -> reqwest::blocking::RequestBuilder {
         self.request(reqwest::Method::PATCH, url)
     }
 
-    pub fn delete(&self, url: impl reqwest::IntoUrl) -> reqwest::blocking::RequestBuilder {
+    pub fn delete(&self, url: impl AsRef<str>) -> reqwest::blocking::RequestBuilder {
         self.request(reqwest::Method::DELETE, url)
     }
 
-    pub fn head(&self, url: impl reqwest::IntoUrl) -> reqwest::blocking::RequestBuilder {
+    pub fn head(&self, url: impl AsRef<str>) -> reqwest::blocking::RequestBuilder {
         self.request(reqwest::Method::HEAD, url)
     }
 }
@@ -512,15 +746,19 @@ mod tests {
         // Nothing mounted: no token, and no header. This is every pod
         // until car 4 mounts the Secret — the deploy-order safety.
         assert_eq!(read_slot(&d, CURRENT), None);
-        let mut h = reqwest::header::HeaderMap::new();
-        attach_value(&mut h, read_slot(&d, CURRENT));
-        assert!(!h.contains_key(HEADER));
+        let client = |d: &Path| {
+            Client::build_with_source(
+                reqwest::Client::builder(),
+                Arc::new(Source::fixed(read_slot(d, CURRENT))),
+            )
+            .unwrap()
+        };
+        assert_eq!(sent(&client(&d)), None);
 
         std::fs::write(d.join("current"), "cur-value\n").unwrap();
         std::fs::write(d.join("next"), "next-value\n").unwrap();
         assert_eq!(read_slot(&d, CURRENT).as_deref(), Some("cur-value"));
-        attach_value(&mut h, read_slot(&d, CURRENT));
-        assert_eq!(h.get(HEADER).unwrap(), "cur-value");
+        assert_eq!(sent(&client(&d)).as_deref(), Some("cur-value"));
         std::fs::remove_dir_all(&d).unwrap();
     }
 
@@ -894,6 +1132,276 @@ mod tests {
         assert!(
             reached.is_empty(),
             "a stamped client followed a redirect to another host: {reached:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The host scope (backlog 2ee29275, F1 and F8)
+    // -----------------------------------------------------------------
+
+    /// What `client` would send to `url`: the header, or none.
+    fn sent_to(client: &Client, url: &str) -> Option<reqwest::header::HeaderValue> {
+        client
+            .get(url)
+            .build()
+            .unwrap()
+            .headers()
+            .get(HEADER)
+            .cloned()
+    }
+
+    fn scoped(hosts: &[&str]) -> Client {
+        Client::build_scoped(
+            reqwest::Client::builder(),
+            Arc::new(Source::fixed(Some("estate-token-value".into()))),
+            Arc::new(Hosts::listed(hosts)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn only_loopback_is_stamped_with_no_list() {
+        // An empty list means loopback and nothing else: a service
+        // calling its pod's neighbour, a CLI on the host it runs on. A
+        // Service name is NOT always the estate's (review of 54d9a23a,
+        // MEDIUM-1): the cluster runs a second instance in its own
+        // namespace, with its own token.
+        let c = scoped(&[]);
+        for url in [
+            "http://127.0.0.1:7900/api/jobs",
+            "http://127.9.9.9:7900/api/jobs",
+            "http://localhost:7900/api/jobs",
+            "http://[::1]:7900/api/jobs",
+        ] {
+            assert!(sent_to(&c, url).is_some(), "{url} must be stamped");
+        }
+        for url in [
+            "http://boss-jobs-internal.boss.svc.cluster.local:7900/api/jobs",
+            "http://boss-jobs-internal.boss-playground.svc.cluster.local:7900/api/jobs",
+        ] {
+            assert!(sent_to(&c, url).is_none(), "{url} needs a list entry");
+        }
+    }
+
+    #[test]
+    fn a_suffix_entry_stamps_its_own_namespace_and_never_the_playgrounds() {
+        // What an instance manifest carries, `.boss.svc.cluster.local`,
+        // which render-instance.sh rewrites per namespace — so prod's
+        // token reaches prod's Services and never another instance's.
+        let prod = scoped(&[".boss.svc.cluster.local"]);
+        for url in [
+            "http://boss-jobs-internal.boss.svc.cluster.local:7900/api/jobs",
+            "http://BOSS-JOBS-INTERNAL.boss.svc.cluster.local./api/jobs",
+        ] {
+            assert!(sent_to(&prod, url).is_some(), "{url} is prod's");
+        }
+        for url in [
+            "http://boss-jobs-internal.boss-playground.svc.cluster.local:7900/api/jobs",
+            "http://boss-gateway.boss-playground.svc.cluster.local/",
+            "http://boss.svc.cluster.local/",
+            "http://x.boss.svc.cluster.local.example.com/",
+        ] {
+            assert!(sent_to(&prod, url).is_none(), "{url} is not prod's");
+        }
+        let play = scoped(&[".boss-playground.svc.cluster.local"]);
+        assert!(
+            sent_to(
+                &play,
+                "http://boss-jobs-internal.boss-playground.svc.cluster.local/"
+            )
+            .is_some()
+        );
+        assert!(sent_to(&play, "http://boss-jobs-internal.boss.svc.cluster.local/").is_none());
+    }
+
+    #[test]
+    fn an_unset_list_is_read_from_the_rendered_sor_env() {
+        // Review LOW-4: a CLI run by hand on a host inherits no unit's
+        // EnvironmentFile, so the list falls back to the file the
+        // converge renders — and only when the variable is UNSET: set
+        // and empty is a list, and means loopback only.
+        let d = dir();
+        let env = d.join("sor.env");
+        std::fs::write(
+            &env,
+            "# rendered\nBOSS_JOBS_URL=http://192.0.2.34:7900\nBOSS_MACHINE_TOKEN_HOSTS=192.0.2.34,x.example\n",
+        )
+        .unwrap();
+        let read = Hosts::from_env_or_file(None, &env);
+        assert!(read.allows("192.0.2.34") && read.allows("x.example"));
+        assert!(!Hosts::from_env_or_file(Some(String::new()), &env).allows("192.0.2.34"));
+        assert!(Hosts::from_env_or_file(Some("y.example".into()), &env).allows("y.example"));
+        assert!(!Hosts::from_env_or_file(None, &d.join("absent")).allows("192.0.2.34"));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_host_off_the_list_goes_out_unstamped() {
+        // The edge (boss.algedonic.dev 302s to Cloudflare Access), an
+        // address the operator typed, another instance: none of them
+        // is this estate's service, so none receives its token.
+        let c = scoped(&[]);
+        for url in [
+            "https://boss.algedonic.dev/api/jobs?state=secret",
+            "http://192.0.2.10:7900/api/jobs",
+            "http://svc.cluster.local.example.com/api/jobs",
+            "http://cluster.local/api/jobs",
+            "http://operator@198.51.100.7/api/jobs",
+        ] {
+            assert!(sent_to(&c, url).is_none(), "{url} must go out unstamped");
+        }
+        // Every verb goes through the same decision.
+        for rb in [
+            c.post("http://192.0.2.10/"),
+            c.put("http://192.0.2.10/"),
+            c.patch("http://192.0.2.10/"),
+            c.delete("http://192.0.2.10/"),
+            c.head("http://192.0.2.10/"),
+            c.request(reqwest::Method::OPTIONS, "http://192.0.2.10/"),
+        ] {
+            assert!(rb.build().unwrap().headers().get(HEADER).is_none());
+        }
+    }
+
+    #[test]
+    fn a_listed_host_is_stamped_and_only_that_host() {
+        // What render-sor-env.sh writes: the hosts of sor_url and
+        // sor_cluster_url, comma-separated, read at RUNTIME — never
+        // compiled in, because another deployment's binary is this one.
+        let c = scoped(&["192.0.2.10", " Boss-Record.example.net "]);
+        assert!(sent_to(&c, "http://192.0.2.10:7900/api/jobs").is_some());
+        assert!(sent_to(&c, "http://boss-record.example.net/api/x").is_some());
+        assert!(sent_to(&c, "http://192.0.2.11:7900/api/jobs").is_none());
+        assert!(sent_to(&c, "http://example.net/api/jobs").is_none());
+        // The parse the environment gets: commas or whitespace, blanks
+        // dropped, case folded.
+        let parsed = Hosts::parse(" 192.0.2.10,, Boss-Record.example.net\n");
+        assert!(parsed.allows("192.0.2.10"));
+        assert!(parsed.allows("boss-record.example.net"));
+        assert!(!parsed.allows(""));
+        assert!(!Hosts::parse("").allows("192.0.2.10"));
+        assert!(parsed.allows_url("http://operator@192.0.2.10:7900/x?y"));
+        assert!(Hosts::default().allows_url("http://[::1]:7900/"));
+        assert!(!Hosts::default().allows_url("not a url"));
+    }
+
+    #[test]
+    fn the_stamped_value_is_marked_sensitive() {
+        // F8: a `Debug` of the request, a hyper trace, or HPACK must
+        // treat the value as a secret.
+        let c = scoped(&[]);
+        let v = sent_to(&c, "http://127.0.0.1:9/").expect("loopback is stamped");
+        assert!(v.is_sensitive(), "the machine token must be sensitive");
+        let shown = format!("{v:?}");
+        assert!(!shown.contains("estate-token-value"), "{shown}");
+    }
+
+    /// Everything `f` logs at WARN, as text.
+    fn warnings_of(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(sub, f);
+        let out = buf.0.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[test]
+    fn a_withheld_token_is_said_once_naming_scheme_and_host_never_the_query() {
+        let c = scoped(&[]);
+        let logged = warnings_of(|| {
+            for _ in 0..3 {
+                let _ = sent_to(&c, "https://boss.algedonic.dev:8443/api/jobs?code=q-secret");
+            }
+            let _ = sent_to(&c, "http://192.0.2.10/api/x?code=q-secret");
+        });
+        assert_eq!(
+            logged.matches("machine token withheld").count(),
+            1,
+            "one warning per process, however many requests: {logged}"
+        );
+        assert!(
+            logged.contains("https") && logged.contains("boss.algedonic.dev"),
+            "the warning names the scheme and the host: {logged}"
+        );
+        assert!(
+            !logged.contains("q-secret") && !logged.contains("/api/jobs"),
+            "the warning never carries the path or the query: {logged}"
+        );
+        assert!(!logged.contains("estate-token-value"), "{logged}");
+
+        // A process holding NO token withholds nothing, so says nothing:
+        // every pod until the Secret is mounted (design 6805c764 car 4).
+        let none = Client::build_scoped(
+            reqwest::Client::builder(),
+            Arc::new(Source::fixed(None)),
+            Arc::new(Hosts::default()),
+        )
+        .unwrap();
+        let logged = warnings_of(|| {
+            let _ = sent_to(&none, "https://boss.algedonic.dev/api/jobs");
+        });
+        assert!(logged.is_empty(), "{logged}");
+    }
+
+    #[test]
+    fn an_unstamped_client_never_stamps_even_on_loopback() {
+        // The test constructor (F2) and the --gateway senders' client:
+        // it holds no source to read, so no mounted Secret reaches it.
+        let c = Client::unstamped(reqwest::Client::builder()).unwrap();
+        assert!(sent_to(&c, "http://127.0.0.1:9/").is_none());
+        assert!(sent_to(&c, "http://[::1]:9/").is_none());
+    }
+
+    #[test]
+    fn under_cfg_test_the_shared_source_holds_no_token() {
+        // boss-core's own tests never read the mounted Secret, whatever
+        // BOSS_MACHINE_TOKEN_DIR names in the process that runs them.
+        assert_eq!(shared().current(), None);
+        let c = Client::build(reqwest::Client::builder()).unwrap();
+        assert!(sent_to(&c, "http://127.0.0.1:9/").is_none());
+    }
+
+    #[cfg(feature = "blocking")]
+    #[test]
+    fn a_blocking_client_takes_the_same_host_decision() {
+        let c = BlockingClient::build_scoped(
+            reqwest::blocking::Client::builder(),
+            Arc::new(Source::fixed(Some("estate-token-value".into()))),
+            Arc::new(Hosts::listed(["192.0.2.10"])),
+        )
+        .unwrap();
+        let on = |url: &str| c.get(url).build().unwrap().headers().get(HEADER).cloned();
+        let v = on("http://192.0.2.10/api/jobs").expect("a listed host is stamped");
+        assert!(v.is_sensitive());
+        assert!(on("http://127.0.0.1/api/jobs").is_some());
+        assert!(on("https://boss.algedonic.dev/api/jobs").is_none());
+        let u = BlockingClient::unstamped(reqwest::blocking::Client::builder()).unwrap();
+        assert!(
+            u.get("http://127.0.0.1/")
+                .build()
+                .unwrap()
+                .headers()
+                .get(HEADER)
+                .is_none()
         );
     }
 }

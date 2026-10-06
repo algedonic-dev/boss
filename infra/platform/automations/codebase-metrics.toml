@@ -1,0 +1,7 @@
+# automation:codebase-metrics — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 7 audit-log facts.
+# Signs as platform-admin today: infra/codebase-metrics.sh.
+
+[[automation]]
+id = "automation:codebase-metrics"
+role = "platform-admin"
+description = 'Records the codebase size and shape, daily (infra/codebase-metrics.sh).'

@@ -75,6 +75,16 @@ forge_journal = "http://10.20.0.15:19531"
 mirror_url = "https://github.com/algedonic-dev/boss"
 
 
+# Report-only ongoing intent, independent of bootstrap templates and
+# filesystem capacity. Assignment copied from design 32e7cf87 review Q1;
+# this declaration grants no storage mutation authority.
+[[volume_intent]]
+namespace = "boss"
+claim = "pgdata-postgres-0"
+desired_bytes = 32212254720
+# employee-id-ok: immutable approved decision receipt, never current owner/signer/authority
+assignment = { packet = "32e7cf87-7d8e-4764-94a3-3b0cfa8548c4", step = "a40668dd-27d0-467b-822c-10f5d28b657a", question = "Q1", decided_by = "emp-david", decided_at = "2026-10-02T23:53:23.553088Z" }
+
 # THE MACHINES — the estate's nodes and their roles, declared here and
 # published on every pod start by the launcher (`boss estate declare`,
 # infra/seed-estate.sh) through POST /api/estate/nodes/batch,

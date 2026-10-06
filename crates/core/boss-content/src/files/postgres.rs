@@ -28,15 +28,28 @@ impl PgFileRepository {
 }
 
 fn store(e: sqlx::Error) -> FileError {
-    // Map the unique-constraint violation on (bucket, object_key) to
-    // the structured DuplicateObject variant so callers can branch on
-    // it without parsing error strings.
-    if let sqlx::Error::Database(db_err) = &e
-        && db_err.constraint() == Some("file_refs_bucket_object_key_key")
-    {
-        return FileError::DuplicateObject(db_err.message().to_string());
-    }
     FileError::Repository(e.to_string())
+}
+
+/// The INSERT's refusals, in the words the in-memory double uses.
+/// Until the adapters-agree suite (backlog be459ab9) a taken key
+/// answered `DuplicateObject` carrying the constraint's raw message
+/// where the variant's Display promises the sha256, and a taken id
+/// answered `Repository` carrying the primary key's raw text (a 500
+/// at the door). Any other failure stays `Repository`.
+fn refused_insert(e: sqlx::Error, draft: &FileRefDraft) -> FileError {
+    if let sqlx::Error::Database(db_err) = &e {
+        match db_err.constraint() {
+            Some("file_refs_bucket_object_key_key") => {
+                return FileError::DuplicateObject(draft.sha256.clone());
+            }
+            Some("file_refs_pkey") => {
+                return FileError::Validation(format!("file {} already exists", draft.id));
+            }
+            _ => {}
+        }
+    }
+    store(e)
 }
 
 fn row_to_file_ref(row: &sqlx::postgres::PgRow) -> Result<FileRef, FileError> {
@@ -68,6 +81,7 @@ impl FileRepository for PgFileRepository {
         draft: FileRefDraft,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<FileRef, FileError> {
+        draft.validate()?;
         let mut tx = self.pool.begin().await.map_err(store)?;
         sqlx::query(
             "INSERT INTO file_refs (
@@ -89,7 +103,7 @@ impl FileRepository for PgFileRepository {
         .bind(draft.uploaded_at)
         .execute(&mut *tx)
         .await
-        .map_err(store)?;
+        .map_err(|e| refused_insert(e, &draft))?;
         let row = draft.into_ref();
         // OUTBOX (phase 2): the attached event (the full FileRef —
         // its event id IS the row id per the design's identity
@@ -127,7 +141,7 @@ impl FileRepository for PgFileRepository {
              FROM file_refs
              WHERE target_kind = $1 AND target_id = $2
                AND deleted_at IS NULL
-             ORDER BY uploaded_at DESC",
+             ORDER BY uploaded_at DESC, id",
         )
         .bind(target.kind.as_str())
         .bind(&target.id)
@@ -144,7 +158,7 @@ impl FileRepository for PgFileRepository {
                     uploaded_by, uploaded_at, deleted_at
              FROM file_refs
              WHERE sha256 = $1
-             ORDER BY uploaded_at DESC",
+             ORDER BY uploaded_at DESC, id",
         )
         .bind(sha256)
         .fetch_all(&self.pool)

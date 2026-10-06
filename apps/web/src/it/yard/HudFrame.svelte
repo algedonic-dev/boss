@@ -28,6 +28,7 @@
   import { safeLinkHref } from '@boss/web-kit/links';
   import type { Remote } from '../../data/remote';
   import type { Regions } from './regions';
+  import { NOT_IN_SCOPE } from '../../policy/withheld';
   import {
     headerOf,
     machineHref,
@@ -202,6 +203,14 @@
             <!-- A dark source is its own line, `?` and why — the rest of
                  the board still reads. -->
             <div class="dep-what">{@render unreadLine(l.why ?? '')}</div><span></span><span></span>
+          {:else if l.state === 'withheld'}
+            <!-- Withheld by policy scope (bd506215): the row as itself,
+                 said neutral — no `?`, which is a failure's picture. -->
+            <div class="dep-what" title={l.why ?? ''}>
+              <span class="dep-title">{l.title}</span>
+              <span class="dep-basis">{NOT_IN_SCOPE}</span>
+            </div>
+            <span class="dep-time dep-none">—</span><span></span>
           {:else}
             <div class="dep-what">
               <span class="dep-title">{l.title}</span>

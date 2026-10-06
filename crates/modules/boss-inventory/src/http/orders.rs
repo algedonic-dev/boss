@@ -110,7 +110,7 @@ pub(super) async fn create_order<R: InventoryRepository + 'static>(
             Json(serde_json::json!({"ok": true, "id": po_id})),
         )
             .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => super::error_response(e),
     }
 }
 
@@ -143,7 +143,7 @@ pub(super) async fn batch_create_orders<R: InventoryRepository + 'static>(
             .create_purchase_order_at(po, now, &stamp)
             .await
         {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            return super::error_response(e);
         }
         inserted += 1;
     }
@@ -213,6 +213,6 @@ pub(super) async fn update_order_status<R: InventoryRepository + 'static>(
         Err(InventoryError::NotFound(id)) => {
             (StatusCode::NOT_FOUND, format!("PO not found: {id}")).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => super::error_response(e),
     }
 }

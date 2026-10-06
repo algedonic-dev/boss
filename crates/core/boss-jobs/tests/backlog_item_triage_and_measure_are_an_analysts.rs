@@ -136,20 +136,17 @@ fn before(to: &WorkflowSpec) -> WorkflowSpec {
 fn packet_at_triage(from: &WorkflowSpec) -> (Job, Vec<Step>) {
     let job = Job {
         id: JobId::new(),
-        kind: "backlog-item".into(),
         workflow_version: from.version,
-        subject: Subject::new("custom", "bosspipeline"),
-        title: "an untriaged item".into(),
-        owner_id: "emp-1".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: chrono::NaiveDate::from_ymd_opt(2026, 9, 24).expect("a date"),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "backlog-item",
+            Subject::new("custom", "bosspipeline"),
+            "an untriaged item",
+            "emp-1",
+            Priority::Standard,
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 24).expect("a date"),
+        )
     };
     let steps = materialize_steps_at(
         from,

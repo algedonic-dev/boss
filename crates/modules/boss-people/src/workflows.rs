@@ -21,8 +21,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use boss_core::publisher::DomainPublisher;
-use boss_policy::{Action, Resource};
-use boss_policy_client::{CurrentUser, PolicyClient};
+use boss_policy_client::{CurrentUser, PolicyClient, controls};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -138,13 +137,8 @@ async fn update_status(
 ) -> Response {
     // A status change writes the employee row and its change log: the
     // Update grant the PUT of the row needs (backlog 69906ab9).
-    if let Err(refused) = crate::grants::require(
-        state.policy.as_ref(),
-        &user,
-        Action::Update,
-        Resource::employee(),
-    )
-    .await
+    if let Err(refused) =
+        crate::grants::require(state.policy.as_ref(), &user, controls::UPDATE_EMPLOYEE).await
     {
         return refused;
     }
@@ -242,13 +236,8 @@ async fn record_change(
 ) -> Response {
     // Recording a change is editing the employee: the Update grant a
     // PUT of the row needs (backlog 8cdad84c).
-    if let Err(refused) = crate::grants::require(
-        state.policy.as_ref(),
-        &user,
-        Action::Update,
-        Resource::employee(),
-    )
-    .await
+    if let Err(refused) =
+        crate::grants::require(state.policy.as_ref(), &user, controls::UPDATE_EMPLOYEE).await
     {
         return refused;
     }
@@ -279,13 +268,8 @@ async fn start_onboarding(
 ) -> Response {
     // A status change writes the employee row and its change log: the
     // Update grant the PUT of the row needs (backlog 69906ab9).
-    if let Err(refused) = crate::grants::require(
-        state.policy.as_ref(),
-        &user,
-        Action::Update,
-        Resource::employee(),
-    )
-    .await
+    if let Err(refused) =
+        crate::grants::require(state.policy.as_ref(), &user, controls::UPDATE_EMPLOYEE).await
     {
         return refused;
     }
@@ -307,13 +291,8 @@ async fn start_offboarding(
 ) -> Response {
     // A status change writes the employee row and its change log: the
     // Update grant the PUT of the row needs (backlog 69906ab9).
-    if let Err(refused) = crate::grants::require(
-        state.policy.as_ref(),
-        &user,
-        Action::Update,
-        Resource::employee(),
-    )
-    .await
+    if let Err(refused) =
+        crate::grants::require(state.policy.as_ref(), &user, controls::UPDATE_EMPLOYEE).await
     {
         return refused;
     }
@@ -444,6 +423,7 @@ mod tests {
     //! so the pool is lazy and pointed at a host that cannot resolve.
     use super::*;
     use boss_policy::Scope;
+    use boss_policy::{Action, Resource};
     use boss_policy_client::FakePolicyClient;
     use boss_testing::TestRequest;
 

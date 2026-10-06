@@ -95,20 +95,16 @@ fn approved() -> Value {
 async fn seed(jobs: &Arc<InMemoryJobs>, id: &str) -> Step {
     let job = Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
-        kind: "field-service".into(),
-        workflow_version: 1,
-        subject: Subject::new("asset", "SYS-1"),
-        title: "A packet with an approval on it".into(),
-        owner_id: "emp-1".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "field-service",
+            Subject::new("asset", "SYS-1"),
+            "A packet with an approval on it",
+            "emp-1",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
+        )
     };
     jobs.create_job(&job).await.unwrap();
     let mut step = Step::new(job.id, "sign-off", "Approve the change", 0)
@@ -311,16 +307,17 @@ async fn an_approval_withdrawn_by_reject_does_not_come_back() {
 
 /// THE WHOLE-STEP PUT is the other door that moves content, and it
 /// voids the same way: its own `jobs.step.updated` carries the void (the
-/// row the rebuild replays), and so does the row.
+/// row the rebuild replays), and so does the row. The PUT writes no
+/// metadata since e39a9d2a (Stage 2's last car), so the content it can
+/// still move is the title — which the shape hash covers — and the A-B-A
+/// runs through that.
 #[tokio::test]
 async fn an_approval_edited_away_through_the_put_does_not_come_back() {
     let (app, jobs) = build_app();
     let step = seed(&jobs, "00000000-0000-0000-0000-00000000c803").await;
     assert_eq!(sign(&app, &step).await.0, StatusCode::OK);
 
-    let mut rejected = approved();
-    rejected["decision"] = json!("rejected");
-    let (status, body) = put(&app, &step, json!({"metadata": rejected})).await;
+    let (status, body) = put(&app, &step, json!({"title": "Approve a different change"})).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     let updated: Vec<Value> = jobs
         .recorded_events()
@@ -335,9 +332,14 @@ async fn an_approval_edited_away_through_the_put_does_not_come_back() {
     );
     assert_eq!(invalidations(&jobs).len(), 1);
 
-    let (status, body) = put(&app, &step, json!({"metadata": approved()})).await;
+    let (status, body) = put(&app, &step, json!({"title": step.title})).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     let row = stored(&jobs, &step).await;
+    assert_eq!(
+        boss_core::job::step_shape_hash(&step.title, &row["metadata"]),
+        row["sign_offs"][0]["shape_hash"].as_str().unwrap(),
+        "the step is back on exactly the shape the stamp signed"
+    );
     assert!(
         row["sign_offs"][0]["voided_at"].is_string(),
         "restoring the content through the PUT lifts nothing: {row}"

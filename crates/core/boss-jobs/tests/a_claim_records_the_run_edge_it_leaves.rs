@@ -58,20 +58,16 @@ async fn seeded(jobs: &InMemoryJobs, status: StepStatus, holder: Option<&str>) -
     let job_id = JobId::from_uuid(Uuid::new_v4());
     let job = Job {
         id: job_id,
-        kind: "backlog-item".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "/it/backlog"),
-        title: "A step the previous run left its edge on".into(),
-        owner_id: "emp-owner".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 23).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "backlog-item",
+            Subject::new("custom", "/it/backlog"),
+            "A step the previous run left its edge on",
+            "emp-owner",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 23).unwrap(),
+        )
     };
     let mut step = Step::new(job_id, "task", "Build it", 0);
     step.assignee_id = holder.map(str::to_string);

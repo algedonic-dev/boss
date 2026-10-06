@@ -56,8 +56,8 @@ use statements::*;
 use tax::*;
 use tax_registry::*;
 
-/// Who may write, asked of policy (backlog 34f0a954, 2026-09-28):
-/// `action` on `resource` through the registry-write ladder
+/// Who may write, asked of policy (backlog 34f0a954, 2026-09-28): a
+/// declared control through the registry-write ladder
 /// ([`boss_policy_client::writes::require_registry_write`], the classes
 /// doors' since 553cf479) — no caller 401, a deny or a grant narrower
 /// than `all` 403 (the books belong to no person and no department), a
@@ -79,19 +79,13 @@ use tax_registry::*;
 async fn require_write(
     parts: &mut axum::http::request::Parts,
     state: &Arc<LedgerApiState>,
-    action: boss_policy_client::Action,
-    resource: boss_policy_client::Resource,
+    control: boss_policy_client::Pair,
 ) -> Result<User, Response> {
     use axum::extract::FromRequestParts;
     let boss_policy_client::CurrentUser(user) =
         boss_policy_client::CurrentUser::from_request_parts(parts, state).await?;
-    boss_policy_client::writes::require_registry_write(
-        state.policy.as_ref(),
-        &user,
-        action,
-        resource,
-    )
-    .await?;
+    boss_policy_client::writes::require_registry_write(state.policy.as_ref(), &user, control)
+        .await?;
     Ok(user)
 }
 
@@ -124,10 +118,10 @@ pub(super) struct PostingRuleCreate(pub(super) User);
 /// a grant that may only change a row must not add one.
 pub(super) struct TaxRegimeCreate(pub(super) User);
 
-/// Each extractor above is one `(action, resource)` pair asked through
-/// [`require_write`]; the pair is the whole difference between them.
+/// Each extractor above is one declared control asked through
+/// [`require_write`]; the control is the whole difference between them.
 macro_rules! asks {
-    ($door:ident, $action:ident, $resource:ident) => {
+    ($door:ident, $control:ident) => {
         impl axum::extract::FromRequestParts<Arc<LedgerApiState>> for $door {
             type Rejection = Response;
 
@@ -135,23 +129,18 @@ macro_rules! asks {
                 parts: &mut axum::http::request::Parts,
                 state: &Arc<LedgerApiState>,
             ) -> Result<Self, Response> {
-                require_write(
-                    parts,
-                    state,
-                    boss_policy_client::Action::$action,
-                    boss_policy_client::Resource::$resource(),
-                )
-                .await
-                .map(Self)
+                require_write(parts, state, boss_policy_client::controls::$control)
+                    .await
+                    .map(Self)
             }
         }
     };
 }
 
-asks!(LedgerCreate, Create, ledger);
-asks!(LedgerUpdate, Update, ledger);
-asks!(PostingRuleCreate, Create, posting_rule);
-asks!(TaxRegimeCreate, Create, tax_regime);
+asks!(LedgerCreate, CREATE_LEDGER);
+asks!(LedgerUpdate, UPDATE_LEDGER);
+asks!(PostingRuleCreate, CREATE_POSTING_RULE);
+asks!(TaxRegimeCreate, CREATE_TAX_REGIME);
 
 #[derive(Clone)]
 pub struct LedgerApiState {
@@ -207,11 +196,7 @@ async fn require_ledger_read(
     }
     match state
         .policy
-        .check(
-            &user,
-            boss_policy_client::Action::Read,
-            boss_policy_client::Resource::ledger(),
-        )
+        .ask(&user, boss_policy_client::controls::READ_LEDGER)
         .await
     {
         Ok(d) if d.is_allowed() => next.run(req).await,
@@ -273,15 +258,11 @@ pub(crate) async fn stamp_as(
 async fn authorize_declaration(
     state: &LedgerApiState,
     user: &User,
-    resource: boss_policy_client::Resource,
+    control: boss_policy_client::Pair,
 ) -> Result<boss_core::publisher::EventStamp, Response> {
-    let actor = boss_policy_client::writes::require_registry_write(
-        state.policy.as_ref(),
-        user,
-        boss_policy_client::Action::Create,
-        resource,
-    )
-    .await?;
+    let actor =
+        boss_policy_client::writes::require_registry_write(state.policy.as_ref(), user, control)
+            .await?;
     Ok(stamp_as(state, actor).await)
 }
 

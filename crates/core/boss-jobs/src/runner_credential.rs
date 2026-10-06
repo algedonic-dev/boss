@@ -36,18 +36,21 @@
 //! header is REMOVED before the request goes on, so no handler, log or
 //! proxy downstream ever holds the value.
 //!
-//! WHO FILLS THE SLOTS. The credential broker, from the next car of the
-//! design: a `credential.rotate.*` handler that mints the value, writes it
-//! into the Secret this directory is the mount of, verifies it by effect
-//! through [`WHOAMI_PATH`], and delivers it to the host's runner file.
-//! Until that Secret is mounted there is no directory, every request
-//! reads as uncredentialed, and nothing any caller sees changes — the
-//! machine token's deploy-order posture. So `runner:ops` is NOT yet in
-//! [`crate::field_writer::RESOLVABLE_PRINCIPALS`]: a door with no
-//! credential behind it resolves nobody, and a protocol that declared the
-//! writer now would lock the runner out of its own plan — the approval
-//! David signs would never be offered. The principal enters that list in
-//! the car that delivers a credential the runner can present.
+//! WHO FILLS THE SLOTS. The credential broker (backlog 1e50e66b): the
+//! `credential.rotate.ops-runner` handler mints a host's value into
+//! `<host>.next` of Secret `boss/ops-runner-credential` — this directory
+//! is its mount (boss.yaml) — verifies it by effect through
+//! [`WHOAMI_PATH`], and promotes it to `current` once the host's deposit
+//! (infra/forge/runner-credential-deposit.sh) has installed it and
+//! recorded delivery. With no Secret there is an empty directory, every
+//! request reads as uncredentialed, and nothing any caller sees changes —
+//! the machine token's deploy-order posture. `runner:ops` is NOT yet in
+//! [`crate::field_writer::RESOLVABLE_PRINCIPALS`]: only the forge has a
+//! delivery today (boss-gcp's waits on the remote deposit, backlog
+//! 7336cb5f), and a protocol that declared the writer before every runner
+//! host could present a credential would lock that host's runner out of
+//! its own plan — the approval David signs would never be offered. The
+//! principal enters that list once both hosts are delivered.
 //!
 //! NO VALUE LEAVES THIS MODULE. Not in a log line, an error, the whoami
 //! answer or a hash of one; a slot is named by its file name only.

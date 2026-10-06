@@ -55,19 +55,19 @@ fn opened_output() -> String {
     format!(
         "publish-github-pr: packet 254177e2 — open-pr ready; publishing forge main as publish/2026-09-18-<snapshot>\n\
          publish-github-pr: snapshot {SNAPSHOT} (tree t of forge f, parent mirror m) — branch publish/2026-09-18-28554177812c\n\
-         publish-github-pr: pushed publish/2026-09-18-28554177812c to the forge as david — the off-site push carries it too\n\
-         publish-github-pr: pushed dauld:publish/2026-09-18-28554177812c\n\
+         publish-github-pr: pushed publish/2026-09-18-28554177812c to the forge as david — algedonic-dev/boss gets it from this verb alone\n\
+         publish-github-pr: pushed algedonic-dev:publish/2026-09-18-28554177812c to algedonic-dev/boss\n\
          publish-github-pr: opened {PR_URL} at {SNAPSHOT}\n\
-         publish-github-pr: done — {PR_URL} (open-pr on 254177e2 completed; the merge is David's)\n"
+         publish-github-pr: done — {PR_URL} carries {SNAPSHOT} (open-pr on 254177e2 completed; the App merges it once every check main requires is green — merge-publish-pr)\n"
     )
 }
 
 /// The re-run's line: the PR found open for the run's own branch.
 fn reused_output() -> String {
     format!(
-        "publish-github-pr: pushed dauld:publish/2026-09-18-28554177812c\n\
-         publish-github-pr: PR already open for dauld:publish/2026-09-18-28554177812c — reusing {PR_URL} at {SNAPSHOT}\n\
-         publish-github-pr: done — {PR_URL} (open-pr on 254177e2 completed; the merge is David's)\n"
+        "publish-github-pr: pushed algedonic-dev:publish/2026-09-18-28554177812c to algedonic-dev/boss\n\
+         publish-github-pr: PR already open for algedonic-dev:publish/2026-09-18-28554177812c — reusing {PR_URL} at {SNAPSHOT}\n\
+         publish-github-pr: done — {PR_URL} carries {SNAPSHOT} (open-pr on 254177e2 completed; the App merges it once every check main requires is green — merge-publish-pr)\n"
     )
 }
 

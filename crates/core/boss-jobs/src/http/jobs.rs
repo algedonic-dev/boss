@@ -59,6 +59,13 @@ pub(super) struct ListJobsQuery {
     /// user-feedback packets to show 14 live ones and was 27 short of
     /// silently truncating at its own limit.
     closed_within: Option<i64>,
+    /// `terminal=true` keeps only closed or cancelled packets,
+    /// `terminal=false` only draft or open ones; absent is both. It
+    /// ANDs with `closed_within`, so `terminal=true&closed_within=30`
+    /// is the last thirty days' departures and nothing live — the read
+    /// a department page makes apart from its live packets, each with
+    /// its own `total` (backlog a22311a1; `JobFilter::terminal`).
+    terminal: Option<bool>,
     /// `partition=real|simulated|shadow` keeps ONE partition; absent
     /// is everything, so no existing caller moves. 87% of packets are
     /// simulated, so a surface that wants real work has to say so in
@@ -308,7 +315,7 @@ pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static
     // return an empty collection so the UI shows a clean empty state
     // instead of a 403 noise. (If you need to know *why*, call /check
     // explicitly.)
-    let predicate = match state.policy.scope_predicate(&user, Resource::job()).await {
+    let predicate = match state.policy.scope_of(&user, controls::READ_JOB).await {
         Ok(p) => p,
         Err(e) => {
             return e.into_response();
@@ -317,9 +324,9 @@ pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static
 
     // Translate the Predicate into a JobScope the adapter can push
     // into SQL — shared with the station queue lens
-    // (`job_scope_from_predicate`), so every packet read surface
+    // (`JobScope::from_predicate`), so every packet read surface
     // passes through one policy path.
-    let scope = job_scope_from_predicate(&user, &predicate);
+    let scope = JobScope::from_predicate(&user, &predicate);
 
     // The two metadata filters are refused at the boundary rather than
     // bound as-is: a document or key the SQL would accept and match
@@ -350,6 +357,7 @@ pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static
         subject_id: q.subject_id,
         waiting_on: q.waiting_on,
         closed_since: closed_since_from(q.closed_within, &state).await,
+        terminal: q.terminal,
         metadata_contains,
         metadata_has,
         scope,
@@ -779,7 +787,7 @@ pub(super) struct JobsSummaryQuery {
 /// door: a caller the policy denies is refused 403, an outage is 503,
 /// and an allowed caller's counts are taken under the scope the list
 /// takes its rows under (the same `scope_to_predicate` →
-/// [`job_scope_from_predicate`] translation), so they equal what
+/// [`JobScope::from_predicate`] translation), so they equal what
 /// `/api/jobs?status=` totals for that caller. The public landing's
 /// open counts are `/api/jobs/live`, which stays unscoped by design.
 pub(super) async fn jobs_summary<R: JobsRepository + 'static, B: EventBus + 'static>(
@@ -791,7 +799,7 @@ pub(super) async fn jobs_summary<R: JobsRepository + 'static, B: EventBus + 'sta
         Ok(scope) => scope,
         Err(refusal) => return refusal,
     };
-    let scope = job_scope_from_predicate(
+    let scope = JobScope::from_predicate(
         &user,
         &boss_policy_client::scope_to_predicate(&scope, &user),
     );
@@ -835,7 +843,7 @@ pub(super) async fn jobs_kinds<R: JobsRepository + 'static, B: EventBus + 'stati
         Ok(scope) => scope,
         Err(refusal) => return refusal,
     };
-    let scope = job_scope_from_predicate(
+    let scope = JobScope::from_predicate(
         &user,
         &boss_policy_client::scope_to_predicate(&scope, &user),
     );
@@ -880,6 +888,7 @@ pub(super) async fn jobs_live<R: JobsRepository + 'static, B: EventBus + 'static
         department: None,
         status: Some(boss_core::job::JobStatus::Open),
         closed_since: None,
+        terminal: None,
         priority: None,
         owner_id: None,
         subject_id: None,
@@ -1268,11 +1277,7 @@ async fn refuse_an_unpublished_arm_without_publish<R: JobsRepository, B: EventBu
     if not_active.is_empty() {
         return None;
     }
-    match state
-        .policy
-        .check(user, Action::Publish, Resource::workflow())
-        .await
-    {
+    match state.policy.ask(user, controls::PUBLISH_WORKFLOW).await {
         Ok(Decision::Allow { .. }) => None,
         Ok(Decision::Deny { reason }) => Some(
             (
@@ -2436,14 +2441,14 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
     // `update` on job only to platform-admin and break-glass, and both
     // hold `close`, so none lost it there.
     let ends = |s: JobStatus| matches!(s, JobStatus::Closed | JobStatus::Cancelled);
-    let action = if ends(job.status) && !ends(old_status) {
-        Action::Close
+    let control = if ends(job.status) && !ends(old_status) {
+        controls::CLOSE_JOB
     } else {
-        Action::Update
+        controls::UPDATE_JOB
     };
 
     // Policy check: role allowed to perform this action on Jobs at all?
-    let decision = match state.policy.check(&user, action, Resource::job()).await {
+    let decision = match state.policy.ask(&user, control).await {
         Ok(d) => d,
         Err(e) => {
             return e.into_response();
@@ -2593,7 +2598,7 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
     // them, win; what this guarantees is that neither is absent. (A
     // cancel takes the Close authority but was never stamped, and still
     // is not: nothing that reads a cycle time reads a cancel.)
-    if action == Action::Close && job.status == JobStatus::Closed {
+    if control == controls::CLOSE_JOB && job.status == JobStatus::Closed {
         let now = boss_clock_client::now_from(&state.clock).await;
         stamp_close_instant(&mut job, &now);
     }
@@ -2803,11 +2808,7 @@ pub(super) async fn patch_job_metadata<R: JobsRepository + 'static, B: EventBus 
     };
 
     // Policy gate mirrors update_job's Update arm exactly.
-    let decision = match state
-        .policy
-        .check(&user, Action::Update, Resource::job())
-        .await
-    {
+    let decision = match state.policy.ask(&user, controls::UPDATE_JOB).await {
         Ok(d) => d,
         Err(e) => {
             return e.into_response();
@@ -3000,7 +3001,7 @@ async fn judge_move<R: JobsRepository + 'static, B: EventBus + 'static>(
     user: &boss_policy_client::User,
     id: &str,
     to_version: Option<i32>,
-    action: Action,
+    control: Pair,
 ) -> Result<JudgedMove, NoMove> {
     let answer = |r: Response| NoMove::Answer(r);
     // THE PREVIEW IS A PACKET READ, and answers as the detail read does
@@ -3010,7 +3011,7 @@ async fn judge_move<R: JobsRepository + 'static, B: EventBus + 'static>(
     // the scope is the same 404 an absent one is — by full id and by
     // short one. It used to look the packet up first and answer 404 for
     // an absent id but 403 for a real one: an existence oracle.
-    let existing = if action == Action::Read {
+    let existing = if control == controls::READ_JOB {
         let scope = job_read_scope(state, user).await.map_err(answer)?;
         readable_path_job(state, user, &scope, id)
             .await
@@ -3019,7 +3020,7 @@ async fn judge_move<R: JobsRepository + 'static, B: EventBus + 'static>(
         // The move itself: the write's own check, still asked before
         // the lookup, and a packet outside its scope is refused as the
         // job writes refuse one.
-        let scope = match state.policy.check(user, action, Resource::job()).await {
+        let scope = match state.policy.ask(user, control).await {
             Ok(Decision::Allow { scope }) => scope,
             Ok(Decision::Deny { reason }) => {
                 return Err(answer((StatusCode::FORBIDDEN, reason).into_response()));
@@ -3189,7 +3190,7 @@ pub(super) async fn preview_convert_job<R: JobsRepository + 'static, B: EventBus
     CurrentUser(user): CurrentUser,
     Query(q): Query<ConvertQuery>,
 ) -> Response {
-    let judged = match judge_move(&state, &user, &id, q.to_version, Action::Read).await {
+    let judged = match judge_move(&state, &user, &id, q.to_version, controls::READ_JOB).await {
         Ok(j) => j,
         Err(NoMove::Answer(r)) => return r,
     };
@@ -3251,10 +3252,12 @@ pub(super) async fn convert_job<R: JobsRepository + 'static, B: EventBus + 'stat
         .get("to_version")
         .and_then(serde_json::Value::as_i64)
         .map(|v| v as i32);
-    if let Err(refusal) = super::kinds::policy_check(&state, &user, Action::Publish).await {
+    if let Err(refusal) =
+        super::kinds::policy_check(&state, &user, controls::PUBLISH_WORKFLOW).await
+    {
         return refusal;
     }
-    let judged = match judge_move(&state, &user, &id, want, Action::Update).await {
+    let judged = match judge_move(&state, &user, &id, want, controls::UPDATE_JOB).await {
         Ok(j) => j,
         Err(NoMove::Answer(r)) => return r,
     };
@@ -3553,11 +3556,7 @@ pub(super) async fn estate_read_refusal<R: JobsRepository + 'static, B: EventBus
     user: &boss_policy_client::User,
     what: &str,
 ) -> Option<Response> {
-    match state
-        .policy
-        .check(user, Action::Read, Resource::estate())
-        .await
-    {
+    match state.policy.ask(user, controls::READ_ESTATE).await {
         Ok(Decision::Allow {
             scope: boss_policy_client::Scope::All,
         }) => None,

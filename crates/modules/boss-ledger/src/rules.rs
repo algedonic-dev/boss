@@ -72,8 +72,15 @@ pub trait RuleSet: Send + Sync {
 /// would double-post. It is reconstructable from the log (the inert pass
 /// in `rebuild_facts.rs`) yet stays GL-inert — hence both off the
 /// `gl_fact_projection_rules` registry AND skipped here.
+///
+/// `finance.inventory.consumed` is the same proof for a consume that
+/// drained no value (backlog 55f69172): it gates a redelivered
+/// `on_hand -= qty` and moved no cents, so there is nothing to post.
 pub fn is_gl_inert(kind: &str) -> bool {
-    matches!(kind, "finance.inventory.received")
+    matches!(
+        kind,
+        "finance.inventory.received" | "finance.inventory.consumed"
+    )
 }
 
 /// The fact kinds whose code rule credits a revenue account chosen by

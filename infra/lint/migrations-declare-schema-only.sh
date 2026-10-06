@@ -101,7 +101,10 @@ CUTOVER="20260918112134"
 # (infra/platform/delivery-policy/ — newest insert
 # 202609050500-the-ci-host-floor-is-forty.sql, older than the cutover;
 # 20260918102236 is newer but only DROPs a column, which is schema).
-REGISTRY_TABLES="stations step_plugins cadence_rules delivery_policy"
+# automation_actors: born a bundle (infra/platform/automations/,
+# backlog ddf0773e, 2026-10-01) — no migration ever inserted a row, so
+# the cutover needs no exemption for it.
+REGISTRY_TABLES="stations step_plugins cadence_rules delivery_policy automation_actors"
 
 # The registries whose rows change through an evented door, so a
 # migration may not UPDATE or DELETE FROM them at all (backlog

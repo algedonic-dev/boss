@@ -235,19 +235,13 @@ async fn open_at_build(app: &axum::Router) -> String {
     .await;
     assert_eq!(status, StatusCode::CREATED, "job create: {job}");
     let id = job["id"].as_str().expect("job id").to_string();
-    let full = get_job(app, &id).await;
-    let scope = step_named(&full, "scope").clone();
-    let scope_id = scope["id"].as_str().expect("step id");
-    let (status, body) = send(
+    complete(
         app,
-        req(
-            "PUT",
-            &format!("/api/jobs/{id}/steps/{scope_id}"),
-            scope_completion(&scope["metadata"]),
-        ),
+        &id,
+        "scope",
+        serde_json::json!({"summary": "s", "excludes": "e"}),
     )
     .await;
-    assert!(status.is_success(), "complete scope: {status}: {body}");
     id
 }
 
@@ -399,16 +393,8 @@ async fn a_move_that_demands_evidence_retroactively_is_refused_and_writes_nothin
             .find(|st| st.title == "scope")
             .expect("scope");
         scope.fields.push(boss_core::job::StepField {
-            name: "blast_radius".into(),
-            field_type: "string".into(),
             required: true,
-            filled_by: boss_core::job::FilledBy::Executor,
-            item_keys: Vec::new(),
-            covers: None,
-            binds: None,
-            item_value_max_bytes: None,
-            item_one_of: Vec::new(),
-            writer: None,
+            ..boss_core::job::StepField::new("blast_radius", "string")
         });
     })
     .await;
@@ -626,23 +612,31 @@ fn backlog_v2() -> WorkflowSpec {
     spec
 }
 
-/// Complete `slug` as a read-merge-write, laying `fields` over the
-/// metadata it holds (the step PUT refuses a body that omits a stored
-/// key, e39a9d2a).
+/// Complete `slug`: `fields` through the step merge door (every stored
+/// key it leaves out is kept), then the status alone — the step PUT
+/// writes no metadata since backlog e39a9d2a.
 async fn complete(app: &axum::Router, id: &str, slug: &str, fields: serde_json::Value) {
     let full = get_job(app, id).await;
     let step = step_named(&full, slug).clone();
-    let mut metadata = step["metadata"].clone();
-    for (k, v) in fields.as_object().expect("fields").iter() {
-        metadata[k] = v.clone();
-    }
     let step_id = step["id"].as_str().expect("step id");
+    if !fields.as_object().expect("fields").is_empty() {
+        let (status, body) = send(
+            app,
+            req(
+                "PATCH",
+                &format!("/api/jobs/{id}/steps/{step_id}/metadata"),
+                fields,
+            ),
+        )
+        .await;
+        assert!(status.is_success(), "write {slug}'s keys: {status}: {body}");
+    }
     let (status, body) = send(
         app,
         req(
             "PUT",
             &format!("/api/jobs/{id}/steps/{step_id}"),
-            serde_json::json!({"status": "completed", "metadata": metadata}),
+            serde_json::json!({"status": "completed"}),
         ),
     )
     .await;
@@ -889,15 +883,4 @@ async fn a_backlog_item_whose_build_is_ready_is_still_refused() {
     assert_eq!(after["workflow_version"], 2, "the pin stays");
     assert!(after["metadata"].get("repins").is_none(), "{after}");
     assert!(repinned_events(&app.jobs).is_empty());
-}
-
-/// The scope completion as a read-merge-write: the step's stored
-/// metadata with the evidence laid over it. The step PUT refuses a
-/// metadata body that omits a stored key (e39a9d2a), so a completer
-/// sends back everything it read.
-fn scope_completion(stored: &serde_json::Value) -> serde_json::Value {
-    let mut metadata = stored.clone();
-    metadata["summary"] = serde_json::json!("s");
-    metadata["excludes"] = serde_json::json!("e");
-    serde_json::json!({"status": "completed", "metadata": metadata})
 }

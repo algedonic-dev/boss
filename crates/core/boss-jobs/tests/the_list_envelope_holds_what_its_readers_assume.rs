@@ -159,21 +159,17 @@ fn ceo() -> User {
 fn packet(kind: &str, n: usize, status: JobStatus) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::new_v4()),
-        kind: kind.into(),
-        workflow_version: 1,
-        subject: Subject::new("branch", format!("fix/{kind}-{n}")),
-        title: format!("{kind} #{n}"),
-        owner_id: "emp-david".into(),
         status,
-        priority: Priority::Standard,
         // Distinct days so the list order is total, not a tie.
-        opened_on: day(1 + n as u32),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            kind,
+            Subject::new("branch", format!("fix/{kind}-{n}")),
+            format!("{kind} #{n}"),
+            "emp-david",
+            Priority::Standard,
+            day(1 + n as u32),
+        )
     }
 }
 

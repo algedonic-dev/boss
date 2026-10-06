@@ -179,18 +179,37 @@ async fn held_car(app: &axum::Router, branch: &str) -> String {
             break;
         }
         for s in actionable {
-            let mut metadata = s["metadata"].clone();
+            // The required fields go through the step merge door, then
+            // the status alone through the PUT: the PUT refuses any body
+            // carrying metadata since e39a9d2a, so a completion is two
+            // writes, as every surface now makes it.
+            let step_path = format!("/api/jobs/{id}/steps/{}", s["id"].as_str().unwrap());
+            let mut required = serde_json::Map::new();
             for f in s["fields"].as_array().into_iter().flatten() {
                 if f["required"].as_bool() == Some(true) {
                     let name = f["name"].as_str().unwrap_or_default();
-                    metadata[name] = json!("x");
+                    required.insert(name.to_string(), json!("x"));
                 }
+            }
+            if !required.is_empty() {
+                let (status, body) = send(
+                    app,
+                    "PATCH",
+                    &format!("{step_path}/metadata"),
+                    Some(Value::Object(required)),
+                )
+                .await;
+                assert!(
+                    status.is_success(),
+                    "writing {}'s fields: {status} {body}",
+                    s["title"]
+                );
             }
             let (status, body) = send(
                 app,
                 "PUT",
-                &format!("/api/jobs/{id}/steps/{}", s["id"].as_str().unwrap()),
-                Some(json!({ "status": "completed", "metadata": metadata })),
+                &step_path,
+                Some(json!({ "status": "completed" })),
             )
             .await;
             assert!(

@@ -1,0 +1,80 @@
+# boss-break-glass-deposit CronJob (infra/cluster/manifests/boss-break-glass-deposit.yaml)
+#
+# The daily deposit of the break-glass kubeconfig on boss-gcp (backlog
+# 7336cb5f). Its packet is where a refusal is READ: the run's `output`
+# carries the verification lines — each can-i answer and each dry-run
+# patch verdict — and, when the deposit key is new or not yet
+# authorized, the authorized_keys line David places on boss-gcp. No
+# value ever reaches it: the script prints paths, byte counts and
+# verdicts only (break_glass_deposit_sh.rs holds that).
+#
+# THREE ENDINGS, one per thing a run can honestly say (backlog
+# 17a7bd18, red_until_deny; review b6d2a716 of 7336cb5f):
+#   completed  deposited, or boss-gcp already held the bytes;
+#   not-yet    reached by no run since the image-only policy's Deny car
+#              (backlog e4a9a9b3). While the policy (4e1c33b4) only
+#              REPORTED, an accepted must-refuse patch exited 75 and
+#              closed here; after Deny that same patch is a refusal,
+#              because a binding deleted or moved off Deny widens a
+#              credential boss-gcp may hold (review 0d3019f0, F1). The
+#              Job no longer exits 75, and its manifest does not set
+#              BOSS_CHORE_NOT_YET_ON_75, the only way boss-chore.sh
+#              records result=not-yet;
+#   failed     anything else: a refusal, whose RED line the chore judge
+#              files as a backlog-item
+#              (file-backlog-items-on-break-glass-deposit-red), or the
+#              first run's authorized_keys line for David, which rides a
+#              RED line of its own for the same reason.
+# `failed` excludes not-yet by name, so the two terminals never race.
+[[workflow]]
+kind = "maintenance-break-glass-deposit"
+label = "Break-glass kubeconfig deposit to boss-gcp"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "The daily 17:20 UTC deposit of the break-glass operator's kubeconfig on boss-gcp, verified by effect in both directions first (boss-break-glass-deposit)."
+metadata = { department = "it", owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "scheduled"
+kind = "trigger"
+ready_when = "true"
+title_template = "Timer fired"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "cluster-cronjob" }
+
+[[workflow.step]]
+title = "run"
+kind = "task"
+ready_when = "steps.scheduled.done"
+title_template = "Run to completion"
+# The automation's step, as every maintenance run's is (backlog
+# 4f909642): born assigned to the actor boss-step.sh signs as.
+audience = { individual = "automation:boss-step" }
+fields = [{ name = "result", field_type = "string", required = true }]
+
+[[workflow.step]]
+title = "completed"
+kind = "outcome"
+ready_when = "steps.run.done AND steps.run.metadata.result = \"ok\""
+title_template = "Maintenance completed"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "completed" }
+
+# The image-only policy is not denying yet: nothing shipped, and nothing
+# is wrong that waiting for its Deny car does not change.
+[[workflow.step]]
+title = "not-yet"
+kind = "outcome"
+ready_when = "steps.run.done AND steps.run.metadata.result = \"not-yet\""
+title_template = "Not yet — the image-only policy does not deny"
+metadata_defaults = { outcome_kind = "skipped" }
+terminal = { outcome = "not-yet" }
+
+# A refused deposit lands here, with the refusal's own words in `output`.
+[[workflow.step]]
+title = "failed"
+kind = "outcome"
+ready_when = "steps.run.done AND steps.run.metadata.result != \"ok\" AND steps.run.metadata.result != \"not-yet\""
+title_template = "Maintenance failed"
+metadata_defaults = { outcome_kind = "aborted" }
+terminal = { outcome = "failed" }

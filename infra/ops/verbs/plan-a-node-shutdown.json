@@ -1,0 +1,18 @@
+{
+  "about": "READ-ONLY: renders what `shutdown-node` WOULD do to one worker node, and does nothing (infra/forge/shutdown-node.sh --plan <node>; backlog f0aaa72f, design 8457c07b). It runs every bound the write runs — the node is a talos-worker in the estate registry, not retired, with one IPv4 address; the cluster agrees (no control-plane label, the registry's address as its InternalIP); and it is already cordoned — and then prints the plan: the node, its estate role and address, the Kubernetes Node's uid, its cordon and its Ready condition, the one command the write runs (talosctl -n <address> shutdown --wait=false), and the pods on the node whose phase is not Succeeded or Failed, split into those the drain will evict and those that stay until power off (a DaemonSet's pod or a static mirror pod), each with its owner, sorted, and the PodDisruptionBudgets whose status allows 0 disruptions that select a pod the drain will evict — each holds the drain, and node-status names why (backlog 9fa9f835, review bc33ff50 M1). No clock, no age and no restart count in the bytes; its sha256 is printed on stderr as `plan-sha256:`, and that hash is what David's passkey signs (design 17835005 q1). Any refusal renders no plan.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/shutdown-node.sh",
+    "--plan",
+    "{1}"
+  ],
+  "params": [
+    {
+      "name": "node",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    }
+  ],
+  "timeout": 120
+}

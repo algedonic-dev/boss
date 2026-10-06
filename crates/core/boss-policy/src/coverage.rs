@@ -59,8 +59,8 @@ pub const COVERAGE_PATH: &str = "/api/policy/coverage";
 /// `orphans` is never read as "everything is covered" past its edge
 /// (design 1c4e42e1, "Limits, stated").
 pub const UNMEASURED: [&str; 6] = [
-    "resources only data names — a View's or a search facet's (boss-views, boss-search) — are \
-     not enumerated",
+    "resources only data names — a View's source (boss-views) — are not enumerated; every \
+     other door asks through a declared control (boss_policy_client::controls)",
     "the readers of /api/credentials entries are not enumerated: nothing maps a credential to \
      the door that reads it",
     "per-kind packet grants (create on job:<kind>) are covered by create on job, the all-kinds \

@@ -17,6 +17,18 @@ pub fn summarise_shipments(
     direction: ShipmentDirection,
     today: chrono::NaiveDate,
 ) -> boss_shipping_client::OutboundShipmentSummary {
+    summarise_shipments_limited(all, direction, today, STATUS_SUMMARY_RECENT_LIMIT)
+}
+
+/// [`summarise_shipments`] with the preview cut at `recent_limit`, the
+/// port's own argument — the in-memory adapter's answer, which must
+/// agree with Postgres's `LIMIT $2` for any limit (backlog be459ab9).
+pub fn summarise_shipments_limited(
+    all: &[Shipment],
+    direction: ShipmentDirection,
+    today: chrono::NaiveDate,
+    recent_limit: usize,
+) -> boss_shipping_client::OutboundShipmentSummary {
     let filtered: Vec<&Shipment> = all.iter().filter(|s| s.direction == direction).collect();
 
     let mut label_created = 0i64;
@@ -51,18 +63,26 @@ pub fn summarise_shipments(
         .copied()
         .filter(|s| !s.status.is_delivered())
         .collect();
-    in_flight.sort_by_key(|s| std::cmp::Reverse(s.shipped_on.unwrap_or(s.created_on)));
+    // Ties by id in byte order, as Postgres orders them `COLLATE "C"`
+    // (backlog be459ab9: both left a tie to chance until 2026-10-01).
+    in_flight.sort_by(|a, b| {
+        let key = |s: &Shipment| s.shipped_on.unwrap_or(s.created_on);
+        key(b).cmp(&key(a)).then(a.id.cmp(&b.id))
+    });
     let mut delivered: Vec<&Shipment> = filtered
         .iter()
         .copied()
         .filter(|s| s.status.is_delivered())
         .collect();
-    delivered.sort_by_key(|s| std::cmp::Reverse(s.delivered_on.unwrap_or(s.created_on)));
+    delivered.sort_by(|a, b| {
+        let key = |s: &Shipment| s.delivered_on.unwrap_or(s.created_on);
+        key(b).cmp(&key(a)).then(a.id.cmp(&b.id))
+    });
 
     let recent: Vec<boss_shipping_client::OutboundShipmentRow> = in_flight
         .iter()
         .chain(delivered.iter())
-        .take(STATUS_SUMMARY_RECENT_LIMIT)
+        .take(recent_limit)
         .map(|s| boss_shipping_client::OutboundShipmentRow {
             id: s.id.clone(),
             status: s.status.as_str().to_string(),

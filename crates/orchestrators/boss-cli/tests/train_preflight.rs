@@ -121,7 +121,14 @@ impl Fixture {
             // That URL is loopback ON PURPOSE, so the drift sentinel
             // (split-brain incident c4b4a6b0) needs the deliberate
             // allowance here — exactly what a test/demo box sets.
-            .env("BOSS_TRAIN_ALLOW_LOCAL_JOBS", "1");
+            .env("BOSS_TRAIN_ALLOW_LOCAL_JOBS", "1")
+            // A token dir that holds nothing: this is the production
+            // build, and it must never read the pod's mounted Secret
+            // (backlog 2ee29275).
+            .env(
+                boss_core::machine_token::TOKEN_DIR_ENV,
+                self.home.join("no-machine-token"),
+            );
         cmd
     }
 

@@ -172,20 +172,16 @@ fn policy() -> Arc<dyn PolicyClient> {
 fn packet(job: &str, owner: &str, day: u32) -> Job {
     Job {
         id: id(job),
-        kind: "brew-day".into(),
-        workflow_version: 1,
-        subject: Subject::new("asset", "FV-1"),
-        title: format!("packet {job}"),
-        owner_id: owner.into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, day).expect("day"),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: Value::Null,
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "brew-day",
+            Subject::new("asset", "FV-1"),
+            format!("packet {job}"),
+            owner,
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, day).expect("day"),
+        )
     }
 }
 

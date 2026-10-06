@@ -218,13 +218,15 @@ fn step_of<'a>(packet: &'a Value, slug: &str) -> Result<&'a Value, ErrResp> {
         })
 }
 
-/// What the `promote` step is completed with: every key it already
-/// holds (the step PUT refuses a body that drops one) plus what this
-/// ceremony spent. `promoted_at` is the ceremony's instant, by the wall
+/// What the `promote` step is completed with: what this ceremony spent,
+/// and nothing else — it goes through the step merge door, which keeps
+/// every key the step already holds (backlog e39a9d2a: the step PUT
+/// refuses any metadata body; until Stage 2's last car this re-sent the
+/// step's own keys, because that PUT refused a body that dropped one).
+/// `promoted_at` is the ceremony's instant, by the wall
 /// clock the ticket's expiry is minted against (an auth act, like the
 /// elevation's `asserted_at`, never the simulation clock).
 pub fn promote_step_metadata(
-    existing: &Value,
     credential_id: &str,
     vouched_by: &str,
     promoted_at_epoch: u64,
@@ -232,11 +234,11 @@ pub fn promote_step_metadata(
     let promoted_at = chrono::DateTime::from_timestamp(promoted_at_epoch as i64, 0)
         .map(|t| t.to_rfc3339())
         .unwrap_or_default();
-    let mut m = existing.as_object().cloned().unwrap_or_default();
-    m.insert("credential_id".into(), json!(credential_id));
-    m.insert("promoted_at".into(), json!(promoted_at));
-    m.insert("vouched_by".into(), json!(vouched_by));
-    Value::Object(m)
+    json!({
+        "credential_id": credential_id,
+        "promoted_at": promoted_at,
+        "vouched_by": vouched_by,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -372,30 +374,49 @@ async fn ask_people_to_promote(
     Err((status, resp.text().await.unwrap_or_default()))
 }
 
+/// Two writes, the spend then the status (backlog e39a9d2a: the step PUT
+/// refuses any metadata body). A refusal of either is the caller's 502,
+/// repaired as D7 repairs the gap before it: press Finish again. The
+/// step is still open, so the merge door takes the spend again and the
+/// status follows.
 async fn complete_promote_step(
     pk: &PasskeyState,
     packet_id: Uuid,
     step: &Value,
-    metadata: &Value,
+    spend: &Value,
 ) -> Result<(), ErrResp> {
     let step_id = step["id"].as_str().unwrap_or_default();
     let step_id = Uuid::parse_str(step_id)
         .map_err(|_| err(StatusCode::BAD_GATEWAY, "the promote step has no id"))?;
     let url = format!("{}/api/jobs/{packet_id}/steps/{step_id}", pk.jobs_base);
-    let resp = pk
-        .request(reqwest::Method::PUT, url)
-        .json(&json!({ "status": "completed", "metadata": metadata }))
-        .send()
-        .await
-        .map_err(|_| err(StatusCode::BAD_GATEWAY, "jobs unreachable"))?;
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        Err(err(
-            StatusCode::BAD_GATEWAY,
-            format!("completing the promote step answered {}", resp.status()),
-        ))
+    for (method, url, body, what) in [
+        (
+            reqwest::Method::PATCH,
+            format!("{url}/metadata"),
+            spend.clone(),
+            "recording the spend on the promote step",
+        ),
+        (
+            reqwest::Method::PUT,
+            url,
+            json!({ "status": "completed" }),
+            "completing the promote step",
+        ),
+    ] {
+        let resp = pk
+            .request(method, url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| err(StatusCode::BAD_GATEWAY, "jobs unreachable"))?;
+        if !resp.status().is_success() {
+            return Err(err(
+                StatusCode::BAD_GATEWAY,
+                format!("{what} answered {}", resp.status()),
+            ));
+        }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -738,12 +759,7 @@ pub async fn promotion_finish(
         Ok(p) => p,
         Err(r) => return refused("people refused the promotion", r),
     };
-    let metadata = promote_step_metadata(
-        &promote_step["metadata"],
-        &pending.credential_id,
-        &vouched_by,
-        now_epoch(),
-    );
+    let metadata = promote_step_metadata(&pending.credential_id, &vouched_by, now_epoch());
     if let Err((_, why)) =
         complete_promote_step(pk, pending.packet_id, &promote_step, &metadata).await
     {
@@ -819,20 +835,19 @@ mod tests {
         assert!(packet_body("emp-owner", &r).is_err());
     }
 
-    /// The step PUT refuses a body that drops a key the step holds, so
-    /// the completion carries the step's own keys plus the spend.
+    /// The spend and nothing else: it goes through the step merge door,
+    /// which keeps the step's own keys (backlog e39a9d2a).
     #[test]
-    fn the_promote_step_keeps_its_keys_and_adds_the_spend() {
-        let m = promote_step_metadata(
-            &json!({"procedure": "p"}),
-            "Y3JlZA",
-            "primary",
-            1_790_000_000,
+    fn the_promote_step_is_sent_the_spend_alone() {
+        let m = promote_step_metadata("Y3JlZA", "primary", 1_790_000_000);
+        assert_eq!(
+            m,
+            json!({
+                "credential_id": "Y3JlZA",
+                "vouched_by": "primary",
+                "promoted_at": "2026-09-21T14:13:20+00:00",
+            })
         );
-        assert_eq!(m["procedure"], "p");
-        assert_eq!(m["credential_id"], "Y3JlZA");
-        assert_eq!(m["vouched_by"], "primary");
-        assert_eq!(m["promoted_at"], "2026-09-21T14:13:20+00:00");
     }
 
     /// ONE MINTER, ONE CALLER (design 2cb6256f D5's gateway half). A

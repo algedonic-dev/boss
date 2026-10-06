@@ -139,7 +139,7 @@ test('a weak truncation names the View\'s own rows, not "events"', async ({ page
   await viewsMocks(page);
   await page.route(RESULTS('view-1'), (r) =>
     json(r, { view_id: 'view-1', source: 'jobs', layout: 'table', rows: [{ id: 'j-1', status: 'open' }],
-      matched: 1, pushed_down: 0, truncated: true }));
+      matched: 1, pushed_down: 0, truncated: true, scope: 'all' }));
   await mount(page);
   await row(page, 'view-1').getByRole('button', { name: 'Run' }).click();
   const trunc = row(page, 'view-1').locator('.v-trunc');
@@ -154,7 +154,7 @@ test('a result says how many rows it shows of how many matched, and when it was 
   await page.route(RESULTS('view-1'), (r) =>
     json(r, { view_id: 'view-1', source: 'jobs', layout: 'table',
       rows: [{ id: 'j-1', status: 'open' }, { id: 'j-2', status: 'open' }],
-      matched: 4000, pushed_down: 1, truncated: false }));
+      matched: 4000, pushed_down: 1, truncated: false, scope: 'all' }));
   await mount(page);
   await row(page, 'view-1').getByRole('button', { name: 'Run' }).click();
   await expect(row(page, 'view-1').locator('.v-shown')).toHaveText(/^showing 2 of 4000 · read \d\d:\d\d$/);
@@ -164,10 +164,10 @@ test('result ids link to what they name', async ({ page }) => {
   await viewsMocks(page);
   await page.route(RESULTS('view-1'), (r) =>
     json(r, { view_id: 'view-1', source: 'jobs', layout: 'table', rows: [{ id: 'j-1', status: 'open' }],
-      matched: 1, pushed_down: 1, truncated: false }));
+      matched: 1, pushed_down: 1, truncated: false, scope: 'all' }));
   await page.route(RESULTS('view-2'), (r) =>
     json(r, { view_id: 'view-2', source: 'steps', layout: 'table', rows: [{ id: 's-1', job_id: 'j-1', status: 'ready' }],
-      matched: 1, pushed_down: 0, truncated: false }));
+      matched: 1, pushed_down: 0, truncated: false, scope: 'all' }));
   await mount(page);
   await row(page, 'view-1').getByRole('button', { name: 'Run' }).click();
   await expect(row(page, 'view-1').getByRole('link', { name: 'j-1' })).toHaveAttribute('href', '/ux/jobs/j-1');

@@ -295,7 +295,10 @@ pub async fn serve(bind: String, telemetry: SharedTelemetry, seeds: PathBuf) -> 
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(%bind, "sim control + telemetry server listening");
-    let app = boss_core::machine_gate::mount(app, "sim-control", &["/health"]);
+    // No database here, so no outbox: this gate's facts reach no log,
+    // and a clean window that names `sim-control` is never clean
+    // (design 21946380) — said at WARN by the mount.
+    let app = boss_core::machine_gate::mount(app, "sim-control", &["/health"], None);
     axum::serve(listener, app).await?;
     Ok(())
 }

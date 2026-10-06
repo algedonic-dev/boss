@@ -2,16 +2,118 @@
 
 use async_trait::async_trait;
 use boss_core::publisher::EventStamp;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, DurationRound, Utc};
 
 use crate::types::Message;
+
+/// `at` as a TIMESTAMPTZ column keeps it: to the microsecond, the
+/// nanoseconds below it truncated (as sqlx's bind truncates). The double
+/// stores what the column stores (backlog be459ab9).
+pub fn to_the_microsecond(at: DateTime<Utc>) -> DateTime<Utc> {
+    at.duration_trunc(chrono::TimeDelta::microseconds(1))
+        .unwrap_or(at)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum MessageError {
     #[error("not found: {0}")]
     NotFound(String),
+    /// A write the store cannot hold — a NUL byte in a field, or a
+    /// reply to a message nobody sent. Both adapters refuse it before
+    /// writing; until the adapters-agree suite (backlog be459ab9)
+    /// Postgres answered with its encoding or foreign-key error as
+    /// `Storage` (a 500) and the double stored it.
+    #[error("bad request: {0}")]
+    BadRequest(String),
     #[error("storage failure: {0}")]
     Storage(String),
+}
+
+/// Refuse a message Postgres cannot store: a NUL byte in any of its
+/// text fields (TEXT rejects one). Both adapters call this before
+/// writing, so the refusal is `BadRequest` naming the field on each
+/// (backlog be459ab9).
+pub fn refuse_nul(msg: &Message) -> Result<(), MessageError> {
+    let er = msg.entity_ref.as_ref();
+    let fields: [(&str, Option<&str>); 10] = [
+        ("id", Some(&msg.id)),
+        ("sender_id", Some(&msg.sender_id)),
+        ("recipient_id", Some(&msg.recipient_id)),
+        ("subject", Some(&msg.subject)),
+        ("body", Some(&msg.body)),
+        ("kind", Some(msg.kind.as_str())),
+        ("entity_type", er.map(|e| e.entity_type.as_str())),
+        ("entity_id", er.map(|e| e.entity_id.as_str())),
+        ("entity_path", er.and_then(|e| e.entity_path.as_deref())),
+        ("reply_to", msg.reply_to.as_deref()),
+    ];
+    match fields
+        .iter()
+        .find(|(_, v)| v.is_some_and(|v| v.contains('\0')))
+    {
+        Some((f, _)) => Err(MessageError::BadRequest(format!(
+            "{f} holds a NUL byte, which cannot be stored"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The refusal for a reply to a message nobody sent — the `reply_to`
+/// column references `messages(id)` (backlog be459ab9).
+pub fn no_such_parent(reply_to: &str) -> MessageError {
+    MessageError::BadRequest(format!("reply_to names no message: {reply_to}"))
+}
+
+/// What one inbox read asks for: which of a recipient's messages, and
+/// which page of them (backlog 74da899d, page audit 5477d9eb GAP 3).
+/// The read was every row, unpaged, and the page filtered the lot in
+/// the browser — 5,129 rows to one recipient in the audit window. Now
+/// the narrowing is the store's and the answer is one page of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxQuery {
+    /// Archived rows too (they have left the inbox; backlog 8578b91e).
+    pub include_archived: bool,
+    /// Only messages of this kind.
+    pub kind: Option<String>,
+    /// Only messages nobody has read.
+    pub unread_only: bool,
+    /// At most this many rows.
+    pub limit: u32,
+    /// After skipping this many, in the read's order.
+    pub offset: u32,
+}
+
+impl InboxQuery {
+    /// The first `limit` rows of the inbox, unnarrowed.
+    pub fn first(limit: u32) -> Self {
+        Self {
+            include_archived: false,
+            kind: None,
+            unread_only: false,
+            limit,
+            offset: 0,
+        }
+    }
+}
+
+/// One page of an inbox read and how many rows its narrowing matches,
+/// so `rows.len() < total` says there is more.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InboxPage {
+    pub rows: Vec<Message>,
+    pub total: u64,
+}
+
+/// How many of the rows an unnarrowed inbox read reads are of one kind,
+/// and how many of those are unread. A page that shows one filtered page
+/// still owes its header the whole inbox's numbers; per kind rather than
+/// per named kind, because kinds are Class registry rows, not this
+/// crate's list.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KindCount {
+    pub kind: String,
+    pub all: u64,
+    pub unread: u64,
 }
 
 /// OUTBOX (phase 2): every mutation records its domain event on the
@@ -21,7 +123,8 @@ pub enum MessageError {
 /// AHEAD of the recording, so a collapsed replay records nothing.
 #[async_trait]
 pub trait MessageRepository: Send + Sync {
-    /// A recipient's messages, newest first. Archived rows are left out
+    /// A recipient's messages, newest first, messages sent in the same
+    /// microsecond in BYTE order of id. Archived rows are left out
     /// unless `include_archived`: archiving is how a message leaves the
     /// inbox, and a read that still returned them handed the page a
     /// third kind it could not place — counted in All and Unread, drawn
@@ -29,11 +132,23 @@ pub trait MessageRepository: Send + Sync {
     /// 5477d9eb GAP 2). The archived rows are not deleted, so a reader
     /// that needs every row it ever sent (a tenant seed's idempotence
     /// check) asks for them.
+    ///
+    /// One PAGE of that list, narrowed by `query`, with the count of
+    /// every row the narrowing matches (backlog 74da899d): `query.limit`
+    /// rows at most, after `query.offset`, in the order above.
     async fn inbox(
         &self,
         recipient_id: &str,
+        query: &InboxQuery,
+    ) -> Result<InboxPage, MessageError>;
+    /// The rows an unnarrowed inbox read reads (archived ones only when
+    /// `include_archived`), counted per kind — all and unread — in BYTE
+    /// order of kind. The sum of `all` is that read's `total`.
+    async fn inbox_counts(
+        &self,
+        recipient_id: &str,
         include_archived: bool,
-    ) -> Result<Vec<Message>, MessageError>;
+    ) -> Result<Vec<KindCount>, MessageError>;
     /// Unread messages for a recipient, optionally narrowed to one
     /// `kind`. The narrowing is what makes the count usable as a
     /// badge: an inbox holding 1,980 unread `signal` rows against 3
@@ -56,7 +171,9 @@ pub trait MessageRepository: Send + Sync {
     /// reconstruct the projection's `read_at` exactly.
     /// Records `messages.message.read` (`{id, read_at}`) in-tx —
     /// only when the row actually updated (a phantom id records
-    /// nothing).
+    /// nothing). Idempotent: marking a read message read again is Ok,
+    /// changes nothing and records nothing — the first `read_at`
+    /// stands (backlog 624e92eb).
     async fn mark_read(
         &self,
         id: &str,
@@ -65,7 +182,11 @@ pub trait MessageRepository: Send + Sync {
     ) -> Result<(), MessageError>;
     /// Records `messages.message.sent` (full row state) in-tx — only
     /// when the INSERT actually inserted (a redelivered notification
-    /// collapses on ON CONFLICT (id) and records nothing).
+    /// collapses on ON CONFLICT (id) and records nothing). The row is
+    /// stored as sent, a `read_at` or `archived_at` included, every
+    /// time to the microsecond the column keeps. A NUL byte in any
+    /// field, or a `reply_to` naming no message, is refused
+    /// `BadRequest` and writes nothing.
     async fn send(&self, msg: &Message, stamp: &EventStamp) -> Result<(), MessageError>;
     /// Records `messages.message.deleted` (`{id, deleted_at}`) in-tx
     /// after the row actually deleted.
@@ -76,8 +197,9 @@ pub trait MessageRepository: Send + Sync {
         stamp: &EventStamp,
     ) -> Result<(), MessageError>;
     /// Records `messages.message.archived` (`{id, archived_at}`)
-    /// in-tx for each row that actually moved; a signal already
-    /// archived does not move again.
+    /// in-tx for each row that actually moved, in BYTE order of id; a
+    /// signal already archived does not move again. The prefix is
+    /// literal — a `_` or `%` in it is a character, not a wildcard.
     /// Archive every UNREAD `signal` whose `entity_path` starts with
     /// `path_prefix`, returning how many moved. The expiry path for
     /// notifications about work that has finished (David, 2026-08-14:
@@ -136,6 +258,7 @@ pub trait MessageRepository: Send + Sync {
         now: DateTime<Utc>,
         stamp: &EventStamp,
     ) -> Result<(), MessageError>;
-    /// Return all messages in a thread (the root message + all replies).
+    /// Return all messages in a thread (the root message + its direct
+    /// replies), oldest first, a tie in BYTE order of id.
     async fn thread(&self, message_id: &str) -> Result<Vec<Message>, MessageError>;
 }

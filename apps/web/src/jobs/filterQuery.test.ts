@@ -40,6 +40,16 @@ describe('jobsFilterSearch', () => {
     ).toBe('?owner_id=emp-1&kind_prefix=ship&new=1&status=closed');
   });
 
+  test('owned owner and prefix removals preserve unrelated query and new-job fields (6c9672c2)', () => {
+    const search = '?owner_id=emp-1&kind_prefix=ship&new=1&kind=ad-hoc&subject_id=acc-1&other=keep';
+    expect(jobsFilterSearch(search, { ...none, ownerId: '', kindPrefix: '' })).toBe(
+      '?new=1&kind=ad-hoc&subject_id=acc-1&other=keep',
+    );
+    expect(jobsFilterSearch('?owner_id=emp-1&kind_prefix=ship', {
+      ...none, ownerId: 'emp-1', kindPrefix: 'ship',
+    })).toBe('?owner_id=emp-1&kind_prefix=ship');
+  });
+
   // Under `new=1` the router reads subject_id as the new job's subject,
   // not as the filter (backlog d0b93b80). The write follows that read:
   // a mount must not strip the deep link's subject, and a filter typed

@@ -127,7 +127,7 @@ async fn a_per_kind_subject_alias_is_refused() {
 #[tokio::test]
 async fn every_parameter_the_listing_reads_is_still_accepted() {
     let every = "limit=5&offset=0&kind=k&kind_prefix=k&status=open&owner_id=o\
-                 &subject_id=s&waiting_on=w&closed_within=7&partition=real\
+                 &subject_id=s&waiting_on=w&closed_within=7&terminal=true&partition=real\
                  &simulated=false&metadata=%7B%22branch%22%3A%22b%22%7D&metadata_has=branch";
     let (status, body) = get(every).await;
     assert_eq!(status, StatusCode::OK, "{body}");

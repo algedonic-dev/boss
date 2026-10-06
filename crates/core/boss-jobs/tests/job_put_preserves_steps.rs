@@ -227,24 +227,36 @@ async fn job_with_a_completed_first_step(app: &axum::Router) -> String {
     let steps = steps_of(app, &job_id).await;
     let inspect = steps.first().expect("inspect step").clone();
     let step_id = inspect["id"].as_str().expect("step id");
-    // Read-merge-write: the step PUT refuses a metadata body that omits
-    // a stored key (e39a9d2a), so the results ride over what the step
-    // already holds.
-    let mut metadata = inspect["metadata"].clone();
-    for (k, v) in [
-        (
-            "summary",
-            serde_json::json!("38% used across three volumes"),
-        ),
-        ("excludes", serde_json::json!("none")),
-        ("test", serde_json::json!("df -h on each node")),
-        ("gates", serde_json::json!("none")),
-        ("verified", serde_json::json!(true)),
-        ("findings", serde_json::json!("nothing above the floor")),
-        ("measured", serde_json::json!("38%")),
-    ] {
-        metadata[k] = v;
-    }
+    // The results go through the step merge door, which keeps every
+    // key the step already holds; the PUT below carries the rest of the
+    // row and no metadata — it refuses any since e39a9d2a.
+    let (status, body) = send(
+        app,
+        Request::builder()
+            .method("PATCH")
+            .uri(format!("/api/jobs/{job_id}/steps/{step_id}/metadata"))
+            .header("content-type", "application/json")
+            .header("x-boss-user", admin_header())
+            .body(Body::from(
+                serde_json::json!({
+                    "summary": "38% used across three volumes",
+                    "excludes": "none",
+                    "test": "df -h on each node",
+                    "gates": "none",
+                    "verified": true,
+                    "findings": "nothing above the floor",
+                    "measured": "38%",
+                })
+                .to_string(),
+            ))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "writing the inspect step's results: {body}"
+    );
 
     let (status, body) = send(
         app,
@@ -261,7 +273,6 @@ async fn job_with_a_completed_first_step(app: &axum::Router) -> String {
                     "title": "Inspect",
                     "sort_order": 0,
                     "status": "completed",
-                    "metadata": metadata,
                 })
                 .to_string(),
             ))

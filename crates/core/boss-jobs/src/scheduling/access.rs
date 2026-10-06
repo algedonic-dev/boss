@@ -23,7 +23,7 @@
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use boss_policy_client::{PolicyClient, Predicate, Resource, User};
+use boss_policy_client::{PolicyClient, Predicate, User, controls};
 
 /// The employees whose schedule one caller may read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,7 +108,7 @@ fn is_an_employee(user: &User) -> bool {
 /// cannot be asked is not a gate that passed.
 pub(crate) async fn readable(policy: &dyn PolicyClient, user: &User) -> Result<Readable, Response> {
     let predicate = policy
-        .scope_predicate(user, Resource::schedule())
+        .scope_of(user, controls::READ_SCHEDULE)
         .await
         .map_err(|e| {
             (

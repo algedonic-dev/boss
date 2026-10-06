@@ -13,8 +13,9 @@
 //! only for a department whose readiness reads `protocols.has = true`,
 //! record each skip on the platform retro — is unit-tested beside
 //! `retro_open.rs`. This half pins what the RULE hands it: the day, the
-//! handler, and the args that turn the protocol filter on without
-//! dropping IT (`open_without_protocol`, whose expiry is a8458043).
+//! handler, and the args that turn the protocol filter on — for every
+//! department alike, IT included since a8458043 gave it protocols
+//! (backlog ab6861a1 deleted its exemption).
 
 use boss_core::calendar::Cadence;
 use boss_dispatcher::rules::expr::{NoHelpers, Value};
@@ -71,13 +72,15 @@ fn a_monday_runs_retro_open_once_with_the_protocol_filters_args() {
         arg(args, "platform_subject"),
         Value::String("infra/protocol-retro".into())
     );
-    assert_eq!(
-        arg(args, "open_without_protocol"),
-        Value::String("it".into()),
-        "IT declares no protocol until a8458043 stamps its department onto the platform \
-         workflows, and its retro carries the agent work profile (2f23f4c6) — the decision on \
-         a4fda30b says the filter must not drop it"
+    // IT opens like every other department (backlog ab6861a1,
+    // 2026-10-01): a8458043 stamped IT onto its 61 platform workflows,
+    // so its readiness reads `protocols.has = true` and the exemption
+    // that kept the filter from dropping it names a state that is gone.
+    assert!(
+        args.iter().all(|(n, _)| n != "open_without_protocol"),
+        "no department is exempt from the protocol filter: {args:?}"
     );
+    assert_eq!(args.len(), 3, "exactly the three retro args: {args:?}");
 }
 
 /// Weekly means one day of seven: the other six open nothing.

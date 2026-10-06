@@ -154,6 +154,7 @@
         ROUTE_CATALOG.inbox,
         ROUTE_CATALOG.views,
         ROUTE_CATALOG.schedule,
+        ROUTE_CATALOG['company-map'],
       ],
     },
   ];

@@ -76,12 +76,18 @@
 # The pod-specific constants are env-overridable:
 #   BOSS_JOBS_URL            the base URL; else the line in ./sor-url
 #   BOSS_SOR_PORTS           `name=port …`; else ../forge/sor-ports.env
+#   BOSS_SOR_READ_PORTS      the READ-ONLY rows, `name=port …`; else
+#                              ./sor-read-ports.env (GET only, backlog 9a440539)
+#   BOSS_SOR_READ_URL        the host those rows are read on; else the
+#                              line in ./sor-read-url (boss-read-internal)
 #   BOSS_SOR_SERVICE         the service to read, when no path routes to
 #                              it (`gateway`); else the path decides
 #   BOSS_ACTOR               who the call signs as — the id; else the one
 #   BOSS_ACTOR_FILE            line in this file ($HOME/.config/boss/actor,
 #                              as the boss CLI reads it)
-#   BOSS_MACHINE_TOKEN_FILE  the machine token, sent only when it exists
+#   BOSS_MACHINE_TOKEN_DIR   the machine token's mounted directory, whose
+#                              `current` slot is sent; else the line in
+#                              ./machine-token-dir, else /etc/boss/machine-token
 #   BOSS_SOR_WAIT_SECONDS    how long a refused connect is waited out as
 #                              a rollout (whole seconds; 0 = not at all);
 #                              else 120
@@ -114,6 +120,16 @@ case "$METHOD" in
   *) echo "usage: boss-api GET|POST|PUT|PATCH|DELETE /api/path [body.json]" >&2; exit 2 ;;
 esac
 [ -n "$API_PATH" ] || { echo "usage: boss-api GET|POST|PUT|PATCH|DELETE /api/path [body.json]" >&2; exit 2; }
+# A PATH STARTS WITH `/`. curl is sent "$BASE$API_PATH", and the
+# machine-token decision below reads the host of $BASE; a path like
+# `@evil.invalid/x` would continue the authority and move the request,
+# token and all, to another host (delta review of ddfa1032, B1). Every
+# real path starts with a slash, so anything else is usage — refused
+# here, before the token file is read and before curl.
+case "$API_PATH" in
+  /*) ;;
+  *) echo "usage: boss-api GET|POST|PUT|PATCH|DELETE /api/path [body.json] — the path must start with '/', got '$API_PATH'" >&2; exit 2 ;;
+esac
 WAIT_WINDOW=${BOSS_SOR_WAIT_SECONDS:-120}
 case "$WAIT_WINDOW" in
   ''|*[!0-9]*)
@@ -178,6 +194,21 @@ if [ -n "$NAMED_SERVICE" ] && [ -z "$SOR_PORTS" ]; then
   echo "boss-api: refusing $METHOD $API_PATH: BOSS_SOR_SERVICE names \`$NAMED_SERVICE\`, and no port table was found (BOSS_SOR_PORTS is unset and $SOR_PORTS_FILE is not readable) — so there is nothing to place that name against. Sending it to the base would ask $NAMED_SERVICE's question of the jobs port, which answers instead of erroring." >&2
   exit 2
 fi
+# THE READ-ONLY ROWS (backlog 9a440539, 2026-10-01). The LAN table above
+# carries the services a machine on the LAN may reach, writes included;
+# it never carried assets, customers or the other module services, so a
+# read of live data before a migration could not be made through any
+# door. These rows are the rest of boss-ports that the boss pod serves
+# off loopback, on the in-cluster boss-read-internal Service (./sor-read-url)
+# — and only a GET goes there. Same overrides as the LAN table:
+# BOSS_SOR_READ_PORTS / BOSS_SOR_READ_URL, else the files beside this
+# script. Pinned by every_boss_ports_service_has_a_door.rs.
+SOR_READ_PORTS_FILE="$HERE/sor-read-ports.env"
+SOR_READ_PORTS=${BOSS_SOR_READ_PORTS:-}; SOR_READ_PORTS_FROM=BOSS_SOR_READ_PORTS
+if [ -z "$SOR_READ_PORTS" ] && [ -r "$SOR_READ_PORTS_FILE" ]; then
+  SOR_READ_PORTS=$(grep -Ev '^[[:space:]]*(#|$)' "$SOR_READ_PORTS_FILE" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//' || true)
+  SOR_READ_PORTS_FROM=$SOR_READ_PORTS_FILE
+fi
 if [ -n "$SOR_PORTS" ]; then
   SOR_ROUTES="$HERE/../forge/probe-bin/sor-routes.sh"
   [ -r "$SOR_ROUTES" ] || {
@@ -192,11 +223,27 @@ if [ -n "$SOR_PORTS" ]; then
     SERVICE=$(sor_service_for_path "$API_PATH"); SERVICE_FROM="the path is served by $SERVICE"
   fi
   if [ "$SERVICE" != jobs ]; then
-    PORT=$(sor_port_for_service "$SERVICE" "$SOR_PORTS") || {
-      echo "boss-api: refusing $METHOD $API_PATH: $SERVICE_FROM, and the port table names no port for $SERVICE (table: '$SOR_PORTS', from $SOR_PORTS_FROM). Sending it to the jobs port would answer 404 about a surface that exists — refusing rather than guessing." >&2
+    if PORT=$(sor_port_for_service "$SERVICE" "$SOR_PORTS"); then
+      BASE=$(sor_base_on_port "$BASE" "$PORT")
+    elif PORT=$(sor_port_for_service "$SERVICE" "$SOR_READ_PORTS"); then
+      # A read-only row: GET only, refused before the URL file is even
+      # read for anything else — the door does not widen what a write
+      # may reach (backlog 9a440539).
+      [ "$METHOD" = GET ] || {
+        echo "boss-api: refusing $METHOD $API_PATH: $SERVICE_FROM, which this door carries for READS only (row from $SOR_READ_PORTS_FROM, on the in-cluster read Service). The LAN machine door does not carry $SERVICE, and widening what a write may reach is its own decision, made on a row of infra/forge/sor-ports.env with its reason — not here." >&2
+        exit 2
+      }
+      READ_BASE=${BOSS_SOR_READ_URL:-$(head -n1 "$HERE/sor-read-url" 2>/dev/null || true)}
+      READ_BASE=$(printf '%s' "$READ_BASE" | tr -d '[:space:]')
+      [ -n "$READ_BASE" ] || {
+        echo "boss-api: refusing $METHOD $API_PATH: $SERVICE_FROM, a read-only row, and BOSS_SOR_READ_URL is unset and $HERE/sor-read-url names no host — sending it to the jobs port would answer 404 about a surface that exists." >&2
+        exit 2
+      }
+      BASE=$(sor_base_on_port "$READ_BASE" "$PORT")
+    else
+      echo "boss-api: refusing $METHOD $API_PATH: $SERVICE_FROM, and the port table names no port for $SERVICE (table: '$SOR_PORTS', from $SOR_PORTS_FROM; read-only rows: '$SOR_READ_PORTS', from $SOR_READ_PORTS_FROM). Sending it to the jobs port would answer 404 about a surface that exists — refusing rather than guessing." >&2
       exit 2
-    }
-    BASE=$(sor_base_on_port "$BASE" "$PORT")
+    fi
   fi
 fi
 
@@ -232,25 +279,67 @@ fi
 ACTOR='{"id":"'"$ACTOR_ID"'","role":"'"$ROLE"'","access_tier":"'"$TIER"'","territory_account_ids":[],"direct_report_ids":[],"department":null}'
 
 args=( -sS -X "$METHOD" -H 'Content-Type: application/json' -H "X-Boss-User: $ACTOR" -w '\n%{http_code}' )
-TOK=$(cat "${BOSS_MACHINE_TOKEN_FILE:-/etc/boss/machine-token}" 2>/dev/null || true)
-# THE TOKEN RIDES IN A FILE, NEVER IN curl's ARGV (backlog 5f3ad356,
-# 2026-09-28): a command line is world-readable in ps and
-# /proc/<pid>/cmdline while curl runs, and this door put
-# `X-Boss-Machine-Token: $TOK` there under a name a *TOKEN* grep missed.
-# infra/lib/secret-header.sh writes it 0600 and hands curl `-H @file`;
-# infra/lint/a-secret-header-rides-in-a-file.sh keeps it out of argv.
-# Needed only when there IS a token, so a copy of the door on a box
-# with none still runs as before; with one and no lib it refuses.
-if [ -n "$TOK" ]; then
-  SECRET_LIB="$HERE/../lib/secret-header.sh"
-  [ -r "$SECRET_LIB" ] || {
-    echo "boss-api: refusing $METHOD $API_PATH: $SECRET_LIB is missing — without it the machine token would ride in curl's command line, readable in ps by every local user (backlog 5f3ad356)" >&2
-    exit 2
-  }
+# THE MACHINE TOKEN — read, host-checked and handed to curl by the ONE
+# shell reader, infra/lib/secret-header.sh's machine_token_header, which
+# every shell sender of the token takes (design 6805c764 car 4).
+#
+# A DIRECTORY, NOT A FILE (backlog 1876bbdb, INFO-6). The token is the
+# `current` slot of the mounted `boss-machine-token` Secret, the one
+# layout boss-core's clients and every service's gate read. This door
+# read a token FILE, by default /etc/boss/machine-token itself; the day
+# car 4 mounted the directory there, every write through
+# the door would have gone out unstamped, in silence.
+#
+# THE DOORS' OWN COPY (INFO-5). On the dev pod the Secret is mounted at
+# the directory ./machine-token-dir names, NOT at boss-core's default:
+# builders run handler tests there, and every stamping client a test
+# builds reads the default. So only the doors — this one and the boss
+# shim — read machine-token-dir, and only when BOSS_MACHINE_TOKEN_DIR
+# names nothing; a copy of the door without that file takes the
+# default, as boss-core does.
+#
+# IN A FILE, NEVER IN curl's ARGV (backlog 5f3ad356): a command line is
+# world-readable in ps while curl runs. The lib writes it 0600 and hands
+# curl `-H @file`; infra/lint/a-secret-header-rides-in-a-file.sh keeps it
+# out of argv. A copy of the door without the lib still runs where there
+# is no token, and refuses where there is one.
+#
+# ONLY TO AN ESTATE HOST (backlog 2ee29275, F1). The base is whatever
+# BOSS_JOBS_URL says, and an operator can point it anywhere — the public
+# edge (which answers with a 302 to Cloudflare Access), another instance.
+# The lib stamps loopback and the hosts BOSS_MACHINE_TOKEN_HOSTS lists
+# (an entry with a leading dot is a suffix) — boss-core's
+# machine_token::Hosts, held equal to it on the rows of the tables in
+# boss_api_sh.rs and secret_header_sh.rs (off them, the named and
+# measured differences in the lib's header). UNSET, the list is the host of this door's
+# own sor-url (the pod's record); set, even empty, it wins. Anywhere else
+# the call goes out without the token and says so once, naming the
+# scheme and host and never the path, query or userinfo.
+#
+# THE READ DOOR'S HOST IS ON THE LIST TOO (backlog 9a440539, review
+# 1d893c98 B1). boss-read-internal is a second ClusterIP in front of the
+# SAME pod, and every service behind it mounts the machine gate; in
+# report mode an unstamped read is tallied as a MISS, which restarts the
+# clean window enforcement has to earn, and under enforce it is a 401.
+# So the unset list is BOTH files' hosts — ./sor-url's and
+# ./sor-read-url's, read from the files and never from an override: a
+# BOSS_SOR_READ_URL aimed elsewhere goes out unstamped, exactly as a
+# BOSS_JOBS_URL aimed elsewhere does.
+if [ -z "${BOSS_MACHINE_TOKEN_DIR:-}" ] && [ -s "$HERE/machine-token-dir" ]; then
+  BOSS_MACHINE_TOKEN_DIR=$(tr -d '[:space:]' < "$HERE/machine-token-dir")
+fi
+SECRET_LIB="$HERE/../lib/secret-header.sh"
+if [ -r "$SECRET_LIB" ]; then
   # shellcheck source=../lib/secret-header.sh
   . "$SECRET_LIB"
-  secret_header TOKEN_HDR "X-Boss-Machine-Token: $TOK"
-  args+=( -H "$TOKEN_HDR" )
+  TOKEN_HOSTS=$(machine_token_host "$(head -n1 "$SOR_URL_FILE" 2>/dev/null || true)")
+  READ_TOKEN_HOST=$(machine_token_host "$(head -n1 "$HERE/sor-read-url" 2>/dev/null || true)")
+  [ -z "$READ_TOKEN_HOST" ] || TOKEN_HOSTS="$TOKEN_HOSTS,$READ_TOKEN_HOST"
+  machine_token_header TOKEN_HDR "$BASE" "$TOKEN_HOSTS"
+  [ -z "$TOKEN_HDR" ] || args+=( -H "$TOKEN_HDR" )
+elif [ -e "${BOSS_MACHINE_TOKEN_DIR:-/etc/boss/machine-token}/current" ]; then
+  echo "boss-api: refusing $METHOD $API_PATH: $SECRET_LIB is missing — without it the machine token would ride in curl's command line, readable in ps by every local user (backlog 5f3ad356)" >&2
+  exit 2
 fi
 [ -n "$BODY" ] && args+=( --data-binary "@$BODY" )
 

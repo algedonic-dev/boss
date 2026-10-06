@@ -75,7 +75,7 @@ fn router(base: String) -> Router {
     let origin = Url::parse("https://boss.test").unwrap();
     let passkey = Arc::new(PasskeyState {
         session_key: KEY.to_vec(),
-        http: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+        http: boss_gateway::machine_client::MachineClient::unstamped(reqwest::Client::builder())
             .unwrap(),
         people_base: base.clone(),
         jobs_base: base.clone(),
@@ -86,7 +86,7 @@ fn router(base: String) -> Router {
         audit: AuthAudit::disabled(),
     });
     let owner = RosterPlatformOwner::new(
-        boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder()).unwrap(),
+        boss_gateway::machine_client::MachineClient::unstamped(reqwest::Client::builder()).unwrap(),
         base,
     );
     elevation_router(Arc::new(ElevationState {

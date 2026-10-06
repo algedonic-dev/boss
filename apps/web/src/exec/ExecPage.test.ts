@@ -63,6 +63,112 @@ const down = (): never => {
   throw new TypeError('Failed to fetch');
 };
 
+describe('malformed successful reads cannot become empty executive cards', () => {
+  test('invalid or contradictory job counts are unread, not no open jobs', async () => {
+    for (const body of [
+      { counts: { sale: 'unread' }, total: 0 },
+      { counts: { sale: -1 }, total: -1 },
+      { counts: { sale: 0.5 }, total: 0.5 },
+      { counts: { sale: 2 }, total: 0 },
+      { counts: {}, total: 'unread' },
+    ]) {
+      stub({ [EXEC_READS.jobs]: () => ok(body) });
+      expect((await loadJobsSummary()).kind).toBe('failed');
+    }
+  });
+
+  test('invalid revenue lines or totals are unread, not no revenue', async () => {
+    const w = trailingYear('2026-09-27');
+    for (const body of [
+      { revenue: [null], total_revenue_cents: 0 },
+      { revenue: [{ account_code: '4200', amount_cents: 'unread' }], total_revenue_cents: 0 },
+      { revenue: [], total_revenue_cents: 'unread' },
+      { revenue: [{ account_code: '4200', amount_cents: 100 }], total_revenue_cents: 0 },
+    ]) {
+      stub({ [EXEC_READS.revenue(w)]: () => ok(body) });
+      expect((await loadRevenueMix(w)).kind).toBe('failed');
+    }
+  });
+
+  test('a rounded signed cancellation total is refused even when every line and total is safe', async () => {
+    const w = trailingYear('2026-09-27');
+    for (const sign of [1, -1]) {
+      const revenue = [Number.MAX_SAFE_INTEGER * sign, 2 * sign, -Number.MAX_SAFE_INTEGER * sign]
+        .map((amount_cents, i) => ({ account_code: `cancellation-${i}`, amount_cents }));
+      stub({ [EXEC_READS.revenue(w)]: () => ok({ revenue, total_revenue_cents: sign }) });
+      expect((await loadRevenueMix(w)).kind).toBe('failed');
+    }
+  });
+
+  test('the true signed cancellation sum is accepted independently of account order', async () => {
+    const w = trailingYear('2026-09-27');
+    const m = Number.MAX_SAFE_INTEGER;
+    const orders = [[m, 2, -m], [m, -m, 2], [2, m, -m], [2, -m, m], [-m, m, 2], [-m, 2, m]];
+    for (const sign of [1, -1]) {
+      for (const amounts of orders) {
+        const revenue = amounts.map((amount, i) => ({ account_code: `cancellation-${i}`, amount_cents: amount * sign }));
+        // An explicit true total and the existing derived-total contract
+        // both use exact cents, never the order's rounded Number sum.
+        for (const total of [2 * sign, undefined]) {
+          stub({ [EXEC_READS.revenue(w)]: () => ok({ revenue, total_revenue_cents: total }) });
+          const answer = await loadRevenueMix(w);
+          expect(answer.kind).toBe('ready');
+          if (answer.kind === 'ready') expect(answer.data.total).toBe(2 * sign);
+        }
+      }
+    }
+  });
+
+  test('a truly out-of-range final signed sum is refused despite intermediate rounding into range', async () => {
+    const w = trailingYear('2026-09-27');
+    for (const sign of [1, -1]) {
+      const revenue = [Number.MAX_SAFE_INTEGER, 2, -1]
+        .map((amount, i) => ({ account_code: `overflow-${i}`, amount_cents: amount * sign }));
+      for (const total of [Number.MAX_SAFE_INTEGER * sign, undefined]) {
+        stub({ [EXEC_READS.revenue(w)]: () => ok({ revenue, total_revenue_cents: total }) });
+        expect((await loadRevenueMix(w)).kind).toBe('failed');
+      }
+    }
+  });
+
+  test('the exact signed safe-range endpoints remain accepted after intermediate cancellation', async () => {
+    const w = trailingYear('2026-09-27');
+    for (const sign of [1, -1]) {
+      const total_revenue_cents = Number.MAX_SAFE_INTEGER * sign;
+      const revenue = [Number.MAX_SAFE_INTEGER, 1, -1]
+        .map((amount, i) => ({ account_code: `endpoint-${i}`, amount_cents: amount * sign }));
+      stub({ [EXEC_READS.revenue(w)]: () => ok({ revenue, total_revenue_cents }) });
+      const answer = await loadRevenueMix(w);
+      expect(answer.kind).toBe('ready');
+      if (answer.kind === 'ready') expect(answer.data.total).toBe(total_revenue_cents);
+    }
+  });
+
+  test('missing liabilities or malformed balance lines are unread, not an empty sheet', async () => {
+    for (const body of [
+      { as_of: '2026-09-27', assets: [] },
+      { as_of: '2026-09-27', assets: [null], liabilities: [] },
+      { as_of: '2026-09-27', assets: [], liabilities: [{ account_code: '2100', amount_cents: 'unread' }] },
+      { as_of: '', assets: [], liabilities: [] },
+    ]) {
+      stub({ [EXEC_READS.balance]: () => ok(body) });
+      expect((await loadBalances()).kind).toBe('failed');
+    }
+  });
+
+  test('invalid assignment count or rows are unread, not nothing waiting', async () => {
+    for (const body of [
+      { data: [], total: -1 },
+      { data: [], total: 'unread' },
+      { data: [null], total: 1 },
+      { data: [{}], total: 0 },
+    ]) {
+      stub({ [EXEC_READS.waiting]: () => ok(body) });
+      expect((await loadWaiting()).kind).toBe('failed');
+    }
+  });
+});
+
 describe('every read shows a loading line before it answers', () => {
   test('each card has its own loading line, never a failure', () => {
     for (const lines of Object.values(EXEC_LINES)) {

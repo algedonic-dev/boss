@@ -84,20 +84,16 @@ fn ceo() -> User {
 fn request(id: &str, verb: &str) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).expect("uuid")),
-        kind: "ops-request".into(),
-        workflow_version: 1,
-        subject: Subject::new("asset", "BOSSNET"),
-        title: format!("{verb} on forge"),
-        owner_id: "emp-david".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: day(2026, 9, 20),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({ "verb": verb, "host": "forge" }),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "ops-request",
+            Subject::new("asset", "BOSSNET"),
+            format!("{verb} on forge"),
+            "emp-david",
+            Priority::Standard,
+            day(2026, 9, 20),
+        )
     }
 }
 
@@ -107,25 +103,15 @@ fn request(id: &str, verb: &str) -> Job {
 fn execute_step(job: &str, exit_code: &str) -> Step {
     Step {
         id: StepId::new(),
-        job_id: JobId::from_uuid(Uuid::parse_str(job).expect("uuid")),
-        kind: "task".into(),
-        title: "execute".into(),
         spec_slug: Some("execute".into()),
-        assignee_id: None,
         status: StepStatus::Ready,
-        sort_order: 1,
-        blocked_by: Vec::new(),
-        sign_offs_required: Vec::new(),
-        assurance_required: None,
-        sign_offs: Vec::new(),
-        fields: Vec::new(),
-        completed_on: None,
-        completed_by: None,
-        completed_at: None,
         metadata: serde_json::json!({ "exit_code": exit_code }),
-        notes: None,
-        step_plugin_version: 0,
-        embedded_job: None,
+        ..Step::new(
+            JobId::from_uuid(Uuid::parse_str(job).expect("uuid")),
+            "task",
+            "execute",
+            1,
+        )
     }
 }
 

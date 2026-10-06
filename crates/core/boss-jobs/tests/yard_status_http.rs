@@ -48,6 +48,237 @@ use uuid::Uuid;
 
 const NOW: &str = "2026-09-03T12:00:00Z";
 
+/// An old settled car behind more than even MAX_LIMIT newer cars.
+/// Different opened_on dates make the page boundary independent of
+/// same-day ordering. Raising the former 400-row window to 1000
+/// still loses this car (d59c4a37).
+async fn late_car_history(jobs: &InMemoryJobs, metadata: Value) -> Job {
+    let mut old = job(
+        "ship-a-change",
+        &Uuid::from_u128(0xa000).to_string(),
+        "An old merged car",
+        JobStatus::Closed,
+        metadata,
+    );
+    old.opened_on = NaiveDate::from_ymd_opt(2026, 9, 2).unwrap();
+    jobs.create_job_at(&old, t(NOW), &[]).await.unwrap();
+    for n in 0..1000 {
+        let newer = job(
+            "ship-a-change",
+            &Uuid::from_u128(0xb000 + n).to_string(),
+            "A newer closed car",
+            JobStatus::Closed,
+            json!({"branch":format!("feat/newer-{n}")}),
+        );
+        jobs.create_job_at(&newer, t(NOW), &[]).await.unwrap();
+    }
+    let filter = boss_jobs::port::JobFilter {
+        kind: Some("ship-a-change".into()),
+        ..Default::default()
+    };
+    for limit in [400, 1000] {
+        let (rows, total) = jobs.list_jobs(&filter, limit, 0).await.unwrap();
+        assert_eq!(total, 1001);
+        assert_eq!(rows.len(), limit as usize);
+        assert!(rows.iter().all(|j| j.id != old.id));
+    }
+    old
+}
+
+async fn history_gate(jobs: &InMemoryJobs, n: u128, branch: &str, verdict: &str, held: bool) {
+    let mut gate = job(
+        "gate-run",
+        &Uuid::from_u128(0xc000 + n).to_string(),
+        "A historical branch's recent gate",
+        JobStatus::Closed,
+        json!({"branch":branch}),
+    );
+    if held {
+        gate.metadata["hold"] = json!("Independent review before boarding");
+    }
+    jobs.create_job_at(&gate, t(NOW), &[]).await.unwrap();
+    jobs.add_step_at(
+        &step(
+            &gate.id,
+            "gate",
+            "Gate",
+            StepStatus::Completed,
+            json!({"verdict":verdict}),
+        ),
+        t(NOW),
+        &[],
+    )
+    .await
+    .unwrap();
+}
+
+fn lane_branches<'a>(body: &'a Value, lane: &str) -> Vec<&'a str> {
+    body[lane]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["branch"].as_str().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_late_settled_car_spends_its_green_but_an_unclaimed_green_remains() {
+    let (app, jobs) = app_with(vec![], vec![]);
+    late_car_history(&jobs, json!({"branch":"feat/settled", "merged":"true"})).await;
+    history_gate(&jobs, 0, "feat/settled", "green", false).await;
+    history_gate(&jobs, 1, "feat/unclaimed", "green", false).await;
+    let (status, body) = get(&app, "operator").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        lane_branches(&body, "stranded"),
+        vec!["feat/unclaimed"],
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn late_closed_cars_and_rerail_origins_clear_only_settled_lanes() {
+    let (app, jobs) = app_with(vec![], vec![]);
+    late_car_history(
+        &jobs,
+        json!({"branch":"feat/settled-held", "rerail_origins":[
+            {"branch":"feat/settled-red", "head":"old-red"},
+            {"branch":"feat/settled-lost", "head":"old-lost"}
+        ]}),
+    )
+    .await;
+    for (n, branch, verdict, held) in [
+        (0, "feat/settled-held", "green", true),
+        (1, "feat/settled-red", "failed", false),
+        (2, "feat/settled-lost", "lost", false),
+        (3, "feat/current-held", "green", true),
+        (4, "feat/current-red", "failed", false),
+        (5, "feat/current-lost", "lost", false),
+    ] {
+        history_gate(&jobs, n, branch, verdict, held).await;
+    }
+    let (status, body) = get(&app, "operator").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        lane_branches(&body, "held"),
+        vec!["feat/current-held"],
+        "{body}"
+    );
+    assert_eq!(
+        lane_branches(&body, "garage"),
+        vec!["feat/current-red"],
+        "{body}"
+    );
+    assert_eq!(
+        lane_branches(&body, "limbo"),
+        vec!["feat/current-lost"],
+        "{body}"
+    );
+    assert!(lane_branches(&body, "stranded").is_empty(), "{body}");
+}
+
+#[tokio::test]
+async fn every_car_page_keeps_the_callers_scope_and_invisible_cars_spend_no_green() {
+    let (app, jobs) = app_with(vec![depth_rule()], vec![]);
+    late_car_history(&jobs, json!({"branch":"feat/owned-settled"})).await;
+    history_gate(&jobs, 0, "feat/owned-settled", "green", false).await;
+    history_gate(&jobs, 1, "feat/visible-unclaimed", "green", false).await;
+    let mut hidden = job(
+        "ship-a-change",
+        &Uuid::from_u128(0xd000).to_string(),
+        "A car this caller cannot read",
+        JobStatus::Closed,
+        json!({"branch":"feat/visible-unclaimed"}),
+    );
+    hidden.owner_id = "emp-other".into();
+    jobs.create_job_at(&hidden, t(NOW), &[]).await.unwrap();
+    let (status, body) = get(&app, "builder").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        lane_branches(&body, "stranded"),
+        vec!["feat/visible-unclaimed"],
+        "{body}"
+    );
+    assert_eq!(body["boarding"]["last_board_reading"], "withheld", "{body}");
+    let (_, full) = get(&app, "operator").await;
+    assert!(lane_branches(&full, "stranded").is_empty(), "{full}");
+}
+
+async fn car_page_failure(offset: i64) {
+    let (app, jobs) = app_with(vec![], vec![]);
+    late_car_history(&jobs, json!({"branch":"feat/settled"})).await;
+    history_gate(&jobs, 0, "feat/settled", "green", false).await;
+    jobs.fail_jobs_list("ship-a-change", offset);
+    let (status, text) = get_text(&app, "operator").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
+    assert!(
+        text.contains("ship-a-change") && text.contains(&format!("offset {offset}")),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_first_car_page_refuses_the_yard() {
+    car_page_failure(0).await;
+}
+
+#[tokio::test]
+async fn an_unreadable_later_car_page_refuses_the_partial_cross_reference() {
+    car_page_failure(1000).await;
+}
+
+async fn history_region(app: &axum::Router) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/yard/regions")
+                .header("x-boss-user", user_header("operator"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn the_shared_region_clears_a_late_settled_green_but_keeps_real_trouble() {
+    let (app, jobs) = app_with(vec![], vec![]);
+    late_car_history(&jobs, json!({"branch":"feat/settled"})).await;
+    history_gate(&jobs, 0, "feat/settled", "green", false).await;
+    let garage = |v: &Value| {
+        v["regions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "garage")
+            .unwrap()
+            .clone()
+    };
+    let (status, body) = history_region(&app).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(garage(&body)["count"], 0, "{body}");
+    assert_eq!(garage(&body)["state"], "clear", "{body}");
+    history_gate(&jobs, 1, "feat/unclaimed", "green", false).await;
+    let (status, body) = history_region(&app).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(garage(&body)["count"], 1, "{body}");
+    assert_eq!(garage(&body)["state"], "troubled", "{body}");
+}
+
+#[tokio::test]
+async fn an_unreadable_later_car_page_also_refuses_the_shared_regions_read() {
+    let (app, jobs) = app_with(vec![], vec![]);
+    late_car_history(&jobs, json!({"branch":"feat/settled"})).await;
+    jobs.fail_jobs_list("ship-a-change", 1000);
+    let (status, body) = history_region(&app).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+}
+
 fn t(rfc3339: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(rfc3339).unwrap().into()
 }
@@ -210,6 +441,22 @@ fn app_with_cadence_repo(
     let policy_client: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()
             .allow("operator", Action::Read, Resource::job(), Scope::All)
+            // The narrowed scopes of backlog d0058c92. `user_header` puts
+            // every caller in department `it`, so `it-lead` reads every
+            // packet and `sales-lead`'s grant translates to none.
+            .allow("builder", Action::Read, Resource::job(), Scope::Self_)
+            .allow(
+                "it-lead",
+                Action::Read,
+                Resource::job(),
+                Scope::Department("it".into()),
+            )
+            .allow(
+                "sales-lead",
+                Action::Read,
+                Resource::job(),
+                Scope::Department("sales".into()),
+            )
             .build(),
     );
     let bus = RecordingEventBus::new();
@@ -243,24 +490,22 @@ fn app_with_cadence_repo(
 fn job(kind: &str, id: &str, title: &str, status: JobStatus, metadata: Value) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
-        kind: kind.into(),
         workflow_version: 16,
-        subject: Subject::new("custom", "s"),
-        title: title.into(),
-        owner_id: "emp-david".into(),
         status,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 3).unwrap(),
-        opened_at: None,
-        due_on: None,
         closed_on: if status == JobStatus::Closed {
             Some(NaiveDate::from_ymd_opt(2026, 9, 3).unwrap())
         } else {
             None
         },
         metadata,
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            kind,
+            Subject::new("custom", "s"),
+            title,
+            "emp-david",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 3).unwrap(),
+        )
     }
 }
 
@@ -1308,6 +1553,213 @@ async fn an_unreadable_caller_gets_an_empty_well_formed_yard_not_a_403() {
     // Still a well-formed payload — the boarding block renders "nothing",
     // never a false-empty error.
     assert!(body["boarding"].is_object());
+}
+
+/// The board rule and the conductor's heartbeat, each with a firing on
+/// the record — the two instants backlog d0058c92 is about — over the
+/// two-car dock, which `emp-david` owns, so a `Self_` caller still reads
+/// the dock and the trains its scope gives it.
+async fn app_with_both_firings() -> (axum::Router, Arc<InMemoryJobs>) {
+    let mut d = depth_rule();
+    d.min_dock_depth = Some(2);
+    let cadence = InMemoryCadence::new(vec![d, reconcile_rule()]);
+    fire(
+        &cadence,
+        "train-board-on-dock-depth",
+        "board",
+        "2026-09-03T11:27:00Z",
+        Some(0),
+    )
+    .await;
+    fire(
+        &cadence,
+        "train-reconcile",
+        "reconcile",
+        "2026-09-03T11:57:00Z",
+        Some(0),
+    )
+    .await;
+    let (app, jobs) = app_with_cadence(cadence, vec![policy_row()]);
+    seed_dock_only(&jobs).await;
+    (app, jobs)
+}
+
+/// A NARROWED SCOPE READS NO MACHINE FIRING HERE EITHER (backlog
+/// d0058c92, from review b987dbc2 of car 84c2a922). The board rule's
+/// last firing and the conductor's heartbeat are the cadence record,
+/// which is not scoped by packet: it says when the track last boarded
+/// and when the conductor last ran, whoever's packets they moved. The IT
+/// map withholds both below a scope that reads every packet; this read
+/// gated only on the policy's `None`, so a caller whose scope reads its
+/// own packets still read `boarding.last_board_at` and
+/// `conductor.last_seen` — and every value derived from them: the
+/// cooldown's minutes (the depth firing, by subtraction), the
+/// conductor's `silent_for_minutes` (the heartbeat, beside `now`), and
+/// the board's refusal line.
+///
+/// So none of those is READ for such a caller, and the payload says
+/// WITHHELD rather than "could not be read" (a failure's words) or a
+/// bare null (which reads as "never boarded" / "never heard from").
+#[tokio::test]
+async fn a_narrowed_scope_reads_no_board_firing_and_no_heartbeat() {
+    let (app, _jobs) = app_with_both_firings().await;
+    let (status, body) = get(&app, "builder").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // What its scope gives it, it still reads: the dock is its own cars.
+    let b = &body["boarding"];
+    assert_eq!(b["dock_depth"], 2, "{b}");
+
+    // The board rule's firing: not read, and said to be withheld.
+    assert!(b["last_board_at"].is_null(), "{b}");
+    assert!(b["cooldown_remaining_minutes"].is_null(), "{b}");
+    assert_eq!(b["last_board_reading"], "withheld", "{b}");
+    for field in ["held_because", "next_board"] {
+        let line = b[field].as_str().unwrap_or_default();
+        assert!(line.contains("withheld"), "{field}: {b}");
+        assert!(!line.contains("could not be read"), "{field}: {b}");
+        // 120 − 33: the minutes left would hand back the firing.
+        assert!(!line.contains("87"), "{field}: {b}");
+    }
+
+    // The heartbeat: not read, and said to be withheld — not `silent`,
+    // and not a "no firing on record" a reader would take as an alarm.
+    let c = &body["conductor"];
+    assert!(c["last_seen"].is_null(), "{c}");
+    assert!(c["silent_for_minutes"].is_null(), "{c}");
+    assert!(c["last_rc"].is_null(), "{c}");
+    assert_eq!(c["silent"], false, "{c}");
+    assert!(
+        c["withheld"]
+            .as_str()
+            .is_some_and(|w| w.contains("scope") && w.contains("every packet")),
+        "{c}"
+    );
+
+    // And neither instant rides anywhere else in the payload.
+    let text = body.to_string();
+    for instant in ["11:27", "11:57"] {
+        assert!(!text.contains(instant), "{instant} leaked: {text}");
+    }
+}
+
+/// A department grant held OUTSIDE its department is a predicate, not
+/// `Predicate::None`, and translates to an empty scope (`job_scope_from_
+/// predicate`). This read checked only the policy's own answer, so such a
+/// caller got an empty yard with the cadence record read in beside it.
+/// Judged on the translated scope it is the caller who reads no packets,
+/// and gets the empty yard every such caller gets.
+#[tokio::test]
+async fn a_department_grant_outside_its_department_reads_the_empty_yard() {
+    let (app, _jobs) = app_with_both_firings().await;
+    let (status, body) = get(&app, "sales-lead").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["dock"].as_array().map(Vec::len), Some(0), "{body}");
+    assert!(body["boarding"]["last_board_at"].is_null(), "{body}");
+    assert!(body["conductor"]["last_seen"].is_null(), "{body}");
+    let text = body.to_string();
+    for instant in ["11:27", "11:57"] {
+        assert!(!text.contains(instant), "{instant} leaked: {text}");
+    }
+}
+
+/// The first object anywhere in `v` whose `id` is `id`.
+fn find_by_id<'a>(v: &'a Value, id: &str) -> Option<&'a Value> {
+    match v {
+        Value::Object(o) if o.get("id").and_then(Value::as_str) == Some(id) => Some(v),
+        Value::Object(o) => o.values().find_map(|x| find_by_id(x, id)),
+        Value::Array(a) => a.iter().find_map(|x| find_by_id(x, id)),
+        _ => None,
+    }
+}
+
+async fn get_uri(app: &axum::Router, role: &str, uri: &str) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("x-boss-user", user_header(role))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+/// THE MAP IS THE SAME PASS (backlog d0058c92). `/api/yard/regions`
+/// builds its regions off `read_yard`, the status's own read, so the
+/// conductor machine on the track and NEXT UP's train-board row were
+/// drawn from the same two firings for the same narrowed caller. They
+/// are withheld there by the same rule: the conductor machine says
+/// WITHHELD (not a running tick, not "no firing on record"), and neither
+/// instant, nor the minutes since one, rides the map. The operator is
+/// the control, off the same record.
+#[tokio::test]
+async fn the_map_withholds_the_same_two_firings_from_a_narrowed_scope() {
+    let (app, _jobs) = app_with_both_firings().await;
+
+    let (status, v) = get_uri(&app, "builder", "/api/yard/regions").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let conductor = find_by_id(&v, "conductor").expect("the track draws the conductor");
+    let why = conductor["why"].as_str().unwrap_or_default();
+    assert!(why.contains("withheld"), "{conductor}");
+    // A state of its own (backlog 1805bac0): until then it arrived as
+    // `unknown`, and the HUD's machine summary counted a refusal by
+    // policy among the failed-or-unknown, as trouble.
+    assert_eq!(conductor["state"], "withheld", "{conductor}");
+    let summary = &v["machines"];
+    assert_eq!(summary["withheld"], 1, "{summary}");
+    let listed = summary["failed_or_unknown"].as_array().unwrap();
+    assert!(
+        listed.iter().all(|m| m["id"] != "conductor"),
+        "a withheld machine is not trouble: {summary}"
+    );
+    let text = v.to_string();
+    for leak in ["11:27", "11:57", "3m ago", "87 min"] {
+        assert!(
+            !text.contains(leak),
+            "{leak} reached a narrowed scope: {text}"
+        );
+    }
+
+    let (status, v) = get_uri(&app, "operator", "/api/yard/regions").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let conductor = find_by_id(&v, "conductor").expect("the track draws the conductor");
+    assert_eq!(
+        conductor["why"], "reconcile 3m ago, within its declared heartbeat",
+        "the control: {conductor}"
+    );
+    // A full scope's summary carries no withheld count (backlog 1805bac0).
+    assert!(v["machines"].get("withheld").is_none(), "{}", v["machines"]);
+}
+
+/// The operator control for the two pins above: a scope that reads every
+/// packet — unrestricted, or a department grant inside its department —
+/// reads both firings and everything derived from them, unchanged, with
+/// no `withheld` on the conductor block. Without it the narrowed pins
+/// would pass on a read that withheld from everyone.
+#[tokio::test]
+async fn a_scope_that_reads_every_packet_reads_both_firings() {
+    let (app, _jobs) = app_with_both_firings().await;
+    for role in ["operator", "it-lead"] {
+        let (status, body) = get(&app, role).await;
+        assert_eq!(status, StatusCode::OK, "{role}: {body}");
+        let b = &body["boarding"];
+        assert_eq!(b["last_board_at"], "2026-09-03T11:27:00Z", "{role}: {b}");
+        assert_eq!(b["last_board_reading"], "read", "{role}: {b}");
+        assert_eq!(b["cooldown_remaining_minutes"], 87, "{role}: {b}");
+        assert_eq!(b["held_because"], "cooldown — 87 min left", "{role}: {b}");
+        let c = &body["conductor"];
+        assert_eq!(c["last_seen"], "2026-09-03T11:57:00+00:00", "{role}: {c}");
+        assert_eq!(c["silent_for_minutes"], 3, "{role}: {c}");
+        assert_eq!(c["last_rc"], 0, "{role}: {c}");
+        assert!(c.get("withheld").is_none(), "{role}: {c}");
+    }
 }
 
 #[tokio::test]

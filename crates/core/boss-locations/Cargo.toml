@@ -51,3 +51,8 @@ workspace = true
 [[test]]
 name = "locations_pg"
 required-features = ["postgres"]
+
+# The adapters-agree suite (backlog be459ab9) names PgLocations too.
+[[test]]
+name = "the_adapters_agree_on_the_location_registry_pg"
+required-features = ["postgres"]

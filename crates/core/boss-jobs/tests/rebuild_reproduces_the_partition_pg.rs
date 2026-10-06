@@ -28,20 +28,18 @@ use uuid::Uuid;
 fn job(id: &str, partition: Partition) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
-        kind: "keg-return".to_string(),
         workflow_version: 4,
-        subject: Subject::new("account", "acct-1"),
-        title: "t".into(),
-        owner_id: "emp-1".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 15).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
         partition,
+        ..Job::new(
+            "keg-return".to_string(),
+            Subject::new("account", "acct-1"),
+            "t",
+            "emp-1",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 15).unwrap(),
+        )
     }
 }
 

@@ -750,20 +750,37 @@ spec:
                         echo "run $run: $seen, but gate-run $gating is open or green — that verdict ends the run, not this pass"
                         continue
                       fi
-                      jq --arg run "$run" --arg seen "$seen" --arg host "$host" '
-                        ([ .data[] | select(.id == $run) | (.steps // [])[] | select(.spec_slug == "building") ] | .[0].metadata // {}) as $md
-                        | { status: "completed",
-                            metadata: ($md + { result: "died",
-                                               host_gone: { host: $host, seen: $seen, at: (now | todate),
-                                                            observer: "boss-estate-observe" } }) }' \
-                        "$WORK/runs.json" >"$WORK/end-run.json" \
+                      # TWO WRITES: THE KEYS THROUGH THE MERGE DOOR, THEN
+                      # THE STATUS ALONE (backlog e39a9d2a, Stage 2). This
+                      # was one PUT carrying building's read metadata back
+                      # beside result and host_gone, because the step PUT
+                      # replaces metadata wholesale; its end state refuses
+                      # any metadata body. The merge first, as the gate
+                      # settle above does: a merge that did not answer 2xx
+                      # is not followed by a flip, and the next pass tries
+                      # again.
+                      jq -n --arg seen "$seen" --arg host "$host" '
+                        { result: "died",
+                          host_gone: { host: $host, seen: $seen, at: (now | todate),
+                                       observer: "boss-estate-observe" } }' \
+                        >"$WORK/end-run.json" \
                         || { echo "run $run: $seen, but its step body could not be built — left for the clock"; continue; }
-                      scode=$(api_curl -s -o /dev/null -w '%{http_code}' -X PUT \
+                      scode=$(api_curl -s -o /dev/null -w '%{http_code}' -X PATCH \
                         -H "content-type: application/json" \
                         -H "x-boss-user: $OBSERVER_USER" \
                         --data-binary @"$WORK/end-run.json" \
-                        "$JOBS_API/api/jobs/$run/steps/$step") || scode="curl $?"
-                      echo "run $run: $seen — building ended died -> $scode"
+                        "$JOBS_API/api/jobs/$run/steps/$step/metadata") || scode="curl $?"
+                      case "$scode" in
+                        2??)
+                          scode=$(api_curl -s -o /dev/null -w '%{http_code}' -X PUT \
+                            -H "content-type: application/json" \
+                            -H "x-boss-user: $OBSERVER_USER" \
+                            --data-binary '{"status":"completed"}' \
+                            "$JOBS_API/api/jobs/$run/steps/$step") || scode="curl $?"
+                          echo "run $run: $seen — building ended died -> $scode" ;;
+                        *)
+                          echo "run $run: $seen — building NOT ended: the merge answered $scode; the next pass tries again" ;;
+                      esac
                     done <"$WORK/dead-hosts.tsv"
                   fi
                   # AN EVICTION IS RECORDED WHERE THE RECORD CAN READ IT

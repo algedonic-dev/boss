@@ -125,8 +125,10 @@ fn req(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
         .expect("request")
 }
 
-/// Complete the step with `slug` the way the conductor does: read it,
-/// lay the evidence over its stored metadata, PUT it completed.
+/// Complete the step with `slug` the way the conductor does: the
+/// evidence through the step merge door, then the status alone — the
+/// step PUT refuses any metadata body (backlog e39a9d2a, design
+/// 93d2bddb's end state).
 async fn complete(app: &axum::Router, job_id: &str, slug: &str, evidence: serde_json::Value) {
     let (status, full) = send(
         app,
@@ -141,17 +143,23 @@ async fn complete(app: &axum::Router, job_id: &str, slug: &str, evidence: serde_
         .find(|s| s["spec_slug"] == slug)
         .unwrap_or_else(|| panic!("`{slug}` materialised"))
         .clone();
-    let mut metadata = step["metadata"].clone();
-    for (k, v) in evidence.as_object().expect("evidence is an object") {
-        metadata[k] = v.clone();
-    }
     let step_id = step["id"].as_str().expect("step id");
+    let (status, body) = send(
+        app,
+        req(
+            "PATCH",
+            &format!("/api/jobs/{job_id}/steps/{step_id}/metadata"),
+            evidence,
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "merging `{slug}`: {status}: {body}");
     let (status, body) = send(
         app,
         req(
             "PUT",
             &format!("/api/jobs/{job_id}/steps/{step_id}"),
-            serde_json::json!({"status": "completed", "metadata": metadata}),
+            serde_json::json!({"status": "completed"}),
         ),
     )
     .await;
@@ -272,6 +280,7 @@ async fn a_trains_ci_verdict_tells_the_trains_owner_the_wait_is_over() {
     let (people, messages, sent) = mock_services().await;
     let handler = MessagesNotify::with_client(
         boss_dispatcher_handlers::handlers::common::api_client(),
+        people.clone(),
         people,
         messages,
     );

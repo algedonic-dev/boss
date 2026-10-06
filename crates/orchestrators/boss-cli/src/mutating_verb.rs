@@ -57,6 +57,38 @@
 //! 4. the protocols in [`ALWAYS`]: the runner names its packet kind
 //!    (`ops-request`) without the file's extension, so no closure finds
 //!    the row that decides who may file, approve and claim a request.
+//! 5. every file under [`CANDIDATES`] whose own text says [`CLAIM`] —
+//!    that every change to it is a credentials-area car waiting for an
+//!    adversarial review — and the CLI module its text names as the
+//!    command that reads it (backlog 275d75af). Today that is the
+//!    printed re-entry sheet, `infra/recovery/re-entry.toml`, and its
+//!    renderer `boss recovery sheet` (`recovery.rs`, `recovery/`): the
+//!    sheet's header made the claim (review of car 67e78997, F6) and no
+//!    list here named it, so a car changing only the sheet boarded
+//!    unheld. The dev pod's login selector, `infra/dev/dev-session.sh`,
+//!    makes it too (review a27c860d F4): every interactive ssh login
+//!    runs it as root, and it names no renderer and prints from no
+//!    file, so it holds itself alone.
+//!    The sentence IS the list (CLAUDE.md 9a): a file that
+//!    makes it is held, a car that deletes it is held by the base that
+//!    still makes it, and a test on the real tree fails if the sheet
+//!    stops making it. The 17 files the sheet reads FACTS from are not
+//!    held: 123 of 642 commits in 30 days touched one (measured
+//!    2026-10-01 on origin/main ee9a78a5) against 7 for the sheet and
+//!    its renderer, and a resolved value is judged by the renderer's
+//!    own key-material refusal and moves the sheet's version, which
+//!    asks for a reprint.
+//!
+//!    The files a claimant prints PROSE from are held, though (backlog
+//!    27272837, review 818ac256 F1): the sheet printed the dev-door
+//!    JSON's free-text `what`, `command` and `why` (outside `infra/`,
+//!    claiming nothing), so a car changing only that file changed
+//!    printed sentences unreviewed — and the header says which key
+//!    opens which door is enforced by review alone. Derived from the
+//!    claimant's own lines ([`prose_sources`]): the `file` of every
+//!    line that names `fields`. A single `key`/`pattern` read is a
+//!    value, and a real-tree test resolves every one and fails on a
+//!    sentence, so the shape cannot quietly stop meaning what it says.
 //!
 //! The MUTATING word (and `requires_approval`) still names, in the
 //! reason, which touched paths belong to a verb that says it acts —
@@ -239,13 +271,125 @@ fn is_script(path: &str, text: &str) -> bool {
 /// the boss CLI modules a verb or a covered script runs.
 pub(crate) fn covered(side: &Side) -> BTreeSet<String> {
     let mut covered = closure(side);
-    let reached = reached(side, &covered);
+    let mut reached = reached(side, &covered);
+    let Claimed {
+        claimants,
+        renderers,
+        prose,
+    } = claimed(side);
+    covered.extend(claimants);
+    covered.extend(prose);
+    reached.extend(renderers);
     covered.extend(
         side.keys()
             .filter(|p| module_of(p).is_some_and(|m| reached.contains(m)))
             .cloned(),
     );
     covered
+}
+
+/// The sentence a file's own header writes to say every change to it
+/// waits for an adversarial review — `infra/recovery/re-entry.toml`'s,
+/// word for word, compared with comment leaders stripped, lines joined
+/// and case folded, so a rewrap of the header does not unhold it.
+pub(crate) const CLAIM: &str =
+    "every change to this file is a credentials-area car and waits for an adversarial review";
+
+/// The text of a file as one line of words: comment leaders (`#`,
+/// `//`, `//!`, `///`) stripped, whitespace collapsed, lowercased.
+fn prose_of(text: &str) -> String {
+    text.lines()
+        .map(|l| l.trim_start().trim_start_matches(['#', '/', '!']))
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// PURE: the files under [`CANDIDATES`] whose text makes the [`CLAIM`],
+/// and the CLI module each one's text names as the command that reads
+/// it (the sheet's header: "`boss recovery sheet` reads this file") —
+/// the renderer, which decides what the file's lines print and holds
+/// the secret-shape tripwires, never a hub. ONE DEFINITION (CLAUDE.md
+/// 9a, backlog 275d75af): the header's claim was the only list, and the
+/// hold did not read it, so a car changing the printed sheet alone
+/// boarded unheld.
+fn claimed(side: &Side) -> Claimed {
+    let modules = cli_modules(side);
+    let claimants: Vec<(&String, &String)> = side
+        .iter()
+        // Under [`CANDIDATES`] only: this module spells the sentence as
+        // a constant, and a Rust source quoting it is not a claimant.
+        .filter(|(p, t)| {
+            CANDIDATES.iter().any(|d| p.starts_with(d))
+                && t.contains("review")
+                && prose_of(t).contains(CLAIM)
+        })
+        .collect();
+    let renderers = claimants
+        .iter()
+        .flat_map(|(_, t)| t.split("`boss ").skip(1))
+        // Only the command the header says READS the file — a `boss
+        // prove` named in a road's prose renders nothing.
+        .filter(|rest| {
+            rest.split_once('`')
+                .is_some_and(|(_, after)| after.starts_with(" reads this file"))
+        })
+        .filter_map(|rest| rest.split([' ', '`']).next())
+        .map(|sub| sub.replace('-', "_"))
+        .filter(|sub| modules.contains(sub.as_str()) && !CLI_HUBS.contains(&sub.as_str()))
+        .collect();
+    let prose = claimants
+        .iter()
+        .flat_map(|(_, t)| prose_sources(t))
+        .collect();
+    Claimed {
+        claimants: claimants.into_iter().map(|(p, _)| p.clone()).collect(),
+        renderers,
+        prose,
+    }
+}
+
+/// What one side's [`CLAIM`] lends its hold to.
+struct Claimed {
+    /// The files whose own text makes the claim.
+    claimants: BTreeSet<String>,
+    /// The CLI module each names as the command that reads it.
+    renderers: BTreeSet<String>,
+    /// The files a claimant prints PROSE from ([`prose_sources`]).
+    prose: BTreeSet<String>,
+}
+
+/// PURE: the files a claimant sheet prints PROSE from — the `file` of
+/// every `[[road.line]]` that names `fields` (backlog 27272837, review
+/// 818ac256 F1). Read off the claimant's own lines, never a list typed
+/// here (CLAUDE.md 9a): today the dev-door JSON, whose `what`, `command`
+/// and `why` print as sentences on the re-entry sheet, so a car editing
+/// only that file changed printed prose with no review.
+///
+/// PROSE FROM A VALUE, by the line's shape: `fields` prints a list of
+/// records field by field — free text. Every other read (a line's
+/// `key` or `pattern`, a command's `with`, a road's `needs`) reads ONE
+/// value — an address, a port, a tag — and stays unheld as backlog
+/// 275d75af decided. The shape is only as good as what it resolves
+/// to, so a real-tree test resolves every such read with the renderer
+/// and fails on any that reads as a sentence (three or more words).
+/// A claimant that does not parse lends nothing here; it is itself
+/// held, and the other side of the change still names its sources.
+fn prose_sources(text: &str) -> BTreeSet<String> {
+    let Ok(doc) = toml::from_str::<toml::Value>(text) else {
+        return BTreeSet::new();
+    };
+    doc.get("road")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|road| road.get("line").and_then(toml::Value::as_array))
+        .flatten()
+        .filter(|line| line.get("fields").is_some())
+        .filter_map(|line| line.get("file").and_then(toml::Value::as_str))
+        .map(str::to_string)
+        .collect()
 }
 
 /// PURE: [`OPS_DIR`], [`ALWAYS`], every verb's path arguments, and the
@@ -395,7 +539,14 @@ fn with_main(
     if !changed.iter().any(|p| p == CLI_MAIN) {
         return judged;
     }
-    let reached: BTreeSet<String> = sides.iter().flat_map(|s| reached(s, &closure(s))).collect();
+    let reached: BTreeSet<String> = sides
+        .iter()
+        .flat_map(|s| {
+            let mut r = reached(s, &closure(s));
+            r.extend(claimed(s).renderers);
+            r
+        })
+        .collect();
     if !main_routes_to(main_hunks, &reached) {
         return judged;
     }
@@ -579,7 +730,8 @@ impl Judgement {
         match self {
             Judgement::Clear => None,
             Judgement::Touches { paths, mutating } => Some(format!(
-                "touches an ops verb, what a verb runs, or the runner ({}){}: waits for its \
+                "touches an ops verb, what a verb runs, the runner, or a file that claims a \
+                 review, its renderer, or a file it prints prose from ({}){}: waits for its \
                  adversarial review; boss release records the RELEASE verdict ({ITEM})",
                 paths.join(", "),
                 if mutating.is_empty() {
@@ -1664,13 +1816,271 @@ mod tests {
         );
     }
 
-    /// THE REAL TREE, read off disk: every module the packet names as
-    /// run by a verb is covered — `workflow`, `tenant`, `prove`, `reach`
-    /// — and the hubs and the crate root are not. The module names come
-    /// from the listing, so a fixture that invented them could pass
-    /// while the tree does not.
+    /// A FILE THAT SAYS IT IS HELD IS HELD (backlog 275d75af): the
+    /// claim, wrapped across comment lines as a header wraps it, covers
+    /// the file and the CLI module its header names as `boss <sub>` —
+    /// and nothing else in the crate. Read on BOTH sides, so a car that
+    /// deletes the sentence is held by the base that still says it.
     #[test]
-    fn on_the_real_tree_the_cli_modules_the_mutating_verbs_run_are_covered() {
+    fn a_file_whose_header_claims_a_review_is_held_with_the_renderer_it_names() {
+        let header = "# THE SHEET. `boss recovery sheet` reads this file.\n\
+                      # No regex can refuse it. Every change to this file is a\n\
+                      # credentials-area car and waits for an adversarial review that reads\n\
+                      # each line. Then `boss prove` the road.\n[[road]]\n";
+        let tree = |sheet: &str| {
+            side(&[
+                ("infra/ops/verbs/df.json", &verb("READ-ONLY", &["df"])),
+                ("infra/recovery/sheet.toml", sheet),
+                ("infra/estate/estate.toml", "[node]\n"),
+                (&cli("recovery.rs"), "mod pdf;\n"),
+                (&cli("recovery/pdf.rs"), "fn x() {}\n"),
+                (&cli("other.rs"), "fn y() {}\n"),
+                (&cli("prove.rs"), "fn z() {}\n"),
+            ])
+        };
+        let (claims, silent) = (tree(header), tree("[[road]]\n"));
+        for held in [
+            "infra/recovery/sheet.toml",
+            &cli("recovery.rs"),
+            &cli("recovery/pdf.rs"),
+        ] {
+            let judged = touched(&paths(&[held]), &[&claims]);
+            assert_eq!(judged, touches(&[held], &[]), "{held}");
+            let reason = judged.hold_reason().expect("a claimant holds");
+            assert!(reason.contains("claims a review"), "{reason}");
+        }
+        for clear in [
+            "infra/estate/estate.toml",
+            &cli("other.rs"),
+            &cli("prove.rs"),
+        ] {
+            assert_eq!(
+                touched(&paths(&[clear]), &[&claims]),
+                Judgement::Clear,
+                "{clear}"
+            );
+        }
+        assert_eq!(
+            touched(&paths(&["infra/recovery/sheet.toml"]), &[&silent]),
+            Judgement::Clear,
+            "no claim, no hold: the sentence is the key"
+        );
+        assert_eq!(
+            touched(&paths(&["infra/recovery/sheet.toml"]), &[&claims, &silent]),
+            touches(&["infra/recovery/sheet.toml"], &[]),
+            "deleting the claim is held by the base that still makes it"
+        );
+    }
+
+    /// THE REAL TREE: the printed re-entry sheet's header says every
+    /// change to it waits for an adversarial review, and the hold list
+    /// is that sentence — so the sheet, every file beside it, and the
+    /// renderer `boss recovery sheet` are held, and the files the sheet
+    /// only READS facts from are not (backlog 275d75af; CLAUDE.md 9a).
+    /// Reword the header and this fails, rather than the sheet boarding
+    /// unheld in silence.
+    #[test]
+    fn on_the_real_tree_the_re_entry_sheet_and_its_renderer_are_held() {
+        let tree = real_tree();
+        let c = covered(&tree);
+        let beside: Vec<&String> = tree
+            .keys()
+            .filter(|p| p.starts_with("infra/recovery/"))
+            .collect();
+        assert!(
+            beside.iter().any(|p| *p == "infra/recovery/re-entry.toml"),
+            "{beside:?}"
+        );
+        for p in beside {
+            assert!(c.contains(p), "{p} is under infra/recovery/ and not held");
+        }
+        for p in [cli("recovery.rs"), cli("recovery/pdf.rs")] {
+            assert!(c.contains(&p), "{p} renders the sheet");
+        }
+        // The claim adds the sheet, its renderer and the files it prints
+        // prose from, and nothing else: a fact source is held only if
+        // another rule holds it already.
+        let Claimed {
+            claimants,
+            renderers,
+            prose,
+        } = claimed(&tree);
+        assert_eq!(
+            claimants.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["infra/dev/dev-session.sh", "infra/recovery/re-entry.toml"],
+            "the dev pod's login selector makes the claim too (review a27c860d F4)"
+        );
+        assert_eq!(
+            renderers.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["recovery"]
+        );
+        assert_eq!(
+            prose.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["apps/web/src/it/estate/dev-door.json"],
+            "derived from the sheet's own `fields` lines (backlog 27272837)"
+        );
+    }
+
+    /// A FILE THE SHEET PRINTS SENTENCES FROM IS HELD WITH IT (backlog
+    /// 27272837, review 818ac256 F1): a `[[road.line]]` that names
+    /// `fields` prints a list of records field by field, and its `file`
+    /// is held — even outside [`CANDIDATES`], since the hold list is
+    /// paths, not the side's files. A line reading ONE value by `key`
+    /// or `pattern` is not. Read on both sides, so a car that drops the
+    /// `fields` line is held by the base that still prints from it.
+    #[test]
+    fn a_file_the_sheet_prints_prose_from_is_held() {
+        let sheet = |door_line: &str| {
+            format!(
+                "# `boss recovery sheet` reads this file. Every change to this file is a\n\
+                 # credentials-area car and waits for an adversarial review.\n\
+                 [[road]]\nid = \"door\"\ntitle = \"The door\"\n\
+                 [[road.line]]\nlabel = \"Host\"\nfile = \"apps/x/door.json\"\nkey = \"host\"\n\
+                 [[road.line]]\nlabel = \"Address\"\nfile = \"infra/estate/estate.toml\"\nkey = \"a\"\n\
+                 {door_line}"
+            )
+        };
+        let steps = "[[road.line]]\nlabel = \"Steps\"\nfile = \"apps/x/door.json\"\n\
+                     key = \"steps\"\nfields = [\"what\", \"why\"]\n";
+        let tree = |text: &str| {
+            side(&[
+                ("infra/ops/verbs/df.json", &verb("READ-ONLY", &["df"])),
+                ("infra/recovery/sheet.toml", text),
+                ("infra/estate/estate.toml", "a = 1\n"),
+                (&cli("recovery.rs"), "fn x() {}\n"),
+            ])
+        };
+        let (prints, values_only) = (tree(&sheet(steps)), tree(&sheet("")));
+        let door = paths(&["apps/x/door.json"]);
+        let judged = touched(&door, &[&prints]);
+        assert_eq!(judged, touches(&["apps/x/door.json"], &[]));
+        let reason = judged.hold_reason().expect("a prose source holds");
+        assert!(reason.contains("prints prose from"), "{reason}");
+        assert_eq!(
+            touched(&paths(&["infra/estate/estate.toml"]), &[&prints]),
+            Judgement::Clear,
+            "a file read for one value is not held"
+        );
+        assert_eq!(
+            touched(&door, &[&values_only]),
+            Judgement::Clear,
+            "a file the sheet reads only a value from is not held"
+        );
+        assert_eq!(
+            touched(&door, &[&prints, &values_only]),
+            touches(&["apps/x/door.json"], &[]),
+            "dropping the fields line is held by the base that still prints it"
+        );
+        let unclaimed = tree(&sheet(steps).replace("Every change", "A change"));
+        assert_eq!(
+            touched(&door, &[&unclaimed]),
+            Judgement::Clear,
+            "only a file that claims a review lends its hold"
+        );
+    }
+
+    /// THE REAL TREE: a change to the dev-door JSON ALONE is held — the
+    /// car review 818ac256 F1 said would board unheld (backlog 27272837).
+    #[test]
+    fn on_the_real_tree_a_change_to_the_dev_door_steps_alone_is_held() {
+        let tree = real_tree();
+        let judged = touched(&paths(&["apps/web/src/it/estate/dev-door.json"]), &[&tree]);
+        assert_eq!(
+            judged,
+            touches(&["apps/web/src/it/estate/dev-door.json"], &[])
+        );
+    }
+
+    /// THE REAL TREE: a change to the dev pod's login selector ALONE is
+    /// held (review a27c860d F4, backlog e2d63c28). Every interactive ssh
+    /// login runs it as root, and when the menu left boss-dev.yaml for
+    /// `infra/dev/` an edit to it stopped drawing that manifest's hold —
+    /// so its header makes the [`CLAIM`], and the sentence is the list.
+    #[test]
+    fn on_the_real_tree_a_change_to_the_login_selector_alone_is_held() {
+        let tree = real_tree();
+        let judged = touched(&paths(&["infra/dev/dev-session.sh"]), &[&tree]);
+        assert_eq!(judged, touches(&["infra/dev/dev-session.sh"], &[]));
+        let reason = judged.hold_reason().expect("the selector is held");
+        assert!(reason.contains("claims a review"), "{reason}");
+    }
+
+    /// HOW PROSE IS TOLD FROM A VALUE, pinned on the real sheet (backlog
+    /// 27272837). The rule is the line's shape: `fields` prints records
+    /// and is held; every other read — a line's `key` or `pattern`, a
+    /// command's `with`, a road's `needs` — reads ONE value and is not.
+    /// That holds only while every such read resolves to a value (an
+    /// address, a port, a tag, a list of them), and a sentence read from
+    /// an unheld file is the hole this item closed. So every single read
+    /// is resolved here by the renderer's own resolver, and any element
+    /// that is a sentence ([`crate::recovery::reads_as_a_sentence`]) fails, naming the file and
+    /// the key, rather than the file printing prose unheld.
+    #[test]
+    fn on_the_real_tree_every_read_the_hold_calls_a_value_is_a_value() {
+        use crate::recovery::{self, Line, LineOut, Ref, Road, Sheet, Value};
+        let root = boss_testing::repo_root();
+        let text = std::fs::read_to_string(root.join(recovery::SOURCE)).expect("the sheet");
+        let real = recovery::parse_sheet(&text).expect("the sheet parses");
+        let single = |r: &Ref| Line {
+            prose: None,
+            not_tree_held: None,
+            label: Some(format!("{}#{:?}{:?}", r.file, r.key, r.pattern)),
+            file: Some(r.file.clone()),
+            key: r.key.clone(),
+            pattern: r.pattern.clone(),
+            fields: None,
+            command: None,
+            with: None,
+        };
+        let mut reads: Vec<Line> = Vec::new();
+        for road in &real.road {
+            for line in &road.line {
+                if let Some(file) = line.file.as_ref().filter(|_| line.fields.is_none()) {
+                    reads.push(single(&Ref {
+                        file: file.clone(),
+                        key: line.key.clone(),
+                        pattern: line.pattern.clone(),
+                    }));
+                }
+                reads.extend(line.with.iter().flat_map(|w| w.values()).map(single));
+            }
+            if let Some(n) = &road.needs {
+                reads.extend(n.host.iter().chain(n.path.iter()).map(single));
+            }
+        }
+        assert!(reads.len() > 40, "{} single reads", reads.len());
+        let one = Sheet {
+            road: vec![Road {
+                id: "reads".into(),
+                title: "reads".into(),
+                proven_by: None,
+                needs: None,
+                line: reads,
+            }],
+        };
+        let rendered = recovery::resolve(&root, &one).expect("every single read resolves");
+        let sentences: Vec<String> = rendered.roads[0]
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                LineOut::Fact {
+                    label,
+                    value: Value::Text(t),
+                    ..
+                } => Some((label, t)),
+                _ => None,
+            })
+            .filter(|(_, t)| t.split(", ").any(recovery::reads_as_a_sentence))
+            .map(|(label, t)| format!("{label} = {t:?}"))
+            .collect();
+        assert!(
+            sentences.is_empty(),
+            "a read the hold calls a VALUE resolves to a sentence — print it through a \
+             `fields` line so its file is held, or hold it another way: {sentences:#?}"
+        );
+    }
+
+    fn real_tree() -> Side {
         fn walk(root: &Path, dir: &Path, out: &mut Side) {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 return;
@@ -1692,6 +2102,17 @@ mod tests {
         for dir in CANDIDATES.iter().chain([&CLI_SRC]) {
             walk(&root, &root.join(dir), &mut tree);
         }
+        tree
+    }
+
+    /// THE REAL TREE, read off disk: every module the packet names as
+    /// run by a verb is covered — `workflow`, `tenant`, `prove`, `reach`
+    /// — and the hubs and the crate root are not. The module names come
+    /// from the listing, so a fixture that invented them could pass
+    /// while the tree does not.
+    #[test]
+    fn on_the_real_tree_the_cli_modules_the_mutating_verbs_run_are_covered() {
+        let tree = real_tree();
         let c = covered(&tree);
         for want in ["workflow.rs", "tenant.rs", "prove.rs", "reach.rs"] {
             assert!(c.contains(&cli(want)), "{want} is run by a verb");

@@ -43,7 +43,7 @@
 //   5  c4c77ddd  FIXED on main, item still open — the region's own rails
 //                         in and out (design 62de32ae decision 7)
 //   6  4142d821  FIXED   — the HUD frame's stuck and waiting, side by side
-//   7  f9b75688  open    — WORKING (claimed vs ready) is not shown
+//   7  f9b75688  FIXED   — READY and WORKING (ACTIVE) counts and row status
 //   8  18683a0a  FIXED   — the waits count line
 //   9  fdc0ea0b  open    — no station opens its queue
 //   10 67825067  FIXED   — a malformed 200 from any board read is its
@@ -321,12 +321,12 @@ test.describe('the marshalling station — the selection, and the words it says'
       'The depths sum to 517 but hold 304 distinct packets: a packet stands at every station whose predicate it matches, so 213 of those standings count a packet already counted at another station. Also standing elsewhere: q.platform-admin.task 213 of 297, a.platform-admin.opus-5-1m 213 of 213.',
     );
 
-    await expect(waitsTable(page).locator('thead th')).toHaveText(['Waiting', 'Obligation', 'Packet', 'On whom']);
+    await expect(waitsTable(page).locator('thead th')).toHaveText(['Waiting', 'Obligation', 'Packet', 'On whom', 'Status']);
     const waits = waitsTable(page).locator('tbody tr');
     await expect(waits).toHaveCount(3);
-    await expect(waits.nth(0).locator('td')).toHaveText(['5 d', 'Build the change', 'Teach the dock to breathe backlog-item', 'agent-claude']);
-    await expect(waits.nth(1).locator('td')).toHaveText(['at least 2 d', 'Review the design', 'Recent performance design-doc', 'emp-david']);
-    await expect(waits.nth(2).locator('td')).toHaveText(['6 h', 'Sign off the page', 'Page audit: /it/estate page-audit', 'nobody']);
+    await expect(waits.nth(0).locator('td')).toHaveText(['5 d', 'Build the change', 'Teach the dock to breathe backlog-item', 'agent-claude', 'WORKING (ACTIVE)']);
+    await expect(waits.nth(1).locator('td')).toHaveText(['at least 2 d', 'Review the design', 'Recent performance design-doc', 'emp-david', 'READY']);
+    await expect(waits.nth(2).locator('td')).toHaveText(['6 h', 'Sign off the page', 'Page audit: /it/estate page-audit', 'nobody', 'READY']);
     await expect(waits.nth(2).locator('td').nth(3)).toHaveClass(/nobody/);
     await expect(b.locator('.my-waits-count')).toHaveText(
       '3 of 3 outstanding obligations, longest first · 1 on simulated or shadow packets not ranked',
@@ -363,13 +363,28 @@ test.describe('the marshalling station — the selection, and the words it says'
     await expect(sidingRows(page).nth(3).locator('td').first().locator('.my-station')).toHaveText('loading-dock');
   });
 
-  test('CURRENT, gap 7 (f9b75688): a claimed obligation reads exactly like a ready one — no WORKING split', async ({ page }) => {
+  test('gap 7 (f9b75688): READY and WORKING remain distinct in full counts and row status', async ({ page }) => {
     await install(page);
     await mountPage(page, PATH, TITLE);
-    // The first row's step is ACTIVE (claimed by agent-claude) and the
-    // third's READY; the table has no column and no word for either.
-    await expect(waitsTable(page).locator('thead th')).toHaveCount(4);
-    await expect(board(page)).not.toContainText(/\bactive\b|\bclaimed\b|\bworking\b/i);
+    await expect(board(page).locator('.my-waits-status')).toHaveText('2 READY · 1 WORKING (ACTIVE)');
+    await expect(waitsTable(page).locator('tbody tr td:last-child')).toHaveText(['WORKING (ACTIVE)', 'READY', 'READY']);
+  });
+
+  test('status totals include capped rows; unknown statuses stay explicit and not-real rows stay excluded', async ({ page }) => {
+    const data = [
+      ...WAITS.data,
+      ...Array.from({ length: 12 }, (_, i) => ({ ...WAITS.data[1]!, job_id: `extra-${i}`, status: 'active', waiting_days: 0 })),
+      { ...WAITS.data[1]!, job_id: 'unknown', status: 'paused', waiting_days: 8 },
+      { ...WAITS.data[1]!, job_id: 'missing', status: null, waiting_days: 7 },
+      { ...WAITS.data[1]!, job_id: 'shadow', partition: 'shadow', status: 'active', waiting_days: 500 },
+    ];
+    await install(page, { waits: (r) => json(r, { ...WAITS, data, total: data.length }) });
+    await mountPage(page, PATH, TITLE);
+    await expect(board(page).locator('.my-waits-status')).toHaveText('2 READY · 13 WORKING (ACTIVE) · 2 status unknown');
+    await expect(waitsTable(page).locator('tbody tr')).toHaveCount(12);
+    await expect(waitsTable(page).locator('tbody tr td:last-child').nth(0)).toHaveText('Unknown (paused)');
+    await expect(waitsTable(page).locator('tbody tr td:last-child').nth(1)).toHaveText('Unknown');
+    await expect(board(page).locator('.my-waits-count')).toHaveText('12 of 17 outstanding obligations, longest first · +5 more not shown · 2 on simulated or shadow packets not ranked');
   });
 
   test('CURRENT, gap 9 (fdc0ea0b): no station opens its queue — the links on the board are the packets and one kind’s drill-down', async ({ page }) => {

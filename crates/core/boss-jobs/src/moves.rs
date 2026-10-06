@@ -836,6 +836,15 @@ fn poisoned<T>(_: T) -> MovesError {
     MovesError::Storage("the in-memory lock was poisoned".into())
 }
 
+/// A page size, refused when negative as Postgres refuses `LIMIT -1`.
+/// It read `usize::try_from(..).unwrap_or(0)` until the adapters-agree
+/// suite (backlog be459ab9), so the double answered a caller's bug with
+/// a confident empty page where production errored.
+fn page(limit: i64) -> Result<usize, MovesError> {
+    usize::try_from(limit)
+        .map_err(|_| MovesError::Storage(format!("a page is never negative: limit {limit}")))
+}
+
 #[async_trait]
 impl MovesStore for InMemoryMoves {
     async fn log_head(&self) -> Result<i64, MovesError> {
@@ -859,7 +868,7 @@ impl MovesStore for InMemoryMoves {
             .cloned()
             .collect();
         out.sort_by_key(|c| c.seq);
-        out.truncate(usize::try_from(limit).unwrap_or(0));
+        out.truncate(page(limit)?);
         Ok(out)
     }
 
@@ -897,7 +906,7 @@ impl MovesStore for InMemoryMoves {
             .map_err(poisoned)?
             .iter()
             .filter(|r| r.seq > seq)
-            .take(usize::try_from(limit).unwrap_or(0))
+            .take(page(limit)?)
             .cloned()
             .collect())
     }
@@ -1066,13 +1075,27 @@ mod pg {
         async fn crossings(&self, since: Instant) -> Result<Vec<RouteCount>, MovesError> {
             // An exit is counted per kind and terminal
             // (`RouteCount::key_of`, the in-memory adapter's key).
+            //
+            // THE ORDER is that key's derived `Ord`: `None` (off the map)
+            // first, then byte order — `COLLATE "C" NULLS FIRST` on every
+            // column. It was `ORDER BY 1, 2, 3, 4` until the
+            // adapters-agree suite (backlog be459ab9): NULLs LAST, and
+            // names in the database's locale, which ignores `-` and folds
+            // case (backlog 2987fb2d) — and `with_undeclared` names a
+            // troubled region's routes in this order, so the two adapters
+            // wrote the same reading two ways.
             let rows = sqlx::query(
-                "SELECT from_region, to_region, \
+                "SELECT * FROM ( \
+                 SELECT from_region, to_region, \
                  CASE WHEN to_region IS NULL AND kind <> '' THEN kind END AS exit_kind, \
                  CASE WHEN to_region IS NULL THEN terminal END AS exit_terminal, \
                  COUNT(*)::BIGINT AS moves, MAX(at) AS last_at \
                  FROM yard_moves WHERE at >= $1 \
-                 GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3, 4",
+                 GROUP BY 1, 2, 3, 4) routes \
+                 ORDER BY from_region COLLATE \"C\" NULLS FIRST, \
+                 to_region COLLATE \"C\" NULLS FIRST, \
+                 exit_kind COLLATE \"C\" NULLS FIRST, \
+                 exit_terminal COLLATE \"C\" NULLS FIRST",
             )
             .bind(since)
             .fetch_all(&self.pool)

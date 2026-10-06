@@ -48,7 +48,7 @@ fn write_stub(dir: &Path) -> PathBuf {
         r#"#!/usr/bin/env bash
 set -u
 { printf '%s\n' "$@"; echo '=== call ==='; } >> "$STUB_LOG"
-verb=""; kind=""; name=""; prev=no; tail=""; cont=""
+verb=""; kind=""; name=""; prev=no; tail=""; cont=""; ignore=no
 while [ $# -gt 0 ]; do
     case "$1" in
         -n) shift ;;
@@ -57,15 +57,23 @@ while [ $# -gt 0 ]; do
         --previous) prev=yes ;;
         --tail=*) tail="${1#--tail=}" ;;
         --all-containers) cont=all ;;
+        --ignore-not-found) ignore=yes ;;
         -c) cont="$2"; shift ;;
     esac
     shift
 done
 case "$verb:$kind" in
     get:deployment)
-        [ -f "$STUB_DIR/deploy.json" ] || { echo 'Error from server (NotFound): deployments.apps "absent" not found' >&2; exit 1; }
+        [ ! -f "$STUB_DIR/deploy.err" ] || { cat "$STUB_DIR/deploy.err" >&2; exit 1; }
+        [ -f "$STUB_DIR/deploy.json" ] || { [ "$ignore" = yes ] && exit 0; echo 'Error from server (NotFound): deployments.apps "absent" not found' >&2; exit 1; }
         cat "$STUB_DIR/deploy.json" ;;
-    get:pods) cat "$STUB_DIR/pods.json" ;;
+    get:statefulset)
+        [ ! -f "$STUB_DIR/statefulset.err" ] || { cat "$STUB_DIR/statefulset.err" >&2; exit 1; }
+        [ -f "$STUB_DIR/statefulset.json" ] || { [ "$ignore" = yes ] && exit 0; echo 'Error from server (NotFound): statefulsets.apps "absent" not found' >&2; exit 1; }
+        cat "$STUB_DIR/statefulset.json" ;;
+    get:pods)
+        [ ! -f "$STUB_DIR/pods.err" ] || { cat "$STUB_DIR/pods.err" >&2; exit 1; }
+        cat "$STUB_DIR/pods.json" ;;
     logs:)
         for i in 1 2 3; do
             echo "[pod/$name/$cont] line $i tail=$tail previous=$prev"
@@ -81,14 +89,14 @@ const DEPLOY: &str = r#"{"metadata":{"name":"boss"},"spec":{"selector":{"matchLa
 
 /// Two pods: one healthy, one whose `boss` container is in
 /// CrashLoopBackOff with 7 restarts.
-fn pods_json(now_minus: &str) -> String {
+fn pods_json(now_minus: &str, ns: &str) -> String {
     format!(
         r#"{{"items":[
-  {{"metadata":{{"name":"boss-7d9f-aaaaa","creationTimestamp":"{now_minus}"}},
+  {{"metadata":{{"name":"boss-7d9f-aaaaa","namespace":"{ns}","creationTimestamp":"{now_minus}"}},
     "status":{{"phase":"Running","containerStatuses":[
       {{"name":"boss","ready":true,"restartCount":0,"state":{{"running":{{}}}}}},
       {{"name":"gateway","ready":true,"restartCount":1,"state":{{"running":{{}}}}}}]}}}},
-  {{"metadata":{{"name":"boss-7d9f-bbbbb","creationTimestamp":"{now_minus}"}},
+  {{"metadata":{{"name":"boss-7d9f-bbbbb","namespace":"{ns}","creationTimestamp":"{now_minus}"}},
     "status":{{"phase":"Running","containerStatuses":[
       {{"name":"boss","ready":false,"restartCount":7,"state":{{"waiting":{{"reason":"CrashLoopBackOff"}}}}}},
       {{"name":"gateway","ready":true,"restartCount":0,"state":{{"running":{{}}}}}}]}}}}
@@ -104,12 +112,35 @@ struct Run {
 }
 
 fn run_with(case: &str, args: &[&str], deploy: Option<&str>, pods: &str) -> Run {
+    let deploy = deploy.map(|raw| {
+        let mut value: serde_json::Value = serde_json::from_str(raw).unwrap();
+        value["kind"] = serde_json::json!("Deployment");
+        value["metadata"]["namespace"] = serde_json::json!(args[0]);
+        value.to_string()
+    });
+    run_controllers(case, args, deploy.as_deref(), None, pods, None)
+}
+
+fn run_controllers(
+    case: &str,
+    args: &[&str],
+    deploy: Option<&str>,
+    statefulset: Option<&str>,
+    pods: &str,
+    failed_read: Option<&str>,
+) -> Run {
     let dir = scratch(case);
     let stub = write_stub(&dir);
     let fixtures = dir.join("fixtures");
     boss_testing::create_dir(&fixtures);
     if let Some(d) = deploy {
         boss_testing::write_file(&fixtures.join("deploy.json"), d);
+    }
+    if let Some(s) = statefulset {
+        boss_testing::write_file(&fixtures.join("statefulset.json"), s);
+    }
+    if let Some(read) = failed_read {
+        boss_testing::write_file(&fixtures.join(format!("{read}.err")), "fixture Forbidden");
     }
     boss_testing::write_file(&fixtures.join("pods.json"), pods);
     let log = dir.join("argv.log");
@@ -132,6 +163,205 @@ fn run_with(case: &str, args: &[&str], deploy: Option<&str>, pods: &str) -> Run 
     }
 }
 
+fn controller(kind: &str, ns: &str, name: &str) -> String {
+    serde_json::json!({"kind":kind,"metadata":{"name":name,"namespace":ns},
+        "spec":{"selector":{"matchLabels":{"app":"postgres","tier":"database"}}}})
+    .to_string()
+}
+
+#[test]
+fn a_statefulset_reads_its_declared_selector_and_bounded_named_container_logs() {
+    let ns = instance_namespaces();
+    let ns = &ns[0];
+    let s = controller("StatefulSet", ns, "postgres");
+    let pods = pods_json("2026-01-01T00:00:00Z", ns).replace("boss-7d9f-aaaaa", "postgres-0");
+    let r = run_controllers(
+        "statefulset",
+        &[ns, "postgres", "40", "boss"],
+        None,
+        Some(&s),
+        &pods,
+        None,
+    );
+    assert_eq!(r.status.code(), Some(0), "{}{}", r.stdout, r.stderr);
+    let calls = calls(&r.log);
+    assert!(
+        calls
+            .iter()
+            .any(|c| c == &format!("-n {ns} get pods -l app=postgres,tier=database -o json")),
+        "{calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|c| c == &format!("-n {ns} logs postgres-0 -c boss --prefix --tail=40")),
+        "{calls:?}"
+    );
+    assert!(
+        r.stdout.starts_with("postgres-0 phase=Running ready=2/2"),
+        "{}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("previous (last 60 lines)"),
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
+fn workload_ambiguity_bad_identity_and_failed_reads_never_read_pods_or_logs() {
+    let ns = instance_namespaces();
+    let ns = &ns[0];
+    let s = controller("StatefulSet", ns, "postgres");
+    let d = controller("Deployment", ns, "postgres");
+    let mut cases = vec![
+        (
+            "ambiguous".to_string(),
+            Some(d.clone()),
+            Some(s.clone()),
+            None,
+        ),
+        (
+            "statefulset-read".to_string(),
+            Some(d),
+            None,
+            Some("statefulset"),
+        ),
+        (
+            "deployment-read".to_string(),
+            None,
+            Some(s.clone()),
+            Some("deploy"),
+        ),
+    ];
+    for (field, value) in [
+        ("name", serde_json::json!("wrong")),
+        ("namespace", serde_json::json!("wrong")),
+        ("name", serde_json::Value::Null),
+        ("name", serde_json::json!(42)),
+    ] {
+        let mut bad: serde_json::Value = serde_json::from_str(&s).unwrap();
+        bad["metadata"][field] = value;
+        cases.push((
+            format!("identity-{field}-{}", cases.len()),
+            None,
+            Some(bad.to_string()),
+            None,
+        ));
+    }
+    for (case, raw) in [
+        ("wrong-kind", controller("Deployment", ns, "postgres")),
+        ("duplicate-documents", format!("{s}\n{s}")),
+        ("null-document", "null".to_string()),
+        ("malformed-document", "{".to_string()),
+    ] {
+        cases.push((case.to_string(), None, Some(raw), None));
+    }
+    for (case, deploy, statefulset, failed) in cases {
+        let r = run_controllers(
+            &case,
+            &[ns, "postgres", "40"],
+            deploy.as_deref(),
+            statefulset.as_deref(),
+            r#"{"items":[]}"#,
+            failed,
+        );
+        assert_eq!(r.status.code(), Some(4), "{case}: {}{}", r.stdout, r.stderr);
+        assert!(r.stdout.is_empty(), "{case}: {}", r.stdout);
+        assert!(r.stderr.contains("CANNOT ANSWER"), "{case}: {}", r.stderr);
+        assert!(
+            !calls(&r.log)
+                .iter()
+                .any(|c| c.contains("get pods") || c.contains(" logs ")),
+            "{case}: {}",
+            r.log
+        );
+    }
+}
+
+#[test]
+fn statefulset_selector_and_pod_read_failures_cannot_answer() {
+    let ns = instance_namespaces();
+    let ns = &ns[0];
+    for (case, selector) in [
+        ("missing-selector", serde_json::Value::Null),
+        ("empty-labels", serde_json::json!({"matchLabels":{}})),
+        (
+            "numeric-label",
+            serde_json::json!({"matchLabels":{"app":42}}),
+        ),
+        (
+            "expression-selector",
+            serde_json::json!({"matchLabels":{"app":"postgres"}, "matchExpressions":[{"key":"tier","operator":"In","values":["database"]}]}),
+        ),
+        (
+            "false-expression-selector",
+            serde_json::json!({"matchLabels":{"app":"postgres"}, "matchExpressions":false}),
+        ),
+    ] {
+        let mut s: serde_json::Value =
+            serde_json::from_str(&controller("StatefulSet", ns, "postgres")).unwrap();
+        s["spec"]["selector"] = selector;
+        let r = run_controllers(
+            case,
+            &[ns, "postgres", "40"],
+            None,
+            Some(&s.to_string()),
+            r#"{"items":[]}"#,
+            None,
+        );
+        assert_eq!(r.status.code(), Some(4), "{case}: {}{}", r.stdout, r.stderr);
+        assert!(
+            r.stdout.is_empty() && !r.log.contains("\npods\n"),
+            "{case}: {}{}",
+            r.stdout,
+            r.log
+        );
+    }
+    let s = controller("StatefulSet", ns, "postgres");
+    for (case, pods, failed) in [
+        ("pods-forbidden", r#"{"items":[]}"#, Some("pods")),
+        ("pods-malformed", "{", None),
+        ("pods-unknown", "{}", None),
+    ] {
+        let r = run_controllers(case, &[ns, "postgres", "40"], None, Some(&s), pods, failed);
+        assert_eq!(r.status.code(), Some(4), "{case}: {}{}", r.stdout, r.stderr);
+        assert!(
+            r.stdout.is_empty() && !r.log.contains("\nlogs\n"),
+            "{case}: {}{}",
+            r.stdout,
+            r.log
+        );
+    }
+    let r = run_controllers(
+        "empty-statefulset",
+        &[ns, "postgres", "40"],
+        None,
+        Some(&s),
+        r#"{"items":[]}"#,
+        None,
+    );
+    assert_eq!(r.status.code(), Some(0), "{}{}", r.stdout, r.stderr);
+    assert!(
+        r.stdout.starts_with("statefulset postgres in ") && r.stdout.contains("no pods"),
+        "{}",
+        r.stdout
+    );
+    assert!(!r.log.contains("\nlogs\n"), "{}", r.log);
+    let mut null_selector: serde_json::Value = serde_json::from_str(&s).unwrap();
+    null_selector["spec"]["selector"]["matchExpressions"] = serde_json::Value::Null;
+    let r = run_controllers(
+        "null-expression-selector",
+        &[ns, "postgres", "40"],
+        None,
+        Some(&null_selector.to_string()),
+        r#"{"items":[]}"#,
+        None,
+    );
+    assert_eq!(r.status.code(), Some(0), "{}{}", r.stdout, r.stderr);
+}
+
 fn run(case: &str, args: &[&str]) -> Run {
     // Created two hours ago, so the age column has something to say.
     let stamp = Command::new("date")
@@ -139,7 +369,58 @@ fn run(case: &str, args: &[&str]) -> Run {
         .output()
         .expect("GNU date");
     let stamp = String::from_utf8_lossy(&stamp.stdout).trim().to_string();
-    run_with(case, args, Some(DEPLOY), &pods_json(&stamp))
+    run_with(case, args, Some(DEPLOY), &pods_json(&stamp, args[0]))
+}
+
+#[test]
+fn unknown_wrong_namespace_and_duplicate_pods_refuse_before_any_log() {
+    let ns = instance_namespaces();
+    let ns = &ns[0];
+    let s = controller("StatefulSet", ns, "postgres");
+    let valid: serde_json::Value =
+        serde_json::from_str(&pods_json("2026-01-01T00:00:00Z", ns)).unwrap();
+    for (case, field, value) in [
+        ("pod-null", "name", serde_json::Value::Null),
+        ("pod-numeric", "name", serde_json::json!(42)),
+        ("pod-unsafe-name", "name", serde_json::json!("--all")),
+        (
+            "pod-wrong-namespace",
+            "namespace",
+            serde_json::json!("wrong"),
+        ),
+    ] {
+        let mut bad = valid.clone();
+        bad["items"][0]["metadata"][field] = value;
+        let r = run_controllers(
+            case,
+            &[ns, "postgres", "40"],
+            None,
+            Some(&s),
+            &bad.to_string(),
+            None,
+        );
+        assert_eq!(r.status.code(), Some(4), "{case}: {}{}", r.stdout, r.stderr);
+        assert!(
+            r.stdout.is_empty() && !r.log.contains("\nlogs\n"),
+            "{case}: {}{}",
+            r.stdout,
+            r.log
+        );
+    }
+    let duplicate = serde_json::json!({"items":[valid["items"][0],valid["items"][0]]});
+    for (case, pods) in [
+        ("duplicate-pods", duplicate.to_string()),
+        ("duplicate-pod-documents", format!("{valid}\n{valid}")),
+    ] {
+        let r = run_controllers(case, &[ns, "postgres", "40"], None, Some(&s), &pods, None);
+        assert_eq!(r.status.code(), Some(4), "{case}: {}{}", r.stdout, r.stderr);
+        assert!(
+            r.stdout.is_empty() && !r.log.contains("\nlogs\n"),
+            "{case}: {}{}",
+            r.stdout,
+            r.log
+        );
+    }
 }
 
 /// The instance namespaces, read the way the script must read them:
@@ -218,11 +499,11 @@ fn the_verdict_comes_first_one_line_per_pod_then_the_tails() {
     // tail, all containers, prefix.
     let calls = calls(&r.log);
     assert!(
-        calls[0].starts_with(&format!("-n {ns} get deployment boss -o json")),
+        calls[0] == format!("-n {ns} get deployment boss --ignore-not-found -o json"),
         "{calls:?}"
     );
     assert!(
-        calls[1].starts_with(&format!("-n {ns} get pods -l app=boss,tier=api -o json")),
+        calls[2].starts_with(&format!("-n {ns} get pods -l app=boss,tier=api -o json")),
         "the pods are found by the deployment's selector: {calls:?}"
     );
     assert!(
@@ -453,6 +734,10 @@ fn the_verb_file_is_a_read_only_forge_verb_with_bounded_params() {
     );
     let about = v["about"].as_str().unwrap();
     assert!(about.starts_with("READ-ONLY"), "{about}");
+    assert!(
+        about.contains("StatefulSet") && about.contains("ambiguous"),
+        "{about}"
+    );
     assert!(!about.contains("MUTATING"));
     assert!(
         about.contains("c09cab0b"),

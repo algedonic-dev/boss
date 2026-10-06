@@ -6,7 +6,7 @@
   // pipeline, Refurb queue) can mount this component with a kind
   // pre-filter. Same pattern as the React app.
 
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { navigate, href } from '../router';
   import Link from '@boss/web-kit/ui/Link.svelte';
   import { rowLink } from '@boss/web-kit/ui/RowLink';
@@ -79,6 +79,10 @@
   }>();
 
   let kind = $state(initialKind);
+  // These props seed this mount; subsequent removals belong to the
+  // viewer rather than a reactive reset to the incoming deep link.
+  let kindPrefix = $state(untrack(() => initialKindPrefix));
+  let ownerIdFilter = $state(untrack(() => initialOwnerId));
   let status = $state(initialStatus);
   // Operator-typed subject-id override. Falls back to initialSubjectId
   // when the page was opened with a pre-filter (e.g. drilled in from an
@@ -98,7 +102,7 @@
   $effect(() => {
     if (!writesFiltersToUrl) return;
     const { pathname, search, hash } = window.location;
-    const next = jobsFilterSearch(search, { kind, status, subjectId: subjectIdFilter });
+    const next = jobsFilterSearch(search, { kind, status, subjectId: subjectIdFilter, ownerId: ownerIdFilter, kindPrefix });
     if (next !== search) window.history.replaceState(window.history.state, '', pathname + next + hash);
   });
 
@@ -118,17 +122,17 @@
   // of its own to reset it.
   const PAGE_SIZE = 200;
   const filterKey = $derived(
-    JSON.stringify([kind, initialKindPrefix, initialDepartment, status, initialOwnerId, subjectIdFilter]),
+    JSON.stringify([kind, kindPrefix, initialDepartment, status, ownerIdFilter, subjectIdFilter]),
   );
   let turned = $state<{ key: string; offset: number }>({ key: '', offset: 0 });
   const offset = $derived(turned.key === filterKey ? turned.offset : 0);
 
   $effect(() => {
     const k = kind;
-    const kp = initialKindPrefix;
+    const kp = kindPrefix;
     const dept = initialDepartment;
     const s = status;
-    const o = initialOwnerId;
+    const o = ownerIdFilter;
     const si = subjectIdFilter;
     const at = offset;
     let cancelled = false;
@@ -177,10 +181,12 @@
     { v: '', l: 'All' },
   ];
 
-  const titleFor = $derived(
-    pageTitle ??
-      (kind ? `${kind} jobs` : initialKindPrefix ? `${initialKindPrefix} jobs` : 'All jobs'),
-  );
+  // A narrowed read must name its scope (6c9672c2). A department
+  // landing keeps its identity; its department is not a removable filter.
+  const filtered = $derived(!!(kind || kindPrefix || ownerIdFilter || subjectIdFilter || status));
+  const titleFor = $derived(pageTitle
+    ? `${pageTitle}${filtered ? ' — filtered' : ''}`
+    : filtered ? 'Filtered jobs' : 'All jobs');
 
   // --- New Job creation ---
   // Two entry points: "Start a new Job" pops the picker with no
@@ -219,6 +225,10 @@
     total: number;
   };
   type Owner = { id: string; name: string; role?: string };
+  type OwnerRead =
+    | { kind: 'idle' | 'loading' }
+    | { kind: 'ready'; rows: Owner[] }
+    | { kind: 'failed'; error: string };
 
   let newJobOpen = $state(false);
   let kinds = $state<WorkflowRow[]>([]);
@@ -234,7 +244,11 @@
    *  measured 2026-09-19. Holding the failure ends the loop; the
    *  operator gestures that need the registry ask again explicitly. */
   let kindsError = $state<string | null>(null);
-  let owners = $state<Owner[]>([]);
+  let ownerRead = $state<OwnerRead>({ kind: 'idle' });
+  let ownerViewer = $state('');
+  const owners = $derived(
+    ownerViewer === userId && ownerRead.kind === 'ready' ? ownerRead.rows : [],
+  );
   let formKind = $state('');
   let formSubjectKind = $state('');
   let formSubjectId = $state('');
@@ -398,15 +412,35 @@
     }
   }
 
-  async function loadOwners(): Promise<void> {
-    if (owners.length > 0) return;
+  async function loadOwners(retry = false): Promise<void> {
+    const viewer = userId;
+    if (ownerViewer === viewer &&
+        (ownerRead.kind === 'loading' || (ownerRead.kind === 'ready' && !retry))) return;
+    ownerViewer = viewer;
+    ownerRead = { kind: 'loading' };
     try {
       const r = await fetch('/api/people');
-      if (!r.ok) return;
-      const body = (await r.json()) as Owner[];
-      owners = body;
-    } catch {
-      // Empty list = the form's owner picker shows just "Unassigned".
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const body: unknown = await r.json();
+      if (!Array.isArray(body)) throw new Error('Owner roster is not an array');
+      const seen = new Set<string>();
+      const rows = body.map((row: unknown): Owner => {
+        if (typeof row !== 'object' || row === null) throw new Error('Invalid owner record');
+        const record = row as Record<string, unknown>;
+        if (typeof record.id !== 'string' || !record.id.trim() || record.id !== record.id.trim() ||
+            seen.has(record.id) || typeof record.name !== 'string' ||
+            (record.role !== undefined && record.role !== null && typeof record.role !== 'string')) {
+          throw new Error('Invalid or duplicate owner record');
+        }
+        seen.add(record.id);
+        return { id: record.id, name: record.name,
+          ...(typeof record.role === 'string' ? { role: record.role } : {}) };
+      });
+      if (viewer === userId && ownerViewer === viewer) ownerRead = { kind: 'ready', rows };
+    } catch (e) {
+      if (viewer === userId && ownerViewer === viewer) {
+        ownerRead = { kind: 'failed', error: e instanceof Error ? e.message : String(e) };
+      }
     }
   }
 
@@ -597,11 +631,29 @@
         bind:value={subjectIdFilter}
       />
     </label>
-    {#if kind || status !== initialStatus || subjectIdFilter}
+    {#if initialDepartment}
+      <span class="job-filter">Department: {initialDepartment}</span>
+    {/if}
+    {#if kind}
+      <button type="button" aria-label="Remove kind filter" onclick={() => { kind = ''; }}>Kind: {kind} ✕</button>
+    {/if}
+    {#if kindPrefix}
+      <button type="button" aria-label="Remove kind prefix filter" onclick={() => { kindPrefix = ''; }}>Kind prefix: {kindPrefix} ✕</button>
+    {/if}
+    {#if ownerIdFilter}
+      <button type="button" aria-label="Remove owner filter" onclick={() => { ownerIdFilter = ''; }}>Owner: {ownerIdFilter} ✕</button>
+    {/if}
+    {#if subjectIdFilter}
+      <button type="button" aria-label="Remove subject filter" onclick={() => { subjectIdFilter = ''; }}>Subject id: {subjectIdFilter} ✕</button>
+    {/if}
+    {#if status}
+      <button type="button" aria-label="Remove status filter" onclick={() => { status = ''; }}>Status: {status} ✕</button>
+    {/if}
+    {#if filtered}
       <button
         type="button"
         class="job-filter-clear"
-        onclick={() => { kind = ''; status = initialStatus; subjectIdFilter = ''; }}
+        onclick={() => { kind = ''; kindPrefix = ''; ownerIdFilter = ''; status = ''; subjectIdFilter = ''; }}
         title="Clear all filters"
       >
         Clear ✕
@@ -736,14 +788,25 @@
       <div class="form-row">
         <label class="grow">
           <span>Owner</span>
-          <select bind:value={formOwnerId}>
+          <select bind:value={formOwnerId} disabled={ownerViewer !== userId || ownerRead.kind !== 'ready'}>
             <option value="">— unassigned —</option>
+            {#if formOwnerId && !owners.some((o) => o.id === formOwnerId)}
+              <option value={formOwnerId}>{formOwnerId} (not listed)</option>
+            {/if}
             {#each owners as o (o.id)}
               <option value={o.id}>
                 {o.name}{o.role ? ` (${o.role})` : ''}
               </option>
             {/each}
           </select>
+          {#if ownerViewer !== userId || ownerRead.kind === 'idle' || ownerRead.kind === 'loading'}
+            <small class="hint" role="status">Loading owners…</small>
+          {:else if ownerRead.kind === 'failed'}
+            <small class="load-failed" role="alert">Owners unavailable: {ownerRead.error}</small>
+            <button type="button" onclick={() => void loadOwners(true)}>Retry owner read</button>
+          {:else if owners.length === 0}
+            <small class="hint">No owners returned by this read.</small>
+          {/if}
         </label>
       </div>
 
@@ -777,7 +840,7 @@
             // the cancellation is no back-button entry.
             if (!writesFiltersToUrl) return;
             const { pathname, search, hash } = window.location;
-            const next = searchWithoutNewJob(search, { kind, status, subjectId: subjectIdFilter });
+            const next = searchWithoutNewJob(search, { kind, status, subjectId: subjectIdFilter, ownerId: ownerIdFilter, kindPrefix });
             if (next !== search) window.history.replaceState(window.history.state, '', pathname + next + hash);
           }}
           disabled={formSubmitting}

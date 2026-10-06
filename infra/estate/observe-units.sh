@@ -265,9 +265,11 @@ fi
 # NOT `$(derive_roster | tr ...)`: a pipeline's status is the LAST
 # command's, so a refusal would be laundered into tr's 0 and the observer
 # would carry on with an empty roster.
+roster_derived=false
 if [ -z "${UNITS:-}" ]; then
     _derived=$(derive_roster) || exit 78 # EX_CONFIG
     UNITS=$(printf '%s\n' "$_derived" | tr '\n' ' ')
+    roster_derived=true
 fi
 
 # Word-split once; an observer with nothing to watch is a
@@ -333,6 +335,58 @@ done
 
 if [ -z "$unhealthy" ]; then node_healthy=true; else node_healthy=false; fi
 
+# ---------------------------------------------------------------------
+# WHAT RUNS HERE THAT NOBODY DECLARED (backlog 6647ac9a; page audit
+# 2cff1d6e, GAP 14).
+#
+# The roster above is derived from what the host DECLARES, which is what
+# stopped the 2026-09-15 false alarms — and it made the opposite class
+# invisible by construction. The retired boss-ml-api.service, stopped by
+# retire-second-stack on 2026-09-15, was running again on boss-gcp from
+# 2026-09-20 (PID 1601343, ops-request 5acce6ec), and every five-minute
+# reading said "15 units watched, all healthy": the estate record and
+# /it/estate read the host clean while a retired service ran on it.
+#
+# So the host is also asked what it IS running under the boss- prefix,
+# and every unit outside the roster rides the node as `undeclared_units`
+# — estate compare counts it as observed_not_declared, the paperwork
+# class it already has for a machine nobody declared. Paperwork, not a
+# sick unit: it does not turn the node unhealthy or fail this run
+# (estate.alarm does not raise on observed_not_declared, and failing
+# here would latch the observer red over a unit it does not watch).
+# Running means active or activating: a crash-looping undeclared unit
+# is still trying to run. The observer's own service is mid-run as this
+# asks, so the exclusion list applies here too.
+#
+# A FAILED ENUMERATION IS RECORDED, never an empty list — an empty list
+# reads "looked, found none", which is the clean reading this replaces.
+# A hand run (UNITS=) watches a list nobody declared, so it makes no
+# claim either way and neither key is written.
+undeclared_json=""
+undeclared_unread=""
+undeclared=""
+if [ "$roster_derived" = "true" ]; then
+    _rc=0
+    _listed=$(systemctl list-units --type=service,timer --state=active,activating \
+        --no-legend --plain 'boss-*' 2>&1) || _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+        undeclared_unread="systemctl list-units exited $_rc: $(printf '%s' "$_listed" | tr '\n' ' ')"
+        echo "observe-units: $undeclared_unread" >&2
+    else
+        undeclared_json='[]'
+        while read -r _u _load _active _sub _rest; do
+            case "$_u" in boss-*.service | boss-*.timer) ;; *) continue ;; esac
+            case " $UNITS $ROSTER_EXCLUDE " in *" $_u "*) continue ;; esac
+            undeclared="$undeclared $_u"
+            undeclared_json=$(printf '%s' "$undeclared_json" | jq \
+                --arg unit "$_u" --arg active "$_active" --arg sub "$_sub" \
+                '. + [{ unit: $unit, active_state: $active, sub_state: $sub }]')
+        done <<EOF
+$_listed
+EOF
+    fi
+fi
+
 # One node — this host — carrying its units. The estate door refuses
 # an observation with no nodes (a probe that saw nothing is a failed
 # probe), and every estate consumer finds the host id where the other
@@ -348,15 +402,19 @@ observation=$(jq -n \
     --arg roles_source "$roles_source" \
     --argjson healthy "$node_healthy" \
     --argjson units "$units_json" \
+    --arg undeclared "$undeclared_json" \
+    --arg undeclared_unread "$undeclared_unread" \
     '{
       observed_at: (now | todate),
       observer: $observer,
       scope: "host-units",
       nodes: [{ id: $id, healthy: $healthy, units: $units,
-                roles: $roles, roles_source: $roles_source }]
+                roles: $roles, roles_source: $roles_source }
+              + (if $undeclared == "" then {} else { undeclared_units: ($undeclared | fromjson) } end)
+              + (if $undeclared_unread == "" then {} else { undeclared_unread: $undeclared_unread } end)]
     }')
 
-echo "observing $HOST_ID units: $# watched (roles: ${BOSS_NODE_ROLES:-none}, $roles_source), unhealthy:${unhealthy:- none}"
+echo "observing $HOST_ID units: $# watched (roles: ${BOSS_NODE_ROLES:-none}, $roles_source), undeclared:${undeclared:- none}, unhealthy:${unhealthy:- none}"
 
 # No temp file, body and status in one capture — the same lesson
 # observe-host.sh carries (its first scheduled firing turned a curl -o

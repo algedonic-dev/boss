@@ -16,6 +16,7 @@
 
 import { fetchRemote, type Remote } from '../data/remote';
 import { ageText } from './ruleFirings';
+import { NOT_IN_SCOPE } from '../policy/withheld';
 import type { RuleStatus } from './ruleAuthoring';
 import type { AuthoredRegistry, DispatcherRule } from './types';
 
@@ -33,6 +34,10 @@ export type ScheduleRead = Readonly<{
   now: string;
   schedule: ReadonlyArray<ScheduleRow> | null;
   schedule_error: string | null;
+  /** The schedule was WITHHELD from this caller by policy scope — the
+   *  dispatcher's flag (backlog 1805bac0), absent on the wire when false.
+   *  A policy outage or a rule table that would not load never sets it. */
+  withheld: boolean;
 }>;
 
 const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
@@ -54,6 +59,7 @@ export function parseDispatcherSchedule(raw: unknown): ScheduleRead {
     now: String(o.now ?? ''),
     schedule,
     schedule_error: schedule === null ? (str(o.schedule_error) ?? 'the schedule was not served') : null,
+    withheld: schedule === null && o.withheld === true,
   };
 }
 
@@ -65,7 +71,12 @@ export async function fetchDispatcherSchedule(): Promise<Remote<ScheduleRead>> {
  *  (or the reason there is none) as its hover. Unread is "unknown",
  *  never "not scheduled". */
 export function nextDue(name: string, read: ScheduleRead): Readonly<{ text: string; why: string }> {
-  if (read.schedule === null) return { text: 'unknown', why: read.schedule_error ?? '' };
+  // Withheld by scope (d0058c92) is said as the scope, not "unknown" —
+  // a refusal is not a failure (bd506215). The dispatcher's flag says
+  // which, never the reason's words (1805bac0).
+  if (read.schedule === null) {
+    return { text: read.withheld ? NOT_IN_SCOPE : 'unknown', why: read.schedule_error ?? '' };
+  }
   const row = read.schedule.find((r) => r.name === name);
   if (!row) {
     return {

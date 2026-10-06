@@ -51,6 +51,35 @@ pub const PLATFORM_ADMIN_ROLE: &str = "platform-admin";
 /// gateway perf, etc.) don't reject anonymous OSS visitors.
 pub const AUDIT_READONLY_ROLE: &str = "audit-readonly";
 
+/// The id a recorded car probe reads the system of record as (backlog
+/// 61085a9e). Named here, in core, because two sides must agree on it:
+/// the CLI hands it to the probe's reader (`boss prove`), and every
+/// machine gate writes it over whatever a caller presenting the
+/// probe-reader credential asserted (design b35c22b4, Q2) — so a probe
+/// reads as the same identity through the door as it does without one.
+pub const PROBE_READER_ACTOR: &str = "automation:run-car-probe-reader";
+
+/// The `x-boss-user` header for a READ-SCOPED identity:
+/// [`AUDIT_READONLY_ROLE`] at the auditor tier — the tier
+/// `boss_jobs::trust::can_read` admits on an operator door's read and
+/// `is_trusted` refuses on its write. ONE shape for every reader: the
+/// CLI's unidentified reader, the reader a recorded probe is handed as
+/// `BOSS_SOR_USER` (which `boss-sor-read` puts on the wire verbatim),
+/// and the identity the machine gate stamps on a probe-reader match.
+/// It lived in the CLI alone until the gate needed it (design
+/// b35c22b4); two copies of one header would drift (CLAUDE.md §9a).
+pub fn reader_header(id: &str) -> String {
+    serde_json::json!({
+        "id": id,
+        "role": AUDIT_READONLY_ROLE,
+        "access_tier": "auditor",
+        "territory_account_ids": [],
+        "direct_report_ids": [],
+        "department": "platform",
+    })
+    .to_string()
+}
+
 /// Break-glass role — the emergency session minted by the gateway's
 /// hardware-key WebAuthn ceremony (docs/design/break-glass-is-a-key-
 /// you-hold.md). Deliberately NARROW (Q4): it carries exactly the

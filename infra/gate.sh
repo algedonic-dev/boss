@@ -14,10 +14,11 @@
 #                                 # Not a gate — nothing compiles. Run
 #                                 # it before spending 17 minutes of
 #                                 # cluster time on a formatting slip.
-#   infra/gate.sh --lint          # --quick PLUS clippy, scoped to the
-#                                 # crates the tree changed. Seconds on
-#                                 # a warm tree against ~11 minutes of
-#                                 # gate, and clippy is the red class
+#   infra/gate.sh --lint          # --quick PLUS workspace clippy when
+#                                 # the change implies a crate. Checks
+#                                 # dependent test targets too; warm
+#                                 # artifacts need no rebuild. Clippy
+#                                 # is the red class
 #                                 # that buys the least: prefer this to
 #                                 # --quick before pushing. Still not a
 #                                 # gate — the build and the suites
@@ -1405,8 +1406,10 @@ scope_self_test() {
     # the_list_envelope_holds_what_its_readers_assume.rs now reads it to
     # hold the jobs-list reader it names (`QUEUE_PAGE=1000`), so editing
     # the runner can redden boss-jobs as well as boss-testing's tests that
-    # execute it. Derived, not listed — this case is the record of it.
-    _case "a script two crates read implies both" "boss-jobs boss-testing" \
+    # execute it. The argument-bearing remedy contract (53c8cb72) also
+    # runs the runner's pure decide function from boss-dispatcher-handlers.
+    # Derived, not listed — this case records every current reader.
+    _case "a script three crates read implies all three" "boss-dispatcher-handlers boss-jobs boss-testing" \
         "infra/ops/ops-runner.sh"
     _case "docs outside design/ imply no crate" "" "docs/invariants/x.toml" "README.md"
     # …unless a crate READS it. gate_sh.rs asserts this runbook tells a
@@ -2969,11 +2972,13 @@ fi
 # takes seconds on a warm tree. Trading the second for the first is the
 # whole argument.
 #
-# SCOPED, NOT WORKSPACE. It clippies exactly the crates the tree
-# changed, derived by the same `crates_from_paths` the `-p` refusal
-# uses — so there is one definition of "which crates did this touch",
-# not two. A change that maps to no crate (docs, infra, apps) skips
-# clippy and says so, because there is nothing to compile.
+# WORKSPACE TARGETS, INCLUDING DEPENDENTS (4669e9d7, design caa2acc9).
+# A new core field can break a literal in another crate's test without
+# breaking the core crate itself. Clippy must compile that consumer,
+# both here and at the car gate; build and test remain scoped there.
+# The path map still decides whether anything needs to compile: a
+# docs, infra or apps change mapping to no crate skips clippy and says
+# so. No separate workspace `cargo check` repeats this compilation.
 #
 # STILL NOT A GATE. The build and the test suites remain unproven, and
 # a DB-backed test cannot run here at all. This narrows the red-gate
@@ -3003,10 +3008,8 @@ if [ "$LINT" -eq 1 ]; then
     run_preflight
     LINT_CRATES=$(crates_from_paths)
     if [ -n "$LINT_CRATES" ]; then
-        LINT_SCOPE=()
-        for c in $LINT_CRATES; do LINT_SCOPE+=(-p "$c"); done
         echo ""
-        echo "pre-flight: clippy on ${LINT_CRATES//$'\n'/ }"
+        echo "pre-flight: workspace clippy, including dependents of ${LINT_CRATES//$'\n'/ }"
         # The SAME invocation the gate runs in car mode — a second
         # spelling here would be a check that disagrees with the check
         # it is meant to predict.
@@ -3018,7 +3021,7 @@ if [ "$LINT" -eq 1 ]; then
         # lib and bins in their normal cfg; on a warm tree it cost the
         # same within noise (boss-jobs after a lib.rs touch, 16-20 s
         # either way). The pin is clippy_checks_every_target_the_build_compiles.
-        check "clippy" cargo clippy "${LINT_SCOPE[@]}" --all-features --all-targets -- -D warnings
+        check "clippy" cargo clippy --workspace --all-features --all-targets -- -D warnings
     else
         echo ""
         echo "pre-flight: no crate implied by the tree — skipping clippy (nothing to compile)"
@@ -3031,7 +3034,7 @@ if [ "$LINT" -eq 1 ]; then
         echo "pre-flight: fix these before spending a gate on them." >&2
         exit 1
     fi
-    echo "pre-flight: clean, and clippy saw the crates this tree changed."
+    echo "pre-flight: clean; crate changes compile their workspace dependents too."
     echo "pre-flight: the build and the test suites are still unproven — this is NOT a gate."
     exit 0
 fi
@@ -3089,7 +3092,7 @@ elif [ "${#SCOPE[@]}" -eq 0 ]; then
     # #161 had deleted, read by nobody (spa-lists-are-generated.toml).
     check "no-snapshot-arrays" infra/lint/no-snapshot-arrays.sh
 else
-    check "clippy"  cargo clippy "${SCOPE[@]}" --all-features --all-targets -- -D warnings
+    check "clippy"  cargo clippy --workspace --all-features --all-targets -- -D warnings
     check "build (default features)" cargo build "${SCOPE[@]}"
     check "test"    cargo test "${SCOPE[@]}" --all-features --no-fail-fast
     # A scoped car pays for the binary only when it could have moved

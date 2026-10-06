@@ -1,0 +1,33 @@
+{
+  "about": "MUTATING — raise ONE Longhorn volume's spec.numberOfReplicas (infra/forge/volume-replicas.sh <volume> <replicas> <plan_sha256>) through the forge's ops_kubectl door (the admin kubeconfig David placed, infra/estate/ops-credentials.sh). Asked for by David 2026-09-30 ~02:50Z ('Yes, go ahead and prep that'; backlog f5f182fc): the dev pod's /work volume (boss-dev/boss-dev-work, 40 GiB, StorageClass longhorn-dev-disposable, numberOfReplicas 1) has its one replica on w-1, and under Longhorn's default node-drain-policy block-if-contains-last-replica that replica holds the w-1 drain of 2026-09-30 (backlog 52ea56ac, review 60b87bff N2). The StorageClass parameter applies only when a volume is made, the dev session cannot read or write longhorn.io, and editing boss-dev.yaml restarts the session — so the live change is this verb. AUTHORISED PER RUN BY DAVID'S PASSKEY in design 17835005's shape, as reclaim-gcp-root and shutdown-node are: it declares requires_approval with the read-only plan-a-volume-replica-change (this script's --plan) as its plan_verb, so the runner renders the plan onto the request's approve step, runs this only after a passkey on the approvers list signs those bytes, and hands the script sha256 of the SIGNED plan; the script re-renders and patches nothing unless today's plan hashes to it. The count before is in the bytes, so a second run of an applied plan is refused: at most once. THE BOUND IS THE SCRIPT'S, NEVER A PARAM: a pvc-<uuid> volume Longhorn holds in longhorn-system; a count of 1-3 that RAISES the current one (this verb never deletes a replica, and what a lowered count leaves over Longhorn v1.11.3 trims only under eviction, best-effort data locality or replica auto-balance, so lowering is not a door it opens); a healthy replica to rebuild from; and enough schedulable Longhorn nodes with room to put every replica on a distinct node — or nothing is done (exit 78). THE WRITE is one kubectl patch --type=json that TESTS spec.numberOfReplicas is still the planned value and replaces it — a compare-and-set on the one field. THE EFFECT IS READ BACK: every 15 s for up to 1500 s, the volume's spec and its replicas; only when spec.numberOfReplicas reads the new count AND that many replicas report healthy (spec.healthyAt set, spec.failedAt empty) on that many DISTINCT nodes is the effect line printed, and otherwise the run exits 1 saying the volume is NOT proven, naming the healthy nodes, the replicas not yet healthy and the failed ones. Timeout 1800: a 40 GiB rebuild, inside which the script's own 1500 s read-back gives its verdict before the runner's kill.",
+  "hosts": [
+    "forge"
+  ],
+  "requires_approval": true,
+  "plan_verb": "plan-a-volume-replica-change",
+  "approvers": [
+    "emp-david"
+  ],
+  "argv": [
+    "infra/forge/volume-replicas.sh",
+    "{1}",
+    "{2}",
+    "{3}"
+  ],
+  "params": [
+    {
+      "name": "volume",
+      "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    {
+      "name": "replicas",
+      "pattern": "^[1-3]$"
+    },
+    {
+      "name": "plan_sha256",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  ],
+  "timeout": 1800,
+  "effect": "^set-volume-replicas: pvc-[0-9a-f-]{36} has [0-9]+ healthy replicas on [0-9]+ distinct nodes \\([a-z0-9-]+(, [a-z0-9-]+)*\\) — read back: spec\\.numberOfReplicas=[1-3], robustness "
+}

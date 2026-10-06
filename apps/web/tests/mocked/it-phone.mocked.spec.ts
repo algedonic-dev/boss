@@ -18,6 +18,7 @@
 import { expect, test, type Page, type Route } from './_test';
 import { YARD_BORDERS, YARD_REGIONS, installSmokeMocks } from './_smokeMocks';
 import { BORDERS } from '../fixtures/yard';
+import { REGION_NAMES } from '../../src/it/yard/regions';
 const PHONE = { width: 390, height: 844 };
 
 const trend = { metric: 'm', unit: 'per day', current: 1, previous: 1, samples: 1, previous_samples: 1 };
@@ -26,7 +27,7 @@ const trend = { metric: 'm', unit: 'per day', current: 1, previous: 1, samples: 
  *  `thirds` block, boss_jobs::regions::THIRDS) — the strip's grouping
  *  is read from here and nowhere else. */
 const THIRDS = [
-  { third: 'queue-management', regions: ['receiving', 'marshalling'] },
+  { third: 'queue-management', regions: ['sensors', 'receiving', 'marshalling'] },
   { third: 'actors-building', regions: ['shop-floor', 'gates', 'garage'] },
   { third: 'delivery', regions: ['dock', 'track', 'arrivals', 'shed', 'publish'] },
 ] as const;
@@ -157,6 +158,7 @@ test('the More menu opens inside the screen at 390px, not clipped by the scrolli
 });
 
 test('on a phone the world is a strip: one row per region in flow order, under the three thirds', async ({ page }) => {
+  expect(REGIONS.regions.map((r) => r.name).sort()).toEqual([...REGION_NAMES].sort());
   await page.setViewportSize(PHONE);
   await mocks(page);
   await page.goto('/it');
@@ -237,4 +239,22 @@ test('at desktop width the world is the SVG, and no strip is drawn', async ({ pa
   // The sidebar still stands beside the page.
   const sidebar = (await page.locator('.shell-sidebar').boundingBox())!;
   expect(sidebar.width).toBe(200);
+});
+
+// Missing from both the reading and its old partition: retain once in unplaced.
+test('a partial regions payload retains missing Sensors once with the phone unread reason', async ({ page }) => {
+  await page.setViewportSize(PHONE);
+  await mocks(page);
+  await page.route(YARD_REGIONS, (r) => r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+    ...REGIONS, regions: REGIONS.regions.filter((region) => region.name !== 'sensors'),
+    thirds: REGIONS.thirds.map((third) => ({ ...third, regions: third.regions.filter((name) => name !== 'sensors') })),
+  }) }));
+  await page.goto('/it');
+  const sensors = page.locator('section.strip .strip-row[data-region="sensors"]');
+  await expect(sensors).toHaveCount(1);
+  await expect(sensors).toHaveAttribute('data-state', 'troubled');
+  await expect(sensors.locator('.strip-kpi')).toHaveText('no reading');
+  await expect(sensors.locator('.strip-verdict')).toHaveText('the regions read answered nothing for this region');
+  await expect(page.locator('.strip-third[data-third="unplaced"] .strip-row')).toHaveAttribute('data-region', 'sensors');
+  await expect(page.locator('section.strip .strip-row')).toHaveCount(REGION_NAMES.length);
 });

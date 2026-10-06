@@ -7,6 +7,14 @@
 # mount diagnosis, d42d4967) and the live config carries it two times.
 # It is declared once — the declaration is the intent; the double is a
 # DOUBLED finding for check-declared.sh until it is removed live.
+#
+# The SECOND document below (a UserVolumeConfig) was declared
+# 2026-09-30 (backlog 52ea56ac, design 8457c07b) for the second NVMe
+# David fitted that morning. It was NOT live when written: the first
+# read after David applies it is the check, and until then
+# check-declared.sh reports it ABSENT. (A /var/mnt/gate kubelet mount
+# was declared beside it first and withdrawn by review a79746c6 — see
+# the extraMounts comment below.)
 machine:
   # The gate seed's directory: a local PersistentVolume
   # (infra/cluster/manifests/gate-seed-local.yaml) refuses a path that
@@ -32,6 +40,21 @@ machine:
           - bind
           - rshared
           - rw
+      # NO entry for the gate volume (/var/mnt/gate), on purpose (review
+      # a79746c6, finding 1). Talos's kubelet runs MkdirAll on every
+      # extraMounts SOURCE each time it starts, so an entry here would
+      # create /var/mnt/gate on EPHEMERAL whenever the kubelet starts
+      # without the volume mounted — no matching disk, a dead disk, or
+      # the boot race — and the gate would write its seed and every
+      # workspace to the install disk, silently: writes through a PV are
+      # not counted as ephemeral storage, so nothing evicts. Talos
+      # already carries /var/mnt into the kubelet as `rbind, rslave, ro`
+      # — READ-ONLY at the top, which is where to look if the proof
+      # fails with EROFS or a chown error (review 635317c5) — and its
+      # user-volume guide says a user volume propagates there; the proof
+      # pod decides whether that suffices. If it does not, the entry
+      # comes back in a car of its own, beside the gate's refusal to run
+      # on EPHEMERAL (infra/gate-runner/run.sh).
   # Every image the cluster runs is pulled through the forge's registry
   # (infra/forge; plain http on the LAN).
   registries:
@@ -39,3 +62,48 @@ machine:
       10.20.0.15:3000:
         endpoints:
           - http://10.20.0.15:3000
+---
+# THE GATE VOLUME — w-1's second NVMe, ALL of it, one xfs filesystem
+# that Talos mounts at /var/mnt/gate (a user volume is mounted at
+# /var/mnt/<name>). Design 8457c07b, decided 2026-09-29:
+#
+#   - ALL of the gate's disk I/O moves here, the warm seed AND the
+#     per-run workspaces, because a reflink copy works only inside ONE
+#     filesystem: seed on one disk and workspaces on the other would
+#     turn every seeding copy back into the 184 s full rewrite backlog
+#     5b3dabb5 removed (~3.6 TB/day written to w-1's first NVMe).
+#   - xfs because reflink needs it (the install disk's EPHEMERAL is xfs
+#     for the same reason the seed could reflink there).
+#   - The install disk keeps containerd, the kubelet, Longhorn and the
+#     dev pod's /scratch. EPHEMERAL is NOT moved: moving it wipes w-1's
+#     Longhorn replicas, dev /work among them.
+#
+# THE DISK IS CHOSEN BY WHAT IT IS, never by a serial or a kernel name:
+# on 2026-09-21 the forge's second NVMe enumerated as nvme0n1 and moved
+# the running root from nvme0n1p2 to nvme1n1p2
+# (infra/cluster/manifests/gate-seed-local.yaml). Not the system disk,
+# NVMe, larger than 500 GB — the install disk is excluded by the first
+# term and a USB stick or small SSD by the other two. If no disk
+# matches (an M.2 SATA drive reports transport `sata`), Talos provisions
+# nothing and the volume reads as waiting in `talosctl get
+# volumestatus`. That is NOT loud by itself: once the volume has ever
+# mounted, its mountpoint directory /var/mnt/gate stays behind on
+# EPHEMERAL, so a later boot without the disk leaves a path the PV
+# mounts happily. The refusal is the gate's own, carried by the runner
+# car that moved the gate onto this volume (after this declaration had
+# landed, which is why the declaration's first version could only point
+# at it): infra/gate-runner/run.sh, armed by GATE_DISK=required in the
+# runner manifest, refuses to run unless the proof-written marker
+# /gate-runs/.gate-volume is present and /gate-seed and /gate-target sit
+# on one device that is not the pod's EPHEMERAL. `grow` takes the whole disk rather than
+# stopping at minSize; the minimum is the selector's own floor.
+apiVersion: v1alpha1
+kind: UserVolumeConfig
+name: gate
+provisioning:
+  diskSelector:
+    match: '!system_disk && disk.transport == "nvme" && disk.size > 500u * GB'
+  minSize: 500GB
+  grow: true
+filesystem:
+  type: xfs

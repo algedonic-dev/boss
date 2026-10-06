@@ -8,6 +8,12 @@ edition.workspace = true
 default = []
 postgres = ["dep:sqlx", "dep:uuid"]
 
+# This packaging contract names the existing service's PostgreSQL
+# recorder in its source assertions and follows the Pg-reaching pin.
+[[test]]
+name = "the_events_api_has_one_apps_owner"
+required-features = ["postgres"]
+
 [dependencies]
 boss-core = { path = "../boss-core" }
 axum = { workspace = true }
@@ -64,6 +70,28 @@ boss-policy-client = { path = "../boss-policy-client" }
 # copies are held to it (CLAUDE.md §9a; backlog 2aa2b19e). boss-jobs
 # dev-depends on boss-testing in turn; both edges are dev-only.
 boss-jobs = { path = "../boss-jobs" }
+# Test-only, for `the_break_glass_patch_is_image_only.rs`: the admission
+# policy that narrows the break-glass operator's patch is CEL, and a pin
+# that only greps the expression text would hold its spelling, not what it
+# decides. This evaluates the manifest's own expressions against an
+# image-only patch and a credential-reading one (backlog 4e1c33b4).
+cel = { version = "0.14", default-features = false, features = ["regex"] }
+# Test-only, for `the_machine_gate_reports_and_refuses_nothing.rs`: the
+# policy check's mode key (F7 of backlog b8e75382) is mounted beside the
+# machine gate's, and its path is boss_policy::check_mode's
+# DEFAULT_MODE_FILE, so the pin reads the key off that constant rather
+# than a copy (CLAUDE.md §9a). boss-policy dev-depends on boss-testing in
+# turn; both edges are dev-only. No `postgres`: only the constant is read.
+boss-policy = { path = "../boss-policy", default-features = false }
+# Test-only, for `a_policy_rule_cannot_blind_the_coverage_reader.rs`: the
+# policy service's coverage read reaches `GET /api/workflows` on the jobs
+# API through `boss_policy::coverage::HttpCoverageSources`, signing
+# `COVERAGE_READER`, so the test serves the real jobs router (on the
+# clock its state takes) to that reader rather than to a copy of its
+# header (CLAUDE.md §9a; backlog 47aed706). It lives here, not in
+# boss-jobs, because a boss-jobs edge to boss-policy points upward
+# (infra/lint/layer-order-audit.sh), even dev-only.
+boss-clock-client = { path = "../boss-clock-client" }
 
 [[test]]
 name = "migrate_sh"

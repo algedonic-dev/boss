@@ -13,7 +13,7 @@
 //   outage. Failure now renders with the error and a Retry.
 
 import { expect, test, type Page, type Route } from './_test';
-import { servePeopleRows } from './_smokeMocks';
+import { inboxPage, servePeopleRows } from './_smokeMocks';
 
 const json = (r: Route, b: unknown, status = 200) =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(b) });
@@ -120,7 +120,7 @@ test('an inbox outage renders as a failure with Retry — never as "Nothing is w
   await inboxMocks(page);
   let up = false;
   await page.route(/\/api\/messages\/inbox\//, (r) =>
-    up ? json(r, [MSG]) : json(r, 'message store down', 500));
+    up ? json(r, inboxPage([MSG], r.request().url())) : json(r, 'message store down', 500));
 
   await page.goto('/inbox');
   await expect(page.locator('.load-failed')).toBeVisible();
@@ -137,7 +137,7 @@ test('an inbox outage renders as a failure with Retry — never as "Nothing is w
 
 test('a truly empty inbox still reads as empty', async ({ page }) => {
   await inboxMocks(page);
-  await page.route(/\/api\/messages\/inbox\//, (r) => json(r, []));
+  await page.route(/\/api\/messages\/inbox\//, (r) => json(r, inboxPage([], r.request().url())));
 
   await page.goto('/inbox');
   await expect(page.getByText('Nothing is waiting on you')).toBeVisible();

@@ -27,7 +27,10 @@
 //! rule, when it last fired and when the runner next fires it — the
 //! top board's "scheduled rules due next". It asks policy: a caller whose
 //! scope reads no packets is told the schedule is withheld, the rule the
-//! machine-firings car applied to the yard's reads (backlog e5f7b51e).
+//! machine-firings car applied to the yard's reads (backlog e5f7b51e) —
+//! and since backlog d0058c92 so is one whose scope reads some packets
+//! but not every one, the rule the IT map keeps for every record not
+//! scoped by packet (see [`reads_every_packet`]).
 //!
 //! The rule reads — `rules` and the two version reads — take the same
 //! rule since backlog 493cebf3: until then they asked nothing, so any
@@ -55,7 +58,8 @@ use boss_calendar_client::CalendarClient;
 use boss_clock_client::ClockClient;
 use boss_core::calendar::BusinessCalendar;
 use boss_jobs::dispatcher_firings::{DispatcherFiringsRepository, RETENTION_DAYS, RuleLastFiring};
-use boss_policy_client::{Action, CurrentUser, PolicyClient, Predicate, Resource, User};
+use boss_jobs::port::JobScope;
+use boss_policy_client::{CurrentUser, Pair, PolicyClient, User, controls};
 use chrono::{DateTime, Utc};
 
 use crate::cascade;
@@ -83,8 +87,9 @@ pub struct HttpState {
     /// served verbatim as `handler_emits` + `system_edges`. Core spells
     /// no handler of its own (backlog ec40e269; see [`cascade`]).
     pub cascade: Arc<cascade::Cascade>,
-    /// Who may read the schedule: a caller whose scope reads no packets
-    /// may not (backlog e5f7b51e's rule, see the module doc). And who may
+    /// Who may read the schedule and the rules: a caller whose scope
+    /// reads every packet (backlog e5f7b51e's rule, narrowed to a full
+    /// scope by d0058c92; see the module doc). And who may
     /// write a rule: Create / Publish / Retire on `dispatcher-rule`
     /// (backlog 847af5c7).
     pub policy: Arc<dyn PolicyClient>,
@@ -255,8 +260,9 @@ fn authored_whys(dir: Option<&std::path::Path>) -> (BTreeMap<String, String>, se
 /// live reflects any rule edits without a restart.
 ///
 /// Asked of policy FIRST (backlog 493cebf3): a caller whose scope reads
-/// no packets gets the feed's failure shape with the reason it was
-/// withheld, and never reaches the table. Its readers all sign — the SPA
+/// no packets — or, since d0058c92, not every packet — gets the feed's
+/// failure shape with the reason it was withheld, and never reaches the
+/// table. Its readers all sign — the SPA
 /// through its session, the departments readiness read as its viewer,
 /// `boss tenant export` as the seed identity, a recorded probe as its
 /// `audit-readonly` reader — so the caller this turns away is the one a
@@ -272,8 +278,10 @@ async fn rules(
             "handler_emits": {}, "system_edges": [],
         }))
     };
-    if let Err(why) = reads_packets(state.policy.as_ref(), &user, "the rule registry").await {
-        return failed(why);
+    if let Err(refused) =
+        reads_every_packet(state.policy.as_ref(), &user, "the rule registry").await
+    {
+        return failed(refused.why);
     }
     let raw = match load_active_rules(&state.pool).await {
         Ok(raw) => raw,
@@ -351,8 +359,19 @@ async fn schedule(
         }))
     };
     // Asked FIRST, so a caller the scope refuses never reaches the table.
-    if let Err(why) = reads_packets(state.policy.as_ref(), &user, "the schedule").await {
-        return answer(serde_json::Value::Null, Some(why));
+    if let Err(refused) = reads_every_packet(state.policy.as_ref(), &user, "the schedule").await {
+        let mut body = answer(serde_json::Value::Null, Some(refused.why));
+        // WITHHELD BY SCOPE is a flag, not words a reader must recognise
+        // (backlog 1805bac0): until then the web matched the reason's
+        // opening phrase, one fact kept twice in prose (CLAUDE.md 9a).
+        // Absent on every other answer, so a full scope's payload and a
+        // policy outage's are unchanged.
+        if refused.by_scope
+            && let Some(o) = body.0.as_object_mut()
+        {
+            o.insert("withheld".into(), serde_json::Value::Bool(true));
+        }
+        return body;
     }
     let raw = match load_active_rules(&state.pool).await {
         Ok(raw) => raw,
@@ -380,29 +399,70 @@ async fn schedule(
 /// THE SCOPE RULE (backlog e5f7b51e, applied to the yard's machine
 /// reads): a caller whose policy scope reads no packets — which is what
 /// a request with no identity is — reads nothing about the machinery
-/// that moves them. Any scope that reads packets at all, however narrow,
-/// reads the schedule: it is about the machine, not about any one
-/// packet. A policy service that cannot answer refuses (D9, fail
-/// closed), and its detail is logged rather than handed to the caller,
-/// because it names the policy service's internal address (fe9d212c).
+/// that moves them.
+///
+/// NOR DOES ONE WHOSE SCOPE READS SOME PACKETS BUT NOT ALL (backlog
+/// d0058c92). Until then any scope that read packets at all, however
+/// narrow, read the schedule and the rules, on the theory that they are
+/// about the machine and not about any one packet. That is exactly why
+/// they are withheld: neither narrows to a caller's packets — the
+/// schedule names when every rule last fired, whoever's packets it
+/// moved — and the IT map already withholds both from such a caller
+/// (070de88c, 0964ba80). The door agreeing with the map is the decision.
+///
+/// JUDGED ON THE TRANSLATED SCOPE ([`JobScope::from_predicate`], the
+/// jobs API's one translation), never on the policy's own answer: a
+/// department grant held outside its department is a predicate, not
+/// `Predicate::None`, and reads no packets, so it was let through here
+/// while every packet read refused it. A policy service that cannot
+/// answer refuses (D9, fail closed), and its detail is logged rather
+/// than handed to the caller, because it names the policy service's
+/// internal address (fe9d212c).
 ///
 /// `what` names the read in the reason — "the schedule", "the rules" —
 /// so a caller is told which record was withheld from it, and that it
 /// was WITHHELD: a refusal by scope is not a read that failed.
-async fn reads_packets(policy: &dyn PolicyClient, user: &User, what: &str) -> Result<(), String> {
-    match policy.scope_predicate(user, Resource::job()).await {
-        Ok(Predicate::None) => Err(format!(
-            "this caller's policy scope reads no packets, so {what} of the machinery that \
-             moves them is withheld from it"
-        )),
-        Ok(_) => Ok(()),
+async fn reads_every_packet(
+    policy: &dyn PolicyClient,
+    user: &User,
+    what: &str,
+) -> Result<(), Refusal> {
+    let by_scope = |why: String| Refusal {
+        why,
+        by_scope: true,
+    };
+    match policy.scope_of(user, controls::READ_JOB).await {
+        Ok(predicate) => match JobScope::from_predicate(user, &predicate) {
+            JobScope::All => Ok(()),
+            JobScope::None => Err(by_scope(format!(
+                "this caller's policy scope reads no packets, so {what} of the machinery that \
+                 moves them is withheld from it"
+            ))),
+            JobScope::OwnerIs(_) | JobScope::OwnerIn(_) | JobScope::AccountIn(_) => {
+                Err(by_scope(format!(
+                    "this caller's policy scope does not read every packet, and {what} is not \
+                     scoped by packet, so it is withheld from it"
+                )))
+            }
+        },
         Err(e) => {
             tracing::warn!(error = %e, read = what, "dispatcher read: policy check failed; withheld");
-            Err(format!(
-                "policy check failed, so {what} is withheld until policy can answer"
-            ))
+            Err(Refusal {
+                why: format!("policy check failed, so {what} is withheld until policy can answer"),
+                by_scope: false,
+            })
         }
     }
+}
+
+/// A read [`reads_every_packet`] refused, and whether the refusal was
+/// the caller's SCOPE (the policy working) or the policy check failing
+/// (a fault). The schedule hands `by_scope` to the wire as `withheld`,
+/// so a surface tells the two apart by a flag rather than by matching
+/// the reason's words (backlog 1805bac0, CLAUDE.md 9a).
+struct Refusal {
+    why: String,
+    by_scope: bool,
 }
 
 /// Read each business calendar a scheduled rule names, once. An error
@@ -642,7 +702,13 @@ async fn create_rule_draft(
     CurrentUser(user): CurrentUser,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    let author = match authorize_rule_write(state.policy.as_ref(), &user, Action::Create).await {
+    let author = match authorize_rule_write(
+        state.policy.as_ref(),
+        &user,
+        controls::CREATE_DISPATCHER_RULE,
+    )
+    .await
+    {
         Ok(author) => author,
         Err(refusal) => return refusal,
     };
@@ -676,12 +742,12 @@ async fn validate_rule(Json(raw): Json<RawRule>) -> Json<serde_json::Value> {
 /// The rule reads' gate, as a refusal: 403 with the reason it was
 /// withheld (backlog 493cebf3). A version read names the rule and
 /// carries its whole definition, drafts included, so it takes the feed's
-/// scope rule.
+/// scope rule — every packet, since d0058c92.
 async fn rule_read_refusal(state: &HttpState, user: &User) -> Option<Response> {
-    reads_packets(state.policy.as_ref(), user, "the rule registry")
+    reads_every_packet(state.policy.as_ref(), user, "the rule registry")
         .await
         .err()
-        .map(|why| (StatusCode::FORBIDDEN, why).into_response())
+        .map(|refused| (StatusCode::FORBIDDEN, refused.why).into_response())
 }
 
 /// `GET /api/dispatcher/rules/{name}/versions` — all versions, oldest first
@@ -723,7 +789,12 @@ async fn publish_rule(
     CurrentUser(user): CurrentUser,
     Path(name): Path<String>,
 ) -> Response {
-    let publisher = match authorize_rule_write(state.policy.as_ref(), &user, Action::Publish).await
+    let publisher = match authorize_rule_write(
+        state.policy.as_ref(),
+        &user,
+        controls::PUBLISH_DISPATCHER_RULE,
+    )
+    .await
     {
         Ok(publisher) => publisher,
         Err(refusal) => return refusal,
@@ -742,7 +813,13 @@ async fn retire_rule(
     CurrentUser(user): CurrentUser,
     Path(name): Path<String>,
 ) -> Response {
-    let retirer = match authorize_rule_write(state.policy.as_ref(), &user, Action::Retire).await {
+    let retirer = match authorize_rule_write(
+        state.policy.as_ref(),
+        &user,
+        controls::RETIRE_DISPATCHER_RULE,
+    )
+    .await
+    {
         Ok(retirer) => retirer,
         Err(refusal) => return refusal,
     };
@@ -784,16 +861,11 @@ async fn retire_rule(
 async fn authorize_rule_write(
     policy: &dyn PolicyClient,
     user: &User,
-    action: Action,
+    control: Pair,
 ) -> Result<String, Response> {
-    boss_policy_client::writes::require_registry_write(
-        policy,
-        user,
-        action,
-        Resource::dispatcher_rule(),
-    )
-    .await
-    .map(|actor| actor.to_string())
+    boss_policy_client::writes::require_registry_write(policy, user, control)
+        .await
+        .map(|actor| actor.to_string())
 }
 
 #[cfg(test)]

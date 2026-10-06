@@ -1,0 +1,23 @@
+{
+  "about": "READ-ONLY: renders what `node-converge` WOULD apply to one Talos node, and applies nothing (infra/forge/node-converge.sh --plan <node> <tree_sha>; backlog 9d56c616, design 1bc4b4ed). It runs every bound the write runs — the node is one the estate registry declares, not retired, with a Talos role and one IPv4 address, and the cluster agrees (the registry's address as its InternalIP, a control-plane label exactly when the registry says talos-control-plane); the declaration is infra/cluster/talos/patches/<node>.yaml read out of git at tree_sha, a full commit on the history the forge's checkout converged to whose blob is the one HEAD carries; every entry it declares is in a class check-declared.sh reads back, under extraConfig only the image-GC pair, and a UserVolumeConfig only with a diskSelector in the check's allowlist grammar (term && term, each exactly !system_disk or disk.<field> <op> <literal>, one !system_disk, no brackets, comments or newlines); Talos's --dry-run in --mode=no-reboot answers 'Applied configuration without a reboot' and changes something; a patch that is not idempotent (its dry run applied twice differs from once, because Talos's merge appends list entries it cannot key) is refused when ANY entry it declares, in any class — UserVolumeConfig included — is already live; and no changed line of Talos's diff is credential-shaped — and then prints the plan: the node, its address, estate role and Node uid, the file, commit and blob, the one command, the declaration's text, the node read against it now (check-declared.sh), the dry-run summary, whether the patch is idempotent, and Talos's config diff with every context line reduced to its key, because a machine config's values include the cluster's keys and tokens. No clock in the bytes; its sha256 is printed on stderr as `plan-sha256:`, and that hash is what David's passkey signs (design 17835005 q1). Every read goes through the forge's ops_kubectl and ops_talosctl doors; a read that could not look renders no plan. Timeout 180: the registry, a bounded image pull, the Node read, one machine-config read and two dry runs, each talosctl call bounded inside its container.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/node-converge.sh",
+    "--plan",
+    "{1}",
+    "{2}"
+  ],
+  "params": [
+    {
+      "name": "node",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    {
+      "name": "tree_sha",
+      "pattern": "^[0-9a-f]{40}$"
+    }
+  ],
+  "timeout": 180
+}

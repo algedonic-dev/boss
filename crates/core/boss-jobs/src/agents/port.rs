@@ -13,6 +13,7 @@ use boss_core::event::Event;
 use boss_core::publish::PublishMode;
 use boss_core::publisher::EventStamp;
 
+use super::automations::{AUTOMATION_DECLARED, AutomationActor, AutomationsSeedOutcome};
 use super::types::{AgentInput, AgentRow, AgentsBatchOutcome, FieldChange};
 
 /// The fact a tenant's declaration leaves: one per agent row the
@@ -124,4 +125,44 @@ pub trait AgentsRegistry: Send + Sync {
         mode: PublishMode,
         stamp: &EventStamp,
     ) -> Result<AgentsBatchOutcome, AgentsError>;
+
+    /// Every writing automation's row, ordered by id (byte order) — the
+    /// automation half of the registry (backlog ddf0773e, design
+    /// abf9eeae car 1; `super::automations` says why it is a table of
+    /// its own). Nothing decides on it yet: it is read by `GET
+    /// /api/agents/automations` and by the report that names a writer
+    /// with no row.
+    async fn list_automations(&self) -> Result<Vec<AutomationActor>, AgentsError>;
+
+    /// Land the platform bundle, one transaction, INSERT-IF-ABSENT and
+    /// nothing else: a row the registry lacks is inserted and records
+    /// one [`AUTOMATION_DECLARED`] built from `stamp`; a row it holds is
+    /// KEPT as it is (design e187198f — an operator who narrows a role
+    /// keeps the narrowing across every boot), with the declared fields
+    /// it differs on named in the outcome. Rows arrive validated
+    /// (`automations::validate_all`). There is no update path here by
+    /// design: changing a held row's role is a decision with its own
+    /// door, which this car does not open.
+    async fn declare_automations(
+        &self,
+        rows: &[AutomationActor],
+        stamp: &EventStamp,
+    ) -> Result<AutomationsSeedOutcome, AgentsError>;
+}
+
+/// Build the `automation.declared` event for one inserted row: the row
+/// as declared plus `declared_by`, the stamp's actor — the
+/// [`declared_event`] shape, one builder for both adapters.
+pub fn automation_declared_event(
+    stamp: &EventStamp,
+    row: &AutomationActor,
+) -> Result<Event, AgentsError> {
+    let mut payload = serde_json::to_value(row).map_err(|e| AgentsError::Storage(e.to_string()))?;
+    if let serde_json::Value::Object(map) = &mut payload {
+        map.insert(
+            "declared_by".to_string(),
+            serde_json::Value::String(stamp.actor().to_string()),
+        );
+    }
+    Ok(stamp.event(AUTOMATION_DECLARED, payload))
 }

@@ -1,0 +1,32 @@
+{
+  "about": "READ-ONLY: one Talos resource of one cluster node, as the Talos API states it (infra/forge/talos-get.sh <node> <resource> [id]): talosctl -n <the registry's address> get <resource> [id] -o yaml through the forge's ops_talosctl door. Asked for by design 8457c07b §4 (the w-1 second-NVMe window of 2026-09-30; backlog f0aaa72f): the morning reads machinestatus (stage running, not booting), disks (two NVMe, which is the system disk) and volumestatus u-gate (ready, xfs, mounted). The resource is one of three literal words — never machineconfig, whose bytes carry the cluster's CA keys and join tokens, and never secrets; the optional id is one lowercase word. The node must be one the estate registry declares, not retired, with a talos-* role and one IPv4 address (a control plane may be read). Nothing is written; a read that fails exits 1 with talosctl's own words. Timeout 60: one bounded talosctl call and, the first time, a bounded pull of the door's image.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/talos-get.sh",
+    "{1}",
+    "{2}",
+    "{3}"
+  ],
+  "params": [
+    {
+      "name": "node",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    {
+      "name": "resource",
+      "one_of": [
+        "machinestatus",
+        "disks",
+        "volumestatus"
+      ]
+    },
+    {
+      "name": "id",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,62}$",
+      "optional": true
+    }
+  ],
+  "timeout": 60
+}

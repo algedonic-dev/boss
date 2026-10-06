@@ -17,10 +17,11 @@
 #
 # ONE SHAPE, THREE READERS (CLAUDE.md §9a): node-roles.sh (through
 # infra/lib/sor.sh), every lint (infra/lint/lib/sor-read.sh), and — in
-# Rust — the recorded probe's and the unnamed CLI read's
-# `boss-cli identity.rs reader_header`, which cannot source a shell
-# file. `a_read_of_the_record_signs_one_shape` (boss-testing) holds the
-# Rust copy equal to this one.
+# Rust — `boss_core::roles::reader_header`, which signs the recorded
+# probe's and the unnamed CLI read and which every machine gate stamps
+# on a probe-reader match (design b35c22b4), and which cannot source a
+# shell file. `a_read_of_the_record_signs_one_shape` (boss-testing)
+# holds the Rust copy equal to this one.
 sor_reader_header() { # <automation id>
     printf '{"id":"%s","role":"audit-readonly","access_tier":"auditor","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}' "$1"
 }

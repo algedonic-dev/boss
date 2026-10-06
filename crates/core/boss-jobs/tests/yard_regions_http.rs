@@ -331,6 +331,13 @@ fn app() -> (axum::Router, Arc<InMemoryJobs>) {
     let policy_client: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()
             .allow("operator", Action::Read, Resource::job(), Scope::All)
+            // The estate registry's own question (`/api/estate/nodes`),
+            // which the operator's shipped grant answers (backlog 0964ba80).
+            .allow("operator", Action::Read, Resource::estate(), Scope::All)
+            // A NARROWED scope — its own packets only (backlog 070de88c).
+            .allow("sales", Action::Read, Resource::job(), Scope::Self_)
+            // EVERY packet, and no Read on the estate (backlog 0964ba80).
+            .allow("packets-only", Action::Read, Resource::job(), Scope::All)
             .build(),
     );
     let bus = RecordingEventBus::new();
@@ -369,21 +376,19 @@ fn app() -> (axum::Router, Arc<InMemoryJobs>) {
 fn job(kind: &str, id: &str, title: &str, status: JobStatus, metadata: Value) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
-        kind: kind.into(),
         workflow_version: 16,
-        subject: Subject::new("custom", "s"),
-        title: title.into(),
-        owner_id: "emp-david".into(),
         status,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 19).unwrap(),
-        opened_at: None,
-        due_on: None,
         closed_on: (status == JobStatus::Closed)
             .then(|| NaiveDate::from_ymd_opt(2026, 9, 19).unwrap()),
         metadata,
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            kind,
+            Subject::new("custom", "s"),
+            title,
+            "emp-david",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 19).unwrap(),
+        )
     }
 }
 
@@ -738,5 +743,128 @@ async fn a_declared_runner_host_stands_on_the_map_with_no_request_of_its_own() {
             .contains("declares an ops-runner"),
         "{}",
         machines[0]["why"]
+    );
+}
+
+/// A NARROWED SCOPE IS NOT HANDED THE ESTATE (backlog 0f462796 item 1,
+/// built on the car of 070de88c). The estate registry is not scoped by
+/// packet: it names every host and what it runs. The map asked policy
+/// for its packet rows and then read the registry for any caller whose
+/// scope was not empty, so a caller who may read only its OWN packets
+/// was drawn each ops-runner host by id and label. The rule the moves
+/// reading keeps is the rule here: below a full packet scope, a read
+/// that is not scoped by packet is not made. The control is the
+/// operator, whose full scope still draws the host from the same
+/// registry — so the absence below is the gate, not an empty estate.
+#[tokio::test]
+async fn a_narrowed_scope_is_not_drawn_the_estates_runner_hosts() {
+    let (app, jobs) = app();
+    seed(&jobs).await;
+    let stamp = boss_core::publisher::EventStamp::new(
+        "jobs",
+        boss_core::actor::ActorId::Automation("estate-seed".into()),
+    );
+    jobs.declare_estate_nodes(
+        &[boss_jobs::port::EstateNodeInput {
+            id: "forge".to_string(),
+            label: "the forge".to_string(),
+            address: "10.20.0.15".to_string(),
+            role: "forge".to_string(),
+            roles: vec![boss_jobs::regions::OPS_RUNNER_ROLE.to_string()],
+            cpu: None,
+            memory_gb: None,
+            disk_gb: None,
+            notes: None,
+        }],
+        &stamp,
+    )
+    .await
+    .expect("the declaration lands");
+
+    let (status, narrowed) = get(&app, "sales", "/api/yard/regions").await;
+    assert_eq!(status, StatusCode::OK, "{narrowed}");
+    let text = narrowed.to_string();
+    assert!(
+        !text.contains("runner:host:forge") && !text.contains("the forge"),
+        "a caller who reads only its own packets was drawn the estate's runner host: {}",
+        narrowed["plant"]
+    );
+
+    let (_, operator) = get(&app, "operator", "/api/yard/regions").await;
+    let ids: Vec<&str> = operator["plant"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&"runner:host:forge"),
+        "the control: a full scope still draws the declared host: {ids:?}"
+    );
+}
+
+/// A FULL PACKET SCOPE IS NOT A READ ON THE ESTATE (backlog 0964ba80).
+/// `/api/estate/nodes` answers only a caller policy grants Read on
+/// `estate` at scope all (`estate_read_refusal`); the map drew the same
+/// registry's hosts for any caller who read every packet, without
+/// asking. Now it asks the registry door's own question first, and a
+/// caller it refuses is drawn no host — the empty list a narrowed scope
+/// gets, never "the estate could not be read", which would be a
+/// failure's words for a refusal. The control is the operator, granted
+/// both, who is still drawn the host.
+#[tokio::test]
+async fn a_full_packet_scope_without_read_on_the_estate_is_not_drawn_its_hosts() {
+    let (app, jobs) = app();
+    seed(&jobs).await;
+    let stamp = boss_core::publisher::EventStamp::new(
+        "jobs",
+        boss_core::actor::ActorId::Automation("estate-seed".into()),
+    );
+    jobs.declare_estate_nodes(
+        &[boss_jobs::port::EstateNodeInput {
+            id: "forge".to_string(),
+            label: "the forge".to_string(),
+            address: "10.20.0.15".to_string(),
+            role: "forge".to_string(),
+            roles: vec![boss_jobs::regions::OPS_RUNNER_ROLE.to_string()],
+            cpu: None,
+            memory_gb: None,
+            disk_gb: None,
+            notes: None,
+        }],
+        &stamp,
+    )
+    .await
+    .expect("the declaration lands");
+
+    // The estate door itself refuses this caller — the question the map
+    // must ask is the one this answers.
+    let (status, _) = get(&app, "packets-only", "/api/estate/nodes").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, v) = get(&app, "packets-only", "/api/yard/regions").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let text = v.to_string();
+    assert!(
+        !text.contains("runner:host:forge") && !text.contains("the forge"),
+        "a caller the estate door refuses was drawn its runner host: {}",
+        v["plant"]
+    );
+    assert!(
+        !text.contains("estate registry could not be read"),
+        "a refusal in a failure's words: {}",
+        v["plant"]
+    );
+
+    let (_, operator) = get(&app, "operator", "/api/yard/regions").await;
+    let ids: Vec<&str> = operator["plant"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&"runner:host:forge"),
+        "the control: Read on the estate still draws the declared host: {ids:?}"
     );
 }

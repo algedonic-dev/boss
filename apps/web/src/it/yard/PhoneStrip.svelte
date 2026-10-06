@@ -15,14 +15,16 @@
   import { countText, kpiText, lampOf, regionHref, stateText, type Regions } from './regions';
   import { railLine, stripGroups, verdictOf } from './phone-strip';
   import { safeLinkHref } from '@boss/web-kit/links';
+  import { presentationHref } from './map-navigation';
 
   type Props = Readonly<{
     regions: Regions;
     /** The rails, or null while unread or unreadable — each row then
      *  says its rail in is not read, never that nothing waits there. */
     borders?: Borders | null;
+    overview?: boolean;
   }>;
-  let { regions, borders = null }: Props = $props();
+  let { regions, borders = null, overview = false }: Props = $props();
 
   const groups = $derived(stripGroups(regions, borders));
 
@@ -46,8 +48,8 @@
               class="strip-row"
               data-region={row.name}
               data-state={state}
-              href={safeLinkHref(regionHref(row.name))}
-              onclick={(e) => open(e, regionHref(row.name))}>
+              href={safeLinkHref(presentationHref(regionHref(row.name), overview))}
+              onclick={(e) => open(e, presentationHref(regionHref(row.name), overview))}>
               <span class="strip-head">
                 <span class="strip-name">{row.name}</span>
                 <span class="strip-state"><span class="lamp {lampOf(state)}"></span>{stateText(r)}</span>
@@ -55,7 +57,8 @@
               <!-- THE KPI, in the server's words and units (decision
                    9); the count in its unit on an older payload that
                    sends no KPI. -->
-              <span class="strip-kpi">{r === undefined ? 'no reading' : kpiText(r) || countText(r)}</span>
+              <span class="strip-kpi">{r === undefined ? 'no reading' : overview ? countText(r) : kpiText(r) || countText(r)}</span>
+              {#if !overview}
               {#each verdictOf(r) as line, i (i)}
                 <span class="strip-verdict" class:err={state === 'troubled'}>{line}</span>
               {/each}
@@ -70,6 +73,7 @@
                   <span class="strip-rail" data-rail="{b.from}→{b.to}" data-state={b.state}
                     ><span class="lamp {lampOf(b.state)}"></span>{railLine(b)}</span>
                 {/each}
+              {/if}
               {/if}
             </a>
           </li>

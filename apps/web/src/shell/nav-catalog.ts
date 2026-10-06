@@ -105,6 +105,7 @@ export type NavGroup = Readonly<{ label: string; items: ReadonlyArray<NavItem> }
 // here until car N1 of design e765b3fc (2026-09-25): each was a sidebar
 // row onto a station of the map, and the map's one row replaced them.
 export type UngatedSurfaceId =
+  | 'company-map'
   | 'system-incidents'
   // 'system-codebase' (the Codebase row): the department's own numbers,
   // readable by any operator — permKey-less like the Operate row above,
@@ -157,6 +158,7 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName | UngatedSurfaceId, NavIte
   hr:        { id: 'hr',        label: 'HR',               path: '/hr',           permKey: 'people',    owner: 'people', unlisted: true },
   watchlist: { id: 'watchlist', label: 'Churn watchlist',  path: '/watchlist',    permKey: 'accounts',  owner: 'sales', unlisted: true },
   manual:    { id: 'manual',    label: 'Manual',           path: '/manual',       owner: 'home' },
+  'company-map': { id: 'company-map', label: 'System Network Map', path: '/map', owner: 'home' },
 
   // The IT department — SIX surfaces (the 2026-08-31 consolidation,
   // packet 1f6d55e0; was 17 pages, four of them dual-routed). The

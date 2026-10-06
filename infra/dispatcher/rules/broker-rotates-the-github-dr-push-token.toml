@@ -5,8 +5,20 @@
 # convention of `broker-rotates-the-boss-dev-forge-token`: registry id
 # `github-dr-push-token`, Secret boss/github-dr-push-token key `token`,
 # minted from the GitHub App root as a one-hour INSTALLATION TOKEN
-# narrowed to the one repository and the two permissions a push needs,
+# narrowed to the one repository and the three permissions a push needs,
 # proven by reading algedonic-dev/boss-dr.
+#
+# WHY workflows:write (version 2, backlog d76cc3ac, 2026-09-29). v1 held
+# contents:write,metadata:read, and GitHub refused the first DR push of
+# forge main: "refusing to allow a GitHub App to create or update
+# workflow .github/workflows/ci.yml without workflows permission". A
+# token that pushes a tree containing .github/workflows must be able to
+# write workflows, whether or not anything runs them there. The App
+# itself must hold Workflows: Read and write, accepted on the
+# algedonic-dev installation, or the narrowed mint is refused — David's
+# act in the GitHub UI, and this version must not land before it. Pinned
+# by a_token_that_pushes_this_tree_may_write_its_workflows in
+# crates/core/boss-dispatcher/tests/github_app_installation_token_rules.rs.
 #
 # THE ROOT is the GitHub App on the algedonic-dev organisation — its App
 # id, installation id and private key, placed ONCE by David in Secret
@@ -55,10 +67,13 @@ Workflow definition can address. The rotate-a-credential protocol row
 declares the ORDER; this rule is the machine executor for ONE credential,
 and its args are that credential's declaration — Secret, narrowing,
 proving repository. It adds no routing: it advances the very packet that
-fired it and spawns nothing. Design 76155676 (2026-09-27).
+fired it and spawns nothing. Design 76155676 (2026-09-27). Version 2
+widens the narrowing by workflows:write, which GitHub requires of any
+push carrying .github/workflows (backlog d76cc3ac).
 """
+version = 2
 on_event = "step.done.credential-rotation"
 when = 'subject_id = "github-dr-push-token" OR metadata.credential = "github-dr-push-token"'
 [[rule.do]]
 handler = "credential.rotate.github-app-installation"
-args = { secret_namespace = "\"boss\"", secret_name = "\"github-dr-push-token\"", secret_key = "\"token\"", credential_id = "\"github-dr-push-token\"", verify_repo = "\"algedonic-dev/boss-dr\"", repositories = "\"boss-dr\"", permissions = "\"contents:write,metadata:read\"" }
+args = { secret_namespace = "\"boss\"", secret_name = "\"github-dr-push-token\"", secret_key = "\"token\"", credential_id = "\"github-dr-push-token\"", verify_repo = "\"algedonic-dev/boss-dr\"", repositories = "\"boss-dr\"", permissions = "\"contents:write,metadata:read,workflows:write\"" }

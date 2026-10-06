@@ -61,10 +61,18 @@ fn reading_of(row: &sqlx::postgres::PgRow) -> Result<Reading, SensorsError> {
 #[async_trait]
 impl Sensors for PgSensors {
     async fn list(&self) -> Result<Vec<SensorRow>, SensorsError> {
-        let rows = sqlx::query(&format!("SELECT {SENSOR_COLUMNS} FROM sensors ORDER BY id"))
-            .fetch_all(&self.pool)
-            .await
-            .map_err(storage)?;
+        // Every text ORDER BY here is `COLLATE "C"`, byte order — the
+        // in-memory adapter's `String::cmp` / `BTreeSet` order. The
+        // database's locale ignores `-` at first level and folds case,
+        // so `suite-ab` served before `suite-a-z` here and after it in
+        // memory until the adapters-agree suite (backlog be459ab9; the
+        // class is 2987fb2d's).
+        let rows = sqlx::query(&format!(
+            "SELECT {SENSOR_COLUMNS} FROM sensors ORDER BY id COLLATE \"C\""
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)?;
         rows.iter().map(sensor_of).collect()
     }
 
@@ -142,7 +150,7 @@ impl Sensors for PgSensors {
         let rows = sqlx::query(
             "SELECT sensor_id, external_id, observed_at, payload, packet_id \
              FROM sensor_readings WHERE sensor_id = $1 AND packet_id IS NULL \
-             ORDER BY observed_at, external_id",
+             ORDER BY observed_at, external_id COLLATE \"C\"",
         )
         .bind(sensor_id)
         .fetch_all(&self.pool)
@@ -169,7 +177,7 @@ impl Sensors for PgSensors {
         // window rides sensor_readings_observed_at_idx.
         let row = sqlx::query(
             "SELECT COUNT(*) AS arrived, COUNT(packet_id) AS stamped, \
-             COALESCE(ARRAY_AGG(DISTINCT packet_id ORDER BY packet_id) \
+             COALESCE(ARRAY_AGG(DISTINCT packet_id COLLATE \"C\" ORDER BY packet_id COLLATE \"C\") \
                       FILTER (WHERE packet_id IS NOT NULL), '{}') AS packets \
              FROM sensor_readings \
              WHERE sensor_id = $1 AND observed_at >= $2 AND observed_at < $3",

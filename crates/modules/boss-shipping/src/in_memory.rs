@@ -2,19 +2,51 @@
 
 use async_trait::async_trait;
 
-use crate::port::{ShippingError, ShippingRepository};
-use crate::summary::summarise_shipments;
-use crate::types::{Shipment, ShipmentDirection};
+use std::collections::HashSet;
+
+use crate::port::{
+    ShippingError, ShippingRepository, validate_bound, validate_shipment, validate_update,
+};
+use crate::summary::summarise_shipments_limited;
+use crate::types::{Shipment, ShipmentDirection, ShipmentStatus};
+
+/// The proof a scan was applied: `(shipment_id, status, occurred_on)`,
+/// the key of `shipment_tracking_events`' UNIQUE constraint.
+type ScanKey = (String, String, chrono::NaiveDate);
 
 pub struct InMemoryShipping {
     shipments: std::sync::RwLock<Vec<Shipment>>,
+    scans: std::sync::Mutex<HashSet<ScanKey>>,
     recorded: std::sync::Mutex<Vec<boss_core::event::Event>>,
+}
+
+/// A shipment as the store keeps it: asset ids in byte order, each once
+/// — what Postgres's `shipment_assets` junction (keyed on the pair,
+/// read `ORDER BY asset_id COLLATE "C"`) answers.
+fn kept(s: &Shipment) -> Shipment {
+    let mut asset_ids = s.asset_ids.clone();
+    asset_ids.sort();
+    asset_ids.dedup();
+    Shipment {
+        asset_ids,
+        ..s.clone()
+    }
+}
+
+/// Newest `created_on` first, then id in byte order — the list order
+/// both adapters answer (backlog be459ab9, found by the adapters-agree
+/// suite: this double answered insertion order, Postgres left ties of
+/// one day to the planner).
+fn in_list_order(mut v: Vec<Shipment>) -> Vec<Shipment> {
+    v.sort_by(|a, b| b.created_on.cmp(&a.created_on).then(a.id.cmp(&b.id)));
+    v
 }
 
 impl InMemoryShipping {
     pub fn new(shipments: Vec<Shipment>) -> Self {
         Self {
-            shipments: std::sync::RwLock::new(shipments),
+            shipments: std::sync::RwLock::new(shipments.iter().map(kept).collect()),
+            scans: std::sync::Mutex::new(HashSet::new()),
             recorded: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -35,7 +67,7 @@ impl InMemoryShipping {
 #[async_trait]
 impl ShippingRepository for InMemoryShipping {
     async fn all_shipments(&self) -> Result<Vec<Shipment>, ShippingError> {
-        Ok(self.shipments.read().unwrap().clone())
+        Ok(in_list_order(self.shipments.read().unwrap().clone()))
     }
 
     async fn list_shipments(
@@ -44,21 +76,24 @@ impl ShippingRepository for InMemoryShipping {
         offset: i64,
         account_id: Option<&str>,
     ) -> Result<(Vec<Shipment>, i64), ShippingError> {
-        let shipments = self.shipments.read().unwrap();
-        let filtered: Vec<&Shipment> = match account_id {
-            Some(cid) => shipments
+        validate_bound("limit", limit)?;
+        validate_bound("offset", offset)?;
+        let filtered: Vec<Shipment> = in_list_order(
+            self.shipments
+                .read()
+                .unwrap()
                 .iter()
-                .filter(|s| s.account_id.as_deref() == Some(cid))
+                .filter(|s| account_id.is_none() || s.account_id.as_deref() == account_id)
+                .cloned()
                 .collect(),
-            None => shipments.iter().collect(),
-        };
+        );
         let total = filtered.len() as i64;
-        let start = (offset as usize).min(filtered.len());
-        let end = (start + limit as usize).min(filtered.len());
-        Ok((
-            filtered[start..end].iter().map(|&s| s.clone()).collect(),
-            total,
-        ))
+        let page = filtered
+            .into_iter()
+            .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+            .collect();
+        Ok((page, total))
     }
 
     async fn shipment_by_id(&self, id: &str) -> Result<Option<Shipment>, ShippingError> {
@@ -77,6 +112,7 @@ impl ShippingRepository for InMemoryShipping {
         _now: chrono::DateTime<chrono::Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<String, ShippingError> {
+        validate_shipment(shipment)?;
         {
             let mut shipments = self.shipments.write().unwrap();
             if shipments.iter().any(|s| s.id == shipment.id) {
@@ -85,7 +121,7 @@ impl ShippingRepository for InMemoryShipping {
                     shipment.id
                 )));
             }
-            shipments.push(shipment.clone());
+            shipments.push(kept(shipment));
         }
         self.record(stamp.event(
             crate::events::SHIPMENT_CREATED,
@@ -101,13 +137,14 @@ impl ShippingRepository for InMemoryShipping {
         _now: chrono::DateTime<chrono::Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), ShippingError> {
+        validate_update(id, shipment)?;
         {
             let mut shipments = self.shipments.write().unwrap();
             let pos = shipments
                 .iter()
                 .position(|s| s.id == id)
                 .ok_or_else(|| ShippingError::NotFound(id.to_string()))?;
-            shipments[pos] = shipment.clone();
+            shipments[pos] = kept(shipment);
         }
         self.record(stamp.event(
             crate::events::SHIPMENT_UPDATED,
@@ -130,6 +167,9 @@ impl ShippingRepository for InMemoryShipping {
                 .ok_or_else(|| ShippingError::NotFound(id.to_string()))?;
             shipments.remove(pos);
         }
+        // The scans go with the shipment, as `ON DELETE CASCADE` takes
+        // them in Postgres.
+        self.scans.lock().unwrap().retain(|(sid, _, _)| sid != id);
         self.record(stamp.event(
             crate::events::SHIPMENT_DELETED,
             serde_json::json!({ "id": id, "deleted_at": now }),
@@ -137,17 +177,54 @@ impl ShippingRepository for InMemoryShipping {
         Ok(())
     }
 
+    /// Until 2026-10-01 a stub answering `Ok` for any shipment, rolling
+    /// nothing up and recording nothing (backlog be459ab9, found by the
+    /// adapters-agree suite). It now keeps the proof, the rollup and the
+    /// fact Postgres keeps, in the same order of judgement.
     async fn record_tracking_scan(
         &self,
-        _shipment_id: &str,
-        _status: &str,
-        _occurred_on: chrono::NaiveDate,
-        _stage_index: Option<i16>,
-        _stamp: &boss_core::publisher::EventStamp,
+        shipment_id: &str,
+        status: &str,
+        occurred_on: chrono::NaiveDate,
+        stage_index: Option<i16>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), ShippingError> {
-        // In-memory backend: tracking events are not persisted (and
-        // so none are recorded). Tests that exercise the live flow
-        // use the Postgres path.
+        if status.contains('\0') {
+            return Err(ShippingError::Invalid(
+                "status carries a NUL byte, which cannot be stored".into(),
+            ));
+        }
+        {
+            let mut shipments = self.shipments.write().unwrap();
+            let row = shipments
+                .iter_mut()
+                .find(|s| s.id == shipment_id)
+                .ok_or_else(|| ShippingError::NotFound(shipment_id.to_string()))?;
+            let key = (shipment_id.to_string(), status.to_string(), occurred_on);
+            // The proof of application: a replayed scan is a full no-op.
+            if !self.scans.lock().unwrap().insert(key) {
+                return Ok(());
+            }
+            if matches!(
+                status,
+                ShipmentStatus::IN_TRANSIT | ShipmentStatus::DELIVERED
+            ) {
+                row.status = ShipmentStatus::new(status);
+                row.shipped_on = row.shipped_on.or(Some(occurred_on));
+                if status == ShipmentStatus::DELIVERED {
+                    row.delivered_on = row.delivered_on.or(Some(occurred_on));
+                }
+            }
+        }
+        self.record(stamp.event(
+            crate::events::TRACKING_RECORDED,
+            serde_json::json!({
+                "shipment_id": shipment_id,
+                "status": status,
+                "occurred_on": occurred_on,
+                "stage_index": stage_index,
+            }),
+        ));
         Ok(())
     }
 
@@ -157,16 +234,18 @@ impl ShippingRepository for InMemoryShipping {
         today: chrono::NaiveDate,
         recent_limit: i64,
     ) -> Result<boss_shipping_client::OutboundShipmentSummary, ShippingError> {
+        validate_bound("recent_limit", recent_limit)?;
         let shipments = self.shipments.read().unwrap();
-        let mut summary = summarise_shipments(&shipments, direction, today);
-        // The pure `summarise_shipments` hardcodes the preview cap at
-        // STATUS_SUMMARY_RECENT_LIMIT (10). If the caller wanted less,
-        // honour that here. The port's limit is an upper bound, not a
-        // target — we don't pad up.
-        if (recent_limit as usize) < summary.recent.len() {
-            summary.recent.truncate(recent_limit as usize);
-        }
-        Ok(summary)
+        // The caller's limit, not a hard ten: until 2026-10-01 this
+        // double capped the preview at STATUS_SUMMARY_RECENT_LIMIT
+        // whatever was asked, while Postgres honoured the limit
+        // (backlog be459ab9, found by the adapters-agree suite).
+        Ok(summarise_shipments_limited(
+            &shipments,
+            direction,
+            today,
+            usize::try_from(recent_limit).unwrap_or(usize::MAX),
+        ))
     }
 }
 

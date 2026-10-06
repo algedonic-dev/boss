@@ -55,20 +55,16 @@ const PACKET: &str = "cccccccc-0000-4000-8000-000000000001";
 fn packet() -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(PACKET).unwrap()),
-        kind: "backlog-item".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "bosspipeline"),
-        title: "A station claim reads the agents own role".into(),
-        owner_id: "emp-david".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 22).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "backlog-item",
+            Subject::new("custom", "bosspipeline"),
+            "A station claim reads the agents own role",
+            "emp-david",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 22).unwrap(),
+        )
     }
 }
 
@@ -78,30 +74,20 @@ fn packet() -> Job {
 fn step_for(role: &str) -> Step {
     Step {
         id: StepId::from_uuid(Uuid::new_v4()),
-        job_id: JobId::from_uuid(Uuid::parse_str(PACKET).unwrap()),
-        kind: "task".into(),
-        title: "build".into(),
         spec_slug: Some("build".into()),
-        assignee_id: None,
         status: StepStatus::Ready,
-        sort_order: 0,
-        blocked_by: vec![],
-        sign_offs_required: Vec::new(),
-        assurance_required: None,
-        sign_offs: Vec::new(),
-        fields: Vec::new(),
-        completed_on: None,
-        completed_by: None,
-        completed_at: None,
         metadata: serde_json::json!({
             "authority_role": role,
             "agent_profile": "builder",
             "agent_model": MODEL,
             "agent_effort": "high",
         }),
-        notes: None,
-        step_plugin_version: 0,
-        embedded_job: None,
+        ..Step::new(
+            JobId::from_uuid(Uuid::parse_str(PACKET).unwrap()),
+            "task",
+            "build",
+            0,
+        )
     }
 }
 

@@ -47,7 +47,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "One operator's Claude Code session, as a packet: opened by the SessionStart hook, kept alive by a heartbeat on every prompt (last_active_at and prompt_count, never the prompt text), ended by the SessionEnd hook or by the clock when it goes silent past twice the active step's duration. Runs dispatched from the session link back to it by metadata.session on each agent-run. The shop floor of the operator surface — sessions as crews, runs as the cars they are building."
-metadata = { owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin" }
 metadata_schema = { type = "object", required = ["actor", "host", "started_at"], properties = { actor = { type = "string", description = "The actor id the session signs as (BOSS_ACTOR)." }, host = { type = "string" }, cwd = { type = "string" }, started_at = { type = "string", description = "RFC3339, written by the SessionStart hook." }, session_id = { type = "string", description = "Claude Code's own session id, so a resumed session finds its packet." }, source = { type = "string", description = "startup | resume | clear | compact — SessionStart's own word." }, last_active_at = { type = "string", description = "The heartbeat: RFC3339 of the last prompt, written by UserPromptSubmit." }, prompt_count = { type = "number" }, untracked_runs = { type = "number", description = "Agent-tool calls the dispatch hook could parse no packet from — counted, never refused." }, ended_at = { type = "string" }, end_reason = { type = "string", description = "SessionEnd's own reason word." } } }
 
 [[workflow.step]]

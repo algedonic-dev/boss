@@ -458,16 +458,8 @@ mod tests {
 
     fn field(name: &str, filled_by: boss_core::job::FilledBy) -> boss_core::job::StepField {
         boss_core::job::StepField {
-            name: name.into(),
-            field_type: "string".into(),
-            required: false,
             filled_by,
-            item_keys: Vec::new(),
-            covers: None,
-            binds: None,
-            item_value_max_bytes: None,
-            item_one_of: Vec::new(),
-            writer: None,
+            ..boss_core::job::StepField::new(name, "string")
         }
     }
 

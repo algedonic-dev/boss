@@ -142,7 +142,7 @@ pub(super) async fn upsert_vendor_invoice<R: InventoryRepository + 'static>(
         .await
     {
         Ok(()) => (StatusCode::CREATED, Json(invoice)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => super::error_response(e),
     }
 }
 
@@ -255,7 +255,7 @@ pub(super) async fn create_vendor_invoice_from_po<R: InventoryRepository + 'stat
         .await
     {
         Ok(()) => (StatusCode::CREATED, Json(invoice)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => super::error_response(e),
     }
 }
 
@@ -308,7 +308,7 @@ pub(super) async fn batch_pay_vendor_invoices<R: InventoryRepository + 'static>(
             .upsert_vendor_invoice_at(&invoice, stamp.timestamp, &stamp)
             .await
         {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            return super::error_response(e);
         }
         total += invoice.amount_cents;
         paid_ids.push(invoice.id);

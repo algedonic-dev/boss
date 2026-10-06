@@ -1,0 +1,23 @@
+{
+  "about": "READ-ONLY: renders what retire-volume-replica WOULD do, with no write (infra/forge/retire-volume-replica.sh --plan <volume> <replica>; 5ef9d2d9, 077adeb3). Every write bound is applied: one attached pvc-<uuid> Longhorn volume and one of ITS named replicas; N replicas with declared count N, none deleting, N-1 healthy+active copies on distinct nodes, and either the named copy healthy on an N-th node with robustness healthy, or the sole unhealthy copy with robustness degraded (back-down after a stalled move). A stopped retirement can instead render a NEW resume plan when the declared count is already N-1 and all N copies remain healthy+active on N distinct nodes with robustness healthy; step 1 then tests N-1 without lowering again. N-1 stays at least BOSS_RETIRE_FLOOR (default 3, never below 2). Data locality and effective replica auto-balance must be disabled, with no eviction on any replica, node or disk. For retirement and resume, every remaining disk must admit the next GiB of growth in its scheduling ledger AND live free space by Longhorn v1.11.3 ValidateDiskAvailableForExpansion and IsSchedulableToDisk with requiredStorage 0 (infra/lib/longhorn-ledger.sh). Back-down does not require growth room, and its unhealthy copy may rebuild healthy before the delete, which then costs that healthy copy. The signed plan states the actual declared count, copies, node/disk identities, floor, trim settings, growth ledger and three steps. Live space rides stderr, never the signed bytes; sha256 rides stderr as plan-sha256 and David's passkey signs those bytes. The write re-renders before any mutation, tests the current declared count, watches 30 s and rechecks retained identities, count, trim settings and robustness immediately before the named delete, then proves the final state for up to 180 s. Reads use the forge ops_kubectl door; an unreadable answer exits 1, and a refusal exits 78 without a plan. Timeout 300 covers the default 120 s image pull plus all six bounded reads.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/retire-volume-replica.sh",
+    "--plan",
+    "{1}",
+    "{2}"
+  ],
+  "params": [
+    {
+      "name": "volume",
+      "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    {
+      "name": "replica",
+      "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-r-[0-9a-f]{8}$"
+    }
+  ],
+  "timeout": 300
+}

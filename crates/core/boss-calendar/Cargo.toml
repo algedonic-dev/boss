@@ -58,3 +58,7 @@ required-features = ["postgres"]
 [[test]]
 name = "business_calendars_pg"
 required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_calendar_pg"
+required-features = ["postgres"]

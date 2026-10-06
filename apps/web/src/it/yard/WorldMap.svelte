@@ -55,6 +55,7 @@
     crossedText,
     machineStatus,
     machineText,
+    machineWithheld,
     railWidth,
     rateText as borderRateText,
     unlistedText,
@@ -207,7 +208,17 @@
   /** The machine's lamp: its own silence when it declares a cadence,
    *  otherwise unlit — an unlit lamp is "cannot tell", not "fine". */
   const machineLamp = (b: Border | undefined): string =>
-    b === undefined || b.machine.silent === null ? 'unknown' : b.machine.silent ? 'err' : 'ok';
+    b === undefined
+      ? 'unknown'
+      : // Withheld by scope (bd506215): a closed, plain ring — the policy
+        // working, not the broken "cannot tell" ring a failed read wears.
+        machineWithheld(b.machine)
+        ? 'scope'
+        : b.machine.silent === null
+          ? 'unknown'
+          : b.machine.silent
+            ? 'err'
+            : 'ok';
   /** The machine's name as the rail writes it — the name the server
    *  sent, broken after a hyphen when it will not fit on one line. */
   const nameOf = (b: Border | undefined): string => b?.machine.name ?? 'no reading';
@@ -606,6 +617,9 @@
      a different SHAPE from lit, as the machinery glyphs are. */
   .machine-lamp { fill: var(--map-surface); stroke: var(--map-muted); stroke-width: 1; stroke-dasharray: 1.5 1.5; }
   .machine-lamp.ok { fill: var(--map-ok-edge); stroke: var(--map-ok-edge); stroke-dasharray: none; }
+  /* Withheld by policy scope (bd506215): a whole, unlit ring — neutral,
+     and a different shape from the broken ring of "cannot tell". */
+  .machine-lamp.scope { fill: var(--map-surface); stroke: var(--map-muted); stroke-dasharray: none; }
   .machine-lamp.err { fill: var(--map-bad-edge); stroke: var(--map-bad-edge); stroke-dasharray: none;
     animation: blink 1s steps(2) infinite; }
   .glyph { fill: var(--map-surface); stroke: var(--map-rule-strong); }
@@ -694,6 +708,10 @@
      idle, not a different shade of it, because shade alone does not
      survive world scale. */
   .glyph.unknown .shed { stroke-dasharray: 2 2; }
+  /* Withheld by policy scope (1805bac0): a whole, unfilled outline —
+     neutral, no mark, and a different shape from both idle (filled)
+     and unknown (broken), as the rail's withheld lamp is. */
+  .glyph.withheld .shed { fill: none; stroke: var(--map-muted); }
   .yard .glyph text.mark { font-size: 9px; letter-spacing: 0; }
   @keyframes piston { to { transform: translateX(4px); } }
   /* THE MOVING MAP (flight it-map-motion, design 31bade8f). Motion means

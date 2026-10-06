@@ -9,6 +9,10 @@
 //                                   one series at a time (75027a93)
 //   GET /api/estate/comparisons   — the difference, computed on event
 //
+// plus the packets the estate's own loops leave, read from the jobs API
+// — the loops, the open alarms, and the DNS zone readings that carry
+// the declared edge (THE EDGE, e0e183fb).
+//
 // Every fetch lands in a Remote<T>: this page's whole subject is
 // absence lying, so an outage must render as failure, never as an
 // empty estate (the false-empty family).
@@ -48,6 +52,10 @@ export type ObservedNode = Readonly<{
   ready?: boolean;
   /** The `host-units` scope's one node carries the units it watched. */
   units?: readonly ObservedUnit[];
+  /** Running `boss-*` units outside the declared roster (6647ac9a). */
+  undeclared_units?: readonly ObservedUnit[];
+  /** Why the observer could not ask what runs, when it could not. */
+  undeclared_unread?: string;
 }>;
 
 export type Observation = Readonly<{
@@ -165,10 +173,13 @@ export type HostLine = Readonly<{ host: string | null; cmp: Comparison | null }>
  *  that reads "never finished" forever. */
 export type EstateLoop = Readonly<{ kind: string; label: string }>;
 
+/** The loop whose run step also records the tunnel routes (THE EDGE). */
+export const CLUSTER_CONVERGE_KIND = 'maintenance-cluster-converge';
+
 export const ESTATE_LOOPS: readonly EstateLoop[] = [
   { kind: 'maintenance-forge-converge', label: 'forge converge' },
   { kind: 'maintenance-boss-gcp-converge', label: 'boss-gcp converge' },
-  { kind: 'maintenance-cluster-converge', label: 'cluster converge' },
+  { kind: CLUSTER_CONVERGE_KIND, label: 'cluster converge' },
   { kind: 'maintenance-cluster-watchdog', label: 'cluster watchdog' },
   { kind: 'maintenance-estate-observe-host', label: 'observe hosts' },
   { kind: 'maintenance-estate-observe-units', label: 'observe units' },
@@ -184,8 +195,10 @@ export const OPS_RUNNER_ROLE = 'ops-runner';
 
 /** The success terminals of the loops above; every other terminal they
  *  declare (failed, refused) renders as trouble. Held to the workflow
- *  files by estate.test.ts. */
-export const LOOP_OK_OUTCOMES: ReadonlySet<string> = new Set(['completed', 'answered']);
+ *  files by estate.test.ts. `nothing-to-do` is ops-request's close for
+ *  a plan that named no change (backlog b2f78bb9): the runner answered,
+ *  and nothing needing doing is not trouble. */
+export const LOOP_OK_OUTCOMES: ReadonlySet<string> = new Set(['completed', 'answered', 'nothing-to-do']);
 
 /** One packet of a loop, reduced to what "did it run" needs. */
 export type LoopPacket = Readonly<{
@@ -197,7 +210,15 @@ export type LoopPacket = Readonly<{
   at: string | null;
   /** The host the packet names, or null when it names none. */
   host: string | null;
+  /** The tunnel routes the run applied and its connector's state, when
+   *  the run step recorded them — only the cluster converge does (THE
+   *  EDGE below); null on every other loop. */
+  tunnel: TunnelRoutes | null;
 }>;
+
+/** What a cluster converge's run step records of the tunnel
+ *  (infra/forge/cluster-deploy-lib.sh, `tunnel_ingress` + `cloudflared`). */
+export type TunnelRoutes = Readonly<{ connector: string | null; routes: readonly string[] }>;
 
 export type LoopPlan = Readonly<{ kind: string; label: string; host: string | null }>;
 
@@ -232,6 +253,141 @@ export const CLUSTER_OBSERVATIONS_READ = `/api/estate/observations?scope=${CLUST
 /** The cluster verdict is the newest comparison of ITS scope — the
  *  unscoped page of 20 it came from was spent the same way. */
 export const CLUSTER_COMPARISON_READ = `/api/estate/comparisons?scope=${CLUSTER_SCOPE}&limit=1`;
+
+// THE INSTANCE VOLUMES (backlog 21ee3b4e, incident d3c0a67c). On
+// 2026-10-01 the system of record's Postgres volume filled and writes
+// failed with No space left on device; no surface showed any claim, and
+// a builder found it through a 500. The forge now reads every claim in
+// every instance namespace (infra/estate/observe-volumes.sh) and
+// estate.compare judges each against the volume floor — and the
+// COMPARISON carries every row whole, judged (`volumes`, each with its
+// floor and `tight`), so this page draws the comparator's verdict and
+// never a second copy of the floor (CLAUDE.md §9a). Ten rows, as every
+// series here, so its age reads against its own cadence.
+export const VOLUMES_SCOPE = 'instance-volumes';
+export const VOLUMES_READ = `/api/estate/comparisons?scope=${VOLUMES_SCOPE}&limit=${SERIES_SAMPLE}`;
+
+/** One claim as the volume comparison records it. A claim the forge
+ *  could not read carries null figures, `tight: null` and `unread`. */
+export type VolumeRow = Readonly<{
+  id: string;
+  namespace: string | null;
+  claim: string | null;
+  volume: string | null;
+  capacity_bytes: number | null;
+  used_bytes: number | null;
+  free_bytes: number | null;
+  floor_bytes: number | null;
+  tight: boolean | null;
+  unread: string | null;
+  requested: string | null;
+  capacity_intent: CapacityIntent;
+}>;
+
+export type CapacityAssignment = Readonly<{
+  packet: string;
+  step: string;
+  question: string;
+  decided_by: string;
+  decided_at: string;
+}>;
+export type CapacityIntent = Readonly<{
+  verdict: 'match' | 'drift' | 'unknown';
+  desired_bytes: number | null;
+  requested_bytes: number | null;
+  assignment: CapacityAssignment | null;
+  reason: string | null;
+}>;
+
+const byteCount = (v: unknown): number | null => typeof v === 'number' && Number.isSafeInteger(v) && v > 0 ? v : null;
+const unknownIntent = (reason: string): CapacityIntent => ({ verdict: 'unknown', desired_bytes: null, requested_bytes: null, assignment: null, reason });
+
+/** Retain the recorded verdict; contradictory or incomplete evidence is
+ * unavailable, never a browser-inferred target or match. */
+export function parseCapacityIntent(raw: unknown): CapacityIntent {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return unknownIntent('no declared capacity comparison recorded');
+  const o = raw as Record<string, unknown>;
+  const a = o.assignment;
+  const provenance = a && typeof a === 'object' && !Array.isArray(a) ? a as Record<string, unknown> : null;
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const assignment = provenance && ['packet', 'step', 'question', 'decided_by', 'decided_at'].every((k) => typeof provenance[k] === 'string' && (provenance[k] as string).trim().length > 0)
+    && uuid.test(provenance.packet as string) && uuid.test(provenance.step as string) && Number.isFinite(Date.parse(provenance.decided_at as string))
+    ? { packet: provenance.packet as string, step: provenance.step as string, question: provenance.question as string, decided_by: provenance.decided_by as string, decided_at: provenance.decided_at as string } : null;
+  const desired_bytes = byteCount(o.desired_bytes);
+  const requested_bytes = byteCount(o.requested_bytes);
+  if (o.verdict === 'unknown' && typeof o.reason === 'string' && o.reason.trim()) return { verdict: 'unknown', desired_bytes: assignment ? desired_bytes : null, requested_bytes, assignment, reason: o.reason };
+  if (assignment && desired_bytes !== null && requested_bytes !== null && ((o.verdict === 'match' && desired_bytes === requested_bytes) || (o.verdict === 'drift' && desired_bytes !== requested_bytes))) {
+    return { verdict: o.verdict as 'match' | 'drift', desired_bytes, requested_bytes, assignment, reason: null };
+  }
+  return unknownIntent('capacity comparison evidence is malformed or contradictory');
+}
+
+export type VolumeReading = Readonly<{
+  observed_at: string;
+  observer: string;
+  volumes: readonly VolumeRow[];
+}>;
+
+const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+
+/** The volume comparisons, this scope's only, in the order read. */
+export function parseVolumeReadings(raw: unknown): readonly VolumeReading[] {
+  return asArray(raw).flatMap((r) => {
+    const p = (r as { payload?: unknown }).payload as Record<string, unknown> | undefined;
+    if (!p || p.scope !== VOLUMES_SCOPE || typeof p.observed_at !== 'string') return [];
+    const volumes = (Array.isArray(p.volumes) ? (p.volumes as unknown[]) : []).flatMap((x) => {
+      const o = (x ?? {}) as Record<string, unknown>;
+      if (typeof o.id !== 'string') return [];
+      return [{
+        id: o.id,
+        namespace: str(o.namespace),
+        claim: str(o.claim),
+        volume: str(o.volume),
+        capacity_bytes: num(o.capacity_bytes),
+        used_bytes: num(o.used_bytes),
+        free_bytes: num(o.free_bytes),
+        floor_bytes: num(o.floor_bytes),
+        tight: typeof o.tight === 'boolean' ? o.tight : null,
+        unread: str(o.unread),
+        requested: str(o.requested),
+        capacity_intent: parseCapacityIntent(o.capacity_intent),
+      }];
+    });
+    return [{ observed_at: p.observed_at, observer: str(p.observer) ?? '?', volumes }];
+  });
+}
+
+const gibText = (bytes: number): string => `${(bytes / 1024 ** 3).toFixed(1)}G`;
+
+export function capacityIntentLine(v: VolumeRow): string {
+  const c = v.capacity_intent;
+  const desired = c.desired_bytes === null ? 'unknown' : `${c.desired_bytes} bytes`;
+  const requested = v.requested ?? 'unread';
+  return c.verdict === 'unknown'
+    ? `Capacity intent unknown: ${c.reason ?? 'no comparison evidence'} · desired ${desired} · requested ${requested}`
+    : `Capacity ${c.verdict}: desired ${desired} · requested ${requested} (${c.requested_bytes} bytes)`;
+}
+
+/** One claim's line. Unread unless the row carries the comparator's
+ *  verdict AND the three figures it was reached on — a verdict with no
+ *  figures behind it is not taken at its word. */
+export function volumeLine(v: VolumeRow): { state: 'tight' | 'ok' | 'unread'; text: string } {
+  const { free_bytes: free, capacity_bytes: cap, floor_bytes: floor } = v;
+  if (v.tight === null || free === null || cap === null || floor === null) {
+    return { state: 'unread', text: `unread: ${v.unread ?? 'the reading carries no figures for this claim'}` };
+  }
+  return v.tight
+    ? { state: 'tight', text: `${gibText(free)} free of ${gibText(cap)} — under its ${gibText(floor)} floor` }
+    : { state: 'ok', text: `${gibText(free)} free of ${gibText(cap)} · floor ${gibText(floor)}` };
+}
+
+/** The open alarms about one claim, keyed as estate.alarm keys them:
+ *  `disk_tight:<ns>/<claim>`, or `blind:disk_tight/<ns>/<claim>` for one
+ *  nobody could read three times running. */
+export function volumeAlarms(alarms: Remote<AlarmPage>, id: string): readonly EstateAlarm[] {
+  if (alarms.kind !== 'ready') return [];
+  return alarms.data.rows.filter((a) => a.finding === `disk_tight:${id}` || a.finding === `blind:disk_tight/${id}`);
+}
 
 /**
  * The registry read's failure, said as what it was (backlog e5f7b51e).
@@ -341,7 +497,7 @@ export type Freshness = Readonly<{
  *  consecutive readings, floored at a minute; stale is strictly past
  *  three of them. Fewer than three readings measure no cadence, and no
  *  verdict is invented. Null for a series with no reading. */
-export function seriesFreshness(rows: readonly Observation[], now: Date): Freshness | null {
+export function seriesFreshness(rows: readonly Readonly<{ observed_at: string }>[], now: Date): Freshness | null {
   const times = rows
     .map((r) => Date.parse(r.observed_at))
     .filter((t) => !Number.isNaN(t))
@@ -378,8 +534,15 @@ export function unitsVerdict(node: ObservedNode): { ok: boolean; text: string } 
   const n = node.units.length;
   const watched = `${n} unit${n === 1 ? '' : 's'} watched`;
   const sick = node.units.filter((u) => u.healthy !== true).map((u) => u.unit ?? 'unnamed unit');
-  if (sick.length === 0) return { ok: true, text: `${watched}, all healthy` };
-  return { ok: false, text: `${watched}, ${sick.length} unhealthy: ${sick.join(', ')}` };
+  const parts = [sick.length === 0 ? `${watched}, all healthy` : `${watched}, ${sick.length} unhealthy: ${sick.join(', ')}`];
+  // What runs outside the roster (backlog 6647ac9a): the retired
+  // boss-ml-api ran on boss-gcp for days under "all healthy", because
+  // the roster is the declaration. An observer that could not ask says
+  // so; a reading from before it asked carries neither key.
+  const undeclared = (node.undeclared_units ?? []).map((u) => u.unit ?? 'unnamed unit');
+  if (undeclared.length > 0) parts.push(`${undeclared.length} running but not declared: ${undeclared.join(', ')}`);
+  if (typeof node.undeclared_unread === 'string') parts.push(`running units not enumerated: ${node.undeclared_unread}`);
+  return { ok: parts.length === 1 && sick.length === 0, text: parts.join('; ') };
 }
 
 export type EstateState = Readonly<{
@@ -393,6 +556,10 @@ export type EstateState = Readonly<{
   loops: readonly LoopRow[];
   /** The open ESTATE ALARM packets (48ef9961). */
   alarms: Remote<AlarmPage>;
+  /** The DNS zone readings, newest per zone, and the open ones (THE EDGE). */
+  zones: ZonesState;
+  /** The instance volumes' judged series, newest first (21ee3b4e). */
+  volumes: Remote<readonly VolumeReading[]>;
 }>;
 
 // THE DEV WORKSPACE DOOR (design 5fc71f03, David 2026-09-18; backlog
@@ -830,12 +997,17 @@ export function parseLoopPackets(raw: unknown): readonly LoopPacket[] {
     const run = steps.find((s) => s.spec_slug === 'run');
     const runMd = (run?.metadata ?? {}) as Record<string, unknown>;
     const open = o.status === 'open';
+    const ingress = str(runMd.tunnel_ingress);
     return {
       id: o.id,
       status: o.status,
       outcome: open ? null : str(md.outcome),
       at: open ? (str(o.opened_at) ?? str(md.opened_at)) : (str(md.closed_at) ?? str(o.closed_on)),
       host: str(md.host) ?? str(runMd.node_id),
+      tunnel:
+        ingress === null
+          ? null
+          : { connector: str(runMd.cloudflared), routes: ingress.split(/;\s*/).filter((r) => r.length > 0) },
     };
   });
 }
@@ -876,6 +1048,207 @@ export function loopAge(at: string | null, now: Date): string {
   return at ? `${sinceText(at, now.getTime())} ago` : 'undated';
 }
 
+// THE EDGE (backlog e0e183fb; page audit 2cff1d6e, GAP 11). The DNS
+// zone, the Cloudflare Access applications in front of it and the
+// tunnel routes behind it are declared in the tree
+// (infra/cluster/dns/<zone>.toml, access.toml, tunnel-origins.toml) —
+// and until this the page rendered only machines, so the estate alarm a
+// drifted zone raises (dns_drift:<zone>) had no line to stand beside.
+//
+// NO NEW READER. The system of record already holds all of it, as
+// declared AND as compared: the daily `dns-zone-observation` packet's
+// observe step carries one verdict per record — the tree's declaration,
+// what the zone holds, the interlock that fronts it — and one per
+// Access application (dns_observe.rs, observe_fields), and the cluster
+// converge's run step carries the tunnel routes it applied and the
+// connector's state (`tunnel_ingress`, `cloudflared`). This page reads
+// those packets; it spells no zone, hostname or address of its own (the
+// instance declares its values, design c6f08b60).
+//
+// SEVEN readings, newest first: the newest per zone wins. One zone is
+// read a day (infra/dispatcher/rules/dns-zone-observe-daily.toml), so a
+// week of readings holds every zone observed this week; a zone whose
+// reading could not complete stays OPEN at `observe`, and the open read
+// below — every open one, unlimited — is where it shows.
+export const ZONE_KIND = 'dns-zone-observation';
+export const ZONE_SAMPLE = 7;
+export const ZONE_READINGS_READ = `/api/jobs?kind=${ZONE_KIND}&status=closed&limit=${ZONE_SAMPLE}&full=true`;
+export const ZONE_OPEN_READ = `/api/jobs?kind=${ZONE_KIND}&status=open`;
+
+/** One declared zone record, as the observe step judged it. */
+export type ZoneRecord = Readonly<{
+  /** `<name> <type>`, the comparator's own key. */
+  record: string;
+  /** MATCH, DRIFT, ABSENT, HELD or REFUSED. */
+  verdict: string;
+  /** The tree's spelling: the target reference (`tunnel:<credential>`)
+   *  when the declaration names one, else the declared content. */
+  declared: string | null;
+  /** What the zone holds; null when the record is absent. */
+  live: string | null;
+  /** What stands in front of it: `access: present`, `tunnel: routed`. */
+  front: string | null;
+  /** Why a flip was held, or what the zone refused. */
+  note: string | null;
+  why: string | null;
+}>;
+
+/** One declared Access application, as the observe step judged it. */
+export type AccessApp = Readonly<{
+  domain: string;
+  type: string | null;
+  /** Each policy by name and decision — never the people it admits. */
+  policies: readonly string[];
+  verdict: string;
+  /** What the account refused, in its own words. */
+  note: string | null;
+  why: string | null;
+}>;
+
+export type ZoneReading = Readonly<{
+  id: string;
+  zone: string;
+  /** When the reading closed. */
+  at: string | null;
+  records: readonly ZoneRecord[];
+  /** Live records the tree names nowhere — reported, never a failure. */
+  undeclared: number;
+  access: readonly AccessApp[];
+  accessUndeclared: number;
+}>;
+
+/** A reading still open: a zone that could not be read or compared. */
+export type ZoneOpen = Readonly<{ id: string; zone: string; at: string | null }>;
+
+export type ZonesState = Readonly<{
+  latest: Remote<readonly ZoneReading[]>;
+  open: Remote<readonly ZoneOpen[]>;
+}>;
+
+const obj = (v: unknown): Record<string, unknown> =>
+  v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+const objs = (v: unknown): readonly Record<string, unknown>[] => (Array.isArray(v) ? v.map(obj) : []);
+
+function zoneOf(o: Record<string, unknown>): string {
+  if (typeof o.id !== 'string') throw new Error('jobs row missing id');
+  return str(obj(o.metadata).zone) ?? str(obj(o.subject).id) ?? 'zone not named on the packet';
+}
+
+function zoneRecord(v: Record<string, unknown>): ZoneRecord {
+  const declared = obj(v.declared);
+  const front = str(v.access) !== null ? `access: ${str(v.access)}` : str(v.tunnel) !== null ? `tunnel: ${str(v.tunnel)}` : null;
+  return {
+    record: str(v.record) ?? str(v.name) ?? 'record not named',
+    verdict: str(v.verdict) ?? 'no verdict',
+    declared: str(declared.target) ?? str(declared.content),
+    live: str(obj(v.live).content),
+    front,
+    note: str(v.held) ?? str(v.refused),
+    why: str(v.why),
+  };
+}
+
+function accessApp(v: Record<string, unknown>): AccessApp {
+  const side = v.declared ? obj(v.declared) : obj(v.live);
+  const write = str(v.write);
+  const error = str(v.error);
+  return {
+    domain: str(v.domain) ?? str(v.application) ?? 'application not named',
+    type: str(side.type),
+    policies: objs(side.policies).map((p) => `${str(p.name) ?? 'unnamed'} (${str(p.decision) ?? 'no decision'})`),
+    verdict: str(v.verdict) ?? 'no verdict',
+    note: error === null ? null : write === null ? error : `${write}: ${error}`,
+    why: str(v.why),
+  };
+}
+
+/** The newest closed reading of each zone (the listing is newest
+ *  first), its observe step read whole. */
+export function parseZoneReadings(raw: unknown): readonly ZoneReading[] {
+  const seen = new Set<string>();
+  return asArray(raw).flatMap((r) => {
+    const o = obj(r);
+    const zone = zoneOf(o);
+    if (seen.has(zone)) return [];
+    seen.add(zone);
+    const md = obj(o.metadata);
+    const step = objs(o.steps).find((s) => s.spec_slug === 'observe');
+    const smd = obj(step?.metadata);
+    const verdicts = objs(smd.verdicts);
+    const access = objs(smd.access);
+    const isUndeclared = (v: Record<string, unknown>) => v.verdict === 'UNDECLARED';
+    return [{
+      id: o.id as string,
+      zone,
+      at: str(md.closed_at) ?? str(o.closed_on),
+      records: verdicts.filter((v) => !isUndeclared(v)).map(zoneRecord),
+      undeclared: verdicts.filter(isUndeclared).length,
+      access: access.filter((v) => !isUndeclared(v)).map(accessApp),
+      accessUndeclared: access.filter(isUndeclared).length,
+    }];
+  });
+}
+
+export function parseZoneOpen(raw: unknown): readonly ZoneOpen[] {
+  return asArray(raw).map((r) => {
+    const o = obj(r);
+    const zone = zoneOf(o);
+    return { id: o.id as string, zone, at: str(o.opened_at) ?? str(obj(o.metadata).opened_at) };
+  });
+}
+
+/** The verdicts the observer counts as findings (dns_observe.rs
+ *  `is_hard`); HELD is a designed wait and UNDECLARED is paperwork. */
+const ZONE_HARD: ReadonlySet<string> = new Set(['DRIFT', 'ABSENT', 'REFUSED']);
+
+/** The zone's line: how much of what is declared matches, and whether
+ *  any of it is a finding. */
+export function zoneVerdict(z: ZoneReading): { ok: boolean; text: string } {
+  const match = (rows: readonly { verdict: string }[]) => rows.filter((r) => r.verdict === 'MATCH').length;
+  const held = z.records.filter((r) => r.verdict === 'HELD').length;
+  const ok = [...z.records, ...z.access].every((r) => !ZONE_HARD.has(r.verdict));
+  const records = `${match(z.records)} of ${z.records.length} declared records match${held > 0 ? `, ${held} held` : ''}`;
+  return { ok, text: `${records} · ${match(z.access)} of ${z.access.length} Access applications match` };
+}
+
+/** The open alarm a drifted zone raised, keyed as its raiser keys it
+ *  (dns_observe.rs `alarm_key`). */
+export function zoneAlarms(alarms: Remote<AlarmPage>, zone: string): readonly EstateAlarm[] {
+  if (alarms.kind !== 'ready') return [];
+  return alarms.data.rows.filter((a) => a.finding === `dns_drift:${zone}`);
+}
+
+export type TunnelLine = Readonly<{
+  ok: boolean;
+  text: string;
+  /** The converge packet the routes were read off, to link. */
+  id: string | null;
+  at: string | null;
+  routes: readonly string[];
+}>;
+
+/** The tunnel routes as the newest cluster converge applied them, read
+ *  off the loop row the page already fetched — and, when there are
+ *  none to show, which kind of none. */
+export function tunnelLine(loops: readonly LoopRow[]): TunnelLine {
+  const none = (text: string, id: string | null = null, at: string | null = null): TunnelLine =>
+    ({ ok: false, text, id, at, routes: [] });
+  const row = loops.find((l) => l.kind === CLUSTER_CONVERGE_KIND);
+  if (!row || row.latest.kind === 'loading') return none('the cluster converge was not read');
+  if (row.latest.kind === 'failed') return none(`unread: ${row.latest.error}`);
+  const p = row.latest.data;
+  if (!p) return none('no cluster converge has finished, so no route is recorded');
+  if (!p.tunnel) return none('the newest cluster converge recorded no tunnel routes', p.id, p.at);
+  const connector = p.tunnel.connector ?? 'not recorded';
+  return {
+    ok: p.tunnel.connector === 'connected',
+    text: `connector ${connector} · ${p.tunnel.routes.length} routes`,
+    id: p.id,
+    at: p.at,
+    routes: p.tunnel.routes,
+  };
+}
+
 async function fetchLoop(plan: LoopPlan): Promise<LoopRow> {
   const q = loopQueries(plan.kind, plan.host);
   const [latest, open] = await Promise.all([
@@ -902,7 +1275,7 @@ export async function fetchEstate(): Promise<EstateState> {
     const plan = hostPlan(n, hc);
     return { known: plan.known, series: await Promise.all(plan.hosts.map(fetchHostSeries)) };
   });
-  const [nodes, cluster, comparisons, hostComparisons, hosts, loops, alarms] = await Promise.all([
+  const [nodes, cluster, comparisons, hostComparisons, hosts, loops, alarms, latestZones, openZones, volumes] = await Promise.all([
     nodesRead,
     fetchRemote(CLUSTER_OBSERVATIONS_READ, (raw) => parseSeriesPage(raw, CLUSTER_SCOPE, null)),
     fetchRemote(CLUSTER_COMPARISON_READ, parseComparisons),
@@ -910,6 +1283,9 @@ export async function fetchEstate(): Promise<EstateState> {
     hostsRead,
     nodesRead.then((n) => Promise.all(loopPlan(n).map(fetchLoop))),
     fetchRemote(OPEN_ALARMS_READ, parseAlarms),
+    fetchRemote(ZONE_READINGS_READ, parseZoneReadings),
+    fetchRemote(ZONE_OPEN_READ, parseZoneOpen),
+    fetchRemote(VOLUMES_READ, parseVolumeReadings),
   ]);
-  return { nodes, cluster, comparisons, hostComparisons, hosts, loops, alarms };
+  return { nodes, cluster, comparisons, hostComparisons, hosts, loops, alarms, zones: { latest: latestZones, open: openZones }, volumes };
 }

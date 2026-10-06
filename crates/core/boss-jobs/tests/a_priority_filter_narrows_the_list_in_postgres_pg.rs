@@ -21,20 +21,16 @@ use chrono::NaiveDate;
 fn job(title: &str, priority: Priority) -> Job {
     Job {
         id: JobId::new(),
-        kind: "backlog-item".to_string(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "s"),
-        title: title.to_string(),
-        owner_id: "emp-a".into(),
         status: JobStatus::Open,
-        priority,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 27).expect("day"),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "backlog-item".to_string(),
+            Subject::new("custom", "s"),
+            title.to_string(),
+            "emp-a",
+            priority,
+            NaiveDate::from_ymd_opt(2026, 9, 27).expect("day"),
+        )
     }
 }
 

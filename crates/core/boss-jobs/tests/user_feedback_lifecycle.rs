@@ -130,6 +130,49 @@ async fn send(app: &axum::Router, req: Request<Body>) -> (StatusCode, serde_json
     (status, json)
 }
 
+/// Complete a step the way every surface does since e39a9d2a: `keys`
+/// through the step merge door (only the keys the completion writes —
+/// the door keeps the rest, `authority_role` among them), then the
+/// status alone through the PUT, which refuses any body carrying
+/// metadata. Answers the first refusal, or the PUT's answer.
+async fn complete_step(
+    app: &axum::Router,
+    job_id: &str,
+    step_id: &str,
+    keys: serde_json::Map<String, serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let path = format!("/api/jobs/{job_id}/steps/{step_id}");
+    if !keys.is_empty() {
+        let (status, body) = send(
+            app,
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("{path}/metadata"))
+                .header("content-type", "application/json")
+                .header("x-boss-user", admin_header())
+                .body(Body::from(serde_json::Value::Object(keys).to_string()))
+                .unwrap(),
+        )
+        .await;
+        if !status.is_success() {
+            return (status, body);
+        }
+    }
+    send(
+        app,
+        Request::builder()
+            .method("PUT")
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("x-boss-user", admin_header())
+            .body(Body::from(
+                serde_json::json!({ "status": "completed" }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await
+}
+
 /// Exactly the body `FeedbackControl.svelte` posts from the chrome bar.
 fn submit_feedback_body() -> String {
     serde_json::json!({
@@ -218,9 +261,10 @@ async fn every_disposition_drives_the_job_to_closed() {
             for step in actionable {
                 let step_id = step["id"].as_str().expect("step id");
 
-                // Merge, never replace: `authority_role` shares this
-                // object and is what keeps the step gated.
-                let mut metadata = step["metadata"].clone();
+                // Only the keys the completion writes; the merge door
+                // keeps `authority_role`, which is what keeps the step
+                // gated.
+                let mut keys = serde_json::Map::new();
                 for f in step["fields"].as_array().into_iter().flatten() {
                     if f["required"].as_bool() != Some(true) {
                         continue;
@@ -234,7 +278,10 @@ async fn every_disposition_drives_the_job_to_closed() {
                     } else {
                         declared.split('|').next().unwrap_or("x")
                     };
-                    metadata[name] = serde_json::Value::String(value.to_string());
+                    keys.insert(
+                        name.to_string(),
+                        serde_json::Value::String(value.to_string()),
+                    );
                 }
                 // …and the KIND's own required fields, exactly as the
                 // kind's surface collects them (v11's design-review is
@@ -246,27 +293,17 @@ async fn every_disposition_drives_the_job_to_closed() {
                     .get(step["kind"].as_str().unwrap_or_default())
                 {
                     for f in st.fields.iter().filter(|f| f.required) {
-                        if metadata.get(f.name).is_none() {
+                        if step["metadata"].get(f.name).is_none() && !keys.contains_key(f.name) {
                             let sample = f.field_type.split('|').next().unwrap_or("x");
-                            metadata[f.name] = serde_json::Value::String(sample.to_string());
+                            keys.insert(
+                                f.name.to_string(),
+                                serde_json::Value::String(sample.to_string()),
+                            );
                         }
                     }
                 }
 
-                let (status, body) = send(
-                    &app,
-                    Request::builder()
-                        .method("PUT")
-                        .uri(format!("/api/jobs/{job_id}/steps/{step_id}"))
-                        .header("content-type", "application/json")
-                        .header("x-boss-user", admin_header())
-                        .body(Body::from(
-                            serde_json::json!({ "status": "completed", "metadata": metadata })
-                                .to_string(),
-                        ))
-                        .unwrap(),
-                )
-                .await;
+                let (status, body) = complete_step(&app, &job_id, step_id, keys).await;
                 assert!(
                     status.is_success(),
                     "`{disposition}`: completing step `{}` (kind `{}`) failed with \
@@ -352,25 +389,13 @@ async fn an_investigation_can_route_the_packet_onward_instead_of_ending_it() {
             "step `{slug}` is `{}`, not actionable",
             step["status"]
         );
-        // Merge, never replace: `authority_role` shares this object.
-        let mut metadata = step["metadata"].clone();
-        metadata["disposition"] = serde_json::Value::String(disposition.to_string());
-        let (status, body) = send(
-            app,
-            Request::builder()
-                .method("PUT")
-                .uri(format!(
-                    "/api/jobs/{job_id}/steps/{}",
-                    step["id"].as_str().expect("step id")
-                ))
-                .header("content-type", "application/json")
-                .header("x-boss-user", admin_header())
-                .body(Body::from(
-                    serde_json::json!({ "status": "completed", "metadata": metadata }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await;
+        let mut keys = serde_json::Map::new();
+        keys.insert(
+            "disposition".into(),
+            serde_json::Value::String(disposition.to_string()),
+        );
+        let (status, body) =
+            complete_step(app, job_id, step["id"].as_str().expect("step id"), keys).await;
         assert!(
             status.is_success(),
             "completing `{slug}` failed {status}: {body}"
@@ -480,35 +505,17 @@ async fn routing_to_design_opens_the_draft_first_and_the_review_waits_on_it() {
             .unwrap_or_else(|| panic!("no step `{slug}` on the packet: {job:#?}"))
     }
 
-    /// PUT a completion, merging `extra` over the step's current
-    /// metadata — never replacing, because `authority_role` shares
-    /// that object. Returns the response so a refusal can be asserted.
+    /// A completion writing `extra` through the merge door, which keeps
+    /// every other key (`authority_role` among them), then the status.
+    /// Returns the response so a refusal can be asserted.
     async fn put_done(
         app: &axum::Router,
         job_id: &str,
         step: &serde_json::Value,
         extra: serde_json::Value,
     ) -> (StatusCode, serde_json::Value) {
-        let mut metadata = step["metadata"].clone();
-        for (k, v) in extra.as_object().into_iter().flatten() {
-            metadata[k] = v.clone();
-        }
-        send(
-            app,
-            Request::builder()
-                .method("PUT")
-                .uri(format!(
-                    "/api/jobs/{job_id}/steps/{}",
-                    step["id"].as_str().expect("step id")
-                ))
-                .header("content-type", "application/json")
-                .header("x-boss-user", admin_header())
-                .body(Body::from(
-                    serde_json::json!({ "status": "completed", "metadata": metadata }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
+        let keys = extra.as_object().cloned().unwrap_or_default();
+        complete_step(app, job_id, step["id"].as_str().expect("step id"), keys).await
     }
 
     async fn complete(

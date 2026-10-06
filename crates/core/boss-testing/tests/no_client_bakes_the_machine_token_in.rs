@@ -42,31 +42,20 @@ use regex::Regex;
 use std::path::{Path, PathBuf};
 
 /// Files that still bake the token in, and why each has not moved.
-const BAKED: &[(&str, &str)] = &[
-    (
-        "crates/orchestrators/boss-sim/src/output.rs",
-        "a reqwest::blocking client. Moves with the blocking senders, onto \
-         machine_token::BlockingClient (built for the CLI's blocking walks, 2026-09-29).",
-    ),
-    (
-        "crates/core/boss-jobs/src/bootstrap.rs",
-        "a one-shot walk on a blocking client that passes its header map per request, built \
-         at walk start; a walk lasts minutes against a rotation's overlap window. Moves with \
-         the blocking senders.",
-    ),
-];
-
-/// The most [`BAKED`] may ever hold: the four it held when it was
-/// written (6fbc7fc7), less the dispatcher handlers' `api_client`, which
-/// became a `machine_token::Client` in car 2's handlers slice, and the
-/// conductor's client, which became one with every boss verb's jobs-API
-/// helpers in car 2's CLI slice (2026-09-29). The stale
-/// check below makes a row leave when its file stops calling the door,
-/// but nothing stopped a new row being ADDED beside a new caller — which
-/// is the list growing, the one thing its header says it cannot do
-/// (review of 6fbc7fc7, follow-up 2). Lower this when a row goes; never
-/// raise it.
-const BAKED_CEILING: usize = 2;
+/// EMPTY since car 2's blocking-senders slice (2026-09-29): boss-sim's
+/// live output and the workflow bootstrap walk, the last two, now stamp
+/// through `machine_token::BlockingClient`, and the read-once door they
+/// called, `machine_token::attach`, is deleted — so a new caller does
+/// not compile, and this scan is the guard should it ever come back.
+///
+/// It held four when it was written (6fbc7fc7) and went one slice at a
+/// time: the dispatcher handlers' `api_client` (car 2's handlers slice),
+/// the conductor's client (the CLI slice), boss-sim's output and the
+/// workflow bootstrap (the blocking-senders slice). Its ceiling was the
+/// guard against a row being ADDED beside a new caller (review of
+/// 6fbc7fc7, follow-up 2); at zero the ceiling is simply "empty", which
+/// the pin asserts, so a row can no longer be added at all.
+const BAKED: &[(&str, &str)] = &[];
 
 /// Production files whose job is the header itself, and why. Everything
 /// else reaches it through a stamping client — `machine_token::Client`
@@ -284,9 +273,11 @@ fn no_client_bakes_the_machine_token_in() {
     let named: Vec<&str> = BAKED.iter().map(|(f, _)| *f).collect();
 
     assert!(
-        BAKED.len() <= BAKED_CEILING,
-        "BAKED holds {} rows and its ceiling is {BAKED_CEILING}: the list only shrinks. Build \
-         the new caller's client as `boss_core::machine_token::Client` instead of adding a row.",
+        BAKED.is_empty(),
+        "BAKED holds {} rows and it only shrinks — it reached empty on 2026-09-29, and the door \
+         it exempted callers of, `machine_token::attach`, is deleted. Build the new caller's \
+         client as `boss_core::machine_token::Client` (or `BlockingClient`) instead of adding a \
+         row.",
         BAKED.len()
     );
 

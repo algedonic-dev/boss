@@ -13,6 +13,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::error::ViewsError;
+
 /// What a View reads — the four foundational primitives.
 ///
 /// Subjects (identity), Jobs (bounded work), Steps (the typed
@@ -178,6 +180,42 @@ pub struct ViewInput {
 
 fn default_visibility() -> Visibility {
     Visibility::Private
+}
+
+/// Whether a text value can be stored at all: Postgres TEXT cannot hold
+/// a NUL byte.
+pub(crate) fn storable(s: &str) -> bool {
+    !s.contains('\0')
+}
+
+/// Refuse a write whose text cannot be stored, naming the field.
+///
+/// WHY IT EXISTS (backlog be459ab9, found by the adapters-agree suite,
+/// 2026-09-30). Postgres refused a NUL byte in any of these with its
+/// encoding error as `Storage` text — a 500 carrying database prose —
+/// while the in-memory adapter stored it and answered. Both adapters
+/// now ask this before they write, so both refuse the same way and
+/// neither writes. A create also asks it of the owner it stamps; a
+/// replace's owner is a lookup key, never written, so a NUL there is
+/// the miss it is (`NotFound`).
+pub(crate) fn refuse_unstorable(
+    owner_id: Option<&str>,
+    input: &ViewInput,
+) -> Result<(), ViewsError> {
+    let nul = |field: &str| ViewsError::Invalid(format!("{field} holds a NUL byte"));
+    if !owner_id.is_none_or(storable) {
+        return Err(nul("owner_id"));
+    }
+    if !storable(&input.title) {
+        return Err(nul("title"));
+    }
+    if !storable(&input.filter) {
+        return Err(nul("filter"));
+    }
+    if !input.columns.iter().all(|c| storable(c)) {
+        return Err(nul("columns"));
+    }
+    Ok(())
 }
 
 /// The result of running a View.

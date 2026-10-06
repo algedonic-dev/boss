@@ -227,7 +227,12 @@ async fn run_server<R: AssetsRepository + 'static>(
     let app = app.layer(axum::middleware::from_fn(
         boss_policy_client::request_context_middleware,
     ));
-    let app = boss_core::machine_gate::mount(app, "assets", &["/api/assets/health"]);
+    let app = boss_core::machine_gate::mount(
+        app,
+        "assets",
+        &["/api/assets/health"],
+        Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
+    );
     let mut http_rx = cancel_rx.clone();
     let http_task = tokio::spawn(async move {
         let shutdown = async move {
@@ -310,22 +315,31 @@ async fn run_nats_ingress<R: AssetsRepository + 'static>(
                                     continue;
                                 }
                             };
-                        let outcome: Result<(), String> = match core_event_to_system(&core_event) {
+                        use boss_assets::port::AssetsError;
+                        use boss_nats::durable::Settle;
+                        let outcome = match core_event_to_system(&core_event) {
                             // Not an asset system event (unknown kind) —
                             // nothing to append, done with the message.
-                            None => Ok(()),
+                            None => Settle::Ack,
                             Some(system_event) => match assets.append(system_event).await {
-                                Ok(()) => Ok(()),
+                                Ok(()) => Settle::Ack,
                                 // Redelivered and already applied — the
                                 // dedup doing its job.
-                                Err(boss_assets::port::AssetsError::DuplicateEvent(id)) => {
+                                Err(AssetsError::DuplicateEvent(id)) => {
                                     warn!(event_id = %id, "duplicate event (redelivery), skipping");
-                                    Ok(())
+                                    Settle::Ack
                                 }
-                                Err(e) => Err(format!("append: {e}")),
+                                // A refusal fails the same on every
+                                // redelivery (backlog be459ab9: Postgres
+                                // answered both as Storage, so they spent
+                                // the whole retry budget first).
+                                Err(e @ (AssetsError::UnknownModel(_) | AssetsError::Invalid(_))) => {
+                                    Settle::Permanent(format!("append: {e}"))
+                                }
+                                Err(e) => Settle::Retry(format!("append: {e}")),
                             },
                         };
-                        boss_nats::durable::settle(&msg, outcome).await;
+                        boss_nats::durable::settle_classified(&msg, outcome).await;
                     }
                 }
             }

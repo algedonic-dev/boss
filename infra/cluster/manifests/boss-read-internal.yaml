@@ -1,0 +1,58 @@
+# The in-cluster READ door for every boss-ports service the LAN machine
+# door (boss-jobs-internal.yaml) does not carry (backlog 9a440539,
+# 2026-10-01).
+#
+# WHAT WAS MEASURED. Twice on 2026-10-01 the dev pod's door could not
+# read a module service: `BOSS_SOR_SERVICE=assets boss-api GET …` was
+# refused (no assets row in infra/forge/sor-ports.env, run 7d1ff56c),
+# and `GET /api/customers` answered 404 on the jobs port and 401 through
+# the gateway without a session. So a car that changes customer data
+# (fix/one-customer-email-normalisation-for-mint-adapters-and-index) sat
+# HELD: the read-only production count that would say whether its
+# migration collides could not be run from any door.
+#
+# WHY A SECOND SERVICE AND NOT MORE ROWS ON THE LAN DOOR. A port on
+# boss-jobs-internal is a port on 10.20.0.34 for every LAN host and
+# WireGuard peer, writes included — the services are header-trusted.
+# The rows there were each added for a write or a recorded probe that
+# needed one, with the reason on its line. This need is a READ from the
+# dev pod, which is inside the cluster, so it is met inside the
+# cluster: a ClusterIP, no LoadBalancer, nothing a LAN host can reach
+# that it could not before. In-cluster it names, it does not widen: no
+# NetworkPolicy fences the `boss` namespace (boss-dev.yaml says why
+# that is still a gap), so every pod in the cluster already reaches the
+# boss pod's IP on each of these ports; this Service gives the door a
+# stable name for them. And the door that reads it, infra/dev/boss-api,
+# sends only GET here — a write to a row of infra/dev/sor-read-ports.env
+# is refused before curl.
+#
+# WHICH ROWS. Every boss-ports service the boss pod serves off loopback
+# (generate-configs.sh binds 0.0.0.0; the clock by BOSS_CLOCK_HTTP_BIND
+# in boss.yaml) that the LAN door does not already carry. The four
+# boss-ports services that listen on loopback only — search, views, the
+# simulator and the sim daemon's control port — are on no door, each
+# named with its reason in the pin. The pin is
+# crates/core/boss-testing/tests/every_boss_ports_service_has_a_door.rs:
+# the LAN door, this door and that named set partition boss-ports, and
+# these lines equal infra/dev/sor-read-ports.env at boss-ports' prod
+# ports. Each entry stays on one flow-style line — that is the shape the
+# pin reads.
+apiVersion: v1
+kind: Service
+metadata:
+  name: boss-read-internal
+  namespace: boss
+spec:
+  type: ClusterIP
+  selector: {app: boss}
+  ports:
+    - {port: 7100, targetPort: 7100, name: shipping}
+    - {port: 7200, targetPort: 7200, name: messages}
+    - {port: 7300, targetPort: 7300, name: inventory}
+    - {port: 7400, targetPort: 7400, name: commerce}
+    - {port: 7600, targetPort: 7600, name: assets}
+    - {port: 7750, targetPort: 7750, name: catalog}
+    - {port: 7060, targetPort: 7060, name: clock}
+    - {port: 7840, targetPort: 7840, name: products}
+    - {port: 7845, targetPort: 7845, name: campaigns}
+    - {port: 7855, targetPort: 7855, name: customers}

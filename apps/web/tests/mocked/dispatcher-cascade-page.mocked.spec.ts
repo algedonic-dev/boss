@@ -25,10 +25,12 @@
 //   gap 3 (4d9b09e0, closed) an empty registry painted a full picture —
 //                    FIXED as a consequence of gap 2: an empty rule set
 //                    with the server's real roster paints the empty line;
-//   gap 4 (d3734028) the only filter cannot reach a scheduled rule, and a
-//                    filtered view drops it;
-//   gap 5 (68162348) the rule panel drops why/source/authored/version and
-//                    links nowhere;
+//   gap 4 (d3734028) the only filter could not reach a scheduled rule, and
+//                    a filtered view dropped it — FIXED: each rule no
+//                    event fires is an option of its own, and choosing it
+//                    narrows to what its clock sets moving;
+//   gap 5 (68162348) the rule panel shows why/source/authored/version,
+//                    links to the rule and names an unread authored registry;
 //   gap 6 (f0216f5e) the legend keys 3 of the 5 edge kinds;
 //   covered A (cae1a377 / d7732e88) the failure line is marked — FIXED;
 //                    the 503 and 200-with-error branches are pinned in
@@ -83,7 +85,7 @@ const RULES = /\/api\/dispatcher\/rules$/;
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
 
-const WHY = 'a why the panel does not render';
+const WHY = 'the recorded reason for this reaction';
 
 const RESOLVE = {
   name: 'resolve-subjob-on-child-job-closed',
@@ -288,12 +290,14 @@ test.describe('/it/registry/dispatcher — the picture', () => {
     await expect(page.locator('.dx-stats span')).toHaveText(['4 rules', '3 handlers', '4 in cycles']);
 
     await expect(page.locator('.dx-legend .dx-key')).toHaveText(['event', 'rule', 'handler']);
-    // GAP 6 (backlog f0216f5e), pinned as it stands: three edge keys,
-    // while the graph also draws trigger, do and match edges — 8 of the
-    // 15 here have no key. The fixing car adds the three.
+    // Every drawn edge kind has a key (f0216f5e); feedback cycle is
+    // an overlay, so it remains a separate entry.
     await expect(page.locator('.dx-legend .dx-edgekey')).toHaveText([
+      'trigger',
+      'do',
       'emits',
       'system (jobs-api / external)',
+      'match',
       'feedback cycle',
     ]);
     await expect(edges(page, 't:')).toHaveCount(3);
@@ -301,6 +305,26 @@ test.describe('/it/registry/dispatcher — the picture', () => {
     await expect(edges(page, 'm:')).toHaveCount(1);
     await expect(edges(page, 'e:')).toHaveCount(2);
     await expect(edges(page, 's:')).toHaveCount(5);
+
+    // The legend's repeated color facts must agree with the graph.
+    // These two edges are outside the red cycle overlay.
+    for (const [label, edgeId] of [
+      ['trigger', `t:${ASSIGNED.name}`],
+      ['do', `d:${ASSIGNED.name}:0`],
+    ]) {
+      const key = page.locator('.dx-edgekey').filter({ hasText: new RegExp(`^${label}$`) }).locator('i');
+      const color = await key.evaluate((el) => getComputedStyle(el).backgroundColor);
+      const stroke = await page.locator(`.svelte-flow__edge[data-id="${edgeId}"] path.svelte-flow__edge-path`)
+        .evaluate((el) => getComputedStyle(el).stroke);
+      expect(color).toBe(stroke);
+    }
+    const match = page.locator('.dx-edgekey').filter({ hasText: /^match$/ }).locator('i');
+    const image = await match.evaluate((el) => getComputedStyle(el).backgroundImage);
+    expect(image).toContain('repeating-linear-gradient');
+    const matchPath = edges(page, 'm:').locator('path.svelte-flow__edge-path');
+    const matchStroke = await matchPath.evaluate((el) => getComputedStyle(el).stroke);
+    expect(image).toContain(matchStroke);
+    expect(await matchPath.evaluate((el) => getComputedStyle(el).strokeDasharray)).toBe('2px, 3px');
 
     await expect(page.locator('.svelte-flow__node.dx-event')).toHaveCount(7);
     await expect(page.locator('.svelte-flow__node.dx-rule')).toHaveCount(4);
@@ -394,7 +418,7 @@ test.describe('/it/registry/dispatcher — the picture', () => {
 });
 
 test.describe('/it/registry/dispatcher — the trigger filter', () => {
-  test('options are the event topics; a chip narrows, × and show all widen', async ({ page }) => {
+  test('options are the event topics and the scheduled rules; a chip narrows, × and show all widen', async ({ page }) => {
     const writes = watchWrites(page);
     await install(page);
     await mountGraph(page);
@@ -402,14 +426,18 @@ test.describe('/it/registry/dispatcher — the trigger filter', () => {
     const select = page.locator('select.dx-filter-select');
     const options = select.locator('option');
     await expect(page.locator('.dx-filter-label')).toContainText('Trigger');
-    // GAP 4 (backlog d3734028), pinned as it stands: the options are the
-    // three on_event topics; the scheduled publish-to-github-daily has
-    // no option and no other way to be chosen.
+    // GAP 4 (backlog d3734028), fixed: the options are the three on_event
+    // topics AND the scheduled publish-to-github-daily, which a clock
+    // fires and which used to have no option at all.
+    await expect(select.locator('optgroup')).toHaveCount(2);
+    await expect(select.locator('optgroup').nth(0)).toHaveAttribute('label', 'on event');
+    await expect(select.locator('optgroup').nth(1)).toHaveAttribute('label', 'on schedule');
     await expect(options).toHaveText([
-      'filter cascade by trigger event…',
+      'filter cascade by trigger…',
       'jobs.job.closed',
       'step.assigned.*',
       'step.done.task',
+      PUBLISH.name,
     ]);
     await expect(page.locator('.dx-chip')).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'show all' })).toHaveCount(0);
@@ -418,7 +446,7 @@ test.describe('/it/registry/dispatcher — the trigger filter', () => {
     await select.selectOption('step.assigned.*');
     await expect(page.locator('.dx-chip')).toHaveText(['step.assigned.* ×']);
     await expect(select).toHaveValue('');
-    await expect(options).toHaveText(['filter cascade by trigger event…', 'jobs.job.closed', 'step.done.task']);
+    await expect(options).toHaveText(['filter cascade by trigger…', 'jobs.job.closed', 'step.done.task', PUBLISH.name]);
     await expect(page.locator('.dx-filter-note')).toHaveText(`cascade from 1 trigger · 3/${NODES} nodes`);
     await expect(page.locator('.svelte-flow__node')).toHaveCount(3);
 
@@ -426,8 +454,8 @@ test.describe('/it/registry/dispatcher — the trigger filter', () => {
     await expect(page.locator('.dx-chip')).toHaveText(['step.assigned.* ×', 'jobs.job.closed ×']);
     await expect(page.locator('.dx-filter-note')).toHaveText(`cascade from 2 triggers · 11/${NODES} nodes`);
     await expect(page.locator('.svelte-flow__node')).toHaveCount(11);
-    // GAP 4 again: the scheduled rule, and the chain only it starts,
-    // leave every filtered view.
+    // Two event triggers do not reach the scheduled rule or the chain only
+    // it starts; choosing it (below) does.
     await expect(node(page, `rule:${PUBLISH.name}`)).toHaveCount(0);
     await expect(node(page, 'hdl:jobs.spawn')).toHaveCount(0);
     // The stats describe the whole registry, not the filtered view.
@@ -444,7 +472,25 @@ test.describe('/it/registry/dispatcher — the trigger filter', () => {
     await expect(page.locator('.dx-chip')).toHaveCount(0);
     await expect(page.locator('.dx-filter-note')).toHaveCount(0);
     await expect(page.locator('.svelte-flow__node')).toHaveCount(NODES);
-    await expect(options).toHaveCount(4);
+    await expect(options).toHaveCount(5);
+
+    // GAP 4 (d3734028), the reach: the scheduled rule alone narrows to what
+    // its clock sets moving — the rule, jobs.spawn, jobs.job.created, then
+    // through the jobs-api to step.ready.* and step.assigned.*, whose rule
+    // fires messages.notify. 7 nodes, and nothing upstream of the clock.
+    await select.selectOption({ label: PUBLISH.name });
+    await expect(page.locator('.dx-chip')).toHaveText([`${PUBLISH.name} ×`]);
+    await expect(page.locator('.dx-filter-note')).toHaveText(`cascade from 1 trigger · 7/${NODES} nodes`);
+    await expect(page.locator('.svelte-flow__node')).toHaveCount(7);
+    await expect(node(page, `rule:${PUBLISH.name}`)).toHaveCount(1);
+    await expect(node(page, 'hdl:jobs.spawn')).toHaveCount(1);
+    await expect(node(page, `rule:${ASSIGNED.name}`)).toHaveCount(1);
+    await expect(node(page, `rule:${RESOLVE.name}`)).toHaveCount(0);
+    await expect(options).toHaveText(['filter cascade by trigger…', 'jobs.job.closed', 'step.assigned.*', 'step.done.task']);
+
+    await page.getByRole('button', { name: 'show all' }).click();
+    await expect(page.locator('.svelte-flow__node')).toHaveCount(NODES);
+    await expect(options).toHaveCount(5);
     expect(writes.map((w) => `${w.method()} ${w.url()}`)).toEqual([]);
   });
 });
@@ -457,19 +503,18 @@ test.describe('/it/registry/dispatcher — the side panel', () => {
 
     await clickNode(page, `rule:${RESOLVE.name}`);
     await expect(panel(page).locator('h2')).toHaveText(`rule · ${RESOLVE.name}`);
-    await expect(panel(page).locator('dt')).toHaveText(['on event', 'when', 'do']);
+    await expect(panel(page).locator('dt')).toHaveText(['on event', 'when', 'do', 'why', 'source', 'authored', 'version']);
     await expect(panel(page).locator('dd').nth(0)).toHaveText('jobs.job.closed');
     await expect(panel(page).locator('dd').nth(1)).toHaveText('parent_step_id != null');
     await expect(panel(page).locator('dd ol > li')).toHaveText(['jobs.subjob_resolve']);
     await expect(node(page, `rule:${RESOLVE.name}`)).toHaveClass(/dx-selected/);
 
-    // GAP 5 (backlog 68162348), pinned as it stands: the payload's why,
-    // source, authored flag and version are not shown, and the panel has
-    // no link to the rule's own page. The fixing car flips these.
-    await expect(panel(page).getByText(WHY)).toHaveCount(0);
-    await expect(panel(page).getByText('product')).toHaveCount(0);
-    await expect(panel(page).getByText(/version|v1\b/)).toHaveCount(0);
-    await expect(panel(page).locator('a')).toHaveCount(0);
+    // Gap5 (68162348): provenance comes from this row, not the graph.
+    await expect(panel(page).getByText(RESOLVE.why, { exact: true })).toBeVisible();
+    await expect(panel(page).getByText('product', { exact: true })).toBeVisible();
+    await expect(panel(page).getByText('file', { exact: true })).toBeVisible();
+    await expect(panel(page).locator('dd').last()).toHaveText('1');
+    await expect(panel(page).getByRole('link', { name: 'Open rule →' })).toHaveAttribute('href', `${RULES_PAGE}/${RESOLVE.name}`);
 
     await clickPane(page);
     await expect(panel(page)).toHaveCount(0);
@@ -478,22 +523,60 @@ test.describe('/it/registry/dispatcher — the side panel', () => {
     // listed under the handler.
     await clickNode(page, `rule:${PUBLISH.name}`);
     await expect(panel(page).locator('h2')).toHaveText(`rule · ${PUBLISH.name}`);
-    await expect(panel(page).locator('dt')).toHaveText(['on schedule', 'when', 'do']);
+    await expect(panel(page).locator('dt')).toHaveText(['on schedule', 'when', 'do', 'why', 'source', 'authored', 'version']);
     await expect(panel(page).locator('dd').nth(0)).toHaveText('every day · from 2026-08-15');
     await expect(panel(page).locator('dd').nth(1)).toHaveText('NOT open_publish_exists("github-mirror")');
     await expect(panel(page).locator('ul.dx-args > li')).toHaveText([
       'kind = "publish-to-github"',
       'subject = "github-mirror"',
     ]);
-    await expect(panel(page).locator('a')).toHaveCount(0);
+    await expect(panel(page).locator('dd').last()).toHaveText('2');
+    await expect(panel(page).getByRole('link', { name: 'Open rule →' })).toHaveAttribute('href', `${RULES_PAGE}/${PUBLISH.name}`);
     await clickPane(page);
 
-    // A tenant rule paints like a product rule: the source is not shown.
+    // Tenant-declared is distinct from an unauthored product rule.
     await clickNode(page, `rule:${TASK_DONE.name}`);
     await expect(panel(page).locator('h2')).toHaveText(`rule · ${TASK_DONE.name}`);
-    await expect(panel(page).getByText('tenant:algedonic')).toHaveCount(0);
+    await expect(panel(page).getByText('tenant:algedonic', { exact: true })).toHaveCount(2);
+    await expect(panel(page).locator('dd').last()).toHaveText('4');
+    await expect(panel(page).getByText('Not recorded in this read', { exact: true })).toBeVisible();
     await clickPane(page);
     await expect(panel(page)).toHaveCount(0);
+  });
+
+  test('an unread authored registry stays visible and product provenance becomes unknown', async ({ page }) => {
+    await installSmokeMocks(page);
+    await page.route(RULES, (r) => json(r, {
+      ...payload(ROWS.map((rule) => ({ ...rule, authored: false, why: null }))),
+      authored_registry: { dir: '/opt/boss/infra/dispatcher/rules', rules: 0, error: 'private fixture: directory unreadable' },
+    }));
+    await mountGraph(page);
+    await expect(page.locator('.dx-registry-unread')).toContainText('private fixture: directory unreadable');
+    await clickNode(page, `rule:${RESOLVE.name}`);
+    await expect(panel(page).getByText('unknown', { exact: true })).toBeVisible();
+    await expect(panel(page).getByText('Unavailable — the authored registry could not be read', { exact: true })).toBeVisible();
+    await expect(panel(page).getByText('live only', { exact: true })).toHaveCount(0);
+  });
+
+  test('a live-only product row and missing provenance stay distinct; its link navigates without writing', async ({ page }) => {
+    const writes = watchWrites(page);
+    await install(page, ROWS.map((rule) => rule.name === RESOLVE.name ? { ...rule, authored: false, why: null } : rule));
+    await mountGraph(page);
+    await clickNode(page, `rule:${RESOLVE.name}`);
+    await expect(panel(page).getByText('live only', { exact: true })).toBeVisible();
+    await panel(page).getByRole('link', { name: 'Open rule →' }).click();
+    await expect(page).toHaveURL((u) => u.pathname === `${RULES_PAGE}/${RESOLVE.name}`);
+    await backHere(page);
+    expect(writes.map((w) => `${w.method()} ${w.url()}`)).toEqual([]);
+  });
+
+  test('an older response never invents provenance or an unread-registry diagnostic', async ({ page }) => {
+    await install(page, ROWS.map(({ source: _source, authored: _authored, why: _why, ...rule }) => rule));
+    await mountGraph(page);
+    await clickNode(page, `rule:${RESOLVE.name}`);
+    await expect(panel(page).getByText('unknown', { exact: true })).toHaveCount(2);
+    await expect(panel(page).getByText('Not recorded in this read', { exact: true })).toBeVisible();
+    await expect(page.locator('.dx-registry-unread')).toHaveCount(0);
   });
 
   test('a handler node lists what it emits, or says it is a sink', async ({ page }) => {

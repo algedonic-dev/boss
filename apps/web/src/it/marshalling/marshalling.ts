@@ -480,6 +480,23 @@ export function waitsCountLine(waits: ReadonlyArray<Wait>, limit: number): strin
   ].join(' · ');
 }
 
+/** Status counts cover the whole real queue, even when its table is capped
+ *  (f9b75688). Unrecognised status is evidence, never presumed readiness. */
+export function waitsStatusLine(waits: ReadonlyArray<Wait>): string {
+  const real = waits.filter((w) => !w.simulated);
+  const ready = real.filter((w) => w.status === 'ready').length;
+  const working = real.filter((w) => w.status === 'active').length;
+  const unknown = real.length - ready - working;
+  return `${ready} READY · ${working} WORKING (ACTIVE)` +
+    (unknown > 0 ? ` · ${unknown} status unknown` : '');
+}
+
+export function waitStatusText(w: Wait): string {
+  if (w.status === 'ready') return 'READY';
+  if (w.status === 'active') return 'WORKING (ACTIVE)';
+  return w.status === '' ? 'Unknown' : `Unknown (${w.status})`;
+}
+
 /** How long it has waited — and, when the stamp is a fallback, that it
  *  is a floor rather than the figure. */
 export function waitText(w: Wait): string {

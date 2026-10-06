@@ -52,6 +52,10 @@ boss.yaml instance
 boss-jobs-internal.yaml instance
 boss-clock-internal.yaml instance
 boss-dispatcher-internal.yaml instance
+# The in-cluster READ door (backlog 9a440539): a ClusterIP over every
+# boss-ports service the LAN door does not carry, so the dev pod can
+# measure live data. Per instance because it fronts the instance's pod.
+boss-read-internal.yaml instance
 
 # There is no TLS front per instance. Until 2026-09-17 boss-tls-front.yaml
 # (Caddy terminating the instance's hostname with a lego-issued
@@ -99,6 +103,11 @@ gate-seed-local.yaml pipeline
 # namespace on that cluster, and a per-instance copy would grant a
 # second credential over the same nodes for no added reach.
 boss-break-glass-operator.yaml pipeline
+# Its delivery (backlog 7336cb5f): the CronJob that reads that one
+# credential and deposits it on boss-gcp. PIPELINE for the same reason —
+# one cluster, one credential, one host to hand it to; a per-instance
+# copy would read a token Secret the other namespaces do not hold.
+boss-break-glass-deposit.yaml pipeline
 
 # The break-glass ceremony is the business system of record's; the
 # boss pod mounts this ConfigMap `optional: true`, so an instance
@@ -142,7 +151,7 @@ boss-playground-crawl.yaml pipeline
 # (design 125d405d, car 3).
 boss-recovery-sheet.yaml pipeline
 #
-# boss-backup: the nightly dump ships to boss-gcp and to GCS under the
+# boss-backup: the nightly dump uploads to GCS under the
 # name `boss-<stamp>.sql.gz` with a keep-21 retention shared by every
 # dump in the bucket. A playground dump under the same name would spend
 # prod's retention (21 nights becomes ~10), and the playground is

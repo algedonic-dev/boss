@@ -659,7 +659,7 @@ test.describe('/ux/parts — State B: the warehouse department\'s packets (044df
     id, kind: 'receive-a-delivery', title, status, priority: 'standard',
     subject: { subject_kind: 'purchase_order', id: 'PO-1' }, owner_id: 'emp-1',
     opened_on: '2026-09-20', due_on: null, closed_on, metadata: {}, tags: [],
-    steps: stepStatuses.map((s, i) => ({ id: `s${i}`, kind: 'task', status: s })),
+    steps: stepStatuses.map((s, i) => ({ id: `s${i}`, kind: 'task', title: 'task', status: s, sort_order: i })),
   });
   const JOBS = [
     job('11111111-0000-0000-0000-000000000001', 'Receive the hop delivery', 'open', ['completed', 'active']),
@@ -667,7 +667,7 @@ test.describe('/ux/parts — State B: the warehouse department\'s packets (044df
     job('11111111-0000-0000-0000-000000000003', 'Count bin A-01', 'closed', ['completed'], '2026-09-22'),
   ];
 
-  test('mount reads the department listing once and draws In / Working / Out beside the parts', async ({ page }) => {
+  test('mount reads the live and departed listings once each and draws In / Working / Out beside the parts', async ({ page }) => {
     const urls: string[] = [];
     page.on('request', (req) => {
       if (DEPT_JOBS.test(req.url())) urls.push(req.url());
@@ -690,9 +690,16 @@ test.describe('/ux/parts — State B: the warehouse department\'s packets (044df
     // The parts table is untouched by the panel beside it.
     await expect(page.locator('.catalog-layout tbody tr')).toHaveCount(ROWS.length);
 
-    expect(await settledReads(page, () => urls.length, 1)).toBe(1);
-    const q = new URL(urls[0]!).searchParams;
-    expect([q.get('department'), q.get('closed_within'), q.get('limit')]).toEqual(['warehouse', '30', '200']);
+    // Two reads, live and departed, each its own page (backlog a22311a1).
+    expect(await settledReads(page, () => urls.length, 2)).toBe(2);
+    const reads = urls
+      .map((u) => new URL(u).searchParams)
+      .map((q) => [q.get('department'), q.get('terminal'), q.get('closed_within'), q.get('limit')])
+      .sort();
+    expect(reads).toEqual([
+      ['warehouse', 'false', null, '500'],
+      ['warehouse', 'true', '30', '100'],
+    ]);
   });
 
   test('a department no protocol declares yet says so, and is not a failure', async ({ page }) => {

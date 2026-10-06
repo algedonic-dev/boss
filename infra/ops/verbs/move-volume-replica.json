@@ -1,0 +1,33 @@
+{
+  "about": "MUTATING — move ONE replica of ONE Longhorn volume to a disk on another node (infra/forge/move-volume-replica.sh <volume> <replica> <plan_sha256>) through the forge's ops_kubectl door (the admin kubeconfig David placed, infra/estate/ops-credentials.sh). Filed from incident d3c0a67c (backlog ab39a34e, 2026-10-01), when the system of record's database volume (boss/pgdata-postgres-0) had a replica on w-2's disk bf045701-…, whose scheduling ledger held ~755 MB, so Longhorn's admission webhook refused every growth of the volume; David chose to retire that replica by a separate verb, and this is the general door. It takes ANY Longhorn volume, not only an instance's: moving a replica is volume-agnostic, and David's passkey reads the claim in the plan. AUTHORISED PER RUN BY DAVID'S PASSKEY in design 17835005's shape, as set-volume-replicas and expand-instance-volume are: it declares requires_approval with the read-only plan-a-volume-replica-move (this script's --plan) as its plan_verb, so the runner renders the plan onto the request's approve step, runs this only after a passkey on the approvers list signs those bytes, and hands the script sha256 of the SIGNED plan; the script re-renders and changes nothing unless today's plan hashes to it. The count and the replicas before are in the bytes, so a second run of an applied plan is refused: at most once. THE BOUND IS THE SCRIPT'S, NEVER A PARAM, each rule Longhorn v1.11.3's as its source reads (review 091904d3): a pvc-<uuid> volume Longhorn holds and one of ITS replicas; the volume attached and healthy, every declared replica healthy and active on a distinct node; one replica per node (replica-soft-anti-affinity false), so the disks the new replica can land on are nameable; data locality disabled, replica auto-balance resolving to disabled, and no eviction requested on any replica or its node or disk — the only three ways Longhorn trims a replica on its own when a count is lowered; and every disk the new replica can land on with ledger headroom for twice the volume, passing on live figures the scheduler's placement test IsSchedulableToDisk(size, actualSize) and CheckReplicasSizeExpansion's test for the volume's next growth there (infra/lib/longhorn-ledger.sh) — or nothing is done (exit 78). THE WRITE, each step only after the one before read back: (1) a compare-and-set patch raising spec.numberOfReplicas N -> N+1; (2) a wait of up to 1200 s for a NEW replica healthy on a disk the plan named — a stall, a rebuild slower than the wait, or a replica that lands anywhere else, leaves the count at N+1 and deletes NOTHING; (3) a compare-and-set lowering N+1 -> N, then, after 30 s of reads in which no replica was removed, a delete of the named replica — lowered FIRST because a replica deleted under a count of N+1 is replenished onto the node it just left. The count never goes below N, and the delete follows a read of N+1 healthy replicas; a replica that fails in the second between that read and the delete would leave N-1 until Longhorn rebuilds, which no kubectl call can close. A replica other than the named one removed during the settle skips the delete; the named one removed by another hand (gone, or terminating) is the move done. THE EFFECT IS READ BACK for up to 180 s, waiting for the named replica's finalizer: the named replica gone, spec.numberOfReplicas N, N healthy replicas on N distinct nodes including the new one, robustness healthy, and every replica's disk admitting the volume's growth to twice its size on live figures; only then is the effect line printed, and otherwise the run exits 1 naming what it read. Timeout 1800: the script's own waits (1200 + 30 + 180 s) give its verdict before the runner's kill.",
+  "hosts": [
+    "forge"
+  ],
+  "requires_approval": true,
+  "plan_verb": "plan-a-volume-replica-move",
+  "approvers": [
+    "emp-david"
+  ],
+  "argv": [
+    "infra/forge/move-volume-replica.sh",
+    "{1}",
+    "{2}",
+    "{3}"
+  ],
+  "params": [
+    {
+      "name": "volume",
+      "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    {
+      "name": "replica",
+      "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-r-[0-9a-f]{8}$"
+    },
+    {
+      "name": "plan_sha256",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  ],
+  "timeout": 1800,
+  "effect": "^move-volume-replica: pvc-[0-9a-f-]{36} has [0-9]+ healthy replicas on [0-9]+ distinct nodes \\([a-z0-9-]+(, [a-z0-9-]+)*\\) — [0-9a-z-]+-r-[0-9a-f]{8} is gone, [0-9a-z-]+-r-[0-9a-f]{8} is healthy on [a-z0-9-]+ \\(disk [^)]+\\), and every replica's disk has room for growth to [0-9]+ bytes — read back: spec\\.numberOfReplicas=[0-9]+, robustness healthy"
+}

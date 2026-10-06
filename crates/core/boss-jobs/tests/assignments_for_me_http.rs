@@ -83,6 +83,18 @@ impl AgentsRegistry for DarkRegistry {
     ) -> Result<AgentsBatchOutcome, AgentsError> {
         Err(AgentsError::Storage("registry dark".into()))
     }
+    async fn list_automations(
+        &self,
+    ) -> Result<Vec<boss_jobs::agents::AutomationActor>, AgentsError> {
+        Err(AgentsError::Storage("registry dark".into()))
+    }
+    async fn declare_automations(
+        &self,
+        _: &[boss_jobs::agents::AutomationActor],
+        _: &EventStamp,
+    ) -> Result<boss_jobs::agents::AutomationsSeedOutcome, AgentsError> {
+        Err(AgentsError::Storage("registry dark".into()))
+    }
 }
 
 fn app(agents: Arc<dyn AgentsRegistry>) -> (axum::Router, Arc<InMemoryJobs>) {
@@ -121,20 +133,16 @@ fn registry() -> Arc<dyn AgentsRegistry> {
 async fn seed(jobs: &InMemoryJobs) {
     let job = Job {
         id: JobId::new(),
-        kind: "backlog-item".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "s"),
-        title: "an item".into(),
-        owner_id: "emp-david".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 27).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "backlog-item",
+            Subject::new("custom", "s"),
+            "an item",
+            "emp-david",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 27).unwrap(),
+        )
     };
     jobs.create_job_at(&job, t("2026-09-27T00:00:00Z"), &[])
         .await

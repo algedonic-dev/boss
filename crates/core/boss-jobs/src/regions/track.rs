@@ -145,7 +145,29 @@ pub(super) fn track(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
     let (cur, prev) = split(w, ci_times);
     let trend = duration_trend("time at CI", "minutes", cur, prev);
     let count = count_in(inputs, "track").unwrap_or(on_track.len());
-    let clear_why = plural(count, "train in transit", "trains in transit");
+    // AN EMPTY TRACK SAYS WHERE THE TRAIN IS (backlog 3eddffc4). On
+    // 2026-10-01 this read "no train in transit" while PR train 02:41
+    // stood at its CI verdict — at the gates, by R1 — and `boss orient`
+    // listed it IN TRANSIT. Orient now reads the track's own predicate,
+    // and the track names a train under test rather than denying one.
+    let under_test: Vec<&str> = trains_in(inputs, "gates")
+        .iter()
+        .map(|(j, _)| j.title.as_str())
+        .collect();
+    let empty = if under_test.is_empty() {
+        "no train on the track".to_string()
+    } else {
+        format!(
+            "no train on the track; {} {} under test at the gates",
+            under_test.join(", "),
+            if under_test.len() == 1 { "is" } else { "are" }
+        )
+    };
+    let clear_why = if count == 0 {
+        empty.clone()
+    } else {
+        plural(count, "train in transit", "trains in transit")
+    };
     let settled = settle(train_findings(inputs, &on_track), clear_why, inputs.now);
     // THE KPI: how long the oldest train in transit has stood at the
     // stage it is at — from its last completed step (the stage's start),
@@ -169,12 +191,7 @@ pub(super) fn track(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
             "minutes",
             format!("oldest train {m} minutes at its stage"),
         ),
-        None => measure_said(
-            "train age at its stage",
-            None,
-            "minutes",
-            "no train in transit".to_string(),
-        ),
+        None => measure_said("train age at its stage", None, "minutes", empty),
     }];
     region(
         "track",
@@ -349,5 +366,34 @@ mod tests {
 
         let out = read(&[], &[]);
         assert_eq!(by_name(&out, "track").count, Some(0));
+    }
+
+    /// THE MEASURED SCENE (backlog 3eddffc4, 2026-10-01 03:26Z, at
+    /// David's "is the map accurate?"): PR train 2026-10-01 02:41 at its
+    /// CI verdict. It stands at the gates (car R1); the track read "no
+    /// train in transit" while `boss orient` listed the train IN TRANSIT.
+    /// Orient now asks the track's own predicate — `yard::in_transit`,
+    /// merged — and the empty track names the train under test.
+    #[test]
+    fn an_empty_track_names_the_train_under_test_and_orients_predicate_agrees() {
+        let scene = under_test("PR train 2026-10-01 02:41", json!({}), StepStatus::Ready);
+        assert!(
+            !crate::yard::in_transit(&scene.1),
+            "the predicate orient's IN TRANSIT reads: not merged, not in transit"
+        );
+        let out = read(std::slice::from_ref(&scene), &[]);
+        let track = by_name(&out, "track");
+        assert_eq!(track.count, Some(0), "{}", track.why);
+        assert_eq!(
+            track.why,
+            "no train on the track; PR train 2026-10-01 02:41 is under test at the gates"
+        );
+        assert_eq!(track.kpi[0].text, track.why);
+        assert_eq!(by_name(&out, "gates").count, Some(1), "counted once, there");
+
+        let merged = in_transit("train #472", "2026-09-19T11:00:00Z");
+        assert!(crate::yard::in_transit(&merged.1));
+        let out = read(&[], &[]);
+        assert_eq!(by_name(&out, "track").why, "no train on the track");
     }
 }

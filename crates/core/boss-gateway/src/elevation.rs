@@ -510,7 +510,7 @@ mod tests {
         ElevationState {
             passkey: Arc::new(PasskeyState {
                 session_key: KEY.to_vec(),
-                http: crate::machine_client::MachineClient::build(reqwest::Client::builder())
+                http: crate::machine_client::MachineClient::unstamped(reqwest::Client::builder())
                     .unwrap(),
                 people_base: "http://127.0.0.1:9".into(),
                 jobs_base: "http://127.0.0.1:9".into(),

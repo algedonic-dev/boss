@@ -23,9 +23,11 @@
 #       and owes nothing to the forge token, so a revoked or broken
 #       token cannot stop the step that repairs it (CLAUDE.md, "an arm
 #       that needs the patient is not an arm"). Only the LOCAL target
-#       exists; the remote target is the forced-command path backlog
-#       7336cb5f builds, and it extends this script rather than writing
-#       a second one.
+#       exists here. The remote one — boss-gcp's break-glass kubeconfig
+#       — was built by backlog 7336cb5f as a cluster CronJob instead
+#       (infra/cluster/break-glass-deposit.sh): its credential is a
+#       Secret the cluster already holds, so the cluster pushes it, and
+#       nothing on the forge takes part.
 #   D2  A FILE, NOT A URL. The value lives in --dest (0600, the owner's),
 #       read at use time by a credential helper in the owner's GLOBAL git
 #       config scoped to the forge's URL — the shape `boss credential
@@ -94,7 +96,7 @@ while [ $# -gt 0 ]; do
     shift 2
 done
 [ "$TARGET" = local ] \
-    || refuse "target '$TARGET': only the local target exists. The remote target — a forced-command deposit onto another host — is what backlog 7336cb5f builds on this script (design 835c0c9c)"
+    || refuse "target '$TARGET': only the local target exists. A forced-command deposit onto another host is not this script's: boss-gcp's kubeconfig is pushed from the cluster by infra/cluster/break-glass-deposit.sh (backlog 7336cb5f)"
 [ -n "$RULE" ] && [ -n "$CHECKOUT" ] && [ -n "$DEST" ] && [ "$OWNER_SET" = 1 ] \
     || refuse "--rule, --checkout, --dest and --owner are all required"
 if [ -z "$OWNER" ] && [ -z "${GIT_CONFIG_GLOBAL:-}" ]; then
@@ -384,14 +386,15 @@ record_delivery() {
     # The machine token rides to curl in a 0600 file, never in its argv,
     # where every local user reads it in ps — the defect the publish
     # review of 8d7a3507 found at this line (backlog 5f3ad356). This
-    # runs in the script's own shell, after the EXIT trap above.
-    if [ -n "${BOSS_MACHINE_TOKEN:-}" ]; then
-        if ! secret_header MT_HDR "x-boss-machine-token: $BOSS_MACHINE_TOKEN"; then
-            DELIVERY_STATE="not recorded: the machine token's header file could not be written; the next pass retries"
-            return 0
-        fi
-        hdrs+=(-H "$MT_HDR")
+    # runs in the script's own shell, after the EXIT trap above. It is
+    # the mounted Secret's `current` slot, stamped only on an estate
+    # host (infra/lib/secret-header.sh machine_token_header; design
+    # 6805c764 car 4).
+    if ! machine_token_header MT_HDR "$BOSS_JOBS_URL"; then
+        DELIVERY_STATE="not recorded: the machine token's header file could not be written; the next pass retries"
+        return 0
     fi
+    [ -z "$MT_HDR" ] || hdrs+=(-H "$MT_HDR")
     if ! jobs="$("$API_CURL" -fsS "${hdrs[@]}" \
         "$BOSS_JOBS_URL/api/jobs?kind=rotate-a-credential&status=open&limit=500" 2>/dev/null)"; then
         # Not a failure of the deposit: the value is installed and the

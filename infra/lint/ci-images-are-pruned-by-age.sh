@@ -62,6 +62,22 @@ for f in "$lib" "$resolver" "$sweep"; do
 done
 
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+
+# HERMETIC OF THE HOST (backlog 920524dc, 2026-10-01). Every fixture below
+# is this lint's own; none may see the host's machine token, system of
+# record or hosts list. The resolver makes its token header WHEN SOURCED,
+# for the BOSS_JOBS_URL it finds, and resolve() sources it in a subshell,
+# where secret-header.sh refuses a first call — so in the conductor pod,
+# where a token is mounted and BOSS_JOBS_URL names the estate, this lint
+# went red on 3 FAILs and held every train from 00:04Z. An empty token
+# dir, no URL, no hosts list and a sor.env that does not exist is the
+# state every gate already ran it in. Pinned by
+# crates/core/boss-testing/tests/the_image_prune_lint_is_hermetic_of_the_hosts_token.rs.
+mkdir -p "$tmp/no-machine-token"
+export BOSS_MACHINE_TOKEN_DIR="$tmp/no-machine-token"
+export BOSS_SOR_ENV="$tmp/no-sor.env"
+unset BOSS_JOBS_URL BOSS_MACHINE_TOKEN_HOSTS
+
 problems=0
 fail() { echo "FAIL: $*" >&2; problems=$((problems + 1)); }
 

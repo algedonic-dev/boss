@@ -145,6 +145,48 @@ async fn get_job(app: &axum::Router, job_id: &str) -> serde_json::Value {
     job
 }
 
+/// Complete a step the way every surface does since e39a9d2a: the keys
+/// it writes through the step merge door, then the status alone through
+/// the PUT, which refuses any body carrying metadata. Answers the first
+/// refusal, or the PUT's answer.
+async fn complete_step(
+    app: &axum::Router,
+    job_id: &str,
+    step_id: &str,
+    keys: serde_json::Map<String, serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let path = format!("/api/jobs/{job_id}/steps/{step_id}");
+    if !keys.is_empty() {
+        let (status, body) = send(
+            app,
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("{path}/metadata"))
+                .header("content-type", "application/json")
+                .header("x-boss-user", admin_header())
+                .body(Body::from(serde_json::Value::Object(keys).to_string()))
+                .unwrap(),
+        )
+        .await;
+        if !status.is_success() {
+            return (status, body);
+        }
+    }
+    send(
+        app,
+        Request::builder()
+            .method("PUT")
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("x-boss-user", admin_header())
+            .body(Body::from(
+                serde_json::json!({ "status": "completed" }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await
+}
+
 fn step<'a>(job: &'a serde_json::Value, title: &str) -> &'a serde_json::Value {
     job["steps"]
         .as_array()
@@ -198,32 +240,23 @@ async fn merged_outcome_survives_review_and_closes_on_the_marker() {
         }
         for s in actionable {
             let step_id = s["id"].as_str().expect("step id");
-            // Merge, never replace: `authority_role` shares the object.
-            let mut metadata = s["metadata"].clone();
+            // Only the required keys, through the merge door, which
+            // keeps every key not sent (`authority_role` among them).
+            let mut keys = serde_json::Map::new();
             for f in s["fields"].as_array().into_iter().flatten() {
                 if f["required"].as_bool() != Some(true) {
                     continue;
                 }
                 let name = f["name"].as_str().unwrap_or_default();
                 let declared = f["field_type"].as_str().unwrap_or_default();
-                metadata[name] = serde_json::Value::String(
-                    declared.split('|').next().unwrap_or("x").to_string(),
+                keys.insert(
+                    name.to_string(),
+                    serde_json::Value::String(
+                        declared.split('|').next().unwrap_or("x").to_string(),
+                    ),
                 );
             }
-            let (status, body) = send(
-                &app,
-                Request::builder()
-                    .method("PUT")
-                    .uri(format!("/api/jobs/{job_id}/steps/{step_id}"))
-                    .header("content-type", "application/json")
-                    .header("x-boss-user", admin_header())
-                    .body(Body::from(
-                        serde_json::json!({ "status": "completed", "metadata": metadata })
-                            .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await;
+            let (status, body) = complete_step(&app, &job_id, step_id, keys).await;
             assert!(
                 status.is_success(),
                 "completing `{}` failed with {status}: {body}",
@@ -290,32 +323,25 @@ async fn merged_outcome_survives_review_and_closes_on_the_marker() {
         .as_str()
         .unwrap()
         .to_string();
-    let mut proven_md = step(&marked, "Proven in prod")["metadata"].clone();
-    proven_md["verified"] =
-        serde_json::Value::String("uxprobe: surface renders on prod, controls present".into());
-    proven_md["method"] = serde_json::Value::String("browser".into());
+    let mut proven_md = serde_json::Map::new();
+    proven_md.insert(
+        "verified".into(),
+        serde_json::Value::String("uxprobe: surface renders on prod, controls present".into()),
+    );
+    proven_md.insert("method".into(), serde_json::Value::String("browser".into()));
     // `proof` is REQUIRED on `proven` — the machine-probe rule
     // (ship-a-change v22, "proven requires a machine-run probe"), in
     // the tree since the live row was folded into the bundle on
     // 2026-09-15 (backlog 0ccf23ec). Prose alone is a claim; this is
     // the record `boss prove` writes: the probe, its exit, its output.
-    proven_md["proof"] = serde_json::Value::String(
-        "probe: curl -sf https://boss.example/it/flow | grep -c 'a-change'; exit 0; stdout: 1"
-            .into(),
+    proven_md.insert(
+        "proof".into(),
+        serde_json::Value::String(
+            "probe: curl -sf https://boss.example/it/flow | grep -c 'a-change'; exit 0; stdout: 1"
+                .into(),
+        ),
     );
-    let (status, body) = send(
-        &app,
-        Request::builder()
-            .method("PUT")
-            .uri(format!("/api/jobs/{job_id}/steps/{proven_id}"))
-            .header("content-type", "application/json")
-            .header("x-boss-user", admin_header())
-            .body(Body::from(
-                serde_json::json!({ "status": "completed", "metadata": proven_md }).to_string(),
-            ))
-            .unwrap(),
-    )
-    .await;
+    let (status, body) = complete_step(&app, &job_id, &proven_id, proven_md).await;
     assert!(status.is_success(), "proving failed: {status} {body}");
 
     let proven = get_job(&app, &job_id).await;

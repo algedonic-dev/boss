@@ -392,8 +392,19 @@ spec:
                     case $- in *i*) [ -t 0 ] && [ -z "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1 && exec /work/dev-session.sh;; esac
                     PR
                     done
+                    # THE LOGIN SELECTOR IS VERSIONED (backlog e2d63c28,
+                    # 2026-10-01): the menu (Claude / Codex / Gemini / Shell,
+                    # each joining or creating its tmux session, Enter = `dev`)
+                    # is infra/dev/dev-session.sh in the checkout, so a menu
+                    # edit rides a train and never rolls this pod. This file
+                    # only execs it - when it exists AND parses, so a bad
+                    # edit cannot lock ssh logins out - and otherwise is
+                    # today's attach to `dev`.
                     cat > /work/dev-session.sh <<'LS'
                     #!/usr/bin/env bash
+                    if [ -x /work/boss/infra/dev/dev-session.sh ] && bash -n /work/boss/infra/dev/dev-session.sh 2>/dev/null; then
+                      exec /work/boss/infra/dev/dev-session.sh "$@"
+                    fi
                     export HOME=/work/home
                     export PATH=/work/tools/bin:/work/home/.local/bin:/usr/local/cargo/bin:$PATH
                     export RUSTUP_HOME=/usr/local/rustup
@@ -608,8 +619,35 @@ spec:
                         echo "dev session: tmux could not start the session (exit $?) — ssh in and run /work/dev-session.sh"
                       fi
                     else
-                      echo "dev session: not started — claude binary or /work/home/.claude/.credentials.json missing; ssh in, run claude once to log in, and the next boot starts it"
+                      echo "dev session: not started — claude binary or /work/home/.claude/.credentials.json missing; ssh in, choose Shell (4) at the menu and run claude once to log in, and the next boot starts it"
                     fi
+                    # CODEX AND GEMINI, beside claude (backlog e2d63c28): the
+                    # login selector's options 2 and 3. npm-installed onto the
+                    # PVC prefix /work/home/.local (its bin/ is on the PATH
+                    # above) so they survive a roll and download once;
+                    # best-effort - a failure is named here, never fails the
+                    # boot, and the selector offers the install again at
+                    # login. NO login is placed: `codex login` and gemini's
+                    # first-run auth are David's, once, inside their
+                    # sessions, and live on the PVC home like claude's.
+                    #
+                    # DETACHED, so this hook returns without them (review
+                    # a27c860d F1, measured on the live pod): the kubelet
+                    # starts the postgres and reclaim sidecars, and marks
+                    # the pod Ready - which is what opens the ssh
+                    # LoadBalancer - only once this postStart returns, so
+                    # two inline `timeout 300` installs would have held
+                    # the test database, the reclaim and the ssh door for
+                    # up to ten minutes on any boot that installs. setsid
+                    # and every fd redirected, so neither the hook nor the
+                    # exec's streams wait on npm; neither the dev session
+                    # nor the sidecars do. -k 10: an npm that ignores TERM
+                    # is killed rather than outliving its bound.
+                    setsid bash -c '
+                      [ -x /work/home/.local/bin/codex ] || timeout -k 10 300 npm i -g --prefix /work/home/.local @openai/codex || echo "codex install: failed (exit $?) - choose option 2 at login to retry"
+                      [ -x /work/home/.local/bin/gemini ] || timeout -k 10 300 npm i -g --prefix /work/home/.local @google/gemini-cli || echo "gemini install: failed (exit $?) - choose option 3 at login to retry"
+                    ' < /dev/null >> /work/ssh/postStart.log 2>&1 &
+                    echo "codex/gemini: a missing CLI installs detached (pid $!); npm's output and any failure land below, after this hook returns"
                     } >> /work/ssh/postStart.log 2>&1 || true
           workingDir: /work
           env:
@@ -712,6 +750,26 @@ spec:
             - {name: forge-write-token, mountPath: /etc/boss-train, readOnly: true}
             - {name: ssh-authorized, mountPath: /etc/ssh-authorized, readOnly: true}
             - {name: access-ssh-ca, mountPath: /etc/access-ssh-ca, readOnly: true}
+            # THE DOORS' COPY OF THE ESTATE MACHINE TOKEN (design 6805c764
+            # car 4; backlog 1876bbdb, INFO-5) — at the one directory
+            # infra/dev/machine-token-dir names, and deliberately NOT at
+            # boss-core's default /etc/boss/machine-token: builders run
+            # handler tests on this pod, every stamping client a test
+            # builds (common::api_client() among them) reads the default,
+            # and a failing test that prints its request would put the
+            # live token in a transcript. Nothing here sets
+            # BOSS_MACHINE_TOKEN_DIR for the pod; only the doors
+            # (infra/dev/boss, infra/dev/boss-api) read that file and name
+            # the directory to what they run — and the boss CLI removes it
+            # again from every child that runs tree or car code (a probe
+            # at `boss prove`'s hand door, the consist lints, gate.sh
+            # --roster; crates/orchestrators/boss-cli/src/door_env.rs,
+            # review ef2da426 F1), so a rehearsed probe's handler tests
+            # read the empty default too. This keeps ACCIDENTS off the
+            # token; it is no bound on hostile code, which the holder
+            # roster in the_machine_gate_reports_and_refuses_nothing.rs
+            # states.
+            - {name: machine-token, mountPath: /etc/boss-doors/machine-token, readOnly: true}
         - name: postgres
           # Matches production's major (the `boss` StatefulSet runs
           # postgres:16). A dev database on a different major is a test
@@ -903,6 +961,15 @@ spec:
             defaultMode: 0400
             items:
               - {key: token, path: forge.token}
+        # THE ESTATE MACHINE TOKEN — boss-dev's copy of Secret
+        # boss-machine-token, which the broker writes beside prod's
+        # (also_in_namespaces in broker-rotates-the-machine-token.toml).
+        # Whole, never items, so a rotation reaches the mount; optional,
+        # because until the first mint it is empty and the doors send no
+        # token, which every gate in `report` admits. 0440 + the pod's
+        # fsGroup 1500. Mounted at the doors' directory above.
+        - name: machine-token
+          secret: {secretName: boss-machine-token, optional: true, defaultMode: 0440}
         - name: work
           persistentVolumeClaim: {claimName: boss-dev-work}
         - name: scratch

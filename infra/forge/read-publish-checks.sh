@@ -160,7 +160,7 @@ trap 'rm -rf "$workdir"' EXIT
 # below run inside $(…).
 # shellcheck source=infra/lib/secret-header.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/secret-header.sh"
-secret_header MT_HDR ${BOSS_MACHINE_TOKEN:+"x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+machine_token_header MT_HDR "${BOSS_JOBS_URL:-}" \
     || fail "the machine token's header file could not be written"
 
 check_inputs() {
@@ -517,18 +517,26 @@ curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_US
     || fail "writing the reading onto ${job_id:0:8} (PATCH /api/jobs/$job_id/metadata) — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
 say "reading written onto ${job_id:0:8} as code_scanning"
 
-# Merge, never replace: PUT swaps the step's metadata wholesale.
-printf '%s' "$target" | jq -c --arg c "$conclusion" --arg a "$alerts" --arg r "$rules" --arg h "$head" \
+# Merge, never replace — and the SERVER merges: the verb's keys go
+# through the step merge door, then a PUT carries the status alone
+# (backlog e39a9d2a, Stage 2). This used to send the step's read
+# metadata back beside them, because the step PUT swaps metadata
+# wholesale; its end state refuses any metadata body. The keys first:
+# conclusion is required at done, and the flip is where that is judged.
+jq -n -c --arg c "$conclusion" --arg a "$alerts" --arg r "$rules" --arg h "$head" \
         --arg f "$failing" --arg s "$running" '
-    {status: "completed",
-     metadata: ((.read.metadata // {})
-                + {conclusion: $c, alerts: $a, rules: $r, head: $h, read_by: "read-publish-checks",
-                   failing: $f, still_running: $s})}' \
+    {conclusion: $c, alerts: $a, rules: $r, head: $h, read_by: "read-publish-checks",
+     failing: $f, still_running: $s}' \
     > "$workdir/payload"
+printf '%s\n' '{"status":"completed"}' > "$workdir/done"
+curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+    ${MT_HDR:+-H "$MT_HDR"} \
+    --data-binary @"$workdir/payload" "$BASE/api/jobs/$job_id/steps/$step_id/metadata" > /dev/null 2>"$workdir/err" \
+    || fail "the reading is on ${job_id:0:8} but writing it onto read-checks failed — $(head -c 300 "$workdir/err" | tr '\n' ' '); complete the step by hand with conclusion=$conclusion alerts=$alerts rules=$rules"
 curl -fsS -X PUT -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
     ${MT_HDR:+-H "$MT_HDR"} \
-    --data-binary @"$workdir/payload" "$BASE/api/jobs/$job_id/steps/$step_id" > /dev/null 2>"$workdir/err" \
-    || fail "the reading is on ${job_id:0:8} but completing read-checks failed — $(head -c 300 "$workdir/err" | tr '\n' ' '); complete the step by hand with conclusion=$conclusion alerts=$alerts rules=$rules"
+    --data-binary @"$workdir/done" "$BASE/api/jobs/$job_id/steps/$step_id" > /dev/null 2>"$workdir/err" \
+    || fail "the reading is on ${job_id:0:8} and on read-checks, but completing read-checks failed — $(head -c 300 "$workdir/err" | tr '\n' ' '); complete the step by hand"
 
 # What failed, by name, before the answer line — the verdict names it.
 [ -z "$failing" ] || say "failing: $failing"

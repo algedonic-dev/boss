@@ -96,20 +96,18 @@ fn packet(n: u8, title: &str, partition: Partition) -> Job {
         id: JobId::from_uuid(
             Uuid::parse_str(&format!("00000000-0000-0000-0000-0000000000{n:02}")).expect("uuid"),
         ),
-        kind: "keg-return".into(),
         workflow_version: 4,
-        subject: Subject::new("asset", "KEG-1"),
-        title: title.into(),
-        owner_id: "emp-david".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: day(2026, 9, 1),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
         partition,
+        ..Job::new(
+            "keg-return",
+            Subject::new("asset", "KEG-1"),
+            title,
+            "emp-david",
+            Priority::Standard,
+            day(2026, 9, 1),
+        )
     }
 }
 

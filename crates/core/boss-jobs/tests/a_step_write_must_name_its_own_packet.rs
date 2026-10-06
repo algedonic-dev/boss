@@ -102,45 +102,32 @@ fn allow_update() -> Arc<dyn PolicyClient> {
 fn job(id: &str, kind: &str) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
-        kind: kind.into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", kind),
-        title: "A packet with a step on it".into(),
-        owner_id: "emp-op".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 21).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            kind,
+            Subject::new("custom", kind),
+            "A packet with a step on it",
+            "emp-op",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 21).unwrap(),
+        )
     }
 }
 
 fn step() -> Step {
     Step {
         id: StepId::from_uuid(Uuid::parse_str(STEP).unwrap()),
-        job_id: JobId::from_uuid(Uuid::parse_str(JOB).unwrap()),
-        kind: "generic".into(),
-        title: "Build the change".into(),
         spec_slug: Some("build".into()),
         assignee_id: Some("emp-op".into()),
         status: StepStatus::Ready,
-        sort_order: 1,
-        blocked_by: vec![],
-        sign_offs_required: Vec::new(),
-        assurance_required: None,
-        sign_offs: Vec::new(),
-        fields: Vec::new(),
-        completed_on: None,
-        completed_by: None,
-        completed_at: None,
         metadata: serde_json::json!({}),
-        notes: None,
-        step_plugin_version: 0,
-        embedded_job: None,
+        ..Step::new(
+            JobId::from_uuid(Uuid::parse_str(JOB).unwrap()),
+            "generic",
+            "Build the change",
+            1,
+        )
     }
 }
 

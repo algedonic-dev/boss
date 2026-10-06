@@ -155,6 +155,13 @@ data:
   # address, so BOSS_TRAIN_ALLOW_LOCAL_JOBS stays unset and preflight's
   # loopback guard stays armed.
   BOSS_JOBS_URL: "http://boss-jobs-internal.boss.svc.cluster.local:7900"
+  # The hosts the conductor's clients may stamp the estate machine token
+  # on, besides loopback: prod's namespace, by suffix — the record above
+  # is a Service there (backlog 2ee29275; the car-4 checklist on
+  # 2710c8fc: without it the mounted token reaches the record unstamped).
+  # Prod's, not this pod's own boss-dev: the token is prod's, copied here
+  # by the broker for this pod's callers.
+  BOSS_MACHINE_TOKEN_HOSTS: ".boss.svc.cluster.local"
   # WHO THE CONDUCTOR SIGNS AS. Every jobs-API write this loop makes
   # carries this id, and the system of record stamps it into the
   # audit log and the step's `completed_by`. It is the conductor's
@@ -320,6 +327,10 @@ spec:
           volumeMounts:
             - {name: home, mountPath: /var/lib/boss-train}
             - {name: forge-token, mountPath: /etc/boss-train, readOnly: true}
+            # The estate machine token, at boss-core's default directory:
+            # the boss CLI stamps its `current` slot on every jobs-API
+            # request, per request (design 6805c764 car 4).
+            - {name: machine-token, mountPath: /etc/boss/machine-token, readOnly: true}
           resources:
             # A supervisor loop plus occasional git/gate shell-outs — modest
             # steady state, headroom for a merge assembly. Bounded so a
@@ -344,3 +355,12 @@ spec:
             defaultMode: 0400
             items:
               - {key: token, path: forge.token}
+        # THE ESTATE MACHINE TOKEN — boss-dev's copy of Secret
+        # boss-machine-token, which the broker writes beside prod's
+        # (also_in_namespaces in broker-rotates-the-machine-token.toml;
+        # design 6805c764 car 4). Whole, never items, so a rotation
+        # reaches the mount; optional, because until the first mint it is
+        # empty, the conductor sends no token, and every gate in `report`
+        # admits it. 0440 + the pod's fsGroup 1500, as forge-token.
+        - name: machine-token
+          secret: {secretName: boss-machine-token, optional: true, defaultMode: 0440}

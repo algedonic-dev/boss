@@ -37,6 +37,12 @@
 //! would convert a harmless redelivery into a loud failure. The refusal
 //! is therefore scoped to a write that would actually CHANGE a frozen
 //! field.
+//!
+//! SINCE e39a9d2a the PUT writes no metadata at all: a `metadata` body
+//! is refused 409 naming the merge door. A body that would CHANGE a
+//! terminal step's metadata still gets THIS refusal (it names the
+//! frozen field, which is the truer answer); an unchanged one gets the
+//! merge-door refusal, and a redelivery re-sends its keys there.
 
 use std::sync::Arc;
 
@@ -108,28 +114,20 @@ fn build_app() -> (Router, Arc<InMemoryJobs>) {
 fn step(id: &str, status: StepStatus, metadata: serde_json::Value) -> Step {
     Step {
         id: StepId::from_uuid(Uuid::parse_str(id).unwrap()),
-        job_id: JobId::from_uuid(Uuid::parse_str(JOB).unwrap()),
-        kind: "generic".into(),
-        title: "Reproduce and investigate".into(),
         spec_slug: Some("investigate".into()),
         assignee_id: Some("emp-op".into()),
         status,
-        sort_order: 1,
-        blocked_by: vec![],
-        sign_offs_required: Vec::new(),
-        assurance_required: None,
-        sign_offs: Vec::new(),
-        fields: Vec::new(),
         completed_on: match status {
             StepStatus::Completed => NaiveDate::from_ymd_opt(2026, 8, 20),
             _ => None,
         },
-        completed_by: None,
-        completed_at: None,
         metadata,
-        notes: None,
-        step_plugin_version: 0,
-        embedded_job: None,
+        ..Step::new(
+            JobId::from_uuid(Uuid::parse_str(JOB).unwrap()),
+            "generic",
+            "Reproduce and investigate",
+            1,
+        )
     }
 }
 
@@ -137,20 +135,16 @@ async fn seed() -> (Router, Arc<InMemoryJobs>) {
     let (app, jobs) = build_app();
     let job = Job {
         id: JobId::from_uuid(Uuid::parse_str(JOB).unwrap()),
-        kind: "incident".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "bosspipeline"),
-        title: "The CI runner lost outbound network".into(),
-        owner_id: "emp-op".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 8, 18).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "incident",
+            Subject::new("custom", "bosspipeline"),
+            "The CI runner lost outbound network",
+            "emp-op",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 8, 18).unwrap(),
+        )
     };
     jobs.create_job(&job).await.unwrap();
     jobs.add_step(&step(
@@ -176,6 +170,27 @@ async fn put_step(app: &Router, step_id: &str, body: &str) -> axum::http::Respon
             Request::builder()
                 .method("PUT")
                 .uri(format!("/api/jobs/{JOB}/steps/{step_id}"))
+                .header("content-type", "application/json")
+                .header("x-boss-user", serde_json::to_string(&operator()).unwrap())
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// The step merge door — the one writer of step metadata since backlog
+/// e39a9d2a (Stage 2's last car: the PUT writes no metadata).
+async fn patch_step_metadata(
+    app: &Router,
+    step_id: &str,
+    body: &str,
+) -> axum::http::Response<Body> {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/jobs/{JOB}/steps/{step_id}/metadata"))
                 .header("content-type", "application/json")
                 .header("x-boss-user", serde_json::to_string(&operator()).unwrap())
                 .body(Body::from(body.to_string()))
@@ -247,9 +262,40 @@ async fn the_refusal_names_the_frozen_field() {
 /// THE HALF THAT IS EASY TO BREAK BY OVERREACHING. The freeze exists so
 /// that racing writers are harmless: a dispatcher retry or a JetStream
 /// redelivery re-PUTs content already stored. Those must stay 204.
+///
+/// Since backlog e39a9d2a the PUT writes no metadata, so a redelivery
+/// is two writes, each harmless on its own door: the status re-PUT, and
+/// the stored keys re-sent through the merge door, which answers an
+/// unchanged re-send to a terminal step 204.
 #[tokio::test]
 async fn a_redelivery_that_changes_nothing_still_succeeds() {
     let (app, _jobs) = seed().await;
+
+    let resp = put_step(&app, DONE_STEP, r#"{"status":"completed"}"#).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a write that changes no frozen field is a harmless redelivery and must not 409 — \
+         turning retries into failures would trade a silent bug for a noisy one"
+    );
+
+    let resp = patch_step_metadata(&app, DONE_STEP, r#"{"finding":"the original sentence"}"#).await;
+    let status = resp.status();
+    let body = body_of(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the same keys re-sent through the merge door are a redelivery too.\nbody: {body}"
+    );
+}
+
+/// An UNCHANGED metadata re-send through the PUT is no longer a
+/// redelivery the PUT absorbs: the PUT refuses any `metadata` key
+/// (backlog e39a9d2a) and names the merge door that takes it — and it
+/// writes nothing.
+#[tokio::test]
+async fn an_unchanged_metadata_put_on_a_completed_step_names_the_merge_door() {
+    let (app, jobs) = seed().await;
 
     let resp = put_step(
         &app,
@@ -257,12 +303,28 @@ async fn a_redelivery_that_changes_nothing_still_succeeds() {
         r#"{"metadata":{"finding":"the original sentence"},"status":"completed"}"#,
     )
     .await;
+    let status = resp.status();
+    let body: serde_json::Value = serde_json::from_str(&body_of(resp).await).unwrap();
 
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
     assert_eq!(
-        resp.status(),
-        StatusCode::NO_CONTENT,
-        "a write that changes no frozen field is a harmless redelivery and must not 409 — \
-         turning retries into failures would trade a silent bug for a noisy one"
+        body["merge_door"],
+        format!("/api/jobs/{JOB}/steps/{DONE_STEP}/metadata"),
+        "body: {body}"
+    );
+    assert_eq!(
+        body["hint"],
+        boss_jobs::step_metadata_write::METADATA_BODY_HINT,
+        "body: {body}"
+    );
+    let stored = jobs
+        .get_step(&StepId::from_uuid(Uuid::parse_str(DONE_STEP).unwrap()))
+        .await
+        .unwrap()
+        .expect("step exists");
+    assert_eq!(
+        stored.metadata,
+        serde_json::json!({ "finding": "the original sentence" })
     );
 }
 
@@ -297,12 +359,13 @@ async fn a_demotion_still_gets_the_specific_message() {
     );
 }
 
-/// A live step is untouched by any of this.
+/// A live step is untouched by any of this — through the merge door,
+/// the one writer of step metadata since backlog e39a9d2a.
 #[tokio::test]
 async fn a_live_step_still_accepts_metadata() {
     let (app, jobs) = seed().await;
 
-    let resp = put_step(&app, LIVE_STEP, r#"{"metadata":{"finding":"edited"}}"#).await;
+    let resp = patch_step_metadata(&app, LIVE_STEP, r#"{"finding":"edited"}"#).await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     let stored = jobs

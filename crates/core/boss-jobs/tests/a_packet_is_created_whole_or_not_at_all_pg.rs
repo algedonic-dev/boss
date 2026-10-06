@@ -33,20 +33,16 @@ use uuid::Uuid;
 fn job(id: &str) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
-        kind: "user-feedback".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "/ux/jobs"),
-        title: "whole or nothing".into(),
-        owner_id: "emp-1".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 16).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "user-feedback",
+            Subject::new("custom", "/ux/jobs"),
+            "whole or nothing",
+            "emp-1",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 16).unwrap(),
+        )
     }
 }
 

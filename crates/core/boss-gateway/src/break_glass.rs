@@ -376,11 +376,6 @@ pub struct Authorised {
     pub label: CredentialLabel,
     /// The employee whose passkey signed it.
     pub authorised_by: String,
-    /// The `enrol` step's metadata as judged. The spend is written back
-    /// as this plus the credential, in ONE completing PUT, and that PUT
-    /// refuses a body omitting a stored key — so a step written between
-    /// the judgement and the spend refuses the spend (review F2).
-    pub enrol_metadata: Value,
 }
 
 /// Who authorised an enrollment.
@@ -547,7 +542,6 @@ pub fn judge_authorisation(
         enrol_step_id: *enrol.id.inner().as_uuid(),
         label,
         authorised_by: signer.to_string(),
-        enrol_metadata: enrol.metadata.clone(),
     })
 }
 
@@ -559,16 +553,16 @@ pub fn judge_authorisation(
 pub trait EnrolmentAuthorisations: Send + Sync {
     /// The packet, read whole (full steps, stamps included).
     async fn packet(&self, job_id: Uuid) -> Result<Value, String>;
-    /// Complete the `enrol` step carrying `metadata` — the step's whole
-    /// metadata, spend included — in ONE write. The completion is the
-    /// single-use record: a completed step refuses every later metadata
-    /// write, so nothing can null the credential back out and re-arm the
-    /// packet (review F2). Any refusal is an `Err`, and fatal.
+    /// Complete the `enrol` step carrying `spend` — the record's fields
+    /// and nothing else. The completion is the single-use record: a
+    /// completed step refuses every later metadata change, so nothing
+    /// can null the credential back out and re-arm the packet (review
+    /// F2). Any refusal is an `Err`, and fatal.
     async fn complete_enrol(
         &self,
         job_id: Uuid,
         enrol_step_id: Uuid,
-        metadata: &Value,
+        spend: &Value,
     ) -> Result<(), String>;
 }
 
@@ -576,9 +570,7 @@ pub trait EnrolmentAuthorisations: Send + Sync {
 /// Called BEFORE the record is handed out: a record whose spend the
 /// jobs API refused would leave the authorisation reusable, so the
 /// enrolment fails instead (the credential made on the key is then an
-/// orphan nothing commits). The spend rides on every key the step held
-/// when it was judged, because the step PUT refuses a body that omits
-/// one — which also refuses a spend onto a step written since.
+/// orphan nothing commits).
 ///
 /// The spend is the WHOLE record, serialized exactly as the manifest
 /// holds it (backlog 4a173252): the step is the durable copy the commit
@@ -588,27 +580,20 @@ pub trait EnrolmentAuthorisations: Send + Sync {
 /// committed record verifies with — so both records enrolled that day
 /// were copied by hand from `kubectl logs`. Every field is public (Q5);
 /// `the_enrol_step_carries_every_field_of_the_record` names them.
+///
+/// It is the record ALONE (backlog e39a9d2a, Stage 2's last car). It
+/// carried every key the step held as judged until the step PUT stopped
+/// taking metadata, because that PUT refused a body omitting one; the
+/// merge door it goes through now keeps every key it is not sent.
 pub async fn record_spend(
     port: &dyn EnrolmentAuthorisations,
     authorised: &Authorised,
     record: &BreakGlassCredential,
 ) -> Result<(), String> {
-    let mut metadata = authorised
-        .enrol_metadata
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
-    let whole = serde_json::to_value(record)
+    let spend = serde_json::to_value(record)
         .map_err(|e| format!("the enrolled record did not serialize ({e})"))?;
-    if let Value::Object(fields) = whole {
-        metadata.extend(fields);
-    }
-    port.complete_enrol(
-        authorised.job_id,
-        authorised.enrol_step_id,
-        &Value::Object(metadata),
-    )
-    .await
+    port.complete_enrol(authorised.job_id, authorised.enrol_step_id, &spend)
+        .await
 }
 
 /// How long the gateway waits on the jobs API during an enrolment. An
@@ -645,29 +630,68 @@ impl EnrolmentAuthorisations for JobsApiAuthorisations {
         }
     }
 
+    /// TWO WRITES, the spend then the close (backlog e39a9d2a: the step
+    /// PUT refuses any metadata body). It was ONE completing PUT carrying
+    /// status and metadata (review F2), because the merge-then-close it
+    /// replaced only LOGGED a refused close — leaving a credential on a
+    /// still-open step with the record already handed out. Both halves
+    /// of that review hold on two writes, each on its own: the merge door
+    /// refuses a real change to a terminal step, so a spend onto an
+    /// authorisation closed since it was judged is refused; and a refused
+    /// close is FATAL (no record leaves the ceremony) and WITHDRAWS the
+    /// spend, each key sent as null, so the open step does not carry a
+    /// credential nobody was given. Two ceremonies cannot interleave the
+    /// pair: every presence finish holds the enrolment lock from its
+    /// re-judge to its record.
     async fn complete_enrol(
         &self,
         job_id: Uuid,
         enrol_step_id: Uuid,
-        metadata: &Value,
+        spend: &Value,
     ) -> Result<(), String> {
         let step = format!("{}/api/jobs/{job_id}/steps/{enrol_step_id}", self.jobs_base);
-        // ONE write: the status and the whole metadata together (review
-        // F2). It was a merge then a close, and a refused close only
-        // logged — leaving a credential on a still-open step that any
-        // step writer could null out to re-arm the packet.
-        let resp = crate::passkey::sign_as_gateway(self.http.put(step))
-            .json(&json!({ "status": "completed", "metadata": metadata }))
+        let door = format!("{step}/metadata");
+        let resp = crate::passkey::sign_as_gateway(self.http.patch(&door))
+            .json(spend)
             .send()
             .await
             .map_err(|_| "jobs unreachable — the spend was not recorded".to_string())?;
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "completing packet {job_id}'s `{ENROL_STEP}` step answered {}",
+        if !resp.status().is_success() {
+            return Err(format!(
+                "recording the spend on packet {job_id}'s `{ENROL_STEP}` step answered {}",
                 resp.status()
-            ))
+            ));
+        }
+        let closed = crate::passkey::sign_as_gateway(self.http.put(step))
+            .json(&json!({ "status": "completed" }))
+            .send()
+            .await
+            .map(|r| r.status());
+        match closed {
+            Ok(s) if s.is_success() => Ok(()),
+            closed => {
+                let why = match closed {
+                    Ok(s) => format!("answered {s}"),
+                    Err(_) => "did not answer".to_string(),
+                };
+                let withdrawal: serde_json::Map<String, Value> = spend
+                    .as_object()
+                    .map(|o| o.keys().map(|k| (k.clone(), Value::Null)).collect())
+                    .unwrap_or_default();
+                let withdrawn = crate::passkey::sign_as_gateway(self.http.patch(&door))
+                    .json(&Value::Object(withdrawal))
+                    .send()
+                    .await
+                    .is_ok_and(|r| r.status().is_success());
+                Err(format!(
+                    "completing packet {job_id}'s `{ENROL_STEP}` step {why}; the spend was {}",
+                    if withdrawn {
+                        "withdrawn"
+                    } else {
+                        "NOT withdrawn — the open step still names the credential"
+                    }
+                ))
+            }
         }
     }
 }
@@ -2488,13 +2512,14 @@ mod tests {
         assert_eq!(spend["label"], json!("primary"));
         assert_eq!(spend["rp_id"], json!(DOOR_RP));
         assert!(spend["enrolled_at"].is_string());
-        // Review F2: the completion carries EVERY key the step already
-        // held, so the one PUT the adapter makes is accepted whole — the
-        // step's PUT refuses a body that omits a stored key.
-        assert_eq!(
-            spend["procedure"],
-            json!("Completed by the gateway."),
-            "the stored keys ride with the spend"
+        // The spend is the record and nothing else (backlog e39a9d2a):
+        // it goes through the step merge door, which keeps every key the
+        // step holds, so re-sending the stored keys would only race a
+        // concurrent writer. Until Stage 2's last car it carried them all,
+        // because the one completing PUT refused a body that omitted one.
+        assert!(
+            spend.get("procedure").is_none(),
+            "the stored keys do not ride with the spend: {spend}"
         );
 
         let refusing = MemoryAuthorisations {
@@ -2564,9 +2589,11 @@ mod tests {
     }
 
     /// A stub jobs API: every request's method, path and body, and the
-    /// status to answer the step write with.
+    /// status to answer each step write with — the merge door (PATCH)
+    /// and the status PUT separately, so a test can refuse either.
     async fn stub_jobs(
-        step_status: StatusCode,
+        patch_status: StatusCode,
+        put_status: StatusCode,
     ) -> (String, Arc<Mutex<Vec<(String, String, Value)>>>) {
         let seen: Arc<Mutex<Vec<(String, String, Value)>>> = Arc::default();
         let log = seen.clone();
@@ -2575,10 +2602,15 @@ mod tests {
                 let log = log.clone();
                 async move {
                     let v = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let answer = if method == axum::http::Method::PATCH {
+                        patch_status
+                    } else {
+                        put_status
+                    };
                     log.lock()
                         .unwrap()
                         .push((method.to_string(), uri.path().to_string(), v));
-                    step_status
+                    answer
                 }
             },
         );
@@ -2588,51 +2620,91 @@ mod tests {
         (format!("http://{addr}"), seen)
     }
 
-    /// Review F2: the spend is ONE write — the step PUT carrying
-    /// `status: completed` and the whole metadata — so the terminal
-    /// freeze is the compare-and-set. Two writes (a merge, then a close
-    /// that only logged when refused) left a credential on a still-open
-    /// step that any step writer could null back out and re-arm.
-    #[tokio::test]
-    async fn the_http_spend_is_one_completing_put() {
-        let (base, seen) = stub_jobs(StatusCode::OK).await;
-        let adapter = JobsApiAuthorisations {
-            http: crate::machine_client::MachineClient::build(reqwest::Client::builder()).unwrap(),
+    /// The test constructor: it never stamps, so no mounted Secret
+    /// reaches a test's captured request heads (backlog 2ee29275, F2).
+    fn adapter_at(base: String) -> JobsApiAuthorisations {
+        JobsApiAuthorisations {
+            http: crate::machine_client::MachineClient::unstamped(reqwest::Client::builder())
+                .unwrap(),
             jobs_base: base,
-        };
+        }
+    }
+
+    /// Backlog e39a9d2a (Stage 2's last car): the step PUT refuses any
+    /// metadata body, so the spend is the record's fields through the
+    /// step merge door, THEN the status alone. Review F2's two halves
+    /// still hold, each on its own write: the merge door refuses a real
+    /// change to a terminal step, so a spend onto an authorisation
+    /// already closed is refused; and a refused close is fatal and
+    /// withdraws the spend (below), so no credential is left on an open
+    /// step with a record handed out.
+    #[tokio::test]
+    async fn the_http_spend_is_its_keys_then_the_status() {
+        let (base, seen) = stub_jobs(StatusCode::NO_CONTENT, StatusCode::NO_CONTENT).await;
         let job = Uuid::parse_str(PACKET).unwrap();
         let step = Uuid::parse_str(ENROL_ID).unwrap();
-        let metadata = json!({ "credential_id": "Y3JlZA", "procedure": "kept" });
-        adapter
-            .complete_enrol(job, step, &metadata)
+        let spend = json!({ "credential_id": "Y3JlZA", "label": "primary" });
+        adapter_at(base)
+            .complete_enrol(job, step, &spend)
             .await
             .expect("written");
         let seen = seen.lock().unwrap().clone();
-        assert_eq!(seen.len(), 1, "exactly one write: {seen:?}");
-        let (method, path, body) = &seen[0];
-        assert_eq!(method, "PUT");
-        assert_eq!(path, &format!("/api/jobs/{PACKET}/steps/{ENROL_ID}"));
-        assert_eq!(body["status"], json!("completed"));
-        assert_eq!(body["metadata"], metadata);
+        let door = format!("/api/jobs/{PACKET}/steps/{ENROL_ID}");
+        assert_eq!(
+            seen,
+            vec![
+                ("PATCH".to_string(), format!("{door}/metadata"), spend),
+                ("PUT".to_string(), door, json!({ "status": "completed" })),
+            ],
+            "the keys, then the status alone"
+        );
     }
 
-    /// And a refused completion is FATAL: no record is issued on a spend
-    /// the record does not hold.
+    /// A refused spend is FATAL, and closes nothing: no record is issued
+    /// on a spend the step does not hold.
     #[tokio::test]
-    async fn a_refused_completion_is_fatal() {
-        let (base, _seen) = stub_jobs(StatusCode::CONFLICT).await;
-        let adapter = JobsApiAuthorisations {
-            http: crate::machine_client::MachineClient::build(reqwest::Client::builder()).unwrap(),
-            jobs_base: base,
-        };
-        let refused = adapter
+    async fn a_refused_spend_is_fatal_and_closes_nothing() {
+        let (base, seen) = stub_jobs(StatusCode::CONFLICT, StatusCode::NO_CONTENT).await;
+        let refused = adapter_at(base)
             .complete_enrol(
                 Uuid::parse_str(PACKET).unwrap(),
                 Uuid::parse_str(ENROL_ID).unwrap(),
-                &json!({}),
+                &json!({ "credential_id": "Y3JlZA" }),
             )
             .await;
         assert!(refused.is_err());
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|(m, _, _)| m != "PUT"),
+            "no close after a refused spend: {seen:?}"
+        );
+    }
+
+    /// A refused CLOSE is fatal too, and the spend it followed is
+    /// withdrawn — each of its keys sent as null through the merge door
+    /// — so the open step does not carry a credential the ceremony never
+    /// handed out (review F2: a credential on a still-open step is what
+    /// a reader, or a hand completion, could mistake for an enrolment).
+    #[tokio::test]
+    async fn a_refused_close_is_fatal_and_withdraws_the_spend() {
+        let (base, seen) = stub_jobs(StatusCode::NO_CONTENT, StatusCode::CONFLICT).await;
+        let refused = adapter_at(base)
+            .complete_enrol(
+                Uuid::parse_str(PACKET).unwrap(),
+                Uuid::parse_str(ENROL_ID).unwrap(),
+                &json!({ "credential_id": "Y3JlZA", "label": "primary" }),
+            )
+            .await;
+        let why = refused.expect_err("a refused close is fatal");
+        assert!(why.contains("withdrawn"), "{why}");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert_eq!(seen[2].0, "PATCH");
+        assert_eq!(
+            seen[2].2,
+            json!({ "credential_id": null, "label": null }),
+            "every key the spend wrote, and nothing else, sent as null"
+        );
     }
 
     /// Review F3: a caller who is not an authoriser learns nothing about

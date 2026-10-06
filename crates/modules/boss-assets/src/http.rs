@@ -15,13 +15,13 @@ use boss_core::publisher::DomainPublisher;
 use boss_inventory_client::InventoryClient;
 
 use boss_people_client::{PeopleClient, PeopleClientError};
-use boss_policy::{Action, Decision, Resource, Scope};
-use boss_policy_client::{CurrentUser, PolicyClient};
+use boss_policy::{Decision, Scope};
+use boss_policy_client::{CurrentUser, PolicyClient, controls};
 use serde::{Deserialize, Serialize};
 
 use crate::asset_insights::build_asset_insights;
 use crate::bridge::asset_event_to_core;
-use crate::port::AssetsRepository;
+use crate::port::{AssetsError, AssetsRepository};
 use crate::sse::SseHub;
 use crate::types::{AssetCurrentState, AssetEvent, AssetEventKind, AssetId};
 
@@ -127,6 +127,21 @@ const STORAGE: &str = "postgres";
 #[cfg(not(feature = "postgres"))]
 const STORAGE: &str = "in-memory";
 
+/// The status a store answer is returned with: a refusal is the
+/// caller's (4xx), only a store that could not answer is a 500. Until
+/// the adapters-agree suite (backlog be459ab9) the event door answered
+/// EVERY store error 409 (a Postgres outage read as a conflict) and the
+/// batch door every one 500 (an unknown model read as an outage).
+fn refusal_status(e: &AssetsError) -> StatusCode {
+    match e {
+        AssetsError::UnknownSystem(_) => StatusCode::NOT_FOUND,
+        AssetsError::DuplicateEvent(_) => StatusCode::CONFLICT,
+        AssetsError::UnknownModel(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        AssetsError::Invalid(_) => StatusCode::BAD_REQUEST,
+        AssetsError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 async fn health() -> Json<boss_core::startup::HealthResponse> {
     Json(boss_core::startup::health_response(
         "boss-assets-api",
@@ -143,7 +158,7 @@ async fn assets_summary<R: AssetsRepository + 'static, B: EventBus + 'static>(
     let today = state.clock.now().await.now.date_naive();
     match state.assets.assets_summary(today).await {
         Ok(summary) => Json(summary).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (refusal_status(&e), e.to_string()).into_response(),
     }
 }
 
@@ -161,7 +176,7 @@ async fn list_asset_ids<R: AssetsRepository + 'static, B: EventBus + 'static>(
             offset,
         })
         .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (refusal_status(&e), e.to_string()).into_response(),
     }
 }
 
@@ -183,7 +198,7 @@ async fn list_assets<R: AssetsRepository + 'static, B: EventBus + 'static>(
             offset,
         })
         .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (refusal_status(&e), e.to_string()).into_response(),
     }
 }
 
@@ -209,7 +224,7 @@ async fn open_ticket_count_for_account<R: AssetsRepository + 'static, B: EventBu
         .await
     {
         Ok(count) => Json(OpenTicketCountResponse { account_id, count }).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (refusal_status(&e), e.to_string()).into_response(),
     }
 }
 
@@ -225,7 +240,7 @@ async fn active_asset_count_for_sku<R: AssetsRepository + 'static, B: EventBus +
 ) -> Response {
     match state.assets.active_asset_count_for_sku(&sku).await {
         Ok(count) => Json(ActiveAssetCountResponse { sku, count }).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (refusal_status(&e), e.to_string()).into_response(),
     }
 }
 
@@ -251,7 +266,7 @@ async fn asset_insights<R: AssetsRepository + 'static, B: EventBus + 'static>(
         Ok(None) => {
             return (StatusCode::NOT_FOUND, format!("no asset with id {serial}")).into_response();
         }
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return (refusal_status(&e), e.to_string()).into_response(),
     };
 
     // Fetch the catalog model first so we know which SKUs to ask
@@ -301,7 +316,7 @@ async fn get_asset<R: AssetsRepository + 'static, B: EventBus + 'static>(
     let asset_id = AssetId::new(asset_id);
     let events = match state.assets.events_for(&asset_id).await {
         Ok(e) => e,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return (refusal_status(&e), e.to_string()).into_response(),
     };
     if events.is_empty() {
         return (
@@ -312,7 +327,7 @@ async fn get_asset<R: AssetsRepository + 'static, B: EventBus + 'static>(
     }
     let current_state = match state.assets.current_state(&asset_id).await {
         Ok(s) => s,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return (refusal_status(&e), e.to_string()).into_response(),
     };
     Json(AssetResponse {
         current_state,
@@ -475,7 +490,7 @@ pub(crate) async fn require_asset_update_on(
     policy: &dyn PolicyClient,
     user: &boss_policy_client::User,
 ) -> Result<(), Response> {
-    match policy.check(user, Action::Update, Resource::asset()).await {
+    match policy.ask(user, controls::UPDATE_ASSET).await {
         Ok(Decision::Allow { scope: Scope::All }) => Ok(()),
         Ok(Decision::Allow { scope }) => Err((
             StatusCode::FORBIDDEN,
@@ -516,7 +531,7 @@ async fn post_event<R: AssetsRepository + 'static, B: EventBus + 'static>(
         return resp;
     }
     if let Err(e) = state.assets.append(event.clone()).await {
-        return (StatusCode::CONFLICT, e.to_string()).into_response();
+        return (refusal_status(&e), e.to_string()).into_response();
     }
     // The record stamp is wall time — sim time is retired from the
     // record (David, 2026-08-22, packet a7a4cae5). The AssetEvent's
@@ -558,7 +573,7 @@ async fn batch_events<R: AssetsRepository + 'static, B: EventBus + 'static>(
         Ok(s) => s,
         Err(e) => {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                refusal_status(&e),
                 Json(serde_json::json!({"error": e.to_string()})),
             )
                 .into_response();
@@ -596,6 +611,7 @@ mod tests {
     use axum::http::Request;
     use boss_classes_client::FakeClassesClient;
     use boss_people_client::{AlwaysExistsPeople, FakePeopleClient};
+    use boss_policy::{Action, Resource};
     use boss_testing::RecordingEventBus;
     use chrono::NaiveDate;
     use tower::ServiceExt;
@@ -675,6 +691,61 @@ mod tests {
             assets.events_for(&event.asset_id).await.unwrap().is_empty(),
             "a refused batch must append nothing"
         );
+    }
+
+    /// A store refusal is the caller's 4xx and only a store that could
+    /// not answer is a 500 (backlog be459ab9): the event door used to
+    /// answer every store error 409, the batch door every one 500.
+    #[test]
+    fn a_store_refusal_is_a_4xx_and_only_a_storage_failure_is_a_500() {
+        use crate::port::AssetsError;
+        for (e, want) in [
+            (
+                AssetsError::DuplicateEvent("e".into()),
+                StatusCode::CONFLICT,
+            ),
+            (
+                AssetsError::UnknownModel("m".into()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (AssetsError::Invalid("i".into()), StatusCode::BAD_REQUEST),
+            (
+                AssetsError::Storage("s".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ] {
+            assert_eq!(refusal_status(&e), want, "{e:?}");
+        }
+    }
+
+    /// An event carrying a NUL byte is refused 400 at both doors and
+    /// stored at neither (backlog be459ab9; Postgres answered it as a
+    /// 409 at one door and a 500 at the other).
+    #[tokio::test]
+    async fn a_nul_byte_is_refused_400_at_both_event_doors() {
+        let (app, assets) = app_over(
+            None,
+            Arc::new(AlwaysExistsPeople),
+            Arc::new(boss_policy_client::PermissivePolicyClient),
+        );
+        let event = received_event_with_source("evt-\0-nul", "oem-new");
+        let resp = post_event_req(app.clone(), &event).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/assets/events/batch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&vec![event.clone()]).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(assets.events_for(&event.asset_id).await.unwrap().is_empty());
     }
 
     /// A `Received` event whose intake `source` is the given code.

@@ -154,7 +154,12 @@ async fn main() -> Result<()> {
         .with_context(|| format!("binding HTTP listener on {http_addr}"))?;
     info!(addr = %http_addr, "commerce HTTP API listening");
 
-    let app = boss_core::machine_gate::mount(app, "commerce", &["/api/commerce/health"]);
+    let app = boss_core::machine_gate::mount(
+        app,
+        "commerce",
+        &["/api/commerce/health"],
+        Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }

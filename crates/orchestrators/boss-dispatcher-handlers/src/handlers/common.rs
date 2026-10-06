@@ -306,6 +306,46 @@ pub(crate) async fn post_json(
     Ok(())
 }
 
+/// [`post_json`] for a create keyed on a DETERMINISTIC id: `Ok(true)`
+/// when the POST created the row, `Ok(false)` when the service answered
+/// 409 because the id is already held — which the caller must then
+/// judge (a redelivery of its own create, or a real collision). Every
+/// other answer is [`post_json`]'s. Added for `shipping.create` (backlog
+/// be459ab9): the shipment store refuses a held id since 2026-10-01
+/// instead of upserting over it.
+pub(crate) async fn post_json_or_held(
+    client: &boss_core::machine_token::Client,
+    url: &str,
+    body: &Value,
+    rule_name: &str,
+) -> Result<bool, HandlerError> {
+    let resp = client
+        .post(url)
+        .header("content-type", "application/json")
+        .header("x-boss-user", dispatcher_actor_header(rule_name))
+        .header("x-sim-origin", sim_origin_value())
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| HandlerError::Downstream(format!("POST {url}: {e}")))?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(true);
+    }
+    if status == reqwest::StatusCode::CONFLICT {
+        return Ok(false);
+    }
+    let text = resp.text().await.unwrap_or_default();
+    if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+        return Err(HandlerError::Permanent(format!(
+            "POST {url} returned {status}: {text}"
+        )));
+    }
+    Err(HandlerError::Downstream(format!(
+        "POST {url} returned {status}: {text}"
+    )))
+}
+
 /// POST a packet and read the id the jobs API minted for it — the one
 /// thing [`post_json`] does not return, and the thing a judging
 /// handler's note on the judged packet names. Same 422 contract.
@@ -1377,9 +1417,12 @@ mod lane_pin {
         // rather than swallowed, stamped `Telemetry` beside it; eighteen
         // since the boot seed's rule-drift alarm (backlog 732c3cf9), a
         // rule file edited without a version bump, stamped `Telemetry` —
-        // a reading of the registry against the tree.
+        // a reading of the registry against the tree; nineteen since
+        // `policy.check.refusals.alarm` (backlog b8e75382 R3), a lapsed
+        // service grant read off the policy check's tally, stamped
+        // `Telemetry` like the coverage backstop beside it.
         assert_eq!(
-            filings, 18,
+            filings, 19,
             "the number of machine filing sites changed. That is fine — but check the new \
              one stamps a lane, then update this count, which exists so a filing that \
              DISAPPEARS from the scan (a renamed key, a reshaped body) cannot read as \

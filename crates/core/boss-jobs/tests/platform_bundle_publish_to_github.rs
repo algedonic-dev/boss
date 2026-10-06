@@ -86,7 +86,8 @@ fn publish_to_github_v6_keeps_its_decided_shape() {
         "open-pr still requires pr_url at done — the machine records where the PR is"
     );
 
-    // The terminal set is v5's.
+    // The terminal set is v5's, plus v11's `merged` (backlog 602fe95f)
+    // and v12's `merge-refused` (backlog 16a9c5ae).
     let mut terminals: Vec<&str> = wf
         .steps
         .iter()
@@ -95,7 +96,14 @@ fn publish_to_github_v6_keeps_its_decided_shape() {
     terminals.sort_unstable();
     assert_eq!(
         terminals,
-        vec!["declined", "nothing-to-publish", "pr-opened", "superseded"]
+        vec![
+            "declined",
+            "merge-refused",
+            "merged",
+            "nothing-to-publish",
+            "pr-opened",
+            "superseded"
+        ]
     );
 }
 
@@ -115,8 +123,11 @@ fn publish_to_github_v6_keeps_its_decided_shape() {
 ///     ready only when the scan did not conclude `success` — guarded
 ///     by `read-checks.done` so the `!=` never reads over Absent — and
 ///     it requires a disposition per rule plus the verdict enum.
-/// (3) `pr-opened` follows the judgement, or the reading alone when the
-///     scan was clean; never open-pr alone, which is the v6 defect.
+/// (3) The packet never closes over an unread or unjudged reading;
+///     never on open-pr alone, which is the v6 defect. Since v11
+///     (backlog 602fe95f) the clean-reading close is `merged`, after the
+///     App's merge, and `pr-opened` is left the judged-real close — both
+///     pinned in `publish_to_github_v11_the_app_merges_what_the_passkey_approved`.
 #[test]
 fn publish_to_github_v7_reads_the_checks_back_and_judges_them_before_closing() {
     let wf = bundled("publish-to-github");
@@ -185,16 +196,109 @@ fn publish_to_github_v7_reads_the_checks_back_and_judges_them_before_closing() {
     assert!(verdict.required);
     assert_eq!(verdict.field_type, "clean|noise|real");
 
-    // (3) the terminal never closes over an unread or unjudged scan.
+    // (3) no terminal closes over an unread or unjudged scan: each one
+    // past open-pr names the judgement, or the merge that follows the
+    // reading — never open-pr alone.
+    for title in ["pr-opened", "merged"] {
+        let t = step(title);
+        assert!(
+            !t.ready_when.contains("steps.open-pr.done"),
+            "v6's terminal — open-pr done closes the packet — is back on {title}: {}",
+            t.ready_when
+        );
+        assert!(
+            t.ready_when.contains("steps.judge-checks.done") || t.ready_when == "steps.merge.done",
+            "{title} closes neither on a judgement nor on the merge: {}",
+            t.ready_when
+        );
+    }
+}
+
+/// v11 (backlog 602fe95f, David 2026-09-30: "NOBODY pushes or merges
+/// main by hand"). Measured anonymously that day: main's classic rule
+/// required `rust` and `web`, which no workflow produces, so every merge
+/// was an admin bypass through the UI, and a UI squash stamped a personal
+/// address on the public main (#248). This names which decided property
+/// broke if someone reshapes it:
+///
+/// (1) `merge` is a MACHINE step in the open-pr shape — nobody
+///     nominated, the `ops_verb` marker the rule
+///     `merge-publish-pr-on-merge-ready` routes on, and the commit main
+///     reads at done.
+/// (2) It is ready only after the reading: green, or judged with no
+///     `real` in it — and every comparison is guarded by its step's
+///     `.done`, so none reads over an absent field (the v5 footgun).
+/// (3) `merged` closes on the merge alone; `pr-opened` closes only a
+///     judged-real reading, whose PR stays open and unmerged.
+/// (4) The approval is still ONE passkey — `approve` is unchanged and no
+///     second sign-off sits in front of the merge (the passkey signed the
+///     tree, and the merge lands exactly that tree).
+#[test]
+fn publish_to_github_v11_the_app_merges_what_the_passkey_approved() {
+    let wf = bundled("publish-to-github");
+    let step = |title: &str| {
+        wf.steps
+            .iter()
+            .find(|s| s.title == title)
+            .unwrap_or_else(|| panic!("publish-to-github has no `{title}` step"))
+    };
+
+    // (1) a machine step.
+    let merge = step("merge");
+    assert_eq!(
+        merge.authority_role, None,
+        "merge is the forge's, not a person's"
+    );
+    assert!(
+        merge.agent.is_none(),
+        "merge is the forge verb's, not an agent's"
+    );
+    assert_eq!(
+        merge
+            .metadata_defaults
+            .get("ops_verb")
+            .and_then(|v| v.as_str()),
+        Some("merge-publish-pr"),
+        "merge carries the ops_verb marker its filing rule routes on"
+    );
+    assert!(
+        merge
+            .fields
+            .iter()
+            .any(|f| f.name == "merged_sha" && f.required),
+        "merge requires merged_sha at done — the commit main reads"
+    );
+
+    // (2) after the reading, and never over an absent field.
+    assert_eq!(
+        merge.ready_when,
+        "(steps.read-checks.done AND steps.read-checks.metadata.conclusion = \"success\") OR (steps.judge-checks.done AND steps.judge-checks.metadata.verdict != \"real\")"
+    );
+
+    // (3) the two closes past the reading.
+    let merged = step("merged");
+    assert_eq!(merged.ready_when, "steps.merge.done");
+    assert_eq!(
+        merged.terminal.as_ref().map(|t| t.outcome.as_str()),
+        Some("merged")
+    );
     let opened = step("pr-opened");
     assert_eq!(
         opened.ready_when,
-        "steps.judge-checks.done OR (steps.read-checks.done AND steps.read-checks.metadata.conclusion = \"success\")"
+        "steps.judge-checks.done AND steps.judge-checks.metadata.verdict = \"real\""
     );
-    assert!(
-        !opened.ready_when.contains("steps.open-pr.done"),
-        "v6's terminal — open-pr done closes the packet — is back: {}",
-        opened.ready_when
+
+    // (4) one signature: the only sign-off in the protocol is approve's.
+    let signed: Vec<&str> = wf
+        .steps
+        .iter()
+        .filter(|s| !s.sign_offs_required.is_empty())
+        .map(|s| s.title.as_str())
+        .collect();
+    assert_eq!(
+        signed,
+        vec!["approve"],
+        "a second sign-off sits in the flow"
     );
 }
 
@@ -396,5 +500,125 @@ fn publish_to_github_v10_approve_is_a_passkey_over_the_measured_tree() {
     assert!(
         review_procedure.contains("git show <source_sha>:<path>"),
         "review reads the MEASURED tree, not whatever origin/main has become: {review_procedure}"
+    );
+}
+
+/// v12 (backlog 16a9c5ae, review 01561b13 N2). A refused merge used to
+/// leave the packet OPEN — `merged` needs merge.done — and the daily rule
+/// spawns nothing while a publish packet is open, so one red required
+/// check judged noise stopped the daily publish until a person acted.
+/// Walked through the engine that runs the predicates (`reevaluate`):
+///
+/// (1) a `merge` step the answer rule annotated FAILED closes the packet
+///     at `merge-refused` — the refusal (exit 2) and a failure before
+///     the push (exit 1) alike, because in both nothing was merged;
+/// (2) exit 3 is the verb's word for "main MOVED and the record did not
+///     follow" — that packet stays OPEN, troubled, because closing it
+///     refused would record a merge that happened as one that did not;
+/// (3) an unannotated ready merge waits, and a completed one closes
+///     `merged` and skips `merge-refused`.
+#[test]
+fn publish_to_github_v12_a_refused_merge_closes_the_packet_so_the_next_publish_runs() {
+    use boss_core::job::{JobId, Step, StepId, StepStatus, Subject};
+    use boss_jobs::registry::{materialize_steps, reevaluate};
+
+    let wf = bundled("publish-to-github");
+    let idx = |slug: &str| {
+        wf.steps
+            .iter()
+            .position(|s| s.title == slug)
+            .unwrap_or_else(|| panic!("publish-to-github has no `{slug}` step"))
+    };
+    // A publish whose reading came back green: `merge` is ready.
+    let at_merge = || -> (Subject, serde_json::Value, Vec<Step>) {
+        let subject = Subject::new("custom", "github-mirror");
+        let job_metadata = serde_json::json!({});
+        let mut steps = materialize_steps(&wf, &subject, JobId::new(), &job_metadata, StepId::new);
+        let done: [(&str, serde_json::Value); 6] = [
+            ("opened", serde_json::json!({})),
+            ("measure", serde_json::json!({"has_drift": "true"})),
+            ("review", serde_json::json!({})),
+            ("approve", serde_json::json!({"decision": "approved"})),
+            (
+                "open-pr",
+                serde_json::json!({"pr_url": "https://github.com/o/r/pull/1"}),
+            ),
+            (
+                "read-checks",
+                serde_json::json!({"conclusion": "success", "alerts": "0", "rules": "0"}),
+            ),
+        ];
+        for (slug, md) in done {
+            steps[idx(slug)].status = StepStatus::Completed;
+            steps[idx(slug)].metadata = md;
+        }
+        reevaluate(&wf, &mut steps, &subject, &job_metadata);
+        assert_eq!(steps[idx("merge")].status, StepStatus::Ready);
+        (subject, job_metadata, steps)
+    };
+    let annotated = |exit: &str| {
+        let (subject, job_metadata, mut steps) = at_merge();
+        // What `jobs.complete_linked_step`'s annotate-and-alert writes
+        // onto the still-open step (its keys, not a paraphrase of them).
+        steps[idx("merge")].metadata = serde_json::json!({
+            "ops_verb": "merge-publish-pr",
+            "failed": "publish-github-pr: REFUSED — not every check main requires is green",
+            "failed_exit": exit,
+            "failed_source": "00000000-0000-4000-8000-000000000001",
+            "alert": "00000000-0000-4000-8000-000000000002",
+        });
+        reevaluate(&wf, &mut steps, &subject, &job_metadata);
+        steps
+    };
+
+    // (3) waiting: nothing has failed, nothing has merged.
+    let (_, _, steps) = at_merge();
+    assert_eq!(steps[idx("merge-refused")].status, StepStatus::Pending);
+    assert_eq!(steps[idx("merged")].status, StepStatus::Pending);
+
+    // (1) refused, or failed before the push: the packet closes.
+    for exit in ["2", "1"] {
+        let steps = annotated(exit);
+        assert_eq!(
+            steps[idx("merge-refused")].status,
+            StepStatus::Ready,
+            "a merge that failed with exit {exit} merged nothing, and must free the daily publish"
+        );
+        assert_eq!(steps[idx("merged")].status, StepStatus::Pending);
+    }
+
+    // (2) main moved: stays open and troubled, never `merge-refused`.
+    let steps = annotated("3");
+    assert_eq!(
+        steps[idx("merge-refused")].status,
+        StepStatus::Pending,
+        "exit 3 says main IS the approved commit — closing it refused would be false"
+    );
+    // ...and so does every exit the verb did not CHOOSE as "nothing was
+    // merged" (review af3f2996 B1): the runner's timeout (124), an OOM
+    // kill (137), the verb's own "main not read yet" (4). A whitelist of
+    // 1 and 2, never a blacklist of 3 — no evidence is not a pass.
+    for exit in ["124", "137", "4", "0", ""] {
+        let steps = annotated(exit);
+        assert_eq!(
+            steps[idx("merge-refused")].status,
+            StepStatus::Pending,
+            "exit {exit:?} is no evidence that nothing merged, so the packet must stay open"
+        );
+    }
+
+    // (3) merged: the other terminal can no longer fire.
+    let (subject, job_metadata, mut steps) = at_merge();
+    steps[idx("merge")].status = StepStatus::Completed;
+    steps[idx("merge")].metadata = serde_json::json!({"merged_sha": "a".repeat(40)});
+    reevaluate(&wf, &mut steps, &subject, &job_metadata);
+    assert_eq!(steps[idx("merged")].status, StepStatus::Ready);
+    assert_eq!(steps[idx("merge-refused")].status, StepStatus::Skipped);
+
+    let refused = &wf.steps[idx("merge-refused")];
+    assert_eq!(refused.kind, "outcome");
+    assert_eq!(
+        refused.terminal.as_ref().map(|t| t.outcome.as_str()),
+        Some("merge-refused")
     );
 }

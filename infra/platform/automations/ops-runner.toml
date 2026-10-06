@@ -1,0 +1,8 @@
+# automation:ops-runner — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 25,326 (plus 18 by 9 per-pass ids under automation:ops-runner:) audit-log facts.
+# Signs as platform-admin today: infra/ops/ops-runner.sh (BOSS_USER), infra/gcp/publish-drift.sh, infra/gcp/retire-cloudflared.sh.
+
+[[automation]]
+id = "automation:ops-runner"
+role = "platform-admin"
+description = 'Runs the allowlisted verb an ops-request names on its host (infra/ops/ops-runner.sh). Each pass claims as automation:ops-runner:<host>:<moment>-<pid> (mint_claimant), so that family signs as this row.'
+signs_for = "automation:ops-runner:"

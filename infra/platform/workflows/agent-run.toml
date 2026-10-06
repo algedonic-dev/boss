@@ -124,7 +124,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "One agent's execution of one protocol step, as a packet: claimed at dispatch, briefed with the exact prompt, building until the run's gate goes green or a run that ships no car delivers its work (landed), the agent stops without doing it (refused), or the packet goes silent past twice the step's duration (died). The middle third of the operator surface — a builder that dies is a packet that ages."
-metadata = { owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin" }
 metadata_schema = { type = "object", required = ["packet", "step", "agent", "model", "budget_usd", "effort"], properties = { packet = { type = "string", description = "The job whose step this run executes." }, step = { type = "string", description = "The step's spec_slug on that job." }, agent = { type = "string", description = "The actor id the run signs as." }, model = { type = "string" }, budget_usd = { type = "number" }, effort = { type = "string" }, worktree = { type = "string" }, host = { type = "string" }, gate_run = { type = "string" }, car = { type = "string" }, spend_usd = { type = "number" }, tokens = { type = "number" } } }
 
 [[workflow.step]]

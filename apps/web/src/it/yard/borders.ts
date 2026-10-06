@@ -22,6 +22,7 @@
 // for an empty rail.
 
 import { fetchRemote, type Remote } from '../../data/remote';
+import { NOT_IN_SCOPE } from '../../policy/withheld';
 import type { RegionState, Trend } from './regions';
 
 /** What moves packets across a border, and what records that it fired
@@ -39,6 +40,10 @@ export type Machine = Readonly<{
    *  that declares a heartbeat (a cadence rule) can be judged silent. */
   silent: boolean | null;
   why: string;
+  /** The firing record was WITHHELD from this caller by policy scope —
+   *  the server's own flag (backlog 1805bac0), absent on the wire when
+   *  false, so it is never recognised from the words of `why`. */
+  withheld: boolean;
 }>;
 
 /** One packet standing at a border, with the record's own reason. */
@@ -118,6 +123,7 @@ function parseMachine(raw: unknown): Machine {
     expected_every_minutes: numberOrNull(o.expected_every_minutes),
     silent: boolOrNull(o.silent),
     why: String(o.why ?? ''),
+    withheld: o.withheld === true,
   };
 }
 
@@ -219,11 +225,23 @@ export function machineText(m: Machine): string {
   return `${m.name} · ${machineStatus(m)}`;
 }
 
+/** Whether the server WITHHELD this machine's firing record from the
+ *  caller (backlog 0964ba80 on the server): its scope does not read
+ *  every packet, and the record is not scoped by packet. Read off the
+ *  server's `withheld` flag (backlog 1805bac0) — until then off the
+ *  words of `why`, one fact kept twice in prose (CLAUDE.md 9a).
+ *  Drawn neutral and said as "not in your policy scope" — never "no
+ *  firing recorded", which is a finding about the machine (bd506215). */
+export function machineWithheld(m: Machine): boolean {
+  return m.withheld;
+}
+
 /** The status half of `machineText`, alone — the line the rail writes
  *  under the machine's name, beside its lamp (design 62de32ae decision
  *  6: the machine's name and lamp written ON the rail). */
 export function machineStatus(m: Machine): string {
   if (m.kind === 'actors') return 'worked by actors';
+  if (machineWithheld(m)) return NOT_IN_SCOPE;
   if (m.silent === true) return `SILENT ${m.silent_for_minutes ?? '?'}m`;
   if (m.silent_for_minutes !== null) return `fired ${m.silent_for_minutes}m ago`;
   return 'no firing recorded';

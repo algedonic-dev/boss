@@ -33,3 +33,6 @@ jq
 # verdicts lost during a roll). Without it that test skipped entirely,
 # so the gate did not exercise its own report path.
 python3
+# The deposit renderer validates the public ed25519 host pin locally.
+# A missing parser must fail the image's tool check before its suites.
+ssh-keygen

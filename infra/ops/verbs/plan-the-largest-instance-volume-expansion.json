@@ -1,0 +1,10 @@
+{
+  "about": "READ-ONLY: discover the largest whole-GiB expansion one run can currently admit for an explicit instance namespace/PVC, through infra/forge/expand-instance-volume.sh --plan-largest (PARTIAL backlog53c8cb72). Reads the same claim, StorageClass, Longhorn volume, replica/node lists and settings as the existing explicit-size plan, refuses incomplete or ambiguous identities and noninteger/unsafe numeric facts, and uses the existing shared Longhorn admission arithmetic. Counts ALL assigned replicas on each disk; selects the minimum of current physical and scheduling-ledger fit, 2x the current capacity and the script's100GiB ceiling. Refuses when no growth fits; it selects or moves no replica. Prints exactly one JSON proposal with verb=plan-an-instance-volume-expansion, explicit args=[namespace,pvc,resolved-size], the ordinary expansion plan and its plan_sha256; the hash also rides stderr. This is argument discovery, not automatic request filing, approval or execution. A later request must freeze the explicit proposal arguments; the unchanged expand-instance-volume mutation still requires David's passkey-signed exact plan hash and rechecks live conditions. No dynamic auto size reaches the mutation. Discovery may change as live headroom changes; the resolved explicit-size plan excludes live free-space values so admissible changes leave its approval hash unchanged. The alarm-to-request integration, unambiguous movement fallback and declared-capacity drift remain separate partial obligations. No credential or cluster write.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/expand-instance-volume.sh", "--plan-largest", "{1}", "{2}"],
+  "params": [
+    {"name": "namespace", "pattern": "^[a-z][a-z0-9-]{0,62}$"},
+    {"name": "pvc", "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"}
+  ],
+  "timeout": 120
+}

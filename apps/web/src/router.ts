@@ -12,6 +12,7 @@ import { departmentLanding } from './shell/nav-catalog';
 export type Route =
   /// The landing page (the System Model live view), at /ux/system-model.
   | { kind: 'home' }
+  | { kind: 'companyMap' }
   /// A path nothing in the app answers — rendered in place, naming the
   /// path as it was asked for (design ee3a3a2f). `department` is set
   /// only by the registry check (sections.ts `withRoster`): the path is
@@ -112,7 +113,7 @@ export type Route =
   /** The Department Map — the IT landing (design e765b3fc, car N1): the
    *  map on top, and below it the detail of `at`, the station the query
    *  selects (`/it?at=gates`). Absent, nothing is selected. */
-  | { kind: 'systemYard'; at?: string }
+  | { kind: 'systemYard'; at?: string; overview?: true; detail?: true }
   // 'systemYardFloor' (/it/yard/<region>), 'systemCrew' (/it/crew),
   // 'systemYardStatus', 'systemMonitoringConductor', 'systemFeedback'
   // and 'systemBacklog' retired 2026-09-25 with car N3 of design
@@ -218,6 +219,7 @@ export function notFoundBack(pathname: string, department?: string): { href: str
 export function parseRoute(pathname: string, search = ''): Route {
   const raw = routable(pathname);
   if (raw === '/login') return { kind: 'login' };
+  if (raw === '/map') return { kind: 'companyMap' };
 
   // ===== The IT department — /it/* =====
   //
@@ -249,6 +251,8 @@ export function parseRoute(pathname: string, search = ''): Route {
       const r: Route = { kind: 'systemYard' };
       const at = new URLSearchParams(search).get('at');
       if (at) (r as { at?: string }).at = at;
+      if (new URLSearchParams(search).get('view') === 'overview') (r as { overview?: true }).overview = true;
+      if (r.overview && new URLSearchParams(search).get('detail') === '1') r.detail = true;
       return r;
     }
     // 2. Operate — incidents lead; audit/perf/atlas/bottlenecks tabs.

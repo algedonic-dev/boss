@@ -15,9 +15,15 @@
 //!    carried to the rule reads by 493cebf3): a caller whose policy scope
 //!    reads no packets — a request with no identity is one — gets the
 //!    schedule `null`, and the rules withheld, with a scope reason, and
-//!    never reaches the rule table; a narrow scope still reads; a policy
-//!    service that cannot answer is refused, not waved through. `readyz`
-//!    is the one read left open, and it carries liveness numbers only.
+//!    never reaches the rule table; a policy service that cannot answer
+//!    is refused, not waved through. `readyz` is the one read left open,
+//!    and it carries liveness numbers only.
+//! 3. **A narrowed scope reads neither** (backlog d0058c92): the IT map
+//!    withholds the schedule from a caller whose scope reads some packets
+//!    but not every one, because neither record is scoped by packet, and
+//!    the dispatcher's own doors now agree with it. The scope is judged
+//!    TRANSLATED, as the jobs API judges it: a department grant held
+//!    outside its department reads no packets, whatever predicate it is.
 
 mod common;
 
@@ -53,6 +59,21 @@ fn policy() -> Arc<dyn PolicyClient> {
         FakePolicyClient::builder()
             .allow("operator", Action::Read, Resource::job(), Scope::All)
             .allow("builder", Action::Read, Resource::job(), Scope::Self_)
+            // `user_header` puts every caller in department `it`: the
+            // insider's grant translates to every packet, the outsider's
+            // to none (`boss_jobs::port::JobScope::from_predicate`).
+            .allow(
+                "it-lead",
+                Action::Read,
+                Resource::job(),
+                Scope::Department("it".into()),
+            )
+            .allow(
+                "sales-lead",
+                Action::Read,
+                Resource::job(),
+                Scope::Department("sales".into()),
+            )
             .build(),
     )
 }
@@ -175,10 +196,14 @@ async fn every_scheduled_rule_answers_its_last_firing_and_next_due() {
     );
 
     let app = router(state(db.pool.clone(), policy()));
-    for role in ["operator", "builder"] {
+    // The two scopes that read every packet: an unrestricted grant, and a
+    // department grant held inside its department.
+    for role in ["operator", "it-lead"] {
         let (status, v) = get(&app, Some(role)).await;
         assert_eq!(status, StatusCode::OK, "{role}: {v}");
         assert!(v["schedule_error"].is_null(), "{role}: {v}");
+        // A full scope's payload is unchanged: no withheld flag (1805bac0).
+        assert!(v.get("withheld").is_none(), "{role}: {v}");
         assert_eq!(v["now"], "2026-09-27T14:32:10Z", "{role}: {v}");
         let rows = v["schedule"].as_array().expect("the schedule is read");
         assert_eq!(
@@ -226,6 +251,46 @@ async fn a_caller_who_reads_no_packets_reads_no_schedule() {
                 .is_some_and(|e| e.contains("scope") && e.contains("reads no packets")),
             "{who}: withheld by scope, and says so rather than 'could not be read': {v}"
         );
+        // ...and in a structured flag the web reads instead of the
+        // words (backlog 1805bac0, CLAUDE.md 9a).
+        assert_eq!(v["withheld"], true, "{who}: {v}");
+    }
+}
+
+/// A NARROWED SCOPE READS NO SCHEDULE (backlog d0058c92). The schedule
+/// names every rule the dispatcher runs and when each last fired,
+/// whoever's packets it moved; it does not narrow to a caller's packets,
+/// so a scope that reads only some of them is told it is withheld — as
+/// the IT map already withholds it — and never reaches the rule table
+/// (the pool here refuses every connection). A department grant held
+/// outside its department is judged by what it TRANSLATES to: no packets
+/// at all, which `reads_packets` let through until this, because it asked
+/// only whether the policy's own answer was `None`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_narrowed_scope_reads_no_schedule() {
+    let app = router(state(unreachable_pool(), policy()));
+    for (who, role, says) in [
+        (
+            "its own packets only",
+            "builder",
+            "does not read every packet",
+        ),
+        (
+            "a department grant outside its department",
+            "sales-lead",
+            "reads no packets",
+        ),
+    ] {
+        let (status, v) = get(&app, Some(role)).await;
+        assert_eq!(status, StatusCode::OK, "{who}: {v}");
+        assert_eq!(v["schedule"], Value::Null, "{who}: {v}");
+        assert!(
+            v["schedule_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("scope") && e.contains(says) && e.contains("withheld")),
+            "{who}: withheld by scope, and says so rather than 'could not be read': {v}"
+        );
+        assert_eq!(v["withheld"], true, "{who}: {v}");
     }
 }
 
@@ -294,16 +359,65 @@ async fn a_caller_who_reads_no_packets_reads_no_rules() {
     }
 }
 
-/// The narrow scope still reads (backlog 493cebf3's third finding): the
-/// rule is "reads no packets", not "reads every packet", so a builder
-/// whose job scope is its own packets reads the rules as the operator
-/// does. A later tightening to an unrestricted-only gate fails here.
+/// A NARROWED SCOPE READS NO RULES (backlog d0058c92). This pin said the
+/// opposite until then — "the narrow scope still reads", backlog
+/// 493cebf3's third finding, which held the rule at "reads no packets"
+/// and named an unrestricted-only gate as the regression to catch. It
+/// PREDATES THE SCOPE WORK: the IT map has since withheld every record
+/// not scoped by packet from a caller who does not read every packet
+/// (070de88c, 0964ba80), and a rule's name, trigger, guard and handler
+/// are such a record. So the door now agrees with the map, and the
+/// tightening that pin guarded against is the decision (d0058c92).
+///
+/// The gate is the TRANSLATED scope, so a department grant read inside
+/// its department reads every packet and reads the rules; held outside
+/// it, it reads none and is told so.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_narrow_scope_still_reads_the_rules() {
+async fn a_narrowed_scope_reads_no_rules() {
+    let app = router(state(unreachable_pool(), policy()));
+    for (who, role, says) in [
+        (
+            "its own packets only",
+            "builder",
+            "does not read every packet",
+        ),
+        (
+            "a department grant outside its department",
+            "sales-lead",
+            "reads no packets",
+        ),
+    ] {
+        let (status, body) = get_at(&app, "/api/dispatcher/rules", Some(role)).await;
+        assert_eq!(status, StatusCode::OK, "{who}: {body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("scope") && e.contains(says) && e.contains("withheld")),
+            "{who}: withheld by scope, and says so: {v}"
+        );
+        assert_eq!(v["rules"], serde_json::json!([]), "{who}: {v}");
+        for uri in &RULE_READS[1..] {
+            let (status, body) = get_at(&app, uri, Some(role)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{who}: GET {uri}: {body}");
+            assert!(
+                body.contains(says) && body.contains("withheld"),
+                "{who}: GET {uri}: {body}"
+            );
+        }
+    }
+}
+
+/// The operator control for the pin above: a scope that reads every
+/// packet — unrestricted, or a department grant inside its department —
+/// reads every rule read as it always did. Without it the narrowed pin
+/// would pass on a door that refused everyone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scope_that_reads_every_packet_reads_the_rules() {
     let db = TestDb::new().await;
     common::shipped_raw_rules(&db).await;
     let app = router(state(db.pool.clone(), policy()));
-    for role in ["operator", "builder"] {
+    for role in ["operator", "it-lead"] {
         for uri in RULE_READS {
             let (status, body) = get_at(&app, uri, Some(role)).await;
             assert_eq!(status, StatusCode::OK, "{role}: GET {uri}: {body}");
@@ -370,4 +484,7 @@ async fn a_policy_outage_withholds_the_schedule() {
             .is_some_and(|e| e.contains("policy check failed")),
         "{v}"
     );
+    // A policy outage is a FAILURE, not a refusal by scope: it carries
+    // no withheld flag (backlog 1805bac0).
+    assert!(v.get("withheld").is_none(), "{v}");
 }

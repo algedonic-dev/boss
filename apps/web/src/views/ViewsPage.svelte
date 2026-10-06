@@ -23,6 +23,7 @@
   import { readPeopleRow, session, type ViewerRead } from '@boss/web-kit/session/session.svelte';
   import { fetchRemote, type Remote } from '../data/remote';
   import { ceilingLabel, fieldsOf, parseSources, pushableHint, scopeLine } from './sources';
+  import { parseViews, parseViewResults } from './schemas';
   import {
     type View,
     type ViewInput,
@@ -104,7 +105,7 @@
       // any user's private Views by naming them.
       const r = await fetch('/api/views');
       if (!r.ok) throw new Error(`views: HTTP ${r.status}`);
-      views = (await r.json()) as View[];
+      views = parseViews(await r.json());
       void nameSharers(views);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -133,7 +134,7 @@
     try {
       const r = await fetch(`/api/views/${v.id}/results?limit=100`);
       if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
-      results = { ...results, [v.id]: (await r.json()) as ViewResults };
+      results = { ...results, [v.id]: parseViewResults(await r.json(), v) };
       readAt = { ...readAt, [v.id]: new Date() };
     } catch (e) {
       rowErrors = { ...rowErrors, [v.id]: e instanceof Error ? e.message : String(e) };

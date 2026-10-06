@@ -18,7 +18,10 @@ use sqlx::PgPool;
 use std::collections::HashSet;
 use std::time::Instant;
 
-use crate::port::{AssetsError, AssetsRepository, BatchAppendStats};
+use crate::port::{
+    AssetsError, AssetsRepository, BatchAppendStats, model_named,
+    refuse_an_actor_that_reads_back_as_another, refuse_negative_page, refuse_nul_in_event,
+};
 use crate::project::{TicketOp, apply_event, project};
 use crate::types::{
     AssetCurrentState, AssetEvent, AssetEventId, AssetEventKind, AssetId, AssetLifecyclePhase,
@@ -66,6 +69,8 @@ fn kind_tag(kind: &AssetEventKind) -> &'static str {
 #[async_trait]
 impl AssetsRepository for PgAssets {
     async fn append(&self, event: AssetEvent) -> Result<(), AssetsError> {
+        refuse_nul_in_event(&event)?;
+        refuse_an_actor_that_reads_back_as_another(&event)?;
         let kind = kind_tag(&event.kind);
         let payload =
             serde_json::to_value(&event.kind).map_err(|e| AssetsError::Storage(e.to_string()))?;
@@ -98,14 +103,21 @@ impl AssetsRepository for PgAssets {
                 AssetsError::Storage(e.to_string())
             }
         })?;
+        // Judged after the insert, so a redelivery is a duplicate
+        // whatever it names; the refusal drops the transaction.
+        refuse_unknown_models(&mut tx, model_named(&event.kind).into_iter().collect()).await?;
 
         // Read existing projection state. This is one indexed lookup,
         // not a full event-log scan.
         let existing = fetch_system_state(&mut tx, &serial).await?;
 
-        if existing
-            .as_ref()
-            .is_some_and(|s| event.ts < s.last_event_at)
+        if sorts_before_the_projection(
+            &mut tx,
+            existing.as_ref(),
+            &event,
+            std::slice::from_ref(&event.id.0),
+        )
+        .await?
         {
             // Out-of-order arrival: full reprojection from the serial's
             // complete event log (which already includes the row we
@@ -145,6 +157,12 @@ impl AssetsRepository for PgAssets {
         // amplification on phase 1; if phase 2 grows faster, the culprit
         // is instead full-reproject frequency or projection-table bloat.
         let t_batch_start = Instant::now();
+        // All or nothing (backlog be459ab9): every refusal is judged
+        // before the transaction commits, the NUL before any SQL.
+        for event in &events {
+            refuse_nul_in_event(event)?;
+            refuse_an_actor_that_reads_back_as_another(event)?;
+        }
 
         let mut tx = self
             .pool
@@ -203,10 +221,11 @@ impl AssetsRepository for PgAssets {
             .collect();
 
         let phase_1_insert_ms = t_batch_start.elapsed().as_millis() as u64;
+        let events_len = events.len() as u64;
         let t_phase_2 = Instant::now();
 
         let inserted_count = inserted_ids.len() as u64;
-        let duplicate_count = events.len() as u64 - inserted_count;
+        let duplicate_count = events_len - inserted_count;
 
         // Then keep only the events that actually got inserted,
         // group them by serial, and update each serial's projection
@@ -214,12 +233,25 @@ impl AssetsRepository for PgAssets {
         // Within a serial we apply incrementally if all of the new
         // events are >= the existing last_event_at; otherwise we
         // fall back to a full reprojection of that serial.
+        //
+        // Only the FIRST copy of an id is the one stored: a batch may
+        // carry one id twice, and `ON CONFLICT DO NOTHING` keeps the
+        // first while RETURNING names the id once. Until backlog
+        // be459ab9 both copies were applied to the projection.
+        let mut unapplied = inserted_ids.clone();
+        let stored: Vec<AssetEvent> = events
+            .into_iter()
+            .filter(|e| unapplied.remove(&e.id.0))
+            .collect();
+        refuse_unknown_models(
+            &mut tx,
+            stored.iter().filter_map(|e| model_named(&e.kind)).collect(),
+        )
+        .await?;
         let mut by_serial: std::collections::BTreeMap<String, Vec<AssetEvent>> =
             std::collections::BTreeMap::new();
-        for e in events {
-            if inserted_ids.contains(&e.id.0) {
-                by_serial.entry(e.asset_id.0.clone()).or_default().push(e);
-            }
+        for e in stored {
+            by_serial.entry(e.asset_id.0.clone()).or_default().push(e);
         }
 
         let serials_touched = by_serial.len() as u64;
@@ -230,10 +262,14 @@ impl AssetsRepository for PgAssets {
             let serial = AssetId::new(serial_str);
 
             let existing = fetch_system_state(&mut tx, &serial).await?;
-            let earliest_new = new_events.first().unwrap().ts;
-            let needs_full_reproject = existing
-                .as_ref()
-                .is_some_and(|s| earliest_new < s.last_event_at);
+            let new_ids: Vec<String> = new_events.iter().map(|e| e.id.0.clone()).collect();
+            let needs_full_reproject = match new_events.first() {
+                Some(earliest) => {
+                    sorts_before_the_projection(&mut tx, existing.as_ref(), earliest, &new_ids)
+                        .await?
+                }
+                None => false,
+            };
 
             if needs_full_reproject {
                 full_reproject_count += 1;
@@ -295,12 +331,18 @@ impl AssetsRepository for PgAssets {
     }
 
     async fn events_for(&self, serial: &AssetId) -> Result<Vec<AssetEvent>, AssetsError> {
+        if holds_nul(&serial.0) {
+            return Ok(Vec::new());
+        }
+        // `id COLLATE "C"`: one day's events in BYTE order, the order
+        // `project` folds them in; the locale's order until backlog
+        // be459ab9.
         let rows: Vec<EventRow> = sqlx::query_as(
             r#"
             SELECT id, asset_id, ts, actor_id, payload
             FROM asset_events
             WHERE asset_id = $1
-            ORDER BY ts ASC, id ASC
+            ORDER BY ts ASC, id COLLATE "C" ASC
             "#,
         )
         .bind(&serial.0)
@@ -338,13 +380,15 @@ impl AssetsRepository for PgAssets {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<AssetId>, i64), AssetsError> {
+        refuse_negative_page(limit, offset)?;
         let (total,): (i64,) = sqlx::query_as("SELECT count(DISTINCT asset_id) FROM asset_events")
             .fetch_one(&self.pool)
             .await
             .map_err(|e| AssetsError::Storage(e.to_string()))?;
 
         let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT DISTINCT asset_id FROM asset_events ORDER BY asset_id LIMIT $1 OFFSET $2",
+            "SELECT DISTINCT asset_id COLLATE \"C\" FROM asset_events \
+             ORDER BY 1 LIMIT $1 OFFSET $2",
         )
         .bind(limit)
         .bind(offset)
@@ -368,6 +412,10 @@ impl AssetsRepository for PgAssets {
         // account filter = the typed pair (holder_kind='account');
         // the brewery's location-held equipment never matches an
         // account scope, which is the honest answer.
+        refuse_negative_page(limit, offset)?;
+        if account_id.is_some_and(holds_nul) {
+            return Ok((Vec::new(), 0));
+        }
         let (total,): (i64,) = sqlx::query_as(
             "SELECT count(*) FROM assets WHERE ($1::text IS NULL OR (holder_kind = 'account' AND holder_id = $1))",
         )
@@ -381,7 +429,7 @@ impl AssetsRepository for PgAssets {
              open_ticket_count, first_seen, last_event_at, oem_serial \
              FROM assets \
              WHERE ($1::text IS NULL OR (holder_kind = 'account' AND holder_id = $1)) \
-             ORDER BY last_event_at DESC LIMIT $2 OFFSET $3",
+             ORDER BY last_event_at DESC, asset_id COLLATE \"C\" LIMIT $2 OFFSET $3",
         )
         .bind(account_id)
         .bind(limit)
@@ -397,6 +445,9 @@ impl AssetsRepository for PgAssets {
     }
 
     async fn open_ticket_count_for_account(&self, account_id: &str) -> Result<u64, AssetsError> {
+        if holds_nul(account_id) {
+            return Ok(0);
+        }
         let (count,): (i64,) = sqlx::query_as(
             "SELECT count(*) FROM asset_open_tickets t \
              JOIN assets d ON d.asset_id = t.asset_id \
@@ -411,6 +462,9 @@ impl AssetsRepository for PgAssets {
     }
 
     async fn active_asset_count_for_sku(&self, sku: &str) -> Result<u64, AssetsError> {
+        if holds_nul(sku) {
+            return Ok(0);
+        }
         // "Active" means any phase except decommissioned. Assets just
         // received, in stock, or installed all
         // count — if a model has active devices, deleting the model
@@ -463,13 +517,15 @@ impl AssetsRepository for PgAssets {
 
         // Top SKUs by active device count. The Assets list header shows
         // a "model mix" line so a handful is enough — return all 20 and
-        // let the client truncate if it wants.
+        // let the client truncate if it wants. An unidentified asset
+        // has no model (its NULL sku failed this whole summary until
+        // backlog be459ab9); a tie reads in byte order of sku.
         let sku_rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT sku, COUNT(*)::bigint \
              FROM assets \
-             WHERE phase <> 'decommissioned' \
+             WHERE phase <> 'decommissioned' AND sku IS NOT NULL \
              GROUP BY sku \
-             ORDER BY COUNT(*) DESC",
+             ORDER BY COUNT(*) DESC, sku COLLATE \"C\"",
         )
         .fetch_all(&self.pool)
         .await
@@ -674,7 +730,7 @@ async fn apply_ticket_op_to_table(
                 "INSERT INTO asset_open_tickets \
                     (ticket_id, asset_id, summary, opened_on) \
                  VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (ticket_id) DO NOTHING",
+                 ON CONFLICT (asset_id, ticket_id) DO NOTHING",
             )
             .bind(ticket_id)
             .bind(&serial.0)
@@ -686,7 +742,11 @@ async fn apply_ticket_op_to_table(
             Ok(())
         }
         TicketOp::Close { ticket_id } => {
-            sqlx::query("DELETE FROM asset_open_tickets WHERE ticket_id = $1")
+            // By BOTH keys: a ticket id is the caller's and may be open on
+            // another asset too, whose row this close must not take
+            // (backlog b8099caf).
+            sqlx::query("DELETE FROM asset_open_tickets WHERE asset_id = $1 AND ticket_id = $2")
+                .bind(&serial.0)
                 .bind(ticket_id)
                 .execute(&mut **tx)
                 .await
@@ -718,7 +778,7 @@ async fn full_reproject_system(
     let rows: Vec<EventRow> = sqlx::query_as(
         "SELECT id, asset_id, ts, actor_id, payload \
          FROM asset_events WHERE asset_id = $1 \
-         ORDER BY ts ASC, id ASC",
+         ORDER BY ts ASC, id COLLATE \"C\" ASC",
     )
     .bind(&serial.0)
     .fetch_all(&mut **tx)
@@ -786,7 +846,7 @@ async fn full_reproject_system(
                 "INSERT INTO asset_open_tickets \
                     (ticket_id, asset_id, summary, opened_on) \
                  VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (ticket_id) DO NOTHING",
+                 ON CONFLICT (asset_id, ticket_id) DO NOTHING",
             )
             .bind(&ticket_id)
             .bind(&serial.0)
@@ -938,6 +998,74 @@ pub struct AssetsRebuildReport {
     /// Rows whose `kind` this build no longer knows — a retired kind —
     /// left out of the projection and counted here.
     pub events_skipped: u64,
+}
+
+/// A key holding a NUL byte names nothing TEXT can hold, so a read keyed
+/// by one is the miss it is — Postgres refused the bind with its
+/// encoding error, a 500, until backlog be459ab9.
+fn holds_nul(key: &str) -> bool {
+    key.contains('\0')
+}
+
+/// Refuse the first of `skus` (in the order given) that names no
+/// catalog model, `UnknownModel`, before the projection's foreign key
+/// would answer it as `Storage` (backlog be459ab9).
+async fn refuse_unknown_models(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    skus: Vec<&str>,
+) -> Result<(), AssetsError> {
+    if skus.is_empty() {
+        return Ok(());
+    }
+    let unknown: Option<(String,)> = sqlx::query_as(
+        "SELECT t.s FROM unnest($1::text[]) WITH ORDINALITY AS t(s, n) \
+         WHERE NOT EXISTS (SELECT 1 FROM asset_models m WHERE m.sku = t.s) \
+         ORDER BY t.n LIMIT 1",
+    )
+    .bind(&skus)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| AssetsError::Storage(e.to_string()))?;
+    match unknown {
+        Some((sku,)) => Err(AssetsError::UnknownModel(sku)),
+        None => Ok(()),
+    }
+}
+
+/// Whether `event` (the earliest of `new_ids`, all already inserted)
+/// sorts before the projection's last folded event, so the fast path
+/// would apply it out of the log's order and a full reprojection is
+/// owed. A DAY earlier always does. On the projection's own last day it
+/// does when a stored event of that day — not one of `new_ids` — sorts
+/// after it in byte order of id, the order `project` folds a day in.
+/// Until backlog be459ab9 only the day was compared, so a same-day
+/// event arriving late was folded after one it precedes, and the
+/// projection table answered a different phase than the log.
+async fn sorts_before_the_projection(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    existing: Option<&AssetCurrentState>,
+    event: &AssetEvent,
+    new_ids: &[String],
+) -> Result<bool, AssetsError> {
+    let Some(state) = existing else {
+        return Ok(false);
+    };
+    if event.ts != state.last_event_at {
+        return Ok(event.ts < state.last_event_at);
+    }
+    let (later,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM asset_events \
+         WHERE asset_id = $1 AND ts = $2 AND id COLLATE \"C\" > $3 \
+           AND NOT (id = ANY($4)))",
+    )
+    .bind(&event.asset_id.0)
+    .bind(event.ts)
+    .bind(&event.id.0)
+    .bind(new_ids)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|e| AssetsError::Storage(e.to_string()))?;
+    Ok(later)
 }
 
 fn is_unique_violation(e: &sqlx::Error) -> bool {

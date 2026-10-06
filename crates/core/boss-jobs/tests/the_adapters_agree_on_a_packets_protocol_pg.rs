@@ -21,35 +21,24 @@ use uuid::Uuid;
 fn job(id: JobId) -> Job {
     Job {
         id,
-        kind: "field-service".into(),
         workflow_version: 3,
-        subject: Subject::new("asset", "SYS-1"),
-        title: "Repair".into(),
-        owner_id: "emp-owner".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "field-service",
+            Subject::new("asset", "SYS-1"),
+            "Repair",
+            "emp-owner",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+        )
     }
 }
 
 fn field(name: &str) -> StepField {
     StepField {
-        name: name.into(),
-        field_type: "string".into(),
         required: true,
-        filled_by: boss_core::job::FilledBy::Executor,
-        item_keys: Vec::new(),
-        covers: None,
-        binds: None,
-        item_value_max_bytes: None,
-        item_one_of: Vec::new(),
-        writer: None,
+        ..StepField::new(name, "string")
     }
 }
 

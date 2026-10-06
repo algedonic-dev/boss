@@ -57,6 +57,7 @@
 //! deleted. The same rule, decided once, governs the roster's
 //! employees in `boss tenant publish`.
 
+pub mod automations;
 pub mod door;
 pub mod http;
 pub mod in_memory;
@@ -66,6 +67,7 @@ pub mod postgres;
 pub mod seed;
 pub mod types;
 
+pub use automations::{AUTOMATION_DECLARED, AutomationActor, AutomationsSeedOutcome};
 pub use door::{LoginDoor, Resolution, UNRESOLVED_LOGIN, decide, resolve_login};
 pub use in_memory::InMemoryAgents;
 pub use port::{AGENT_DECLARED, AGENT_UPDATED, AgentsError, AgentsRegistry};

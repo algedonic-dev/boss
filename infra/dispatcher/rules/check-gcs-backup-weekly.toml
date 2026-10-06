@@ -1,0 +1,14 @@
+# Remote bytes must be read back on record before local dumps are reclaimed.
+# No open-packet guard: one unfinished request must not retire this check.
+[[rule]]
+name = "check-gcs-backup-weekly"
+why = """
+A TIMER, the standing exemption: a week passed is no packet's event.
+Backlog 3a68ab36 asks for recorded remote archive validation because the
+nightly uploader proves only its local source. File the existing ops-request
+protocol with a read-only verb; its result is watched by ops.judge.
+"""
+schedule = { cadence = "weekly", anchor_date = "2026-10-02" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = '"ops-request"', subject_kind = '"custom"', subject = '"gcs-backup-readback"', title = '"Verify the newest remote GCS database archive"', "metadata.host" = '"forge"', "metadata.verb" = '"check-gcs-backup"', "metadata.area" = '"backup"' }

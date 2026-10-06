@@ -625,10 +625,12 @@ fn the_cutover_is_one_fourteen_digit_stamp() {
             "stations",
             "step_plugins",
             "cadence_rules",
-            "delivery_policy"
+            "delivery_policy",
+            "automation_actors"
         ],
         "the registry list names the four registries 393d3234 moved — stations \
          (car 1), step_plugins (car 2), cadence_rules (car 3), delivery_policy \
-         (car 4) — and a fifth arrives with its own bundle and pin: {tables:?}"
+         (car 4) — and automation_actors, born a bundle (infra/platform/automations/, \
+         ddf0773e); a sixth arrives with its own bundle and pin: {tables:?}"
     );
 }

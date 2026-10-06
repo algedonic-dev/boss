@@ -47,9 +47,12 @@
 # and unit files — it backs up nothing the host keeps. Its kanidm leg
 # copies /var/lib/kanidm/backups, which is empty here: the estate
 # registry (infra/postgres/schema/144-estate-subjects.sql) places kanidm
-# on cp-1. The cluster's offsite dumps arrive under
+# on cp-1. The cluster's offsite dumps arrived under
 # /var/backups/boss-cluster-pg through an SSH forced command, not this
-# unit, and are untouched. roles.toml already classifies it legacy-stack.
+# unit, and were untouched by this verb; that leg was retired on
+# 2026-10-01 (backlog 4bf7bdd1: the GCS bucket is the offsite copy), and
+# what it left goes through reclaim-gcp-root's bound 8. roles.toml
+# already classifies it legacy-stack.
 # The verb's own capture — a pg_dump of that database to
 # /var/backups/boss/second-stack/ before the first stop — is its last
 # backup; the tarballs it left stay on disk.

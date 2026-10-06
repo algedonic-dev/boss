@@ -25,7 +25,9 @@
 //! and grant it the kinds. That is the shape the decision chose — plain
 //! `job` is the superset, not a default the kinds refine.
 
-use boss_policy_client::{Action, Decision, PolicyClient, PolicyClientError, Resource, User};
+use boss_policy_client::{
+    Action, Decision, PolicyClient, PolicyClientError, Resource, User, controls,
+};
 
 /// Whether `user` may open a packet of `kind`, and on which grant.
 ///
@@ -40,7 +42,7 @@ pub async fn may_open(
     user: &User,
     kind: Option<&str>,
 ) -> Result<Decision, PolicyClientError> {
-    let every_kind = policy.check(user, Action::Create, Resource::job()).await?;
+    let every_kind = policy.ask(user, controls::CREATE_JOB).await?;
     if every_kind.is_allowed() {
         return Ok(every_kind);
     }

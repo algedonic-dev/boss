@@ -1,6 +1,8 @@
-//! `infra/forge/github-act.sh` — the three bounded GitHub verbs of design
+//! `infra/forge/github-act.sh` — the four bounded GitHub verbs of design
 //! 76155676 decision 4 (David 2026-09-27; backlog 6a8ff89f): create a
-//! repository, set branch protection, delete named refs. Each is a
+//! repository, set branch protection, delete named refs, and turn GitHub
+//! Actions off (backlog e727fcfd; create-repository turns them off too,
+//! after its 201). Each is a
 //! READ-ONLY plan verb and a passkey-approved write in design 17835005's
 //! shape, authenticated as the GitHub App's installation on the owner the
 //! request names, and each proves its act by reading GitHub back.
@@ -24,7 +26,7 @@
 //!   * the token slot: absent, loose, foreign-owned, expired or
 //!     expiry-less is refused before GitHub is called, and the token
 //!     never appears in any output or any argv
-//!   * the six verb files hold the approval contract, and through the
+//!   * the eight verb files hold the approval contract, and through the
 //!     ops runner the plan verb is answered while the write, unapproved,
 //!     never reaches GitHub
 
@@ -154,6 +156,24 @@ server() {
           else . end' "$3"
 }
 case "$method $bare" in
+    # CLASSIC branch protection, by branch name (backlog 602fe95f): a
+    # branch whose `<owner>/<repo>.classic/<branch>.json` exists is
+    # protected, and answers that body; any other answers GitHub's 404.
+    # `$STUB_DIR/classic_status` answers that status to the read instead,
+    # and `$STUB_DIR/classic_ignored` answers the DELETE 204 and keeps the
+    # rule — a delete that did not take.
+    "GET /repos/"*/*/branches/*/protection)
+        rest="${bare#/repos/}"; or="${rest%%/branches/*}"; b="${rest#*/branches/}"; b="${b%/protection}"
+        [ -e "$STUB_DIR/classic_status" ] && reply "$(cat "$STUB_DIR/classic_status")" '{"message":"Resource not accessible by integration"}'
+        f="$R/$or.classic/$b.json"
+        [ -e "$f" ] && reply 200 "$(cat "$f")"
+        reply 404 '{"message":"Branch not protected","documentation_url":"https://docs.github.com/rest"}' ;;
+    "DELETE /repos/"*/*/branches/*/protection)
+        rest="${bare#/repos/}"; or="${rest%%/branches/*}"; b="${rest#*/branches/}"; b="${b%/protection}"
+        f="$R/$or.classic/$b.json"
+        [ -e "$f" ] || reply 404 '{"message":"Branch not protected"}'
+        [ -e "$STUB_DIR/ignore_writes" ] || [ -e "$STUB_DIR/classic_ignored" ] || rm -f "$f"
+        reply 204 '' ;;
     "GET /orgs/"*)
         f="$STUB_DIR/org_${bare#/orgs/}.json"
         [ -e "$f" ] && reply 200 "$(cat "$f")"
@@ -191,6 +211,19 @@ case "$method $bare" in
         body="$(server "$id" "$or" "$data")"
         [ -e "$STUB_DIR/ignore_writes" ] || printf '%s' "$body" > "$d/$id.json"
         reply 201 "$body" ;;
+    # A repository's Actions permission: GitHub's default on a repository
+    # it holds is enabled, all actions; a PUT stores what it was sent and
+    # answers 204 (backlog e727fcfd).
+    "GET /repos/"*/*/actions/permissions)
+        rest="${bare#/repos/}"; or="${rest%/actions/permissions}"
+        [ -e "$R/$or.json" ] || reply 404 '{"message":"Not Found"}'
+        [ -e "$R/$or.actions.json" ] && reply 200 "$(cat "$R/$or.actions.json")"
+        reply 200 '{"enabled":true,"allowed_actions":"all"}' ;;
+    "PUT /repos/"*/*/actions/permissions)
+        rest="${bare#/repos/}"; or="${rest%/actions/permissions}"
+        [ -e "$R/$or.json" ] || reply 404 '{"message":"Not Found"}'
+        [ -e "$STUB_DIR/ignore_writes" ] || jq -c '{enabled}' "$data" > "$R/$or.actions.json"
+        reply 204 '' ;;
     "GET /repos/"*)
         f="$R/${bare#/repos/}.json"
         [ -e "$f" ] && reply 200 "$(cat "$f")"
@@ -423,6 +456,30 @@ impl Gh {
             .map(|s| serde_json::from_str(&s).unwrap())
     }
 
+    /// Whether GitHub Actions are enabled on `owner/name`, as the stub
+    /// holds it: `None` when the repository does not exist.
+    fn actions_enabled(&self, owner: &str, name: &str) -> Option<bool> {
+        self.repo(owner, name)?;
+        let f = self
+            .state
+            .join(format!("repos/{owner}/{name}.actions.json"));
+        Some(match std::fs::read_to_string(f) {
+            Ok(s) => serde_json::from_str::<Value>(&s).unwrap()["enabled"]
+                .as_bool()
+                .unwrap(),
+            Err(_) => true,
+        })
+    }
+
+    fn put_actions(&self, owner: &str, name: &str, enabled: bool) {
+        write_file(
+            &self
+                .state
+                .join(format!("repos/{owner}/{name}.actions.json")),
+            &json!({"enabled": enabled}).to_string(),
+        );
+    }
+
     fn rulesets(&self, owner: &str, name: &str) -> Vec<Value> {
         let d = self.state.join(format!("repos/{owner}/{name}.rulesets"));
         let Ok(rd) = std::fs::read_dir(&d) else {
@@ -462,6 +519,13 @@ fn a_repository_plan_names_its_act_changes_nothing_and_renders_the_same_twice() 
             "organisation: algedonic-dev (id 4242)",
             "state: absent",
             r#"act: POST /orgs/algedonic-dev/repos {"name":"boss-dr","private":true,"visibility":"private","auto_init":false}"#,
+            // GitHub enables Actions on every new repository; this verb's
+            // repositories are BOSS-managed copies whose workflows are the
+            // forge's, so the plan the passkey signs says it turns them
+            // off (backlog e727fcfd).
+            "actions: disabled after the create",
+            r#"act: PUT /repos/algedonic-dev/boss-dr/actions/permissions {"enabled":false}"#,
+            "Actions read back as enabled false",
             "never: a fork",
         ],
         "the plan",
@@ -488,17 +552,22 @@ fn the_write_creates_on_the_signed_plan_proves_it_and_refuses_a_second_run() {
             "plan: github-create-repository",
             "still holds",
             "answered 201",
-            "proven — GET /repos/algedonic-dev/boss-dr reads back as algedonic-dev/boss-dr, private true, fork false",
+            "PUT /repos/algedonic-dev/boss-dr/actions/permissions answered 204",
+            "proven — GET /repos/algedonic-dev/boss-dr reads back as algedonic-dev/boss-dr, private true, fork false; Actions read back as enabled false",
         ],
         "the write",
     );
     assert_eq!(
         g.writes(),
-        vec!["POST /orgs/algedonic-dev/repos".to_string()]
+        vec![
+            "POST /orgs/algedonic-dev/repos".to_string(),
+            "PUT /repos/algedonic-dev/boss-dr/actions/permissions".to_string(),
+        ]
     );
     let r = g.repo(ORG, "boss-dr").expect("the repository exists");
     assert_eq!(r["private"], true);
     assert_eq!(r["fork"], false);
+    assert_eq!(g.actions_enabled(ORG, "boss-dr"), Some(false));
     assert_eq!(g.revokes(), 1, "the act's token outlived it:\n{}", g.log());
 
     // The state moved, so the signed plan no longer holds: no second act,
@@ -516,7 +585,7 @@ fn the_write_creates_on_the_signed_plan_proves_it_and_refuses_a_second_run() {
         &["not the approved", "state: exists as declared"],
         "the refusal",
     );
-    assert_eq!(g.writes().len(), 1, "a second run wrote: {:?}", g.writes());
+    assert_eq!(g.writes().len(), 2, "a second run wrote: {:?}", g.writes());
 }
 
 #[test]
@@ -528,11 +597,13 @@ fn a_repository_that_already_stands_as_declared_is_a_plan_with_no_act() {
         "boss-dr",
         json!({"id": 9, "full_name": "algedonic-dev/boss-dr", "private": true, "visibility": "private", "fork": false, "archived": false}),
     );
+    g.put_actions(ORG, "boss-dr", false);
     let p = g.run(&["create-repository", "--plan", ORG, "boss-dr", "private"]);
     contains_all(
         &p.stdout,
         &[
             "state: exists as declared — id 9, visibility private, private true, fork false, not archived",
+            "actions: disabled — GET /repos/algedonic-dev/boss-dr/actions/permissions answers enabled false",
             "act: none",
         ],
         "the plan",
@@ -547,6 +618,62 @@ fn a_repository_that_already_stands_as_declared_is_a_plan_with_no_act() {
     assert_eq!(w.code, 0, "{}", w.text());
     assert!(w.stdout.contains("nothing was created"), "{}", w.text());
     assert!(g.writes().is_empty(), "{:?}", g.writes());
+}
+
+/// A create whose Actions PUT failed after the 201 leaves the repository
+/// standing with Actions ENABLED. That must be a failure naming what
+/// stands, and the next plan converges it: the PUT alone, never a second
+/// POST (backlog e727fcfd).
+#[test]
+fn a_create_whose_actions_put_fails_is_exit_1_and_the_next_plan_is_the_put_alone() {
+    needs_tools!();
+    let g = Gh::new("create-actions-fail");
+    let sha = g
+        .run(&["create-repository", "--plan", ORG, "boss-dr", "private"])
+        .plan_sha();
+    g.fault("status_PUT", "403");
+    let w = g.run(&["create-repository", ORG, "boss-dr", "private", &sha]);
+    assert_eq!(w.code, 1, "{}", w.text());
+    contains_all(
+        &w.stderr,
+        &["answered HTTP 403", "Actions still ENABLED"],
+        "the failure",
+    );
+    assert_eq!(g.actions_enabled(ORG, "boss-dr"), Some(true));
+
+    let _ = std::fs::remove_file(g.state.join("status_PUT"));
+    g.remint();
+    let p = g.run(&["create-repository", "--plan", ORG, "boss-dr", "private"]);
+    contains_all(
+        &p.stdout,
+        &[
+            "state: exists as declared — id 777",
+            "actions: enabled — GET /repos/algedonic-dev/boss-dr/actions/permissions answers enabled true",
+            r#"act: PUT /repos/algedonic-dev/boss-dr/actions/permissions {"enabled":false}"#,
+        ],
+        "the converging plan",
+    );
+    assert!(!p.stdout.contains("act: POST"), "{}", p.stdout);
+    let w = g.run(&[
+        "create-repository",
+        ORG,
+        "boss-dr",
+        "private",
+        &p.plan_sha(),
+    ]);
+    assert_eq!(w.code, 0, "{}", w.text());
+    assert!(
+        w.stdout.contains("Actions read back as enabled false"),
+        "{}",
+        w.text()
+    );
+    assert_eq!(g.actions_enabled(ORG, "boss-dr"), Some(false));
+    assert_eq!(
+        g.writes().iter().filter(|l| l.starts_with("POST")).count(),
+        1,
+        "{:?}",
+        g.writes()
+    );
 }
 
 #[test]
@@ -1526,6 +1653,530 @@ fn a_ruleset_that_does_not_read_back_fails_and_bad_arguments_are_refused() {
 }
 
 // ---------------------------------------------------------------------------
+// set-branch-protection REPLACES a classic rule on the branch it names
+// (backlog 602fe95f, David 2026-09-30: only the GitHub App updates
+// algedonic-dev/boss main). Measured anonymously that day: main carried
+// CLASSIC protection requiring the checks `rust` and `web` of non-admins,
+// which no workflow has produced since ci.yml became one Gate job — so
+// every merge was an admin bypass. GitHub applies a classic rule AND a
+// ruleset together, so the App (not an admin) would stay blocked behind
+// the stale requirement however the ruleset read: the verb that installs
+// the ruleset removes the classic rule it replaces, in the same signed
+// plan, and only once the ruleset reads back.
+// ---------------------------------------------------------------------------
+
+/// The classic rule GitHub held on algedonic-dev/boss main on 2026-09-30,
+/// as `GET /repos/{o}/{r}/branches/main/protection` shapes it: two stale
+/// required contexts, enforced for non-admins only.
+fn stale_classic() -> Value {
+    json!({
+        "url": "https://api.github.test/repos/algedonic-dev/boss-dr/branches/main/protection",
+        "required_status_checks": {
+            "url": "https://api.github.test/x", "strict": false,
+            "contexts": ["web", "rust"],
+            "checks": [{"context": "web", "app_id": 15368}, {"context": "rust", "app_id": 15368}]
+        },
+        "enforce_admins": {"url": "https://api.github.test/x", "enabled": false},
+        "required_linear_history": {"enabled": false},
+        "allow_force_pushes": {"enabled": false},
+        "allow_deletions": {"enabled": false},
+        "required_conversation_resolution": {"enabled": false},
+        "lock_branch": {"enabled": false}
+    })
+}
+
+fn put_classic(g: &Gh, repo: &str, branch: &str, v: Value) {
+    let d = g.state.join(format!("repos/{ORG}/{repo}.classic"));
+    std::fs::create_dir_all(&d).unwrap();
+    write_file(&d.join(format!("{branch}.json")), &v.to_string());
+}
+
+fn classic_held(g: &Gh, repo: &str, branch: &str) -> bool {
+    g.state
+        .join(format!("repos/{ORG}/{repo}.classic/{branch}.json"))
+        .exists()
+}
+
+#[test]
+fn a_classic_rule_on_the_branch_is_planned_and_deleted_once_the_ruleset_reads_back() {
+    needs_tools!();
+    let g = Gh::new("protect-classic");
+    put_boss_dr(&g);
+    put_classic(&g, "boss-dr", "main", stale_classic());
+    let args = [ORG, "boss-dr", "main", "app:123456", "Gate"];
+    let p = g.run(&[&["set-branch-protection", "--plan"][..], &args[..]].concat());
+    contains_all(
+        &p.stdout,
+        &[
+            "classic protection on refs/heads/main: present — GET /repos/algedonic-dev/boss-dr/branches/main/protection answers 200",
+            "  classic: required_status_checks strict=false contexts=rust,web",
+            "  classic: enforce_admins false",
+            "act: POST /repos/algedonic-dev/boss-dr/rulesets",
+            "act: DELETE /repos/algedonic-dev/boss-dr/branches/main/protection",
+        ],
+        "the plan",
+    );
+    // The plan names both acts, the ruleset's first.
+    let post = p.stdout.find("act: POST").unwrap();
+    let delete = p.stdout.find("act: DELETE").unwrap();
+    assert!(
+        post < delete,
+        "the ruleset is planned before the delete:\n{}",
+        p.stdout
+    );
+
+    let w = g.run(
+        &[
+            &["set-branch-protection"][..],
+            &args[..],
+            &[p.plan_sha().as_str()][..],
+        ]
+        .concat(),
+    );
+    assert_eq!(w.code, 0, "{}", w.text());
+    // In THAT order: the ruleset stands before the rule it replaces goes,
+    // so the branch is never unprotected in between.
+    assert_eq!(
+        g.writes(),
+        vec![
+            "POST /repos/algedonic-dev/boss-dr/rulesets".to_string(),
+            "DELETE /repos/algedonic-dev/boss-dr/branches/main/protection".to_string(),
+        ]
+    );
+    assert!(
+        !classic_held(&g, "boss-dr", "main"),
+        "the classic rule still stands"
+    );
+    contains_all(
+        &w.stdout,
+        &[
+            "github-act: proven — ruleset 101",
+            "reads back as desired; the classic protection on refs/heads/main is removed",
+        ],
+        "the write",
+    );
+
+    // Applied, the plan says there is nothing classic left — and nothing to do.
+    g.remint();
+    let p2 = g.run(&[&["set-branch-protection", "--plan"][..], &args[..]].concat());
+    contains_all(
+        &p2.stdout,
+        &[
+            "classic protection on refs/heads/main: none — GET /repos/algedonic-dev/boss-dr/branches/main/protection answers 404 Branch not protected",
+            "act: none",
+        ],
+        "the second plan",
+    );
+    assert!(!p2.stdout.contains("act: DELETE"), "{}", p2.stdout);
+}
+
+#[test]
+fn a_classic_rule_is_never_deleted_before_the_ruleset_stands_and_a_delete_that_does_not_take_fails()
+{
+    needs_tools!();
+    // A ruleset that does not read back: the classic rule is never touched.
+    let g = Gh::new("protect-classic-order");
+    put_boss_dr(&g);
+    put_classic(&g, "boss-dr", "main", stale_classic());
+    let args = [ORG, "boss-dr", "main", "app:1", "Gate"];
+    let sha = g
+        .run(&[&["set-branch-protection", "--plan"][..], &args[..]].concat())
+        .plan_sha();
+    g.fault("ignore_writes", "");
+    let w = g.run(
+        &[
+            &["set-branch-protection"][..],
+            &args[..],
+            &[sha.as_str()][..],
+        ]
+        .concat(),
+    );
+    assert_eq!(w.code, 1, "{}", w.text());
+    assert!(
+        !g.writes().iter().any(|l| l.starts_with("DELETE")),
+        "the classic rule was deleted though the ruleset did not read back: {:?}",
+        g.writes()
+    );
+
+    // The ruleset already stands; the plan is the delete alone — and a
+    // delete GitHub answers 204 but does not make is exit 1, naming it.
+    let g = Gh::new("protect-classic-ignored");
+    put_boss_dr(&g);
+    let sha = g
+        .run(&[&["set-branch-protection", "--plan"][..], &args[..]].concat())
+        .plan_sha();
+    let first = g.run(
+        &[
+            &["set-branch-protection"][..],
+            &args[..],
+            &[sha.as_str()][..],
+        ]
+        .concat(),
+    );
+    assert_eq!(first.code, 0, "{}", first.text());
+    g.remint();
+    put_classic(&g, "boss-dr", "main", stale_classic());
+    let p = g.run(&[&["set-branch-protection", "--plan"][..], &args[..]].concat());
+    contains_all(
+        &p.stdout,
+        &[
+            "(id 101)",
+            "act: DELETE /repos/algedonic-dev/boss-dr/branches/main/protection",
+        ],
+        "the delete-only plan",
+    );
+    assert!(!p.stdout.contains("act: PUT"), "{}", p.stdout);
+    assert!(!p.stdout.contains("act: POST"), "{}", p.stdout);
+    g.fault("classic_ignored", "");
+    let w = g.run(
+        &[
+            &["set-branch-protection"][..],
+            &args[..],
+            &[p.plan_sha().as_str()][..],
+        ]
+        .concat(),
+    );
+    assert_eq!(w.code, 1, "{}", w.text());
+    assert!(
+        w.stderr
+            .contains("classic protection on refs/heads/main still reads"),
+        "{}",
+        w.stderr
+    );
+}
+
+/// The check the mirror's ci.yml produces is named `Gate (infra/gate.sh,
+/// full)` — a space, a comma and parentheses, none of which an ops
+/// argument carries (the runner splits argv on whitespace, and the list
+/// is comma-separated). So a check name is spelled with `%XX` escapes, as
+/// in a URL, and the plan — what the passkey signs — prints it DECODED,
+/// the name GitHub will require. A malformed or control-character escape
+/// is refused before anything is read.
+#[test]
+fn a_check_name_with_spaces_is_spelled_with_escapes_and_signed_decoded() {
+    needs_tools!();
+    let g = Gh::new("protect-escaped-check");
+    put_boss_dr(&g);
+    let args = [
+        ORG,
+        "boss-dr",
+        "main",
+        "app:1",
+        "Gate%20%28infra%2Fgate.sh%2C%20full%29",
+    ];
+    let p = g.run(&[&["set-branch-protection", "--plan"][..], &args[..]].concat());
+    contains_all(
+        &p.stdout,
+        &[
+            "required checks: Gate (infra/gate.sh, full)",
+            "  rule: required_status_checks Gate (infra/gate.sh, full)@any strict=false",
+        ],
+        "the plan",
+    );
+    let w = g.run(
+        &[
+            &["set-branch-protection"][..],
+            &args[..],
+            &[p.plan_sha().as_str()][..],
+        ]
+        .concat(),
+    );
+    assert_eq!(w.code, 0, "{}", w.text());
+    let rs = g.rulesets(ORG, "boss-dr");
+    let checks: Vec<&Value> = rs[0]["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["type"] == "required_status_checks")
+        .collect();
+    assert_eq!(
+        checks[0]["parameters"]["required_status_checks"],
+        json!([{"context": "Gate (infra/gate.sh, full)"}]),
+        "GitHub is sent the decoded name"
+    );
+
+    for bad in ["Gate%2", "Gate%0Afull", "Gate%zz", "%20Gate"] {
+        let o = g.run(&[
+            "set-branch-protection",
+            "--plan",
+            ORG,
+            "boss-dr",
+            "main",
+            "app:1",
+            bad,
+        ]);
+        assert_eq!(o.code, 78, "{bad} was not refused:\n{}", o.text());
+    }
+}
+
+/// A required check PINNED to the App that runs it (backlog 16a9c5ae,
+/// review 01561b13 N1). Unpinned, a check run of the Gate's name from ANY
+/// App that can write checks satisfies main's rule — CodeQL's App could
+/// post one on the mirror. `<name>@<App id>` sends GitHub
+/// `integration_id`, the plan (what the passkey signs) names the App, the
+/// ruleset reads back pinned, and a pin that is not a number is refused.
+#[test]
+fn a_check_pinned_to_its_app_is_sent_as_the_integration_it_must_come_from() {
+    needs_tools!();
+    let g = Gh::new("protect-pinned-check");
+    put_boss_dr(&g);
+    let args = [
+        ORG,
+        "boss-dr",
+        "main",
+        "app:1",
+        "Gate%20%28infra%2Fgate.sh%2C%20full%29@15368,build",
+    ];
+    let p = g.run(&[&["set-branch-protection", "--plan"][..], &args[..]].concat());
+    contains_all(
+        &p.stdout,
+        &[
+            "required checks: Gate (infra/gate.sh, full) (from App 15368 only),build",
+            "  rule: required_status_checks Gate (infra/gate.sh, full)@15368,build@any strict=false",
+        ],
+        "the plan",
+    );
+    let w = g.run(
+        &[
+            &["set-branch-protection"][..],
+            &args[..],
+            &[p.plan_sha().as_str()][..],
+        ]
+        .concat(),
+    );
+    assert_eq!(w.code, 0, "{}", w.text());
+    let rs = g.rulesets(ORG, "boss-dr");
+    let checks: Vec<&Value> = rs[0]["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["type"] == "required_status_checks")
+        .collect();
+    assert_eq!(
+        checks[0]["parameters"]["required_status_checks"],
+        json!([
+            {"context": "Gate (infra/gate.sh, full)", "integration_id": 15368},
+            {"context": "build"}
+        ]),
+        "GitHub is sent the pin as integration_id, and an unpinned check without one"
+    );
+
+    for bad in ["Gate@", "Gate@x1", "Gate@1@2", "@15368"] {
+        let o = g.run(&[
+            "set-branch-protection",
+            "--plan",
+            ORG,
+            "boss-dr",
+            "main",
+            "app:1",
+            bad,
+        ]);
+        assert_eq!(o.code, 78, "{bad} was not refused:\n{}", o.text());
+    }
+}
+
+#[test]
+fn a_pattern_reads_no_classic_rule_and_an_unreadable_one_renders_no_plan() {
+    needs_tools!();
+    // `publish/**` names no single branch, and GitHub reads classic
+    // protection by branch name: the plan says so and asks nothing.
+    let g = Gh::new("protect-classic-pattern");
+    put_boss_dr(&g);
+    let p = g.run(&[
+        "set-branch-protection",
+        "--plan",
+        ORG,
+        "boss-dr",
+        "publish/**",
+        "app:1",
+        "none",
+    ]);
+    assert_eq!(p.code, 0, "{}", p.text());
+    assert!(
+        p.stdout
+            .contains("classic protection: not read — publish/** is a pattern"),
+        "{}",
+        p.stdout
+    );
+    assert!(!g.log().contains("/branches/"), "{}", g.log());
+
+    // A read the installation is refused is no answer: no plan to sign.
+    let g = Gh::new("protect-classic-403");
+    put_boss_dr(&g);
+    g.fault("classic_status", "403");
+    let p = g.run(&[
+        "set-branch-protection",
+        "--plan",
+        ORG,
+        "boss-dr",
+        "main",
+        "app:1",
+        "none",
+    ]);
+    assert_eq!(p.code, 1, "{}", p.text());
+    assert!(
+        p.stderr
+            .contains("branches/main/protection answered HTTP 403"),
+        "{}",
+        p.stderr
+    );
+    assert!(g.writes().is_empty(), "{:?}", g.writes());
+}
+
+// ---------------------------------------------------------------------------
+// disable-actions (backlog e727fcfd): every DR push of forge main would
+// otherwise run the tree's own workflows on a private repository
+// ---------------------------------------------------------------------------
+
+#[test]
+fn actions_are_disabled_on_the_signed_plan_and_read_back_enabled_false() {
+    needs_tools!();
+    let g = Gh::new("actions-disable");
+    put_boss_dr(&g);
+    let p = g.run(&["disable-actions", "--plan", ORG, "boss-dr"]);
+    contains_all(
+        &p.stdout,
+        &[
+            "plan: github-disable-actions",
+            "repository: algedonic-dev/boss-dr",
+            "state: Actions enabled true — GET /repos/algedonic-dev/boss-dr/actions/permissions",
+            r#"act: PUT /repos/algedonic-dev/boss-dr/actions/permissions {"enabled":false}"#,
+            "proof: GET /repos/algedonic-dev/boss-dr/actions/permissions reads back enabled false",
+            "never: enabling Actions",
+        ],
+        "the plan",
+    );
+    let sha = p.plan_sha();
+    let again = g.run(&["disable-actions", "--plan", ORG, "boss-dr"]);
+    assert_eq!(p.stdout, again.stdout, "two renders of one state differ");
+    assert!(g.writes().is_empty(), "a plan wrote: {:?}", g.writes());
+    assert_eq!(g.actions_enabled(ORG, "boss-dr"), Some(true));
+
+    let w = g.run(&["disable-actions", ORG, "boss-dr", &sha]);
+    assert_eq!(w.code, 0, "{}", w.text());
+    contains_all(
+        &w.text(),
+        &[
+            "still holds",
+            "PUT /repos/algedonic-dev/boss-dr/actions/permissions answered 204",
+            "github-act: proven — Actions on algedonic-dev/boss-dr reads back as enabled false",
+        ],
+        "the write",
+    );
+    assert_eq!(
+        g.writes(),
+        vec!["PUT /repos/algedonic-dev/boss-dr/actions/permissions".to_string()]
+    );
+    assert_eq!(g.actions_enabled(ORG, "boss-dr"), Some(false));
+    assert_eq!(g.revokes(), 1, "the act's token outlived it:\n{}", g.log());
+
+    // The state moved: the signed plan no longer holds, so no second act.
+    g.remint();
+    let stale = g.run(&["disable-actions", ORG, "boss-dr", &sha]);
+    assert_eq!(stale.code, 78, "{}", stale.text());
+    contains_all(
+        &stale.text(),
+        &["not the approved", "state: Actions enabled false"],
+        "the refusal",
+    );
+    // Already disabled, the plan names no act, and its write changes nothing.
+    // (The refused write above ended its token, as every write does.)
+    g.remint();
+    let p2 = g.run(&["disable-actions", "--plan", ORG, "boss-dr"]);
+    contains_all(&p2.stdout, &["act: none"], "the second plan");
+    let w2 = g.run(&["disable-actions", ORG, "boss-dr", &p2.plan_sha()]);
+    assert_eq!(w2.code, 0, "{}", w2.text());
+    assert!(w2.stdout.contains("nothing was written"), "{}", w2.text());
+    assert_eq!(g.writes().len(), 1, "{:?}", g.writes());
+}
+
+#[test]
+fn an_actions_disable_that_does_not_read_back_fails_and_bad_repositories_are_refused() {
+    needs_tools!();
+    let g = Gh::new("actions-ignored");
+    put_boss_dr(&g);
+    let sha = g
+        .run(&["disable-actions", "--plan", ORG, "boss-dr"])
+        .plan_sha();
+    g.fault("ignore_writes", "");
+    let w = g.run(&["disable-actions", ORG, "boss-dr", &sha]);
+    assert_eq!(w.code, 1, "a 204 that did not take passed:\n{}", w.text());
+    assert!(
+        w.stderr.contains("do not read back as enabled false"),
+        "{}",
+        w.stderr
+    );
+    assert!(w.stderr.contains(r#""enabled":true"#), "{}", w.stderr);
+
+    let g = Gh::new("actions-403");
+    put_boss_dr(&g);
+    let sha = g
+        .run(&["disable-actions", "--plan", ORG, "boss-dr"])
+        .plan_sha();
+    g.fault("status_PUT", "403");
+    let w = g.run(&["disable-actions", ORG, "boss-dr", &sha]);
+    assert_eq!(w.code, 1, "{}", w.text());
+    assert!(w.stderr.contains("answered HTTP 403"), "{}", w.stderr);
+    assert_eq!(g.actions_enabled(ORG, "boss-dr"), Some(true));
+
+    let g = Gh::new("actions-refuse");
+    g.put_repo(
+        ORG,
+        "archived",
+        json!({"full_name": "algedonic-dev/archived", "private": true, "fork": false, "archived": true}),
+    );
+    g.put_repo(
+        ORG,
+        "forked",
+        json!({"full_name": "algedonic-dev/forked", "private": false, "fork": true, "archived": false}),
+    );
+    g.put_repo(
+        ORG,
+        "renamed",
+        json!({"full_name": "algedonic-dev/other-name", "private": true, "fork": false, "archived": false}),
+    );
+    for (name, words) in [
+        ("archived", "is archived"),
+        ("forked", "is a FORK"),
+        ("renamed", "answered as algedonic-dev/other-name"),
+        ("absent", "does not exist"),
+    ] {
+        let o = g.run(&["disable-actions", "--plan", ORG, name]);
+        assert_eq!(o.code, 78, "{name} was not refused:\n{}", o.text());
+        assert!(o.stderr.contains(words), "{name}: {}", o.stderr);
+    }
+    for bad in ["-rf", "boss.git", "../x"] {
+        let o = g.run(&["disable-actions", "--plan", ORG, bad]);
+        assert_eq!(o.code, 78, "{bad} was not refused:\n{}", o.text());
+    }
+    // A write without the signed plan's hash is no write.
+    let o = g.run(&["disable-actions", ORG, "forked"]);
+    assert_eq!(o.code, 78, "{}", o.text());
+    assert!(g.writes().is_empty(), "{:?}", g.writes());
+}
+
+/// An answer that says nothing about `enabled` is no answer: an empty 200
+/// or a body without the boolean renders no plan (d96e38ab).
+#[test]
+fn an_actions_answer_without_enabled_renders_no_plan() {
+    needs_tools!();
+    let g = Gh::new("actions-no-enabled");
+    put_boss_dr(&g);
+    write_file(
+        &g.state.join(format!("repos/{ORG}/boss-dr.actions.json")),
+        r#"{"allowed_actions":"all"}"#,
+    );
+    let o = g.run(&["disable-actions", "--plan", ORG, "boss-dr"]);
+    assert_eq!(o.code, 1, "{}", o.text());
+    assert!(
+        o.stderr.contains("without a boolean enabled"),
+        "{}",
+        o.stderr
+    );
+    assert!(g.writes().is_empty(), "{:?}", g.writes());
+}
+
+// ---------------------------------------------------------------------------
 // delete-refs, against a real git repository
 // ---------------------------------------------------------------------------
 
@@ -1728,7 +2379,7 @@ fn the_default_branch_is_refused_and_main_needs_a_reason() {
 // the verb files, and through the ops runner
 // ---------------------------------------------------------------------------
 
-const PAIRS: [(&str, &str, &str); 3] = [
+const PAIRS: [(&str, &str, &str); 4] = [
     (
         "github-create-repository",
         "plan-a-github-repository",
@@ -1743,6 +2394,11 @@ const PAIRS: [(&str, &str, &str); 3] = [
         "github-delete-refs",
         "plan-a-github-ref-delete",
         "delete-refs",
+    ),
+    (
+        "github-disable-actions",
+        "plan-a-github-actions-disable",
+        "disable-actions",
     ),
 ];
 
@@ -1862,6 +2518,25 @@ fn the_patterns_admit_the_exercises_and_nothing_shaped_like_an_option() {
         ("github-set-branch-protection", "push_allow", "none"),
         ("github-set-branch-protection", "checks", "none"),
         ("github-set-branch-protection", "checks", "build,test/unit"),
+        // The mirror's one CI check, `Gate (infra/gate.sh, full)`,
+        // escaped (backlog 602fe95f).
+        (
+            "github-set-branch-protection",
+            "checks",
+            "Gate%20%28infra%2Fgate.sh%2C%20full%29",
+        ),
+        // ...pinned to GitHub Actions, the App that runs it (backlog
+        // 16a9c5ae) — the spelling main's ruleset is applied with.
+        (
+            "github-set-branch-protection",
+            "checks",
+            "Gate%20%28infra%2Fgate.sh%2C%20full%29@15368",
+        ),
+        (
+            "github-set-branch-protection",
+            "checks",
+            "build@1,test/unit",
+        ),
         ("github-delete-refs", "owner", "dauld"),
         ("github-delete-refs", "repo", "boss-mirror"),
         (
@@ -1875,6 +2550,8 @@ fn the_patterns_admit_the_exercises_and_nothing_shaped_like_an_option() {
             "public-fork-carries-no-main",
         ),
         ("github-delete-refs", "reason", "none"),
+        ("github-disable-actions", "owner", "algedonic-dev"),
+        ("github-disable-actions", "repo", "boss-dr"),
     ];
     for (v, n, s) in good {
         assert!(matches(&pat(v, n), s), "{v}.{n} refuses {s}");

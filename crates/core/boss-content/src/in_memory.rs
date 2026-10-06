@@ -62,6 +62,9 @@ impl ContentRepository for InMemoryContent {
                 .cmp(&b.priority.sort_key())
                 .then(b.posted_on.cmp(&a.posted_on))
                 .then(b.created_at.cmp(&a.created_at))
+                // Two rows sharing all three answered in HashMap order
+                // (backlog be459ab9, found by the adapters-agree suite).
+                .then(a.id.cmp(&b.id))
         });
         Ok(out)
     }
@@ -69,7 +72,15 @@ impl ContentRepository for InMemoryContent {
     async fn list_all_bulletins(&self) -> Result<Vec<Bulletin>, ContentError> {
         let state = self.state.lock().map_err(poisoned)?;
         let mut out: Vec<Bulletin> = state.bulletins.values().cloned().collect();
-        out.sort_by_key(|b| std::cmp::Reverse(b.posted_on));
+        // Postgres's order, which this double sorted by `posted_on`
+        // alone until the adapters-agree suite (backlog be459ab9): a
+        // same-day pair answered in HashMap order.
+        out.sort_by(|a, b| {
+            b.posted_on
+                .cmp(&a.posted_on)
+                .then(b.created_at.cmp(&a.created_at))
+                .then(a.id.cmp(&b.id))
+        });
         Ok(out)
     }
 
@@ -127,16 +138,20 @@ impl ContentRepository for InMemoryContent {
             .bulletins
             .get_mut(&id)
             .ok_or_else(|| ContentError::NotFound(format!("bulletin {id}")))?;
+        // Validate the WHOLE patch before touching the row. Until the
+        // adapters-agree suite (backlog be459ab9) this validated field
+        // by field as it wrote, so a good title beside a blank body was
+        // refused after the title had landed; Postgres writes nothing.
+        if patch.title.as_ref().is_some_and(|t| t.trim().is_empty()) {
+            return Err(ContentError::Validation("title must not be empty".into()));
+        }
+        if patch.body.as_ref().is_some_and(|b| b.trim().is_empty()) {
+            return Err(ContentError::Validation("body must not be empty".into()));
+        }
         if let Some(title) = patch.title {
-            if title.trim().is_empty() {
-                return Err(ContentError::Validation("title must not be empty".into()));
-            }
             existing.title = title;
         }
         if let Some(body) = patch.body {
-            if body.trim().is_empty() {
-                return Err(ContentError::Validation("body must not be empty".into()));
-            }
             existing.body = body;
         }
         if let Some(expires) = patch.expires_on {
@@ -195,6 +210,9 @@ impl ContentRepository for InMemoryContent {
                 .cmp(&b.parent_slug)
                 .then(a.sort_order.cmp(&b.sort_order))
                 .then(a.title.cmp(&b.title))
+                // The slug is unique, so it settles a shared title
+                // (backlog be459ab9, found by the adapters-agree suite).
+                .then(a.slug.cmp(&b.slug))
         });
         Ok(out)
     }

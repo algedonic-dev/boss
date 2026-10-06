@@ -68,9 +68,20 @@
 //! table. One row is the whole policy and a train pins the version it
 //! departed under, so a version bump here changes the rules for the
 //! NEXT boarding and never for a train in flight.
+//!
+//! THE AUTOMATIONS RIDE IT AFTER (backlog ddf0773e, design abf9eeae
+//! car 1). Every `automation:*` id that writes, with the role it signs
+//! as — `infra/platform/automations/`, the sibling again,
+//! `--automations-path` to override — published last through
+//! `PgAgents::declare_automations`. Not the versioned table above: an
+//! automation row has no version, so it is the agents registry's
+//! insert-if-absent, a held row kept as the instance holds it and the
+//! fields it differs on named in the line.
 
 use anyhow::{Context, Result};
 use boss_core::actor::ActorId;
+use boss_jobs::agents::automations::{AutomationActor, automations_beside, load_automations_dir};
+use boss_jobs::agents::{AgentsRegistry, PgAgents};
 use boss_jobs::cadence::{CadenceRuleSpec, PgCadence};
 use boss_jobs::cadence_seed::{cadence_beside, seed_cadence_rules};
 use boss_jobs::delivery::{DeliveryPolicySpec, PgDeliveryPolicy};
@@ -127,6 +138,12 @@ struct Cli {
     /// (`infra/platform/delivery-policy` for the in-tree default).
     #[arg(long)]
     delivery_policy_path: Option<PathBuf>,
+
+    /// The automations bundle: a directory of `<slug>.toml` files.
+    /// Defaults to the `automations` directory BESIDE `--seed-path`
+    /// (`infra/platform/automations` for the in-tree default).
+    #[arg(long)]
+    automations_path: Option<PathBuf>,
 
     /// Report what would be inserted and write nothing.
     #[arg(long)]
@@ -223,6 +240,21 @@ fn load_delivery_policy_bundle(cli: &Cli) -> Result<Option<(PathBuf, Vec<Deliver
     )
 }
 
+fn load_automations_bundle(cli: &Cli) -> Result<Option<(PathBuf, Vec<AutomationActor>)>> {
+    load_sibling_bundle(
+        cli,
+        "platform-automation-seed",
+        "automations",
+        "--automations-path",
+        &cli.automations_path,
+        automations_beside,
+        |dir| {
+            load_automations_dir(dir)
+                .map_err(|e| SeedLoaderError::Parse(dir.display().to_string(), e))
+        },
+    )
+}
+
 /// Who the platform seed publishes as.
 ///
 /// Machine-shaped on purpose. It is not `bootstrap`: that string is
@@ -246,6 +278,7 @@ async fn main() -> Result<()> {
     let step_plugins = load_step_plugin_bundle(&cli)?;
     let cadence = load_cadence_bundle(&cli)?;
     let delivery_policy = load_delivery_policy_bundle(&cli)?;
+    let automations = load_automations_bundle(&cli)?;
     if specs.is_empty() {
         println!("platform-workflow-seed: bundle is empty, nothing to do");
     }
@@ -338,11 +371,39 @@ async fn main() -> Result<()> {
                 dir.display()
             );
         } else {
-            let registry = PgDeliveryPolicy::new(pool);
+            let registry = PgDeliveryPolicy::new(pool.clone());
             let report = seed_delivery_policies(&registry, &policy_specs, &actor, now, cli.dry_run)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("{report}");
+        }
+    }
+
+    // Insert-if-absent and nothing else (the agents registry's posture,
+    // design e187198f): a held row is kept and the line names what it
+    // differs on; nothing here can rewrite a role.
+    if let Some((dir, rows)) = automations {
+        if rows.is_empty() {
+            println!(
+                "platform-automation-seed: bundle at {} is empty",
+                dir.display()
+            );
+        } else {
+            let registry = PgAgents::new(pool);
+            let outcome = if cli.dry_run {
+                let held = registry
+                    .list_automations()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                boss_jobs::agents::automations::classify(&held, &rows)
+            } else {
+                let stamp = boss_core::publisher::EventStamp::new("jobs", actor.clone());
+                registry
+                    .declare_automations(&rows, &stamp)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+            };
+            println!("{outcome}");
         }
     }
     Ok(())

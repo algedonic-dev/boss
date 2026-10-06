@@ -16,7 +16,7 @@
 //!
 //! WHY THIS TEST EXECUTES THE MANIFEST INSTEAD OF READING IT. A textual
 //! assertion can say the wrap is mentioned; it cannot say the packet
-//! OPENS before the dump, CLOSES after both offsite legs, and — the
+//! OPENS before the dump, CLOSES after the offsite leg, and — the
 //! property that matters most — does NOT close green when the dump or
 //! the upload fails. So the container scripts are lifted out of
 //! `boss-backup.yaml` exactly as they ship, every absolute path they
@@ -194,10 +194,7 @@ enum Fail {
     /// pg_dump dies mid-stream: a truncated dump that is still a valid
     /// gzip. Only the trailer check catches it.
     DumpTruncated,
-    /// The offsite ship to the playground box fails.
-    Ship,
-    /// The GCS upload fails — the dump is good, the second offsite copy
-    /// is not.
+    /// The GCS upload fails — the dump is good, the offsite copy is not.
     Upload,
     /// The packet will not close (the SoR is dark). The backup already
     /// happened; only its visibility is lost.
@@ -209,6 +206,7 @@ enum Fail {
     /// The store is mounted and holds no object yet — the state the
     /// SoR is in the day it is switched on. That is a good backup.
     EmptyStore,
+    SampleCapture,
 }
 
 impl Fail {
@@ -217,11 +215,11 @@ impl Fail {
             Fail::Nothing => "",
             Fail::Open => "open",
             Fail::DumpTruncated => "dump",
-            Fail::Ship => "ship",
             Fail::Upload => "upload",
             Fail::Close => "close",
             Fail::NoStore => "no-store",
             Fail::EmptyStore => "empty-store",
+            Fail::SampleCapture => "sample",
         }
     }
 }
@@ -278,7 +276,6 @@ impl PodRun {
 /// script this host runs.
 const REBASE: &[(&str, &str)] = &[
     ("/backup", "backup"),
-    ("/keys", "keys"),
     ("/gcs", "gcs"),
     // The file_refs store, at the path every pod mounts it on — the
     // same path boss-content-api records as each row's `bucket`.
@@ -339,7 +336,7 @@ fn run_pod(tag: &str, fail: Fail) -> PodRun {
     // which is what makes this unique across accounts as well as across
     // live processes.
     let dir = scratch::scratch_dir(&format!("boss-backup-pod-{tag}"));
-    for sub in ["backup", "keys", "gcs", "bin", "tmp", "files"] {
+    for sub in ["backup", "gcs", "bin", "tmp", "files"] {
         scratch::create_dir(&dir.join(sub));
     }
     // The file store, laid out the way LocalDiskStorage writes it:
@@ -359,14 +356,19 @@ fn run_pod(tag: &str, fail: Fail) -> PodRun {
     }
     let seq = dir.join("sequence.log");
     scratch::write_file(&seq, "");
-    scratch::write_file(&dir.join("keys/id_ed25519"), "not-a-key\n");
     scratch::write_file(&dir.join("gcs/bucket"), "boss-offsite-test");
     scratch::write_file(&dir.join("gcs/sa.json"), "{}\n");
 
     // ---- what the images provide and this host does not
     let bin = dir.join("bin");
-    // The dump leg installs openssh-client with apk.
-    scratch::write_exec(&bin.join("apk"), "#!/usr/bin/env bash\nexit 0\n");
+    // The retired boss-gcp leg (backlog 4bf7bdd1) installed openssh-client
+    // with apk and shipped over ssh. Both stay as RECORDING shims, so a
+    // ship that came back would be seen in the sequence rather than fail
+    // on a missing binary.
+    scratch::write_exec(
+        &bin.join("apk"),
+        "#!/usr/bin/env bash\necho \"exec:apk $*\" >> \"$BOSS_TEST_SEQ\"\nexit 0\n",
+    );
     // pg_dump writes a real dump; the `dump` failure mode stops
     // mid-stream and exits non-zero, which `set -e` does NOT catch on
     // the left of a pipe — the exact hole the manifest's `gzip -t` +
@@ -386,7 +388,6 @@ fn run_pod(tag: &str, fail: Fail) -> PodRun {
         "#!/usr/bin/env bash\n\
          cat > /dev/null\n\
          echo \"exec:ship\" >> \"$BOSS_TEST_SEQ\"\n\
-         if [ \"$BOSS_TEST_FAIL\" = \"ship\" ]; then exit 255; fi\n\
          exit 0\n",
     );
     scratch::write_exec(
@@ -422,6 +423,11 @@ fn run_pod(tag: &str, fail: Fail) -> PodRun {
          if [ -z \"${BOSS_JOBS_URL:-}\" ]; then echo 'no BOSS_JOBS_URL' >&2; exit 78; fi\n\
          if [ \"$BOSS_TEST_FAIL\" = \"close\" ]; then echo 'jobs-api unreachable' >&2; exit 1; fi\n\
          exit 0\n",
+    );
+    scratch::write_exec(
+        &bin.join("boss-filesystem-sample.sh"),
+        "#!/usr/bin/env bash\necho \"sample:$*\" >> \"$BOSS_TEST_SEQ\"\n\
+         if [ \"$BOSS_TEST_FAIL\" = sample ]; then echo 'sample recording failed' >&2; exit 1; fi\nexit 0\n",
     );
 
     // ---- run the containers
@@ -517,8 +523,115 @@ fn run_pod(tag: &str, fail: Fail) -> PodRun {
 
 // --------------------------------------------------------------- tests
 
+#[test]
+fn mounted_samples_surround_backup_work_and_never_finish_a_failed_leg() {
+    let good = run_pod("fs-lifecycle", Fail::Nothing);
+    assert!(good.succeeded(), "{}", good.log);
+    let start = good
+        .seq
+        .iter()
+        .position(|s| s.starts_with("sample:") && s.ends_with(" start"))
+        .expect("start statfs after native packet opens");
+    let final_sample = good
+        .seq
+        .iter()
+        .position(|s| s.starts_with("sample:") && s.ends_with(" final"))
+        .expect("final mounted statfs after all backup writes");
+    assert!(
+        good.position("open:").unwrap() < start && start < good.position("exec:pg_dump").unwrap()
+    );
+    assert!(
+        good.position("exec:upload").unwrap() < final_sample
+            && final_sample < good.position("close:").unwrap()
+    );
+    for failed in [Fail::DumpTruncated, Fail::Upload, Fail::NoStore] {
+        let r = run_pod("fs-failed-leg", failed);
+        assert!(
+            r.seq
+                .iter()
+                .any(|s| s.starts_with("sample:") && s.ends_with(" start")),
+            "retain dated start evidence: {:?}",
+            r.seq
+        );
+        assert!(
+            !r.seq
+                .iter()
+                .any(|s| s.starts_with("sample:") && s.ends_with(" final")),
+            "failed work cannot leave reusable final evidence: {:?}",
+            r.seq
+        );
+    }
+    let capture_failure = run_pod("fs-recording-failed", Fail::SampleCapture);
+    assert!(
+        capture_failure.succeeded(),
+        "visibility must not stop the backup: {}",
+        capture_failure.log
+    );
+    assert_eq!(capture_failure.closes().len(), 1);
+    let docker =
+        std::fs::read_to_string(repo_root().join("infra/oss-quickstart/Dockerfile")).unwrap();
+    assert!(
+        docker.contains("COPY infra/boss-filesystem-sample.sh /usr/local/bin/"),
+        "the image must carry the executed recorder"
+    );
+    let yaml = manifest();
+    let sources: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_root().join("infra/estate/mounted-volume-sources.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    let source = &sources[0];
+    assert_eq!(sources.as_array().unwrap().len(), 1);
+    let native_call = format!(
+        "sample:{} {} {} ",
+        source["workflow"].as_str().unwrap(),
+        source["step"].as_str().unwrap(),
+        source["claim"].as_str().unwrap()
+    );
+    assert!(
+        good.seq[start].starts_with(&native_call)
+            && good.seq[final_sample].starts_with(&native_call),
+        "mounted producer registry and actual native calls drifted: {} / {:?}",
+        source,
+        good.seq
+    );
+    assert!(yaml.contains(&format!(
+        "  name: {}\n",
+        source["cronjob"].as_str().unwrap()
+    )));
+    assert!(yaml.contains(&format!(
+        "  namespace: {}\n",
+        source["namespace"].as_str().unwrap()
+    )));
+    let step = std::fs::read_to_string(repo_root().join("infra/boss-step.sh")).unwrap();
+    let dockerfile =
+        std::fs::read_to_string(repo_root().join("infra/oss-quickstart/Dockerfile")).unwrap();
+    assert!(
+        dockerfile.contains("COPY infra/lib/jq.sh /usr/local/bin/lib/jq.sh"),
+        "the mounted metadata recorder carries the shared document guard in its production image"
+    );
+    assert!(
+        step.contains(&format!(
+            "ACTOR=\"${{BOSS_STEP_ACTOR:-{}}}\"",
+            source["actor"].as_str().unwrap()
+        )),
+        "the registry expects the native signing actor, {source}"
+    );
+    assert_eq!(
+        yaml.matches("metadata.labels['batch.kubernetes.io/controller-uid']")
+            .count(),
+        2,
+        "both mounted stages record actual controller Job UID"
+    );
+    assert_eq!(
+        yaml.matches("metadata.uid").count(),
+        2,
+        "both mounted stages record actual Pod UID"
+    );
+}
+
 /// THE DEFECT, DIRECTLY: a healthy nightly run must open a packet
-/// before it dumps, and close it green only after both offsite legs.
+/// before it dumps, and close it green only after the offsite leg.
 #[test]
 fn a_healthy_run_opens_a_packet_and_closes_it_green() {
     let r = run_pod("green", Fail::Nothing);
@@ -577,18 +690,58 @@ fn a_healthy_run_opens_a_packet_and_closes_it_green() {
         "the packet must carry the dump's size: {close}"
     );
     assert!(
-        close.contains("offsite="),
-        "the packet must name where the dump went — the run already prints it: {close}"
+        close.contains(" offsite=gcs "),
+        "the packet must name where the dump went — the GCS bucket, and nothing else \
+         (backlog 4bf7bdd1): {close}"
     );
 
-    let ship = r.position("exec:ship").expect("the offsite ship ran");
     let upload = r.position("exec:upload").expect("the GCS upload ran");
     let closed = r.position("close:").expect("the close is in the sequence");
     assert!(
-        dump < ship && ship < upload && upload < closed,
+        dump < upload && upload < closed,
         "ordering must be dump -> offsite -> close. A packet that closes before the offsite \
-         legs finish is a backup that looks present.\nsequence: {:?}",
+         leg finishes is a backup that looks present.\nsequence: {:?}",
         r.seq
+    );
+}
+
+/// David, 2026-10-01 (backlog 4bf7bdd1): "boss-gcp doesn't need to be
+/// storage backup." The GCS bucket is the off-site copy. The leg that
+/// shipped each dump to boss-gcp over a deposit-only ssh key is gone:
+/// a healthy run installs no ssh client and ships nothing over ssh, the
+/// manifest mounts no deposit key and dials no host, and the packet says
+/// the dump went to `gcs` alone.
+#[test]
+fn the_dump_goes_offsite_to_the_gcs_bucket_alone() {
+    let r = run_pod("gcs-alone", Fail::Nothing);
+    assert!(r.succeeded(), "the healthy run failed:\n{}", r.log);
+    assert!(
+        r.position("exec:ship").is_none() && r.position("exec:apk").is_none(),
+        "the run installed an ssh client or shipped over ssh — the boss-gcp leg is retired:\n\
+         sequence: {:?}",
+        r.seq
+    );
+    assert!(
+        r.position("exec:upload boss-").is_some(),
+        "the dump must still reach the bucket: {:?}",
+        r.seq
+    );
+    let yaml = manifest();
+    for gone in [
+        "boss-backup-key",
+        "ssh -i",
+        "ConnectTimeout",
+        "mountPath: /keys",
+    ] {
+        assert!(
+            !yaml.contains(gone),
+            "{MANIFEST} still carries `{gone}` — the boss-gcp leg is retired (backlog 4bf7bdd1)"
+        );
+    }
+    let close = r.closes()[0].clone();
+    assert!(
+        close.contains(" offsite=gcs ") && !close.contains("boss-gcp"),
+        "the packet's offsite field reads `gcs` alone: {close}"
     );
 }
 
@@ -626,24 +779,22 @@ fn a_truncated_dump_never_closes_the_packet_green() {
     );
 }
 
-/// Either offsite leg failing is the same rule: the dump is good, the
-/// run is not, and the packet must not say ok.
+/// The offsite leg failing: the dump is good, the run is not, and the
+/// packet must not say ok.
 #[test]
 fn a_failed_offsite_leg_never_closes_the_packet_green() {
-    for (tag, fail) in [("ship", Fail::Ship), ("upload", Fail::Upload)] {
-        let r = run_pod(tag, fail);
-        assert!(
-            !r.succeeded(),
-            "a failed {tag} leg must fail the Job:\n{}",
-            r.log
-        );
-        assert!(
-            r.closes().is_empty(),
-            "the packet closed despite a failed {tag} leg: {:?}\n{}",
-            r.closes(),
-            r.log
-        );
-    }
+    let r = run_pod("upload", Fail::Upload);
+    assert!(
+        !r.succeeded(),
+        "a failed upload leg must fail the Job:\n{}",
+        r.log
+    );
+    assert!(
+        r.closes().is_empty(),
+        "the packet closed despite a failed upload leg: {:?}\n{}",
+        r.closes(),
+        r.log
+    );
 }
 
 /// CLAUDE.md §Diagnosis, "an arm that needs the patient is not an arm".
@@ -660,9 +811,7 @@ fn a_refused_packet_does_not_stop_the_backup() {
         r.log
     );
     assert!(
-        r.position("exec:pg_dump").is_some()
-            && r.position("exec:ship").is_some()
-            && r.position("exec:upload").is_some(),
+        r.position("exec:pg_dump").is_some() && r.position("exec:upload").is_some(),
         "every leg must still have run:\nsequence: {:?}\n{}",
         r.seq,
         r.log

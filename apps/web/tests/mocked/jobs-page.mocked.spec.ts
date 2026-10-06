@@ -20,7 +20,8 @@
 //   links    — 2 per row (the short ID -> /ux/jobs/{id}; the Subject ->
 //              its page, or its own packets for any kind with no page)
 //              and the row itself, which goes where the ID link goes;
-//   buttons  — 8: Clear ✕, Start a new Job, Create Ad Hoc Job (only when
+//   buttons  — removable active-filter chips, Clear ✕, Start a new Job,
+//              Create Ad Hoc Job (only when
 //              the registry carries `ad-hoc`), the Status aside's Open /
 //              Closed / All, Create Job, Cancel;
 //   inputs   — 3 filters (Kind, Status, Subject id) and 5 form fields
@@ -35,13 +36,13 @@
 // item, and are meant to be edited by the car that answers it, so the
 // answer shows up here as a changed expectation rather than a silently
 // passing one:
-//   gap 5  ce8f634a  a failed people read leaves Owner looking empty
-//   gap 6  6c9672c2  owner_id / kind_prefix narrow with no visible sign
+//   gap 6  6c9672c2  answered: active filters are visible and removable
 //   gap 10 8708447c  no column for the step a packet waits at, its
 //                    holder, or its closed date
 //   gap 11 75d1b902  no department filter, column or link
 // Answered on main before this spec, each pinned by its own spec named
 // above: gap 2 4af37dd8, gap 4 e98cabd0, gap 7 03e198e5, gap 8 45ca0f89,
+// gap 5 ce8f634a now retains a failed Owner read and offers retry;
 // gap 9 3c3dc8f3; gap 3 3b1ec06e (a failed registry read left Kind
 // looking valid) answered after it, its line edited below and its three
 // routes pinned by jobs-kinds-failed-read. Answered here: gap 1 d1310776 (200 rows, no offset,
@@ -248,14 +249,13 @@ test.describe('/ux/jobs — the list', () => {
     // rest. It said neither, so the 86 oldest open packets — the ones
     // the standing order works first — could not be reached. The first
     // page's read sends no offset.
-    await expectHeader(page, 'All jobs', `${LIVE_TOTAL} open`);
+    await expectHeader(page, 'Filtered jobs', `${LIVE_TOTAL} open`);
     expect(lastRead(seen)).toEqual({ status: 'open', limit: '200' });
     await expect(pagerLine(page)).toHaveText(`Showing 1–3 of ${LIVE_TOTAL}, newest first`);
-    // The page's every button, in order: the two entry buttons, the
-    // three Status buttons and the pager's two. (Clear ✕, Create Job and
-    // Cancel render only under a filter or an open form.)
+    // The default Open read is an active filter: its chip and Clear
+    // precede the entry buttons, Status buttons and pager.
     await expect(page.locator('.catalog').getByRole('button')).toHaveText([
-      'Start a new Job', 'Create Ad Hoc Job', 'Open', 'Closed', 'All', 'Previous', 'Next',
+      'Status: open ✕', 'Clear ✕', 'Start a new Job', 'Create Ad Hoc Job', 'Open', 'Closed', 'All', 'Previous', 'Next',
     ]);
     await expect(button(page, 'Previous')).toBeDisabled();
     await expect(button(page, 'Next')).toBeEnabled();
@@ -295,10 +295,10 @@ test.describe('/ux/jobs — the list', () => {
     await expect(listLine(page)).toHaveText('Loading…');
     // d0b93b80: while the read was out the header stated the zero
     // `total` starts at — "0 open" above "Loading…".
-    await expectHeader(page, 'All jobs', 'Counting…');
+    await expectHeader(page, 'Filtered jobs', 'Counting…');
     release();
     await expect(bodyRows(page)).toHaveCount(3);
-    await expectHeader(page, 'All jobs', '3 open');
+    await expectHeader(page, 'Filtered jobs', '3 open');
     // Every match is on the page, so there is nothing to page to.
     await expect(pager(page)).toHaveCount(0);
   });
@@ -309,7 +309,7 @@ test.describe('/ux/jobs — the list', () => {
   test('an empty backend says "No jobs match." and paints no failure marker', async ({ page }) => {
     await openList(page, { list: (r) => json(r, { data: [], total: 0 }) });
     await expect(listLine(page)).toHaveText('No jobs match.');
-    await expectHeader(page, 'All jobs', '0 open');
+    await expectHeader(page, 'Filtered jobs', '0 open');
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
     await expect(page.locator('table.data-table')).toHaveCount(0);
   });
@@ -318,7 +318,7 @@ test.describe('/ux/jobs — the list', () => {
     await openList(page, { list: (r) => json(r, 'jobs down', 503) });
     await expect(page.locator(`${FAILURE_MARKER}[role=alert]`)).toHaveText("Couldn't load jobs: HTTP 503");
     await expect(page.getByText('No jobs match.')).toHaveCount(0);
-    await expectHeader(page, 'All jobs', 'Job count unknown — the read failed');
+    await expectHeader(page, 'Filtered jobs', 'Job count unknown — the read failed');
     await expect(page.locator('table.data-table')).toHaveCount(0);
   });
 });
@@ -355,7 +355,7 @@ test.describe('/ux/jobs — the pager', () => {
     await expect(button(page, 'Next')).toBeDisabled();
     await expect(button(page, 'Previous')).toBeEnabled();
     // The header's count is the filter's, not the page's.
-    await expectHeader(page, 'All jobs', '5 open');
+    await expectHeader(page, 'Filtered jobs', '5 open');
 
     await button(page, 'Previous').click();
     await expect.poll(() => lastRead(seen)).toEqual({ status: 'open', limit: '200' });
@@ -385,18 +385,18 @@ test.describe('/ux/jobs — the filters', () => {
     await expect(bodyRows(page)).toHaveCount(3);
 
     await expect(kindFilter(page).locator('option')).toHaveText(['All kinds', 'ad-hoc', 'backlog-item', 'page-audit']);
-    await expect(button(page, 'Clear ✕')).toHaveCount(0);
+    await expect(button(page, 'Clear ✕')).toBeVisible();
 
     await kindFilter(page).selectOption('page-audit');
     await expect.poll(() => lastRead(seen)).toEqual({ kind: 'page-audit', status: 'open', limit: '200' });
-    await expect(page.locator('h1.exec-title')).toHaveText('page-audit jobs');
+    await expect(page.locator('h1.exec-title')).toHaveText('Filtered jobs');
     await expect.poll(() => new URL(page.url()).search).toBe('?kind=page-audit');
     await expect(button(page, 'Clear ✕')).toHaveAttribute('title', 'Clear all filters');
 
     await button(page, 'Clear ✕').click();
-    await expect.poll(() => lastRead(seen)).toEqual({ status: 'open', limit: '200' });
+    await expect.poll(() => lastRead(seen)).toEqual({ limit: '200' });
     await expect(page.locator('h1.exec-title')).toHaveText('All jobs');
-    await expect.poll(() => new URL(page.url()).search).toBe('');
+    await expect.poll(() => new URL(page.url()).search).toBe('?status=');
     await expect(button(page, 'Clear ✕')).toHaveCount(0);
     expect(seen.writes).toHaveLength(0);
   });
@@ -412,7 +412,7 @@ test.describe('/ux/jobs — the filters', () => {
     await expect(statusButton(page, 'Closed')).toHaveAttribute('aria-pressed', 'true');
     // Gap 10 (8708447c): Closed shows no closed date; the columns do not change.
     await expect(page.locator('table.data-table thead th')).toHaveCount(7);
-    await expectHeader(page, 'All jobs', `${LIVE_TOTAL} closed`);
+    await expectHeader(page, 'Filtered jobs', `${LIVE_TOTAL} closed`);
     await expect(button(page, 'Clear ✕')).toBeVisible();
 
     await statusButton(page, 'All').click();
@@ -423,7 +423,7 @@ test.describe('/ux/jobs — the filters', () => {
 
     await statusButton(page, 'Open').click();
     await expect.poll(() => lastRead(seen)).toEqual({ status: 'open', limit: '200' });
-    await expect(button(page, 'Clear ✕')).toHaveCount(0);
+    await expect(button(page, 'Clear ✕')).toBeVisible();
   });
 
   test('Subject id is an exact-match filter that reads once per keystroke, and Clear empties it', async ({ page }) => {
@@ -438,25 +438,30 @@ test.describe('/ux/jobs — the filters', () => {
 
     await button(page, 'Clear ✕').click();
     await expect(subjectFilter(page)).toHaveValue('');
-    await expect.poll(() => lastRead(seen)).toEqual({ status: 'open', limit: '200' });
+    await expect.poll(() => lastRead(seen)).toEqual({ limit: '200' });
   });
 
-  test('an owner_id deep link narrows the read with no control, chip or title that says so, and Clear keeps it', async ({ page }) => {
+  test('active owner and prefix filters are visible, removable and stay cleared after reload (6c9672c2)', async ({ page }) => {
     const seen = await openList(page, {}, `${PATH}?owner_id=emp-002&kind_prefix=backlog`);
     await expect(bodyRows(page)).toHaveCount(3);
 
-    // Gap 6 (6c9672c2): owner_id and kind_prefix reach the read; the
-    // page names the prefix in its title and the owner nowhere, and
-    // no filter control shows either.
     expect(lastRead(seen)).toEqual({ kind_prefix: 'backlog', status: 'open', owner_id: 'emp-002', limit: '200' });
-    await expect(page.locator('h1.exec-title')).toHaveText('backlog jobs');
-    await expect(filterBar(page)).not.toContainText('emp-002');
-    await expect(filterBar(page)).not.toContainText('Rhea');
-    await expect(button(page, 'Clear ✕')).toHaveCount(0);
+    await expect(page.locator('h1.exec-title')).toHaveText('Filtered jobs');
+    await expect(filterBar(page)).toContainText('Owner: emp-002');
+    await expect(filterBar(page)).toContainText('Kind prefix: backlog');
+    await button(page, 'Remove owner filter').click();
+    await expect.poll(() => lastRead(seen)).toEqual({ kind_prefix: 'backlog', status: 'open', limit: '200' });
+    await expect.poll(() => new URL(page.url()).searchParams.has('owner_id')).toBe(false);
 
     await statusFilter(page).selectOption('closed');
     await button(page, 'Clear ✕').click();
-    await expect.poll(() => lastRead(seen)).toEqual({ kind_prefix: 'backlog', status: 'open', owner_id: 'emp-002', limit: '200' });
+    await expect.poll(() => lastRead(seen)).toEqual({ limit: '200' });
+    await expect(page.locator('h1.exec-title')).toHaveText('All jobs');
+    await expect.poll(() => new URL(page.url()).searchParams.has('kind_prefix')).toBe(false);
+    await page.reload();
+    await expect(bodyRows(page)).toHaveCount(3);
+    expect(lastRead(seen)).toEqual({ limit: '200' });
+    expect(seen.writes).toHaveLength(0);
   });
 
   test('the page offers no department control (gap 11)', async ({ page }) => {
@@ -468,6 +473,44 @@ test.describe('/ux/jobs — the filters', () => {
     expect(lastRead(seen)).toEqual({ status: 'open', limit: '200' });
     await expect(page.getByRole('link', { name: /department/i })).toHaveCount(0);
     await expect(page.locator('.catalog').getByText(/department/i)).toHaveCount(0);
+  });
+
+  for (const [path, department] of [[ROUTE_CATALOG.service.path, 'service'], [ROUTE_CATALOG.sales.path, 'sales']] as const) {
+    test(`Clear retains the visible department identity on ${path}`, async ({ page }) => {
+      const seen = await openList(page, {}, path);
+      await expect(bodyRows(page)).toHaveCount(3);
+      await expect(filterBar(page)).toContainText(`Department: ${department}`);
+      await expect(button(page, 'Remove department filter')).toHaveCount(0);
+      await statusFilter(page).selectOption('closed');
+      await kindFilter(page).selectOption('page-audit');
+      await subjectFilter(page).fill('ast-9');
+      await button(page, 'Clear ✕').click();
+      await expect.poll(() => lastRead(seen)).toEqual({ department, limit: '200' });
+      await expect(filterBar(page)).toContainText(`Department: ${department}`);
+      await expect(page.locator('h1.exec-title')).not.toContainText('filtered');
+      expect(new URL(page.url()).pathname).toBe(path);
+      expect(seen.writes).toHaveLength(0);
+    });
+  }
+
+  test('each active filter removes only its own scope, and Clear preserves unrelated URL values', async ({ page }) => {
+    const seen = await openList(page, {}, `${PATH}?kind=page-audit&kind_prefix=page&owner_id=emp-002&subject_id=ast-9&status=closed&other=keep`);
+    await expect(bodyRows(page)).toHaveCount(3);
+    for (const [label, key] of [
+      ['Remove kind prefix filter', 'kind_prefix'], ['Remove kind filter', 'kind'],
+      ['Remove subject filter', 'subject_id'], ['Remove status filter', 'status'],
+    ] as const) {
+      await button(page, label).click();
+      await expect.poll(() => lastRead(seen)[key]).toBeUndefined();
+      expect(lastRead(seen)['owner_id']).toBe('emp-002');
+      expect(new URL(page.url()).searchParams.get('other')).toBe('keep');
+    }
+    await button(page, 'Clear ✕').click();
+    await expect.poll(() => lastRead(seen)).toEqual({ limit: '200' });
+    await expect.poll(() => new URL(page.url()).search).toBe('?status=&other=keep');
+    await expect(page.locator('h1.exec-title')).toHaveText('All jobs');
+    await expect(button(page, 'Clear ✕')).toHaveCount(0);
+    expect(seen.writes).toHaveLength(0);
   });
 
   test('a failed registry read leaves Kind offering "All kinds" alone and says so beside the filter, form closed', async ({ page }) => {
@@ -521,7 +564,7 @@ test.describe('/ux/jobs — the links', () => {
 
     await page.goBack();
     await expect.poll(() => new URL(page.url()).pathname).toBe(PATH);
-    await expect(page.locator('h1.exec-title')).toHaveText('All jobs');
+    await expect(page.locator('h1.exec-title')).toHaveText('Filtered jobs');
     await expect(bodyRows(page)).toHaveCount(3);
   });
 
@@ -759,7 +802,7 @@ test.describe('/ux/jobs — the new-job form', () => {
     await expect(form(page).locator('datalist#new-job-subject-options option')).toHaveCount(0);
   });
 
-  test('a failed people read leaves the Owner picker with "— unassigned —" alone, and says nothing', async ({ page }) => {
+  test('a failed people read says why the Owner picker is unavailable and can be retried', async ({ page }) => {
     await openList(page);
     await expect(bodyRows(page)).toHaveCount(3);
     // Failed only now: the shell has already read the roster at mount,
@@ -772,12 +815,64 @@ test.describe('/ux/jobs — the new-job form', () => {
     await button(page, 'Start a new Job').click();
     await expect.poll(() => peopleReads).toBe(1);
 
-    // Gap 5 (ce8f634a): the non-2xx is swallowed; the picker shows only
-    // the unassigned row, and the session user it defaulted to is no
-    // longer an option the select can show.
-    await expect(field(page, 'Owner').locator('option')).toHaveText(['— unassigned —']);
-    await expect(formError(page)).toHaveCount(0);
-    await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
+    await expect(field(page, 'Owner').locator('.load-failed')).toContainText('HTTP 503');
+    await expect(field(page, 'Owner').locator('select')).toBeDisabled();
+    await field(page, 'Title (optional)').locator('input').fill('Keep this draft');
+    await page.unroute(/\/api\/people$/);
+    await page.route(/\/api\/people$/, (r) => json(r, [EMP, BREWER]));
+    await button(page, 'Retry owner read').click();
+    await expect(field(page, 'Owner').locator('select')).toBeEnabled();
+    await expect(field(page, 'Owner').locator('option')).toHaveText(['— unassigned —', 'Demo CEO (ceo)', 'Rhea Okafor (brewer)']);
+    await expect(field(page, 'Title (optional)').locator('input')).toHaveValue('Keep this draft');
+    await expect(field(page, 'Owner').locator('.load-failed')).toHaveCount(0);
+    await expect(field(page, 'Owner').locator('select')).toHaveValue('emp-001');
+  });
+
+  for (const path of [PATH, ROUTE_CATALOG.service.path, ROUTE_CATALOG.sales.path]) {
+    test(`owner read transport failure is explicit on ${path}`, async ({ page }) => {
+      const seen = await openList(page, {}, path);
+      await expect(bodyRows(page)).toHaveCount(3);
+      await page.route(/\/api\/people$/, (r) => r.abort('connectionrefused'));
+      await button(page, 'Start a new Job').click();
+      await expect(field(page, 'Owner').locator('.load-failed')).toContainText('Owners unavailable');
+      await expect(button(page, 'Retry owner read')).toBeVisible();
+      await expect(field(page, 'Owner').locator('select')).toBeDisabled();
+      expect(seen.writes).toHaveLength(0);
+    });
+  }
+
+  for (const [label, roster] of [
+    ['object', { data: [EMP] }],
+    ['null record', [null]],
+    ['duplicate identity', [EMP, EMP]],
+  ] as const) {
+    test(`owner read refuses malformed ${label} without hiding the form`, async ({ page }) => {
+      const seen = await openList(page);
+      await expect(bodyRows(page)).toHaveCount(3);
+      await page.route(/\/api\/people$/, (r) => json(r, roster));
+      await button(page, 'Start a new Job').click();
+      await expect(field(page, 'Owner').locator('.load-failed')).toContainText('Owners unavailable');
+      await expect(form(page)).toBeVisible();
+      expect(seen.writes).toHaveLength(0);
+    });
+  }
+
+  test('owner read loading and a successful empty roster are distinct and preserve the default identity', async ({ page }) => {
+    const seen = await openList(page);
+    await expect(bodyRows(page)).toHaveCount(3);
+    let pending: Route | undefined;
+    await page.route(/\/api\/people$/, (r) => { pending = r; });
+    await button(page, 'Start a new Job').click();
+    await expect(field(page, 'Owner').getByRole('status')).toHaveText('Loading owners…');
+    await expect(field(page, 'Owner').locator('select')).toBeDisabled();
+    await expect.poll(() => !!pending).toBe(true);
+    if (!pending) throw new Error('Owner read did not reach the fixture');
+    await json(pending, []);
+    await expect(field(page, 'Owner')).toContainText('No owners returned by this read.');
+    await expect(field(page, 'Owner').locator('select')).toBeEnabled();
+    await expect(field(page, 'Owner').locator('select')).toHaveValue('emp-001');
+    await expect(field(page, 'Owner').locator('.load-failed')).toHaveCount(0);
+    expect(seen.writes).toHaveLength(0);
   });
 
   test('a new-job deep link opens the form narrowed to kinds that take its subject; Cancel closes it and keeps the filters in the URL', async ({ page }) => {

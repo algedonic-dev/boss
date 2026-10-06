@@ -40,11 +40,19 @@ async fn main() -> Result<()> {
             boss_policy_client::ReqwestPolicyClient::new("search", cli.policy_url),
         ));
 
-    let app = boss_search::http::router(boss_search::http::SearchApiState { pool, policy });
+    let app = boss_search::http::router(boss_search::http::SearchApiState {
+        pool: pool.clone(),
+        policy,
+    });
     let addr = format!("127.0.0.1:{}", cli.http_port);
     tracing::info!(addr = %addr, "boss-search-api listening");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    let app = boss_core::machine_gate::mount(app, "search", &["/api/search/health"]);
+    let app = boss_core::machine_gate::mount(
+        app,
+        "search",
+        &["/api/search/health"],
+        Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }

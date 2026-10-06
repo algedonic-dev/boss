@@ -28,10 +28,13 @@
 #   one regen must not fail: idempotence is the contract of a step's
 #   status.
 #
-# Metadata is MERGED, never replaced. `PUT /api/jobs/{id}/steps/{id}`
-# has PATCH semantics for top-level fields but swaps `metadata`
-# wholesale, so sending only new keys silently wipes the rest —
-# including `authority_role`, which is what keeps a gated step gated.
+# Metadata is MERGED, never replaced — by the server. The keys go
+# through the step merge door (`PATCH .../steps/{id}/metadata`), then a
+# PUT carries the status alone (backlog e39a9d2a, Stage 2). The step
+# PUT swaps `metadata` wholesale, so this used to read the step and
+# send every stored key back beside the new ones — including
+# `authority_role`, which is what keeps a gated step gated — and its
+# end state refuses any metadata body at all.
 #
 # Talks to jobs-api directly with an actor header, like
 # feedback-queue.sh: the gateway is the browser edge and strips
@@ -51,6 +54,11 @@ fi
 WORKFLOW="$1"; shift
 STEP_TITLE="$1"; shift
 
+# A mounted reading may be recorded before the operation ends (075d81f7).
+# The same merge door, with no status transition or synthesized verdict.
+METADATA_ONLY="${BOSS_STEP_METADATA_ONLY:-0}"
+case "$METADATA_ONLY" in 0|1) ;; *) echo 'boss-step: BOSS_STEP_METADATA_ONLY must be 0 or 1' >&2; exit 2 ;; esac
+
 # A VERDICT FOR THE RUN THAT JUST ENDED. systemd hands every
 # ExecStopPost= process $SERVICE_RESULT (success / exit-code / timeout /
 # signal / ...) and $EXIT_STATUS, and ExecStopPost runs whether ExecStart
@@ -66,7 +74,7 @@ STEP_TITLE="$1"; shift
 # service result: `ok` for success (the word the outcome predicates
 # route on), otherwise systemd's word for how it died, with the exit
 # status beside it. An explicit result= pair still wins.
-if [ -n "${SERVICE_RESULT:-}" ] && ! grep -q '^result=' <<< "$(printf '%s\n' "$@")"; then
+if [ "$METADATA_ONLY" = 0 ] && [ -n "${SERVICE_RESULT:-}" ] && ! grep -q '^result=' <<< "$(printf '%s\n' "$@")"; then
     if [ "$SERVICE_RESULT" = "success" ]; then
         set -- "$@" "result=ok"
     else
@@ -182,6 +190,10 @@ BOSS_USER="{\"id\":\"$ACTOR\",\"role\":\"platform-admin\",\"access_tier\":\"oper
 API_CURL="$(dirname "$0")/boss-api-curl.sh"
 [ -x "$API_CURL" ] || API_CURL=boss-api-curl.sh
 
+# Set the caller's cleanup before secret-header chains its own onto it.
+metadata_file=""
+trap '[ -z "$metadata_file" ] || rm -f "$metadata_file"' EXIT
+
 # The machine token rides to curl in a 0600 file, never in its argv,
 # where every local user reads it in ps (backlog 5f3ad356). The lib is
 # found the way the curl helper is — lib/ next to this file, which is
@@ -194,11 +206,19 @@ if [ ! -r "$SECRET_LIB" ]; then
 fi
 # shellcheck source=infra/lib/secret-header.sh
 . "$SECRET_LIB"
-secret_header MT_HDR ${BOSS_MACHINE_TOKEN:+"x-boss-machine-token: $BOSS_MACHINE_TOKEN"}
+machine_token_header MT_HDR "$BOSS_JOBS_URL"
 
 if ! jobs_json=$("$API_CURL" -fsS -H "x-boss-user: $BOSS_USER" \
+        ${MT_HDR:+-H "$MT_HDR"} \
         "$BASE/api/jobs?kind=$WORKFLOW&status=open&limit=50&full=true" 2>/dev/null); then
     echo "boss-step: jobs-api unreachable at $BASE — '$STEP_TITLE' not recorded" >&2
+    exit 1
+fi
+
+if [ "$METADATA_ONLY" = 1 ] && ! printf '%s' "$jobs_json" | jq -se '
+    length == 1 and (.[0] | type == "object" and (.data | type) == "array" and
+    (.total | type) == "number" and .total == (.data | length))' >/dev/null; then
+    echo 'boss-step: metadata-only needs the entire native open-job answer — no metadata recorded' >&2
     exit 1
 fi
 
@@ -213,6 +233,7 @@ open_count=$(printf '%s' "$open_jobs" | jq 'length')
 
 if [ "$open_count" -eq 0 ]; then
     echo "boss-step: no open $WORKFLOW Job — nothing to record" >&2
+    [ "$METADATA_ONLY" = 0 ] || exit 1
     exit 0
 fi
 if [ "$open_count" -gt 1 ]; then
@@ -240,16 +261,31 @@ if [ "$step" = "null" ]; then
 fi
 
 step_status=$(printf '%s' "$step" | jq -r '.status // ""')
+if [ "$METADATA_ONLY" = 1 ]; then
+    . "$(dirname "$0")/lib/jq.sh"
+    if ! jq_doc_text "$job" || ! printf '%s' "$job" | jq -e -s --arg actor "$ACTOR" --arg workflow "$WORKFLOW" --argjson step "$step" '
+        length == 1 and (.[0] |
+        .kind == $workflow and .partition == "real" and .simulated == false and
+        $step.job_id == .id and $step.assignee_id == $actor and
+        ($step.status == "ready" or $step.status == "active"))' >/dev/null; then
+        echo 'boss-step: metadata-only requires the actor-owned nonterminal step on a real native packet — no metadata recorded' >&2
+        exit 1
+    fi
+fi
 if [ "$step_status" = "completed" ] || [ "$step_status" = "skipped" ]; then
     echo "boss-step: $STEP_TITLE already $step_status — no-op" >&2
     exit 0
 fi
 
-merged=$(printf '%s' "$step" | jq '.metadata // {}')
+# Only the keys this run writes. The run summary merges DEEP onto what
+# the step holds (`*`), so each of its top-level keys is sent as that
+# deep merge; the merge door itself merges top-level keys only.
+merged='{}'
 # The run's own facts go under the caller's explicit pairs: a verdict the
 # unit line states wins over one a script left in a file.
 if [ -n "$SUMMARY_JSON" ]; then
-    merged=$(printf '%s' "$merged" | jq --argjson s "$SUMMARY_JSON" '. * $s')
+    merged=$(printf '%s' "$step" | jq --argjson s "$SUMMARY_JSON" '
+        ((.metadata // {}) * $s) | with_entries(select(.key as $k | $s | has($k)))')
 fi
 for pair in "$@"; do
     case "$pair" in
@@ -263,13 +299,54 @@ for pair in "$@"; do
         | jq --arg k "${pair%%=*}" --arg v "${pair#*=}" '. + {($k): $v}')
 done
 
-payload=$(printf '%s' "$merged" | jq -c '{status: "completed", metadata: .}')
+keys=$(printf '%s' "$merged" | jq -c '.')
+if [ "$METADATA_ONLY" = 1 ] && [ "$keys" = '{}' ]; then
+    echo 'boss-step: metadata-only has no evidence to merge — nothing recorded' >&2
+    exit 1
+fi
+metadata_data=(-d "$keys")
+if [ -n "${BOSS_STEP_OUTPUT_FILE:-}" ]; then
+    # The break-glass chore needs its complete observed refusal, even past
+    # Linux's 128 KiB per-argument limit (review a432c7be, d40eddc0).
+    # Neither jq nor curl sees the bytes in argv; both read a private file.
+    if [ ! -f "$BOSS_STEP_OUTPUT_FILE" ] || [ ! -r "$BOSS_STEP_OUTPUT_FILE" ]; then
+        echo "boss-step: output file is not readable: $BOSS_STEP_OUTPUT_FILE — no metadata recorded" >&2
+        exit 1
+    fi
+    metadata_file=$(mktemp "${TMPDIR:-/tmp}/boss-step-output.XXXXXX")
+    if ! printf '%s' "$keys" | jq -c --rawfile output "$BOSS_STEP_OUTPUT_FILE" '. + {output: $output}' > "$metadata_file"; then
+        echo 'boss-step: could not read the complete output into metadata — no metadata recorded' >&2
+        exit 1
+    fi
+    # Json at the jobs step merge door uses axum's default 2 MiB body
+    # limit. Judge the encoded body, never trim evidence to fit it.
+    metadata_bytes=$(wc -c < "$metadata_file")
+    if [ "$metadata_bytes" -gt 2097152 ]; then
+        echo "boss-step: complete output metadata is $metadata_bytes bytes, beyond the jobs API's 2097152-byte body limit — no metadata recorded; the chore log retains the whole output" >&2
+        exit 1
+    fi
+    keys="@$metadata_file"
+    metadata_data=(--data-binary "$keys")
+fi
 step_id=$(printf '%s' "$step" | jq -r '.id')
 url="$BASE/api/jobs/$job_id/steps/$step_id"
+# The keys first: a result required at done is judged at the flip, so a
+# merge that did not land is not followed by one.
+if [ "$keys" != '{}' ] && ! merge_err=$("$API_CURL" -fsS -X PATCH -H "content-type: application/json" \
+        -H "x-boss-user: $BOSS_USER" \
+        ${MT_HDR:+-H "$MT_HDR"} \
+        "${metadata_data[@]}" "$url/metadata" 2>&1 >/dev/null); then
+    echo "boss-step: metadata merge failed — $merge_err" >&2
+    exit 1
+fi
+if [ "$METADATA_ONLY" = 1 ]; then
+    echo "boss-step: recorded metadata on $WORKFLOW/$STEP_TITLE on ${job_id:0:8}; status unchanged"
+    exit 0
+fi
 if ! put_err=$("$API_CURL" -fsS -X PUT -H "content-type: application/json" \
         -H "x-boss-user: $BOSS_USER" \
         ${MT_HDR:+-H "$MT_HDR"} \
-        -d "$payload" "$url" 2>&1 >/dev/null); then
+        -d '{"status":"completed"}' "$url" 2>&1 >/dev/null); then
     echo "boss-step: PUT failed — $put_err" >&2
     exit 1
 fi

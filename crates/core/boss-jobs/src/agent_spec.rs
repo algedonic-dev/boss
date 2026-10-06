@@ -263,7 +263,8 @@ pub fn resolved_steps(
 }
 
 /// The migrations that insert `agent_rate_card` rows: the seed, then
-/// Opus 5.5 (backlog 6bb85880). Read at compile time so the lint can
+/// Opus 5.5 (backlog 6bb85880), then the Codex and Gemini CLIs' models
+/// (backlog 5840c068). Read at compile time so the lint can
 /// name the priced models without a database; the pin tests below hold
 /// them equal to the whole schema directory and to the live table.
 const RATE_CARD_SEED: &[&str] = &[
@@ -272,6 +273,10 @@ const RATE_CARD_SEED: &[&str] = &[
     ),
     include_str!(
         "../../../../infra/postgres/schema/20260925023146-opus-5-5-is-priced-at-its-own-rates.sql"
+    ),
+    // The Codex and Gemini CLIs' pinned models (backlog 5840c068).
+    include_str!(
+        "../../../../infra/postgres/schema/20261001183105-codex-and-gemini-are-priced-at-their-published-rates.sql"
     ),
 ];
 

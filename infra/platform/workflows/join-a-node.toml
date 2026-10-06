@@ -21,6 +21,7 @@ label = "Join a node"
 category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
+metadata = { department = "it" }
 description = "Admitting a machine to the cluster, as a protocol rather than a runbook. Every step demands the evidence that a node which reports Ready can still be broken: twice in one week a node joined, passed every Kubernetes health check, and could not pull an image or had never finished booting. The runbook said to check; nothing made anyone check. Each step here refuses to complete without the measurement."
 
 [[workflow.step]]

@@ -76,7 +76,13 @@ fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| cli.policy_base.clone());
 
+    // Stamps the machine token per request, follows no redirect (design
+    // 6805c764 car 2).
+    let client = boss_core::machine_token::BlockingClient::build(
+        reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(30)),
+    )?;
     let out = boss_policy::bootstrap::publish_policy_rules(
+        &client,
         &api_base,
         &cli.seeds,
         cli.force,

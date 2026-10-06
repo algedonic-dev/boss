@@ -56,12 +56,17 @@ async fn main() -> Result<()> {
         fleet: Some(Arc::new(boss_views::PgViewsRepo::new(pool.clone()))),
         // Stage durations read audit_log wall time (crate::stages).
         stages: Some(Arc::new(boss_views::PgViewsRepo::new(pool.clone()))),
-        resolver: Arc::new(boss_views::PgViewResolver::new(pool, policy)),
+        resolver: Arc::new(boss_views::PgViewResolver::new(pool.clone(), policy)),
     });
     let addr = format!("127.0.0.1:{}", cli.http_port);
     tracing::info!(addr = %addr, "boss-views-api listening");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    let app = boss_core::machine_gate::mount(app, "views", &["/api/views/health"]);
+    let app = boss_core::machine_gate::mount(
+        app,
+        "views",
+        &["/api/views/health"],
+        Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }

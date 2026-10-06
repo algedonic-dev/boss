@@ -246,7 +246,11 @@ impl Shell {
         self
     }
 
-    /// The hand door's shell: as the operator, in `cwd` when given.
+    /// The hand door's shell: as the operator, in `cwd` when given. No
+    /// machine token reaches it — not by a strip here, which removed the
+    /// dev pod's directory name and so fell back to boss-core's default,
+    /// but by `execute_with`, which points every probe at an empty one
+    /// (`door_env::NoTokenInReach`; review ef2da426 F1, backlog 844b936e).
     pub(crate) fn here(cwd: Option<&Path>) -> Self {
         Self {
             cwd: cwd.map(Path::to_path_buf),
@@ -262,6 +266,12 @@ impl Shell {
     /// the forge runner's order — with the prelude ahead of the probe's
     /// text. Pure, so the test pins the words rather than a run.
     pub(crate) fn command_line(&self, probe: &str, as_root: bool) -> Vec<String> {
+        let mut argv = self.command_prefix(as_root);
+        argv.extend(["bash", "-c", &format!("{PRELUDE}\n{probe}")].map(str::to_string));
+        argv
+    }
+
+    fn command_prefix(&self, as_root: bool) -> Vec<String> {
         let mut argv = Vec::new();
         if let Some(t) = self.timeout_secs {
             argv.extend(
@@ -277,8 +287,46 @@ impl Shell {
         if let (Some(u), true) = (&self.user, as_root) {
             argv.extend(["runuser", "-u", u, "--"].map(str::to_string));
         }
-        argv.extend(["bash", "-c", &format!("{PRELUDE}\n{probe}")].map(str::to_string));
         argv
+    }
+
+    /// Shared by execution and its provenance reads: the same directory,
+    /// environment and effective user, without any broader git trust.
+    fn command(&self, argv: &[String]) -> std::process::Command {
+        let mut cmd = std::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        if let Some(dir) = &self.cwd {
+            cmd.current_dir(dir);
+        }
+        for name in &self.strip {
+            cmd.env_remove(name);
+        }
+        for (k, v) in &self.env {
+            cmd.env(k, v);
+        }
+        if let Some(prefix) = &self.path_prefix {
+            let path = std::env::var("PATH").unwrap_or_default();
+            cmd.env("PATH", format!("{}:{path}", prefix.display()));
+        }
+        cmd
+    }
+
+    fn read(
+        &self,
+        program: &str,
+        args: &[&str],
+        no_token: &crate::door_env::NoTokenInReach,
+    ) -> Result<std::process::Output, String> {
+        let mut argv = self.command_prefix(self.user.is_some() && running_as_root());
+        argv.push(program.into());
+        argv.extend(args.iter().map(|arg| (*arg).to_string()));
+        let mut cmd = self.command(&argv);
+        // Local metadata needs no credential. Keep the same empty-token
+        // boundary as execution, including after caller-set environment.
+        no_token.token_only(&mut cmd);
+        cmd.stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("{program} {}: {e}", args.join(" ")))
     }
 }
 
@@ -300,6 +348,226 @@ fn running_as_root() -> bool {
 /// (macOS's 3.2) the channel stays empty and the verdict falls back to
 /// what it was: `command not found` on stderr, read as a red.
 pub(crate) fn execute_with(probe: &str, shell: &Shell) -> Result<Outcome> {
+    execute_given(probe, shell, crate::door_env::NoTokenInReach::new())
+}
+
+/// THE PROBE DID NOT RUN, AND THE HOST IS WHY (backlog 2e1f609e, review
+/// 595d8a89 N2 of car 844b936e). A probe runs only beside an empty token
+/// directory this process made; when the directory cannot be made — the
+/// temp filesystem full or unwritable — the probe is not run, which is
+/// fail-closed and right.
+///
+/// WHAT WAS WRONG WITH IT (corrected by review 19ecf37f). That error left
+/// this verb by `?` as an ordinary failure, exit 1, and recorded nothing.
+/// Exit 1 never made a car red — nothing reads an ops-request's exit as a
+/// car's colour; the shed reads only `proof_attempt` — so review
+/// 595d8a89's N2 overstated it. The real gap was the SILENCE: the arrival
+/// run left no `proof_attempt`, recheck-failing-probes-hourly re-runs only
+/// cars that carry one (`Scope::Failing` in jobs_run_car_probes.rs), and
+/// such a car sat as probe-pending with no last attempt for ~72 hours,
+/// until the shed's stale band, with the host fault shown nowhere. The
+/// gate's disk floor is the shape to copy: a refusal of the environment,
+/// said as one, on the record, never a verdict on the branch (CLAUDE.md
+/// §Diagnosis, "An infrastructure refusal is not a consist failure").
+///
+/// So it is its own error type, every door exits [`REFUSED_EXIT`] on it
+/// ("nothing ran and nothing was judged"), and the doors that record
+/// attempts record this refusal on the car ([`refusal_patch`]): as a NOT
+/// YET attempt naming the host and the cause when there is no judgement
+/// to keep, and beside a failed attempt, never over it (review 2d0043ad).
+/// Which door does what is [`on_environment_refusal`].
+#[derive(Debug)]
+pub(crate) struct EnvironmentRefusal(pub String);
+
+impl std::fmt::Display for EnvironmentRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ENVIRONMENT REFUSAL — the probe did not run and nothing about the claim was \
+             judged: {}. This host could not give the probe the environment it is promised; \
+             free the temp filesystem and run it again.",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for EnvironmentRefusal {}
+
+/// The refusal's cause, when this error is one; any other error back
+/// unchanged, for the door to propagate as before.
+pub(crate) fn environment_refusal(e: anyhow::Error) -> Result<String> {
+    match e.downcast_ref::<EnvironmentRefusal>() {
+        Some(r) => Ok(r.0.clone()),
+        None => Err(e),
+    }
+}
+
+/// The four doors that run a car's probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Door {
+    /// `boss prove <car> --from-car --unattended`: the arrival run and
+    /// the hourly recheck's, filed as a `run-car-probe` ops-request.
+    Unattended,
+    /// `boss prove <car> --from-car` or `--probe` by hand: records a
+    /// proof or an attempt on the car.
+    Hand,
+    /// `boss prove <car> --recheck`: re-runs a recorded probe, writes
+    /// nothing on any outcome.
+    Recheck,
+    /// `boss prove <car> --disproved`: records a disproof only on a
+    /// probe judged false.
+    Disproved,
+}
+
+/// What a door does when the host refuses the probe's environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OnRefusal {
+    /// Record the refusal on the car ([`refusal_patch`]).
+    pub record_attempt: bool,
+    /// The process's exit.
+    pub exit: i32,
+}
+
+/// EVERY DOOR EXITS [`REFUSED_EXIT`]; the two that record attempts
+/// record this one. `--recheck` writes nothing on any outcome and
+/// `--disproved` records only a disproof, so neither starts writing here.
+pub(crate) fn on_environment_refusal(door: Door) -> OnRefusal {
+    let record_attempt = matches!(door, Door::Unattended | Door::Hand);
+    OnRefusal {
+        record_attempt,
+        exit: REFUSED_EXIT,
+    }
+}
+
+/// The `proof_attempt.why` of a refusal: a NOT YET, so the shed never
+/// draws it red and the hourly recheck runs it again, naming the host
+/// and the cause so the fault is visible where the car is.
+pub(crate) fn environment_why(host: &str, cause: &str) -> String {
+    format!(
+        "NOT YET: the probe did not run — {host} refused its environment ({cause}). \
+         ENVIRONMENT REFUSAL, not a verdict against the change; free the host's temp \
+         filesystem, and recheck-failing-probes-hourly runs it again."
+    )
+}
+
+/// The attempt a refusal records: the doors' own shape
+/// ([`attempt_json`]), so the yard and the streak read it like any other
+/// not-yet, with `exit` null because nothing exited and `environment`
+/// set so a reader can tell the host's refusal from a probe's own 75.
+pub(crate) fn environment_attempt_json(
+    probe: &str,
+    expect: Option<&str>,
+    host: &str,
+    at: &str,
+    cause: &str,
+    prior: Option<&Value>,
+) -> Value {
+    let nothing = Outcome {
+        exit: 0,
+        stdout: String::new(),
+        stderr: String::new(),
+        missing_tools: Vec::new(),
+    };
+    let why = environment_why(host, cause);
+    let mut a = attempt_json(probe, expect, &nothing, host, at, &why, prior);
+    a["exit"] = Value::Null;
+    a["environment"] = json!(true);
+    a
+}
+
+/// The car key that holds the latest environment refusal, beside
+/// `proof_attempt` rather than inside it.
+pub(crate) const PROOF_ENVIRONMENT_REFUSAL: &str = "proof_environment_refusal";
+
+/// WHAT A REFUSAL WRITES ON THE CAR — the metadata PATCH, as a pure
+/// function of the car (backlog 2e1f609e, review 2d0043ad F2).
+///
+/// A refusal judged nothing, so it must not overwrite a judgement. The
+/// hourly recheck re-runs exactly the cars whose last attempt FAILED, and
+/// writing the refusal over that attempt turned every failing car in the
+/// shed into a calm NOT YET within the hour of a full /tmp on the forge
+/// (measured by the review through `shed_place`). So:
+///
+/// - no prior attempt, or a prior NOT YET: the refusal IS the attempt (a
+///   not-yet, the streak carried), so the recheck picks the car up and
+///   the shed shows why — the ~72 silent hours review 19ecf37f found;
+/// - a prior that judged (failed, unrunnable): `proof_attempt` is left
+///   exactly as it was. The car still carries an attempt, so the recheck
+///   still selects it, and it still reads failing.
+///
+/// Either way the refusal itself lands under
+/// [`PROOF_ENVIRONMENT_REFUSAL`] as `{at, host, cause}`, so the host
+/// fault is on the car whichever case it was.
+pub(crate) fn refusal_patch(
+    car: &Value,
+    probe: &str,
+    expect: Option<&str>,
+    host: &str,
+    at: &str,
+    cause: &str,
+) -> Value {
+    let prior = car
+        .pointer("/metadata/proof_attempt")
+        .filter(|p| !p.is_null());
+    let mut patch = json!({
+        PROOF_ENVIRONMENT_REFUSAL: {"at": at, "host": host, "cause": cause},
+    });
+    if prior.is_none_or(boss_jobs::car::attempt_said_not_yet) {
+        patch["proof_attempt"] = environment_attempt_json(probe, expect, host, at, cause, prior);
+    }
+    patch
+}
+
+/// Hand `patch` to `write` when `door` records refusals and this is not
+/// a dry run: `Ok(true)` when written, `Ok(false)` when this door writes
+/// nothing. The decision lives here, not at the door, so the test that
+/// drives this with a capturing writer pins both the decision and the
+/// handing-over (review 2d0043ad: an `if false` at the door left every
+/// refusal test green); each door's call is pinned by `door_sites`.
+pub(crate) async fn record_refusal<F, Fut>(
+    door: Door,
+    dry: bool,
+    patch: &Value,
+    write: F,
+) -> Result<bool>
+where
+    F: FnOnce(Value) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    if !on_environment_refusal(door).record_attempt || dry {
+        return Ok(false);
+    }
+    write(patch.clone()).await?;
+    Ok(true)
+}
+
+/// Leave the process as `door` does on a refusal, with the sentence on
+/// stderr. Called after any record the door makes.
+pub(crate) fn exit_refused(door: Door, cause: &str) -> ! {
+    eprintln!(
+        "boss prove: REFUSED — {}",
+        EnvironmentRefusal(cause.to_string())
+    );
+    std::process::exit(on_environment_refusal(door).exit)
+}
+
+/// [`execute_with`] with the empty token directory's making handed in,
+/// so the failure to make it can be pinned without filling a disk.
+fn execute_given(
+    probe: &str,
+    shell: &Shell,
+    no_token: Result<crate::door_env::NoTokenInReach>,
+) -> Result<Outcome> {
+    // Car-written text runs below: no machine token in reach of it, at
+    // EITHER door, and not by the shell's own `strip` — removing the
+    // directory's name falls back to boss-core's default, where a host
+    // that mounts the Secret there keeps the token (backlog 844b936e).
+    // Here, rather than in each constructor, so no Shell can be built
+    // that runs a probe with it. Made before anything else, so a
+    // failure to make it runs nothing — and is said as the host's
+    // refusal, not the car's failure (backlog 2e1f609e).
+    let no_token =
+        no_token.map_err(|e| anyhow::Error::new(EnvironmentRefusal(format!("{e:#}"))))?;
     let as_root = shell.user.is_some() && running_as_root();
     // The channel: a file of this process's own, named so two operators
     // (or two rechecks) on one box never share it — the uid and pid by
@@ -328,24 +596,13 @@ pub(crate) fn execute_with(probe: &str, shell: &Shell) -> Result<Outcome> {
         let _ = std::fs::set_permissions(c, std::fs::Permissions::from_mode(0o666));
     }
     let argv = shell.command_line(probe, as_root);
-    let mut cmd = std::process::Command::new(&argv[0]);
-    cmd.args(&argv[1..]);
-    if let Some(dir) = &shell.cwd {
-        cmd.current_dir(dir);
-    }
-    for name in &shell.strip {
-        cmd.env_remove(name);
-    }
-    for (k, v) in &shell.env {
-        cmd.env(k, v);
-    }
-    if let Some(prefix) = &shell.path_prefix {
-        let path = std::env::var("PATH").unwrap_or_default();
-        cmd.env("PATH", format!("{}:{path}", prefix.display()));
-    }
+    let mut cmd = shell.command(&argv);
     if let Some(c) = &channel {
         cmd.env("BOSS_PROBE_NOTFOUND", c);
     }
+    // LAST, so nothing the shell set can name a token; the address its
+    // door resolved stays, because reading the record is the probe's job.
+    no_token.token_only(&mut cmd);
     let out = cmd
         .stdin(std::process::Stdio::null())
         .output()
@@ -765,7 +1022,9 @@ pub(crate) const UNRUNNABLE_EXIT: i32 = 3;
 /// car with a recorded probe and an open `proven` step, so nothing ran
 /// and nothing was judged. Distinct from 1 (ran, not proven) so a
 /// reader of the ops-request does not go looking for a probe run that
-/// never happened.
+/// never happened. The host refusing the probe's environment — no empty
+/// token directory could be made ([`EnvironmentRefusal`], backlog
+/// 2e1f609e) — exits the same code for the same reason: nothing ran.
 pub(crate) const REFUSED_EXIT: i32 = 2;
 
 /// THE THREE-WAY READING (backlog 726562de). Two doors run a car's
@@ -1401,8 +1660,59 @@ pub(crate) fn override_reason(given: Option<&str>) -> Result<Option<&str>> {
 /// and this process's directory at the hand door. Reading it anywhere
 /// else would answer about a tree the probe never opens, which is the
 /// class of mistake this whole area exists to refuse.
-pub(crate) fn probe_tree(shell: &Shell) -> crate::freshness::TreeObservation {
-    crate::freshness::observe_tree(shell.cwd.as_deref().unwrap_or_else(|| Path::new(".")))
+#[derive(Debug, Default)]
+pub(crate) struct ProbeObservation {
+    tree: crate::freshness::TreeObservation,
+    cwd: Option<String>,
+    user: Option<String>,
+    uid: Option<String>,
+    unreadable: Vec<String>,
+}
+
+pub(crate) fn probe_tree(shell: &Shell) -> ProbeObservation {
+    let no_token = match crate::door_env::NoTokenInReach::new() {
+        Ok(no_token) => no_token,
+        Err(e) => {
+            return ProbeObservation {
+                unreadable: vec![format!("could not isolate provenance reads: {e:#}")],
+                ..Default::default()
+            };
+        }
+    };
+    let mut unreadable = Vec::new();
+    let mut line = |program: &str, args: &[&str]| {
+        let result = shell.read(program, args, &no_token).and_then(|out| {
+            let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if out.status.success() && !value.is_empty() {
+                Ok(value)
+            } else {
+                Err(format!(
+                    "{program} {} exited {:?}: {}",
+                    args.join(" "),
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ))
+            }
+        });
+        match result {
+            Ok(value) => Some(value),
+            Err(why) => {
+                unreadable.push(why);
+                None
+            }
+        }
+    };
+    let cwd = line("pwd", &["-P"]);
+    let user = line("id", &["-un"]);
+    let uid = line("id", &["-u"]);
+    let tree = crate::freshness::observe_tree_with(|args| shell.read("git", args, &no_token));
+    ProbeObservation {
+        tree,
+        cwd,
+        user,
+        uid,
+        unreadable,
+    }
 }
 
 /// The proof record. Serialised once, stored verbatim, re-read by
@@ -1413,7 +1723,7 @@ pub(crate) fn probe_tree(shell: &Shell) -> crate::freshness::TreeObservation {
 /// unattended door never writes it: it has no override, and a probe it
 /// refuses is refused on the ops-request, exit 2.
 ///
-/// `tree` is taken by value rather than left to each door to remember,
+/// `observed` is passed explicitly rather than left to each door to remember,
 /// because a door that forgets it records a proof that cannot say what
 /// it read — the defect this closed (backlog 6f581de6). See
 /// [`crate::freshness::tree_metadata`] for what the two keys mean.
@@ -1423,7 +1733,7 @@ pub(crate) fn proof_json(
     o: &Outcome,
     host: &str,
     at: &str,
-    tree: &crate::freshness::TreeObservation,
+    observed: &ProbeObservation,
     overridden: Option<&Value>,
 ) -> Value {
     let mut p = json!({
@@ -1441,19 +1751,22 @@ pub(crate) fn proof_json(
         // `ssh boss-gcp ...` re-run ON boss-gcp, where that name does
         // not resolve. Both are free to record — the verb already
         // knows them (66fd64c6).
-        "cwd": std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default(),
+        "cwd": observed.cwd,
+        "user": observed.user,
+        "uid": observed.uid,
         "at": at,
     });
     // WHAT IT READ, beside where it ran. `cwd` names a directory whose
     // contents change under it; these name the revision that answered.
-    for (k, v) in crate::freshness::tree_metadata(tree)
+    for (k, v) in crate::freshness::tree_metadata(&observed.tree)
         .as_object()
         .into_iter()
         .flatten()
     {
         p[k] = v.clone();
+    }
+    if !observed.unreadable.is_empty() {
+        p["context_unreadable"] = json!(observed.unreadable);
     }
     if let Some(o) = overridden {
         p["overridden"] = o.clone();
@@ -2096,8 +2409,11 @@ fn proven_writes(car_id: &str, step_id: &str, md: &Value) -> Vec<(reqwest::Metho
 /// backlog d843abf2 (2026-09-19) it was a literal here, the second
 /// spelling the unidentified reader in identity.rs would have needed a
 /// third of. The id is the one the credentials door already names for
-/// this reader (`boss_jobs::credentials`).
-pub(crate) const READER_ACTOR: &str = "automation:run-car-probe-reader";
+/// this reader (`boss_jobs::credentials`), and since design b35c22b4 it
+/// is read from core too: every machine gate writes this same id over a
+/// probe-reader caller's own, so the door and the gate cannot disagree
+/// about who a probe is.
+pub(crate) const READER_ACTOR: &str = boss_core::roles::PROBE_READER_ACTOR;
 
 /// The `x-boss-user` header a recorded probe's reader sends —
 /// `boss-sor-read` puts it on the wire verbatim. One shape with the
@@ -2151,11 +2467,14 @@ impl Shell {
             env: Vec::new(),
             // This verb's own write credential never reaches the
             // probe's text; `boss_jobs::probe::names_an_actor` refuses
-            // a probe that sets one, and this is the other half.
-            strip: vec![
-                crate::identity::ACTOR_ENV.into(),
-                crate::identity::ACTOR_FILE_ENV.into(),
-            ],
+            // a probe that sets one, and this is the other half. Nor
+            // does the machine token, which `execute_with` keeps out of
+            // reach at both doors (`door_env::NoTokenInReach`; review
+            // ef2da426 F1, backlog 844b936e).
+            strip: [crate::identity::ACTOR_ENV, crate::identity::ACTOR_FILE_ENV]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
         }
         .with_probe_reader(Some(&dir), base))
     }
@@ -2385,9 +2704,38 @@ pub(crate) async fn run_unattended(car_id: &str, now: chrono::DateTime<chrono::U
     // remote-tracking ref, and `tree_head` is the fact that matters:
     // production's own revision at the moment the claim was judged.
     let tree = probe_tree(&shell);
-    let o = execute_with(&probe, &shell)?;
     let at = now.to_rfc3339();
     let here = host();
+    let o = match execute_with(&probe, &shell) {
+        Ok(o) => o,
+        // The host refused the probe's environment: recorded on the car
+        // as a NOT YET naming the host and the cause, so the hourly
+        // recheck retries it and the shed shows it — never red, and
+        // never the ~72 silent hours an unrecorded arrival run cost
+        // (backlog 2e1f609e, review 19ecf37f).
+        Err(e) => {
+            let cause = environment_refusal(e)?;
+            let path = format!("/api/jobs/{car_id}/metadata");
+            let http = &http;
+            let wrote = record_refusal(
+                Door::Unattended,
+                false,
+                &refusal_patch(&car, &probe, Some(&expect), &here, &at, &cause),
+                |patch| async move {
+                    crate::gate::api(http, reqwest::Method::PATCH, &path, Some(patch))
+                        .await
+                        .map(|_| ())
+                },
+            )
+            .await;
+            if let Err(w) = wrote {
+                eprintln!(
+                    "boss prove: recording the environment refusal on {short} failed too — {w}"
+                );
+            }
+            exit_refused(Door::Unattended, &cause)
+        }
+    };
     let verdict = verdict(&probe, &o, Some(&expect));
     if let Verdict::Proven = verdict {
         let proof = proof_json(&probe, Some(&expect), &o, &here, &at, &tree, None);
@@ -2623,11 +2971,15 @@ pub(crate) async fn run(
         println!(
             "{}",
             crate::freshness::unrecorded_tree_note(
-                &probe_tree(&shell),
+                &probe_tree(&shell).tree,
                 crate::freshness::freshness_silenced(),
             )
         );
-        let o = execute_with(&probe, &shell)?;
+        // A recheck writes nothing on any outcome, a refusal included.
+        let o = match execute_with(&probe, &shell) {
+            Ok(o) => o,
+            Err(e) => exit_refused(Door::Recheck, &environment_refusal(e)?),
+        };
         // THREE READINGS, and which record they are read against
         // decides the sentence: a PROOF that fails now has decayed; an
         // ATTEMPT was never a proof. --recheck writes nothing on any of
@@ -2778,7 +3130,7 @@ pub(crate) async fn run(
     }
     if from_car {
         match crate::freshness::stale_tree_guard(
-            &obs,
+            &obs.tree,
             // A `--dry` run records nothing, so it is the rehearsal the
             // refusal leaves open rather than a write to refuse.
             !dry,
@@ -2790,8 +3142,38 @@ pub(crate) async fn run(
     }
 
     println!("boss prove: {short}  $ {probe}");
-    let o = execute_with(&probe, &shell)?;
     let at = now.to_rfc3339();
+    let o = match execute_with(&probe, &shell) {
+        Ok(o) => o,
+        // Recorded on the car as the unattended door records it
+        // (`refusal_patch`; backlog 2e1f609e, reviews 19ecf37f and
+        // 2d0043ad); a --dry run records nothing. A failed write is said
+        // and still exits 2: nothing ran, whatever the record did.
+        Err(e) => {
+            let cause = environment_refusal(e)?;
+            let path = format!("/api/jobs/{car_id}/metadata");
+            let http = &http;
+            let wrote = record_refusal(
+                Door::Hand,
+                dry,
+                &refusal_patch(car, &probe, expect.as_deref(), &host(), &at, &cause),
+                |patch| async move {
+                    crate::gate::api(http, reqwest::Method::PATCH, &path, Some(patch))
+                        .await
+                        .map(|_| ())
+                },
+            )
+            .await;
+            match wrote {
+                Ok(true) => println!("boss prove: the refusal is recorded on {short}"),
+                Ok(false) => {}
+                Err(w) => eprintln!(
+                    "boss prove: recording the environment refusal on {short} failed too — {w}"
+                ),
+            }
+            exit_refused(Door::Hand, &cause)
+        }
+    };
     match verdict(&probe, &o, expect.as_deref()) {
         Verdict::Proven => {}
         Verdict::NotProven(e) => return Err(e),
@@ -2975,8 +3357,8 @@ mod tests {
     /// The tree observation for a test that is not about the tree. It
     /// is deliberately the UNREADABLE one rather than a current tree:
     /// a fixture must not hand a proof a standing nothing measured.
-    fn no_tree() -> crate::freshness::TreeObservation {
-        crate::freshness::TreeObservation::default()
+    fn no_tree() -> ProbeObservation {
+        ProbeObservation::default()
     }
 
     /// THE RULE THE VERB EXISTS TO ENFORCE: a failing probe is not proof.
@@ -3221,7 +3603,10 @@ mod tests {
             &o,
             "h",
             "2026-09-22T00:00:00Z",
-            &tree,
+            &ProbeObservation {
+                tree,
+                ..Default::default()
+            },
             None,
         );
         assert_eq!(p["tree_head"], json!("1c63ca24ffff"));
@@ -3234,6 +3619,185 @@ mod tests {
         ] {
             assert!(p.get(k).is_some(), "{k} is a contract, not a detail: {p}");
         }
+    }
+
+    #[test]
+    fn a_proof_records_the_directory_its_shell_actually_used() {
+        let dir = boss_testing::scratch::scratch_dir("proof-executed-cwd");
+        let shell = Shell::here(Some(&dir));
+        let probe = "pwd -P";
+        let outcome = execute_with(probe, &shell).unwrap();
+        assert_eq!(outcome.exit, 0, "{outcome:?}");
+        let proof = proof_json(
+            probe,
+            None,
+            &outcome,
+            "private-host",
+            "now",
+            &probe_tree(&shell),
+            None,
+        );
+        assert_eq!(
+            proof["cwd"].as_str(),
+            Some(outcome.stdout.trim()),
+            "{proof}"
+        );
+        assert_eq!(
+            proof["tree_head"],
+            Value::Null,
+            "a non-repository must not invent a revision: {proof}"
+        );
+        assert_eq!(proof["tree_standing"], "unreadable");
+    }
+
+    #[test]
+    fn a_proof_observes_the_tree_and_identity_as_the_probe_user() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = boss_testing::scratch::scratch_dir("proof-executed-user");
+        #[cfg(unix)]
+        // mode-bits-ok: a fixture directory nobody traverses and creates its own checkout in
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let dir = root.join("user-checkout");
+        let dropping = running_as_root();
+        let git = |args: &[&str]| {
+            let mut command = if dropping {
+                let mut command = std::process::Command::new("runuser");
+                command.args(["-u", "nobody", "--", "git"]);
+                command
+            } else {
+                std::process::Command::new("git")
+            };
+            let output = command
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "private fixture")
+                .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+                .env("GIT_COMMITTER_NAME", "private fixture")
+                .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main", dir.to_str().unwrap()]);
+        git(&[
+            "-C",
+            dir.to_str().unwrap(),
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "fixture",
+        ]);
+        let head = git(&["-C", dir.to_str().unwrap(), "rev-parse", "HEAD"]);
+        git(&[
+            "-C",
+            dir.to_str().unwrap(),
+            "update-ref",
+            "refs/remotes/origin/main",
+            &head,
+        ]);
+        let shell = Shell {
+            user: Some("nobody".into()),
+            ..Shell::here(Some(&dir))
+        };
+        let probe = "pwd -P; id -un; id -u; git rev-parse HEAD";
+        let outcome = execute_with(probe, &shell).unwrap();
+        assert_eq!(outcome.exit, 0, "{outcome:?}");
+        let lines: Vec<_> = outcome.stdout.lines().collect();
+        assert_eq!(lines.len(), 4, "{outcome:?}");
+        assert_eq!(lines[3], head);
+        if dropping {
+            assert_eq!(lines[1], "nobody");
+        }
+        let tree = probe_tree(&shell);
+        println!(
+            "actual execution identity={} uid={} head={} observed tree={tree:?}",
+            lines[1], lines[2], head
+        );
+        let proof = proof_json(probe, None, &outcome, "private-host", "now", &tree, None);
+        assert_eq!(proof["tree_head"].as_str(), Some(head.as_str()), "{proof}");
+        assert_eq!(proof["cwd"].as_str(), Some(lines[0]), "{proof}");
+        assert_eq!(proof["user"].as_str(), Some(lines[1]), "{proof}");
+        assert_eq!(proof["uid"].as_str(), Some(lines[2]), "{proof}");
+        // A missing remote ref is a standing gap, not loss of the
+        // checkout identity git already answered for this same user.
+        git(&[
+            "-C",
+            dir.to_str().unwrap(),
+            "update-ref",
+            "-d",
+            "refs/remotes/origin/main",
+        ]);
+        let without_main = probe_tree(&shell);
+        let proof = proof_json(
+            probe,
+            None,
+            &outcome,
+            "private-host",
+            "now",
+            &without_main,
+            None,
+        );
+        assert_eq!(proof["tree_head"].as_str(), Some(head.as_str()), "{proof}");
+        assert_eq!(proof["tree_standing"], "unreadable");
+    }
+
+    #[test]
+    fn an_unavailable_execution_directory_is_not_replaced_by_the_parent() {
+        let dir = boss_testing::scratch::scratch_dir("proof-unavailable-cwd").join("absent");
+        let observed = probe_tree(&Shell::here(Some(&dir)));
+        let proof = proof_json(
+            "true",
+            None,
+            &ok(""),
+            "private-host",
+            "now",
+            &observed,
+            None,
+        );
+        assert_eq!(proof["cwd"], Value::Null, "{proof}");
+        assert_eq!(proof["user"], Value::Null, "{proof}");
+        assert_eq!(proof["uid"], Value::Null, "{proof}");
+        assert_eq!(proof["tree_head"], Value::Null, "{proof}");
+        assert_eq!(
+            proof["context_unreadable"].as_array().unwrap().len(),
+            3,
+            "{proof}"
+        );
+        assert!(execute_with("true", &Shell::here(Some(&dir))).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symbolic_execution_directory_is_recorded_as_its_physical_directory() {
+        let root = boss_testing::scratch::scratch_dir("proof-symlink-cwd");
+        let dir = root.join("real");
+        let alias = root.join("alias");
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&dir, &alias).unwrap();
+        let shell = Shell::here(Some(&alias));
+        let observed = probe_tree(&shell);
+        let outcome = execute_with("pwd -P", &shell).unwrap();
+        assert_eq!(outcome.exit, 0, "{outcome:?}");
+        let proof = proof_json(
+            "pwd -P",
+            None,
+            &outcome,
+            "private-host",
+            "now",
+            &observed,
+            None,
+        );
+        assert_eq!(
+            proof["cwd"].as_str(),
+            Some(outcome.stdout.trim()),
+            "{proof}"
+        );
+        assert_eq!(proof["cwd"], dir.to_str().unwrap());
     }
 
     /// THE 932aa956 / 3f846cc5 CASE. A probe authored on the workstation
@@ -3340,7 +3904,7 @@ mod tests {
             &o,
             "somehost",
             "2026-08-29T00:00:00Z",
-            &no_tree(),
+            &probe_tree(&Shell::here(None)),
             None,
         );
         let step = json!({"metadata": {"proof": proof.to_string()}});
@@ -5299,6 +5863,91 @@ ugrep: warning: complete\": No such file or directory\n";
         }
     }
 
+    /// NO MACHINE TOKEN REACHES A PROBE, AT EITHER DOOR (design 6805c764
+    /// car 4, review ef2da426 F1; backlog 844b936e). A probe is
+    /// car-written text builders rehearse on the dev pod, and a handler
+    /// test it runs would stamp the token onto a mock and print it into
+    /// the record. Until 844b936e both doors STRIPPED the directory's
+    /// name, and a stripped name falls back to boss-core's default —
+    /// where a host that mounts the Secret there keeps the token — so
+    /// the old version of this test asserted `unset` and called it safe.
+    /// Proven by effect: this binary re-run with the doors' directory
+    /// holding a live-looking token, and, separately, with no name at all
+    /// (the conductor's shape); each door's probe must see a NAMED
+    /// directory that is neither, and no token in it. The unattended
+    /// door runs here as itself in a scratch dir — its user and checkout
+    /// are the forge's — with every other piece its constructor builds.
+    #[test]
+    fn no_machine_token_reaches_a_probe_at_either_door() {
+        let var = boss_core::machine_token::TOKEN_DIR_ENV;
+        const INNER: &str = "BOSS_PROVE_TOKEN_DIR_INNER";
+        let probe = format!(
+            "d=\"${{{var}:-unset}}\"; t=absent; [ -e \"$d/current\" ] && t=present; \
+             printf 'DIR=%s TOKEN=%s URL=[%s]\\n' \"$d\" \"$t\" \"${{BOSS_JOBS_URL:-}}\""
+        );
+        if std::env::var(INNER).is_ok() {
+            let scratch = boss_testing::scratch::scratch_dir("prove-no-token-unattended");
+            let unattended = Shell {
+                user: None,
+                cwd: Some(scratch),
+                ..Shell::unattended("http://sor.invalid:7900").unwrap()
+            };
+            for (door, shell) in [("here", Shell::here(None)), ("unattended", unattended)] {
+                let o = execute_with(&probe, &shell).unwrap();
+                println!("{door}: {}", o.stdout.trim());
+            }
+            return;
+        }
+        let held = boss_testing::scratch::scratch_dir("prove-held-token");
+        let doors = held.join("machine-token");
+        std::fs::create_dir_all(&doors).unwrap();
+        std::fs::write(doors.join("current"), "x".repeat(43)).unwrap();
+        for parent in [Some(doors.as_path()), None] {
+            let me = std::env::current_exe().unwrap();
+            let mut cmd = std::process::Command::new(me);
+            cmd.args([
+                "--exact",
+                "prove::tests::no_machine_token_reaches_a_probe_at_either_door",
+                "--nocapture",
+            ])
+            .env(INNER, "1");
+            match parent {
+                Some(d) => cmd.env(var, d),
+                None => cmd.env_remove(var),
+            };
+            let out = cmd.output().unwrap();
+            let printed = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success(),
+                "{printed}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            for door in ["here", "unattended"] {
+                let line = printed
+                    .lines()
+                    .find(|l| l.starts_with(&format!("{door}: ")))
+                    .unwrap_or_else(|| panic!("no {door} line (parent {parent:?}): {printed}"));
+                for wrong in [
+                    "unset",
+                    boss_core::machine_token::DEFAULT_TOKEN_DIR,
+                    &doors.display().to_string(),
+                ] {
+                    assert!(
+                        !line.contains(&format!("DIR={wrong} ")),
+                        "the {door} door's probe must see a named empty dir (parent {parent:?}): \
+                         {line}"
+                    );
+                }
+                assert!(line.contains("TOKEN=absent"), "{line}");
+            }
+            // The unattended door still hands the address it resolved.
+            assert!(
+                printed.contains("URL=[http://sor.invalid:7900]"),
+                "{printed}"
+            );
+        }
+    }
+
     /// THE PORT TABLE IS READ AS DATA: `name=port` lines become one
     /// space-separated table; comments, blanks and padding are not in
     /// it. The twin's `grep -Ev | tr -s | sed` extraction, in Rust.
@@ -5518,6 +6167,413 @@ ugrep: warning: complete\": No such file or directory\n";
     /// The three non-zero codes are distinct from each other and from
     /// the refusal's, so a reader of the ops-request's `exit_code`
     /// knows what to do without opening the output.
+    /// A PROBE WHOSE EMPTY TOKEN DIRECTORY CANNOT BE MADE DID NOT RUN,
+    /// AND SAYS SO AS THE HOST'S REFUSAL (backlog 2e1f609e, review
+    /// 595d8a89 N2). The making is handed in failed — the disk-full
+    /// error `tempfile` would give — and the probe would leave a marker
+    /// if it ran. Three halves: nothing ran; the error is an
+    /// [`EnvironmentRefusal`] that names the cause and says nothing was
+    /// judged; and an ordinary error is not one, so only this case is
+    /// diverted to [`REFUSED_EXIT`] and never read as exit 1, "ran, not
+    /// proven" — a red car over a full /tmp.
+    #[test]
+    fn a_probe_without_its_empty_token_dir_is_an_environment_refusal_not_a_red() {
+        let dir = boss_testing::scratch::scratch_dir("prove-environment-refusal");
+        let marker = dir.join("ran");
+        let probe = format!("touch '{}'; echo claim:ok", marker.display());
+        let made: Result<crate::door_env::NoTokenInReach> =
+            Err(anyhow::anyhow!("No space left on device (os error 28)")
+                .context("making the empty token directory a child runs with"));
+        let e = execute_given(&probe, &Shell::here(None), made)
+            .expect_err("no token directory, no run");
+        assert!(
+            !marker.exists(),
+            "the probe ran without its empty token dir"
+        );
+        let said = format!("{e:#}");
+        assert!(environment_refusal(e).is_ok(), "{said}");
+        assert!(said.contains("ENVIRONMENT REFUSAL"), "{said}");
+        assert!(said.contains("did not run"), "{said}");
+        assert!(said.contains("No space left on device"), "{said}");
+        assert!(
+            environment_refusal(anyhow::anyhow!("could not run the probe (bash): gone")).is_err(),
+            "only the environment's refusal is diverted from the ordinary error path"
+        );
+        assert_ne!(REFUSED_EXIT, 1, "a refusal must not read as ran-not-proven");
+        // The made directory, handed in, runs the probe as before.
+        let o = execute_given(
+            "echo claim:ok",
+            &Shell::here(None),
+            crate::door_env::NoTokenInReach::new(),
+        )
+        .expect("bash runs");
+        assert_eq!(o.exit, 0, "{o:?}");
+    }
+
+    /// Every site in non-test source where a door runs a car's probe —
+    /// `match [prove::]execute_with(&probe, &shell)` — as (the function
+    /// it sits in, the `Door::` its refusal arm names). A door that went
+    /// back to `?` or a bare call has no `match` and no Door, and the
+    /// bare-call count below names it.
+    fn door_sites() -> Vec<(String, String, String)> {
+        let mut sites = Vec::new();
+        for src in [include_str!("prove.rs"), include_str!("disprove.rs")] {
+            let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+            let lines: Vec<&str> = prod.lines().collect();
+            for (i, l) in lines.iter().enumerate() {
+                if !l.contains("execute_with(&probe, &shell)") {
+                    continue;
+                }
+                let func = lines[..i]
+                    .iter()
+                    .rev()
+                    .find_map(|p| {
+                        let t = p.trim_start();
+                        let t = t.strip_prefix("pub(crate) ").unwrap_or(t);
+                        let t = t.strip_prefix("async ").unwrap_or(t);
+                        t.strip_prefix("fn ")
+                            .map(|r| r.split('(').next().unwrap_or("").to_string())
+                    })
+                    .unwrap_or_default();
+                let door = if l.contains("match ") {
+                    lines[i..lines.len().min(i + 40)]
+                        .iter()
+                        .find_map(|n| n.split("Door::").nth(1))
+                        .map(|r| {
+                            r.chars()
+                                .take_while(char::is_ascii_alphanumeric)
+                                .collect::<String>()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                // The refusal arm: from the call to the door's exit.
+                let end = lines[i..]
+                    .iter()
+                    .position(|n| n.contains("exit_refused("))
+                    .map_or(i, |k| i + k);
+                let arm = lines[i..=end.min(i + 60)].join("\n");
+                sites.push((func, door, arm));
+            }
+        }
+        sites
+    }
+
+    /// One door's pin: its site routes the refusal through its own Door,
+    /// in the function that is that door, and the Door exits 2 — and
+    /// records an attempt exactly when the door records attempts.
+    fn the_door_routes_a_refusal_to_exit_2(door: Door, func: &str, records: bool) {
+        let sites = door_sites();
+        let bare: Vec<_> = sites.iter().filter(|(_, d, _)| d.is_empty()).collect();
+        assert!(
+            bare.is_empty(),
+            "a door runs a probe without routing a refusal: {bare:?}"
+        );
+        let name = format!("{door:?}");
+        let here: Vec<_> = sites.iter().filter(|(_, d, _)| *d == name).collect();
+        assert_eq!(
+            here.len(),
+            1,
+            "the {name} door must route a refusal exactly once: {sites:?}"
+        );
+        assert_eq!(
+            here[0].0, func,
+            "the {name} door's site sits in the wrong function"
+        );
+        // A recording door hands the refusal to `record_refusal`, built
+        // by `refusal_patch`, unconditionally — no `if` at the door may
+        // stand between the refusal and the record (review 2d0043ad).
+        let arm = &here[0].2;
+        let calls = arm.contains("record_refusal(") && arm.contains("refusal_patch(");
+        assert_eq!(calls, records, "the {name} door's refusal arm:\n{arm}");
+        if records {
+            // ...and passes its own door and the only dry it has: the
+            // unattended door none (`false`), the hand door its `--dry`.
+            let flat: String = arm.chars().filter(|c| !c.is_whitespace()).collect();
+            let dry = if door == Door::Unattended {
+                "false"
+            } else {
+                "dry"
+            };
+            assert!(
+                flat.contains(&format!("record_refusal(Door::{name},{dry},")),
+                "the {name} door must call record_refusal(Door::{name}, {dry}, …):\n{arm}"
+            );
+            let before = arm.split("record_refusal(").next().unwrap_or("");
+            assert!(
+                !before.lines().any(|l| l.trim_start().starts_with("if ")),
+                "the {name} door guards its record with an `if`:\n{arm}"
+            );
+        }
+        let act = on_environment_refusal(door);
+        assert_eq!(act.exit, REFUSED_EXIT, "{name}");
+        assert_eq!(REFUSED_EXIT, 2);
+        assert_eq!(act.record_attempt, records, "{name}");
+    }
+
+    /// `boss prove --from-car --unattended` — the arrival run and the
+    /// hourly recheck's: exit 2, and the refusal recorded on the car.
+    #[test]
+    fn the_unattended_door_routes_an_environment_refusal_to_exit_2() {
+        the_door_routes_a_refusal_to_exit_2(Door::Unattended, "run_unattended", true);
+    }
+
+    /// `boss prove --from-car` (or `--probe`) by hand: exit 2, recorded.
+    #[test]
+    fn the_from_car_door_routes_an_environment_refusal_to_exit_2() {
+        the_door_routes_a_refusal_to_exit_2(Door::Hand, "run", true);
+    }
+
+    /// `boss prove --recheck`: exit 2, nothing written.
+    #[test]
+    fn the_recheck_door_routes_an_environment_refusal_to_exit_2() {
+        the_door_routes_a_refusal_to_exit_2(Door::Recheck, "run", false);
+    }
+
+    /// `boss prove --disproved`: exit 2, no disproof.
+    #[test]
+    fn the_disproved_door_routes_an_environment_refusal_to_exit_2() {
+        the_door_routes_a_refusal_to_exit_2(Door::Disproved, "run", false);
+    }
+
+    /// THE REFUSAL IS RECORDED AS A NOT YET THE RECHECK RETRIES (backlog
+    /// 2e1f609e, review 19ecf37f). Without a record the arrival run left
+    /// no `proof_attempt`, the hourly recheck (which re-runs only cars
+    /// carrying one) never picked the car up, and it sat ~72 hours with
+    /// the host fault shown nowhere. The record: an attempt, read as not
+    /// yet by the one definition the shed and the streak share, never an
+    /// exit anyone could read as a failure, naming host and cause, and
+    /// marked as the environment's.
+    #[test]
+    fn an_environment_refusal_is_recorded_as_a_not_yet_attempt() {
+        let a = environment_attempt_json(
+            "echo claim:ok",
+            Some("claim:ok"),
+            "forge",
+            "2026-10-01T09:00:00Z",
+            "making the empty token directory a child runs with: No space left on device",
+            None,
+        );
+        assert!(boss_jobs::car::attempt_said_not_yet(&a), "{a}");
+        assert_eq!(a["not_yet"], json!(true), "{a}");
+        assert_eq!(a["exit"], Value::Null, "nothing exited: {a}");
+        assert_eq!(a["environment"], json!(true), "{a}");
+        assert_eq!(a["unrunnable"], json!(false), "{a}");
+        assert_eq!(
+            a["probe"],
+            json!("echo claim:ok"),
+            "the recheck re-runs this text"
+        );
+        let why = a["why"].as_str().unwrap_or("");
+        assert!(why.starts_with("NOT YET"), "{why}");
+        assert!(why.contains("ENVIRONMENT REFUSAL"), "{why}");
+        assert!(
+            why.contains("forge") && why.contains("No space left on device"),
+            "{why}"
+        );
+        assert_eq!(a[boss_jobs::car::NOT_YET_RUNS], json!(1), "{a}");
+        // A second refusal carries the streak, as any not-yet does.
+        let b = environment_attempt_json(
+            "echo claim:ok",
+            Some("claim:ok"),
+            "forge",
+            "2026-10-01T10:00:00Z",
+            "again",
+            Some(&a),
+        );
+        assert_eq!(b[boss_jobs::car::NOT_YET_RUNS], json!(2), "{b}");
+        assert_eq!(
+            b[boss_jobs::car::NOT_YET_SINCE],
+            a[boss_jobs::car::NOT_YET_SINCE],
+            "{b}"
+        );
+    }
+
+    /// A car as the doors read it, with this `proof_attempt` (if any).
+    fn refused_car(prior: Option<Value>) -> Value {
+        let mut md = json!({"proof_probe": "echo claim:ok", "proof_expect": "claim:ok"});
+        if let Some(p) = prior {
+            md["proof_attempt"] = p;
+        }
+        json!({"id": "00000000-0000-0000-0000-0000000000aa", "metadata": md})
+    }
+
+    /// The car's metadata after `patch` is applied the way the metadata
+    /// endpoint applies it: top-level keys merged.
+    fn merged(car: &Value, patch: &Value) -> Value {
+        let mut md = car["metadata"].clone();
+        for (k, v) in patch.as_object().expect("a patch is an object") {
+            md[k] = v.clone();
+        }
+        md
+    }
+
+    const REFUSED_CAUSE: &str = "making the empty token directory: No space left on device";
+
+    /// A RED PRIOR STILL READS FAILING AFTER A REFUSAL (review 2d0043ad
+    /// F2). The hourly recheck re-runs exactly the failing cars, so a
+    /// refusal written over their attempt turned every one of them into a
+    /// calm NOT YET within the hour of a full /tmp. The refusal judged
+    /// nothing; the judgement stands, and the refusal sits beside it.
+    #[test]
+    fn a_refusal_leaves_a_failed_attempt_reading_failing() {
+        let failed = Outcome {
+            exit: 1,
+            stdout: "nope".into(),
+            stderr: String::new(),
+            missing_tools: Vec::new(),
+        };
+        let red = attempt_json(
+            "echo claim:ok",
+            Some("claim:ok"),
+            &failed,
+            "forge",
+            "2026-10-01T08:00:00Z",
+            "FAILED: printed nope",
+            None,
+        );
+        let car = refused_car(Some(red.clone()));
+        let before = boss_jobs::regions::shed_place(&car["metadata"]);
+        let patch = refusal_patch(
+            &car,
+            "echo claim:ok",
+            Some("claim:ok"),
+            "forge",
+            "2026-10-01T09:00:00Z",
+            REFUSED_CAUSE,
+        );
+        assert!(patch.get("proof_attempt").is_none(), "{patch}");
+        let after = merged(&car, &patch);
+        assert_eq!(
+            after["proof_attempt"], red,
+            "the judgement is left exactly as it was"
+        );
+        assert_eq!(boss_jobs::regions::shed_place(&after), before);
+        assert_eq!(
+            boss_jobs::regions::shed_place(&after),
+            boss_jobs::regions::ShedPlace::ProbePending {
+                last: Some("FAILED: printed nope".into())
+            },
+            "a failing car still reads failing"
+        );
+        let r = &after[PROOF_ENVIRONMENT_REFUSAL];
+        assert_eq!(r["host"], json!("forge"), "{r}");
+        assert_eq!(r["at"], json!("2026-10-01T09:00:00Z"), "{r}");
+        assert_eq!(r["cause"], json!(REFUSED_CAUSE), "{r}");
+    }
+
+    /// NO PRIOR ATTEMPT: the refusal IS the attempt, a not-yet, so the
+    /// hourly recheck picks the car up and the shed says why — the ~72
+    /// silent hours review 19ecf37f found.
+    #[test]
+    fn a_refusal_with_no_prior_becomes_a_not_yet_attempt() {
+        let car = refused_car(None);
+        let patch = refusal_patch(
+            &car,
+            "echo claim:ok",
+            Some("claim:ok"),
+            "forge",
+            "2026-10-01T09:00:00Z",
+            REFUSED_CAUSE,
+        );
+        let after = merged(&car, &patch);
+        assert!(
+            boss_jobs::car::attempt_said_not_yet(&after["proof_attempt"]),
+            "{after}"
+        );
+        assert_eq!(
+            after["proof_attempt"]["environment"],
+            json!(true),
+            "{after}"
+        );
+        match boss_jobs::regions::shed_place(&after) {
+            boss_jobs::regions::ShedPlace::ProbeNotYet { said } => {
+                assert!(said.contains("ENVIRONMENT REFUSAL"), "{said}");
+                assert!(said.contains("No space left on device"), "{said}");
+            }
+            other => panic!("expected a not-yet, got {other:?}"),
+        }
+        assert_eq!(
+            after[PROOF_ENVIRONMENT_REFUSAL]["cause"],
+            json!(REFUSED_CAUSE)
+        );
+        // A `proof_attempt: null` is no prior either.
+        let null = refused_car(Some(Value::Null));
+        let p = refusal_patch(&null, "echo claim:ok", None, "forge", "t", "c");
+        assert!(p.get("proof_attempt").is_some(), "{p}");
+    }
+
+    /// A NOT-YET PRIOR: the refusal replaces it as the next not-yet, and
+    /// the streak continues rather than restarting.
+    #[test]
+    fn a_refusal_after_a_not_yet_continues_the_streak() {
+        let car = refused_car(None);
+        let first = refusal_patch(
+            &car,
+            "echo claim:ok",
+            Some("claim:ok"),
+            "forge",
+            "2026-10-01T09:00:00Z",
+            REFUSED_CAUSE,
+        );
+        let car = json!({"id": car["id"], "metadata": merged(&car, &first)});
+        let second = refusal_patch(
+            &car,
+            "echo claim:ok",
+            Some("claim:ok"),
+            "forge",
+            "2026-10-01T10:00:00Z",
+            REFUSED_CAUSE,
+        );
+        let a = &second["proof_attempt"];
+        assert_eq!(a[boss_jobs::car::NOT_YET_RUNS], json!(2), "{second}");
+        assert_eq!(
+            a[boss_jobs::car::NOT_YET_SINCE],
+            first["proof_attempt"][boss_jobs::car::NOT_YET_SINCE],
+            "{second}"
+        );
+    }
+
+    /// THE RECORD IS HANDED TO THE WRITER (review 2d0043ad: an `if false`
+    /// at the door left every refusal test green). The decision lives in
+    /// `record_refusal`, which each recording door calls unconditionally
+    /// (pinned by the door tests above): the unattended door and a
+    /// non-dry hand door hand over exactly the patch; a dry hand run,
+    /// `--recheck` and `--disproved` write nothing; a failed write is an
+    /// error the door can say, never a silent success.
+    #[tokio::test]
+    async fn the_recording_doors_hand_the_refusal_to_their_writer() {
+        let car = refused_car(None);
+        let patch = refusal_patch(&car, "echo claim:ok", None, "forge", "t", REFUSED_CAUSE);
+        for (door, dry, writes) in [
+            (Door::Unattended, false, true),
+            (Door::Hand, false, true),
+            (Door::Hand, true, false),
+            (Door::Recheck, false, false),
+            (Door::Disproved, false, false),
+        ] {
+            let seen = std::sync::Mutex::new(None::<Value>);
+            let wrote = record_refusal(door, dry, &patch, |p| {
+                *seen.lock().expect("the capture") = Some(p);
+                async { Ok(()) }
+            })
+            .await
+            .expect("the writer succeeded");
+            assert_eq!(wrote, writes, "{door:?} dry={dry}");
+            let got = seen.lock().expect("the capture").clone();
+            assert_eq!(got.is_some(), writes, "{door:?} dry={dry}");
+            if writes {
+                assert_eq!(got.as_ref(), Some(&patch), "{door:?}: the patch, unchanged");
+            }
+        }
+        let failed = record_refusal(Door::Unattended, false, &patch, |_| async {
+            Err(anyhow::anyhow!("503 from the jobs API"))
+        })
+        .await;
+        assert!(failed.is_err(), "a failed write is said, not swallowed");
+    }
+
     #[test]
     fn the_unattended_door_exits_one_of_three_codes() {
         let codes = [1, UNRUNNABLE_EXIT, NOT_YET_EXIT, REFUSED_EXIT];

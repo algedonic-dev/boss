@@ -240,7 +240,12 @@ pub(crate) async fn run(
         .with_car_instant(prove::car_merge_ref(&car));
     let obs = prove::probe_tree(&shell);
     println!("boss prove --disproved: {short}  $ {probe}");
-    let o = prove::execute_with(&probe, &shell)?;
+    // A disproof records only a probe judged false; a refusal records
+    // nothing and exits as every door does (backlog 2e1f609e).
+    let o = match prove::execute_with(&probe, &shell) {
+        Ok(o) => o,
+        Err(e) => prove::exit_refused(prove::Door::Disproved, &prove::environment_refusal(e)?),
+    };
     disproof_verdict(&probe, &o, expect.as_deref()).map_err(|e| {
         anyhow!("boss prove --disproved: REFUSED — {e}\n\nNothing is recorded on {short}.")
     })?;

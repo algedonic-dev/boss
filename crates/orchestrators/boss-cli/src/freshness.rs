@@ -123,7 +123,14 @@ fn git(repo: &Path, args: &[&str]) -> Result<std::process::Output, String> {
 
 /// The trimmed stdout of a git command that had to succeed.
 fn git_line(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let out = git(repo, args)?;
+    git_output_line(git(repo, args), args)
+}
+
+fn git_output_line(
+    output: Result<std::process::Output, String>,
+    args: &[&str],
+) -> Result<String, String> {
+    let out = output?;
     if !out.status.success() {
         return Err(format!(
             "git {}: {}",
@@ -244,11 +251,12 @@ const MAIN_REF: &str = "refs/remotes/origin/main";
 /// A probe reads the tree with `git show HEAD:<path>`. On the forge,
 /// where the unattended door runs it, HEAD is the converged checkout —
 /// production. At the hand door it is whatever this checkout last
-/// fast-forwarded to, and on the dev pod the freshness sidecar DEFERS
-/// while any gate-run is open, which under load is most of the time. So
-/// the staleness is the steady state exactly when proofs are recorded:
-/// measured 2026-09-22 (backlog a09bd894) the pod's checkout was NINE
-/// trains behind while five shed cars were run through `--from-car`.
+/// fast-forwarded to. On the dev pod the reclaim sidecar takes it to
+/// origin/main once an hour while trains land about as often, so a
+/// train behind is ordinary — and until 475fbd10 and af27db95 removed
+/// its gate-run deferral it was far worse: measured 2026-09-22 (backlog
+/// a09bd894) the pod's checkout was NINE trains behind while five shed
+/// cars were run through `--from-car`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TreeObservation {
     /// Current (the checkout carries every landed change) / Behind /
@@ -278,13 +286,23 @@ pub(crate) struct TreeObservation {
 /// from an old main reads an old tree too, and that is the thing being
 /// judged. Every failure is [`Base::Unanswered`], never a staleness
 /// finding.
+#[cfg(test)]
 pub(crate) fn observe_tree(repo: &Path) -> TreeObservation {
+    observe_tree_with(|args| git(repo, args))
+}
+
+/// The same local observation through the caller's execution context.
+/// A probe running as another user must ask git as that user too; the
+/// standing arithmetic and partial-head evidence remain one definition.
+pub(crate) fn observe_tree_with(
+    mut read: impl FnMut(&[&str]) -> Result<std::process::Output, String>,
+) -> TreeObservation {
     let unreadable = |why: String| TreeObservation {
         standing: Base::Unanswered,
         unreadable: Some(why),
         ..Default::default()
     };
-    let head = match git_line(repo, &["rev-parse", "HEAD"]) {
+    let head = match git_output_line(read(&["rev-parse", "HEAD"]), &["rev-parse", "HEAD"]) {
         Ok(s) => s,
         Err(e) => return unreadable(e),
     };
@@ -293,7 +311,8 @@ pub(crate) fn observe_tree(repo: &Path) -> TreeObservation {
     // — and is the fact the proof stamp wants most, since it names the
     // tree the probe read. Reducing a record before storing it throws
     // away the only copy (CLAUDE.md §Diagnosis).
-    let main_head = match git_line(repo, &["rev-parse", MAIN_REF]) {
+    let main_head = match git_output_line(read(&["rev-parse", MAIN_REF]), &["rev-parse", MAIN_REF])
+    {
         Ok(s) => s,
         Err(e) => {
             return TreeObservation {
@@ -305,7 +324,7 @@ pub(crate) fn observe_tree(repo: &Path) -> TreeObservation {
         }
     };
     let standing = base_from_is_ancestor_code(
-        git(repo, &["merge-base", "--is-ancestor", &main_head, &head])
+        read(&["merge-base", "--is-ancestor", &main_head, &head])
             .ok()
             .and_then(|o| o.status.code()),
     );
@@ -321,13 +340,11 @@ pub(crate) fn observe_tree(repo: &Path) -> TreeObservation {
             },
         };
     }
-    let behind_by = git_line(
-        repo,
-        &["rev-list", "--count", &format!("{head}..{main_head}")],
-    )
-    .ok()
-    .and_then(|s| s.parse().ok())
-    .unwrap_or(0);
+    let args = ["rev-list", "--count", &format!("{head}..{main_head}")];
+    let behind_by = git_output_line(read(&args), &args)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     TreeObservation {
         standing,
         head,
@@ -994,9 +1011,9 @@ pub(crate) fn stale_tree_guard(obs: &TreeObservation, records: bool, silenced: b
                  A recorded probe reads the tree with `git show HEAD:<path>`. On the \
                  forge, where this car's probe will be re-run unattended, HEAD is the \
                  CONVERGED checkout; here it is whatever this one last fast-forwarded \
-                 to, and the dev pod's sidecar defers while any gate-run is open — so \
-                 under load, which is when proofs get recorded, stale is the steady \
-                 state.\n  \
+                 to, and the dev pod's sidecar fast-forwards it once an hour while \
+                 trains land about as often — so a checkout a train behind is \
+                 ordinary.\n  \
                  A proof recorded off it is immutable and says nothing about which tree \
                  answered. The failure mode is the passing one: a probe asserting a \
                  change HAS converged passes against a checkout that predates a later \
@@ -2098,8 +2115,8 @@ mod tests {
         assert_eq!(current.head, current.main_head, "{current:?}");
         assert_eq!(current.behind_by, 0, "{current:?}");
 
-        // Move the checkout back two trains, the way the pod's is when
-        // the freshness sidecar has deferred: `git show HEAD:` now reads
+        // Move the checkout back two trains, the way the pod's is before
+        // the reclaim sidecar's hourly pass: `git show HEAD:` now reads
         // a tree that is NOT the one the forge would read.
         let base = String::from_utf8_lossy(
             &Forge::git(&f.clone, &["rev-list", "--max-parents=0", "HEAD"]).stdout,

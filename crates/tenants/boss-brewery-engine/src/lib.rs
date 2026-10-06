@@ -93,6 +93,20 @@ pub fn load_parts(seeds: &Path) -> Result<Vec<InventoryItem>> {
     Ok(bundle.parts)
 }
 
+/// The daemon's blocking client for a sibling service: it stamps the
+/// estate machine token on every request from the process's watched
+/// source and follows no redirect (design 6805c764 car 2, the
+/// blocking-senders slice, 2026-09-29). Every read and mint below
+/// reaches a service port the machine gate guards, and until then each
+/// built a plain `reqwest::blocking` client carrying no token. Called
+/// only from the daemon's own paths, never a test: a test builds its
+/// client over a fixed source (backlog 2ee29275, F2).
+fn machine_client(
+    builder: reqwest::blocking::ClientBuilder,
+) -> reqwest::Result<boss_core::machine_token::BlockingClient> {
+    boss_core::machine_token::BlockingClient::build(builder)
+}
+
 /// Resolve the kind-scoped subject-mint URL for `api_base` —
 /// `direct://<host>` goes straight at the subject-kinds service port,
 /// anything else is a gateway-style base.
@@ -114,7 +128,7 @@ pub fn mint_subject_identity(
     label: Option<&str>,
     api_base: &str,
 ) -> Result<(), String> {
-    let client = reqwest::blocking::Client::new();
+    let client = machine_client(reqwest::blocking::Client::builder()).map_err(|e| e.to_string())?;
     let url = subject_mint_url(api_base, kind);
     let body = match label {
         Some(l) => serde_json::json!({ "id": id, "label": l }),
@@ -143,7 +157,13 @@ pub fn mint_subject_identity(
 /// create logs and moves on (the daemon boot path must not die on
 /// one bad campaign slug).
 pub fn mint_campaign_identities(campaign_ids: &[String], api_base: &str) {
-    let client = reqwest::blocking::Client::new();
+    let client = match machine_client(reqwest::blocking::Client::builder()) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "building campaigns HTTP client failed; no campaign minted");
+            return;
+        }
+    };
     let url = if let Some(host) = api_base.strip_prefix("direct://") {
         format!("http://{host}:7845/api/campaigns")
     } else {
@@ -457,10 +477,9 @@ pub fn fetch_employees(api_base: &str) -> std::collections::HashMap<String, Stri
     }
     let mut out = std::collections::HashMap::new();
     let url = format!("{}/api/people", people_base_url(api_base));
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-    {
+    let client = match machine_client(
+        reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(15)),
+    ) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %e, "building people HTTP client failed; keeping seed roster");
@@ -533,10 +552,9 @@ pub fn fetch_vendors(api_base: &str) -> Vec<(String, VendorBehavior)> {
     }
     let mut out = Vec::new();
     let url = format!("{}/api/inventory/vendors", inventory_base_url(api_base));
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-    {
+    let client = match machine_client(
+        reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(15)),
+    ) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %e, "building inventory HTTP client failed; no vendor specs");
@@ -920,7 +938,15 @@ pub fn build_workforce(
         .get("platform-admin")
         .cloned()
         .unwrap_or_default();
-    Workforce::new(api_base, step_durations, required_fields).with_excluded_assignees(operators)
+    // The daemon's own workforce stamps from the process's watched
+    // machine-token source (design 6805c764 car 2).
+    Workforce::new(
+        api_base,
+        step_durations,
+        required_fields,
+        boss_core::machine_token::shared(),
+    )
+    .with_excluded_assignees(operators)
 }
 
 #[allow(clippy::too_many_arguments)]

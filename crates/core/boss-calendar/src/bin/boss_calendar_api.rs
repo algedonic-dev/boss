@@ -38,9 +38,10 @@ async fn main() -> Result<()> {
 
     info!(http_bind = %cfg.http_bind, "boss-calendar-api starting");
 
-    let (calendar, publisher): (
+    let (calendar, publisher, recorder): (
         Arc<dyn CalendarClient>,
         Option<boss_core::publisher::DomainPublisher>,
+        Arc<dyn boss_core::port::EventRecorder>,
     ) = {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(10)
@@ -49,6 +50,7 @@ async fn main() -> Result<()> {
             .with_context(|| "connecting to Postgres")?;
         let calendar: Arc<dyn CalendarClient> =
             Arc::new(boss_calendar::PgCalendar::new(pool.clone()));
+        let recorder = boss_events::outbox::PgOutboxRecorder::shared(&pool);
         let publisher = match &cfg.nats_url {
             Some(url) => {
                 let bus = boss_nats::NatsEventBus::connect(url)
@@ -64,7 +66,7 @@ async fn main() -> Result<()> {
                 None
             }
         };
-        (calendar, publisher)
+        (calendar, publisher, recorder)
     };
 
     let clock_url = std::env::var("BOSS_CLOCK_URL").unwrap_or_else(|_| boss_ports::url("clock"));
@@ -114,7 +116,8 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding HTTP listener on {http_addr}"))?;
     info!(addr = %http_addr, "calendar HTTP API listening");
-    let app = boss_core::machine_gate::mount(app, "calendar", &["/api/calendar/health"]);
+    let app =
+        boss_core::machine_gate::mount(app, "calendar", &["/api/calendar/health"], Some(recorder));
     axum::serve(listener, app).await?;
     Ok(())
 }

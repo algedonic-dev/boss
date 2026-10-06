@@ -77,7 +77,7 @@ fn router(people_base: String, jobs_base: String) -> Router {
     let origin = Url::parse("https://boss.test").unwrap();
     passkey_router(Arc::new(PasskeyState {
         session_key: KEY.to_vec(),
-        http: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+        http: boss_gateway::machine_client::MachineClient::unstamped(reqwest::Client::builder())
             .unwrap(),
         people_base,
         jobs_base,

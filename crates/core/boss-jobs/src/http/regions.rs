@@ -54,11 +54,25 @@ pub(super) async fn yard_regions<R: JobsRepository + 'static, B: EventBus + 'sta
         Ok(rows) => rows,
         Err(resp) => return resp,
     };
-    let map = regions::Regions {
+    let mut map = regions::Regions {
         outranks: rows.outranks(now),
         next_up: Some(read_next_up(&state, &user, &rows, now).await),
         ..regions::regions(&rows.inputs(now, window_hours))
     };
+    let sensor =
+        super::sensor_regions::read(&state, &user, now, window_hours, rows.reads_every_packet)
+            .await;
+    map.regions = map
+        .regions
+        .into_iter()
+        .map(|r| {
+            if r.name == "sensors" {
+                sensor.clone()
+            } else {
+                r
+            }
+        })
+        .collect();
     // THE OBSERVED-UNDECLARED READING (design e765b3fc §2b; M1 read it,
     // R2 made it judge): every route the moves record saw taken in this
     // window, judged against the routes derived now from the protocols
@@ -74,8 +88,14 @@ pub(super) async fn yard_regions<R: JobsRepository + 'static, B: EventBus + 'sta
     // the empty map with every undeclared crossing hung on it, count
     // and last instant: the half-a-gate the borders' machine firings
     // were withheld for.
+    //
+    // AND SO DOES A CALLER WHOSE SCOPE READS SOME PACKETS BUT NOT ALL
+    // (backlog 070de88c, item 2). The record counts routes, not packets:
+    // a crossing cannot be narrowed to the caller's packets without a
+    // read per move, so below a full scope the reading is withheld,
+    // exactly as `/api/yard/moves` refuses such a caller its rows.
     let map = match state.yard_moves.as_ref() {
-        Some(_) if rows.reads_no_packets => map,
+        Some(_) if !rows.reads_every_packet => map,
         Some(feed) => {
             let since = boss_clock_client::wall_now() - chrono::Duration::hours(window_hours);
             let crossings = feed.store.crossings(since).await.ok();
@@ -145,7 +165,17 @@ pub(super) struct MapRows {
     /// then the empty map; a read beside them that is not scoped by
     /// packet (the borders' machine firing records) must withhold its
     /// half from this caller too, or the empty map is only half a gate.
+    /// Read off the TRANSLATED scope (`JobScope::None`), not the policy's
+    /// answer: a department grant held outside its department is a
+    /// predicate that reads no packets (review 500f8a23, backlog 0964ba80).
     pub(super) reads_no_packets: bool,
+    /// THE CALLER'S POLICY SCOPE READS EVERY PACKET (backlog 070de88c):
+    /// `JobScope::All`, which the mover's own pass is too. A read beside
+    /// the rows that is not scoped by packet — the moves record's
+    /// crossings, the estate registry's hosts — is made only for such a
+    /// caller: a NARROWED scope gets its own packets in the rows above
+    /// and nothing that would describe everyone else's.
+    pub(super) reads_every_packet: bool,
 }
 
 impl MapRows {
@@ -199,13 +229,20 @@ pub(super) async fn read_map<R: JobsRepository + 'static, B: EventBus + 'static>
     now: chrono::DateTime<chrono::Utc>,
     window_hours: i64,
 ) -> Result<MapRows, Response> {
-    let predicate = match state.policy.scope_predicate(user, Resource::job()).await {
+    let predicate = match state.policy.scope_of(user, controls::READ_JOB).await {
         Ok(p) => p,
         Err(e) => {
             return Err(e.into_response());
         }
     };
-    if matches!(predicate, boss_policy_client::Predicate::None) {
+    // THE TRANSLATED SCOPE DECIDES, not the policy's own answer (review
+    // 500f8a23 of backlog 0964ba80). A department grant held outside its
+    // department is a predicate, not `None`, and translates to an EMPTY
+    // scope: it read no packets, but was handed the reads beside them
+    // that are gated on reading none. `Predicate::None` translates to
+    // the same empty scope, so one test covers both.
+    let scope = JobScope::from_predicate(user, &predicate);
+    if matches!(scope, crate::port::JobScope::None) {
         return Ok(MapRows {
             read: empty_read(),
             closed_trains: Vec::new(),
@@ -222,10 +259,49 @@ pub(super) async fn read_map<R: JobsRepository + 'static, B: EventBus + 'static>
             predecessors: Vec::new(),
             outranking: Some(Vec::new()),
             reads_no_packets: true,
+            reads_every_packet: false,
         });
     }
-    let scope = job_scope_from_predicate(user, &predicate);
-    read_map_as(state, user, scope, now, window_hours).await
+    // THE ESTATE'S OWN QUESTION (backlog 0964ba80): the registry's hosts
+    // are drawn only for a caller `/api/estate/nodes` would answer — Read
+    // on `estate` at scope all — and asked only of a caller who reads
+    // every packet, the only one the hosts are drawn for at all.
+    let estate = if matches!(scope, crate::port::JobScope::All) {
+        estate_read(state, user).await
+    } else {
+        EstateRead::Withheld
+    };
+    read_map_as(state, user, scope, estate, now, window_hours).await
+}
+
+/// Whether the map may draw the estate registry's hosts for a caller.
+pub(super) enum EstateRead {
+    /// Policy grants Read on `estate` at scope all — what the registry
+    /// door itself requires. The mover, which reads as the service
+    /// itself over the whole yard, reads it too.
+    Granted,
+    /// Refused — by the estate grant, or by a packet scope below full.
+    /// The map draws no host: the empty list, never an unread estate.
+    Withheld,
+    /// The policy service could not be asked: which hosts should have a
+    /// runner is unknown, and the plant says so.
+    Unasked,
+}
+
+/// The estate grant, asked as `/api/estate/nodes` asks it — through
+/// [`super::jobs::estate_read_refusal`], the one place that question is
+/// written, so the map and the registry door cannot disagree about who
+/// reads the estate. Its refusal is a 403; any other answer is the
+/// policy service failing to answer.
+async fn estate_read<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &Arc<JobsApiState<R, B>>,
+    user: &boss_policy_client::User,
+) -> EstateRead {
+    match super::jobs::estate_read_refusal(state, user, "the estate's runner hosts").await {
+        None => EstateRead::Granted,
+        Some(refusal) if refusal.status() == StatusCode::FORBIDDEN => EstateRead::Withheld,
+        Some(_) => EstateRead::Unasked,
+    }
 }
 
 /// The map's read sequence within a scope already decided — the caller's
@@ -237,10 +313,24 @@ pub(super) async fn read_map_as<R: JobsRepository + 'static, B: EventBus + 'stat
     state: &Arc<JobsApiState<R, B>>,
     user: &boss_policy_client::User,
     scope: crate::port::JobScope,
+    estate: EstateRead,
     now: chrono::DateTime<chrono::Utc>,
     window_hours: i64,
 ) -> Result<MapRows, Response> {
-    let read = read_yard(state, user, scope.clone(), now).await?;
+    // Whether this caller reads every packet — the one answer every read
+    // below that is not scoped by packet is gated on, and the value
+    // `MapRows::reads_every_packet` carries to the read-models.
+    let reads_every_packet = matches!(scope, crate::port::JobScope::All);
+    // The cadence record's firings — the conductor machine's heartbeat
+    // and NEXT UP's last board — only for a scope that reads every
+    // packet, the rule `/api/yard/status` keeps (backlog d0058c92). The
+    // mover reads as the service itself, at `All`, so its pass is whole.
+    let firings = if reads_every_packet {
+        super::yard::Firings::Read
+    } else {
+        super::yard::Firings::Withheld
+    };
+    let read = read_yard(state, user, scope.clone(), firings, now).await?;
 
     // The tails reach back two windows: this one and the previous.
     let reach = (now - chrono::Duration::hours(2 * window_hours)).date_naive();
@@ -343,7 +433,7 @@ pub(super) async fn read_map_as<R: JobsRepository + 'static, B: EventBus + 'stat
     // the conductor asks before it boards the car, asked here so the dock
     // stops promising a train the conductor will refuse.
     let predecessors =
-        read_predecessors(state, &regions::declared_edges(&read.status, &cars)).await;
+        read_predecessors(state, &scope, &regions::declared_edges(&read.status, &cars)).await;
 
     // Gate-runs: rows only. `opened_at`, `closed_at` and `outcome` are
     // on the metadata, which is all the duration and the reds need.
@@ -413,9 +503,27 @@ pub(super) async fn read_map_as<R: JobsRepository + 'static, B: EventBus + 'stat
     // — including one that died — is still a machine on the map. The
     // evidence read above is widened to the newest request of each such
     // host, because ANY verb it answered proves the loop polled.
-    let runner_hosts = match state.jobs.list_estate_nodes().await {
-        Ok(nodes) => Some(regions::runner_hosts_of(&nodes)),
-        Err(_) => None,
+    //
+    // ONLY FOR A CALLER WHO READS EVERY PACKET (backlog 0f462796 item 1,
+    // on the car of 070de88c). The registry is not scoped by packet — it
+    // names every host and what it runs — so a narrowed scope is drawn
+    // no host from it, the empty list the empty map already carries:
+    // its plant shows the runners its OWN ops-requests evidence, and
+    // never "the estate could not be read", which would be a failure's
+    // words for a refusal.
+    //
+    // AND ONLY FOR A CALLER THE ESTATE DOOR WOULD ANSWER (backlog
+    // 0964ba80): reading every packet is not Read on `estate`, which
+    // `/api/estate/nodes` asks before it names a host — so a full packet
+    // scope the estate grant refuses is drawn none either.
+    let runner_hosts = match estate {
+        _ if !reads_every_packet => Some(Vec::new()),
+        EstateRead::Withheld => Some(Vec::new()),
+        EstateRead::Unasked => None,
+        EstateRead::Granted => match state.jobs.list_estate_nodes().await {
+            Ok(nodes) => Some(regions::runner_hosts_of(&nodes)),
+            Err(_) => None,
+        },
     };
     let host_ids: Vec<String> = runner_hosts
         .iter()
@@ -484,7 +592,8 @@ pub(super) async fn read_map_as<R: JobsRepository + 'static, B: EventBus + 'stat
         run_capacity,
         predecessors,
         outranking,
-        reads_no_packets: false,
+        reads_no_packets: matches!(scope, crate::port::JobScope::None),
+        reads_every_packet,
     })
 }
 
@@ -540,6 +649,13 @@ async fn read_outranking<R: JobsRepository + 'static, B: EventBus + 'static>(
 /// never a row missing. A caller whose scope reads no packets gets the
 /// empty map's empty row and neither read is made for it: they are not
 /// scoped by packet, so making them would be half a gate (e5f7b51e).
+///
+/// NOR FOR ONE WHOSE SCOPE READS SOME PACKETS BUT NOT ALL (backlog
+/// 0964ba80) — the rule the crossings and the estate hosts keep
+/// (070de88c). The schedule names every rule the dispatcher runs and the
+/// registry every credential and where it is stored; neither narrows to
+/// a caller's packets. Such a caller keeps the rows its own packets
+/// give, and the two sources each stand as a row saying WITHHELD.
 async fn read_next_up<R: JobsRepository + 'static, B: EventBus + 'static>(
     state: &Arc<JobsApiState<R, B>>,
     user: &boss_policy_client::User,
@@ -548,6 +664,15 @@ async fn read_next_up<R: JobsRepository + 'static, B: EventBus + 'static>(
 ) -> Vec<crate::next_up::NextEvent> {
     if rows.reads_no_packets {
         return Vec::new();
+    }
+    if !rows.reads_every_packet {
+        return crate::next_up::next_up(&crate::next_up::NextUpInputs {
+            yard: &rows.read.status,
+            schedule: &Ok(Vec::new()),
+            credentials: &Ok(Vec::new()),
+            withheld: Some(NEXT_UP_WITHHELD),
+            now,
+        });
     }
     let schedule = async {
         match state.dispatcher_schedule.as_ref() {
@@ -569,9 +694,15 @@ async fn read_next_up<R: JobsRepository + 'static, B: EventBus + 'static>(
         yard: &rows.read.status,
         schedule: &schedule,
         credentials: &credentials,
+        withheld: None,
         now,
     })
 }
+
+/// Why NEXT UP withholds the schedule and the credentials registry from
+/// a narrowed scope (backlog 0964ba80).
+const NEXT_UP_WITHHELD: &str = "this caller's policy scope does not read every packet, and \
+                                this source is not scoped by packet";
 
 /// Each declared predecessor, read the way the conductor reads it
 /// (`edge_hold` in boss-cli's conductor): a row that came back is
@@ -580,8 +711,16 @@ async fn read_next_up<R: JobsRepository + 'static, B: EventBus + 'static>(
 /// conductor, counts as boardable and SAYS it could not judge. One
 /// failed read therefore never fails the map, and never reads as "no
 /// such car" either.
+///
+/// READ BY ID, JUDGED AGAINST THE CALLER'S SCOPE (review 500f8a23 of
+/// backlog 0964ba80). The id comes off the caller's own car, but the row
+/// it names may be another owner's, and the hold reason names a found
+/// predecessor by branch and says where it stands. A row the caller's
+/// scope does not admit is `Unscoped`: judged by the same predicates, so
+/// the car still reads as held, and described by nothing.
 async fn read_predecessors<R: JobsRepository + 'static, B: EventBus + 'static>(
     state: &Arc<JobsApiState<R, B>>,
+    scope: &crate::port::JobScope,
     ids: &[String],
 ) -> Vec<(String, crate::car::Predecessor)> {
     use crate::car::Predecessor;
@@ -596,7 +735,10 @@ async fn read_predecessors<R: JobsRepository + 'static, B: EventBus + 'static>(
                 Ok(None) => Predecessor::Absent,
                 Err(e) => Predecessor::Unreadable(e.to_string()),
                 Ok(Some(job)) => match state.jobs.list_steps(&job.id).await {
-                    Ok(steps) => Predecessor::Found(regions::packet_value(&job, &steps)),
+                    Ok(steps) if scope.admits(&job) => {
+                        Predecessor::Found(regions::packet_value(&job, &steps))
+                    }
+                    Ok(steps) => Predecessor::Unscoped(regions::packet_value(&job, &steps)),
                     Err(e) => Predecessor::Unreadable(e.to_string()),
                 },
             },

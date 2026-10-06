@@ -27,6 +27,7 @@
     type ReadState,
   } from '../data/readState';
   import { safeLinkHref } from '@boss/web-kit/links';
+  import { readRows } from '../data/shape';
 
   type InventoryRow = Readonly<{
     part_sku: string;
@@ -54,8 +55,9 @@
           if (!cancelled) stockRead = read;
           return;
         }
-        const body = (await r.json()) as InventoryRow[] | { data: InventoryRow[] };
-        const rows = Array.isArray(body) ? body : (body.data ?? []);
+        // The root audit's d0900959 slice: malformed success is a
+        // failed read, while both genuine empty wire shapes stay empty.
+        const rows = readRows(ITEMS_URL, await r.json()) as ReadonlyArray<InventoryRow>;
         if (cancelled) return;
         const m = new Map<string, number>();
         for (const row of rows) {
@@ -70,7 +72,8 @@
         stockRead = read;
       } catch (e) {
         if (!cancelled) {
-          stockRead = failedRead(`${ITEMS_URL}: ${e instanceof Error ? e.message : String(e)}`);
+          const error = e instanceof Error ? e.message : String(e);
+          stockRead = failedRead(error.includes(ITEMS_URL) ? error : `${ITEMS_URL}: ${error}`);
         }
       }
     })();

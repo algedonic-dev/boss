@@ -1108,8 +1108,17 @@ mod tests {
     /// One SICK comparison per comparator, computed by the comparator
     /// itself — between them they raise every hard class there is.
     fn every_comparators_sick_comparison() -> Vec<(&'static str, Value)> {
-        use crate::handlers::estate_compare::{compare, compare_door, compare_host, compare_units};
+        use crate::handlers::estate_compare::{
+            compare, compare_door, compare_host, compare_units, compare_volumes,
+        };
         vec![
+            (
+                "instance-volumes",
+                compare_volumes(&json!({"scope": "instance-volumes", "nodes": [{
+                    "id": "boss/pgdata-postgres-0", "namespace": "boss",
+                    "claim": "pgdata-postgres-0", "volume": "pvc-93e11a6e",
+                    "capacity_bytes": 32_212_254_720_i64, "free_bytes": 1_073_741_824_i64}]})),
+            ),
             (
                 "kubernetes-nodes",
                 compare(

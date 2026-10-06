@@ -129,6 +129,13 @@ ALLOWED_PREFIXES=(
   # audit_log row — and the gate runs in every service, including the
   # clock's own, so it cannot wait on the clock port to say when.
   "crates/core/boss-core/src/machine_gate.rs"
+  # The policy check's refusal tally (F7 of backlog b8e75382): the same
+  # shape as the machine gate's beside it — when it began and when each
+  # key was first and last seen, in process, bounded, answered on
+  # /api/policy/check/refusals and lost on restart. Telemetry the enforce
+  # flip's clean window and the lapsed-grant alarm read, never an
+  # audit_log row.
+  "crates/core/boss-policy/src/check_mode.rs"
   # Diagnostic CLI — checkpoint timestamps in operator output.
   "crates/core/boss-events/src/bin/boss_audit_integrity_check.rs"
   # Deprecated clock helpers, pre-Clock-as-service. The module
@@ -359,6 +366,14 @@ HANDLER_CLOCK_ALLOWED=(
   # token's Secret gets a wall-time expiry key so every consumer reads it
   # as not-live from that moment.
   "$HANDLERS_SRC/handlers/credential_rotate_github_app.rs"
+  # Two real-time uses, neither a packet stamp (design 6805c764, car 3):
+  # the Secret's `promoted-at`, and the revoke's drain judgement, which
+  # compares it and every gate's tally (`last_seen`, `started_at`, each
+  # the gate process's own Utc::now) against NOW. A firing's instant is a
+  # tick that may be replayed; judged at it, a caller seen after it would
+  # read as outside the window and the old token would be revoked under
+  # a caller still sending it.
+  "$HANDLERS_SRC/handlers/credential_rotate_self_issued.rs"
 )
 handler_allow_used=""
 

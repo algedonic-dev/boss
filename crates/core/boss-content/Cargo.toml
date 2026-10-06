@@ -74,9 +74,17 @@ name = "files_e2e"
 required-features = ["postgres"]
 
 [[test]]
+name = "the_adapters_agree_on_the_file_store_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "manual_e2e"
 required-features = ["postgres"]
 
 [[test]]
 name = "rebuild_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_content_store_pg"
 required-features = ["postgres"]

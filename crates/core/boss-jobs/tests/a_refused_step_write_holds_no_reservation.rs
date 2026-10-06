@@ -232,20 +232,16 @@ fn build_app() -> (Router, Arc<InMemoryJobs>, Arc<HeldCalendar>) {
 async fn scheduled(jobs: &InMemoryJobs) -> (Job, Step) {
     let job = Job {
         id: JobId::from_uuid(Uuid::parse_str("00000000-0000-0000-0000-000000558396").unwrap()),
-        kind: "service-visit".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "visit"),
-        title: "A visit whose start races a note".into(),
-        owner_id: "emp-tech".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "service-visit",
+            Subject::new("custom", "visit"),
+            "A visit whose start races a note",
+            "emp-tech",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
+        )
     };
     jobs.create_job(&job).await.unwrap();
     let mut step = Step::new(job.id, "task", "Visit", 1);

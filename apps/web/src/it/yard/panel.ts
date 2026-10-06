@@ -29,6 +29,7 @@ import { crossedText, machineText, rateText, unlistedText, waitingText, type Bor
 import { regionRails, type RegionRail } from './region-page';
 import { bandText, stateText, trendText, type Region, type RegionName } from './regions';
 import { sourceLines, type Route } from './routes';
+import { NOT_IN_SCOPE } from '../../policy/withheld';
 import { headwayText, stationLabel } from './transit';
 
 export type PanelField = 'route' | 'crossing' | 'rate' | 'waiting' | 'stuck' | 'trend' | 'verdict' | 'machines' | 'crossings';
@@ -118,7 +119,10 @@ export function stationCells(region: Region, borders: Borders | null, now: strin
       'machines',
       region.machines.length === 0
         ? ['no machine of ours works here']
-        : region.machines.map((m) => `${m.name} · ${m.state} — ${m.why}`),
+        : // A machine whose record was withheld from this caller (d0058c92)
+          // is said as the scope, not "unknown" (bd506215) — read off the
+          // server's own `withheld` state since 1805bac0, never its words.
+          region.machines.map((m) => `${m.name} · ${m.state === 'withheld' ? NOT_IN_SCOPE : m.state} — ${m.why}`),
     ),
     cellOf(
       'crossings',
@@ -134,12 +138,12 @@ const SECTION_FIELDS: ReadonlyArray<PanelField> = ['crossing', 'rate', 'waiting'
 export function sectionCells(
   b: Border | null,
   now: string,
-  served: Readonly<{ route: Route; windowHours: number; bordersRead: boolean }> | null = null,
+  served: Readonly<{ route: Route; windowHours: number; bordersRead: boolean; observedWithheld?: string | null }> | null = null,
 ): ReadonlyArray<PanelCell> {
   // WHAT DECLARES IT (car R3): the section is a route the server serves,
   // and its sources say why it is on the map — the protocol step that
   // makes the move, the hand-off, the moves the record counted.
-  const declared = served === null ? [] : [cellOf('route', sourceLines(served.route, served.windowHours))];
+  const declared = served === null ? [] : [cellOf('route', sourceLines(served.route, served.windowHours, served.observedWithheld ?? null))];
   // No border: the borders read failed, or it answered and keeps no rate
   // for this route yet — two different facts, each said as itself.
   const none = served !== null && served.bordersRead ? NO_RATE_YET : NO_RAILS;

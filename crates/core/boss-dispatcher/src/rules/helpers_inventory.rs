@@ -95,11 +95,6 @@ impl HelperResolver for InventoryHelpers {
             // 2026-09-15 when `spawn-car-on-sweep-remediated` v4 began
             // filing backlog items and asking this instead (655c5917).
             "open_job_exists" => open_job_exists(self, args),
-            // The same (kind, subject) question over a WINDOW, whatever
-            // the packet's status (backlog 3df309bf): a remedy that ran
-            // but did not clear its finding must not be refiled the next
-            // morning just because its request has closed.
-            "recent_job_exists" => recent_job_exists(self, args),
             // A pure string test, no request: the DSL compares whole
             // values only, and the conflict trigger (design b35456ac)
             // must tell `conflict: <files>` — the conductor's reading of
@@ -252,79 +247,6 @@ fn open_job_exists(h: &InventoryHelpers, args: &[Value]) -> Result<Value, EvalEr
     Ok(Value::Bool(!r.data.is_empty()))
 }
 
-/// True if a Job of `kind` with subject id `subject_id` was OPENED within
-/// the last `hours`, whatever its status — `open_job_exists` over a
-/// window instead of over the open set.
-///
-/// Born for `file-reclaim-gcp-root-while-disk-tight-boss-gcp` (backlog
-/// 3df309bf, review of car 4d80316f): the reclaim frees ~2.3 GB and
-/// leaves boss-gcp at ~16.4 GB free against a 17 GB floor, so the
-/// finding persists after a successful run, the request closes
-/// `answered`, and an open-set guard would file a fresh one — a fresh
-/// passkey prompt — every morning. Asking "was one opened this week?"
-/// is the week-window shape `retro_open` already uses, as rule data.
-///
-/// The list is newest first (`ORDER BY opened_on DESC, created_at DESC`,
-/// both adapters), so the newest packet alone answers and `limit=1` is
-/// exact rather than a page passed off as the world. No `status`: an
-/// answered, refused or rejected request counts.
-fn recent_job_exists(h: &InventoryHelpers, args: &[Value]) -> Result<Value, EvalError> {
-    let kind = first_string(args, "recent_job_exists")?;
-    let subject_id = second_string(args, "recent_job_exists")?;
-    let hours = match args.get(2) {
-        Some(Value::Int(n)) if *n > 0 => *n,
-        Some(Value::Int(n)) => {
-            return Err(EvalError::HelperFailed {
-                name: "recent_job_exists".into(),
-                msg: format!("window must be a positive number of hours, got {n}"),
-            });
-        }
-        Some(other) => {
-            return Err(EvalError::TypeError {
-                expected: "integer hours",
-                got: other.kind(),
-            });
-        }
-        None => {
-            return Err(EvalError::HelperFailed {
-                name: "recent_job_exists".into(),
-                msg: "missing required third arg (hours)".into(),
-            });
-        }
-    };
-    let url = format!(
-        "{}/api/jobs?kind={}&subject_id={}&limit=1",
-        h.jobs_base.trim_end_matches('/'),
-        percent_encode(kind),
-        percent_encode(subject_id),
-    );
-    let r: JobsListResponse = h.get_json(&url, "recent_job_exists")?;
-    match r.data.first() {
-        None => Ok(Value::Bool(false)),
-        Some(newest) => {
-            opened_within(newest, boss_clock_client::wall_now(), hours).map(Value::Bool)
-        }
-    }
-}
-
-/// Whether `row`'s `opened_at` (the admission instant the jobs API
-/// stamps, wall clock) lies within `hours` before `now`. A row whose
-/// opening cannot be read is REFUSED rather than guessed: "not recent"
-/// would refile, "recent" would retire the guard in silence.
-fn opened_within(
-    row: &serde_json::Value,
-    now: chrono::DateTime<chrono::Utc>,
-    hours: i64,
-) -> Result<bool, EvalError> {
-    let raw = row.get("opened_at").and_then(|v| v.as_str()).unwrap_or("");
-    let opened =
-        chrono::DateTime::parse_from_rfc3339(raw).map_err(|e| EvalError::HelperFailed {
-            name: "recent_job_exists".into(),
-            msg: format!("the newest packet carries no readable opened_at ({raw:?}: {e})"),
-        })?;
-    Ok(now.signed_duration_since(opened) < chrono::Duration::hours(hours))
-}
-
 /// `starts_with(subject, prefix)`: true when `subject` is a string that
 /// begins with `prefix`.
 ///
@@ -372,8 +294,6 @@ fn open_restock_exists(h: &InventoryHelpers, args: &[Value]) -> Result<Value, Ev
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Duration, TimeZone, Utc};
-    use serde_json::json;
 
     fn s(v: &str) -> Value {
         Value::String(v.into())
@@ -423,127 +343,5 @@ mod tests {
             h.call("starts_with", &[s("conflict: a.rs"), s("conflict")]),
             Ok(Value::Bool(true))
         );
-    }
-
-    fn at(h: i64) -> chrono::DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 9, 28, 12, 0, 0).unwrap() + Duration::hours(h)
-    }
-
-    fn row(opened: chrono::DateTime<Utc>) -> serde_json::Value {
-        json!({"status": "closed", "opened_at": opened.to_rfc3339()})
-    }
-
-    #[test]
-    fn a_packet_opened_inside_the_window_is_recent_whatever_its_status() {
-        // Closed a day ago, answered or refused: still inside a week.
-        assert_eq!(opened_within(&row(at(-24)), at(0), 168), Ok(true));
-        assert_eq!(opened_within(&row(at(-167)), at(0), 168), Ok(true));
-    }
-
-    #[test]
-    fn a_packet_opened_before_the_window_is_not_recent() {
-        assert_eq!(opened_within(&row(at(-169)), at(0), 168), Ok(false));
-        assert_eq!(opened_within(&row(at(-25)), at(0), 24), Ok(false));
-    }
-
-    #[test]
-    fn a_row_whose_opening_cannot_be_read_is_refused_not_guessed() {
-        // No evidence is not an answer either way: guessing "not recent"
-        // would refile, guessing "recent" would retire the rule silently.
-        for bad in [
-            json!({}),
-            json!({"opened_at": null}),
-            json!({"opened_at": "yesterday"}),
-        ] {
-            assert!(
-                matches!(
-                    opened_within(&bad, at(0), 168),
-                    Err(EvalError::HelperFailed { .. })
-                ),
-                "{bad}"
-            );
-        }
-    }
-
-    type Asked = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
-
-    /// A jobs API that answers `/api/jobs` with `rows` and records the
-    /// query it was asked.
-    async fn serve(rows: serde_json::Value, asked: Asked) -> String {
-        use axum::extract::{RawQuery, State};
-        use axum::routing::get;
-        async fn list(
-            State((rows, asked)): State<(serde_json::Value, Asked)>,
-            RawQuery(q): RawQuery,
-        ) -> axum::Json<serde_json::Value> {
-            asked.lock().unwrap().push(q.unwrap_or_default());
-            axum::Json(json!({"data": rows, "total": 1}))
-        }
-        let app = axum::Router::new()
-            .route("/api/jobs", get(list))
-            .with_state((rows, asked));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        format!("http://{addr}")
-    }
-
-    fn ask(h: &InventoryHelpers, hours: i64) -> Result<Value, EvalError> {
-        h.call(
-            "recent_job_exists",
-            &[
-                Value::String("ops-request".into()),
-                Value::String("reclaim-gcp-root@boss-gcp".into()),
-                Value::Int(hours),
-            ],
-        )
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn recent_job_exists_reads_the_newest_packet_of_any_status() {
-        let asked = Asked::default();
-        let two_days_ago = Utc::now() - Duration::hours(48);
-        let base = serve(json!([row(two_days_ago)]), asked.clone()).await;
-        let h = InventoryHelpers::new("http://inventory.invalid", base);
-
-        assert_eq!(ask(&h, 168), Ok(Value::Bool(true)), "inside a week");
-        assert_eq!(ask(&h, 24), Ok(Value::Bool(false)), "outside a day");
-
-        let q = asked.lock().unwrap()[0].clone();
-        assert!(
-            q.contains("kind=ops-request") && q.contains("subject_id=reclaim-gcp-root%40boss-gcp"),
-            "{q}"
-        );
-        assert!(
-            q.contains("limit=1"),
-            "the newest packet alone answers: {q}"
-        );
-        assert!(
-            !q.contains("status="),
-            "ANY status: an answered or refused request counts: {q}"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn recent_job_exists_is_false_when_no_packet_was_ever_filed() {
-        let base = serve(json!([]), Asked::default()).await;
-        let h = InventoryHelpers::new("http://inventory.invalid", base);
-        assert_eq!(ask(&h, 168), Ok(Value::Bool(false)));
-    }
-
-    #[test]
-    fn recent_job_exists_refuses_a_window_that_is_not_a_positive_integer() {
-        let h = InventoryHelpers::new("http://inventory.invalid", "http://jobs.invalid");
-        for bad in [Value::Int(0), Value::Int(-1), Value::String("168".into())] {
-            let r = h.call(
-                "recent_job_exists",
-                &[
-                    Value::String("ops-request".into()),
-                    Value::String("s".into()),
-                    bad.clone(),
-                ],
-            );
-            assert!(r.is_err(), "{bad:?} answered {r:?}");
-        }
     }
 }

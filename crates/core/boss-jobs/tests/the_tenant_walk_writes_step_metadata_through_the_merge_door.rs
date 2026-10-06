@@ -178,7 +178,18 @@ async fn the_walk_publishes_with_no_step_put_carrying_metadata() {
 
     let walk_base = base.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        boss_jobs::bootstrap::publish_workflows(&walk_base, &seeds, "platform", true, false, None)
+        // A FIXED source holding no token, never the process's live one:
+        // a failing test prints the request heads it captured, and a
+        // mounted Secret must not reach a gate log that way (backlog
+        // 2ee29275, F2).
+        let client = boss_core::machine_token::BlockingClient::build_with_source(
+            reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(30)),
+            Arc::new(boss_core::machine_token::Source::fixed(None)),
+        )
+        .expect("a blocking client");
+        boss_jobs::bootstrap::publish_workflows(
+            &client, &walk_base, &seeds, "platform", true, false, None,
+        )
     })
     .await
     .expect("walk thread");

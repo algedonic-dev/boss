@@ -285,8 +285,10 @@ mod tests {
             proxy_client: reqwest::Client::new(),
             perf: Arc::new(crate::perf::PerfCollector::new()),
             machine_token: Default::default(),
-            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
-                .unwrap(),
+            machine: boss_gateway::machine_client::MachineClient::unstamped(
+                reqwest::Client::builder(),
+            )
+            .unwrap(),
         });
         axum::Router::new()
             .route("/probe", axum::routing::get(probe))
@@ -414,8 +416,10 @@ mod tests {
             proxy_client: reqwest::Client::new(),
             perf: Arc::new(crate::perf::PerfCollector::new()),
             machine_token: Default::default(),
-            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
-                .unwrap(),
+            machine: boss_gateway::machine_client::MachineClient::unstamped(
+                reqwest::Client::builder(),
+            )
+            .unwrap(),
         });
         let app = axum::Router::new()
             .route("/whoami", axum::routing::get(tier))
@@ -509,8 +513,10 @@ mod tests {
             proxy_client: reqwest::Client::new(),
             perf: Arc::new(crate::perf::PerfCollector::new()),
             machine_token: Arc::new(Source::fixed(token.map(String::from))),
-            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
-                .unwrap(),
+            machine: boss_gateway::machine_client::MachineClient::unstamped(
+                reqwest::Client::builder(),
+            )
+            .unwrap(),
         });
         let forward = |req: Request<axum::body::Body>| async move {
             let (parts, body) = req.into_parts();
@@ -655,8 +661,10 @@ mod tests {
             proxy_client: reqwest::Client::new(),
             perf: Arc::new(crate::perf::PerfCollector::new()),
             machine_token: Arc::new(Source::fixed(Some(ESTATE_TOKEN.into()))),
-            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
-                .unwrap(),
+            machine: boss_gateway::machine_client::MachineClient::unstamped(
+                reqwest::Client::builder(),
+            )
+            .unwrap(),
         });
         axum::Router::new()
             .fallback(axum::routing::get(probe))

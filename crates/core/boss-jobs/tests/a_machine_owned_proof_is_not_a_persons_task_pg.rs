@@ -50,20 +50,16 @@ const BACKLOG: &str = "aaaaaaaa-0000-4000-8000-000000000003";
 fn job(id: &str, kind: &str, metadata: serde_json::Value) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
-        kind: kind.into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "fix/x"),
-        title: format!("{kind} {id}"),
-        owner_id: "emp-david".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 14).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata,
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            kind,
+            Subject::new("custom", "fix/x"),
+            format!("{kind} {id}"),
+            "emp-david",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 14).unwrap(),
+        )
     }
 }
 
@@ -73,25 +69,15 @@ fn job(id: &str, kind: &str, metadata: serde_json::Value) -> Job {
 fn ready_task(job_id: &str, slug: &str) -> Step {
     Step {
         id: StepId::from_uuid(Uuid::new_v4()),
-        job_id: JobId::from_uuid(Uuid::parse_str(job_id).unwrap()),
-        kind: "task".into(),
-        title: slug.into(),
         spec_slug: Some(slug.into()),
-        assignee_id: None,
         status: StepStatus::Ready,
-        sort_order: 0,
-        blocked_by: vec![],
-        sign_offs_required: Vec::new(),
-        assurance_required: None,
-        sign_offs: Vec::new(),
-        fields: Vec::new(),
-        completed_on: None,
-        completed_by: None,
-        completed_at: None,
         metadata: serde_json::json!({ "authority_role": "platform-admin" }),
-        notes: None,
-        step_plugin_version: 0,
-        embedded_job: None,
+        ..Step::new(
+            JobId::from_uuid(Uuid::parse_str(job_id).unwrap()),
+            "task",
+            slug,
+            0,
+        )
     }
 }
 

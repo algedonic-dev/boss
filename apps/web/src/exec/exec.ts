@@ -55,6 +55,15 @@ export function trailingYear(today: string): Ttm {
 
 const isObject = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v);
+const isCount = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
+const isMoney = (v: unknown): v is number => Number.isSafeInteger(v);
+const isLedgerLine = (v: unknown): v is Record<string, unknown> =>
+  isObject(v) && typeof v.account_code === 'string' && v.account_code.length > 0
+  && isMoney(v.amount_cents)
+  && (v.account_name === undefined || typeof v.account_name === 'string');
+const completeLedgerLines = (v: unknown): v is ReadonlyArray<Record<string, unknown>> =>
+  Array.isArray(v) && v.every(isLedgerLine)
+  && new Set(v.map((line) => line.account_code)).size === v.length;
 
 // --- Active jobs -----------------------------------------------------------
 
@@ -68,11 +77,16 @@ export function parseJobsSummary(raw: unknown): JobsSummary {
     throw new Error('the jobs summary answered no counts');
   }
   const byKind = Object.entries(raw.counts)
-    .filter((e): e is [string, number] => typeof e[1] === 'number')
-    .map(([kind, count]) => ({ kind, count }))
+    .map(([kind, count]) => {
+      if (kind.length === 0 || !isCount(count)) throw new Error('the jobs summary answered invalid counts');
+      return { kind, count };
+    })
     .sort((a, b) => b.count - a.count);
-  const total =
-    typeof raw.total === 'number' ? raw.total : byKind.reduce((s, r) => s + r.count, 0);
+  const sum = byKind.reduce((s, r) => s + r.count, 0);
+  const total = raw.total === undefined ? sum : raw.total;
+  if (!isCount(total) || !isCount(sum) || total !== sum) {
+    throw new Error('the jobs summary answered inconsistent counts');
+  }
   return { total, byKind };
 }
 
@@ -112,21 +126,29 @@ export type RevenueMix = Readonly<{ window: Ttm; total: number; rows: ReadonlyAr
 /** The income statement's revenue lines by account, largest first,
  *  each with its share of total revenue. A zero line is no revenue. */
 export function parseRevenueMix(raw: unknown, window: Ttm): RevenueMix {
-  if (!isObject(raw) || !Array.isArray(raw.revenue)) {
+  if (!isObject(raw) || !completeLedgerLines(raw.revenue)) {
     throw new Error('the income statement answered no revenue lines');
   }
   const lines = raw.revenue
-    .filter(isObject)
     .map((l) => ({
-      code: String(l.account_code ?? ''),
-      name: String(l.account_name ?? l.account_code ?? ''),
-      amount: typeof l.amount_cents === 'number' ? l.amount_cents : 0,
+      code: l.account_code as string,
+      name: (l.account_name ?? l.account_code) as string,
+      amount: l.amount_cents as number,
     }))
     .filter((l) => l.amount !== 0);
-  const total =
-    typeof raw.total_revenue_cents === 'number'
-      ? raw.total_revenue_cents
-      : lines.reduce((s, l) => s + l.amount, 0);
+  // Signed safe cents can cross the Number boundary before cancelling.
+  // Sum exactly first (Exec audit a1d62870, 2026-10-03), then convert
+  // only a safe final result: account order cannot change the total.
+  const exactSum = lines.reduce((s, l) => s + BigInt(l.amount), 0n);
+  const bound = BigInt(Number.MAX_SAFE_INTEGER);
+  if (exactSum > bound || exactSum < -bound) {
+    throw new Error('the income statement answered inconsistent revenue');
+  }
+  const sum = Number(exactSum);
+  const total = raw.total_revenue_cents === undefined ? sum : raw.total_revenue_cents;
+  if (!isMoney(sum) || !isMoney(total) || total !== sum) {
+    throw new Error('the income statement answered inconsistent revenue');
+  }
   const rows = lines
     .map((l) => ({ ...l, share: total > 0 ? l.amount / total : 0 }))
     .sort((a, b) => b.amount - a.amount);
@@ -146,11 +168,12 @@ export type Balances = Readonly<{ asOf: string; stats: ReadonlyArray<BalanceStat
  *  projection: cash (1000), cash in transit (1010, only when not
  *  zero), receivables (1100) and payables (2100). */
 export function parseBalances(raw: unknown): Balances {
-  if (!isObject(raw) || !Array.isArray(raw.assets) || typeof raw.as_of !== 'string') {
+  if (!isObject(raw) || !completeLedgerLines(raw.assets) || !completeLedgerLines(raw.liabilities)
+      || typeof raw.as_of !== 'string' || raw.as_of.length === 0) {
     throw new Error('the balance sheet answered no assets');
   }
-  const assets = raw.assets.filter(isObject);
-  const liabilities = Array.isArray(raw.liabilities) ? raw.liabilities.filter(isObject) : [];
+  const assets = raw.assets;
+  const liabilities = raw.liabilities;
   const find = (lines: ReadonlyArray<Record<string, unknown>>, code: string) =>
     lines.find((l) => l.account_code === code && typeof l.amount_cents === 'number');
   const cash = find(assets, '1000');
@@ -180,10 +203,13 @@ export type Waiting = Readonly<{ count: number; capped: boolean }>;
  *  My Day lists (f0f04375: one fact, rendered once as a list there and
  *  once as a number here, never as a second list). */
 export function parseWaiting(raw: unknown): Waiting {
-  if (!isObject(raw) || !Array.isArray(raw.data)) {
+  if (!isObject(raw) || !Array.isArray(raw.data) || !raw.data.every(isObject)) {
     throw new Error('the assignments read answered no rows');
   }
-  const count = typeof raw.total === 'number' ? raw.total : raw.data.length;
+  const count = raw.total === undefined ? raw.data.length : raw.total;
+  if (!isCount(count) || count < raw.data.length) {
+    throw new Error('the assignments read answered an inconsistent count');
+  }
   return { count, capped: count >= WAITING_LIMIT };
 }
 

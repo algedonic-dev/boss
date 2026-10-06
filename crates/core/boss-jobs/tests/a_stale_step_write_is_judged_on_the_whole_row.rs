@@ -54,20 +54,16 @@ fn dispatcher() -> User {
 fn run_packet(id: &str) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
-        kind: "agent-run".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "run"),
-        title: "A run whose step is written twice at once".into(),
-        owner_id: "emp-1".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "agent-run",
+            Subject::new("custom", "run"),
+            "A run whose step is written twice at once",
+            "emp-1",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
+        )
     }
 }
 

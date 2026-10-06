@@ -42,7 +42,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "A host-side debug read, as a packet instead of an ssh session. The requester names a host (the Subject: custom/<estate node id>) and an allowlisted read-only verb in job metadata (`host`, `verb`, `args`); the runner on that host polls about once a minute, executes the verb from infra/ops/verbs.json — never a packet-supplied string — and completes `execute` with the output and exit code. `answered` is the output arriving in the system of record with provenance; `refused` is the runner declining a verb outside the allowlist or an arg outside its pattern, with the reason in `output`. Phase 1 is read-only; mutating verbs are phase 2, behind per-verb policy. The operator stops being the transport."
-metadata = { owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "filed"
@@ -205,3 +205,56 @@ title_template = "Refused — outside the allowlist"
 # down, not taken back by its filer.
 metadata_defaults = { outcome_kind = "aborted" }
 terminal = { outcome = "refused" }
+
+# A PLAN THAT NAMES NOTHING TO DO ASKS NOBODY (backlog b2f78bb9, car 3 of
+# 3df309bf). The machine files an approval verb's request while an
+# estate finding persists, and a remedy that already ran renders a plan
+# with nothing in it — which reached the approve step as a passkey
+# prompt for a no-op. A plan verb may declare `nothing_to_do` in its
+# file (infra/ops/verbs/README.md), and when the plan the runner renders
+# matches it, the runner closes the request HERE instead of writing the
+# plan onto `approve`: the record first (the plan and everything it was
+# rendered for, through the merge door), then the job marker this waits
+# on, then the status. Nothing runs and nobody is asked.
+#
+# THE MARKER IS ROUTING; THE RECORD IS THE GATE. `plan_names_nothing` is
+# absent on a fresh request (absent reads FALSE in boolean position), so
+# this is never ready at open. A filer who sets it by hand readies a step
+# whose record is REQUIRED at done and was never written, so no
+# completion lands and the request runs on through `approve` as ever.
+# The key is the runner's NOTHING_TO_DO_MARKER, held equal to this line
+# by boss-testing's the_nothing_to_do_terminal_waits_on_the_marker_the_runner_writes.
+# `skipped`, the outcome vocabulary's word for "not applicable here", as
+# maintenance-break-glass-deposit's `not-yet`: nothing was wrong and
+# nothing was done.
+#
+# ONLY THE RUNNER WRITES THE RECORD (backlog aa816dd4, LOW-1 of review
+# ea2ecfd4). Required at done stopped a marker ALONE; it did not stop a
+# caller writing the seven keys AND the marker, which closed a request
+# on a plan no runner rendered. `written_by` names the runner's account
+# (ops-runner.sh's ACTOR, held equal to this line by boss-testing's
+# the_nothing_to_do_record_is_written_by_the_runners_account), and the
+# jobs API's step merge door refuses these fields from any OTHER
+# automation or agent session (boss_jobs::written_by). Never a person:
+# David closing a request by hand stays his to do (DR rule 62dac114).
+# It refuses the honest mistake, not a forger — the signer is the
+# self-asserted x-boss-user — and the forger-proof field `writer =
+# "runner:ops"` (design f623e425) replaces it once the runner presents
+# its credential. A runner signing under another BOSS_OPS_ACTOR is
+# refused here and renders the plan for a passkey instead.
+[[workflow.step]]
+title = "nothing-to-do"
+kind = "outcome"
+ready_when = "steps.filed.done AND job.metadata.plan_names_nothing"
+title_template = "Nothing to do — the plan names no change"
+metadata_defaults = { outcome_kind = "skipped", written_by = "automation:ops-runner" }
+terminal = { outcome = "nothing-to-do" }
+fields = [
+    { name = "plan", field_type = "string", required = true },
+    { name = "verb", field_type = "string", required = true },
+    { name = "host", field_type = "string", required = true },
+    { name = "args", field_type = "array", required = true },
+    { name = "rendered_plan_sha256", field_type = "string", required = true },
+    { name = "plan_verb", field_type = "string", required = true },
+    { name = "nothing_to_do", field_type = "string", required = true },
+]

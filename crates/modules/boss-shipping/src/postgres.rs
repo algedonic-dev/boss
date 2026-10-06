@@ -6,7 +6,9 @@
 use async_trait::async_trait;
 use sqlx::PgPool;
 
-use crate::port::{ShippingError, ShippingRepository};
+use crate::port::{
+    ShippingError, ShippingRepository, validate_bound, validate_shipment, validate_update,
+};
 use crate::types::*;
 
 pub struct PgShipping {
@@ -23,7 +25,7 @@ impl PgShipping {
 impl ShippingRepository for PgShipping {
     async fn all_shipments(&self) -> Result<Vec<Shipment>, ShippingError> {
         let rows: Vec<ShipmentRow> =
-            sqlx::query_as("SELECT * FROM shipments ORDER BY created_on DESC")
+            sqlx::query_as("SELECT * FROM shipments ORDER BY created_on DESC, id COLLATE \"C\"")
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| ShippingError::Storage(e.to_string()))?;
@@ -43,6 +45,15 @@ impl ShippingRepository for PgShipping {
         offset: i64,
         account_id: Option<&str>,
     ) -> Result<(Vec<Shipment>, i64), ShippingError> {
+        // A negative bound reached Postgres as a 500 until 2026-10-01,
+        // and a NUL-keyed account as an encoding error (backlog
+        // be459ab9, found by the adapters-agree suite): the first is the
+        // caller's mistake, the second the miss it is.
+        validate_bound("limit", limit)?;
+        validate_bound("offset", offset)?;
+        if account_id.is_some_and(|a| a.contains('\0')) {
+            return Ok((vec![], 0));
+        }
         let (total,): (i64,) = match account_id {
             Some(cid) => {
                 sqlx::query_as("SELECT count(*) FROM shipments WHERE account_id = $1")
@@ -62,7 +73,7 @@ impl ShippingRepository for PgShipping {
             Some(cid) => {
                 sqlx::query_as(
                     "SELECT * FROM shipments WHERE account_id = $1 \
-                 ORDER BY created_on DESC LIMIT $2 OFFSET $3",
+                 ORDER BY created_on DESC, id COLLATE \"C\" LIMIT $2 OFFSET $3",
                 )
                 .bind(cid)
                 .bind(limit)
@@ -72,7 +83,8 @@ impl ShippingRepository for PgShipping {
             }
             None => {
                 sqlx::query_as(
-                    "SELECT * FROM shipments ORDER BY created_on DESC LIMIT $1 OFFSET $2",
+                    "SELECT * FROM shipments ORDER BY created_on DESC, id COLLATE \"C\" \
+                     LIMIT $1 OFFSET $2",
                 )
                 .bind(limit)
                 .bind(offset)
@@ -92,6 +104,11 @@ impl ShippingRepository for PgShipping {
     }
 
     async fn shipment_by_id(&self, id: &str) -> Result<Option<Shipment>, ShippingError> {
+        // No stored id can hold a NUL; asking for one is a miss, not
+        // the encoding error Postgres raises for it.
+        if id.contains('\0') {
+            return Ok(None);
+        }
         let row: Option<ShipmentRow> = sqlx::query_as("SELECT * FROM shipments WHERE id = $1")
             .bind(id)
             .fetch_optional(&self.pool)
@@ -114,25 +131,30 @@ impl ShippingRepository for PgShipping {
         now: chrono::DateTime<chrono::Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<String, ShippingError> {
+        validate_shipment(shipment)?;
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| ShippingError::Storage(e.to_string()))?;
-        // Upsert: if the shipment already exists, update status +
-        // delivery dates. This supports both initial creation and
-        // lifecycle advancement from the shipping generator via the
-        // same batch endpoint. Device junction rows use ON CONFLICT
-        // DO NOTHING since they don't change across status updates.
+        // A held id is refused `Conflict`, as the port says. Until
+        // 2026-10-01 this upserted (for a "lifecycle advancement" batch
+        // path nothing drives any more: boss-sim never emits a
+        // shipment), so a redelivered `shipping.create` effect regressed
+        // a scanned shipment to label-created, kept asset ids the new
+        // body dropped, and recorded a second `created` fact (backlog
+        // be459ab9, found by the adapters-agree suite). The refusal is
+        // the INSERT's own unique violation, so two racing creates
+        // cannot both pass a separate existence check.
         // Identity write-through (subject-model R1, Q1).
         boss_subject_kinds::subjects::record_subject_in_tx(&mut tx, "shipment", &shipment.id, None)
             .await
             .map_err(ShippingError::Storage)?;
-        insert_shipment_row(&mut tx, shipment, now).await?;
+        create_shipment_row(&mut tx, shipment, now).await?;
         insert_shipment_assets(&mut tx, shipment).await?;
         replace_shipment_line_items(&mut tx, shipment).await?;
-        // OUTBOX (phase 2): the created event (full row state, matching
-        // the upsert semantics above) records with the rows.
+        // OUTBOX (phase 2): the created event (full row state) records
+        // with the rows.
         let event = stamp.event(
             crate::events::SHIPMENT_CREATED,
             serde_json::to_value(shipment).unwrap_or_default(),
@@ -153,6 +175,7 @@ impl ShippingRepository for PgShipping {
         now: chrono::DateTime<chrono::Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), ShippingError> {
+        validate_update(id, shipment)?;
         let mut tx = self
             .pool
             .begin()
@@ -203,6 +226,7 @@ impl ShippingRepository for PgShipping {
         today: chrono::NaiveDate,
         recent_limit: i64,
     ) -> Result<boss_shipping_client::OutboundShipmentSummary, ShippingError> {
+        validate_bound("recent_limit", recent_limit)?;
         let dir_str = direction_str(direction);
         let week_ago = today - chrono::Duration::days(7);
 
@@ -260,7 +284,8 @@ impl ShippingRepository for PgShipping {
                COALESCE( \
                  CASE WHEN s.status = 'delivered' THEN s.delivered_on ELSE s.shipped_on END, \
                  s.created_on \
-               ) DESC \
+               ) DESC, \
+               s.id COLLATE \"C\" \
              LIMIT $2",
         )
         .bind(dir_str)
@@ -301,6 +326,9 @@ impl ShippingRepository for PgShipping {
         now: chrono::DateTime<chrono::Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), ShippingError> {
+        if id.contains('\0') {
+            return Err(ShippingError::NotFound(id.to_string()));
+        }
         let mut tx = self
             .pool
             .begin()
@@ -343,6 +371,17 @@ impl ShippingRepository for PgShipping {
         stage_index: Option<i16>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), ShippingError> {
+        // A NUL reached Postgres as an encoding error (a 500) until
+        // 2026-10-01 (backlog be459ab9): a NUL status is refused, a
+        // NUL-keyed shipment is one nobody holds.
+        if status.contains('\0') {
+            return Err(ShippingError::Invalid(
+                "status carries a NUL byte, which cannot be stored".into(),
+            ));
+        }
+        if shipment_id.contains('\0') {
+            return Err(ShippingError::NotFound(shipment_id.to_string()));
+        }
         let mut tx = self
             .pool
             .begin()
@@ -453,7 +492,8 @@ impl ShippingRepository for PgShipping {
 impl PgShipping {
     async fn fetch_asset_ids(&self, shipment_id: &str) -> Result<Vec<String>, ShippingError> {
         let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT asset_id FROM shipment_assets WHERE shipment_id = $1 ORDER BY asset_id",
+            "SELECT asset_id FROM shipment_assets WHERE shipment_id = $1 \
+             ORDER BY asset_id COLLATE \"C\"",
         )
         .bind(shipment_id)
         .fetch_all(&self.pool)
@@ -501,16 +541,37 @@ fn to_kebab<T: serde::Serialize>(val: &T) -> String {
         .unwrap_or_default()
 }
 
+const INSERT_SHIPMENT: &str = "INSERT INTO shipments (id, direction, status, carrier, \
+     tracking_number, origin, destination, po_id, order_id, account_id, created_on, shipped_on, \
+     estimated_delivery, delivered_on, created_at, updated_at) \
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15)";
+
+/// Write a NEW shipment row: a held id is refused `Conflict` by the
+/// primary key itself (23505), never overwritten.
+async fn create_shipment_row(
+    tx: &mut sqlx::PgConnection,
+    s: &Shipment,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), ShippingError> {
+    write_shipment_row(tx, s, now, INSERT_SHIPMENT.to_string())
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(ref dbe) if dbe.code().as_deref() == Some("23505") => {
+                ShippingError::Conflict(format!("shipment {} already exists", s.id))
+            }
+            e => ShippingError::Storage(e.to_string()),
+        })
+}
+
+/// Write a shipment row, replacing a held one — the update and the
+/// rebuild's replay of a created/updated fact.
 pub(crate) async fn insert_shipment_row(
     tx: &mut sqlx::PgConnection,
     s: &Shipment,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), ShippingError> {
-    sqlx::query(
-        "INSERT INTO shipments (id, direction, status, carrier, tracking_number, origin, \
-         destination, po_id, order_id, account_id, created_on, shipped_on, estimated_delivery, \
-         delivered_on, created_at, updated_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15) \
+    let sql = format!(
+        "{INSERT_SHIPMENT} \
          ON CONFLICT (id) DO UPDATE SET \
             direction = EXCLUDED.direction, \
             status = EXCLUDED.status, \
@@ -525,32 +586,43 @@ pub(crate) async fn insert_shipment_row(
             shipped_on = EXCLUDED.shipped_on, \
             estimated_delivery = EXCLUDED.estimated_delivery, \
             delivered_on = EXCLUDED.delivered_on, \
-            updated_at = EXCLUDED.updated_at",
-    )
-    .bind(&s.id)
-    .bind(to_kebab(&s.direction))
-    // Transparent `ShipmentStatus` wrapper — `as_str()` is the bare
-    // kebab code the column stores, no serde round-trip needed.
-    .bind(s.status.as_str())
-    // Identity-first nullable carrier: bind the bare code when
-    // present, SQL NULL when absent. The transparent `Carrier`
-    // wrapper means `as_str()` already yields the plain string, so no
-    // `to_kebab` round-trip is needed here.
-    .bind(s.carrier.as_ref().map(|c| c.as_str()))
-    .bind(&s.tracking_number)
-    .bind(&s.origin)
-    .bind(&s.destination)
-    .bind(&s.po_id)
-    .bind(&s.order_id)
-    .bind(&s.account_id)
-    .bind(s.created_on)
-    .bind(s.shipped_on)
-    .bind(s.estimated_delivery)
-    .bind(s.delivered_on)
-    .bind(now)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| ShippingError::Storage(e.to_string()))?;
+            updated_at = EXCLUDED.updated_at"
+    );
+    write_shipment_row(tx, s, now, sql)
+        .await
+        .map_err(|e| ShippingError::Storage(e.to_string()))
+}
+
+async fn write_shipment_row(
+    tx: &mut sqlx::PgConnection,
+    s: &Shipment,
+    now: chrono::DateTime<chrono::Utc>,
+    sql: String,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(&sql)
+        .bind(&s.id)
+        .bind(to_kebab(&s.direction))
+        // Transparent `ShipmentStatus` wrapper — `as_str()` is the bare
+        // kebab code the column stores, no serde round-trip needed.
+        .bind(s.status.as_str())
+        // Identity-first nullable carrier: bind the bare code when
+        // present, SQL NULL when absent. The transparent `Carrier`
+        // wrapper means `as_str()` already yields the plain string, so no
+        // `to_kebab` round-trip is needed here.
+        .bind(s.carrier.as_ref().map(|c| c.as_str()))
+        .bind(&s.tracking_number)
+        .bind(&s.origin)
+        .bind(&s.destination)
+        .bind(&s.po_id)
+        .bind(&s.order_id)
+        .bind(&s.account_id)
+        .bind(s.created_on)
+        .bind(s.shipped_on)
+        .bind(s.estimated_delivery)
+        .bind(s.delivered_on)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
     Ok(())
 }
 

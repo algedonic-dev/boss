@@ -35,10 +35,22 @@
 # record, and a completed step is not open, so a redelivery writes
 # nothing.
 #
-# WHAT IT DOES NOT DO. It records no `agent_runs` row. The finish record
-# is insert-once and needs the run's outcome, so a pre-green `--report`
-# writes none (dispatch.rs `run_outcome`); this rule makes the run LAND,
-# and a `--report` made after the terminal still writes the cost row.
+# THE COST ROW LANDS WITH IT (backlog bb32b2a0, 2026-09-30). The
+# `agent_runs` row is insert-once and needs the run's outcome, so a
+# pre-green `--report` could not write one — and once this rule landed
+# the report, no second `--report` came, so every such run ended with NO
+# cost row and the budget gate under-counted it. `--report` now stores
+# the record on the packet as `finish_record` (all but what the terminal
+# decides), in the SAME metadata write as `report`, so this rule never
+# sees one without the other, and the `post_*` args post it here, BEFORE
+# the completion: `run_id` is the packet's own (a record naming another
+# run is refused, never posted), `outcome = success` overriding anything
+# stored, because `reported` opens only on `gated` or
+# `delivered` (dispatch.rs `run_outcome` maps both to success, and
+# `the_landing_rule_posts_the_record_report_stores` holds the two
+# equal), and `branch` off the green's own evidence on `building`. The
+# row is keyed on the run id, so a later `--report` or a redelivery
+# writes nothing twice.
 [[rule]]
 name = "agent-run-lands-a-report-sent-before-green"
 why = """
@@ -52,11 +64,14 @@ metadata onto a step, and its `ready_when` cannot complete anything.
 Measured 2026-09-28 (backlog b951c00a): six runs re-reported by hand
 after their green and one recorded `unreported` with its report on the
 packet — each holding a slot against the cap while its record said
-nothing was owed.
+nothing was owed. It posts the run's stored finish record as it lands
+(bb32b2a0): a pre-green report wrote no `agent_runs` row, and the
+landing asked for no second report, so the budget gate under-counted
+every such run.
 """
-version = 1
+version = 2
 on_event = "step.ready.task"
 when = 'workflow_kind = "agent-run" AND spec_slug = "reported"'
 [[rule.do]]
 handler = "jobs.complete_step_from_record"
-args = { kind = "\"agent-run\"", step = "\"reported\"", requires = "\"report\"", record = '"{\"summary\": \"report\", \"spend_usd\": \"spend_usd\", \"tokens\": \"tokens\"}"', done_metadata = '"{\"handback\": \"recorded\"}"' }
+args = { kind = "\"agent-run\"", step = "\"reported\"", requires = "\"report\"", record = '"{\"summary\": \"report\", \"spend_usd\": \"spend_usd\", \"tokens\": \"tokens\"}"', done_metadata = '"{\"handback\": \"recorded\"}"', post_to = "\"/api/agent-runs\"", post_record = "\"finish_record\"", post_id_key = "\"run_id\"", post_fields = '"{\"outcome\": \"success\"}"', post_fill = '"{\"branch\": {\"step\": \"building\", \"from\": [\"/metadata/gate_run/branch\", \"/metadata/car/branch\"]}}"' }

@@ -66,9 +66,10 @@
 # retained set is bounded by COUNT, pruned oldest-first by the stamp in
 # the name, every deletion printed.
 #
-# WHAT THIS DOES NOT DO: take the copy off this host. The boss-gcp leg
-# (a deposit-only forced-command key and a receiver) and the GCS leg (a
-# service-account key) each need a credential on the forge, and there is
+# WHAT THIS DOES NOT DO: take the copy off this host. The offsite home is
+# the GCS bucket (David, 2026-10-01, backlog 4bf7bdd1: boss-gcp is not a
+# backup store, so design 5c81319e's forge leg is GCS, not boss-gcp), and
+# its service-account key needs a credential on the forge — there is
 # none. So every run says so — `offsite: NONE` in the journal and
 # `offsite=none …` on the packet — rather than let a local copy be read
 # as the disaster-recovery copy it is not: it shares this disk's fire,
@@ -109,7 +110,7 @@ export DOCKER_HOST="${BOSS_FORGE_BACKUP_DOCKER_HOST:-unix:///var/run/docker.sock
 run_summary_reset
 stamp="$(date -u +%Y%m%d-%H%M%S)"
 run_summary_field stamp_epoch "$(date -u +%s)"
-OFFSITE_NOTE="none — this copy shares the forge's disk; the boss-gcp and GCS legs need a credential on this host that has not been placed (backlog 121831e6)"
+OFFSITE_NOTE="none — this copy shares the forge's disk; the GCS leg needs a credential on this host that has not been placed (backlog 121831e6)"
 run_summary_field offsite "$OFFSITE_NOTE"
 
 partial="$DEST/.partial-${stamp}.tar.gz"
@@ -263,4 +264,4 @@ run_summary_field summary "dumped and verified $(basename "$final") ($size, $rep
 
 say "OK $(basename "$final") ($size, sha256 ${sha:0:12}) verified: forgejo-db.sql ${db_bytes} bytes, app.ini, ${repos} repositories, no registry data"
 say "$kept kept in $DEST, $pruned pruned; ${free_after}G free after"
-say "offsite: NONE — this copy shares the forge's disk (fire, theft, the box dying); the boss-gcp and GCS legs need a credential on this host"
+say "offsite: NONE — this copy shares the forge's disk (fire, theft, the box dying); the GCS leg needs a credential on this host"

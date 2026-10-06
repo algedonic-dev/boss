@@ -30,20 +30,16 @@ async fn app(db: &TestDb) -> (axum::Router, Arc<PgJobs>) {
     let job_id = JobId::from_uuid(Uuid::parse_str(JOB).unwrap());
     jobs.create_job(&Job {
         id: job_id,
-        kind: "backlog-item".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "bosspipeline"),
-        title: "A step someone is working".into(),
-        owner_id: "emp-owner".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "backlog-item",
+            Subject::new("custom", "bosspipeline"),
+            "A step someone is working",
+            "emp-owner",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
+        )
     })
     .await
     .expect("packet lands");

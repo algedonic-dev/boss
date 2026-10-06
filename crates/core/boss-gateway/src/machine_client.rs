@@ -27,20 +27,28 @@
 //! to a third party — the IdP, the mail relay — must not be this one;
 //! those keep a plain `reqwest::Client` beside it (`local_auth`'s
 //! `http` is the IdP's; its people lookup rides [`MachineClient`]).
+//!
+//! STAMPED ONLY ON THE ESTATE'S HOSTS (backlog 2ee29275). Which host may
+//! receive the token is decided by `machine_token::token_for`, the one
+//! decision boss-core's clients take too — loopback, and the hosts and
+//! `.namespace` suffixes `BOSS_MACHINE_TOKEN_HOSTS` lists (the instance
+//! manifest carries its own namespace) — and the value it hands back is marked
+//! sensitive. [`MachineClient::unstamped`] is the constructor for a test.
 
 use std::sync::Arc;
 
-use boss_core::machine_token::{self, Source};
+use boss_core::machine_token::{self, Hosts, Source};
 
 #[derive(Clone, Debug)]
 pub struct MachineClient {
     http: reqwest::Client,
     token: Arc<Source>,
+    hosts: Arc<Hosts>,
 }
 
 impl MachineClient {
     /// Finish `builder` with redirects off; stamp from the process's
-    /// one watched source.
+    /// one watched source, on the process's host list.
     pub fn build(builder: reqwest::ClientBuilder) -> reqwest::Result<Self> {
         Self::build_with_source(builder, machine_token::shared())
     }
@@ -53,38 +61,51 @@ impl MachineClient {
         let http = builder
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        Ok(MachineClient { http, token })
+        Ok(MachineClient {
+            http,
+            token,
+            hosts: machine_token::hosts(),
+        })
     }
 
+    /// A client that never stamps — for a test, which must not read the
+    /// process's mounted Secret (backlog 2ee29275, F2).
+    pub fn unstamped(builder: reqwest::ClientBuilder) -> reqwest::Result<Self> {
+        Self::build_with_source(builder, Arc::new(Source::fixed(None)))
+    }
+
+    /// `impl AsRef<str>`, not `IntoUrl`: the host decision reads the URL
+    /// before reqwest consumes it, and every `IntoUrl` type is one.
     pub fn request(
         &self,
         method: reqwest::Method,
-        url: impl reqwest::IntoUrl,
+        url: impl AsRef<str>,
     ) -> reqwest::RequestBuilder {
+        let url = url.as_ref();
         let rb = self.http.request(method, url);
-        match self.token.current() {
-            Some(token) => rb.header(machine_token::HEADER, token),
+        match machine_token::token_for(&self.token, &self.hosts, url) {
+            Some(value) => rb.header(machine_token::HEADER, value),
             None => rb,
         }
     }
 
-    pub fn get(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+    pub fn get(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
         self.request(reqwest::Method::GET, url)
     }
 
-    pub fn post(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+    pub fn post(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
         self.request(reqwest::Method::POST, url)
     }
 
-    pub fn put(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+    pub fn put(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
         self.request(reqwest::Method::PUT, url)
     }
 
-    pub fn patch(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+    pub fn patch(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
         self.request(reqwest::Method::PATCH, url)
     }
 
-    pub fn delete(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+    pub fn delete(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
         self.request(reqwest::Method::DELETE, url)
     }
 }
@@ -120,6 +141,38 @@ mod tests {
         )
         .unwrap();
         let req = none.get("http://127.0.0.1:9/").build().unwrap();
+        assert!(req.headers().get(machine_token::HEADER).is_none());
+    }
+
+    #[test]
+    fn it_takes_boss_cores_host_decision_and_marks_the_value_sensitive() {
+        // Backlog 2ee29275: the stamp is decided once, in
+        // `machine_token::token_for`, and this twin asks it rather than
+        // keeping a copy of the rule. Loopback and a Service name are
+        // the estate's; a host off the list goes out unstamped.
+        let c = MachineClient::build_with_source(
+            reqwest::Client::builder(),
+            Arc::new(Source::fixed(Some("estate-token".into()))),
+        )
+        .unwrap();
+        let on = |url: &str| {
+            c.get(url)
+                .build()
+                .unwrap()
+                .headers()
+                .get(machine_token::HEADER)
+                .cloned()
+        };
+        let v = on("http://127.0.0.1:9/").expect("loopback is stamped");
+        assert!(v.is_sensitive());
+        assert!(on("https://boss.algedonic.dev/api/people").is_none());
+        // Another instance's Service is not this one's (review of
+        // 54d9a23a, MEDIUM-1): a Service name is stamped only when the
+        // process lists its namespace, and none lists the playground's.
+        assert!(on("http://boss-gateway.boss-playground.svc.cluster.local/").is_none());
+        // The test constructor: never stamps, even on loopback.
+        let u = MachineClient::unstamped(reqwest::Client::builder()).unwrap();
+        let req = u.get("http://127.0.0.1:9/").build().unwrap();
         assert!(req.headers().get(machine_token::HEADER).is_none());
     }
 

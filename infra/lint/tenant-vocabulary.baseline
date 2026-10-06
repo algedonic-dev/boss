@@ -281,7 +281,7 @@
 
 1	crates/modules/boss-inventory/src/port.rs
 
-2	crates/modules/boss-inventory/src/postgres.rs
+1	crates/modules/boss-inventory/src/postgres.rs
 
 1	crates/modules/boss-inventory/src/procurement/http.rs
 

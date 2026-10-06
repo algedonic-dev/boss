@@ -51,3 +51,11 @@ workspace = true
 [[test]]
 name = "customers_pg"
 required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_customer_registry_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "an_email_is_one_key_everywhere_pg"
+required-features = ["postgres"]

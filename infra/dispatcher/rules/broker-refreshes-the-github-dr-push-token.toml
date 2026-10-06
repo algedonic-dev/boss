@@ -52,9 +52,11 @@ definition can address. It adds no routing and spawns nothing: it
 refreshes one Secret's value and records credential.installed. Design
 76155676 (2026-09-27): installation tokens live one hour, so a
 credential minted from the App root exists only if something re-mints
-it.
+it. Version 2 carries the rotation's widened narrowing
+(workflows:write, backlog d76cc3ac), since the two are one declaration.
 """
+version = 2
 schedule = { cadence = "every-15-minutes", anchor_date = "2026-09-27" }
 [[rule.do]]
 handler = "credential.rotate.github-app-installation"
-args = { phase = "\"refresh\"", refresh_within_minutes = "\"40\"", secret_namespace = "\"boss\"", secret_name = "\"github-dr-push-token\"", secret_key = "\"token\"", credential_id = "\"github-dr-push-token\"", verify_repo = "\"algedonic-dev/boss-dr\"", repositories = "\"boss-dr\"", permissions = "\"contents:write,metadata:read\"" }
+args = { phase = "\"refresh\"", refresh_within_minutes = "\"40\"", secret_namespace = "\"boss\"", secret_name = "\"github-dr-push-token\"", secret_key = "\"token\"", credential_id = "\"github-dr-push-token\"", verify_repo = "\"algedonic-dev/boss-dr\"", repositories = "\"boss-dr\"", permissions = "\"contents:write,metadata:read,workflows:write\"" }

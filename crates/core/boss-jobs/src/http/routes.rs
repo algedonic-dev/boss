@@ -21,6 +21,13 @@ use super::*;
 use crate::moves::RouteCount;
 use crate::routes::RouteMap;
 
+/// Why a narrowed caller is served no observed count — a refusal by
+/// scope, said as one, so `observed: false` never reads to it as a
+/// record that could not be read (backlog 070de88c).
+const OBSERVED_WITHHELD: &str = "this caller's policy scope reads only some packets, and the \
+                                 moves record counts every packet's crossings, so the observed \
+                                 counts are not read for it";
+
 /// The routes, derived from the registries this API holds, with the
 /// observed counts laid over them. `Err` names the registry that could
 /// not be read.
@@ -66,17 +73,28 @@ pub(super) async fn yard_routes<R: JobsRepository + 'static, B: EventBus + 'stat
     // beside them are totals per route — so any caller who may read a
     // packet at all may read them; one who may read none is refused by
     // name rather than served an empty map.
-    match state.policy.scope_predicate(&user, Resource::job()).await {
+    //
+    // THE COUNTS ARE THE MOVES RECORD, THOUGH (backlog 070de88c): every
+    // packet that crossed a route in the window is in them, whoever's it
+    // is, and an observed-only route IS the regions read's undeclared
+    // reading. That reading is withheld below a full scope, so the counts
+    // are too — or the same record would reach a narrowed caller one door
+    // over. A narrowed caller is served the declared routes, and told why
+    // no count rides beside them.
+    let reads_every_packet = match state.policy.scope_of(&user, controls::READ_JOB).await {
         Err(e) => return e.into_response(),
-        Ok(p) if job_scope_from_predicate(&user, &p) == JobScope::None => {
-            return (
-                StatusCode::FORBIDDEN,
-                "the routes are read by a caller who may read packets; this caller may read none",
-            )
-                .into_response();
-        }
-        Ok(_) => {}
-    }
+        Ok(p) => match JobScope::from_predicate(&user, &p) {
+            JobScope::None => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "the routes are read by a caller who may read packets; this caller may read none",
+                )
+                    .into_response();
+            }
+            JobScope::All => true,
+            _ => false,
+        },
+    };
     let window_hours = match crate::regions::parse_window(q.window.as_deref()) {
         Ok(h) => h,
         Err(why) => return (StatusCode::BAD_REQUEST, why).into_response(),
@@ -84,16 +102,19 @@ pub(super) async fn yard_routes<R: JobsRepository + 'static, B: EventBus + 'stat
     // The record's counts, when it is wired and answers. `None` serves
     // the declared routes with no counts beside them — never zeroes.
     let observed = match state.yard_moves.as_ref() {
+        Some(_) if !reads_every_packet => None,
         Some(feed) => {
             let since = boss_clock_client::wall_now() - chrono::Duration::hours(window_hours);
             feed.store.crossings(since).await.ok()
         }
         None => None,
     };
+    let withheld = (!reads_every_packet).then_some(OBSERVED_WITHHELD);
     match derived(&state, observed.as_deref()).await {
         Ok(map) => Json(serde_json::json!({
             "window_hours": window_hours,
             "observed": observed.is_some(),
+            "observed_withheld": withheld,
             "routes": map.routes,
             "walked": map.walked,
             "refused": map.refused,

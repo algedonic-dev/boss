@@ -13,11 +13,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use boss_core::primitives::Location;
-use boss_policy_client::{Action, CurrentUser, PolicyClient, Resource};
+use boss_policy_client::{CurrentUser, PolicyClient, controls};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::port::LocationRepository;
+use crate::port::{LocationError, LocationRepository};
 
 #[derive(Clone)]
 pub struct LocationsApiState {
@@ -52,6 +52,24 @@ async fn health() -> axum::Json<serde_json::Value> {
     }))
 }
 
+/// How every door answers a store error — one mapping, by variant
+/// (backlog 3292f4ee, 2026-09-30). A conflict — the batch's
+/// orphan-parent refusal ([`crate::port::absent_parent`]), which names
+/// the parent — is the caller's to fix, so 409; a missing row is 404;
+/// only a storage failure is the server's, 500. Each carries the
+/// error's own text. Until then every error answered 500, so `boss
+/// tenant publish` read a refused batch as the service breaking.
+/// Malformed input never reaches the store: axum's `Json` rejection
+/// answers it 422 naming the field, as the classes doors do.
+fn store_refusal(e: LocationError) -> Response {
+    let status = match e {
+        LocationError::Conflict(_) => StatusCode::CONFLICT,
+        LocationError::NotFound(_) => StatusCode::NOT_FOUND,
+        LocationError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, e.to_string()).into_response()
+}
+
 #[derive(Deserialize)]
 struct ListQuery {
     /// Filter by Class registry kind code. If absent, returns
@@ -79,7 +97,7 @@ async fn list_locations(
     };
     match result {
         Ok(rows) => Json(rows).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => store_refusal(e),
     }
 }
 
@@ -87,7 +105,7 @@ async fn get_location(State(state): State<LocationsApiState>, Path(id): Path<Str
     match state.locations.get(&id).await {
         Ok(Some(l)) => Json(l).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "no such location").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => store_refusal(e),
     }
 }
 
@@ -97,14 +115,14 @@ async fn location_exists(
 ) -> Response {
     match state.locations.exists_active(&id).await {
         Ok(b) => Json(serde_json::json!({ "exists": b })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => store_refusal(e),
     }
 }
 
 async fn children_of(State(state): State<LocationsApiState>, Path(id): Path<String>) -> Response {
     match state.locations.children_of(Some(&id)).await {
         Ok(rows) => Json(rows).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => store_refusal(e),
     }
 }
 
@@ -186,8 +204,7 @@ async fn batch_upsert(
     let actor = match boss_policy_client::writes::require_registry_write(
         state.policy.as_ref(),
         &user,
-        Action::Create,
-        Resource::location(),
+        controls::CREATE_LOCATION,
     )
     .await
     {
@@ -208,7 +225,7 @@ async fn batch_upsert(
             "inserted": inserted,
         }))
         .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => store_refusal(e),
     }
 }
 
@@ -219,6 +236,7 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::Request;
     use boss_core::primitives::Location;
+    use boss_policy_client::{Action, Resource};
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
@@ -665,6 +683,123 @@ mod tests {
         .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert!(!repo.exists_active("loc-t-hq").await.unwrap());
+    }
+
+    // ---- how a store error answers (backlog 3292f4ee) ------------------
+
+    /// A batch naming a parent neither the registry nor the batch holds
+    /// is the caller's to fix, not a server fault: 409, the refusal text
+    /// naming the parent, and nothing written. Until 2026-09-30 every
+    /// `LocationError` answered 500, so `boss tenant publish` read the
+    /// orphan-parent refusal as the service breaking.
+    #[tokio::test]
+    async fn a_batch_naming_an_absent_parent_answers_409_naming_the_parent() {
+        let repo = Arc::new(InMemoryLocations::new(vec![]));
+        let resp = door(repo.clone(), default_policy())
+            .oneshot(batch_request(
+                Some(&operator_header()),
+                json!([{"id": "loc-t-lab", "name": "Lab", "kind": "office",
+                        "timezone": "UTC", "parent_id": "loc-t-nowhere"}]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("loc-t-nowhere"), "{text}");
+        assert!(!repo.exists_active("loc-t-lab").await.unwrap());
+        assert!(repo.recorded_events().is_empty());
+    }
+
+    /// A store that answers each call with one error, to judge how every
+    /// door maps it.
+    struct FailingStore(fn() -> crate::port::LocationError);
+
+    #[async_trait::async_trait]
+    impl LocationRepository for FailingStore {
+        async fn get(&self, _: &str) -> Result<Option<Location>, crate::port::LocationError> {
+            Err((self.0)())
+        }
+        async fn exists_active(&self, _: &str) -> Result<bool, crate::port::LocationError> {
+            Err((self.0)())
+        }
+        async fn list_for_kind(
+            &self,
+            _: &str,
+        ) -> Result<Vec<Location>, crate::port::LocationError> {
+            Err((self.0)())
+        }
+        async fn children_of(
+            &self,
+            _: Option<&str>,
+        ) -> Result<Vec<Location>, crate::port::LocationError> {
+            Err((self.0)())
+        }
+        async fn batch_upsert(
+            &self,
+            _: &[Location],
+            _: &boss_core::publisher::EventStamp,
+        ) -> Result<u64, crate::port::LocationError> {
+            Err((self.0)())
+        }
+    }
+
+    /// Every door answers a store error through ONE mapping: a storage
+    /// failure stays 500, a conflict is 409, a missing row is 404 — each
+    /// with the error's own text.
+    #[tokio::test]
+    async fn every_door_maps_a_store_error_by_its_variant() {
+        use crate::port::LocationError;
+        let variants: [(fn() -> LocationError, StatusCode, &str); 3] = [
+            (
+                || LocationError::Storage("disk on fire".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "disk on fire",
+            ),
+            (
+                || crate::port::absent_parent("loc-gone"),
+                StatusCode::CONFLICT,
+                "loc-gone",
+            ),
+            (
+                || LocationError::NotFound("loc-missing".into()),
+                StatusCode::NOT_FOUND,
+                "loc-missing",
+            ),
+        ];
+        for (make, want, text) in variants {
+            let requests = [
+                Request::builder()
+                    .uri("/api/locations?kind=hq")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+                Request::builder()
+                    .uri("/api/locations/loc-hq")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+                Request::builder()
+                    .uri("/api/locations/loc-hq/exists")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+                Request::builder()
+                    .uri("/api/locations/loc-hq/children")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+                batch_request(Some(&operator_header()), hq_rows()),
+            ];
+            for req in requests {
+                let uri = req.uri().to_string();
+                let app = router(LocationsApiState {
+                    locations: Arc::new(FailingStore(make)),
+                    policy: default_policy(),
+                });
+                let resp = app.oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), want, "{uri}");
+                let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+                let got = String::from_utf8_lossy(&body);
+                assert!(got.contains(text), "{uri}: {got}");
+            }
+        }
     }
 
     #[tokio::test]

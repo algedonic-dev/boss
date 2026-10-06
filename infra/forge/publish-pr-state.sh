@@ -44,16 +44,18 @@
 # "open". A write the jobs API refuses is a failure.
 #
 # Inputs: BASE (the jobs API), BOSS_USER, MT_HDR (the caller's
-# `secret_header MT_HDR …` of the optional BOSS_MACHINE_TOKEN — the token
-# rides to curl as a 0600 file, never in its argv, backlog 5f3ad356),
+# `machine_token_header MT_HDR …` — the machine token rides to curl as a
+# 0600 file, never in its argv, backlog 5f3ad356; empty when this host
+# holds none or BASE is not an estate host, infra/lib/secret-header.sh),
 # GITHUB_API, MIRROR_SLUG, workdir; and the caller's say / fail.
 
 publish_pr_states() {
     local read_by="$1" listed listed_total row pr_job pr_url pr_number head
-    # A caller that holds a token and made no header file would send the
-    # writes below unsigned; say so rather than be refused unexplained.
-    if [ -n "${BOSS_MACHINE_TOKEN:-}" ] && [ -z "${MT_HDR:-}" ]; then
-        fail "BOSS_MACHINE_TOKEN is set but the caller made no MT_HDR header file (infra/lib/secret-header.sh) — the pr-state writes would go out without it"
+    # A caller that never asked for the header would send the writes
+    # below without the token whether or not its host holds one; say so
+    # rather than be tallied, and later refused, unexplained.
+    if [ -z "${MT_HDR+set}" ]; then
+        fail "the caller made no machine_token_header MT_HDR call (infra/lib/secret-header.sh) — the pr-state writes would go out without the machine token"
     fi
     if ! curl -fsS -H "x-boss-user: $BOSS_USER" \
             "$BASE/api/jobs?kind=publish-to-github&limit=60&full=true" > "$workdir/prs-published" 2>"$workdir/prs-err"; then

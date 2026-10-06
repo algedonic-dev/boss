@@ -105,6 +105,16 @@ fn app() -> (axum::Router, Arc<InMemoryJobs>, Arc<dyn CadenceRepository>) {
     let policy_client: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()
             .allow("operator", Action::Read, Resource::job(), Scope::All)
+            // A NARROWED scope — its own packets only (backlog 0964ba80).
+            .allow("sales", Action::Read, Resource::job(), Scope::Self_)
+            // A department grant held OUTSIDE its department: the caller
+            // sits in `it`, so this translates to no packets at all.
+            .allow(
+                "outsider",
+                Action::Read,
+                Resource::job(),
+                Scope::Department("finance".into()),
+            )
             .build(),
     );
     let bus = RecordingEventBus::new();
@@ -160,21 +170,19 @@ fn app() -> (axum::Router, Arc<InMemoryJobs>, Arc<dyn CadenceRepository>) {
 fn job(kind: &str, id: &str, title: &str, status: JobStatus, metadata: Value) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
-        kind: kind.into(),
         workflow_version: 16,
-        subject: Subject::new("custom", "s"),
-        title: title.into(),
-        owner_id: "emp-david".into(),
         status,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 19).unwrap(),
-        opened_at: None,
-        due_on: None,
         closed_on: (status == JobStatus::Closed)
             .then(|| NaiveDate::from_ymd_opt(2026, 9, 19).unwrap()),
         metadata,
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            kind,
+            Subject::new("custom", "s"),
+            title,
+            "emp-david",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 19).unwrap(),
+        )
     }
 }
 
@@ -489,6 +497,189 @@ async fn a_caller_who_reads_no_packets_reads_no_machine_firings() {
                 "{who}: {machine}"
             );
             assert!(!why.contains("could not be read"), "{who}: {machine}");
+            // ...and SAYS it in a structured flag the web reads, never
+            // in the prose alone (backlog 1805bac0, CLAUDE.md 9a).
+            assert_eq!(machine["withheld"], true, "{who}: {machine}");
         }
     }
+}
+
+/// A firing so the machine halves have something to withhold.
+async fn fire_the_boarding_rule(cadence: &Arc<dyn CadenceRepository>) {
+    cadence
+        .claim_firing(&NewFiring {
+            firing_id: "f1".into(),
+            rule_name: "train-board-on-dock-depth".into(),
+            verb: "board".into(),
+            basis: "queue-depth".into(),
+            fired_at: t("2026-09-19T09:00:00Z"),
+            detail: json!({}),
+        })
+        .await
+        .unwrap();
+}
+
+/// A NARROWED SCOPE READS NO MACHINE FIRINGS EITHER (backlog 0964ba80).
+/// The gate above withheld the firing records only from a caller whose
+/// scope reads NO packets; one who reads SOME — its own — was handed
+/// every machine's last-fired instant. The records are not scoped by
+/// packet, so below a full scope they are withheld, as the crossings
+/// and the estate hosts are (070de88c) — and the border says WITHHELD,
+/// never "could not be read". The control is the operator, off the same
+/// two records.
+#[tokio::test]
+async fn a_narrowed_scope_reads_no_machine_firings() {
+    let (app, jobs, cadence) = app();
+    seed(&jobs).await;
+    fire_the_boarding_rule(&cadence).await;
+
+    let (status, v) = get(&app, "sales", "/api/yard/borders").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    for (from, to) in [("dock", "track"), ("gates", "dock")] {
+        let machine = &border(&v, from, to)["machine"];
+        assert_eq!(machine["last_fired"], Value::Null, "{machine}");
+        let why = machine["why"].as_str().unwrap_or_default();
+        assert!(
+            why.contains("withheld") && why.contains("every packet"),
+            "{from} -> {to}: {machine}"
+        );
+        assert!(!why.contains("could not be read"), "{machine}");
+        assert_eq!(machine["withheld"], true, "{machine}");
+    }
+
+    // The control: a full scope reads both records — and its payload
+    // carries no withheld flag at all (backlog 1805bac0: a full scope's
+    // answer does not change).
+    let (_, v) = get(&app, "operator", "/api/yard/borders").await;
+    for b in v["borders"].as_array().unwrap() {
+        assert!(b["machine"].get("withheld").is_none(), "{b}");
+    }
+    assert_eq!(
+        border(&v, "dock", "track")["machine"]["last_fired"],
+        "2026-09-19T09:00:00+00:00"
+    );
+    assert_eq!(
+        border(&v, "gates", "dock")["machine"]["last_fired"],
+        "2026-09-19T11:00:00+00:00"
+    );
+}
+
+/// A DEPARTMENT GRANT HELD OUTSIDE ITS DEPARTMENT READS NO PACKETS
+/// (review 500f8a23 of backlog 0964ba80). The policy answers it a
+/// predicate, not `None`, and the jobs API translates that to an EMPTY
+/// scope — so the rows were empty, but the gate beside them read the
+/// policy's answer and handed the caller the firing records. The
+/// translated scope decides now, and the border says the scope reads no
+/// packets, as it says for a caller the policy grants nothing.
+#[tokio::test]
+async fn a_department_grant_held_outside_its_department_reads_no_machine_firings() {
+    let (app, jobs, cadence) = app();
+    seed(&jobs).await;
+    fire_the_boarding_rule(&cadence).await;
+
+    let (status, v) = get(&app, "outsider", "/api/yard/borders").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    for (from, to) in [("dock", "track"), ("gates", "dock")] {
+        let machine = &border(&v, from, to)["machine"];
+        assert_eq!(machine["last_fired"], Value::Null, "{machine}");
+        let why = machine["why"].as_str().unwrap_or_default();
+        assert!(
+            why.contains("withheld") && why.contains("reads no packets"),
+            "{from} -> {to}: {machine}"
+        );
+    }
+}
+
+/// A PREDECESSOR OUTSIDE THE CALLER'S SCOPE IS NOT DESCRIBED TO IT
+/// (review 500f8a23 of backlog 0964ba80). The dock reads each parked
+/// car's declared predecessor BY ID, the way the conductor does — and it
+/// read it with no scope, so a caller who reads only its own packets saw
+/// another owner's car named by branch, with where it stood, in its own
+/// car's hold reason. The hold is still judged (the car does not board,
+/// and the dock must not promise a train), but the reason says only that
+/// a predecessor outside the caller's scope holds it. The control is the
+/// operator, whose full scope still reads the predecessor by name.
+#[tokio::test]
+async fn a_predecessor_outside_the_callers_scope_is_not_named_in_the_hold() {
+    let (app, jobs, _) = app();
+    let now = t(NOW);
+    let mut pred = job(
+        "ship-a-change",
+        "55555555-5555-5555-5555-555555555555",
+        "Another owner's change",
+        JobStatus::Open,
+        json!({ "branch": "fix/another-owners-branch" }),
+    );
+    pred.owner_id = "emp-someone-else".into();
+    jobs.create_job_at(&pred, now, &[]).await.unwrap();
+    let car = job(
+        "ship-a-change",
+        "22222222-2222-2222-2222-222222222222",
+        "A fix",
+        JobStatus::Open,
+        json!({
+            "branch": "fix/a",
+            "boards_after": "55555555-5555-5555-5555-555555555555",
+        }),
+    );
+    jobs.create_job_at(&car, now, &[]).await.unwrap();
+    for s in [
+        step(
+            &car.id,
+            "gate",
+            "Green, and observed working",
+            StepStatus::Completed,
+            json!({ "completed_at": "2026-09-19T10:00:00Z" }),
+        ),
+        step(
+            &car.id,
+            "review",
+            "Open for review",
+            StepStatus::Ready,
+            json!({}),
+        ),
+    ] {
+        jobs.add_step_at(&s, now, &[]).await.unwrap();
+    }
+
+    for uri in ["/api/yard/borders", "/api/yard/regions"] {
+        let (status, v) = get(&app, "sales", uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {v}");
+        let text = v.to_string();
+        assert!(
+            !text.contains("another-owners-branch")
+                && !text.contains("Another owner")
+                && !text.contains("STILL IN FLIGHT"),
+            "{uri}: a predecessor outside the caller's scope was described to it: {text}"
+        );
+    }
+    let (_, v) = get(&app, "sales", "/api/yard/borders").await;
+    let boarding = border(&v, "dock", "track");
+    let hold = boarding["holds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["what"] == "fix/a")
+        .unwrap_or_else(|| panic!("the caller's own car is not on the dock: {boarding}"));
+    assert!(
+        hold["why"]
+            .as_str()
+            .is_some_and(|w| w.contains("outside") && w.contains("scope")),
+        "the hold says a predecessor outside the scope holds it: {hold}"
+    );
+
+    // The control: the operator's full scope reads it by name and state.
+    let (_, v) = get(&app, "operator", "/api/yard/borders").await;
+    let boarding = border(&v, "dock", "track");
+    let hold = boarding["holds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["what"] == "fix/a")
+        .unwrap_or_else(|| panic!("no hold for fix/a: {boarding}"));
+    let why = hold["why"].as_str().unwrap_or_default();
+    assert!(
+        why.contains("fix/another-owners-branch") && why.contains("STILL IN FLIGHT"),
+        "{hold}"
+    );
 }

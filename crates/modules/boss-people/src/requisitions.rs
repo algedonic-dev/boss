@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use boss_core::publisher::DomainPublisher;
-use boss_policy_client::{Action, CurrentUser, PolicyClient, Resource};
+use boss_policy_client::{CurrentUser, PolicyClient, controls};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -121,17 +121,12 @@ async fn create_requisition(
     CurrentUser(user): CurrentUser,
     Json(req): Json<Requisition>,
 ) -> Response {
-    let scope = match crate::grants::require(
-        state.policy.as_ref(),
-        &user,
-        Action::Create,
-        Resource::employee(),
-    )
-    .await
-    {
-        Ok(scope) => scope,
-        Err(refused) => return refused,
-    };
+    let scope =
+        match crate::grants::require(state.policy.as_ref(), &user, controls::CREATE_EMPLOYEE).await
+        {
+            Ok(scope) => scope,
+            Err(refused) => return refused,
+        };
     if !crate::grants::covers(&scope, &user, &req.hiring_manager_id, Some(&req.department)) {
         return (
             StatusCode::FORBIDDEN,

@@ -12,7 +12,7 @@ use boss_locations_client::LocationsClient;
 use sqlx::PgPool;
 
 use crate::departments::{DepartmentRoster, PgDepartmentRoster, validate_department};
-use crate::port::{PeopleError, PeopleRepository};
+use crate::port::{PeopleError, PeopleRepository, refuse_another_id, refuse_malformed};
 use crate::types::*;
 
 pub struct PgPeople {
@@ -167,7 +167,9 @@ async fn validate_employee_class(
 #[async_trait]
 impl PeopleRepository for PgPeople {
     async fn all_employees(&self) -> Result<Vec<Employee>, PeopleError> {
-        let rows: Vec<EmployeeRow> = sqlx::query_as("SELECT * FROM employees ORDER BY id")
+        let rows: Vec<EmployeeRow> = // Byte order, as the port states it and the double answers
+        // (backlog be459ab9; the locale put `suite-ab` before `suite-B`).
+        sqlx::query_as("SELECT * FROM employees ORDER BY id COLLATE \"C\"")
             .fetch_all(&self.pool)
             .await
             .map_err(|e| PeopleError::Storage(e.to_string()))?;
@@ -247,6 +249,7 @@ impl PeopleRepository for PgPeople {
                 emp.id
             )));
         }
+        refuse_unholdable(&mut tx, emp).await?;
         upsert_employee_row(&mut tx, emp, now).await?;
         insert_employee_satellites(&mut tx, emp).await?;
         // OUTBOX (phase 2): the created event (full row state)
@@ -304,6 +307,8 @@ impl PeopleRepository for PgPeople {
         if !exists {
             return Err(PeopleError::NotFound(id.to_string()));
         }
+        refuse_another_id(id, emp)?;
+        refuse_unholdable(&mut tx, emp).await?;
         // UPSERT preserves `created_at` (load-bearing for rebuild
         // equality). Satellites still get full replacement since
         // skills + certifications have no per-row id we can UPSERT
@@ -346,6 +351,22 @@ impl PeopleRepository for PgPeople {
             .begin()
             .await
             .map_err(|e| PeopleError::Storage(e.to_string()))?;
+        // A manager with a report is refused by name, as the double
+        // refuses it — the foreign key answered a `Storage` error, a
+        // 500, until backlog be459ab9.
+        let report: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM employees WHERE manager_id = $1 AND id <> $1 \
+             ORDER BY id COLLATE \"C\" LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| PeopleError::Storage(e.to_string()))?;
+        if let Some(report) = report {
+            return Err(PeopleError::Conflict(format!(
+                "employee {id} still manages {report}"
+            )));
+        }
         sqlx::query("DELETE FROM employee_skills WHERE employee_id = $1")
             .bind(id)
             .execute(&mut *tx)
@@ -380,12 +401,17 @@ impl PeopleRepository for PgPeople {
     }
 
     async fn direct_reports(&self, manager_id: &str) -> Result<Vec<Employee>, PeopleError> {
-        let rows: Vec<EmployeeRow> =
-            sqlx::query_as("SELECT * FROM employees WHERE manager_id = $1 ORDER BY name")
-                .bind(manager_id)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| PeopleError::Storage(e.to_string()))?;
+        let rows: Vec<EmployeeRow> = sqlx::query_as(
+            // Byte order, nameless last, id breaking ties — the port's
+            // words (backlog be459ab9; this was the locale's order of
+            // `name` alone).
+            "SELECT * FROM employees WHERE manager_id = $1 \
+                 ORDER BY name COLLATE \"C\" NULLS LAST, id COLLATE \"C\"",
+        )
+        .bind(manager_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| PeopleError::Storage(e.to_string()))?;
 
         let mut employees = Vec::with_capacity(rows.len());
         for row in rows {
@@ -408,7 +434,7 @@ impl PgPeople {
 
     async fn fetch_skills(&self, employee_id: &str) -> Result<Vec<String>, PeopleError> {
         let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT skill FROM employee_skills WHERE employee_id = $1 ORDER BY skill",
+            "SELECT skill FROM employee_skills WHERE employee_id = $1 ORDER BY skill COLLATE \"C\"",
         )
         .bind(employee_id)
         .fetch_all(&self.pool)
@@ -423,7 +449,8 @@ impl PgPeople {
         employee_id: &str,
     ) -> Result<Vec<Certification>, PeopleError> {
         let rows: Vec<CertRow> = sqlx::query_as(
-            "SELECT name, issuing_body, issued_on, expires_on FROM employee_certifications WHERE employee_id = $1 ORDER BY issued_on",
+            "SELECT name, issuing_body, issued_on, expires_on FROM employee_certifications WHERE employee_id = $1 \
+             ORDER BY issued_on, name COLLATE \"C\", id",
         )
         .bind(employee_id)
         .fetch_all(&self.pool)
@@ -451,6 +478,44 @@ pub(crate) fn to_kebab<T: serde::Serialize>(val: &T) -> String {
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_default()
+}
+
+/// The roster-wide refusals the port states, asked inside the write's
+/// own transaction so a `Conflict` names the value instead of the
+/// constraint answering a `Storage` error (the email unique index, the
+/// `manager_id` foreign key, the skill-level CHECK, the skills primary
+/// key) — what the double refuses, in the same words (backlog
+/// be459ab9).
+async fn refuse_unholdable(tx: &mut sqlx::PgConnection, e: &Employee) -> Result<(), PeopleError> {
+    refuse_malformed(e)?;
+    if let Some(email) = &e.email {
+        let taken: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM employees WHERE LOWER(email) = LOWER($1) AND id <> $2)",
+        )
+        .bind(email)
+        .bind(&e.id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|err| PeopleError::Storage(err.to_string()))?;
+        if taken {
+            return Err(PeopleError::Conflict(format!(
+                "email `{email}` is held by another employee"
+            )));
+        }
+    }
+    if let Some(manager) = e.manager_id.as_ref().filter(|m| **m != e.id) {
+        let held: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM employees WHERE id = $1)")
+            .bind(manager)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|err| PeopleError::Storage(err.to_string()))?;
+        if !held {
+            return Err(PeopleError::Conflict(format!(
+                "manager `{manager}` is not an employee"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn upsert_employee_row(

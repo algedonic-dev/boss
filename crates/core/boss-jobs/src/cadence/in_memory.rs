@@ -70,24 +70,6 @@ impl InMemoryCadence {
     }
 }
 
-/// The version a publish must exceed: the newest the lineage holds,
-/// any status, or 0 for a name never held (so versions start at 1).
-/// ONE rule for both adapters' conflict arm; the Pg adapter asks the
-/// database the same question with `MAX(version)`.
-pub(super) fn newest_version(lineage: impl Iterator<Item = i32>) -> i32 {
-    lineage.max().unwrap_or(0)
-}
-
-/// The conflict a publish at or below the newest version answers —
-/// worded once, so the door's 409 reads the same over either adapter.
-pub(super) fn not_above(name: &str, version: i32, newest: i32) -> CadenceError {
-    CadenceError::Conflict(format!(
-        "{name}@{version} is not above the newest version of its lineage (v{newest}); \
-         a publish is a version bump — declare v{}",
-        newest + 1
-    ))
-}
-
 #[async_trait]
 impl CadenceRepository for InMemoryCadence {
     async fn active_rules(&self) -> Result<Vec<CadenceRuleRow>, CadenceError> {
@@ -190,14 +172,19 @@ impl CadenceRegistry for InMemoryCadence {
         // did not until the adapters-agree suite (backlog be459ab9).
         super::types::check_rule(&spec.row).map_err(CadenceError::BadRequest)?;
         let mut rules = self.rules.write().await;
-        let newest = newest_version(
+        // The floor every declared registry shares (`crate::declared_version`).
+        let newest = crate::declared_version::newest(
             rules
                 .iter()
                 .filter(|r| r.name() == spec.name())
                 .map(|r| r.version),
         );
         if spec.version <= newest {
-            return Err(not_above(spec.name(), spec.version, newest));
+            return Err(CadenceError::Conflict(crate::declared_version::not_above(
+                spec.name(),
+                spec.version,
+                newest,
+            )));
         }
         // Mirrors the Pg adapter: retire by name, then insert.
         for r in rules.iter_mut() {

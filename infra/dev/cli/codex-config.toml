@@ -1,0 +1,34 @@
+# Codex CLI config for the BOSS dev pod (backlog e2d63c28, David
+# 2026-10-01). infra/dev/dev-session.sh places this at
+# /work/home/.codex/config.toml when the PVC home has none, and never
+# over a copy David has edited — it says when the two differ. Keys read
+# off the installed codex-cli 0.159.3 binary (its SandboxMode and
+# AskForApproval enums and its config help text), not from memory.
+
+# ONE named model, so the registry states what runs (backlog 5840c068):
+# agent-codex in infra/dev/cli/agents.json is priced as this model, and
+# a boss-jobs test holds the two equal. gpt-6.1-sol is priority 1 in
+# codex-cli 0.159.3's bundled catalog ("Latest workhorse model for
+# coding"), listed and API-supported. Unpinned, the CLI picks its own.
+model = "gpt-6.1-sol"
+
+# Writes confined to the workspace (the checkout the session starts in).
+sandbox_mode = "workspace-write"
+
+# The model asks before anything the sandbox would refuse.
+approval_policy = "on-request"
+
+# The project doc is AGENTS.md — codex's own default name, and in this
+# repo a symlink to CLAUDE.md, so the three CLIs read one rulebook.
+# CLAUDE.md is ~64 KB; a smaller cap would cut it mid-rule.
+project_doc_max_bytes = 131072
+
+# The workspace-write sandbox cuts the network unless this says
+# otherwise (codex's default is off), and every BOSS door is network:
+# boss-api and boss reach the system of record at infra/dev/sor-url, and
+# git fetches from the forge. Writes stay confined to the workspace.
+# Key read off the installed 0.159.3 binary (SandboxWorkspaceWrite:
+# writable_roots, network_access, ...); pinned by boss-testing
+# the_cli_sessions_reach_their_doors (backlog 5840c068).
+[sandbox_workspace_write]
+network_access = true

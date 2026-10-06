@@ -7,6 +7,7 @@ import {
   densityOf,
   machineStatus,
   machineText,
+  machineWithheld,
   parseBorders,
   railWidth,
   rateText,
@@ -34,6 +35,7 @@ const machine = (over: Partial<Machine> = {}): Machine => ({
   expected_every_minutes: 30,
   silent: true,
   why: 'its own firing in cadence_firings',
+  withheld: false,
   ...over,
 });
 
@@ -217,6 +219,46 @@ describe('the words a rail prints', () => {
     for (const m of [machine(), machine({ kind: 'actors' }), machine({ silent: false, silent_for_minutes: 4 })]) {
       expect(machineText(m)).toBe(`${m.name} · ${machineStatus(m)}`);
     }
+  });
+
+  // Backlog bd506215: the server withholds a machine's firing record from
+  // a caller whose scope does not read every packet (0964ba80). The rail
+  // used to print "no firing recorded" for it — a finding about the
+  // machine, made of a refusal about the reader. Since 1805bac0 the
+  // server says it in a `withheld` flag, and the flag is all that is read.
+  it('says a withheld firing record is not in your policy scope, never no firing recorded', () => {
+    const why = "the firing record is withheld: this caller's policy scope does not read every packet";
+    const withheld = machine({
+      silent: null,
+      silent_for_minutes: null,
+      last_fired: null,
+      expected_every_minutes: null,
+      why,
+      withheld: true,
+    });
+    expect(machineWithheld(withheld)).toBe(true);
+    expect(machineStatus(withheld)).toBe('not in your policy scope');
+    expect(machineText(withheld)).not.toContain('no firing recorded');
+    // The control: an unread record (a failure) is not a refusal.
+    const unread = machine({ silent: null, silent_for_minutes: null, last_fired: null, why: 'the cadence firing record could not be read' });
+    expect(machineWithheld(unread)).toBe(false);
+    expect(machineStatus(unread)).toBe('no firing recorded');
+    // The words alone decide nothing (CLAUDE.md 9a): the refusal's
+    // phrase without the flag is not read as a refusal.
+    expect(machineWithheld({ ...withheld, withheld: false })).toBe(false);
+  });
+
+  it('parses the server\'s withheld flag, and its absence as false', () => {
+    const wire = (extra: Record<string, unknown>) => ({
+      window_hours: 24,
+      borders: [{
+        from: 'dock', to: 'track', crossing: 'a car boards', rate: { metric: 'crossings', unit: 'per day', current: null, previous: null, samples: 0, previous_samples: 0 },
+        last_crossed: null, waiting: null, holds: [], holds_by_class: null, flowing: null, flowing_why: '', state: 'clear', why: '',
+        machine: { name: 'm', kind: 'cadence', last_fired: null, silent_for_minutes: null, expected_every_minutes: null, silent: null, why: 'x', ...extra },
+      }],
+    });
+    expect(parseBorders(wire({ withheld: true })).borders[0]!.machine.withheld).toBe(true);
+    expect(parseBorders(wire({})).borders[0]!.machine.withheld).toBe(false);
   });
 
   // RAIL WIDTH FOLLOWS RATE (decision 6). Presentation only — the rate

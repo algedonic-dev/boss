@@ -646,8 +646,10 @@ mod traversal_tests {
             proxy_client: reqwest::Client::new(),
             perf: Arc::new(PerfCollector::new()),
             machine_token: Default::default(),
-            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
-                .unwrap(),
+            machine: boss_gateway::machine_client::MachineClient::unstamped(
+                reqwest::Client::builder(),
+            )
+            .unwrap(),
         }
     }
 

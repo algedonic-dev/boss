@@ -24,7 +24,7 @@ const border = (from: string, to: string, over: Partial<Border> = {}): Border =>
   flowing: true,
   held_since: null,
   flowing_why: 'last crossed 19m ago, inside 4× its mean gap',
-  machine: { name: 'boss gate', kind: 'actors', last_fired: null, silent_for_minutes: null, expected_every_minutes: null, silent: null, why: 'crossed by whoever runs the verb' },
+  machine: { name: 'boss gate', kind: 'actors', last_fired: null, silent_for_minutes: null, expected_every_minutes: null, silent: null, why: 'crossed by whoever runs the verb', withheld: false },
   state: 'clear',
   why: 'flowing',
   ...over,
@@ -113,6 +113,19 @@ describe('stationCells — a station, read through its own sections', () => {
       'out to dock: 2026-09-25 17:02 UTC · 19m ago',
       MOVES_NOT_KEPT,
     ]);
+  });
+
+  // Backlog bd506215: a machine the server could not judge because its
+  // record was withheld from this caller (d0058c92) is not "unknown".
+  // Since 1805bac0 the server says so in the machine's own `withheld`
+  // state, and that state is all that is read.
+  it('a machine withheld by policy scope says so in place of its state', () => {
+    const why = "withheld: this caller's policy scope does not read every packet";
+    const c = stationCells({ ...gates, machines: [{ id: 'conductor', name: 'conductor', state: 'withheld', why }] }, BORDERS, NOW);
+    expect(cell(c, 'machines')).toEqual([`conductor · not in your policy scope — ${why}`]);
+    // The words alone decide nothing (CLAUDE.md 9a).
+    const words = stationCells({ ...gates, machines: [{ id: 'conductor', name: 'conductor', state: 'unknown', why }] }, BORDERS, NOW);
+    expect(cell(words, 'machines')).toEqual([`conductor · unknown — ${why}`]);
   });
 
   it('a station the rails do not reach says so, rather than printing nothing', () => {

@@ -46,8 +46,15 @@ pub enum Placed {
 ///
 /// An open train whose arrival step has completed is still in transit
 /// until it closes; a closed one is in arrivals (the window's).
+///
+/// The track is [`crate::yard::TrainPhase::in_transit`] — the one
+/// definition `boss orient`'s IN TRANSIT reads too (backlog 3eddffc4) —
+/// and the match stays exhaustive so a new phase cannot go unplaced.
 pub fn train_region(phase: crate::yard::TrainPhase) -> &'static str {
     use crate::yard::TrainPhase::*;
+    if phase.in_transit() {
+        return "track";
+    }
     match phase {
         Boarding => "dock",
         AwaitingCi | AwaitingMerge => "gates",

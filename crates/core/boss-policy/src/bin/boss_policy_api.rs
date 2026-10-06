@@ -36,6 +36,12 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("connecting to Postgres at {postgres_url}"))?;
 
+    // Where the policy check and the machine gate state what they would
+    // refuse: the transactional outbox, which the relay carries to the
+    // audit log — the log, not this process, is the clean window
+    // (design 21946380).
+    let recorder: Arc<dyn boss_core::port::EventRecorder> =
+        Arc::new(boss_events::outbox::PgOutboxRecorder::new(pool.clone()));
     let repo: Arc<PgPolicy> = Arc::new(PgPolicy::new(pool));
 
     // Reconcile the default rules (per D8). Insert rules that don't
@@ -68,7 +74,16 @@ async fn main() -> Result<()> {
         repo: repo.clone(),
         sources,
     });
-    let state = PolicyApiState { repo, engine };
+    // F7 of backlog b8e75382 (design b08725c2 row D): what `/check` does
+    // with an unsigned caller and a refused service is a mounted word,
+    // re-read in seconds, so turning a refusal back is one edit and not a
+    // deploy. Absent (every pod today) is `off`.
+    let check_mode = boss_policy::check_mode::CheckMode::mount(Arc::clone(&recorder));
+    let state = PolicyApiState {
+        repo,
+        engine,
+        check_mode,
+    };
     let app: Router = router(state).merge(coverage);
 
     // Default port pulled from boss_ports — single source of truth
@@ -93,7 +108,8 @@ async fn main() -> Result<()> {
         }
     };
     info!(%bind, "boss-policy-api listening (postgres-backed)");
-    let app = boss_core::machine_gate::mount(app, "policy", &["/api/policy/health"]);
+    let app =
+        boss_core::machine_gate::mount(app, "policy", &["/api/policy/health"], Some(recorder));
     axum::serve(listener, app).await?;
     Ok(())
 }

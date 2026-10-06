@@ -1,0 +1,13 @@
+[[rule]]
+name = "watch-check-gcs-backup"
+why = """
+A CROSS-PROTOCOL READER: ops-request closes when its verb ran, while
+jobs.job.closed carries neither output nor exit. Backlog 3a68ab36 requires
+failed readback to be recorded and read. ops.judge alarms on a failed or
+refused run or absent verdict; a successful archive check needs no follow-on.
+"""
+on_event = "jobs.job.closed"
+when = 'kind = "ops-request" AND (outcome = "answered" OR outcome = "refused")'
+[[rule.do]]
+handler = "ops.judge"
+args = { verb = '"check-gcs-backup"', verdict_pattern = '"^check-gcs-backup: READ . remote archive integrity verified$"', when = '"true"' }

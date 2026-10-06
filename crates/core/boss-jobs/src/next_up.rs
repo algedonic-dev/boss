@@ -92,6 +92,13 @@ pub struct NextEvent {
     pub source: String,
     /// The source could not be read, and why. `at` is then null.
     pub unread: Option<String>,
+    /// `true` when `unread` is a REFUSAL by policy scope rather than a
+    /// read that failed ([`NextUpInputs::withheld`]). A flag, so a
+    /// surface never tells the two apart by the words of `unread`
+    /// (backlog 1805bac0, CLAUDE.md 9a). Absent from the wire when
+    /// false, so a full scope's rows are unchanged.
+    #[serde(default, skip_serializing_if = "crate::borders::is_false")]
+    pub withheld: bool,
 }
 
 /// Everything the row is computed from.
@@ -102,6 +109,14 @@ pub struct NextUpInputs<'a> {
     pub schedule: &'a Result<Vec<ScheduledRule>, String>,
     /// The credentials registry, or why it could not be read.
     pub credentials: &'a Result<Vec<CredentialRow>, String>,
+    /// WITHHELD FROM THIS CALLER, and why (backlog 0964ba80): the
+    /// schedule and the registry are not scoped by packet, so a caller
+    /// whose scope does not read every packet is not handed them. Each
+    /// is then one row saying it was withheld — never a missing row,
+    /// which reads as "nothing is coming", and never "could not be
+    /// read", a failure's words for a refusal. `schedule` and
+    /// `credentials` are not consulted.
+    pub withheld: Option<&'a str>,
     pub now: DateTime<Utc>,
 }
 
@@ -113,8 +128,13 @@ pub fn next_up(inputs: &NextUpInputs<'_>) -> Vec<NextEvent> {
     let mut rows = board_rows(&y.boarding, &y.trains, now);
     rows.extend(transit_rows(&y.trains, now));
     rows.extend(gate_row(&y.gates, now));
-    rows.extend(scheduled_rows(inputs.schedule));
-    rows.extend(rotation_rows(inputs.credentials));
+    match inputs.withheld {
+        Some(why) => rows.extend(withheld_rows(why)),
+        None => {
+            rows.extend(scheduled_rows(inputs.schedule));
+            rows.extend(rotation_rows(inputs.credentials));
+        }
+    }
 
     let (unread, read): (Vec<NextEvent>, Vec<NextEvent>) =
         rows.into_iter().partition(|r| r.unread.is_some());
@@ -136,6 +156,7 @@ fn row(kind: NextKind, title: String, source: &str) -> NextEvent {
         basis: String::new(),
         source: source.to_string(),
         unread: None,
+        withheld: false,
     }
 }
 
@@ -145,6 +166,29 @@ fn unread_row(kind: NextKind, title: &str, source: &str, why: String) -> NextEve
         unread: Some(why),
         ..row(kind, title.to_string(), source)
     }
+}
+
+/// The two sources not scoped by packet, each one row saying it was
+/// withheld from this caller (backlog 0964ba80). `unread` carries the
+/// reason, so a surface draws it with the unread sources — no time, the
+/// reason beside it — and `basis` says WITHHELD, not a failed read.
+fn withheld_rows(why: &str) -> Vec<NextEvent> {
+    [
+        (NextKind::Scheduled, "scheduled rules", SOURCE_DISPATCHER),
+        (
+            NextKind::RotationDue,
+            "credential rotations",
+            SOURCE_CREDENTIALS,
+        ),
+    ]
+    .into_iter()
+    .map(|(kind, title, source)| NextEvent {
+        basis: format!("the {source} is withheld from this caller"),
+        unread: Some(format!("withheld: {why}")),
+        withheld: true,
+        ..row(kind, title.to_string(), source)
+    })
+    .collect()
 }
 
 fn cars(n: usize) -> String {
@@ -636,6 +680,7 @@ mod tests {
             yard: y,
             schedule: &schedule,
             credentials: &creds,
+            withheld: None,
             now: t(NOW),
         })
     }
@@ -741,6 +786,7 @@ mod tests {
             yard: &y,
             schedule: &Ok(vec![]),
             credentials: &Ok(vec![]),
+            withheld: None,
             now: t("2026-09-27T19:00:00Z"),
         });
         let window = of(&rows, NextKind::TrainWindow);

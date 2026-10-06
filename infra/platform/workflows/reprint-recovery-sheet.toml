@@ -48,7 +48,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "Print the recovery sheet again, because the tree now says something the signed paper copy does not (design 125d405d). Filed and kept current by the daily recovery-sheet check: the PDF rendered from origin/main is attached to the `print` step with the fact-level diff on the packet. The platform owner prints it, destroys the copy it replaces and approves `print` with a passkey over the machine-filled statement; the version on that step is then the printed version. `declined` records a print that did not happen."
-metadata = { owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "render"

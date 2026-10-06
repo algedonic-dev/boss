@@ -30,45 +30,31 @@ fn t(rfc3339: &str) -> DateTime<Utc> {
 fn packet(id: &str, owner: &str, title: &str) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
-        kind: "backlog-item".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "bosspipeline"),
-        title: title.into(),
-        owner_id: owner.into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 8, 29).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "backlog-item",
+            Subject::new("custom", "bosspipeline"),
+            title,
+            owner,
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 8, 29).unwrap(),
+        )
     }
 }
 
 fn step(id: &str, job_id: &str, status: StepStatus, title: &str) -> Step {
     Step {
         id: StepId::from_uuid(Uuid::parse_str(id).unwrap()),
-        job_id: JobId::from_uuid(Uuid::parse_str(job_id).unwrap()),
-        kind: "generic".into(),
-        title: title.into(),
         spec_slug: Some(title.to_lowercase().replace(' ', "-")),
-        assignee_id: None,
         status,
-        sort_order: 0,
-        blocked_by: vec![],
-        sign_offs_required: Vec::new(),
-        assurance_required: None,
-        sign_offs: Vec::new(),
-        fields: Vec::new(),
-        completed_on: None,
-        completed_by: None,
-        completed_at: None,
         metadata: serde_json::json!({}),
-        notes: None,
-        step_plugin_version: 0,
-        embedded_job: None,
+        ..Step::new(
+            JobId::from_uuid(Uuid::parse_str(job_id).unwrap()),
+            "generic",
+            title,
+            0,
+        )
     }
 }
 

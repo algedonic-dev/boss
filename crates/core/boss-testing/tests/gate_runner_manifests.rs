@@ -43,13 +43,17 @@ const APPLY: &str = "infra/gate-runner/apply-script-configmap.sh";
 const CONFIGMAP: &str = "gate-runner-script";
 
 /// The per-pod workspace is the whole reason concurrent gates are safe.
+/// Since backlog 52ea56ac it is the pod's OWN directory of the gate
+/// claim rather than an emptyDir (it must share the seed's filesystem
+/// for the seeding copy to reflink); gate_runner_parallel_workspace.rs
+/// pins the rest of that shape.
 #[test]
 fn the_runner_keeps_its_workspace_per_pod() {
     assert!(
-        read(SHARED).contains("emptyDir: {sizeLimit:"),
-        "{SHARED} must give /gate-target an emptyDir. A claimed workspace cannot be shared \
-         by two gates: each `git checkout -f -B` yanks the tree from under the other and \
-         both write the same receipt path, which crossed three verdicts on 2026-08-24."
+        read(SHARED).contains("mountPath: /gate-target, subPathExpr: runs/$(POD_NAME)}"),
+        "{SHARED} must give each pod its own /gate-target. A shared workspace cannot be \
+         shared by two gates: each `git checkout -f -B` yanks the tree from under the other \
+         and both write the same receipt path, which crossed three verdicts on 2026-08-24."
     );
 }
 

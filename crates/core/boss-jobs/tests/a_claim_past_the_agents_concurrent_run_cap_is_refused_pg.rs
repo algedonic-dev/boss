@@ -65,20 +65,16 @@ const PACKET: &str = "cccccccc-0000-4000-8000-000000000001";
 fn packet() -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(PACKET).unwrap()),
-        kind: "backlog-item".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "bosspipeline"),
-        title: "Nothing calls boss dispatch --next".into(),
-        owner_id: "emp-david".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 19).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "backlog-item",
+            Subject::new("custom", "bosspipeline"),
+            "Nothing calls boss dispatch --next",
+            "emp-david",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 19).unwrap(),
+        )
     }
 }
 
@@ -87,20 +83,16 @@ fn packet() -> Job {
 fn open_run(agent: &str) -> Job {
     Job {
         id: JobId::new(),
-        kind: "agent-run".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "bosspipeline"),
-        title: "run".into(),
-        owner_id: "emp-david".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 20).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({ "agent": agent }),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "agent-run",
+            Subject::new("custom", "bosspipeline"),
+            "run",
+            "emp-david",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 20).unwrap(),
+        )
     }
 }
 
@@ -109,21 +101,8 @@ fn open_run(agent: &str) -> Job {
 fn build_step(slug: &str, sort_order: i32) -> Step {
     Step {
         id: StepId::from_uuid(Uuid::new_v4()),
-        job_id: JobId::from_uuid(Uuid::parse_str(PACKET).unwrap()),
-        kind: "task".into(),
-        title: slug.into(),
         spec_slug: Some(slug.into()),
-        assignee_id: None,
         status: StepStatus::Ready,
-        sort_order,
-        blocked_by: vec![],
-        sign_offs_required: Vec::new(),
-        assurance_required: None,
-        sign_offs: Vec::new(),
-        fields: Vec::new(),
-        completed_on: None,
-        completed_by: None,
-        completed_at: None,
         metadata: serde_json::json!({
             "authority_role": "platform-admin",
             "agent_profile": "builder",
@@ -131,9 +110,12 @@ fn build_step(slug: &str, sort_order: i32) -> Step {
             "agent_budget_usd": 1.0,
             "agent_effort": "high",
         }),
-        notes: None,
-        step_plugin_version: 0,
-        embedded_job: None,
+        ..Step::new(
+            JobId::from_uuid(Uuid::parse_str(PACKET).unwrap()),
+            "task",
+            slug,
+            sort_order,
+        )
     }
 }
 

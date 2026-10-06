@@ -53,8 +53,9 @@
      *  applies to the next dot; one in flight keeps the time it set off
      *  with. */
     transit: number;
+    onFeed?: (kind: string, why: string) => void;
   }>;
-  let { geometry, reduced, transit }: Props = $props();
+  let { geometry, reduced, transit, onFeed = undefined }: Props = $props();
 
   // The two paths are written where they are fetched, whole: the
   // gateway's `every_api_path_the_web_fetches_is_routed` reads a
@@ -65,6 +66,7 @@
   /** What the feed is doing — said on the map when it is not live. */
   let feed = $state<'connecting' | 'live' | 'polling' | 'down'>('connecting');
   let feedWhy = $state('');
+  $effect(() => { onFeed?.(feed, feedWhy); });
   let awayNote = $state<string | null>(null);
   let root = $state<SVGGElement | undefined>(undefined);
 
@@ -236,7 +238,7 @@
   {#each more as m (m.key)}
     <text x={m.at.x} y={m.at.y - 10} text-anchor="middle" class="more" data-motion-more={m.key}>+{m.n}</text>
   {/each}
-  {#if feed === 'down'}
+  {#if feed === 'down' && onFeed === undefined}
     <text x="12" y="22" class="feed-down" data-feed-down>the moves feed cannot be read — nothing drawn moving is live: {feedWhy}</text>
   {:else if awayNote !== null}
     <text x="12" y="22" class="away" data-away-note>{awayNote}</text>

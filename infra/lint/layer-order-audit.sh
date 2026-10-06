@@ -108,7 +108,7 @@ layer_of() {
         boss-jobs)                      echo net ;;
         boss-policy)                    echo protocols ;;
         boss-dispatcher)                echo actors ;;
-        boss-gateway|boss-views)        echo apps ;;
+        boss-gateway|boss-views|boss-events-api) echo apps ;;
         *)                              echo "" ;;
     esac
 }

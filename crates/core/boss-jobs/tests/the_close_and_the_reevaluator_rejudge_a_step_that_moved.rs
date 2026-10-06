@@ -193,6 +193,9 @@ async fn step_titled(jobs: &InMemoryJobs, job_id: &JobId, title: &str) -> boss_c
         .unwrap_or_else(|| panic!("no step titled {title}"))
 }
 
+/// The status alone: the stored metadata it used to send back wrote
+/// nothing, and the step PUT refuses any body carrying metadata since
+/// e39a9d2a.
 async fn complete(app: &axum::Router, jobs: &InMemoryJobs, job_id: &JobId, title: &str) {
     let step = step_titled(jobs, job_id, title).await;
     let (status, body) = send(
@@ -203,7 +206,7 @@ async fn complete(app: &axum::Router, jobs: &InMemoryJobs, job_id: &JobId, title
             .header("content-type", "application/json")
             .header("x-boss-user", admin_header())
             .body(Body::from(
-                serde_json::json!({ "status": "completed", "metadata": step.metadata }).to_string(),
+                serde_json::json!({ "status": "completed" }).to_string(),
             ))
             .unwrap(),
     )

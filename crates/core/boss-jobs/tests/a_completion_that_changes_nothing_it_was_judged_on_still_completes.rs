@@ -20,9 +20,11 @@ use presence::*;
 // ---------------------------------------------------------------------
 
 /// What must keep working: the status-only completion car 5b30ccf9's
-/// surfaces send with the ceremony's ticket, and a read-merge-write
-/// body that sends every stored key back UNCHANGED — the rule is about
-/// a change, not about the key being present.
+/// surfaces send with the ceremony's ticket, and a write-back that
+/// sends a judged field (the title) back UNCHANGED — the rule is about
+/// a change, not about the key being present. The write-back carries no
+/// `metadata`: the step PUT refuses any metadata body since e39a9d2a,
+/// and a whole-row write-back is not a metadata write.
 #[tokio::test]
 async fn a_completion_that_changes_nothing_it_was_judged_on_still_completes() {
     let (app, jobs) = seed(Some(GATEWAY_KEY)).await;
@@ -36,12 +38,11 @@ async fn a_completion_that_changes_nothing_it_was_judged_on_still_completes() {
     assert!(status.is_success(), "{status}: {body}");
     assert_eq!(stored(&jobs, SIGNED).await.status, StepStatus::Completed);
 
-    // A read-merge-write writer re-sends the plan exactly as stored.
+    // A write-back re-sends the title exactly as stored.
     let t = ticket(GUARDED, GATEWAY_KEY, now_epoch() + 60);
     let resent = serde_json::json!({
         "status": "completed",
-        "title": "Approve the plan",
-        "metadata": step(GUARDED, None, false).metadata,
+        "title": step(GUARDED, None, false).title,
     })
     .to_string();
     let (status, body) = put(&app, GUARDED, Some(&t), &resent).await;

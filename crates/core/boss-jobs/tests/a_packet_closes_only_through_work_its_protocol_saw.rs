@@ -48,16 +48,9 @@ const LOOSE_KIND: &str = "no-protocol-here";
 
 fn required(name: &str) -> boss_core::job::StepField {
     boss_core::job::StepField {
-        name: name.into(),
-        field_type: "string".into(),
         required: true,
         filled_by: Default::default(),
-        item_keys: Vec::new(),
-        covers: None,
-        binds: None,
-        item_value_max_bytes: None,
-        item_one_of: Vec::new(),
-        writer: None,
+        ..boss_core::job::StepField::new(name, "string")
     }
 }
 
@@ -326,15 +319,18 @@ fn job_body(job: &Value) -> Value {
 async fn do_the_work_and_review_it(app: &axum::Router, job_id: &str) -> Value {
     let job = get_job(app, job_id).await;
     let work = step_by_slug(&job, "work");
-    let mut metadata = work["metadata"].clone();
-    metadata["evidence"] = json!("measured");
-    let (status, body) = put_step(
+    // The evidence through the step's merge door, then the status alone:
+    // since e39a9d2a (Stage 2's last car) the step PUT writes no metadata.
+    let work_id = work["id"].as_str().expect("step id");
+    let (status, body) = send(
         app,
-        job_id,
-        &work,
-        json!({ "status": "completed", "metadata": metadata }),
+        "PATCH",
+        &format!("/api/jobs/{job_id}/steps/{work_id}/metadata"),
+        Some(json!({ "evidence": "measured" })),
     )
     .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "the evidence lands: {body}");
+    let (status, body) = put_step(app, job_id, &work, json!({ "status": "completed" })).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "the work lands: {body}");
     let job = get_job(app, job_id).await;
     let review = step_by_slug(&job, "review");

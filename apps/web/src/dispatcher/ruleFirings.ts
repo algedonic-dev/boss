@@ -22,6 +22,7 @@
 
 import { fetchRemote, type Remote } from '../data/remote';
 import type { DispatcherRule } from './types';
+import { NOT_IN_SCOPE } from '../policy/withheld';
 
 export type RuleLastFiring = Readonly<{ rule: string; fired_on: string; fired_at: string }>;
 
@@ -43,6 +44,10 @@ export type RuleFirings = Readonly<{
   firings_error: string | null;
   dead_letters: ReadonlyArray<DeadLetterRollup> | null;
   dead_letters_error: string | null;
+  /** Both halves were WITHHELD from this caller by policy scope — the
+   *  server's flag (backlog 1805bac0), absent on the wire when false.
+   *  A failed read, a policy outage included, never sets it. */
+  withheld: boolean;
 }>;
 
 const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
@@ -83,6 +88,7 @@ export function parseRuleFirings(raw: unknown): RuleFirings {
     dead_letters: deadLetters,
     dead_letters_error:
       deadLetters === null ? (str(o.dead_letters_error) ?? 'the dead-letters were not read') : null,
+    withheld: o.withheld === true,
   };
 }
 
@@ -119,6 +125,13 @@ export type RuleActivity = Readonly<{
 
 const UNREAD = 'unknown';
 
+/** A half the server did not read: "unknown" when the read failed, the
+ *  scope's own words when it was WITHHELD from this caller (d0058c92) —
+ *  a refusal is the policy working, not a machine nobody can see
+ *  (bd506215). Read off the server's flag, never the reason's words
+ *  (1805bac0). */
+const unreadText = (withheld: boolean): string => (withheld ? NOT_IN_SCOPE : UNREAD);
+
 /** The two cells for one rule. Pure, so the stalled-vs-idle rule is
  *  pinned without a DOM. */
 export function ruleActivity(rule: Pick<DispatcherRule, 'name'>, read: Remote<RuleFirings>): RuleActivity {
@@ -136,7 +149,7 @@ export function ruleActivity(rule: Pick<DispatcherRule, 'name'>, read: Remote<Ru
   let lastFired: string;
   let lastFiredWhy: string;
   if (d.firings === null) {
-    lastFired = UNREAD;
+    lastFired = unreadText(d.withheld);
     lastFiredWhy = d.firings_error ?? '';
   } else if (fired !== null) {
     const age = ageText(fired.fired_at, d.now);
@@ -148,7 +161,7 @@ export function ruleActivity(rule: Pick<DispatcherRule, 'name'>, read: Remote<Ru
   }
 
   if (d.dead_letters === null) {
-    return { lastFired, lastFiredWhy, deadLetters: UNREAD, deadLettersWhy: d.dead_letters_error ?? '', deadLetterJob: null, failing: false };
+    return { lastFired, lastFiredWhy, deadLetters: unreadText(d.withheld), deadLettersWhy: d.dead_letters_error ?? '', deadLetterJob: null, failing: false };
   }
   const count = dead === null ? 0 : dead.packets + dead.unrouted;
   if (dead === null || count === 0) {

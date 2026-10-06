@@ -31,7 +31,11 @@
 //! its oldest row and how far behind the newest write that row sits
 //! ([`undrained`]), pending rows, open dead letters — and its delivery
 //! lag p50/p95/max over the window up to the newest delivery
-//! ([`relay_lag`], default 24h, 1..=720). Until it, no door read
+//! ([`relay_lag`], default 24h, 1..=720). The outbox keeps delivered
+//! rows only for its retention window (a week by default, backlog
+//! eec0c1f3), so a wider request answers that week: `lag.covered_hours`
+//! names the span the sample actually reaches (review afdc2d5d, N2).
+//! Until it, no door read
 //! `event_outbox`, so how
 //! long a committed write waits before audit_log holds it was
 //! unmeasurable. The door is `/api/events/stats`'s own — operator or
@@ -169,6 +173,8 @@ pub struct OutboxStats {
     pub pending: i64,
     /// Rows set aside and not yet resolved — not lag; the relay is done.
     pub dead_lettered_open: i64,
+    /// Delivery lag over the requested window; `lag.covered_hours` is
+    /// the window the retained rows actually span.
     pub lag: RelayLag,
 }
 

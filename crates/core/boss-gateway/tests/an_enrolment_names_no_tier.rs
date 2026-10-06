@@ -103,7 +103,7 @@ fn router(base: String) -> Router {
     let origin = Url::parse(ORIGIN).unwrap();
     passkey_router(Arc::new(PasskeyState {
         session_key: KEY.to_vec(),
-        http: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
+        http: boss_gateway::machine_client::MachineClient::unstamped(reqwest::Client::builder())
             .unwrap(),
         people_base: base.clone(),
         jobs_base: base,

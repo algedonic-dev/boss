@@ -22,8 +22,9 @@
 # asserts:
 #
 #   1. a run whose host pod is Failed (evicted) is ended: `building`
-#      completed with `result = died`, the step's own metadata kept, and
-#      a `host_gone` object naming the host and what was seen;
+#      completed with `result = died` and a `host_gone` object naming the
+#      host and what was seen — those keys alone through the step merge
+#      door, then a PUT carrying the status alone (backlog e39a9d2a);
 #   2. a run whose host pod is ABSENT, and whose name this namespace's
 #      Deployment generates, is ended the same way;
 #   3. a run on a Running pod is untouched, and so is a run whose host is
@@ -192,7 +193,16 @@ case "$method $url" in
         id="${url##*agent_run%22%3A%22}"; id="${id%%%22*}"
         if [[ -f "$FIXTURES/gates-$id.empty" ]]; then :
         elif [[ -f "$FIXTURES/gates-$id.json" ]]; then cat "$FIXTURES/gates-$id.json"; else printf '{"total":0,"data":[]}'; fi ;;
-    "PUT "*/steps/*) [[ -n "$want_code" ]] && printf '204' ;;
+    "PATCH "*/steps/*/metadata) [[ -n "$want_code" ]] && printf '204' ;;
+    # The step PUT carries the status alone (backlog e39a9d2a, design
+    # 93d2bddb): a metadata body is refused, as the server's end state
+    # refuses it.
+    "PUT "*/steps/*)
+        if [[ "$(jq -r 'has("metadata")' <<<"$body" 2>/dev/null)" == true ]]; then
+            printf '{"error":"a step PUT carries no metadata body"}'; [[ -n "$want_code" ]] && printf '\n409'
+        else
+            [[ -n "$want_code" ]] && printf '204'
+        fi ;;
     *) printf '{"error":"stub has no answer for %s %s"}' "$method" "$url"; [[ -n "$want_code" ]] && printf '\n500' ;;
 esac
 exit 0
@@ -217,19 +227,27 @@ puts=$(grep -c '^PUT	' "$tmp/log-end")
 [[ "$puts" -eq 3 ]] || { cat "$tmp/log-end" "$tmp/out-end" >&2; fail "expected exactly THREE step writes (evicted host, absent host, red-gated run), got $puts"; }
 for r in "$EVICTED:boss-dev-bc5b956bf-wvsrg:Failed/Evicted" "$GONE:boss-dev-bc5b956bf-lx2cw:no longer exists" "$RED:boss-dev-859b7899cc-wf8hk:no longer exists"; do
     id="${r%%:*}"; rest="${r#*:}"; host="${rest%%:*}"; seen="${rest#*:}"
-    line=$(grep "^PUT	http://stub/api/jobs/$id/steps/${id:0:8}-u	" "$tmp/log-end") \
+    # Two writes (backlog e39a9d2a, Stage 2): the keys through the step
+    # merge door, then the status alone. The server keeps the step's
+    # stored keys, so none is read and sent back.
+    merge=$(grep -n "^PATCH	http://stub/api/jobs/$id/steps/${id:0:8}-u/metadata	" "$tmp/log-end") \
+        || { cat "$tmp/log-end" >&2; fail "run $id (host $host): building's keys were not written through the step merge door"; }
+    line=$(grep -n "^PUT	http://stub/api/jobs/$id/steps/${id:0:8}-u	" "$tmp/log-end") \
         || { cat "$tmp/log-end" >&2; fail "run $id (host $host) was not ended on its building step"; }
+    [[ "${merge%%:*}" -lt "${line%%:*}" ]] || fail "run $id: the status flipped before the keys landed — died is judged at the flip"
+    md=$(printf '%s' "$merge" | cut -f3-)
     body=$(printf '%s' "$line" | cut -f3-)
-    [[ "$(jq -r '.status' <<<"$body")" == completed ]] || fail "run $id: the write does not complete building (body: $body)"
-    [[ "$(jq -r '.metadata.result' <<<"$body")" == died ]] || fail "run $id: the result written is not \`died\` (body: $body)"
-    [[ "$(jq -r '.metadata.authority_role' <<<"$body")" == platform-admin ]] \
-        || fail "run $id: the step's own metadata was not kept — PATCH-on-PUT replaces metadata wholesale (body: $body)"
-    [[ "$(jq -r '.metadata.host_gone.host' <<<"$body")" == "$host" ]] || fail "run $id: host_gone does not name the host (body: $body)"
-    grep -qF "$seen" <<<"$(jq -r '.metadata.host_gone.seen' <<<"$body")" \
-        || fail "run $id: host_gone does not say what was seen ('$seen') — a verdict must name what failed (body: $body)"
+    [[ "$(jq -c '.' <<<"$body")" == '{"status":"completed"}' ]] \
+        || fail "run $id: the step PUT must carry the status alone, never a metadata body (body: $body)"
+    [[ "$(jq -r '.result' <<<"$md")" == died ]] || fail "run $id: the result written is not \`died\` (merge: $md)"
+    [[ "$(jq -r 'has("authority_role")' <<<"$md")" == false ]] \
+        || fail "run $id: the merge re-sent a stored key — only the observer's own keys ride the door (merge: $md)"
+    [[ "$(jq -r '.host_gone.host' <<<"$md")" == "$host" ]] || fail "run $id: host_gone does not name the host (merge: $md)"
+    grep -qF "$seen" <<<"$(jq -r '.host_gone.seen' <<<"$md")" \
+        || fail "run $id: host_gone does not say what was seen ('$seen') — a verdict must name what failed (merge: $md)"
 done
 for id in "$LIVE" "$ELSEWHERE" "$GATING" "$GREEN" "$REPORTING" "$SILENT"; do
-    grep -q "^PUT	http://stub/api/jobs/$id/" "$tmp/log-end" \
+    grep -qE "^(PUT|PATCH)	http://stub/api/jobs/$id/" "$tmp/log-end" \
         && { cat "$tmp/log-end" >&2; fail "run $id was written — a live host, a foreign host, a gate still owning the ending, or a finished build must be left alone"; }
 done
 grep -q 'aaaaaaaa-0000-4000-8000-00000000000a' "$tmp/out-end" \
@@ -242,7 +260,7 @@ PODS_FORBIDDEN=1 run_observer refused; rc=$?
 [[ $rc -eq 0 ]] || { cat "$tmp/out-refused" >&2; fail "the observer exited $rc when the pods read was refused — a later duty took the first with it"; }
 grep -q 'POST	http://stub/api/estate/observation' "$tmp/log-refused" \
     || fail "the observation was not posted when the pods read was refused"
-grep -q '^PUT	' "$tmp/log-refused" && fail "a refused pods read still produced a step write"
+grep -qE '^(PUT|PATCH)	' "$tmp/log-refused" && fail "a refused pods read still produced a step write"
 grep -qi 'forbidden' "$tmp/out-refused" \
     || { cat "$tmp/out-refused" >&2; fail "the refused pods read was not spoken on stdout with the server's reason"; }
 

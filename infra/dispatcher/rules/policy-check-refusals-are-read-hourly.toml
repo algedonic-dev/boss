@@ -1,0 +1,44 @@
+# The lapsed-grant watch — the reader of the policy check's refusal
+# tally (backlog b8e75382: R3 of the follow-ups carried into F7, and the
+# enforce checklist of review 1c2860f4).
+#
+# THE GAP IT NAMES. Every service signs its POST /api/policy/check as
+# automation:<svc> at platform-admin. If that service's Read on
+# policy-rule lapses, the check is still answered — refusing it would
+# hang every request in the estate on one mutable grant — and the lapse
+# was one WARN line in the policy service's log that nothing read. Under
+# the policy check's `enforce` the same lapse is every door 503
+# (checklist F3), so it must be seen while it is still a warn. With the
+# mode key mounted at `report` (boss.yaml, checklist F4) each such check
+# is a `service` row, with its last_seen, at /api/policy/check/refusals.
+#
+# HOURLY, beside the coverage backstop that reads the same service: a
+# lapse is a lockout in waiting the day D enforces, and it is also the
+# enforce window's evidence. The handler needs the tick's `_at`, which
+# only a sub-day cadence writes.
+#
+# NO DEDUP GUARD ON THE RULE, ON PURPOSE — the coverage backstop's shape.
+# The handler dedups on its finding key against the OPEN alarms, so a
+# firing that finds nothing writes nothing, and a standing lapse is one
+# packet however many callers it names.
+[[rule]]
+name = "policy-check-refusals-are-read-hourly"
+why = """
+A TIMER over a STATE, the standing exemption: the condition is a
+service whose Read on policy-rule has lapsed, and the check it refuses
+is ANSWERED — the policy service emits no event for a warn, and a
+retired rule or a narrowing override can come from a migration, a
+seed or a restore as well as a write. Measured on review 1c2860f4
+(2026-09-30): 13 services sign their checks at platform-admin, and
+nothing read the lapsed-grant warn. It adds no routing and refuses
+nothing: one firing reads GET /api/policy/check/refusals, files ONE
+urgent alarm when a service row was counted in the last two hours and
+ONE when the tally overflowed (a full tally names no caller and is
+never clean), deduped on the finding, and withdraws each once a read
+no longer shows it. A read it cannot judge keeps ONE unreadable alarm
+naming the error, withdrawn by the next whole read. A tally in mode
+`off` watched nothing, so it neither raises nor withdraws.
+"""
+schedule = { cadence = "hourly", anchor_date = "2026-10-01" }
+[[rule.do]]
+handler = "policy.check.refusals.alarm"

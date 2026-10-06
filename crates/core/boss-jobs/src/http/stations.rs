@@ -147,10 +147,10 @@ async fn readable_predicate<R: JobsRepository, B: EventBus>(
 ) -> Result<boss_policy_client::Predicate, Response> {
     let predicate = state
         .policy
-        .scope_predicate(user, Resource::job())
+        .scope_of(user, controls::READ_JOB)
         .await
         .map_err(|e| e.into_response())?;
-    match job_scope_from_predicate(user, &predicate) {
+    match JobScope::from_predicate(user, &predicate) {
         JobScope::None => Err((
             StatusCode::FORBIDDEN,
             format!(
@@ -170,9 +170,9 @@ async fn readable_predicate<R: JobsRepository, B: EventBus>(
 async fn station_policy_check<R: JobsRepository, B: EventBus>(
     state: &JobsApiState<R, B>,
     user: &boss_policy_client::User,
-    action: Action,
+    control: Pair,
 ) -> Result<(), Response> {
-    match state.policy.check(user, action, Resource::workflow()).await {
+    match state.policy.ask(user, control).await {
         Ok(Decision::Allow { .. }) => Ok(()),
         Ok(Decision::Deny { reason }) => Err((StatusCode::FORBIDDEN, reason).into_response()),
         Err(e) => Err(e.into_response()),
@@ -330,7 +330,7 @@ pub(super) async fn stations_load<R: JobsRepository + 'static, B: EventBus + 'st
         Err(r) => return r,
     };
 
-    let scope = job_scope_from_predicate(&user, &predicate);
+    let scope = JobScope::from_predicate(&user, &predicate);
     // The ACTIVE protocol per kind, read ONCE — the second half of the
     // omission question `station_reach` answers, and the row each
     // packet's agent block resolves against (backlog 51aef4dd), so the
@@ -585,7 +585,7 @@ pub(super) async fn station_queue<R: JobsRepository + 'static, B: EventBus + 'st
         Ok(p) => p,
         Err(r) => return r,
     };
-    let scope = job_scope_from_predicate(&user, &predicate);
+    let scope = JobScope::from_predicate(&user, &predicate);
 
     // The evaluation universe: in-flight packets, because stations
     // hold in-flight traffic. A station declaring a terminal window
@@ -699,7 +699,7 @@ pub(super) async fn create_station<R: JobsRepository + 'static, B: EventBus + 's
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = station_policy_check(&state, &user, Action::Create).await {
+    if let Err(r) = station_policy_check(&state, &user, controls::CREATE_WORKFLOW).await {
         return r;
     }
     let (actor, now) = super::kinds::write_stamp(&state, &user).await;
@@ -722,7 +722,7 @@ pub(super) async fn validate_station<R: JobsRepository + 'static, B: EventBus + 
     Json(spec): Json<crate::stations::StationSpec>,
 ) -> Response {
     // Gated like create — the dry run is an authoring affordance.
-    if let Err(r) = station_policy_check(&state, &user, Action::Create).await {
+    if let Err(r) = station_policy_check(&state, &user, controls::CREATE_WORKFLOW).await {
         return r;
     }
     let problems = match crate::station_lint::gate_active(&spec) {
@@ -744,7 +744,7 @@ pub(super) async fn list_station_versions<R: JobsRepository + 'static, B: EventB
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = station_policy_check(&state, &user, Action::Read).await {
+    if let Err(r) = station_policy_check(&state, &user, controls::READ_WORKFLOW).await {
         return r;
     }
     // A reader is served every version that was published and no draft
@@ -774,7 +774,7 @@ pub(super) async fn get_station_version<R: JobsRepository + 'static, B: EventBus
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = station_policy_check(&state, &user, Action::Read).await {
+    if let Err(r) = station_policy_check(&state, &user, controls::READ_WORKFLOW).await {
         return r;
     }
     match reg.get_version(&name, version).await {
@@ -809,7 +809,7 @@ pub(super) async fn publish_station<R: JobsRepository + 'static, B: EventBus + '
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = station_policy_check(&state, &user, Action::Update).await {
+    if let Err(r) = station_policy_check(&state, &user, controls::UPDATE_WORKFLOW).await {
         return r;
     }
     let (actor, now) = super::kinds::write_stamp(&state, &user).await;
@@ -830,7 +830,7 @@ pub(super) async fn retire_station<R: JobsRepository + 'static, B: EventBus + 's
         Ok(r) => r,
         Err(r) => return r,
     };
-    if let Err(r) = station_policy_check(&state, &user, Action::Update).await {
+    if let Err(r) = station_policy_check(&state, &user, controls::UPDATE_WORKFLOW).await {
         return r;
     }
     let (actor, now) = super::kinds::write_stamp(&state, &user).await;

@@ -1,0 +1,39 @@
+# ---------------------------------------------------------------------
+# The machine token rotation advances on its own (design 6805c764, car
+# 3; backlog 2710c8fc).
+#
+# THE GAP THIS CLOSES. `broker-rotates-the-machine-token` fires once,
+# when a rotation packet's scope step completes. Its phases wait on
+# things one delivery cannot: kubelet refreshes a mounted Secret about a
+# minute after a write, so the gates accept a staged value minutes after
+# it is written, and the revoke waits a whole drain window (a day) of
+# clean tallies. A delivery holds its message for 30 seconds. So the
+# handler does what the state allows, records on the step why it
+# stopped (`<step>_deferred`), and acknowledges — and this clock rule
+# hands it the same declaration every fifteen minutes with `phase =
+# "advance"`, which runs every phase the state now allows over every open
+# rotation packet about the credential, oldest first. Nothing is minted
+# unless a packet's scope asked for it; a quarter-hour with no open
+# rotation reads nothing but the packet list.
+#
+# THE ARGS ARE THE ROTATION RULE'S DECLARATION, verbatim, plus `phase`
+# — a fact that lives twice (CLAUDE.md §9a), pinned equal by
+# crates/core/boss-dispatcher/tests/machine_token_rotation_rules.rs: a
+# sweep reading a different Secret would promote into, or revoke from,
+# a Secret the gates do not mount.
+[[rule]]
+name = "broker-advances-the-machine-token-rotation"
+why = """
+A TIMER, the standing exemption, and EXTERNAL GLUE at once: the
+conditions it waits on are a mounted Secret reaching every pod and a
+day passing with no caller presenting the old value — nothing in the
+system emits an event for either, and both outlast the ack window of
+the event that started the rotation. Its effect lives outside the
+system (the k8s Secret store, every service port's machine gate),
+which no Workflow definition can address. It adds no routing: it
+advances the packets it finds and spawns nothing.
+"""
+schedule = { cadence = "every-15-minutes", anchor_date = "2026-09-30" }
+[[rule.do]]
+handler = "credential.rotate.self-issued"
+args = { phase = "\"advance\"", secret_namespace = "\"boss\"", secret_name = "\"boss-machine-token\"", also_in_namespaces = "\"boss-dev\"", credential_id = "\"boss-machine-token\"", drain_minutes = "\"1440\"" }

@@ -1,0 +1,105 @@
+# ---------------------------------------------------------------------
+# The credential broker mints the token the daily publish opens its pull
+# request with, WHEN THE PUBLISH REQUEST IS FILED (backlog d2b7c947,
+# David 2026-09-30: "Go with option 2, retire the fork", and "we have
+# made a fundamental change to our posture and now are working
+# professionally out of the algedonic-dev Github org via the Github
+# App").
+#
+# WHAT IT REPLACED. Until this rule the publish verb
+# (infra/forge/publish-github-pr.sh) pushed its snapshot to dauld's
+# public fork, dauld/boss-mirror, and opened the pull request against
+# algedonic-dev/boss AS dauld, with a personal access token David minted
+# by hand (registry id dauld-github-token: scopes unverified, rotation
+# never recorded). Now the snapshot is pushed to a publish/* branch IN
+# algedonic-dev/boss and the pull request is opened from that same
+# repository by the GitHub App's installation on algedonic-dev, with a
+# token minted for this one request and revoked by the verb when its
+# GitHub work is done. GitHub shows the opener as the App; the commit's
+# author and committer are the publisher the verb file declares.
+#
+# THE CREDENTIAL is the algedonic-dev installation's (registry id
+# github-app-algedonic-dev, Secret boss/github-app-algedonic-dev, the
+# broker's existing name-scoped grant) — the SAME installation the
+# admin rules mint from, under a key namespace of its own:
+# `publish-token-<ops-request id>`, never the admin verbs'
+# `token-<ops-request id>`, so neither consumer can render the other's
+# token. It is NARROWER than the admin token on both axes the handler
+# narrows: one repository (the mirror, `boss`) and the four permissions
+# a publish uses —
+#   contents:write       push publish/<date>-<snapshot>, delete a
+#                        closed PR's branch
+#   pull_requests:write  open the PR, close an older one as superseded,
+#                        with its comment
+#   workflows:write      the snapshot's tree carries .github/workflows,
+#                        and GitHub refuses an App a push that creates or
+#                        updates a workflow file without it (backlog
+#                        d76cc3ac, measured on the DR push)
+#   metadata:read        GitHub requires it of every installation token
+# and no administration. The App itself must hold Pull requests: Read
+# and write on the algedonic-dev installation; until it does, GitHub
+# refuses the narrowed exchange and the firing's refusal says so on the
+# dispatcher's record, while the verb refuses on its empty slot having
+# pushed nothing.
+#
+# MINTED PER REQUEST, NEVER KEPT ALIVE (design 76c46869, the admin
+# token's posture). No clock re-mints it. The publish's APPROVAL is
+# David's passkey on the publish packet's approve step, which completes
+# BEFORE this request exists (publish-github-pr-on-open-pr-ready files
+# the request when open-pr becomes ready), so there is no second moment
+# to re-mint at: the filing is the only one, and the verb runs within a
+# runner pass or two of it. 59 is the widest window the handler takes,
+# as on the admin filing twin: a token minted more than a minute ago is
+# not this request's.
+#
+# WHICH REQUESTS. A `publish-github-pr` request with no `--check`: the
+# verb's one admitted argument is its no-network input check, which
+# holds no token and must not mint one. A publish run carries no args,
+# and an absent `metadata.args.0` compares unequal to the literal
+# (boss-expr: Absent is unequal to every literal), so it fires.
+#
+# AND THE MERGE (v2, backlog 602fe95f, David 2026-09-30: "NOBODY pushes
+# or merges main by hand"). A `merge-publish-pr` request — the same
+# script, publish-github-pr.sh --merge, filed when the publish packet's
+# `merge` step goes ready — mints under this same rule: the merge is a
+# push of the approved snapshot to the mirror's main, which needs
+# contents:write, and workflows:write when the snapshot carries
+# .github/workflows, and nothing a publish does not already hold. Its
+# approval is the same passkey, completed before either request exists,
+# so the filing is again the only moment to mint. One rule, not two: the
+# script renders its token from this file by name, in both modes, and
+# a second rule with the same declaration would be a second copy of it.
+#
+# THE CONSUMER is off the cluster: publish-github-pr.sh on the forge
+# host renders this rule's key for the request the ops runner hands it
+# (OPS_REQUEST_ID) into /etc/boss-publish/github-app/
+# algedonic-dev-publish.token through infra/forge/credential-render.sh —
+# its own slot, never the admin verbs' algedonic-dev.token, so a publish
+# and a GitHub act running together cannot drop each other's token.
+# github-act.sh selects its rule as the FIRST file in this directory
+# declaring credential_id github-app-algedonic-dev, which is the admin
+# filing rule (`...-admin-token-...` sorts before `...-publish-token-...`);
+# pinned by crates/core/boss-dispatcher/tests/
+# github_app_installation_token_rules.rs, with the rest of this file's
+# shape.
+[[rule]]
+name = "broker-mints-the-algedonic-dev-publish-token-when-a-publish-request-is-filed"
+why = """
+EXTERNAL GLUE, the census class for reactions whose effect lives outside
+the system: the broker speaks to GITHUB's App API (the installation-token
+exchange) and the k8s Secret store, neither of which a Workflow
+definition can address. The ops-request protocol cannot mint a
+credential for its own act; this rule mints the one the publish verb
+opens the mirror's pull request with, on the request that needs it. It
+adds no routing and spawns nothing: it fills one key of one Secret and
+records credential.installed. Backlog d2b7c947 (2026-09-30): the publish
+leaves dauld's personal token and fork for the algedonic-dev
+installation, narrowed to the mirror repository. Backlog 602fe95f
+(v2): the merge of that PR is the same verb's, and mints here too.
+"""
+version = 2
+on_event = "jobs.job.created"
+when = 'kind = "ops-request" AND ((metadata.verb = "publish-github-pr" AND metadata.args.0 != "--check") OR metadata.verb = "merge-publish-pr")'
+[[rule.do]]
+handler = "credential.rotate.github-app-installation"
+args = { phase = "\"refresh\"", refresh_within_minutes = "\"59\"", secret_namespace = "\"boss\"", secret_name = "\"github-app-algedonic-dev\"", secret_key = "\"publish-token\"", credential_id = "\"github-app-algedonic-dev\"", verify_repo = "\"algedonic-dev/boss\"", repositories = "\"boss\"", permissions = "\"contents:write,metadata:read,pull_requests:write,workflows:write\"", request_id = "id" }

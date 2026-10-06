@@ -41,7 +41,7 @@ which outages*:
 
 | lever | verifier | survives |
 |---|---|---|
-| rollout undo | kube-apiserver | BOSS stack down, IdP down |
+| roll to a named build (was `rollout undo`) | kube-apiserver | BOSS stack down, IdP down |
 | emergency merge to forge main | Forgejo | BOSS stack down, IdP down |
 | break-glass web session | boss-gateway | IdP down — but not stack down, and only while Cloudflare's edge, the Access mail and the tunnel are up (see "What this door does not cover") |
 
@@ -89,10 +89,20 @@ no relying party to talk to. The levers below it are gated by the
 same physical key through verifiers that were still standing that
 night:
 
-- **Rollout undo.** The break-glass kubeconfig's client certificate
+- **Roll to a named build.** The break-glass kubeconfig's client certificate
   keeps its private key on the security key's PIV applet:
   non-exportable, PIN + touch per use, verified by kube-apiserver.
-  A stolen kubeconfig file is inert without the hardware.
+  A stolen kubeconfig file is inert without the hardware. The roll is
+  the estate's own — for deploy/boss one JSON patch moving the image
+  of `containers/0` AND `initContainers/0` to the last converged build
+  by name (`_patch_boss_image`, `infra/forge/cluster-deploy-lib.sh`),
+  never `rollout undo`, which can land on a revision carrying the same
+  broken image. When the roll is sent as the break-glass-operator
+  ServiceAccount (`boss-break-glass-operator.yaml`), an admission policy
+  holds it to that: each image may move only within the repository
+  its workload already pulls from, and nothing else in the template
+  may change (item 4e1c33b4 bound it to report; its Deny car, backlog
+  e4a9a9b3, makes it refuse).
 - **Emergency merge.** Forgejo already supports passkey login for
   the merge click. The *approval artifact* — the thing the
   post-mortem's break-glass protocol requires David to produce — is

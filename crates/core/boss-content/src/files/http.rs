@@ -58,8 +58,8 @@ const SIGNED_GET_TTL: Duration = Duration::from_secs(5 * 60);
 /// Same shape: short window for one specific upload by one client.
 const SIGNED_PUT_TTL: Duration = Duration::from_secs(15 * 60);
 
-use boss_policy_client::{Action, Resource};
 use boss_policy_client::{CurrentUser, PolicyClient};
+use boss_policy_client::{Pair, controls};
 
 use crate::files::error::FileError;
 use crate::files::port::{FileRepository, FileStorage};
@@ -109,12 +109,12 @@ pub fn router(state: FilesApiState) -> Router {
 // ---- Policy mapping -------------------------------------------------------
 //
 // Files inherit from their target — read a Job, read its files; update
-// a Job, attach files to it. Mapping ResourceKind to the policy
-// Resource enum:
+// a Job, attach files to it. Mapping ResourceKind to the declared
+// control each asks (`boss_policy_client::controls`, backlog 47aed706):
 //
-//   Job   → Resource::job()
-//   Step  → Resource::step()
-//   Subject → Resource::account() (v1 simplification — Subjects are
+//   Job   → READ_JOB / UPDATE_JOB
+//   Step  → READ_STEP / UPDATE_STEP
+//   Subject → READ_ACCOUNT / UPDATE_ACCOUNT (v1 simplification — Subjects are
 //             generic; using the most-common kind unblocks the slice.
 //             Session 3 can introduce a Subject-kind-aware mapping
 //             once we wire the SPA onto Subject pages.)
@@ -122,25 +122,36 @@ pub fn router(state: FilesApiState) -> Router {
 //           are append-only audit rows; their evidence is read-gated
 //           by whoever already saw the event in the audit page.
 
-fn target_to_policy_resource(kind: ResourceKind) -> Option<Resource> {
-    match kind {
-        ResourceKind::Job => Some(Resource::job()),
-        ResourceKind::Step => Some(Resource::step()),
-        ResourceKind::Subject => Some(Resource::account()),
-        ResourceKind::Event => None,
+/// What a file door does to its target: reads it, or writes to it
+/// (attaching, detaching or replacing a file is an update of the target).
+#[derive(Debug, Clone, Copy)]
+enum Access {
+    Read,
+    Update,
+}
+
+fn target_control(kind: ResourceKind, access: Access) -> Option<Pair> {
+    match (kind, access) {
+        (ResourceKind::Job, Access::Read) => Some(controls::READ_JOB),
+        (ResourceKind::Job, Access::Update) => Some(controls::UPDATE_JOB),
+        (ResourceKind::Step, Access::Read) => Some(controls::READ_STEP),
+        (ResourceKind::Step, Access::Update) => Some(controls::UPDATE_STEP),
+        (ResourceKind::Subject, Access::Read) => Some(controls::READ_ACCOUNT),
+        (ResourceKind::Subject, Access::Update) => Some(controls::UPDATE_ACCOUNT),
+        (ResourceKind::Event, _) => None,
     }
 }
 
 async fn check_policy(
     state: &FilesApiState,
     user: &boss_policy_client::User,
-    action: Action,
+    access: Access,
     target: &ResourceRef,
 ) -> Result<(), Response> {
-    let Some(resource) = target_to_policy_resource(target.kind) else {
+    let Some(control) = target_control(target.kind, access) else {
         return Ok(()); // Event: no policy check
     };
-    match state.policy.check(user, action, resource).await {
+    match state.policy.ask(user, control).await {
         Ok(boss_policy_client::Decision::Allow { .. }) => Ok(()),
         Ok(boss_policy_client::Decision::Deny { reason }) => {
             Err((StatusCode::FORBIDDEN, format!("policy denied: {reason}")).into_response())
@@ -190,7 +201,7 @@ async fn list(
         kind,
         id: q.target_id,
     };
-    if let Err(resp) = check_policy(&state, &user, Action::Read, &target).await {
+    if let Err(resp) = check_policy(&state, &user, Access::Read, &target).await {
         return resp;
     }
     match state.repo.list_for(&target).await {
@@ -274,7 +285,7 @@ async fn upload(
     };
     let target = ResourceRef { kind, id: tid };
 
-    if let Err(resp) = check_policy(&state, &user, Action::Update, &target).await {
+    if let Err(resp) = check_policy(&state, &user, Access::Update, &target).await {
         return resp;
     }
 
@@ -333,7 +344,7 @@ async fn download(
     if row.deleted_at.is_some() {
         return (StatusCode::GONE, "file detached").into_response();
     }
-    if let Err(resp) = check_policy(&state, &user, Action::Read, &row.target).await {
+    if let Err(resp) = check_policy(&state, &user, Access::Read, &row.target).await {
         return resp;
     }
 
@@ -468,7 +479,7 @@ async fn request_upload_url(
         kind,
         id: req.target_id,
     };
-    if let Err(resp) = check_policy(&state, &user, Action::Update, &target).await {
+    if let Err(resp) = check_policy(&state, &user, Access::Update, &target).await {
         return resp;
     }
     let object_key = format!("sha256/{}", req.sha256);
@@ -517,7 +528,7 @@ async fn finalize_upload(
         kind,
         id: req.target_id,
     };
-    if let Err(resp) = check_policy(&state, &user, Action::Update, &target).await {
+    if let Err(resp) = check_policy(&state, &user, Access::Update, &target).await {
         return resp;
     }
     let object_key = format!("sha256/{}", req.sha256);
@@ -583,13 +594,10 @@ async fn audit(
     Query(q): Query<AuditQuery>,
 ) -> Response {
     // Reuse the policy matrix: the audit view is platform-admin-shaped,
-    // so check Action::Read on Resource::policy_rule() (the audit log
-    // surface uses the same gate today).
-    match state
-        .policy
-        .check(&user, Action::Read, Resource::policy_rule())
-        .await
-    {
+    // so ask READ_POLICY_RULE (the audit log surface uses the same gate
+    // today). This door admits any scope; the rule-table reads admit only
+    // `all`, which is why the const is declared so.
+    match state.policy.ask(&user, controls::READ_POLICY_RULE).await {
         Ok(boss_policy_client::Decision::Allow { .. }) => {}
         Ok(boss_policy_client::Decision::Deny { reason }) => {
             return (StatusCode::FORBIDDEN, format!("policy denied: {reason}")).into_response();
@@ -629,7 +637,7 @@ async fn soft_delete(
         Ok(None) => return (StatusCode::NOT_FOUND, "file not found").into_response(),
         Err(e) => return err(e),
     };
-    if let Err(resp) = check_policy(&state, &user, Action::Update, &row.target).await {
+    if let Err(resp) = check_policy(&state, &user, Access::Update, &row.target).await {
         return resp;
     }
     // OUTBOX (phase 2): the adapter records content.file.detached in

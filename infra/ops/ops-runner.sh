@@ -84,6 +84,11 @@
 #   the claim door would refuse this runner on — a held one is refused
 #   by name, and "claimed, outcome unknown" names only a holder shaped
 #   like one of this runner's own passes.
+#   And a plan that names NOTHING TO DO asks nobody (backlog b2f78bb9):
+#   a plan verb may declare `nothing_to_do`, the regex its whole plan
+#   matches when it names no change, and a matching plan closes the
+#   request through its `nothing-to-do` terminal with the plan on it,
+#   never reaching the approve step (see `render_plan`).
 #
 # ## Behaviour
 #
@@ -104,8 +109,9 @@
 # - Completes a step in two writes, sending only what it changes: its
 #   keys through the step merge door (`PATCH .../steps/{id}/metadata`,
 #   merged against the row as it stands), THEN the status alone
-#   (`PUT .../steps/{id}`). The PUT swaps `metadata` wholesale, so a
-#   metadata body must carry every key the step holds — it used to be
+#   (`PUT .../steps/{id}`). The PUT refuses any metadata body now
+#   (e39a9d2a, Stage 2's last car); when it swapped `metadata`
+#   wholesale, a metadata body had to carry every key — it used to be
 #   the keys READ at poll time plus the runner's own, a copy that could
 #   be stale by the time it landed (the boss-step.sh lesson; backlog
 #   2aa2b19e, the gate runner's shape since e39a9d2a). The status-only
@@ -153,8 +159,11 @@
 #   OPS_TIMEOUT    (default 30) seconds before a verb is killed, unless
 #                  the verb's allowlist entry declares its own `timeout`
 #   OPS_OUTPUT_CAP (default 102400) bytes of output kept
-#   BOSS_MACHINE_TOKEN (optional) forwarded as x-boss-machine-token, in a
-#     0600 header file (infra/lib/secret-header.sh), never in argv
+#   BOSS_MACHINE_TOKEN_DIR (default /etc/boss/machine-token) the mounted
+#     machine token; its `current` slot rides as x-boss-machine-token in
+#     a 0600 header file, never in argv, and only to an estate host —
+#     loopback or BOSS_MACHINE_TOKEN_HOSTS (infra/lib/secret-header.sh
+#     machine_token_header; design 6805c764 car 4)
 #   BOSS_RUNNER_CREDENTIAL_FILE (default /etc/boss/ops-runner.credential)
 #     this host's runner credential, presented as x-boss-runner-credential
 #     the same way; absent, none is sent (design f623e425; see below)
@@ -298,7 +307,7 @@ if [ ! -r "$SECRET_LIB" ]; then
 fi
 # shellcheck source=infra/lib/secret-header.sh
 . "$SECRET_LIB"
-if ! secret_header MT_HDR ${BOSS_MACHINE_TOKEN:+"x-boss-machine-token: $BOSS_MACHINE_TOKEN"}; then
+if ! machine_token_header MT_HDR "$BASE"; then
     echo "ops-runner: the machine token's header file could not be written — refusing to run" >&2
     exit 78
 fi
@@ -388,6 +397,8 @@ decide() {
                    + "single-use, verified before the argv is built)")
           elif ($args | type) != "array" or any($args[]; type != "string") then
             refuse("metadata.args must be a JSON array of strings")
+          elif ($spec | has("capture")) and $spec.capture != "separate-streams" then
+            refuse("verb \($verb) declares an unsupported capture format")
           elif ($args | length) > ($spec.params | length) then
             refuse("verb \($verb) takes at most \($spec.params | length) arg(s), got \($args | length)")
           else
@@ -424,10 +435,31 @@ decide() {
                                    | if has("omit") then empty else .ok end
                               else . end ],
                     timeout: ($spec.timeout // null),
+                    capture: ($spec.capture // null),
                     effect: ($spec.effect // null),
                     effect_unread: ($spec.effect_unread // null)}
               end
           end' "$VERBS_FILE"
+}
+
+# A byte record, not a parsed proposal (f3a09e07). Base64 preserves binary
+# and trailing newlines; completeness describes retained bytes, not success.
+# A consumer must also read the exit before interpreting a complete stream.
+stream_record() {
+    sr_file="$1"
+    sr_bytes=$(wc -c < "$sr_file") || return 1
+    sr_hash=$(sha256sum "$sr_file") || return 1
+    sr_hash=${sr_hash%% *}
+    head -c "$OPS_OUTPUT_CAP" "$sr_file" > "$workdir/stream-kept" || return 1
+    sr_kept=$(wc -c < "$workdir/stream-kept") || return 1
+    # Separate commands conserve the encoder's exit in POSIX sh: a pipe
+    # to tr would hide a failed base64 behind tr's successful empty read.
+    base64 "$workdir/stream-kept" > "$workdir/stream-encoded" || return 1
+    tr -d '\n' < "$workdir/stream-encoded" > "$workdir/stream-base64" || return 1
+    jq -cn --rawfile encoded "$workdir/stream-base64" \
+        --argjson bytes "$sr_bytes" --argjson kept "$sr_kept" --arg hash "$sr_hash" \
+        '{base64:$encoded, bytes:$bytes, retained_bytes:$kept,
+          sha256:$hash, complete:($bytes == $kept)}'
 }
 
 # approval_contract <verb> — {plan_verb: name} when the verb can carry
@@ -469,7 +501,60 @@ approval_contract() {
           elif ($s.approvers | type) != "array" or ($s.approvers | length) == 0
                or any($s.approvers[]; type != "string" or . == "") then
             {refuse: "verb \($v) names no approvers (a non-empty list of employee ids in infra/ops/verbs/\($v).json), so no passkey can approve it (design 03451237 q2: who may approve is a named list, never a role)"}
-          else {plan_verb: $pv, approvers: $s.approvers} end' "$VERBS_FILE"
+          else {plan_verb: $pv, approvers: $s.approvers,
+                nothing_to_do: ($all[$pv].nothing_to_do // null)} end' "$VERBS_FILE"
+}
+
+# The job metadata key that readies ops-request's `nothing-to-do`
+# terminal. Written by this runner and nothing else; boss-testing's
+# the_nothing_to_do_terminal_waits_on_the_marker_the_runner_writes holds
+# ops-request.toml's `ready_when` to this line by name (CLAUDE.md §9a).
+NOTHING_TO_DO_MARKER='plan_names_nothing'
+
+# close_nothing_to_do <job json> <plan verb> <args json> <write verb>
+# <pattern> — close the request through its `nothing-to-do` terminal,
+# carrying the plan ($workdir/plan, hash $rv_sha) and everything it was
+# rendered for. Three writes, IN THIS ORDER: the record onto the
+# terminal through the step merge door (it is pending, and the merge
+# door takes a pending step, as `abort_request`'s does); then the job
+# marker its `ready_when` waits on, so the step is never ready without
+# its record; then the status alone (`finish_step`; the dispatcher's
+# marker rule may complete it first, and a status-only re-send to a
+# completed step answers 204). Returns 0 when closed, 2 when the request
+# has no such terminal — pinned to an ops-request version from before
+# it, which has nowhere to record this — and 1 when a write was refused,
+# having said why on stderr.
+close_nothing_to_do() {
+    nd_id=$(printf '%s' "$1" | jq -r '.id')
+    nd_short=$(printf '%s' "$nd_id" | cut -c1-8)
+    nd_sid=$(printf '%s' "$1" | jq -r '((.steps // []) | map(select(.spec_slug == "nothing-to-do")) | .[0].id) // empty')
+    [ -n "$nd_sid" ] || return 2
+    jq -cn --rawfile p "$workdir/plan" --arg v "$4" --arg h "$HOST_ID" --argjson a "$3" \
+        --arg s "$rv_sha" --arg pv "$2" --arg re "$5" \
+        '{plan: $p, verb: $v, host: $h, args: $a, rendered_plan_sha256: $s,
+          plan_verb: $pv, nothing_to_do: $re, runner_host: $h}' > "$workdir/nothing"
+    step_write PATCH "$workdir/nothing" "$workdir/nothing-body" \
+        "$BASE/api/jobs/$nd_id/steps/$nd_sid/metadata"
+    case "${sw_code:-000}" in
+        2??) ;;
+        *) echo "ops-runner: could not record nothing to do on $nd_short — merge HTTP ${sw_code:-none}: $(head -c 2000 "$workdir/nothing-body" | tr '\n' ' ')$(cat "$workdir/put-err")" >&2
+           return 1 ;;
+    esac
+    jq -cn --arg k "$NOTHING_TO_DO_MARKER" '{($k): true}' > "$workdir/nothing-marker"
+    step_write PATCH "$workdir/nothing-marker" "$workdir/nothing-body" \
+        "$BASE/api/jobs/$nd_id/metadata"
+    case "${sw_code:-000}" in
+        2??) ;;
+        *) echo "ops-runner: could not mark $nd_short as naming nothing to do — job merge HTTP ${sw_code:-none}: $(head -c 2000 "$workdir/nothing-body" | tr '\n' ' ')$(cat "$workdir/put-err")" >&2
+           return 1 ;;
+    esac
+    finish_step "$workdir/nothing-body" "$BASE/api/jobs/$nd_id/steps/$nd_sid" \
+        "$nd_short's nothing-to-do step"
+    case "${cs_code:-000}" in
+        2??) return 0 ;;
+    esac
+    echo "ops-runner: could not close $nd_short as nothing to do — PUT HTTP ${cs_code:-none}: $(head -c 2000 "$workdir/nothing-body" | tr '\n' ' ')$(cat "$workdir/put-err")" >&2
+    return 1
 }
 
 # abort_request <job json> <reason> — close the request through its
@@ -718,8 +803,23 @@ ARGV
 }
 
 # render_plan <job json> <plan verb> <args json> <approve step json>
-# <verb> — render the plan and write it onto the approve step. Sets
-# `plan_outcome` to planned | refused | failed.
+# <verb> [<nothing_to_do>] — render the plan and write it onto the
+# approve step, or, when the plan verb's declared `nothing_to_do`
+# matches the plan, close the request with nothing asked. Sets
+# `plan_outcome` to planned | nothing | refused | failed.
+#
+# A PLAN THAT NAMES NOTHING TO DO ASKS NOBODY (backlog b2f78bb9, car 3
+# of 3df309bf). The machine files a remedy while a finding persists, and
+# a remedy that already ran renders a plan with nothing in it — which
+# reached the approve step as a passkey prompt for a no-op. A plan verb
+# may declare in its file the regex (jq's engine) its WHOLE plan matches
+# when it names no change; a match closes the request through its
+# `nothing-to-do` terminal with the plan on it, and the approve step is
+# never written. Every doubt asks instead: no declaration, a regex jq
+# cannot judge, or a request pinned to a version with no such terminal
+# renders the plan for the passkey exactly as before — a no-op signed
+# is a no-op run, while a request closed on a guess is a remedy nobody
+# looked at.
 #
 # WHAT THE PASSKEY SIGNS IS THE WHOLE REQUEST (security review,
 # 2026-09-24). The plan rides with the `verb`, `host` and `args` it was
@@ -729,13 +829,42 @@ ARGV
 # these do not, and execute compares the request against them before it
 # builds an argv.
 render_plan() {
-    rp_job=$1; rp_verb=$2; rp_args=$3; rp_approve=$4; rp_write=$5
+    rp_job=$1; rp_verb=$2; rp_args=$3; rp_approve=$4; rp_write=$5; rp_nothing=${6:-}
     rp_id=$(printf '%s' "$rp_job" | jq -r '.id')
     rp_short=$(printf '%s' "$rp_id" | cut -c1-8)
     rp_sid=$(printf '%s' "$rp_approve" | jq -r '.id')
     plan_outcome=failed
     run_plan_verb "$rp_id" "$rp_verb" "$rp_args"
     rp_why=""
+    if [ -z "$rv_why" ] && [ -n "$rp_nothing" ]; then
+        rp_none=$(jq -rn --rawfile p "$workdir/plan" --arg re "$rp_nothing" \
+            'if ($p | test($re)) then "yes" else "no" end' 2> "$workdir/nothing-err") || rp_none=error
+        case "$rp_none" in
+            yes)
+                close_nothing_to_do "$rp_job" "$rp_verb" "$rp_args" "$rp_write" "$rp_nothing"
+                case $? in
+                    0)
+                        echo "ops-runner: $rp_short — the plan $rp_verb rendered (plan-sha256 $rv_sha) names nothing to do; closed nothing-to-do, no passkey asked"
+                        plan_outcome=nothing
+                        return 0 ;;
+                    2)
+                        echo "ops-runner: $rp_short — the plan $rp_verb rendered names nothing to do, but the request has no nothing-to-do terminal (filed under an ops-request version from before it); rendering it for a passkey as before" >&2 ;;
+                    # A CLOSE THE SERVER DID NOT TAKE IS A DOUBT, AND A
+                    # DOUBT ASKS (backlog aa816dd4). The terminal's record
+                    # is the runner account's alone (`written_by`), so a
+                    # runner signing under another BOSS_OPS_ACTOR is
+                    # refused it on every pass; returning here left such a
+                    # request open forever with nobody asked. The plan
+                    # goes onto the approve step instead — a no-op signed
+                    # is a no-op run. The reason is already on stderr.
+                    *)
+                        echo "ops-runner: $rp_short — the plan $rp_verb rendered names nothing to do, but the request could not be closed that way (above); rendering it for a passkey" >&2 ;;
+                esac ;;
+            no) ;;
+            *)
+                echo "ops-runner: $rp_short — $rp_verb's nothing_to_do could not be judged ($(head -c 300 "$workdir/nothing-err" | tr '\n' ' ')); rendering the plan for a passkey" >&2 ;;
+        esac
+    fi
     if [ -n "$rv_why" ]; then
         rp_why="$rv_why — so there is nothing to sign"
     else
@@ -1016,7 +1145,7 @@ if [ "$n" -eq 0 ]; then
     exit 0
 fi
 
-answered=0; refused=0; skipped=0; failed=0; held=0; planned=0; waiting=0
+answered=0; refused=0; skipped=0; failed=0; held=0; planned=0; nothing=0; waiting=0
 i=0
 while [ "$i" -lt "$n" ]; do
     job=$(printf '%s' "$mine" | jq -c ".[$i]")
@@ -1112,9 +1241,11 @@ while [ "$i" -lt "$n" ]; do
             fi
             continue
         fi
-        render_plan "$job" "$(printf '%s' "$contract" | jq -r '.plan_verb')" "$args" "$approve" "$verb"
+        render_plan "$job" "$(printf '%s' "$contract" | jq -r '.plan_verb')" "$args" "$approve" "$verb" \
+            "$(printf '%s' "$contract" | jq -r '.nothing_to_do // empty | strings')"
         case "$plan_outcome" in
             planned) planned=$((planned + 1)) ;;
+            nothing) nothing=$((nothing + 1)) ;;
             refused) refused=$((refused + 1)) ;;
             *) failed=$((failed + 1)) ;;
         esac
@@ -1316,6 +1447,9 @@ while [ "$i" -lt "$n" ]; do
     outf="$workdir/out"
     disp=""; rc_str=""; script=""; dur_ms=""
     eff_line=""; eff_unproven=""; eff_unread=""
+    streamsf="$workdir/streams"
+    printf 'null\n' > "$streamsf"
+    streams_unread=""
     reason=$(printf '%s' "$decision" | jq -r '.refuse // empty')
     if [ -n "$reason" ]; then
         disp="refused"; rc_str=""
@@ -1477,10 +1611,30 @@ ARGV
         esac
         echo "ops-runner: running $verb on $short ($queued, timeout ${verb_timeout:-$OPS_TIMEOUT}s)"
         t0=$(date -u +%s%3N 2>/dev/null)
-        OPS_REQUEST_ID="$job_id" BOSS_ACTOR="${BOSS_ACTOR:-$ACTOR}" \
-            timeout "${verb_timeout:-$OPS_TIMEOUT}" "$@" > "$rawf" 2>&1 < /dev/null
-        rc=$?
-        t1=$(date -u +%s%3N 2>/dev/null)
+        if [ "$(printf '%s' "$decision" | jq -r '.capture // empty')" = separate-streams ]; then
+            OPS_REQUEST_ID="$job_id" BOSS_ACTOR="${BOSS_ACTOR:-$ACTOR}" \
+                timeout "${verb_timeout:-$OPS_TIMEOUT}" "$@" \
+                > "$workdir/stdout" 2> "$workdir/stderr" < /dev/null
+            rc=$?
+            t1=$(date -u +%s%3N 2>/dev/null)
+            # Opt-in diagnostic output retains both streams, stdout first;
+            # ordinary verbs keep their existing interleaved output below.
+            cat "$workdir/stdout" "$workdir/stderr" > "$rawf"
+            if stream_record "$workdir/stdout" > "$workdir/stdout-record" \
+                && stream_record "$workdir/stderr" > "$workdir/stderr-record" \
+                && jq -cn --slurpfile out "$workdir/stdout-record" \
+                    --slurpfile err "$workdir/stderr-record" '{stdout:$out[0],stderr:$err[0]}' > "$streamsf"; then
+                :
+            else
+                printf 'null\n' > "$streamsf"
+                streams_unread="Separate stream capture failed; diagnostic output and the verb exit are retained, but no structured result is proven"
+            fi
+        else
+            OPS_REQUEST_ID="$job_id" BOSS_ACTOR="${BOSS_ACTOR:-$ACTOR}" \
+                timeout "${verb_timeout:-$OPS_TIMEOUT}" "$@" > "$rawf" 2>&1 < /dev/null
+            rc=$?
+            t1=$(date -u +%s%3N 2>/dev/null)
+        fi
         dur_ms=""
         case ${t0:-empty}${t1:-empty} in
             *[!0-9]*) ;;
@@ -1574,11 +1728,12 @@ ARGV
     # key keeps whatever an earlier pass left, and one record must not
     # mix two passes' answers (the re-review of car 59a6ade9).
     payloadf="$workdir/payload"
-    jq -cn --rawfile out "$outf" \
+    jq -cn --rawfile out "$outf" --slurpfile streams "$streamsf" --arg su "$streams_unread" \
         --arg d "$disp" --arg rc "$rc_str" --arg h "$HOST_ID" --arg ms "${dur_ms:-}" \
         --arg ps "$plan_sha" --arg sa "$signed_at" --arg ap "$approved" --arg ca "$claimant" \
         --arg el "$eff_line" --arg eu "$eff_unproven" --arg er "$eff_unread" '
-        {disposition: $d, output: $out, runner_host: $h,
+        {disposition: $d, output: $out, runner_host: $h, streams:$streams[0],
+         streams_unread:(if $su == "" then null else $su end),
          exit_code: (if $rc == "" then null else $rc end),
          duration_ms: (if $ms == "" then null else ($ms | tonumber) end),
          reason: (if $d == "refused" then $out else null end),
@@ -1696,5 +1851,5 @@ ARGV
     fi
 done
 
-echo "ops-runner: $HOST_ID answered=$answered refused=$refused skipped=$skipped failed=$failed held=$held planned=$planned waiting=$waiting"
+echo "ops-runner: $HOST_ID answered=$answered refused=$refused skipped=$skipped failed=$failed held=$held planned=$planned nothing=$nothing waiting=$waiting"
 [ "$failed" -eq 0 ] || exit 1

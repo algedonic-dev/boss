@@ -62,6 +62,68 @@ const EFFECT_UNREAD: &[&str] = &["publish-github-pr"];
 /// is also checked against its own `FAILED — ` and `REFUSED — ` lines
 /// (see the test).
 const NOT_EFFECTS: &[(&str, &str)] = &[
+    // expand-instance-volume (backlog ebbb923f), at the head beside the
+    // drain-policy car's: the plan-still-holds line, the API server's
+    // acceptance of the patch (what a verb reading kubectl's exit code
+    // alone would call success), and the read-back's stall — the kubelet's
+    // half of an online resize not done.
+    (
+        "expand-instance-volume",
+        "expand-instance-volume: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — growing boss/pgdata-postgres-0 from 30Gi to 40Gi",
+    ),
+    (
+        "expand-instance-volume",
+        "expand-instance-volume: the API server accepted spec.resources.requests.storage=40Gi for boss/pgdata-postgres-0 — reading it back (up to 600s: status.capacity.storage, and Longhorn's spec.size)",
+    ),
+    (
+        "expand-instance-volume",
+        "expand-instance-volume: FAILED — the API server accepted spec.resources.requests.storage=40Gi for boss/pgdata-postgres-0, and after 601s it is NOT proven: status.capacity.storage 30Gi, spec.resources.requests.storage 40Gi, conditions FileSystemResizePending=True; Longhorn volume pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56 spec.size 42949672960, robustness healthy. The request stands — FileSystemResizePending is the kubelet's half not done yet; read it again with plan-an-instance-volume-expansion, whose refusal names a stalled expansion",
+    ),
+    // retire-ops-runner (backlog 98eb9349, design a79a8067), at the head
+    // for the reason the entry below gives: the plan-still-holds line,
+    // the stop itself (systemctl's exit, not a reading), the dry run's
+    // verdict (a plan verb's, never this write's), and each way the
+    // read-back refuses to vouch.
+    (
+        "retire-ops-runner",
+        "retire-ops-runner: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds",
+    ),
+    (
+        "retire-ops-runner",
+        "retire-ops-runner: DRY RUN — every bound passed; would stop+disable boss-ops-runner.timer on forge. Nothing was stopped.",
+    ),
+    (
+        "retire-ops-runner",
+        "retire-ops-runner: FAILED — disable --now returned success and boss-ops-runner.timer still answers is-enabled enabled, so it would start again at the next boot. The marker was removed; this verb will not try again.",
+    ),
+    (
+        "retire-ops-runner",
+        "retire-ops-runner: FAILED — disable --now returned success and boss-ops-runner.timer answers is-enabled disabled but is-active active, so the door is still open. The marker stands: the disable is this request's act, and the converge credits it if the timer stops.",
+    ),
+    (
+        "retire-ops-runner",
+        "retire-ops-runner: FAILED — disable --now exited 1, yet boss-ops-runner.timer reads off (is-enabled disabled, is-active inactive). The marker stands, so the converge credits the off timer to ops-request 5eed0000-1111-4222-8333-444455556666 (RETIRED by it), not to a hand; this run is recorded FAILED because its one act did not report success.",
+    ),
+    (
+        "retire-ops-runner",
+        "retire-ops-runner: CANNOT ANSWER — disable --now returned success but systemctl gave no reading of boss-ops-runner.timer afterwards (is-enabled: ; is-active: ), so it is not proven off. The marker stands: the converge's own reading settles it.",
+    ),
+    // set-longhorn-drain-policy (backlog 46584350), at the head so it
+    // does not share the tail line with the volume-replicas car: the
+    // plan-still-holds line, Longhorn's acceptance of the patch, and the
+    // read-back's refusal when the API never reports the value applied.
+    (
+        "set-longhorn-drain-policy",
+        "set-longhorn-drain-policy: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — setting node-drain-policy from block-if-contains-last-replica to allow-if-replica-is-stopped",
+    ),
+    (
+        "set-longhorn-drain-policy",
+        "set-longhorn-drain-policy: Longhorn accepted node-drain-policy=allow-if-replica-is-stopped — reading it back (up to 90s: the stored setting, and Longhorn's API applying it)",
+    ),
+    (
+        "set-longhorn-drain-policy",
+        "set-longhorn-drain-policy: FAILED — Longhorn accepted node-drain-policy=allow-if-replica-is-stopped, and after 91s it is NOT proven: settings.longhorn.io value allow-if-replica-is-stopped, Longhorn's API value allow-if-replica-is-stopped, applied false. The patch stands — read it again with check-longhorn-drain-policy",
+    ),
     (
         "reclaim-gcp-root",
         "reclaim-gcp-root: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds",
@@ -113,6 +175,20 @@ const NOT_EFFECTS: &[(&str, &str)] = &[
     (
         "github-set-branch-protection",
         "github-act: plan 0123456789abcdef still holds",
+    ),
+    (
+        "github-disable-actions",
+        "github-act: plan 0123456789abcdef still holds",
+    ),
+    (
+        "github-disable-actions",
+        "github-act: PUT /repos/algedonic-dev/boss-dr/actions/permissions answered 204",
+    ),
+    // A repository created and read back is not the whole act: its Actions
+    // must read back disabled too (backlog e727fcfd).
+    (
+        "github-create-repository",
+        "github-act: proven — GET /repos/algedonic-dev/boss-dr reads back as algedonic-dev/boss-dr, private true, fork false",
     ),
     (
         "reap-terminated-pods",
@@ -299,6 +375,157 @@ const NOT_EFFECTS: &[(&str, &str)] = &[
     (
         "mirror-base-images",
         "mirror-base-images: FAILED — pushed 10 image(s) to 10.20.0.15:3000/david, and 10 did not read back from the registry (each named above): 10.20.0.15:3000/david/bun:1.3-slim",
+    ),
+    // cordon-node / uncordon-node (backlog f0aaa72f): the line before the
+    // write, each way the read-back refuses to vouch, and the OTHER verb's
+    // effect — one script prints both, so neither may certify the other.
+    (
+        "cordon-node",
+        "cordon-node: w-1 is a talos-worker at 10.20.0.14 (the estate registry and the cluster agree); spec.unschedulable=false before the cordon",
+    ),
+    (
+        "cordon-node",
+        "cordon-node: FAILED — kubectl cordon w-1 answered, and spec.unschedulable reads back 'unset' — the node is NOT cordoned",
+    ),
+    (
+        "cordon-node",
+        "cordon-node: FAILED — CANNOT ANSWER — kubectl cordon w-1 answered, but the node could not be read back: connection refused",
+    ),
+    (
+        "cordon-node",
+        "uncordon-node: w-1 is schedulable — read back spec.unschedulable=unset (was true)",
+    ),
+    (
+        "uncordon-node",
+        "uncordon-node: w-1 is a talos-worker at 10.20.0.14 (the estate registry and the cluster agree); spec.unschedulable=true before the uncordon",
+    ),
+    (
+        "uncordon-node",
+        "uncordon-node: FAILED — kubectl uncordon w-1 answered, and spec.unschedulable reads back 'true' — the node is NOT schedulable",
+    ),
+    (
+        "uncordon-node",
+        "cordon-node: w-1 is cordoned — read back spec.unschedulable=true (was false)",
+    ),
+    // shutdown-node (backlog f0aaa72f): the plan-still-holds line before
+    // the shutdown, talosctl's acceptance (what a verb reading its exit
+    // code alone would call success), and the read-back's refusals.
+    (
+        "shutdown-node",
+        "shutdown-node: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — shutting down w-1 (10.20.0.14)",
+    ),
+    (
+        "shutdown-node",
+        "shutdown-node: talosctl accepted the shutdown of w-1 — reading it back (up to 720s: Kubernetes' Ready condition, and whether the Talos API still answers)",
+    ),
+    (
+        "shutdown-node",
+        "shutdown-node: FAILED — talosctl accepted the shutdown of w-1, and after 721s it is NOT proven down: Kubernetes Ready=True, Talos API answers. The drain may still be running, or the shutdown was never taken — read it again with talos-get w-1 machinestatus",
+    ),
+    (
+        "shutdown-node",
+        "shutdown-node: FAILED — talosctl accepted the shutdown of w-1, and after 721s it is NOT proven down: Kubernetes Ready=unread: connection refused, Talos API silent: error: rpc error: code = Unavailable",
+    ),
+    // node-converge (backlog 9d56c616): the plan-still-holds line before
+    // the apply, Talos's acceptance (what a verb reading talosctl's exit
+    // code alone would call success), and the read-back's refusal.
+    (
+        "node-converge",
+        "node-converge: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — applying infra/cluster/talos/patches/w-1.yaml at 0123456789abcdef0123456789abcdef01234567 to w-1 (10.20.0.14)",
+    ),
+    (
+        "node-converge",
+        "node-converge: Talos accepted the patch on w-1 — reading it back (up to 120s: the live machine config through check-declared.sh, then the Node Ready with its kubelet lease renewed at least 20s after the apply)",
+    ),
+    // Review 9cb9af67 finding 3: the config reads MATCH and the kubelet
+    // never came back — the line a config-only read-back would call done.
+    (
+        "node-converge",
+        "node-converge: FAILED — Talos accepted the patch on w-1, and after 121s it is NOT proven to carry its declaration: the machine config reads every declared entry MATCH, and the Node is NOT proven back: Ready=False, kubelet lease renewTime 2026-09-30T15:00:00.000000Z (it must be at least 20s after the apply). The patch stands — read it again with plan-a-node-converge w-1 0123456789abcdef0123456789abcdef01234567",
+    ),
+    (
+        "node-converge",
+        "node-converge: FAILED — Talos accepted the patch on w-1, and after 61s it is NOT proven to carry its declaration: check-declared.sh exit 1: ABSENT     machine.kubelet.extraConfig.imageGCHighThresholdPercent  declared, not live: 50;. The patch stands — read it again with plan-a-node-converge w-1 0123456789abcdef0123456789abcdef01234567",
+    ),
+    // Review be5ba8f7 finding 5: the Node was back at the first fresh
+    // lease and NotReady at the end of the bound.
+    (
+        "node-converge",
+        "node-converge: FAILED — Talos accepted the patch on w-1, and after 121s it is NOT proven to carry its declaration: the machine config reads every declared entry MATCH, and the Node was back and is NOT any more: Ready=False, kubelet lease renewTime 2026-09-30T15:00:40.000000Z. The patch stands — read it again with plan-a-node-converge w-1 0123456789abcdef0123456789abcdef01234567",
+    ),
+    // move-volume-replica (backlog ab39a34e), above set-volume-replicas'
+    // so neither shares the other's line: the plan-still-holds line, the
+    // raise Longhorn accepted, the new replica healthy before the old one
+    // goes, the delete, and the read-back's two refusals — the volume not
+    // yet free to grow, and a move not proven.
+    (
+        "move-volume-replica",
+        "move-volume-replica: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — moving replica pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-ae04deab of pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56: numberOfReplicas 4 -> 5",
+    ),
+    (
+        "move-volume-replica",
+        "move-volume-replica: Longhorn accepted spec.numberOfReplicas=5 for pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56 — waiting up to 1200s for a new replica healthy on a target disk (5d1c0a2e-7b44-4f0e-9a51-0c6e2b1d9f10)",
+    ),
+    (
+        "move-volume-replica",
+        "move-volume-replica: new replica pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-e0e0e0e1 is healthy on w-1 (disk 5d1c0a2e-7b44-4f0e-9a51-0c6e2b1d9f10) — 5 healthy on cp-1, cp-2, cp-3, w-1, w-2; lowering spec.numberOfReplicas to 4, then deleting pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-ae04deab",
+    ),
+    (
+        "move-volume-replica",
+        "move-volume-replica: deleted pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-ae04deab — reading it back (up to 180s: pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-ae04deab gone, 4 healthy replicas on 4 distinct nodes, every replica's disk with room for growth to 64424509440 bytes)",
+    ),
+    (
+        "move-volume-replica",
+        "move-volume-replica: FAILED — pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-ae04deab is gone and pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-e0e0e0e1 is healthy on w-1 (disk 5d1c0a2e-7b44-4f0e-9a51-0c6e2b1d9f10) — pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56 has 4 healthy replicas on 4 distinct nodes (cp-1, cp-2, cp-3, w-1), but NOT every replica's disk has room for growth to 64424509440 bytes: disk 9430cd68-91a7-41e9-9bfb-7bcb98bc8cb1 (default-disk-cp3 on cp-3), 1 replica(s) growing 32212254720 each: Scheduling space condition failed: ScheduledTotal = 386547056640 (Size 32212254720 + StorageScheduled 354334801920) is greater than ProvisionedLimit = 375809638400 (IsSchedulableToDisk). The move stands; that disk is the next to clear",
+    ),
+    // set-volume-replicas (backlog f5f182fc): the plan-still-holds line,
+    // Longhorn's acceptance of the patch (what a verb reading kubectl's
+    // exit code alone would call success), and the read-back's refusal.
+    (
+        "set-volume-replicas",
+        "set-volume-replicas: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — setting spec.numberOfReplicas of pvc-dd7b5ac3-884e-485f-8c73-92b87ce77091 from 1 to 2",
+    ),
+    (
+        "set-volume-replicas",
+        "set-volume-replicas: Longhorn accepted spec.numberOfReplicas=2 for pvc-dd7b5ac3-884e-485f-8c73-92b87ce77091 — reading it back (up to 1500s: the spec, and 2 healthy replicas on 2 distinct nodes)",
+    ),
+    (
+        "set-volume-replicas",
+        "set-volume-replicas: FAILED — Longhorn accepted spec.numberOfReplicas=2 for pvc-dd7b5ac3-884e-485f-8c73-92b87ce77091, and after 1501s it is NOT proven: spec.numberOfReplicas=2, robustness degraded, healthy on 1 distinct node(s) (w-1); not yet healthy: pvc-dd7b5ac3-884e-485f-8c73-92b87ce77091-r-5e6f on w-2; failed: none. The patch stands and Longhorn goes on rebuilding — read it again with plan-a-volume-replica-change, whose refusal names the replicas",
+    ),
+    // retire-volume-replica (backlog 5ef9d2d9), below set-volume-replicas'
+    // so it shares no line with move-volume-replica's entries above them:
+    // the plan-still-holds line, the lower Longhorn accepted, the named
+    // replica removed by something else, the delete, the refusal when
+    // another went, the read-back's room refusal, and one that did not
+    // settle.
+    (
+        "retire-volume-replica",
+        "retire-volume-replica: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — retiring replica pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-ae04deab of pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56: numberOfReplicas 4 -> 3",
+    ),
+    (
+        "retire-volume-replica",
+        "retire-volume-replica: Longhorn accepted spec.numberOfReplicas=3 for pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56 — watching 30s for a replica removed by anything but this run before deleting pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-ae04deab",
+    ),
+    (
+        "retire-volume-replica",
+        "retire-volume-replica: something other than this run removed (or is removing) pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-ae04deab on the lowered count — nothing to delete",
+    ),
+    (
+        "retire-volume-replica",
+        "retire-volume-replica: FAILED — pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-ae04deab is gone and pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56 has 3 healthy replicas on 3 distinct nodes (cp-1, cp-2, cp-3), but NOT every remaining replica's disk has room for the next GiB of growth now: disk 9430cd68-91a7-41e9-9bfb-7bcb98bc8cb1 (default-disk-cp3 on cp-3): ledger room 268435456000 bytes; live free space: storageAvailable 1073741824 is not above the floor 134217728000. The retirement stands; the growth it was for does not fit yet",
+    ),
+    (
+        "retire-volume-replica",
+        "retire-volume-replica: deleted pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-ae04deab — reading it back (up to 180s: pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-ae04deab gone, 3 healthy replicas on 3 distinct nodes)",
+    ),
+    (
+        "retire-volume-replica",
+        "retire-volume-replica: FAILED — after spec.numberOfReplicas was lowered to 3, something other than this run removed (or is removing) pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-03f4dac5 — not pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-ae04deab — so pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-ae04deab is NOT deleted, and nothing more is: a delete now would leave 2. pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56 holds 3 healthy replica(s) on cp-1, cp-2, w-2 (pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-1269eb6e, pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-7c1934ba, pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-ae04deab). Read it again with plan-a-volume-replica-retirement",
+    ),
+    (
+        "retire-volume-replica",
+        "retire-volume-replica: FAILED — the retirement of pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-ae04deab is NOT proven after 181s: pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-ae04deab gone, spec.numberOfReplicas 3, robustness degraded, healthy on cp-1, cp-2, cp-3, replicas pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-03f4dac5, pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-1269eb6e, pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-7c1934ba (planned to remain: pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-03f4dac5, pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-1269eb6e, pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-7c1934ba); not healthy: none. Read the volume again with plan-a-volume-replica-retirement",
     ),
 ];
 

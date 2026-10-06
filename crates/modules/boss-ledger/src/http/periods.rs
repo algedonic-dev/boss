@@ -4,7 +4,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use boss_policy_client::{Action, CurrentUser, Resource};
+use boss_policy_client::{CurrentUser, Pair, controls};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -42,16 +42,11 @@ pub(super) struct LockBody {
 async fn authorize_period_write(
     state: &LedgerApiState,
     user: &boss_policy_client::User,
-    action: Action,
+    control: Pair,
 ) -> Result<(), Response> {
-    boss_policy_client::writes::require_registry_write(
-        state.policy.as_ref(),
-        user,
-        action,
-        Resource::ledger_period(),
-    )
-    .await
-    .map(|_| ())
+    boss_policy_client::writes::require_registry_write(state.policy.as_ref(), user, control)
+        .await
+        .map(|_| ())
 }
 
 /// Lock is Close on `ledger-period` ([`authorize_period_write`]).
@@ -61,7 +56,8 @@ pub(super) async fn lock_handler(
     Path(id): Path<Uuid>,
     body: Option<Json<LockBody>>,
 ) -> Response {
-    if let Err(refused) = authorize_period_write(&state, &user, Action::Close).await {
+    if let Err(refused) = authorize_period_write(&state, &user, controls::CLOSE_LEDGER_PERIOD).await
+    {
         return refused;
     }
     let said = body.and_then(|b| b.0.locked_by);
@@ -88,7 +84,9 @@ pub(super) async fn unlock_handler(
     CurrentUser(user): CurrentUser,
     Path(id): Path<Uuid>,
 ) -> Response {
-    if let Err(refused) = authorize_period_write(&state, &user, Action::Update).await {
+    if let Err(refused) =
+        authorize_period_write(&state, &user, controls::UPDATE_LEDGER_PERIOD).await
+    {
         return refused;
     }
     let stamp = super::event_stamp(&state, &user).await;
@@ -129,7 +127,7 @@ impl axum::extract::FromRequestParts<Arc<LedgerApiState>> for PeriodCreate {
         state: &Arc<LedgerApiState>,
     ) -> Result<Self, Response> {
         let CurrentUser(user) = CurrentUser::from_request_parts(parts, state).await?;
-        authorize_period_write(state, &user, Action::Create).await?;
+        authorize_period_write(state, &user, controls::CREATE_LEDGER_PERIOD).await?;
         Ok(Self(user))
     }
 }
@@ -288,7 +286,8 @@ pub(super) async fn close_period_handler(
     Path(id): Path<Uuid>,
     body: Option<Json<CloseBody>>,
 ) -> Response {
-    if let Err(refused) = authorize_period_write(&state, &user, Action::Close).await {
+    if let Err(refused) = authorize_period_write(&state, &user, controls::CLOSE_LEDGER_PERIOD).await
+    {
         return refused;
     }
     let body = body.map(|b| b.0).unwrap_or(CloseBody {

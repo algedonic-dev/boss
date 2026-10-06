@@ -36,20 +36,16 @@ fn service_tech(id: &str) -> User {
 fn job_owned_by(id: &str, owner: &str) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
-        kind: "field-service".into(),
-        workflow_version: 1,
-        subject: Subject::new("asset", "SYS-1"),
-        title: "Repair".into(),
-        owner_id: owner.to_string(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::Value::Null,
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "field-service",
+            Subject::new("asset", "SYS-1"),
+            "Repair",
+            owner.to_string(),
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+        )
     }
 }
 
@@ -377,8 +373,14 @@ async fn post_sign_off(
     .unwrap()
 }
 
+/// PUT the step as a whole row, WITHOUT its `metadata`: the step PUT
+/// refuses any body carrying metadata since e39a9d2a (Stage 2's last
+/// car: the PUT writes no metadata), and a whole-row write-back is not
+/// a metadata write. Metadata goes through [`patch_step_metadata`].
 async fn put_step(app: Router, user: &User, step: &Step) -> axum::http::Response<Body> {
-    let body = serde_json::to_string(step).unwrap();
+    let mut row = serde_json::to_value(step).unwrap();
+    row.as_object_mut().unwrap().remove("metadata");
+    let body = row.to_string();
     app.oneshot(
         Request::builder()
             .method("PUT")
@@ -386,6 +388,30 @@ async fn put_step(app: Router, user: &User, step: &Step) -> axum::http::Response
             .header("content-type", "application/json")
             .header("x-boss-user", user_header(user))
             .body(Body::from(body))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+/// The step merge door, `PATCH .../steps/{id}/metadata` — the one
+/// writer of step metadata (e39a9d2a). Sends only the keys given.
+async fn patch_step_metadata(
+    app: Router,
+    user: &User,
+    step: &Step,
+    keys: serde_json::Value,
+) -> axum::http::Response<Body> {
+    app.oneshot(
+        Request::builder()
+            .method("PATCH")
+            .uri(format!(
+                "/api/jobs/{}/steps/{}/metadata",
+                step.job_id, step.id,
+            ))
+            .header("content-type", "application/json")
+            .header("x-boss-user", user_header(user))
+            .body(Body::from(keys.to_string()))
             .unwrap(),
     )
     .await
@@ -470,6 +496,15 @@ async fn stamp_then_complete_succeeds_and_unstamped_complete_409s() {
         StatusCode::CONFLICT,
         "completion before stamping must be refused"
     );
+    // By the sign-off gate, naming the role — not by the PUT's
+    // metadata refusal (e39a9d2a), which a whole-row body carrying
+    // `metadata` would hit first and pass this assertion for nothing.
+    let refusal = resp.into_body().collect().await.unwrap().to_bytes();
+    let refusal = std::str::from_utf8(&refusal).unwrap();
+    assert!(
+        refusal.contains("qa-lead") && !refusal.contains("merge_door"),
+        "the refusal must be the missing sign-off, got: {refusal}"
+    );
 
     // Stamp, then complete.
     let resp = post_sign_off(app.clone(), &qa, &step, "qa-lead").await;
@@ -523,11 +558,17 @@ async fn editing_a_stamped_step_invalidates_the_stamp() {
     let mut stamped: Step = serde_json::from_value(body).unwrap();
 
     // Change the completion-relevant shape, then try to complete:
-    // the stamp attested the old shape, so completion must 409.
-    stamped.metadata = serde_json::json!({
-        "authority_role": "qa-lead",
-        "edited_after_stamp": true,
-    });
+    // the stamp attested the old shape, so completion must 409. The
+    // edit goes through the merge door (the PUT writes no metadata since
+    // e39a9d2a), and the completion is a status-only PUT after it.
+    let resp = patch_step_metadata(
+        app.clone(),
+        &qa,
+        &stamped,
+        serde_json::json!({ "edited_after_stamp": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "the edit lands");
     stamped.status = StepStatus::Completed;
     let resp = put_step(app, &qa, &stamped).await;
     assert_eq!(

@@ -39,11 +39,29 @@
 #      `result=failed`, `exit_status=<rc>` (the key the systemd leg uses,
 #      so both legs read alike), and `output=` — the check's own words:
 #      every verdict-shaped line wherever it sits, head and tail of the
-#      rest with the omitted count named.
+#      rest with the omitted count named. A chore whose manifest declares
+#      BOSS_CHORE_FULL_OUTPUT=1 sends the whole capture through the step's
+#      file door instead (break-glass refusal evidence, d40eddc0).
 #      BEST-EFFORT too: a lost HTTP call must not report a good run as
 #      failed, nor spend backoffLimit re-running a whole check for it.
 #   4. exits with the CHECK's status, so the Kubernetes Job shows Failed
 #      when the check failed — whatever the packet could be told.
+#
+# NOT YET IS NOT FAILED — FOR A CHORE THAT SAYS SO (backlog 17a7bd18,
+# 2026-09-30; made opt-in by backlog e4a9a9b3, review 0d3019f0). A check
+# that exits 75 — EX_TEMPFAIL, the estate's not-yet, the code a recorded
+# probe and the sweep judge already read that way — is recorded
+# `result=not-yet` and this exits 0, but ONLY when the chore's manifest
+# sets BOSS_CHORE_NOT_YET_ON_75=1: the run measured, and what it
+# measured is a state that only time or another car changes. Every
+# other chore's 75 is `failed` like any nonzero exit. Mapped for every
+# chore, as first landed, a helper's EX_TEMPFAIL leaking through `set
+# -e` in a check that means no such thing would close as a quiet wait.
+# A kind that opts in declares the `not-yet` ending in its protocol (its
+# `failed` excludes it by name), held equal by
+# a_chore_records_ok_and_failed.rs. None opts in today: the break-glass
+# deposit, the first, lost its wait when the image-only policy began to
+# deny, because a binding that stops denying is a refusal to report.
 #
 # The `--` is load-bearing: the title carries spaces, and everything
 # after the separator is one argv handed to exec, not re-parsed. A
@@ -154,12 +172,24 @@ excerpt=$(awk -v re="$VERDICT_RE" -v head="$HEAD_LINES" -v tail="$TAIL_LINES" \
 # as the lines it is.
 [ -z "$excerpt" ] || excerpt="$excerpt"$'\n'
 
-if [ "$check_rc" -eq 0 ]; then result=ok; else result=failed; fi
+result=failed
+if [ "$check_rc" -eq 0 ]; then
+    result=ok
+elif [ "$check_rc" -eq 75 ] && [ "${BOSS_CHORE_NOT_YET_ON_75:-}" = 1 ]; then
+    result=not-yet
+fi
 rc=0
-"$STEP" "$KIND" run "result=$result" "exit_status=$check_rc" "output=$excerpt" || rc=$?
+if [ "${BOSS_CHORE_FULL_OUTPUT:-}" = 1 ]; then
+    # Only the path rides argv. The step reads the bytes and posts a JSON
+    # file; a refusal longer than Linux's 128 KiB argv bound is still data.
+    BOSS_STEP_OUTPUT_FILE="$capture" "$STEP" "$KIND" run "result=$result" "exit_status=$check_rc" || rc=$?
+else
+    "$STEP" "$KIND" run "result=$result" "exit_status=$check_rc" "output=$excerpt" || rc=$?
+fi
 if [ "$rc" -ne 0 ]; then
     echo "$me: the packet for $KIND did not record result=$result (boss-step.sh exit $rc) — the check exited $check_rc and that is what this Job reports; only this run's visibility is lost" >&2
 fi
 
-# 4. The check's own status.
+# 4. The check's own status — a not-yet is a wait, not a failed Job.
+[ "$result" != not-yet ] || exit 0
 exit "$check_rc"

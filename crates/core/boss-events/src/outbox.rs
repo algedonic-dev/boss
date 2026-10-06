@@ -41,6 +41,11 @@
 //!
 //! Consumers tolerate the resulting at-least-once publishes — that is
 //! the standing NAK-redelivery contract.
+//!
+//! `prune_delivered_outbox` is the outbox's retention: a delivered row
+//! older than the window, whose fact `audit_log` holds, is deleted in
+//! bounded batches, each recorded by an `events.outbox.pruned` fact
+//! (backlog eec0c1f3). The relay runs it hourly.
 
 use std::sync::Arc;
 
@@ -192,8 +197,8 @@ const UNDRAINED_ROWS: &str = "FROM event_outbox o \
 /// own locked transaction — hence generic over the executor.
 ///
 /// Scoped to PENDING rows, so it walks the `event_outbox_pending`
-/// partial index rather than every row ever staged (delivered rows are
-/// retained). Same answer as the unscoped anti-join: the relay commits
+/// partial index rather than every row staged (delivered rows are
+/// retained for [`DEFAULT_OUTBOX_RETENTION`]). Same answer as the unscoped anti-join: the relay commits
 /// a row's audit INSERT before it stamps `delivered_at` or
 /// `dead_lettered_at`, so a row with either stamp already has its
 /// audit_log row. That matters most to the rebuild, which counts while
@@ -253,26 +258,36 @@ pub struct RelayLag {
     pub p50_seconds: Option<f64>,
     pub p95_seconds: Option<f64>,
     pub max_seconds: Option<f64>,
+    /// Hours the sample ACTUALLY spans: from the oldest delivery in it to
+    /// the newest delivery in the outbox. Retention deletes delivered
+    /// rows past its window (a week by default, backlog eec0c1f3), so a
+    /// `window_hours` wider than that answers no older sample, and this
+    /// is the window measured — read it, not `window_hours`, as the
+    /// sample's reach (review afdc2d5d, N2). `None` when nothing was
+    /// delivered in the window.
+    pub covered_hours: Option<f64>,
 }
 
 /// Measure [`RelayLag`]. `delivered_at` carries no index, so this reads
 /// the table; it answers an operator on demand, never a hot path.
 pub async fn relay_lag(pool: &PgPool, window_hours: i32) -> Result<RelayLag, String> {
-    let (delivered, p50_seconds, p95_seconds, max_seconds): (
+    let (delivered, p50_seconds, p95_seconds, max_seconds, covered_hours): (
         i64,
         Option<f64>,
         Option<f64>,
         Option<f64>,
+        Option<f64>,
     ) = sqlx::query_as(
-        "WITH lag AS ( \
-             SELECT EXTRACT(EPOCH FROM delivered_at - created_at)::FLOAT8 AS s \
+        "WITH head AS (SELECT MAX(delivered_at) AS at FROM event_outbox), \
+              lag AS ( \
+             SELECT EXTRACT(EPOCH FROM delivered_at - created_at)::FLOAT8 AS s, delivered_at \
              FROM event_outbox \
-             WHERE delivered_at >= (SELECT MAX(delivered_at) FROM event_outbox) \
-                                   - make_interval(hours => $1)) \
+             WHERE delivered_at >= (SELECT at FROM head) - make_interval(hours => $1)) \
          SELECT COUNT(*)::BIGINT, \
                 percentile_cont(0.5) WITHIN GROUP (ORDER BY s), \
                 percentile_cont(0.95) WITHIN GROUP (ORDER BY s), \
-                MAX(s) \
+                MAX(s), \
+                (EXTRACT(EPOCH FROM (SELECT at FROM head) - MIN(delivered_at)) / 3600)::FLOAT8 \
          FROM lag",
     )
     .bind(window_hours)
@@ -285,6 +300,7 @@ pub async fn relay_lag(pool: &PgPool, window_hours: i32) -> Result<RelayLag, Str
         p50_seconds,
         p95_seconds,
         max_seconds,
+        covered_hours,
     })
 }
 
@@ -713,7 +729,11 @@ fn act_payload(letter: &DeadLetter) -> serde_json::Value {
 }
 
 /// How many rows after `outbox_id` had already been delivered — the
-/// events a redelivered row now arrives behind.
+/// events a redelivered row now arrives behind. Counted from the rows
+/// the outbox still holds, so for a dead letter older than the
+/// retention window it is a LOWER bound: delivered rows past the window
+/// have been deleted (backlog eec0c1f3), each recorded by an
+/// `events.outbox.pruned` fact.
 async fn overtaken_by(
     tx: &mut Transaction<'_, Postgres>,
     outbox_id: i64,
@@ -827,6 +847,168 @@ pub async fn resolve_dead_letter(
         .map_err(DeadLetterError::Storage)?;
     tx.commit().await.map_err(storage)?;
     Ok(letter)
+}
+
+/// The fact one retention batch stages, in the same transaction as the
+/// rows it deleted (backlog eec0c1f3).
+pub const PRUNED_KIND: &str = "events.outbox.pruned";
+
+/// How long a DELIVERED outbox row is kept before retention deletes it:
+/// seven days. The relay delivers in well under a minute (p95 0.63 s,
+/// max 39 s over 30 days, measured 2026-10-01), so a week is a wide
+/// margin for reading a recent delivery off the outbox — `relay_lag`'s
+/// windows, a dead letter's neighbours — and the copy holds nothing
+/// `audit_log` does not.
+pub const DEFAULT_OUTBOX_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 3600);
+
+/// Rows one retention batch deletes, in one short transaction.
+pub const DEFAULT_PRUNE_BATCH: i64 = 5_000;
+
+/// Rows one retention pass deletes at most. Bounds the WAL a single
+/// pass writes on a volume that has already filled once: the first
+/// pass on the live outbox owed ~455k rows (measured 2026-10-01), so it
+/// is worked off over a few hourly passes rather than in one burst,
+/// while a steady hour delivers ~4k rows — far under the cap.
+pub const DEFAULT_PRUNE_MAX_ROWS: u64 = 100_000;
+
+/// What one [`prune_delivered_outbox`] pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct PruneStats {
+    /// Outbox rows deleted, over every batch of the pass.
+    pub deleted: u64,
+    /// Batches that deleted at least one row — one fact each.
+    pub batches: u64,
+}
+
+/// Retention for the outbox: delete DELIVERED rows older than
+/// `retention`, in batches of `batch`, at most `max_rows` per pass
+/// (backlog eec0c1f3, incident d3c0a67c).
+///
+/// WHY. Nothing deleted an outbox row: the relay stamps `delivered_at`
+/// and the row stayed, so every event was stored twice for good. On
+/// 2026-10-01, the day the SoR's Postgres volume filled, the outbox
+/// held 1,030,520 delivered rows — exactly `audit_log`'s count. A
+/// delivered row's job is done: its fact is in `audit_log`, the system
+/// of record, and on the bus.
+///
+/// WHAT IS NEVER DELETED. A row is deleted only when all three hold:
+/// - `delivered_at` is set — a pending row is still owed a move, and a
+///   dead letter is never stamped delivered (it keeps its payload for
+///   `boss events redeliver`), so neither is ever touched;
+/// - `delivered_at` is older than `retention`, measured back from the
+///   pass's record stamp — wall time, like the database `NOW()` that
+///   stamped delivery; the two clocks agree to seconds, against a
+///   window of days;
+/// - `audit_log` holds the same FACT: a row with its `event_id` AND its
+///   `timestamp`, `source`, `kind` and `payload`, the five columns the
+///   relay copies verbatim. The relay commits the audit row before it
+///   stamps delivery, so this always holds for a relayed row; it is
+///   checked anyway, because the deletion is only safe when the system
+///   of record is PROVEN to hold the fact, not assumed to. The id alone
+///   is not that proof (review afdc2d5d, N1): the relay's audit insert
+///   skips an id audit_log already holds, so a second, different event
+///   staged under a reused id after the first copy was pruned would be
+///   stamped delivered with no audit row of its own — and deleted, had
+///   the guard matched on the id. Unreachable while every id is a fresh
+///   v4; the guard does not lean on that.
+///
+/// HOW. Each batch is one short transaction: `DELETE … RETURNING` on at
+/// most `batch` rows chosen in id order with `FOR UPDATE SKIP LOCKED`
+/// (row locks only — no table lock, no rewrite; a row another session
+/// holds is left for the next pass), and the batch's
+/// [`PRUNED_KIND`] fact staged on the outbox in the same transaction,
+/// so a deletion and its record commit together or not at all. The
+/// walk is keyset (`id > last deleted`) and bounded above by the first
+/// row STAGED inside the window: a row staged after the cutoff cannot
+/// have been delivered before it, so the scan never reads the retained
+/// week. That bound is by staging order, which matches id order only to
+/// within a transaction's length, so a row at the edge can wait one
+/// more pass; it is never deleted early.
+///
+/// Postgres reuses the space the deleted rows held for new outbox rows
+/// once (auto)vacuum has passed; it does not hand it back to the
+/// filesystem — only `VACUUM FULL` (a table rewrite under an exclusive
+/// lock) shrinks the file.
+pub async fn prune_delivered_outbox(
+    pool: &PgPool,
+    retention: std::time::Duration,
+    batch: i64,
+    max_rows: u64,
+) -> Result<PruneStats, String> {
+    // One wall instant for the whole pass, minted by the record stamp
+    // (the sanctioned wall source), so every batch's fact names the
+    // same cutoff and carries the instant it was judged at.
+    let stamp = EventStamp::new("events", ActorId::automation("event-relay"));
+    let window = chrono::Duration::from_std(retention)
+        .map_err(|e| format!("outbox retention {retention:?} out of range: {e}"))?;
+    let cutoff: DateTime<Utc> = stamp.timestamp - window;
+    // The first row staged inside the window — the walk's upper bound.
+    // None: nothing staged since the cutoff, so the walk has no bound.
+    let upper: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM event_outbox WHERE created_at >= $1 ORDER BY id LIMIT 1",
+    )
+    .bind(cutoff)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let upper = upper.unwrap_or(i64::MAX);
+
+    let mut stats = PruneStats::default();
+    let mut after: i64 = 0;
+    while stats.deleted < max_rows {
+        let limit = batch.min(i64::try_from(max_rows - stats.deleted).unwrap_or(i64::MAX));
+        let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "WITH doomed AS ( \
+                 SELECT o.id FROM event_outbox o \
+                  WHERE o.id > $1 AND o.id < $2 \
+                    AND o.delivered_at IS NOT NULL AND o.delivered_at < $3 \
+                    AND EXISTS (SELECT 1 FROM audit_log a \
+                                 WHERE a.event_id = o.event_id \
+                                   AND a.timestamp = o.timestamp \
+                                   AND a.source = o.source \
+                                   AND a.kind = o.kind \
+                                   AND a.payload = o.payload) \
+                  ORDER BY o.id \
+                  LIMIT $4 \
+                  FOR UPDATE SKIP LOCKED) \
+             DELETE FROM event_outbox o USING doomed d WHERE o.id = d.id \
+             RETURNING o.id",
+        )
+        .bind(after)
+        .bind(upper)
+        .bind(cutoff)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        let (Some(&first), Some(&last)) = (ids.iter().min(), ids.iter().max()) else {
+            // Nothing left below the bound; drop the empty transaction.
+            break;
+        };
+        let deleted = ids.len() as u64;
+        let fact = stamp.event(
+            PRUNED_KIND,
+            serde_json::json!({
+                "deleted": deleted,
+                "first_outbox_id": first,
+                "last_outbox_id": last,
+                "delivered_before": cutoff.to_rfc3339(),
+                "retention_hours": retention.as_secs() / 3600,
+            }),
+        );
+        record_event_in_tx(&mut tx, &fact).await?;
+        tx.commit().await.map_err(|e| e.to_string())?;
+        stats.deleted += deleted;
+        stats.batches += 1;
+        after = last;
+        if (ids.len() as i64) < limit {
+            // A short batch reached the bound: the pass is done.
+            break;
+        }
+    }
+    Ok(stats)
 }
 
 type OutboxRow = (i64, Uuid, DateTime<Utc>, String, String, serde_json::Value);
@@ -1013,6 +1195,13 @@ pub struct PgOutboxRecorder {
 impl PgOutboxRecorder {
     pub fn new(pool: sqlx::PgPool) -> Self {
         Self { pool }
+    }
+
+    /// This pool's outbox as the port, the shape every service binary
+    /// hands its machine gate (`boss_core::machine_gate::mount`), so the
+    /// gate's would-refuse facts reach the audit log (design 21946380).
+    pub fn shared(pool: &sqlx::PgPool) -> Arc<dyn boss_core::port::EventRecorder> {
+        Arc::new(Self::new(pool.clone()))
     }
 }
 

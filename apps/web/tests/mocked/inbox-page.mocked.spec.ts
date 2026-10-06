@@ -20,8 +20,10 @@
 // the composer ✕, Send and Cancel; per row Mark read (unread rows only)
 // and Archive; the bulk bar's Mark all read and Archive selected; 1
 // search input; 1 "Select all shown" checkbox and 1 checkbox per row;
-// 1 form (To, Subject, Message). TWO reads, GET
-// /api/messages/inbox/{viewer} and GET /api/people; THREE writes, POST
+// 1 form (To, Subject, Message); and, when a view holds more than one
+// page, the pager's Previous and Next. TWO reads, GET
+// /api/messages/inbox/{viewer}?… (one page of the view shown) and GET
+// /api/people/names; THREE writes, POST
 // /api/messages/{id}/read, POST /api/messages/{id}/archive and POST
 // /api/messages/send.
 //
@@ -31,13 +33,15 @@
 // item. They are meant to be edited by the car that fixes it, so the
 // fix shows up here as a changed expectation instead of a silently
 // passing one:
-//   gap 3  74da899d  the inbox read is unbounded: no limit, no paging,
-//                    every row rendered in one list
-//   gap 6  7d1c11a3  a failed roster read empties the To list and
-//                    renders senders as raw ids, and says nothing
-// Answered, and pinned as answered: gaps 2, 4, 5, 8 (above) and gap 7
+//   gap 6  7d1c11a3  scoped names read, explicit roster failure and
+//                    recipient retry preserve the draft — FIXED
+// Answered, and pinned as answered: gaps 2, 4, 5, 8 (above), gap 7
 // (fd7f4ab8) — the failure line is pinned here on the catalogued
-// path, every way a read can fail. Gap 1 (0b2bac00) landed in the
+// path, every way a read can fail — and gap 3 (74da899d): the read was
+// every row, unpaged, filtered in the browser; each filter is now the
+// server's narrowing, read one page at a time, with a pager that says
+// which rows of how many. The backend below answers as the store does
+// (`inboxPage`, _smokeMocks.ts). Gap 1 (0b2bac00) landed in the
 // messages domain; gaps 9 (efd5a07d) and 10 (9c453257) are the notify
 // rule's and the machine door's, not controls this page renders.
 //
@@ -53,7 +57,7 @@
 
 import { expect, test, type Page, type Request, type Route } from './_test';
 import { mountPage, settledReads } from './_helpers';
-import { installApiFloor } from './_smokeMocks';
+import { inboxPage, installApiFloor } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
 import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
 import { parseRoute } from '../../src/router';
@@ -121,7 +125,7 @@ const SIGNAL = msg({
 const INBOX: ReadonlyArray<Msg> = [STEP, JOB, READ_SIGNAL, READ_DIRECT, SIGNAL];
 
 const INBOX_READ = /\/api\/messages\/inbox\/[^/?]+(\?.*)?$/;
-const ROSTER_READ = /\/api\/people$/;
+const ROSTER_READ = /\/api\/people\/names$/;
 const SEND = /\/api\/messages\/send$/;
 const ROW_WRITE = /\/api\/messages\/([^/]+)\/(read|archive)$/;
 
@@ -155,16 +159,16 @@ async function install(page: Page, opts: Options = {}): Promise<Backend> {
     setInterval(() => document.querySelector('bun-hmr')?.remove(), 200);
   });
   await installApiFloor(page);
-  await page.route(ROSTER_READ, (r) =>
-    typeof opts.roster === 'function'
-      ? (opts.roster as (r: Route) => Promise<void>)(r)
-      : json(r, opts.roster ?? ROSTER));
   // The session's read: the viewer's own people row, by id.
   await page.route(/\/api\/people\/[^/]+$/, (r) => {
     const id = decodeURIComponent(new URL(r.request().url()).pathname.split('/').pop() ?? '');
     const row = ROSTER.find((e) => e.id === id);
     return row ? json(r, row) : json(r, `no employee with ID ${id}`, 404);
   });
+  await page.route(ROSTER_READ, (r) =>
+    typeof opts.roster === 'function'
+      ? (opts.roster as (r: Route) => Promise<void>)(r)
+      : json(r, opts.roster ?? ROSTER.map(({ id, name, role }) => ({ id, name, role }))));
   await page.route(/\/api\/session$/, (r) =>
     json(r, opts.session ?? { username: 'david', employee_id: DAVID.id, role: 'platform-admin' }));
   await page.route(/\/api\/classes(\?|$)/, (r) => json(r, ROLE_CLASSES));
@@ -174,7 +178,7 @@ async function install(page: Page, opts: Options = {}): Promise<Backend> {
   await page.route(/\/api\/jobs\/job-\d+(\/.*)?$/, (r) => json(r, 'not found', 404));
   await page.route(INBOX_READ, (r) => {
     backend.inboxReads.push(r.request().url());
-    return typeof opts.inbox === 'function' ? opts.inbox(r) : json(r, rows);
+    return typeof opts.inbox === 'function' ? opts.inbox(r) : json(r, inboxPage(rows, r.request().url()));
   });
   await page.route(ROW_WRITE, (r) => {
     const [, id, verb] = ROW_WRITE.exec(new URL(r.request().url()).pathname) ?? [];
@@ -201,7 +205,7 @@ function watch(page: Page): { roster: number; writes: Request[] } {
       if (!SHELL_WRITES.has(url.pathname)) seen.writes.push(req);
       return;
     }
-    if (url.pathname === '/api/people') seen.roster += 1;
+    if (url.pathname === '/api/people/names') seen.roster += 1;
   });
   return seen;
 }
@@ -287,11 +291,16 @@ test.describe('/ux/inbox — the inbox, read', () => {
 
     // One read of the roster — the page's. The shell's session used to
     // read it too, to resolve the viewer, and now reads only the viewer's
-    // own row (backlog b4f68a65). And one of the inbox. Gap 3
-    // (74da899d): the inbox read asks for everything, no limit, no page.
+    // own row (backlog b4f68a65). And one of the inbox per view shown,
+    // each a bounded page the server narrowed (gap 3, 74da899d): it was
+    // one read of everything, no limit, no page, filtered here.
     expect(await settledReads(page, () => seen.roster, 1)).toBe(1);
-    expect(backend.inboxReads.map((u) => new URL(u).pathname + new URL(u).search))
-      .toEqual(['/api/messages/inbox/emp-001']);
+    expect(backend.inboxReads.map((u) => new URL(u).pathname + new URL(u).search)).toEqual([
+      '/api/messages/inbox/emp-001?kind=direct&unread=true&limit=100',
+      '/api/messages/inbox/emp-001?limit=100',
+    ]);
+    // Five rows fit one page: no pager.
+    await expect(page.locator('nav.inbox-pager')).toHaveCount(0);
     expect(seen.writes).toHaveLength(0);
   });
 
@@ -321,6 +330,8 @@ test.describe('/ux/inbox — the inbox, read', () => {
     const seen = watch(page);
     const backend = await open(page);
     await filter(page, 'All (5)').click();
+    // The view's own read has landed before the search starts.
+    await expect(subjects(page)).toHaveCount(5);
     const before = backend.inboxReads.length;
 
     const search = searchbox(page);
@@ -349,22 +360,64 @@ test.describe('/ux/inbox — the inbox, read', () => {
     await search.fill('');
     await expect(subjects(page)).toHaveText(['Review the design', 'Approve the payout']);
 
-    // Client-side only.
-    expect(backend.inboxReads).toHaveLength(before);
+    // The search reads nothing; the one read is the view the filter
+    // asked for, which the server narrows (74da899d).
+    expect(backend.inboxReads).toHaveLength(before + 1);
     expect(seen.writes).toHaveLength(0);
   });
 
-  test('gap 3 (74da899d): every row the read returns is rendered, in one list', async ({ page }) => {
+  test('gap 3 (74da899d), answered: a view is read a page at a time, and the pager says which rows of how many', async ({ page }) => {
     const many: Msg[] = Array.from({ length: 120 }, (_, i) => msg({
       id: `msg-${i}`, sender_id: 'system', kind: 'signal', subject: `Signal ${i}`, body: '',
       sent_at: ago(i), read_at: ago(0), entity_ref: null,
     }));
-    await install(page, { inbox: many });
+    const backend = await install(page, { inbox: many });
     await mountPage(page, PATH, { titleMatch: /Nothing is waiting on you/ });
 
+    // The header counts the whole inbox, not the page.
     await expectHeader(page, 'Nothing is waiting on you', '0 unread · 0 direct · 120 signals · 120 total');
     await filter(page, 'All (120)').click();
-    await expect(rows(page)).toHaveCount(120);
+    const pager = page.locator('nav.inbox-pager');
+    const previous = pager.getByRole('button', { name: 'Previous' });
+    const next = pager.getByRole('button', { name: 'Next' });
+    await expect(rows(page)).toHaveCount(100);
+    await expect(subjects(page).first()).toHaveText('Signal 0');
+    await expect(pager.locator('p')).toHaveText('Showing 1–100 of 120, newest first');
+    await expect(previous).toBeDisabled();
+
+    await next.click();
+    await expect(rows(page)).toHaveCount(20);
+    await expect(subjects(page).first()).toHaveText('Signal 100');
+    await expect(pager.locator('p')).toHaveText('Showing 101–120 of 120, newest first');
+    await expect(next).toBeDisabled();
+    await expectHeader(page, 'Nothing is waiting on you', '0 unread · 0 direct · 120 signals · 120 total');
+
+    // The search reads the page shown, and the pager says so.
+    await searchbox(page).fill('Signal 11');
+    await expect(subjects(page)).toHaveText(['Signal 110', 'Signal 111', 'Signal 112', 'Signal 113',
+      'Signal 114', 'Signal 115', 'Signal 116', 'Signal 117', 'Signal 118', 'Signal 119']);
+    await expect(pager.locator('p')).toHaveText(
+      'Showing 101–120 of 120, newest first — the search reads this page only');
+    await searchbox(page).fill('');
+
+    await previous.click();
+    await expect(pager.locator('p')).toHaveText('Showing 1–100 of 120, newest first');
+    // A view changed lands on its own first page: Signals holds all
+    // 120 too, and opens at 1, not where All was left.
+    await next.click();
+    await expect(pager.locator('p')).toHaveText('Showing 101–120 of 120, newest first');
+    await filter(page, 'Signals (120)').click();
+    await expect(pager.locator('p')).toHaveText('Showing 1–100 of 120, newest first');
+
+    // Each read is one bounded page the server narrowed.
+    expect(backend.inboxReads.map((u) => new URL(u).search)).toEqual([
+      '?kind=direct&unread=true&limit=100',
+      '?limit=100',
+      '?limit=100&offset=100',
+      '?limit=100',
+      '?limit=100&offset=100',
+      '?kind=signal&limit=100',
+    ]);
   });
 });
 
@@ -607,7 +660,7 @@ test.describe('/ux/inbox — the composer', () => {
     await expect(modal(page).locator('p.compose-refused')).toHaveText('Not sent — Failed to fetch');
   });
 
-  test('gap 6 (7d1c11a3): a failed roster read empties the To list and names senders by id, and says nothing', async ({ page }) => {
+  test('a failed roster read says why recipients and sender names are unavailable (7d1c11a3)', async ({ page }) => {
     // The page's own read is the only roster read — the session resolves
     // the viewer from its one row (backlog b4f68a65) — and it is refused.
     let reads = 0;
@@ -625,9 +678,64 @@ test.describe('/ux/inbox — the composer', () => {
     await page.locator('#inbox-subject').fill('Hello');
     await page.locator('#inbox-body').fill('A message.');
     await expect(modal(page).getByRole('button', { name: 'Send' })).toBeDisabled();
-    await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
-    await expect(page.getByRole('alert')).toHaveCount(0);
+    await expect(modal(page).locator('.roster-refused')).toContainText('HTTP 500');
+    await expect(modal(page).getByText('Send unavailable until recipients are read')).toBeVisible();
+    await expect(page.locator('.roster-note')).toContainText('Sender names unavailable');
+    await expect(modal(page).getByRole('button', { name: 'Retry recipients' })).toBeVisible();
   });
+
+  test('retry reads recipients without losing the draft or granting a send', async ({ page }) => {
+    let reads = 0;
+    const backend = await open(page, { roster: (r: Route) =>
+      ++reads === 1 ? json(r, 'store unavailable', 503)
+        : json(r, ROSTER.map(({ id, name, role }) => ({ id, name, role }))),
+    });
+    await page.getByRole('button', { name: 'Compose', exact: true }).click();
+    await page.locator('#inbox-subject').fill('Kept subject');
+    await page.locator('#inbox-body').fill('Kept body');
+    await modal(page).getByRole('button', { name: 'Retry recipients' }).click();
+    await expect(page.locator('#inbox-to option')).toHaveText([
+      'Select recipient...', 'David (Platform administrator)', 'Bo Cellar (Sales lead)',
+    ]);
+    await expect(page.locator('#inbox-subject')).toHaveValue('Kept subject');
+    await expect(page.locator('#inbox-body')).toHaveValue('Kept body');
+    await expect(modal(page).getByRole('button', { name: 'Send' })).toBeDisabled();
+    await expect(page.locator('.roster-note')).toHaveCount(0);
+    expect(backend.writes).toEqual([]);
+  });
+
+  test('a read-empty recipient roster is distinct from malformed or dark reads', async ({ page }) => {
+    await open(page, { roster: [] });
+    await page.getByRole('button', { name: 'Compose', exact: true }).click();
+    await expect(modal(page).getByText('No recipients are available in this read')).toBeVisible();
+    await expect(modal(page).getByRole('alert')).toHaveCount(0);
+    await expect(modal(page).getByRole('button', { name: 'Retry recipients' })).toHaveCount(0);
+    await expect(modal(page).getByRole('button', { name: 'Send' })).toBeDisabled();
+  });
+
+  test('a roster transport failure preserves the inbox and refuses Send visibly', async ({ page }) => {
+    const backend = await open(page, { roster: (r: Route) => r.abort('connectionrefused') });
+    await page.getByRole('button', { name: 'Compose', exact: true }).click();
+    await page.locator('#inbox-subject').fill('Still here');
+    await page.locator('#inbox-body').fill('Draft stays here');
+    await expect(modal(page).locator('.roster-refused')).toContainText('Failed to fetch');
+    await expect(modal(page).getByRole('button', { name: 'Send' })).toBeDisabled();
+    await expect(page.locator('.roster-note')).toContainText('Sender names unavailable');
+    await expect(page.locator('.inbox-row')).toHaveCount(2);
+    expect(backend.writes).toEqual([]);
+  });
+
+  for (const [label, raw] of [
+    ['object', {}], ['null', null], ['duplicate', [{ id: 'x', name: null, role: null }, { id: 'x', name: 'Other', role: null }]],
+  ] as const) {
+    test(`the ${label} roster response is refused rather than rendered empty`, async ({ page }) => {
+      await open(page, { roster: (r: Route) => json(r, raw) });
+      await page.getByRole('button', { name: 'Compose', exact: true }).click();
+      await expect(modal(page).locator('.roster-refused')).toContainText('Recipients unavailable');
+      await expect(modal(page).getByRole('button', { name: 'Send' })).toBeDisabled();
+      await expect(modal(page).getByText('No recipients are available in this read')).toHaveCount(0);
+    });
+  }
 });
 
 test.describe('/ux/inbox — empty, loading and failed reads never paint alike', () => {
@@ -649,7 +757,7 @@ test.describe('/ux/inbox — empty, loading and failed reads never paint alike',
   test('while the inbox loads the page claims neither a count nor an empty inbox', async ({ page }) => {
     let release: () => void = () => {};
     const held = new Promise<void>((resolve) => { release = resolve; });
-    await install(page, { inbox: async (r) => { await held; await json(r, INBOX); } });
+    await install(page, { inbox: async (r) => { await held; await json(r, inboxPage(INBOX, r.request().url())); } });
     await mountPage(page, PATH, { titleMatch: /^Inbox$/ });
 
     await expectHeader(page, 'Inbox', 'Loading…');
@@ -668,23 +776,31 @@ test.describe('/ux/inbox — empty, loading and failed reads never paint alike',
   // message (Chromium's); a body that is not JSON is the parser's,
   // whose wording is V8's and so is matched only past the page's own
   // prefix.
+  // The read the landing view asks for: one page of unread directs.
+  const READ = '/api/messages/inbox/emp-001?kind=direct&unread=true&limit=100';
   const FAILURES: ReadonlyArray<readonly [string, (r: Route) => Promise<void>, string | RegExp]> = [
     ['refused (500)', (r) => json(r, 'message store down', 500),
-      "Couldn't load your inbox — /api/messages/inbox/emp-001: HTTP 500"],
+      `Couldn't load your inbox — ${READ}: HTTP 500`],
     ['forbidden (403)', (r) => json(r, 'forbidden', 403),
-      "Couldn't load your inbox — /api/messages/inbox/emp-001: HTTP 403"],
+      `Couldn't load your inbox — ${READ}: HTTP 403`],
     // The line names the read even when the browser's message does not
     // (backlog 0ef5e008).
     ['unreachable', (r) => r.abort('connectionrefused'),
-      "Couldn't load your inbox — /api/messages/inbox/emp-001: Failed to fetch"],
+      `Couldn't load your inbox — ${READ}: Failed to fetch`],
     ['not JSON', (r) => r.fulfill({ status: 200, contentType: 'application/json', body: 'not json' }),
       /^\s*Couldn't load your inbox — \S.*\S\s*$/],
-    // (c) A changed response shape — an envelope where the list was due
-    // — used to be coerced to [] and read "Nothing is waiting on you".
-    ['a 200 that is not a list', (r) => json(r, { data: [STEP] }),
-      "Couldn't load your inbox — /api/messages/inbox/emp-001: HTTP 200, but the body is an object, not a list"],
+    // (c) A changed response shape used to be coerced to [] and read
+    // "Nothing is waiting on you". Since 74da899d the inbox is the paged
+    // envelope, so the bare list it used to answer is that shape now,
+    // and an envelope without the total or the counts is too.
+    ['a 200 that is a bare list', (r) => json(r, [STEP]),
+      `Couldn't load your inbox — ${READ}: HTTP 200, but the body is a list, not a {data: [...]} envelope`],
+    ['a 200 that has no total', (r) => json(r, { data: [STEP], kinds: [] }),
+      `Couldn't load your inbox — ${READ}: HTTP 200, but the body has no total`],
+    ['a 200 that has no counts', (r) => json(r, { data: [STEP], total: 1 }),
+      `Couldn't load your inbox — ${READ}: HTTP 200, but the body has no kinds list`],
     ['a 200 that is null', (r) => json(r, null),
-      "Couldn't load your inbox — /api/messages/inbox/emp-001: HTTP 200, but the body is null, not a list"],
+      `Couldn't load your inbox — ${READ}: HTTP 200, but the body is null, not a {data: [...]} envelope`],
   ];
   for (const [how, answer, line] of FAILURES) {
     test(`an inbox read that is ${how} paints the failure line and Retry, never the empty one`, async ({ page }) => {
@@ -711,7 +827,7 @@ test.describe('/ux/inbox — empty, loading and failed reads never paint alike',
   test('Retry reads again, and a recovered store paints the inbox', async ({ page }) => {
     let up = false;
     const backend = await install(page, {
-      inbox: (r) => (up ? json(r, INBOX) : json(r, 'message store down', 500)),
+      inbox: (r) => (up ? json(r, inboxPage(INBOX, r.request().url())) : json(r, 'message store down', 500)),
     });
     await mountPage(page, PATH);
     await expect(list(page).locator(FAILURE_MARKER)).toBeVisible();

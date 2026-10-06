@@ -3,7 +3,8 @@
 # pod-logs — READ-ONLY: an instance pod's log, verdict first, through
 # the deploy runner's kubectl.
 #
-#   pod-logs.sh <namespace> <deployment> <lines> [container]
+#   pod-logs.sh <namespace> <workload> <lines> [container]
+#   A bare name must identify exactly one Deployment or StatefulSet.
 #
 # WHY IT EXISTS (backlog c09cab0b, filed urgent 2026-09-18)
 # ---------------------------------------------------------
@@ -22,11 +23,11 @@
 #
 # WHAT IT PRINTS — verdict first, then evidence
 # ---------------------------------------------
-#   one line per pod of the deployment:
+#   one line per pod of the workload:
 #     <pod> phase=<phase> ready=<n>/<m> restarts=<sum> age=<age> [state=<reason>]
 #   (`state=` only when a container is not running — CrashLoopBackOff,
 #   Error, ImagePullBackOff, Completed — so the crashing pod LOOKS
-#   troubled on its own line, CLAUDE.md §Diagnosis); a deployment with
+#   troubled on its own line, CLAUDE.md §Diagnosis); a workload with
 #   no pods says `no pods` as its verdict, with the selector it used.
 #   Then, per pod:
 #     --- <pod> <container|all-containers> (last N lines) ---
@@ -42,7 +43,7 @@
 #               renderer (`infra/cluster/render-instance.sh --instances`,
 #               second column) — never a list typed here (§9a). boss-dev
 #               and every system namespace are outside it.
-#   deployment  a plain DNS label, ^[a-z][a-z0-9-]{0,62}$ (re-checked
+#   workload    a plain DNS label, ^[a-z][a-z0-9-]{0,62}$ (re-checked
 #               here, not only in the allowlist — the run-car-probe
 #               convention)
 #   lines       1..400. The ops-runner caps a verb's output at 100 KB,
@@ -60,9 +61,9 @@
 # EXIT
 #   0  the verdict and tails are on stdout
 #   2  refused — a bound above; stderr names it; nothing on stdout
-#   4  cannot answer — no kubectl, or the deployment/pods read failed;
+#   4  cannot answer — no kubectl, or the controller/pods read failed;
 #      stderr carries kubectl's own words; nothing on stdout. A missing
-#      deployment is exit 4, never "no pods": a wrong name must not
+#      or ambiguous workload is exit 4, never "no pods": a wrong name must not
 #      answer like an empty one (CLAUDE.md §Doors).
 #
 # ENV
@@ -86,14 +87,16 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SELF_DIR/../.." && pwd)"
 RESOLVE="$REPO/infra/cluster/undeclared-objects.sh"
 RENDER="$REPO/infra/cluster/render-instance.sh"
+# shellcheck source=../lib/jq.sh
+. "$REPO/infra/lib/jq.sh"
 
 # --- the arguments' shape --------------------------------------------------
 [ $# -ge 3 ] && [ $# -le 4 ] \
-    || refuse "usage: $ME <namespace> <deployment> <lines 1..$MAX_LINES> [container] — got $# argument(s)"
+    || refuse "usage: $ME <namespace> <workload> <lines 1..$MAX_LINES> [container] — got $# argument(s)"
 NS="$1"; DEPLOY="$2"; LINES="$3"; CONTAINER="${4:-}"
 
 [[ "$NS" =~ $LABEL ]] || refuse "the namespace '$NS' is not a plain DNS label"
-[[ "$DEPLOY" =~ $LABEL ]] || refuse "the deployment '$DEPLOY' is not a plain DNS label (a bare name, not deploy/<name>)"
+[[ "$DEPLOY" =~ $LABEL ]] || refuse "the workload '$DEPLOY' is not a plain DNS label (a bare name, not deploy/<name>)"
 case "$LINES" in
     ''|*[!0-9]*) refuse "lines must be a number 1..$MAX_LINES, got '$LINES'" ;;
 esac
@@ -128,24 +131,63 @@ K=("${KUBECTL[@]}" -n "$NS")
 TMP=$(mktemp -d) || exit "$CANNOT_ANSWER"
 trap 'rm -rf "$TMP"' EXIT
 
-# --- the deployment's own selector, then its pods --------------------------
+# --- the controller's own selector, then its pods --------------------------
 # A Deployment owns its pods through a ReplicaSet, so the honest read is
 # the selector the Deployment declares, not a name prefix — a pod named
 # boss-* in a namespace with a `boss-jobs` deployment would otherwise
 # answer for the wrong workload.
-if ! "${K[@]}" get deployment "$DEPLOY" -o json > "$TMP/deploy.json" 2> "$TMP/deploy.err"; then
-    say "CANNOT ANSWER — the deployment read failed; kubectl said:"
-    sed 's/^/    /' "$TMP/deploy.err" >&2
+# Read both kinds even when the first exists: a shared bare name is
+# ambiguous. Only kubectl's --ignore-not-found classifies absence; every
+# other read failure retains its diagnosis and refuses before pod reads.
+FOUND=0
+WORKLOAD_KIND=""
+for kind in Deployment StatefulSet; do
+    resource=$(printf '%s' "$kind" | tr '[:upper:]' '[:lower:]')
+    if ! "${K[@]}" get "$resource" "$DEPLOY" --ignore-not-found -o json > "$TMP/controller.json" 2> "$TMP/controller.err"; then
+        say "CANNOT ANSWER — the $resource read failed; kubectl said:"
+        sed 's/^/    /' "$TMP/controller.err" >&2
+        exit "$CANNOT_ANSWER"
+    fi
+    [ -s "$TMP/controller.json" ] || continue
+    if ! jq -se --arg kind "$kind" --arg name "$DEPLOY" --arg ns "$NS" '
+        length == 1 and (.[0] | type == "object"
+            and .kind == $kind and .metadata.name == $name and .metadata.namespace == $ns)
+        ' "$TMP/controller.json" >/dev/null 2>&1; then
+        say "CANNOT ANSWER — the $resource read did not return exactly one matching kind, namespace and name"
+        exit "$CANNOT_ANSWER"
+    fi
+    FOUND=$((FOUND + 1))
+    WORKLOAD_KIND="$resource"
+    cp "$TMP/controller.json" "$TMP/workload.json"
+done
+[ "$FOUND" -eq 1 ] || {
+    say "CANNOT ANSWER — workload $DEPLOY in $NS must identify exactly one Deployment or StatefulSet (found $FOUND; NotFound or ambiguous)"
     exit "$CANNOT_ANSWER"
-fi
-SELECTOR=$(jq -r '.spec.selector.matchLabels // {} | to_entries | map("\(.key)=\(.value)") | join(",")' "$TMP/deploy.json" 2>/dev/null)
-[ -n "$SELECTOR" ] || {
-    say "CANNOT ANSWER — deployment $DEPLOY in $NS declares no matchLabels selector, so its pods cannot be named"
+}
+SELECTOR=$(jq_doc_file "$TMP/workload.json" && jq -er '
+    .spec.selector as $s
+    | if ($s.matchLabels | type) == "object" and ($s.matchLabels | length) > 0
+         and ($s.matchExpressions == null or ($s.matchExpressions | type == "array" and length == 0))
+         and ($s.matchLabels | to_entries | all(.[]; (.value | type) == "string"))
+      then $s.matchLabels | to_entries | sort_by(.key) | map("\(.key)=\(.value)") | join(",")
+      else error("unsupported selector") end
+    ' "$TMP/workload.json" 2>/dev/null) || {
+    say "CANNOT ANSWER — $WORKLOAD_KIND $DEPLOY in $NS declares no usable matchLabels-only selector, so its pods cannot be named"
     exit "$CANNOT_ANSWER"
 }
 if ! "${K[@]}" get pods -l "$SELECTOR" -o json > "$TMP/pods.json" 2> "$TMP/pods.err"; then
     say "CANNOT ANSWER — the pods read failed; kubectl said:"
     sed 's/^/    /' "$TMP/pods.err" >&2
+    exit "$CANNOT_ANSWER"
+fi
+if ! jq -se --arg ns "$NS" '
+    length == 1 and (.[0] | type == "object" and (.items | type) == "array"
+        and (.items | all(.[]; type == "object" and .metadata.namespace == $ns
+            and (.metadata.name | type == "string" and length <= 253
+                and test("^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"))))
+        and ((.items | map(.metadata.name) | unique | length) == (.items | length)))
+    ' "$TMP/pods.json" >/dev/null 2>&1; then
+    say "CANNOT ANSWER — the pods read did not return one list of unique named pods in $NS"
     exit "$CANNOT_ANSWER"
 fi
 
@@ -191,7 +233,7 @@ age_of() {
 
 # --- the verdict -----------------------------------------------------------
 if [ ! -s "$TMP/rows" ]; then
-    echo "deployment $DEPLOY in $NS: no pods (selector $SELECTOR)"
+    echo "$WORKLOAD_KIND $DEPLOY in $NS: no pods (selector $SELECTOR)"
     exit 0
 fi
 while IFS=$'\t' read -r name phase ready restarts stamp reason _crashing; do

@@ -149,7 +149,12 @@ async fn main() -> Result<()> {
         .with_context(|| format!("binding HTTP listener on {http_addr}"))?;
     info!(addr = %http_addr, "kb HTTP API listening");
 
-    let app = boss_core::machine_gate::mount(app, "catalog", &["/api/catalog/health"]);
+    let app = boss_core::machine_gate::mount(
+        app,
+        "catalog",
+        &["/api/catalog/health"],
+        Some(boss_events::outbox::PgOutboxRecorder::shared(&pg_pool)),
+    );
     axum::serve(listener, app).await?;
 
     Ok(())

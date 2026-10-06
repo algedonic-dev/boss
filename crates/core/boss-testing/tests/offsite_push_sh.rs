@@ -3,25 +3,26 @@
 //! OWN credential slot, with a PLAIN push — no force, no `--mirror`, no
 //! prune — reads the push back, and only then removes Forgejo's own push
 //! mirror (backlog 21d54f4a, decided 2026-09-26 under David's rule that
-//! no mirror can wipe what it mirrors). The public fork (dauld/boss-mirror)
-//! is declared with NO branch.
+//! no mirror can wipe what it mirrors).
 //!
-//! Forge `main` left the fork on 2026-09-27 (backlog 67931115, design
-//! 1f35a3e8): dauld/boss-mirror is a fork of the public algedonic-dev/boss,
-//! a fork of a public repository is public and cannot be made private,
-//! and so every train reached public GitHub within one converge tick —
-//! unsigned, and outside the publish flow's secrets scan and passkey.
-//! `publish/*` left it next (backlog a2b58aab): a forge branch name
-//! vouches for nothing, and the publish verb pushes the fork itself. Main's
-//! off-site copy moved to a PRIVATE repository outside the fork network,
-//! algedonic-dev/boss-dr, read with a token of its own (backlog 761bc8a9).
-//! Which remote may carry which branch is pinned by
-//! `the_public_fork_receives_nothing_from_the_converge` and
-//! `the_dr_copy_is_declared_main_only`. The push machinery is exercised
-//! with a FIXTURE declaration that gives the fork target `publish/*`, so
-//! two targets, two slots and two helpers are still driven end to end;
-//! `the_real_declaration_pushes_main_to_the_dr_copy_and_nothing_to_the_fork`
-//! runs the real one.
+//! Forge `main` left a public fork in David's personal account on
+//! 2026-09-27 (backlog 67931115, design 1f35a3e8): a fork of a public
+//! repository is public and cannot be made private, and so every train
+//! reached public GitHub within one converge tick — unsigned, and outside
+//! the publish flow's secrets scan and passkey. `publish/*` left it next
+//! (backlog a2b58aab): a forge branch name vouches for nothing. Main's
+//! off-site copy moved to a PRIVATE repository of the organisation,
+//! algedonic-dev/boss-dr, read with a token of its own (backlog 761bc8a9),
+//! and on 2026-09-30 the fork's target went altogether, with its personal
+//! token slot (backlog d2b7c947, David: all GitHub work runs through the
+//! algedonic-dev organisation, as the GitHub App). The real declaration is
+//! pinned by `the_dr_copy_is_declared_main_only` and run by
+//! `the_real_declaration_pushes_main_to_the_dr_copy`. The push machinery
+//! is exercised with a FIXTURE declaration that adds a SECOND target of
+//! the organisation carrying `publish/*`, so two targets, two slots and
+//! two helpers are still driven end to end: the script is written for a
+//! list, and its refusals (main on two targets, one slot for two) only
+//! mean anything with two.
 //!
 //! Why the Forgejo push mirror has to go rather than be filtered: v16.0.2
 //! ALWAYS syncs with `git push -f --mirror` (modules/git/repo.go Push),
@@ -32,15 +33,18 @@
 //!
 //! Pinned here, with real git repositories standing in for the forge and
 //! for GitHub, and a stub curl keeping Forgejo's push-mirror list:
-//!   * main reaches the DR copy and ONLY it — the fork's main is never
-//!     moved — and a fixture publish/* reaches the fork and only it; a branch
-//!     outside the declaration reaches neither, and a branch only a
-//!     TARGET holds survives (no prune), whether or not it matches
-//!   * the declaration refuses main on two targets, main riding with
-//!     anything else, no main at all, and two targets sharing a remote
-//!     or a credential slot — so main cannot come back to the fork by a
-//!     one-word edit; a refused declaration fetches and pushes nothing,
-//!     still removes the Forgejo mirror, and exits 2
+//!   * main reaches the DR copy and ONLY it — the second target's main is
+//!     never moved — and a fixture publish/* reaches the second target and
+//!     only it; a branch outside the declaration reaches neither, and a
+//!     branch only a TARGET holds survives (no prune), whether or not it
+//!     matches
+//!   * the declaration refuses a remote outside the algedonic-dev
+//!     organisation, a target with no branch, main on two targets, main
+//!     riding with anything else, no main at all, and two targets sharing
+//!     a remote or a credential slot — so neither a personal repository
+//!     nor main anywhere but the DR copy comes back by a one-word edit; a
+//!     refused declaration fetches and pushes nothing, still removes the
+//!     Forgejo mirror, and exits 2
 //!   * an EMPTY or absent DR credential slot is a refusal (exit 4, named,
 //!     nothing pushed to either target), never a skip
 //!   * a private clone still holding a branch an old declaration fetched
@@ -66,11 +70,9 @@
 //!     answers only https://github.com AND only its own target's path, so
 //!     neither token can reach the other repository; a nameless mirror
 //!     row is an error
-//!   * the declaration names algedonic-dev/boss-dr for main alone, and the
-//!     canonical dauld/boss-mirror (the fork the publish verb opens its
-//!     PRs from, with the publish verb's token file) for NO branch; run
-//!     for real, it pushes main to the DR copy, nothing to the fork, and
-//!     needs no fork token
+//!   * the declaration is algedonic-dev/boss-dr for main alone, with its
+//!     own slot, and nothing else; run for real, it pushes main to the DR
+//!     copy
 //!   * forge-converge.sh runs it after protect-main.sh, and its verdict
 //!     reaches the packet
 
@@ -79,17 +81,20 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const GH_TOKEN: &str = "ghp-offsite-token-must-never-print-0123456789";
+const SECOND_TOKEN: &str = "ghs-second-token-must-never-print-0123456789";
 const DR_TOKEN: &str = "github_pat-dr-token-must-never-print-5555555555";
 const FJ_TOKEN: &str = "fj-token-must-never-print-9876543210";
-/// The two credential slots, by the registry id each target names.
+/// The two credential slots, by the registry id each target names: the
+/// real declaration's, and the fixture's second target's.
 const DR_CREDENTIAL: &str = "github-dr-push-token";
-/// The two remotes as declared. The fixture keeps them verbatim and maps
-/// https://github.com/ to a local directory through the script's
-/// BOSS_OFFSITE_GITHUB_BASE seam, so every verdict names these.
-const PUBLIC_FORK: &str = "https://github.com/dauld/boss-mirror.git";
+const SECOND_CREDENTIAL: &str = "fixture-second-push-token";
+/// The two remotes. The DR copy's is the real declaration's; the second
+/// is a FIXTURE target of the organisation (see the module doc). Both are
+/// kept verbatim and https://github.com/ is mapped to a local directory
+/// through the script's BOSS_OFFSITE_GITHUB_BASE seam, so every verdict
+/// names these.
+const SECOND_TARGET: &str = "https://github.com/algedonic-dev/boss-second.git";
 const PRIVATE_DR: &str = "https://github.com/algedonic-dev/boss-dr.git";
-const FORK_CREDENTIAL: &str = "dauld-github-token";
 const MIRROR_NAME: &str = "remote_mirror_PDxRD-8iuiw";
 const LIST_URL: &str = "http://forge.test:3000/api/v1/repos/david/boss/push_mirrors";
 
@@ -215,13 +220,14 @@ esac
 }
 
 /// The forge's push mirror as Forgejo 16.0.2 lists it (the live one,
-/// measured on packet 21d54f4a: sync_on_commit, 8h, no filter, the old
-/// boss-fork URL GitHub redirects to boss-mirror).
+/// measured on packet 21d54f4a: sync_on_commit, 8h, no filter). Its
+/// address is a placeholder: the script deletes the row by name and
+/// never reads where it pointed.
 fn live_mirror() -> serde_json::Value {
     serde_json::json!([{
         "repo_name": "boss",
         "remote_name": MIRROR_NAME,
-        "remote_address": "https://github.com/dauld/boss-fork.git",
+        "remote_address": "https://github.com/someone/boss-fork.git",
         "branch_filter": "",
         "sync_on_commit": true,
         "interval": "8h0m0s"
@@ -231,7 +237,7 @@ fn live_mirror() -> serde_json::Value {
 struct World {
     dir: PathBuf,
     forge: PathBuf,
-    /// The public fork (dauld/boss-mirror): publish/* only.
+    /// The fixture's second target (algedonic-dev/boss-second): publish/* only.
     target: PathBuf,
     /// The private DR copy (algedonic-dev/boss-dr): main only. New and empty.
     dr: PathBuf,
@@ -243,13 +249,13 @@ struct World {
 }
 
 /// The forge holds main at `b`, publish/2026-09-25, and a feature branch.
-/// The fork (GitHub) holds main at `a` — where the old push left it — a
-/// branch of its own, and a publish branch the forge no longer has. The
-/// DR copy is the new private repository: empty.
+/// The second target (GitHub) holds main at `a` — where an old push left
+/// it — a branch of its own, and a publish branch the forge no longer has.
+/// The DR copy is the private repository: empty.
 fn world(case: &str) -> World {
     let dir = boss_testing::scratch_dir(&format!("offsite-push-{case}"));
     let forge = dir.join("forge/david/boss.git");
-    let target = dir.join("github/dauld/boss-mirror.git");
+    let target = dir.join("github/algedonic-dev/boss-second.git");
     let dr = dir.join("github/algedonic-dev/boss-dr.git");
     std::fs::create_dir_all(forge.parent().unwrap()).unwrap();
     std::fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -306,7 +312,7 @@ fn real_targets(w: &World) -> serde_json::Value {
     for t in targets.iter_mut() {
         let token = match t["credential"].as_str() {
             Some(DR_CREDENTIAL) => w.dir.join("github-dr.token"),
-            Some(FORK_CREDENTIAL) => w.dir.join("github.token"),
+            Some(SECOND_CREDENTIAL) => w.dir.join("second.token"),
             other => panic!("a target these tests have no fixture for: {other:?}"),
         };
         t["token_file"] = serde_json::json!(token.to_str().unwrap());
@@ -315,15 +321,21 @@ fn real_targets(w: &World) -> serde_json::Value {
 }
 
 /// The fixture declaration the push machinery runs under: the real
-/// targets, with the public fork given `publish/*`. The REAL declaration
-/// carries nothing to the fork (backlog a2b58aab, pinned by
-/// `the_public_fork_receives_nothing_from_the_converge`); the fixture
-/// keeps a second target pushing, so two slots, two helpers and a refusal
-/// on one target beside a landing on the other are still exercised.
+/// targets, plus a second target of the organisation carrying
+/// `publish/*`. The REAL declaration is the DR copy alone (pinned by
+/// `the_dr_copy_is_declared_main_only`); the fixture keeps a second target
+/// pushing, so two slots, two helpers and a refusal on one target beside a
+/// landing on the other are still exercised.
 fn fixture_targets(w: &World) -> serde_json::Value {
     let mut t = real_targets(w);
-    let fork = target_index(&t, FORK_CREDENTIAL);
-    t[fork]["branches"] = serde_json::json!(["publish/*"]);
+    t.as_array_mut()
+        .expect("a targets list")
+        .push(serde_json::json!({
+            "remote": SECOND_TARGET,
+            "branches": ["publish/*"],
+            "credential": SECOND_CREDENTIAL,
+            "token_file": w.dir.join("second.token").to_str().unwrap(),
+        }));
     t
 }
 
@@ -352,8 +364,8 @@ struct Opts {
     /// Replaces the declaration's `targets` (after the fixture has aimed
     /// them): the declaration tests edit what fixture_targets returns.
     targets: Option<serde_json::Value>,
-    /// Run the REAL declaration's branches (the fork declaring none)
-    /// rather than the fixture's publish/* for the fork.
+    /// Run the REAL declaration (the DR copy alone) rather than the
+    /// fixture's two targets.
     real_declaration: bool,
     /// Removes the DR copy's stand-in repository, so main's push fails.
     dead_target: bool,
@@ -460,7 +472,7 @@ fn run(w: &World, o: Opts) -> Run {
 
     for (credential, file, value) in [
         (DR_CREDENTIAL, "github-dr.token", DR_TOKEN),
-        (FORK_CREDENTIAL, "github.token", GH_TOKEN),
+        (SECOND_CREDENTIAL, "second.token", SECOND_TOKEN),
     ] {
         let path = w.dir.join(file);
         let _ = std::fs::remove_file(&path);
@@ -595,7 +607,7 @@ fn no_token_anywhere(r: &Run) {
         ("curl argv", &r.log),
     ] {
         assert!(
-            !text.contains(GH_TOKEN),
+            !text.contains(SECOND_TOKEN),
             "the GitHub token reached {what}:\n{text}"
         );
         assert!(
@@ -610,7 +622,7 @@ fn no_token_anywhere(r: &Run) {
 }
 
 #[test]
-fn main_reaches_only_the_dr_copy_and_publish_only_the_fork_and_nothing_is_pruned() {
+fn main_reaches_only_the_dr_copy_and_publish_only_the_second_target_and_nothing_is_pruned() {
     let w = world("first");
     let forge_before = heads(&w.forge);
     let r = run(
@@ -629,12 +641,12 @@ fn main_reaches_only_the_dr_copy_and_publish_only_the_fork_and_nothing_is_pruned
     assert_eq!(
         head_of(&w.target, "main"),
         Some(w.a.clone()),
-        "the fork's main is never moved: main does not go to the fork"
+        "the second target's main is never moved: main does not go there"
     );
     assert_eq!(
         head_of(&w.target, "publish/2026-09-25"),
         Some(w.publish.clone()),
-        "publish/* arrives on the fork"
+        "publish/* arrives on the second target"
     );
     assert_eq!(
         heads(&w.dr),
@@ -655,20 +667,23 @@ fn main_reaches_only_the_dr_copy_and_publish_only_the_fork_and_nothing_is_pruned
         )),
         "the verdict names main and where it went: {v}"
     );
-    let fork = segment_for(&v, PUBLIC_FORK);
+    let second = segment_for(&v, SECOND_TARGET);
     assert!(
-        fork.contains("publish/*") && fork.contains("publish/2026-09-25"),
-        "the fork's part names its declaration and the ref it pushed: {v}"
+        second.contains("publish/*") && second.contains("publish/2026-09-25"),
+        "the second target's part names its declaration and the ref it pushed: {v}"
     );
-    assert!(!names_main(fork), "the fork's part names no main: {v}");
-    let fork_path = w.target.to_str().unwrap();
+    assert!(
+        !names_main(second),
+        "the second target's part names no main: {v}"
+    );
+    let second_path = w.target.to_str().unwrap();
     assert!(
         git_calls(&r, "push")
             .iter()
-            .filter(|argv| argv.contains(&fork_path))
+            .filter(|argv| argv.contains(&second_path))
             .flatten()
             .all(|a| !a.contains("refs/heads/main")),
-        "no push to the fork names main: {}",
+        "no push to the second target names main: {}",
         r.git_log
     );
     assert_eq!(
@@ -762,11 +777,11 @@ fn a_steady_tick_writes_nothing_to_the_forge() {
 #[test]
 fn a_private_clone_left_holding_an_undeclared_branch_neither_pushes_nor_reports_it() {
     let w = world("stale-clone");
-    // A tick under an older declaration carries feat/* to the fork and
-    // leaves feat/forge-only in the private clone.
+    // A tick under an older declaration carries feat/* to the second
+    // target and leaves feat/forge-only in the private clone.
     let mut old = fixture_targets(&w);
-    let fork = target_index(&old, FORK_CREDENTIAL);
-    old[fork]["branches"] = serde_json::json!(["publish/*", "feat/*"]);
+    let second = target_index(&old, SECOND_CREDENTIAL);
+    old[second]["branches"] = serde_json::json!(["publish/*", "feat/*"]);
     let first = run(
         &w,
         Opts {
@@ -796,7 +811,8 @@ fn a_private_clone_left_holding_an_undeclared_branch_neither_pushes_nor_reports_
         "the verdict names only declared refs: {v}"
     );
     assert!(
-        segment_for(&v, PUBLIC_FORK).contains("read back at the forge's value: publish/2026-09-25"),
+        segment_for(&v, SECOND_TARGET)
+            .contains("read back at the forge's value: publish/2026-09-25"),
         "the verdict names exactly the declared refs it read back: {v}"
     );
 }
@@ -805,7 +821,7 @@ fn a_private_clone_left_holding_an_undeclared_branch_neither_pushes_nor_reports_
 /// forge main rewound — is a live case once more: refused, named, and the
 /// DR copy keeps the newer main. The Forgejo mirror still goes: it was
 /// never a copy of main anywhere private, only a force-push of every
-/// branch to the PUBLIC fork (b176fd60 S1, 67931115).
+/// branch to a PUBLIC fork (b176fd60 S1, 67931115).
 #[test]
 fn a_rewound_forge_main_is_refused_and_the_target_keeps_its_main() {
     let w = world("rewound");
@@ -836,7 +852,7 @@ fn a_rewound_forge_main_is_refused_and_the_target_keeps_its_main() {
     assert_eq!(
         r.mirrors,
         serde_json::json!([]),
-        "a refusal does not keep the public-fork mirror"
+        "a refusal does not keep the Forgejo mirror"
     );
     let v = verdict(&r);
     assert!(
@@ -846,20 +862,19 @@ fn a_rewound_forge_main_is_refused_and_the_target_keeps_its_main() {
 }
 
 /// The forge holds a publish branch (fixture declaration) at a commit that
-/// does not descend from the fork's — until backlog 1f0aa60d the timing of
-/// a same-day re-publish; since then a real disagreement, since the verb
-/// never forces. The refusal is named, exit 1, and the fork keeps what it
-/// had, while main lands on the DR copy in the same run. It does not hold
-/// the Forgejo mirror in place: that mirror
-/// is `git push -f --mirror` of EVERY forge branch, main among them, to
-/// this same public fork — the exposure itself (b176fd60 S1, 67931115).
+/// does not descend from the second target's — a real disagreement, since
+/// nothing here forces. The refusal is named, exit 1, and the second
+/// target keeps what it had, while main lands on the DR copy in the same
+/// run. It does not hold the Forgejo mirror in place: that mirror is
+/// `git push -f --mirror` of EVERY forge branch, main among them — the
+/// exposure itself (b176fd60 S1, 67931115).
 #[test]
 fn a_publish_refusal_with_main_current_still_removes_the_mirror() {
     let w = world("publish-refused");
     let first = run(&w, Opts::default());
     assert_eq!(first.code, Some(0), "{}{}", first.stdout, first.stderr);
     let published = head_of(&w.target, "publish/2026-09-25").expect("publish arrived");
-    // The forge's copy moves to a commit that is NOT a descendant of the fork's.
+    // The forge's copy moves to a commit that is NOT a descendant of the second target's.
     let republish = commit(&w.forge, Some(&w.a), "publish snapshot, again");
     git_in(
         &w.forge,
@@ -1007,7 +1022,7 @@ fn a_github_stand_in_that_is_not_a_local_directory_is_refused() {
         ("no-such-dir", "/nonexistent/offsite-stand-in".to_string()),
     ] {
         let w = world(&format!("stand-in-{case}"));
-        let fork_before = heads(&w.target);
+        let second_before = heads(&w.target);
         let r = run(
             &w,
             Opts {
@@ -1021,7 +1036,11 @@ fn a_github_stand_in_that_is_not_a_local_directory_is_refused() {
             heads(&w.dr).is_empty(),
             "{case}: nothing reached the DR copy"
         );
-        assert_eq!(heads(&w.target), fork_before, "{case}: nor the fork");
+        assert_eq!(
+            heads(&w.target),
+            second_before,
+            "{case}: nor the second target"
+        );
         assert!(
             git_calls(&r, "push").is_empty(),
             "{case}: no push: {}",
@@ -1046,7 +1065,7 @@ fn a_github_stand_in_that_is_not_a_local_directory_is_refused() {
     let r = run(&w, Opts::default());
     assert_eq!(r.code, Some(0), "{}{}", r.stdout, r.stderr);
     let v = verdict(&r);
-    for remote in [PRIVATE_DR, PUBLIC_FORK] {
+    for remote in [PRIVATE_DR, SECOND_TARGET] {
         assert!(
             segment_for(&v, remote).contains(&format!(
                 "(via stand-in {})",
@@ -1102,10 +1121,10 @@ fn helper_path(remote: &str) -> &str {
 
 /// The helper hands the token to whatever asks. The declared remote is
 /// GitHub, but a redirect, an insteadOf or a changed declaration would
-/// have had it hand dauld's token to another host (b176fd60 S5). With two
+/// have had it hand the token to another host (b176fd60 S5). With two
 /// targets it must also refuse the OTHER target's repository: the DR
-/// token is scoped to boss-dr alone and the fork's token must never be
-/// the one that writes main anywhere (761bc8a9). Each helper is driven
+/// token is scoped to boss-dr alone and another target's token must never
+/// be the one that writes main anywhere (761bc8a9). Each helper is driven
 /// here exactly as the script passed it to that target's push.
 #[test]
 fn each_credential_helper_answers_only_its_own_repository_on_github_over_https() {
@@ -1117,7 +1136,7 @@ fn each_credential_helper_answers_only_its_own_repository_on_github_over_https()
     // The push goes to the seam's local stand-in; the helper is bound to
     // the DECLARED remote, which is what GitHub would be asked about.
     let dr_path = w.dr.to_str().unwrap().to_string();
-    let fork_path = w.target.to_str().unwrap().to_string();
+    let second_path = w.target.to_str().unwrap().to_string();
     for push in &pushes {
         assert!(
             push.contains(&"credential.useHttpPath=true"),
@@ -1130,9 +1149,9 @@ fn each_credential_helper_answers_only_its_own_repository_on_github_over_https()
             .unwrap_or_else(|| panic!("the push names its remote after --porcelain: {push:?}"))
             .to_string();
         let (own, other, token, other_token) = if remote == dr_path {
-            (PRIVATE_DR, PUBLIC_FORK, DR_TOKEN, GH_TOKEN)
-        } else if remote == fork_path {
-            (PUBLIC_FORK, PRIVATE_DR, GH_TOKEN, DR_TOKEN)
+            (PRIVATE_DR, SECOND_TARGET, DR_TOKEN, SECOND_TOKEN)
+        } else if remote == second_path {
+            (SECOND_TARGET, PRIVATE_DR, SECOND_TOKEN, DR_TOKEN)
         } else {
             panic!("a push to an undeclared remote: {remote}")
         };
@@ -1205,11 +1224,11 @@ fn a_mirror_row_with_no_name_is_an_error_not_none() {
     for (case, mirrors) in [
         (
             "null-name",
-            serde_json::json!([{"remote_name": null, "remote_address": "https://github.com/dauld/boss-fork.git"}]),
+            serde_json::json!([{"remote_name": null, "remote_address": "https://github.com/someone/boss-fork.git"}]),
         ),
         (
             "no-name",
-            serde_json::json!([{"remote_address": "https://github.com/dauld/boss-fork.git"}]),
+            serde_json::json!([{"remote_address": "https://github.com/someone/boss-fork.git"}]),
         ),
     ] {
         let w = world(&format!("nameless-{case}"));
@@ -1364,7 +1383,7 @@ fn an_empty_dr_credential_slot_is_a_refusal_not_a_skip() {
         ),
     ] {
         let w = world(case);
-        let fork_before = heads(&w.target);
+        let second_before = heads(&w.target);
         let r = run(
             &w,
             Opts {
@@ -1377,7 +1396,11 @@ fn an_empty_dr_credential_slot_is_a_refusal_not_a_skip() {
             heads(&w.dr).is_empty(),
             "{case}: nothing reached the DR copy"
         );
-        assert_eq!(heads(&w.target), fork_before, "{case}: nor the fork");
+        assert_eq!(
+            heads(&w.target),
+            second_before,
+            "{case}: nor the second target"
+        );
         assert_eq!(
             r.mirrors,
             serde_json::json!([]),
@@ -1403,9 +1426,9 @@ fn an_empty_dr_credential_slot_is_a_refusal_not_a_skip() {
 fn a_missing_or_loose_credential_is_exit_4_and_pushes_nothing() {
     for (case, opts) in [
         (
-            "no-fork-token",
+            "no-second-token",
             Opts {
-                no_token: Some(FORK_CREDENTIAL),
+                no_token: Some(SECOND_CREDENTIAL),
                 ..Opts::default()
             },
         ),
@@ -1483,8 +1506,8 @@ fn a_declaration_that_could_force_or_rename_is_refused() {
         let w = world(&format!("decl-{case}"));
         let target_before = heads(&w.target);
         let mut targets = fixture_targets(&w);
-        let fork = target_index(&targets, FORK_CREDENTIAL);
-        targets[fork]["branches"] = branches;
+        let second = target_index(&targets, SECOND_CREDENTIAL);
+        targets[second]["branches"] = branches;
         let r = run(
             &w,
             Opts {
@@ -1498,30 +1521,67 @@ fn a_declaration_that_could_force_or_rename_is_refused() {
     }
 }
 
-/// Main has exactly one off-site home, the private DR copy, and rides
-/// there alone. Each shape below is a one-edit way back to main on the
-/// public fork — or to no off-site main at all — and each is refused
-/// before anything is written, naming why (761bc8a9). The pre-2026-09-27
-/// declaration, one target carrying main AND publish/*, is the first.
+/// Every target is the organisation's and pushes something (d2b7c947),
+/// and main has exactly one off-site home, the private DR copy, and rides
+/// there alone (761bc8a9). Each shape below is a one-edit way back to a
+/// personal repository, to main on another target, or to no off-site main
+/// at all, and each is refused before anything is written, naming why.
+/// The pre-2026-09-27 declaration — one target, a public fork in a
+/// personal account, carrying main AND publish/* — is the first.
 #[test]
-fn a_declaration_that_could_put_main_on_the_fork_or_share_a_slot_is_refused() {
+fn a_declaration_outside_the_org_or_with_main_astray_or_a_shared_slot_is_refused() {
     let w0 = world("decl-shapes");
     let base = fixture_targets(&w0);
     let dr = target_index(&base, DR_CREDENTIAL);
-    let fork = target_index(&base, FORK_CREDENTIAL);
+    let second = target_index(&base, SECOND_CREDENTIAL);
     let mut cases: Vec<(&str, serde_json::Value, &str)> = Vec::new();
 
-    let mut old_shape = base[fork].clone();
+    let mut old_shape = base[second].clone();
+    old_shape["remote"] = serde_json::json!("https://github.com/someone/boss-mirror.git");
     old_shape["branches"] = serde_json::json!(["main", "publish/*"]);
     cases.push((
         "the-old-single-target",
         serde_json::json!([old_shape]),
-        "nowhere else",
+        "outside the algedonic-dev organisation",
     ));
 
+    // A personal repository beside the DR copy, carrying anything at all —
+    // and a lookalike owner that merely BEGINS with the organisation's name.
+    for (case, remote) in [
+        (
+            "a-personal-target",
+            "https://github.com/someone/boss-mirror.git",
+        ),
+        (
+            "a-lookalike-owner",
+            "https://github.com/algedonic-dev-x/boss-second.git",
+        ),
+        // A dot segment as the repository name: the prefix reads as the
+        // organisation's, and git follows `..` out of it (review b0607d1d,
+        // N1) — `.` and `..` are no repository of anyone's.
+        ("a-dot-dot-name", "https://github.com/algedonic-dev/.."),
+        ("a-dot-name", "https://github.com/algedonic-dev/."),
+    ] {
+        let mut t = base.clone();
+        t[second]["remote"] = serde_json::json!(remote);
+        cases.push((case, t, "outside the algedonic-dev organisation"));
+    }
+
+    // And a path that walks out of the organisation through `..` is no
+    // `owner/name` at all: the declaration's shape refuses it first.
     let mut t = base.clone();
-    t[fork]["branches"] = serde_json::json!(["main", "publish/*"]);
-    cases.push(("main-on-the-fork-too", t, "exactly one target"));
+    t[second]["remote"] = serde_json::json!("https://github.com/algedonic-dev/../cli/cli.git");
+    cases.push(("a-dot-dot-walk-out", t, "naming a remote"));
+
+    // A target that pushes nothing is a slot kept for nothing: the only one
+    // there ever was, the fork's, declared an empty list.
+    let mut t = base.clone();
+    t[second]["branches"] = serde_json::json!([]);
+    cases.push(("a-target-with-no-branch", t, "declares no branch"));
+
+    let mut t = base.clone();
+    t[second]["branches"] = serde_json::json!(["main", "publish/*"]);
+    cases.push(("main-on-the-second-target-too", t, "exactly one target"));
 
     let mut t = base.clone();
     t[dr]["branches"] = serde_json::json!(["main", "publish/*"]);
@@ -1532,25 +1592,25 @@ fn a_declaration_that_could_put_main_on_the_fork_or_share_a_slot_is_refused() {
     cases.push(("no-main-anywhere", t, "exactly one target"));
 
     let mut t = base.clone();
-    t[dr]["token_file"] = base[fork]["token_file"].clone();
+    t[dr]["token_file"] = base[second]["token_file"].clone();
     cases.push(("one-slot-for-both", t, "its own credential slot"));
 
     let mut t = base.clone();
-    t[fork]["remote"] = base[dr]["remote"].clone();
+    t[second]["remote"] = base[dr]["remote"].clone();
     cases.push(("one-remote-for-both", t, "share a remote"));
 
     // Two spellings of one repository are one repository: GitHub answers
     // them alike, whatever the case or the .git suffix.
     let mut t = base.clone();
-    t[fork]["remote"] = serde_json::json!("https://github.com/Algedonic-Dev/Boss-DR");
+    t[second]["remote"] = serde_json::json!("https://github.com/Algedonic-Dev/Boss-DR");
     cases.push(("one-remote-spelled-twice", t, "share a remote"));
 
     // And two spellings of one path are one file.
     let mut t = base.clone();
-    let doubled = base[fork]["token_file"]
+    let doubled = base[second]["token_file"]
         .as_str()
         .unwrap()
-        .replace("/github.token", "//github.token");
+        .replace("/second.token", "//second.token");
     t[dr]["token_file"] = serde_json::json!(doubled);
     cases.push(("one-slot-spelled-twice", t, "its own credential slot"));
 
@@ -1580,12 +1640,12 @@ fn a_declaration_that_could_put_main_on_the_fork_or_share_a_slot_is_refused() {
         cases.push((case, t, "naming a remote"));
     }
 
-    // Main declared ONLY on the fork: one target, alone — the script
-    // itself refuses any remote but the DR copy for main (F2).
+    // Main declared ONLY on the second target: one target, alone — the
+    // script itself refuses any remote but the DR copy for main (F2).
     let mut t = base.clone();
-    t[dr]["branches"] = serde_json::json!([]);
-    t[fork]["branches"] = serde_json::json!(["main"]);
-    cases.push(("main-only-on-the-fork", t, "nowhere else"));
+    t[dr]["branches"] = serde_json::json!(["release/*"]);
+    t[second]["branches"] = serde_json::json!(["main"]);
+    cases.push(("main-only-on-the-second-target", t, "nowhere else"));
 
     // A trailing newline passed jq 1.6's `$` (review of fcf6042f, F2):
     // "main\n" and "/etc/x\n" read as valid, and a newline in one field
@@ -1612,12 +1672,14 @@ fn a_declaration_that_could_put_main_on_the_fork_or_share_a_slot_is_refused() {
         t[dr][field] = value;
         cases.push((case, t, "naming a remote"));
     }
-    // The shape the review worked out: the fork's token file carrying a
-    // trailing newline, so four separate lists would pair the fork's
+    // The shape the review worked out: the second target's token file
+    // carrying a trailing newline, so four separate lists would pair its
     // remote and token with main.
     let mut t = base.clone();
-    t[fork]["token_file"] =
-        serde_json::json!(format!("{}\n", base[fork]["token_file"].as_str().unwrap()));
+    t[second]["token_file"] = serde_json::json!(format!(
+        "{}\n",
+        base[second]["token_file"].as_str().unwrap()
+    ));
     cases.push(("newline-shifts-the-lists", t, "naming a remote"));
 
     for (case, targets, why) in cases {
@@ -1627,7 +1689,7 @@ fn a_declaration_that_could_put_main_on_the_fork_or_share_a_slot_is_refused() {
             .to_string()
             .replace(w0.dir.to_str().unwrap(), w.dir.to_str().unwrap());
         let targets: serde_json::Value = serde_json::from_str(&text).unwrap();
-        let fork_before = heads(&w.target);
+        let second_before = heads(&w.target);
         let r = run(
             &w,
             Opts {
@@ -1644,7 +1706,11 @@ fn a_declaration_that_could_put_main_on_the_fork_or_share_a_slot_is_refused() {
             r.stdout,
             r.stderr
         );
-        assert_eq!(heads(&w.target), fork_before, "{case}: the fork untouched");
+        assert_eq!(
+            heads(&w.target),
+            second_before,
+            "{case}: the second target untouched"
+        );
         assert!(heads(&w.dr).is_empty(), "{case}: the DR copy untouched");
         assert!(
             r.stderr.contains(why),
@@ -1663,7 +1729,7 @@ fn a_declaration_that_could_put_main_on_the_fork_or_share_a_slot_is_refused() {
 /// 590d3384). The declaration refusal used to `exit 2` before anything
 /// else ran, so a tick whose declaration was malformed left a re-created
 /// Forgejo push mirror standing — and that mirror force-pushes EVERY
-/// forge branch, main among them, to the public fork. The refusal now
+/// forge branch, main among them, to wherever it points. The refusal now
 /// pushes nothing, removes the mirror, and still exits 2, with a verdict
 /// that begins with the refusal (never with the success words a probe
 /// reads) and names the removal.
@@ -1671,14 +1737,14 @@ fn a_declaration_that_could_put_main_on_the_fork_or_share_a_slot_is_refused() {
 fn a_broken_declaration_pushes_nothing_and_still_removes_the_mirror() {
     let w0 = world("broken-shapes");
     let base = fixture_targets(&w0);
-    let fork = target_index(&base, FORK_CREDENTIAL);
+    let second = target_index(&base, SECOND_CREDENTIAL);
     let dr = target_index(&base, DR_CREDENTIAL);
     let mut force = base.clone();
     force[dr]["branches"] = serde_json::json!(["+main"]);
     let mut not_a_list = base.clone();
-    not_a_list[fork]["branches"] = serde_json::json!("publish/*");
+    not_a_list[second]["branches"] = serde_json::json!("publish/*");
     let mut main_twice = base.clone();
-    main_twice[fork]["branches"] = serde_json::json!(["main"]);
+    main_twice[second]["branches"] = serde_json::json!(["main"]);
     for (case, targets) in [
         ("force", force),
         ("not-a-list", not_a_list),
@@ -1719,7 +1785,7 @@ fn a_broken_declaration_pushes_nothing_and_still_removes_the_mirror() {
             "{case}: the verdict begins with the refusal and names the removal: {v}"
         );
         assert!(
-            !v.contains("read back at the forge's value") && !v.contains("nothing declared for"),
+            !v.contains("read back at the forge's value"),
             "{case}: a refused declaration never carries the success words: {v}"
         );
         no_token_anywhere(&r);
@@ -1756,100 +1822,57 @@ fn a_run_that_stops_without_a_verdict_still_writes_one() {
     no_token_anywhere(&r);
 }
 
-/// THE FORK PIN (backlog a2b58aab, the adversarial review of 67931115's
-/// first car; before it, 67931115 / design 1f35a3e8). dauld/boss-mirror is
-/// a fork of the public algedonic-dev/boss, and a fork of a public
-/// repository is public — whatever reaches it is published. Forge main
-/// left it on 2026-09-27 because it is every train, unsigned and never
-/// secrets-scanned. `publish/*` stayed, on the reading that the publish
-/// flow had scanned and signed it — but a forge BRANCH NAME vouches for
-/// nothing: every holder of a forge write credential for user david can
-/// push refs/heads/publish/<anything>, and the forge protects main alone,
-/// so the carry put any such branch on the public fork within one tick.
-/// And the carry was never needed: publish-github-pr.sh pushes each
-/// snapshot to the fork ITSELF, after its scan and the passkey check
-/// (`a_real_fork_of_the_mirror_is_published_to` in publish_github_pr_sh.rs).
-/// So the converge carries NOTHING to the public fork. Any branch on a
-/// target aimed at it — publish/* included — is refused at the gate.
-#[test]
-fn the_public_fork_receives_nothing_from_the_converge() {
-    let d = declaration();
-    let targets = d["targets"]
-        .as_array()
-        .expect("offsite-push.json declares a targets list");
-    let fork: Vec<&serde_json::Value> = targets
-        .iter()
-        .filter(|t| t["remote"] == PUBLIC_FORK)
-        .collect();
-    assert!(!fork.is_empty(), "the fork is declared, with nothing: {d}");
-    for t in fork {
-        let branches = t["branches"]
-            .as_array()
-            .unwrap_or_else(|| panic!("a target with no branches list: {t}"));
-        assert!(
-            branches.is_empty(),
-            "offsite-push.json carries {branches:?} to {PUBLIC_FORK} — a PUBLIC fork. The \
-             fork receives publish branches only from publish-github-pr.sh, which scans the \
-             approved tree and checks its passkey sign-off; a forge branch name vouches for \
-             nothing, since every forge write credential can create one (backlog a2b58aab)"
-        );
-    }
-}
-
-/// THE DR PIN (backlog 761bc8a9; design 76155676, David 2026-09-27). The
-/// private DR copy carries main and only main, and no remote other than
-/// it and the fork is declared at all — a new target is a decision about
+/// THE DR PIN (backlog 761bc8a9; design 76155676, David 2026-09-27; and
+/// backlog d2b7c947, David 2026-09-30). The declaration is the private DR
+/// copy, algedonic-dev/boss-dr, carrying main and only main with its own
+/// credential slot — and nothing else. A new target is a decision about
 /// which branches may leave the forge, and to where, and this pin is where
-/// it is recorded.
+/// it is recorded. The public fork in David's personal account that stood
+/// beside it, declared with no branch since backlog a2b58aab, went with
+/// d2b7c947: the publish verb opens its PR from a branch of the mirror
+/// itself, as the GitHub App (`a_publish_opens_its_pr_from_a_branch_of_the_mirror_itself`
+/// in publish_github_pr_sh.rs), so nothing read the fork's personal token
+/// but this declaration.
 #[test]
 fn the_dr_copy_is_declared_main_only() {
     let d = declaration();
     let targets = d["targets"]
         .as_array()
         .expect("offsite-push.json declares a targets list");
-    assert!(!targets.is_empty(), "offsite-push.json declares no target");
-    for t in targets {
-        let branches: Vec<&str> = t["branches"]
-            .as_array()
-            .unwrap_or_else(|| panic!("a target with no branches list: {t}"))
-            .iter()
-            .map(|b| b.as_str().unwrap_or_default())
-            .collect();
-        match t["remote"].as_str() {
-            Some(PUBLIC_FORK) => {}
-            Some(PRIVATE_DR) => assert_eq!(
-                branches,
-                vec!["main"],
-                "the private DR copy {PRIVATE_DR} carries main and only main (backlog 761bc8a9)"
-            ),
-            other => panic!(
-                "offsite-push.json declares a target this pin has no decision for: {other:?} — \
-                 which branches may leave the forge, and to where, is decided here"
-            ),
-        }
-    }
+    assert_eq!(
+        targets.len(),
+        1,
+        "offsite-push.json declares the DR copy and nothing else — which branches may \
+         leave the forge, and to where, is decided here: {d}"
+    );
+    let dr = &targets[0];
+    assert_eq!(dr["remote"], serde_json::json!(PRIVATE_DR));
+    assert_eq!(
+        dr["branches"],
+        serde_json::json!(["main"]),
+        "the private DR copy {PRIVATE_DR} carries main and only main (backlog 761bc8a9)"
+    );
+    assert_eq!(dr["credential"], serde_json::json!(DR_CREDENTIAL));
+    assert_eq!(
+        dr["token_file"],
+        serde_json::json!("/etc/boss-publish/github-dr.token")
+    );
 }
 
-/// The real declaration, run: main reaches the DR copy, nothing is pushed
-/// to the fork — so the fork's token is not needed, and is absent here: a
-/// converge must not fail for a credential it does not use. The Forgejo
-/// push mirror is still removed (it would force-push every forge branch,
-/// main among them, to the fork), and the verdict names both targets: main
-/// read back on the DR copy — the words the car's recorded probe reads —
-/// and the fork receiving nothing from here. An empty list must NEVER
-/// reach `git push`: with no refspec git falls back to push.default, which
-/// is not a declaration.
+/// The real declaration, run: main reaches the DR copy, and it is the one
+/// push. The Forgejo push mirror is still removed, and the verdict's DR
+/// part begins with the words the recorded probes of 761bc8a9 read.
 #[test]
-fn the_real_declaration_pushes_main_to_the_dr_copy_and_nothing_to_the_fork() {
+fn the_real_declaration_pushes_main_to_the_dr_copy() {
     let w = world("real-declaration");
-    let fork_before = heads(&w.target);
+    let second_before = heads(&w.target);
     let forge_before = heads(&w.forge);
     let r = run(
         &w,
         Opts {
             mirrors: Some(live_mirror()),
             real_declaration: true,
-            no_token: Some(FORK_CREDENTIAL),
+            no_token: Some(SECOND_CREDENTIAL),
             ..Opts::default()
         },
     );
@@ -1859,14 +1882,17 @@ fn the_real_declaration_pushes_main_to_the_dr_copy_and_nothing_to_the_fork() {
         Some(w.b.clone()),
         "main on the DR copy"
     );
-    assert_eq!(heads(&w.target), fork_before, "the fork is untouched");
+    assert_eq!(
+        heads(&w.target),
+        second_before,
+        "no other repository is touched"
+    );
     assert_eq!(heads(&w.forge), forge_before, "the forge is untouched");
     let pushes = git_calls(&r, "push");
-    let fork_path = w.target.to_str().unwrap();
     assert_eq!(pushes.len(), 1, "one push, the DR copy's: {}", r.git_log);
     assert!(
-        !pushes[0].contains(&fork_path),
-        "no push is aimed at the fork: {}",
+        pushes[0].contains(&w.dr.to_str().unwrap()),
+        "the push is aimed at the DR copy: {}",
         r.git_log
     );
     assert_eq!(
@@ -1878,18 +1904,15 @@ fn the_real_declaration_pushes_main_to_the_dr_copy_and_nothing_to_the_fork() {
     );
     let v = verdict(&r);
     assert!(
-        segment_for(&v, PRIVATE_DR).starts_with(&format!(
+        v.starts_with(&format!(
             "main to {PRIVATE_DR}: pushed main; read back at the forge's value: main"
         )),
-        "the DR part begins with the words the car's probe reads: {v}"
+        "the verdict begins with the words the car's probe reads: {v}"
     );
-    let fork = segment_for(&v, PUBLIC_FORK);
     assert!(
-        fork.starts_with(&format!("nothing declared for {PUBLIC_FORK}"))
-            && fork.contains("publish-github-pr.sh"),
-        "the fork's part says it receives nothing from here, and from what it does: {v}"
+        !v.contains(" | "),
+        "one target, so one part — nothing is reported about a repository the declaration does not name: {v}"
     );
-    assert!(!names_main(fork), "the fork's part names no main: {v}");
     assert!(
         v.ends_with("— read back: none left"),
         "the mirror half's good outcome closes a success verdict: {v}"
@@ -1897,51 +1920,37 @@ fn the_real_declaration_pushes_main_to_the_dr_copy_and_nothing_to_the_fork() {
     no_token_anywhere(&r);
 }
 
-/// The declaration is the decided one (761bc8a9; design 76155676, David
-/// 2026-09-27: the DR copy is algedonic-dev/boss-dr, org-owned, private,
-/// not a fork): the DR copy and the fork, each read with its own
-/// credential slot. The fork is named by its canonical URL,
-/// dauld/boss-mirror, rather than the boss-fork name GitHub 301-redirects
-/// there: git follows a redirect only on a connection's first request
-/// (http.followRedirects defaults to `initial`), and the credential
-/// helper is bound to the path it was declared with, so a renamed path
-/// would answer with no token at all. It is the same fork the publish
-/// verb opens its PRs from, read with the same token file — two spellings
-/// of each fact, pinned (CLAUDE.md §9a). Which branches each may carry is
-/// the pin above.
+/// No off-site path is the fork's any more: the publish verb names no
+/// personal repository, token slot or credential (it opens its PR from the
+/// mirror itself as the GitHub App, backlog d2b7c947), and neither does
+/// this script. Beside it, infra/lint/no-github-path-outside-the-org.sh
+/// refuses any GitHub remote, slug or token slot outside the organisation
+/// across infra/, and this script refuses one in its own declaration.
 #[test]
-fn the_declaration_is_the_decided_one_and_matches_the_publish_fork() {
-    let d = declaration();
-    let targets = d["targets"].as_array().expect("a targets list");
-    assert_eq!(targets.len(), 2, "the DR copy and the fork: {d}");
-    let dr = &targets[target_index(&d["targets"], DR_CREDENTIAL)];
-    let fork = &targets[target_index(&d["targets"], FORK_CREDENTIAL)];
-
-    assert_eq!(dr["remote"], serde_json::json!(PRIVATE_DR));
-    assert_eq!(
-        dr["token_file"],
-        serde_json::json!("/etc/boss-publish/github-dr.token")
-    );
-    assert_eq!(fork["remote"], serde_json::json!(PUBLIC_FORK));
-    assert_ne!(
-        dr["token_file"], fork["token_file"],
-        "the DR copy has its own credential slot"
-    );
-
-    let publish = std::fs::read_to_string(repo_root().join("infra/forge/publish-github-pr.sh"))
-        .expect("publish-github-pr.sh");
-    assert!(
-        publish.contains(r#"FORK_SLUG="${BOSS_FORK_SLUG:-dauld/boss-mirror}""#)
-            && publish.contains(r#"https://github.com/${FORK_SLUG}.git"#),
-        "the publish verb's fork and the off-site push's fork must be one repository"
-    );
-    let fork_token = fork["token_file"].as_str().unwrap();
-    assert!(
-        publish.contains(&format!(
-            r#"TOKEN_FILE="${{BOSS_GITHUB_TOKEN_FILE:-{fork_token}}}""#
-        )),
-        "the fork is written with the publish verb's token file, {fork_token}"
-    );
+fn nothing_off_site_names_the_retired_fork_or_its_token() {
+    for script in [
+        "infra/forge/publish-github-pr.sh",
+        "infra/forge/offsite-push.sh",
+    ] {
+        let text = std::fs::read_to_string(repo_root().join(script)).expect(script);
+        for spelled in [
+            "boss-mirror",
+            "/etc/boss-publish/github.token",
+            "dauld-github-token",
+        ] {
+            // offsite-push.sh names the retired credential once, in prose,
+            // saying it was retired; no line of code does.
+            let code: Vec<&str> = text
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .filter(|l| l.contains(spelled))
+                .collect();
+            assert!(
+                code.is_empty(),
+                "{script} still names {spelled} outside a comment: {code:?} (backlog d2b7c947)"
+            );
+        }
+    }
 }
 
 /// No line of the script that runs a push carries a way to overwrite or

@@ -609,6 +609,18 @@ fn build_router(
             "/api/credentials",
             axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
         )
+        // The Sensors selection panel reads the existing registry and
+        // bounded reading windows on the jobs upstream. The upstream's
+        // Operator/Auditor boundary remains authoritative. Expose only
+        // these GET reads; poller and registry writes stay unmounted here.
+        .route(
+            "/api/sensors",
+            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
+        .route(
+            "/api/sensors/{id}/readings",
+            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
         // Surface opens (backlog 628f182b): the SPA posts each route
         // open here and the Codebase page reads the roll-up. The write
         // is credited to the SESSION — this proxy strips any
@@ -1178,8 +1190,10 @@ mod routing_tests {
             proxy_client: reqwest::Client::new(),
             perf: Arc::new(PerfCollector::new()),
             machine_token: Default::default(),
-            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
-                .unwrap(),
+            machine: boss_gateway::machine_client::MachineClient::unstamped(
+                reqwest::Client::builder(),
+            )
+            .unwrap(),
         });
         build_router(local_auth, reads).with_state(state)
     }
@@ -1360,8 +1374,9 @@ mod routing_tests {
     /// Every `/api/...` path the web bundle fetches, read from
     /// `apps/web/src` itself. Each string or template literal that opens
     /// `/api/` yields one probe path:
-    /// - a template cut by `${…}` probes with a placeholder segment
-    ///   (`/api/jobs/${id}` → `/api/jobs/probe`);
+    /// - template parameters become placeholder segments, retaining
+    ///   the literal suffix (`/api/sensors/${id}/readings` →
+    ///   `/api/sensors/probe/readings`);
     /// - a literal assigned to a name (`const API_BASE = '/api/ledger'`)
     ///   is a base every fetch suffixes, so it probes `/api/ledger/probe`;
     /// - a literal ending in `/` is a `startsWith` prefix, not a fetch;
@@ -1411,22 +1426,31 @@ mod routing_tests {
                 if before.contains("//") || before.trim_start().starts_with('*') {
                     continue;
                 }
-                let rest = &text[i..];
+                let literal = &text[i..];
+                // A fully dynamic first segment names no owning service.
+                if literal.starts_with("/api/${") {
+                    continue;
+                }
+                let expanded;
+                let rest = if text.as_bytes()[i - 1] == b'`' {
+                    expanded =
+                        template_route_parameters(literal.split('`').next().unwrap_or(literal));
+                    expanded.as_str()
+                } else {
+                    literal
+                };
                 let end = rest
                     .find(|c: char| {
                         !(c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
                     })
                     .unwrap_or(rest.len());
                 let mut path = rest[..end].to_string();
-                let cut_by_template = rest[end..].starts_with("${");
                 // `const API_BASE = '…'` — with the spaces; an HTML
                 // `href="…"` has none and is a fetch of exactly that path.
-                let assigned = before.ends_with(" = ");
-                if cut_by_template {
-                    if path.ends_with('/') {
-                        path.push_str("probe");
-                    }
-                } else if assigned {
+                let interpolated = text.as_bytes()[i - 1] == b'`'
+                    && literal.split('`').next().is_some_and(|v| v.contains("${"));
+                let assigned = before.ends_with(" = ") && !interpolated;
+                if assigned {
                     path.push_str("/probe");
                 } else if path.ends_with('/') {
                     continue;
@@ -1443,6 +1467,72 @@ mod routing_tests {
         found
     }
 
+    /// Replace each interpolated path parameter while keeping the literal
+    /// suffix. Query values are still cut off by the path-character scan.
+    fn template_route_parameters(mut text: &str) -> String {
+        let mut out = String::new();
+        while let Some(at) = text.find("${") {
+            out.push_str(&text[..at]);
+            let mut depth = 1;
+            let mut end = None;
+            for (i, c) in text[at + 2..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 {
+                    end = Some(at + 2 + i + 1);
+                    break;
+                }
+            }
+            let Some(end) = end else {
+                return format!("{out}unclosed-template");
+            };
+            out.push_str("probe");
+            text = &text[end..];
+        }
+        out.push_str(text);
+        out
+    }
+
+    #[test]
+    fn template_route_parameters_preserve_multiple_segments_and_queries() {
+        for (input, expected) in [
+            (
+                "/api/sensors/${encodeURIComponent(s.id)}/readings?since=${since}",
+                "/api/sensors/probe/readings?since=probe",
+            ),
+            (
+                "/api/jobs/${id}/steps/${step}/metadata",
+                "/api/jobs/probe/steps/probe/metadata",
+            ),
+            (
+                "/api/jobs/${choose({id: x})}/metadata",
+                "/api/jobs/probe/metadata",
+            ),
+            ("/api/jobs", "/api/jobs"),
+            ("/api/jobs/${broken", "/api/jobs/unclosed-template"),
+        ] {
+            assert_eq!(template_route_parameters(input), expected);
+        }
+    }
+
+    #[test]
+    fn a_readings_template_keeps_its_literal_suffix_in_the_route_probe() {
+        let paths = api_paths_the_web_fetches();
+        assert!(
+            paths
+                .iter()
+                .any(|(path, _)| path == "/api/sensors/probe/readings"),
+            "the interpolated sensor identity must retain the readings door"
+        );
+        assert!(
+            !paths.iter().any(|(path, _)| path == "/api/sensors/probe"),
+            "no consumer fetches a sensor detail door"
+        );
+    }
+
     /// A local-auth state with an empty credential store — enough to
     /// mount the `/api/auth/*` routes, which `app()` leaves off.
     fn empty_local_auth() -> Arc<LocalAuthState> {
@@ -1452,8 +1542,10 @@ mod routing_tests {
             store,
             session_key: vec![0u8; 32],
             http: reqwest::Client::new(),
-            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
-                .unwrap(),
+            machine: boss_gateway::machine_client::MachineClient::unstamped(
+                reqwest::Client::builder(),
+            )
+            .unwrap(),
             audit: boss_gateway::audit::AuthAudit::disabled(),
             guest_access: GuestAccess::Basic,
             oidc: None,
@@ -1553,11 +1645,50 @@ mod routing_tests {
         }
     }
 
-    /// The packet summary is session-gated EVEN on the demo tenant
-    /// (backlog 19f08bd6): it left the publishable table because it
-    /// counts what the caller may read, so a sessionless GET meets the
-    /// gate through `/api/jobs/{*rest}` like every other packet read —
-    /// 401 before anything is forwarded — and never the catch-all.
+    /// Sensor telemetry uses the existing session-gated jobs proxy;
+    /// mounting the panel's reads must not expose the poller's writes.
+    #[tokio::test]
+    async fn sensor_registry_and_readings_are_session_gated_reads_only() {
+        for path in [
+            "/api/sensors",
+            "/api/sensors/source-one/readings?since=2026-10-01T12:00:00Z",
+        ] {
+            let (status, body) = get(app(), path).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: {body}");
+            assert!(!body.contains(MISS), "{path} reached the catch-all: {body}");
+            for method in ["POST", "PUT", "PATCH", "DELETE"] {
+                let response = app()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(path)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "{method} {path}"
+                );
+            }
+        }
+        for path in [
+            "/api/sensors/batch",
+            "/api/sensors/sweep",
+            "/api/sensors/source-one/polled",
+            "/api/sensors/source-one/readings/external/packet",
+        ] {
+            let (status, body) = get(app(), path).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert!(
+                body.contains(MISS),
+                "write-only door must remain unmounted: {path}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn the_jobs_summary_is_session_gated_on_the_demo_tenant() {
         for path in ["/api/jobs/summary", "/api/jobs/summary?status=closed"] {
@@ -1730,8 +1861,10 @@ mod routing_tests {
             store,
             session_key: vec![0u8; 32],
             http: reqwest::Client::new(),
-            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
-                .unwrap(),
+            machine: boss_gateway::machine_client::MachineClient::unstamped(
+                reqwest::Client::builder(),
+            )
+            .unwrap(),
             audit: boss_gateway::audit::AuthAudit::disabled(),
             guest_access: GuestAccess::Basic,
             oidc: None,
@@ -1768,8 +1901,10 @@ mod routing_tests {
             store,
             session_key: vec![0u8; 32],
             http: reqwest::Client::new(),
-            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
-                .unwrap(),
+            machine: boss_gateway::machine_client::MachineClient::unstamped(
+                reqwest::Client::builder(),
+            )
+            .unwrap(),
             audit: boss_gateway::audit::AuthAudit::disabled(),
             guest_access: GuestAccess::Basic,
             oidc: None,
@@ -1827,8 +1962,10 @@ mod routing_tests {
             store,
             session_key: vec![0u8; 32],
             http: reqwest::Client::new(),
-            machine: boss_gateway::machine_client::MachineClient::build(reqwest::Client::builder())
-                .unwrap(),
+            machine: boss_gateway::machine_client::MachineClient::unstamped(
+                reqwest::Client::builder(),
+            )
+            .unwrap(),
             audit: boss_gateway::audit::AuthAudit::disabled(),
             guest_access: GuestAccess::Off,
             oidc: None,

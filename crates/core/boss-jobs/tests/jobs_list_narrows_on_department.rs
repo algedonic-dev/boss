@@ -141,20 +141,16 @@ fn packet(n: u8, kind: &str, title: &str) -> Job {
         id: JobId::from_uuid(
             Uuid::parse_str(&format!("00000000-0000-0000-0000-0000000000{n:02}")).expect("uuid"),
         ),
-        kind: kind.into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "algedonic"),
-        title: title.into(),
-        owner_id: "emp-david".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: day(2026, 9, 1),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::Value::Null,
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            kind,
+            Subject::new("custom", "algedonic"),
+            title,
+            "emp-david",
+            Priority::Standard,
+            day(2026, 9, 1),
+        )
     }
 }
 

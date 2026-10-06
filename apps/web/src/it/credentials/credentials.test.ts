@@ -59,12 +59,12 @@ const LIVE = [
     notes: '',
   },
   {
-    id: 'dauld-github-token',
-    kind: 'github-personal-access-token',
-    issuer: 'github.com (minted by David in the GitHub UI, as dauld)',
-    principal: 'user dauld',
+    id: 'hand-placed-vendor-key',
+    kind: 'api-key',
+    issuer: 'vendor.example (minted by hand in its web UI)',
+    principal: 'account example-operator',
     scopes: [],
-    storage_location: '/etc/boss-publish/github.token on the forge host',
+    storage_location: '/etc/example/vendor.key on the forge host',
     consumers: [],
     rotation_policy: 'on-demand',
     rotated_at: null,
@@ -96,7 +96,7 @@ const RULES = {
     {
       name: 'backlog-item-closes-on-land',
       on_event: 'step.done.land',
-      when: 'subject_id = "dauld-github-token"',
+      when: 'subject_id = "hand-placed-vendor-key"',
       do: [{ handler: 'jobs.close', args: {} }],
       version: 1,
       status: 'active',
@@ -159,23 +159,23 @@ describe('provenanceOf — root placed by David, minted by the broker, or placed
   });
 
   test('a rule naming the credential only in an arg still counts; one with another handler does not', () => {
-    const tunnel = { ...byId('dauld-github-token'), id: 'cloudflare-tunnel-credentials' };
+    const tunnel = { ...byId('hand-placed-vendor-key'), id: 'cloudflare-tunnel-credentials' };
     expect(provenanceOf(tunnel, { kind: 'ready', data: rules() })).toMatchObject({
       kind: 'broker',
       handlers: ['credential.rotate.cloudflare-tunnel'],
     });
-    // `backlog-item-closes-on-land` names dauld-github-token but is not a
+    // `backlog-item-closes-on-land` names hand-placed-vendor-key but is not a
     // credential.rotate handler: no broker rotates it.
-    expect(provenanceOf(byId('dauld-github-token'), { kind: 'ready', data: rules() })).toEqual({ kind: 'hand' });
+    expect(provenanceOf(byId('hand-placed-vendor-key'), { kind: 'ready', data: rules() })).toEqual({ kind: 'hand' });
   });
 
   test('an id is matched whole, as the quoted literal a rule spells', () => {
-    const shorter = { ...byId('dauld-github-token'), id: 'host-checkout-token' };
+    const shorter = { ...byId('hand-placed-vendor-key'), id: 'host-checkout-token' };
     expect(provenanceOf(shorter, { kind: 'ready', data: rules() })).toEqual({ kind: 'hand' });
   });
 
   test('an unread rule set is said, not guessed as hand-placed', () => {
-    expect(provenanceOf(byId('dauld-github-token'), { kind: 'failed', error: '/api/dispatcher/rules: HTTP 403' })).toEqual({
+    expect(provenanceOf(byId('hand-placed-vendor-key'), { kind: 'failed', error: '/api/dispatcher/rules: HTTP 403' })).toEqual({
       kind: 'unknown',
       why: '/api/dispatcher/rules: HTTP 403',
     });
@@ -187,12 +187,12 @@ describe('provenanceOf — root placed by David, minted by the broker, or placed
       'broker-revokes-the-cloudflare-tunnel-daily',
     ]);
     // A retired (or unstated) rule rotates nothing: its credential is not the broker's.
-    const retired = { ...RULES.rules[0], name: 'retired-rotator', when: 'subject_id = "dauld-github-token"', status: 'retired' };
-    const unstated = { ...RULES.rules[0], name: 'unstated-rotator', when: 'subject_id = "dauld-github-token"', status: undefined };
+    const retired = { ...RULES.rules[0], name: 'retired-rotator', when: 'subject_id = "hand-placed-vendor-key"', status: 'retired' };
+    const unstated = { ...RULES.rules[0], name: 'unstated-rotator', when: 'subject_id = "hand-placed-vendor-key"', status: undefined };
     const withStale = parseBrokerRules({ ...RULES, rules: [...RULES.rules, retired, unstated] });
     expect(withStale.map((r) => r.name)).not.toContain('retired-rotator');
     expect(withStale.map((r) => r.name)).not.toContain('unstated-rotator');
-    expect(provenanceOf(byId('dauld-github-token'), { kind: 'ready', data: withStale })).toEqual({ kind: 'hand' });
+    expect(provenanceOf(byId('hand-placed-vendor-key'), { kind: 'ready', data: withStale })).toEqual({ kind: 'hand' });
     expect(() => parseBrokerRules([])).toThrow(/no rule list/);
     expect(() => parseBrokerRules({ rules: [], error: 'db down' })).toThrow(/db down/);
   });
@@ -200,14 +200,14 @@ describe('provenanceOf — root placed by David, minted by the broker, or placed
 
 describe('gaps — what the registry does not say is drawn as missing', () => {
   test('no consumer, no recorded rotation and unverified scopes are gaps', () => {
-    expect(gapsOf(byId('dauld-github-token'))).toEqual(['no consumer declared', 'no rotation recorded', 'scopes unverified']);
+    expect(gapsOf(byId('hand-placed-vendor-key'))).toEqual(['no consumer declared', 'no rotation recorded', 'scopes unverified']);
     expect(gapsOf(byId('forge-host-checkout-token'))).toEqual([]);
   });
 
   test('the text each gap cell carries', () => {
-    expect(scopesText(byId('dauld-github-token'))).toEqual({ text: 'unverified — the audit fills this', gap: true });
+    expect(scopesText(byId('hand-placed-vendor-key'))).toEqual({ text: 'unverified — the audit fills this', gap: true });
     expect(scopesText(byId('forge-host-checkout-token'))).toEqual({ text: 'write:repository', gap: false });
-    expect(lastRotationText(byId('dauld-github-token'))).toEqual({ text: 'never recorded', gap: true });
+    expect(lastRotationText(byId('hand-placed-vendor-key'))).toEqual({ text: 'never recorded', gap: true });
     expect(lastRotationText(byId('forge-host-checkout-token'))).toEqual({ text: '2026-09-26 23:05Z', gap: false });
   });
 

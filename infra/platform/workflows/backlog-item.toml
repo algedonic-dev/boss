@@ -5,7 +5,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "One piece of engineering backlog, modelled as work rather than a line in a markdown file. The Subject is the area it touches, so \"what is outstanding against the ledger\" answers from Subject history. Triage requires the evidence behind the routing decision, because the failure mode of a backlog is not neglect but confident wrong answers read off its own text \u2014 an internal claim about the codebase decays every time the codebase moves. `stale` exists for the items that die without anyone doing them, and `verify` for the ones whose claim needs re-measuring before anyone acts. An item routed to `design` is not finished by the review: the review's verdict is its route, and `approved` opens the build the design decided on rather than closing the item on the decision."
-metadata = { owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "filed"

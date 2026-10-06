@@ -35,21 +35,18 @@ fn job(n: usize, (kind, owner, sk, sid, status): (&str, &str, &str, &str, JobSta
     let id = Uuid::parse_str(&format!("19f08bd6-0000-0000-0001-{n:012}")).expect("uuid");
     Job {
         id: JobId::from_uuid(id),
-        kind: kind.to_string(),
-        workflow_version: 1,
-        subject: Subject::new(sk, sid),
-        title: format!("packet {n}"),
-        owner_id: owner.into(),
         status,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 20).expect("day"),
-        opened_at: None,
-        due_on: None,
         closed_on: (status == JobStatus::Closed)
             .then(|| NaiveDate::from_ymd_opt(2026, 9, 21).expect("day")),
         metadata: serde_json::Value::Null,
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            kind.to_string(),
+            Subject::new(sk, sid),
+            format!("packet {n}"),
+            owner,
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 20).expect("day"),
+        )
     }
 }
 

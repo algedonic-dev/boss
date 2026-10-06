@@ -1,0 +1,23 @@
+{
+  "about": "READ-ONLY: renders what `move-volume-replica` WOULD do to one replica of one Longhorn volume, and does nothing (infra/forge/move-volume-replica.sh --plan <volume> <replica>; backlog ab39a34e, incident d3c0a67c). It runs every bound the write runs — the volume is one pvc-<uuid> Longhorn holds in longhorn-system and the replica one of ITS replicas; the volume is attached, robustness healthy, with exactly spec.numberOfReplicas replicas, every one healthy and active on a distinct node; replica-soft-anti-affinity resolves to false, so the disks the new replica can land on are the schedulable disks of the nodes holding none; data locality disabled, replica auto-balance resolving to disabled and no eviction requested on any replica or its node or disk, so Longhorn v1.11.3 trims nothing itself when the count is lowered; and EVERY disk the new replica can land on has ledger headroom for at least twice the volume (ProvisionedLimit − storageScheduled >= 2 x size) AND passes, on live figures, Longhorn v1.11.3's placement test IsSchedulableToDisk(size, actualSize) and CheckReplicasSizeExpansion's test for the volume's next growth there (the arithmetic in infra/lib/longhorn-ledger.sh, judged at every render, its figures on stderr) — and then prints the plan: the volume, its size, the trim settings, the replica to move, the count's path N -> N+1 -> N, every target disk with its headroom sum, what the remaining replicas' disks admit after the move, the four steps, and every Longhorn disk's verdict with its reason. No clock, no live free space and no actualSize in the bytes (they ride stderr); its sha256 is printed on stderr as `plan-sha256:`, and that hash is what David's passkey signs (design 17835005 q1). Every read goes through the forge's ops_kubectl door; a read that could not look is CANNOT ANSWER (exit 1), never a plan. Any refusal renders no plan.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/move-volume-replica.sh",
+    "--plan",
+    "{1}",
+    "{2}"
+  ],
+  "params": [
+    {
+      "name": "volume",
+      "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    {
+      "name": "replica",
+      "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-r-[0-9a-f]{8}$"
+    }
+  ],
+  "timeout": 120
+}

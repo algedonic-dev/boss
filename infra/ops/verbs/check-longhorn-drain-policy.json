@@ -1,0 +1,12 @@
+{
+  "about": "READ-ONLY: how long Longhorn's node-drain-policy has stood away from Longhorn's default (infra/forge/longhorn-drain-policy.sh --check; backlog 46584350). Filed every day by the dispatcher rule check-longhorn-drain-policy-daily, and judged by watch-check-longhorn-drain-policy-daily, which files an urgent alarm once a non-default value has stood 24 hours — the threshold is the watch's `when`, not a number here. WHY: set-longhorn-drain-policy relaxes the policy for a maintenance window (the w-1 NVMe window of 2026-09-30, backlog 52ea56ac) and nothing else would notice it left relaxed, under which a drain proceeds past a volume's last healthy replica. Through the forge's ops_kubectl door, kubectl get only: the stored setting (with its managedFields, which kubectl hides by default) and Longhorn's definition from its manager API through the API server's service proxy — the default and the options are read, never typed here. When the value is not the default, WHEN it was written is the API server's own managedFields time for the entry that owns `value`. Its last line is the verdict `READ — node-drain-policy <v>, default <d>, non_default <0|1>, hours <h>`. A read that could not look, a stored value Longhorn's API disagrees with, or a non-default value whose write time cannot be read is CANNOT ANSWER (exit 1), which the watch alarms on too. Timeout 120: two reads at 20 s each and, the first time, the door image's pull.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/longhorn-drain-policy.sh",
+    "--check"
+  ],
+  "params": [],
+  "timeout": 120
+}

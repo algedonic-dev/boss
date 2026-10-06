@@ -1474,7 +1474,7 @@ describe('the machines', () => {
     const live = scene(
       yardOf(),
       statusOf({
-        conductor: { last_seen: '2026-09-07T23:10:00Z', silent_for_minutes: 10, expected_every_minutes: 10, silent: false, last_verb: 'reconcile', last_rc: 0 },
+        conductor: { last_seen: '2026-09-07T23:10:00Z', silent_for_minutes: 10, expected_every_minutes: 10, silent: false, last_verb: 'reconcile', last_rc: 0, withheld: null },
       }),
       NOW,
     );
@@ -1483,7 +1483,7 @@ describe('the machines', () => {
     const silent = scene(
       yardOf(),
       statusOf({
-        conductor: { last_seen: '2026-09-07T22:00:00Z', silent_for_minutes: 80, expected_every_minutes: 10, silent: true, last_verb: 'reconcile', last_rc: 0 },
+        conductor: { last_seen: '2026-09-07T22:00:00Z', silent_for_minutes: 80, expected_every_minutes: 10, silent: true, last_verb: 'reconcile', last_rc: 0, withheld: null },
       }),
       NOW,
     );
@@ -1492,6 +1492,20 @@ describe('the machines', () => {
     const none = scene(yardOf(), statusOf({ conductor: null }), NOW);
     expect(none.machines.conductor).toMatchObject({ lamp: 'off', nextTick: null });
     expect(none.machines.conductor.label).toBe('no reading');
+    // Withheld by scope (bd506215): unlit, said as the refusal — never the
+    // warn lamp "no firing on record" wore for it.
+    const withheld = scene(
+      yardOf(),
+      statusOf({
+        conductor: {
+          last_seen: null, silent_for_minutes: null, expected_every_minutes: 10, silent: false,
+          last_verb: null, last_rc: null, withheld: "this caller's policy scope does not read every packet",
+        },
+      }),
+      NOW,
+    );
+    expect(withheld.machines.conductor).toMatchObject({ lamp: 'off', silent: false, nextTick: null });
+    expect(withheld.machines.conductor.label).toBe('not in your policy scope');
   });
 
   test('the runner shed and the cluster tower have no reading until the page feeds one — that is what they say', () => {

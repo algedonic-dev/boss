@@ -48,9 +48,10 @@ and boss-gcp's journals are also readable over HTTP on `:19531`
 - **The `boss-pg-backup` CronJob** in namespace `boss`
   (`infra/cluster/manifests/boss-backup.yaml`) runs nightly at 09:10
   UTC: `pg_dump` of the whole `boss` database, gzipped, onto the
-  `boss-backups` PVC (14-day retention), then shipped offsite twice —
-  to boss-gcp over a deposit-only forced-command key, and to the GCS
-  bucket named in secret `boss-gcs-offsite`.
+  `boss-backups` PVC (14-day retention), then uploaded offsite to the
+  GCS bucket named in secret `boss-gcs-offsite` — the one offsite copy
+  (boss-gcp stopped holding one on 2026-10-01, backlog 4bf7bdd1). The
+  recovery sheet's backups road prints how to fetch a dump from it.
 - **Every run leaves a packet** of kind `maintenance-backup` in the
   system of record, opened before the dump and closed with the
   verdict after the last leg; a failed leg fails the Job loudly.
@@ -124,10 +125,12 @@ kubectl -n boss exec deploy/boss -- boss-audit-integrity-check
   the event relay re-drives from the transactional outbox and the
   rebuild re-derives every projection, so nothing that reached the
   log is lost.
-- **Secrets.** The `boss-secrets` Secret (machine token, session
-  key) is not in the dump; it lives in the cluster, and a restored
-  database against a rotated key needs the key ceremony re-run
-  (`docs/runbooks/machine-token-activation.md`).
+- **Secrets.** The `boss-secrets` Secret (session key) and the
+  `boss-machine-token` Secret are not in the dump; they live in the
+  cluster. The machine token has no ceremony to re-run: a
+  `rotate-a-credential` packet opened on `boss-machine-token` has the
+  credential broker mint a fresh one (design 6805c764, car 3), and a
+  restore needs nothing from the dump to do it.
 - **The tenant's files.** `file_refs` bytes live outside the
   database and are off in every container deploy today.
 

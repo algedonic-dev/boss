@@ -362,7 +362,10 @@ async fn consume_part_emits_item_consumed_event() {
 
 #[tokio::test]
 async fn create_order_returns_201_and_emits_po_upserted_event() {
-    let app = InventoryTestApp::new();
+    // A placed order names a vendor that exists (the subject edge on
+    // `inventory.purchase_order.upserted`); the double checks it as
+    // production does since backlog be459ab9.
+    let app = InventoryTestApp::with_vendors(vec![vendor_fixture("Acme Parts Co")]);
 
     let body = json!({
         "vendor": "Acme Parts Co",
@@ -392,13 +395,52 @@ async fn create_order_returns_201_and_emits_po_upserted_event() {
     );
 }
 
+/// An order naming a vendor nobody registered is the caller's error,
+/// not the service's: 404 naming the vendor, and nothing recorded. It
+/// answered 500 with the subject-edge trigger's text until backlog
+/// be459ab9.
+#[tokio::test]
+async fn create_order_naming_an_unregistered_vendor_returns_404() {
+    let app = InventoryTestApp::new();
+    let resp = TestRequest::post("/api/inventory/orders/create")
+        .json(&json!({
+            "vendor": "Nobody Supply",
+            "lines": [{ "part_sku": "PART-001", "qty": 1, "unit_cost_cents": 5 }]
+        }))
+        .send(&app.router)
+        .await;
+    resp.assert_status(StatusCode::NOT_FOUND);
+    assert!(
+        resp.body_text().contains("Nobody Supply"),
+        "{}",
+        resp.body_text()
+    );
+    app.assert_event_not_recorded("inventory.purchase_order.upserted");
+}
+
+/// A NUL byte in a written field is refused 400 naming the field — it
+/// answered 500 with Postgres's encoding error until backlog be459ab9.
+#[tokio::test]
+async fn create_vendor_with_a_nul_byte_returns_400() {
+    let app = InventoryTestApp::new();
+    let resp = TestRequest::post("/api/inventory/vendors")
+        .json(&json!({ "id": "v-nul", "name": "Bad\u{0}Name" }))
+        .send(&app.router)
+        .await;
+    resp.assert_status(StatusCode::BAD_REQUEST);
+    assert!(resp.body_text().contains("name"), "{}", resp.body_text());
+}
+
 // ---------------------------------------------------------------------------
 // POST /api/inventory/orders/batch
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn batch_create_orders_preserves_backdated_fields() {
-    let app = InventoryTestApp::new();
+    let app = InventoryTestApp::with_vendors(vec![
+        vendor_fixture("Optica Components"),
+        vendor_fixture("NetParts Direct"),
+    ]);
 
     let body = json!([
         {

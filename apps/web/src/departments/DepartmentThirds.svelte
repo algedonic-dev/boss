@@ -22,20 +22,23 @@
   import { subjectLabel, subjectPath, type Job } from '../jobs/types';
   import {
     OUT_WINDOW_DAYS,
-    PAGE,
     THIRD_LABEL,
+    departmentThirds,
     loadDepartment,
-    thirds,
+    truncatedReads,
     waitedFor,
     waitingAt,
-    type JobsPage,
+    type DepartmentJobs,
     type Third,
   } from './department';
   import { loadStepWaits, type StepWaits } from '../jobs/queueAge';
 
   let { code } = $props<{ code: string }>();
 
-  let page = $state<Remote<JobsPage>>({ kind: 'loading' });
+  // Two reads, live and departed, each its own page and total
+  // (backlog a22311a1) — one mixed page let a day of departures push
+  // the open work off it.
+  let page = $state<Remote<DepartmentJobs>>({ kind: 'loading' });
   // Since when each packet has waited: the queue-age lens, ONE read
   // beside the department read, joined by step id (backlog 66a5d5be) —
   // the listing carries no ready-since instant, by design.
@@ -60,9 +63,12 @@
   });
 
   const label = $derived(departmentLabel(code, departments()));
-  const rows = $derived<ReadonlyArray<Job>>(page.kind === 'ready' ? page.data.rows : []);
-  const split = $derived(thirds(rows));
-  const truncated = $derived(page.kind === 'ready' && page.data.total > page.data.rows.length);
+  const split = $derived(
+    page.kind === 'ready' ? departmentThirds(page.data) : { in: [], working: [], out: [] },
+  );
+  const shown = $derived(split.in.length + split.working.length + split.out.length);
+  const truncated = $derived(page.kind === 'ready' ? truncatedReads(page.data) : []);
+  const READ_LABEL = { live: 'live packets (In and Working)', out: 'departures (Out)' } as const;
 
   const THIRDS: ReadonlyArray<Readonly<{ id: Third; note: string }>> = [
     { id: 'in', note: 'open, nothing done yet — standing at the first step' },
@@ -78,18 +84,18 @@
        (tests/mocked/_routes.ts): a failed read is a failure line,
        never an empty department. -->
   <p class="empty load-failed">Couldn't load this department's jobs: {page.error}</p>
-{:else if rows.length === 0}
+{:else if shown === 0}
   <p class="empty">
     No jobs in {label}: no packet of a kind whose workflow declares this department is live or
     closed in the last {OUT_WINDOW_DAYS} days.
   </p>
 {:else}
-  {#if truncated}
-    <p class="empty">
-      Showing {rows.length} of {page.data.total} — this read is one page of {PAGE}; the
-      thirds below are of the page, not of the department.
+  {#each truncated as t (t.read)}
+    <p class="empty truncated">
+      Showing {t.shown} of {t.total} {READ_LABEL[t.read]} — that read is one page; its thirds
+      below are of the page, not of the department.
     </p>
-  {/if}
+  {/each}
   {#if waits.kind === 'failed'}
     <!-- The ages are a second read; its failure is said once, here,
          and never paints the thirds as having no wait. -->

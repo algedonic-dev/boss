@@ -361,20 +361,16 @@ async fn scheduled_as(
 ) -> (Job, Step) {
     let job = Job {
         id: JobId::from_uuid(Uuid::new_v4()),
-        kind: KIND.into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "visit"),
-        title: "A visit started through the claim door".into(),
-        owner_id: TECH.into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 26).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            KIND,
+            Subject::new("custom", "visit"),
+            "A visit started through the claim door",
+            TECH,
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 26).unwrap(),
+        )
     };
     jobs.create_job(&job).await.unwrap();
     let mut step = Step::new(job.id, "scheduling", "Visit", 1);
@@ -520,20 +516,16 @@ async fn the_loser_of_a_claim_race_holds_none_of_the_winners_time() {
 async fn unpinned_job_and_step(jobs: &InMemoryJobs) -> (Job, Step) {
     let job = Job {
         id: JobId::from_uuid(Uuid::new_v4()),
-        kind: "ad-hoc".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "ad-hoc"),
-        title: "A packet no protocol row describes".into(),
-        owner_id: TECH.into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 27).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "ad-hoc",
+            Subject::new("custom", "ad-hoc"),
+            "A packet no protocol row describes",
+            TECH,
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 27).unwrap(),
+        )
     };
     jobs.create_job(&job).await.unwrap();
     let mut step = Step::new(job.id, "scheduling", "Posted", 1);
@@ -948,6 +940,18 @@ impl AgentsRegistry for ListFailsOnCall {
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<AgentsBatchOutcome, AgentsError> {
         self.inner.publish(rows, mode, stamp).await
+    }
+    async fn list_automations(
+        &self,
+    ) -> Result<Vec<boss_jobs::agents::AutomationActor>, AgentsError> {
+        self.inner.list_automations().await
+    }
+    async fn declare_automations(
+        &self,
+        rows: &[boss_jobs::agents::AutomationActor],
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<boss_jobs::agents::AutomationsSeedOutcome, AgentsError> {
+        self.inner.declare_automations(rows, stamp).await
     }
 }
 

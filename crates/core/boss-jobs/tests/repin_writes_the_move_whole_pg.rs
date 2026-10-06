@@ -43,20 +43,17 @@ fn set_procedure(spec: &mut WorkflowSpec, slug: &str, text: &str) {
 fn job(from: &WorkflowSpec) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str("00000000-0000-0000-0000-00000000a4e1").unwrap()),
-        kind: from.kind.clone(),
         workflow_version: from.version,
-        subject: Subject::new("custom", "feat/x"),
-        title: "t".into(),
-        owner_id: "emp-1".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({ "note": "kept" }),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            from.kind.clone(),
+            Subject::new("custom", "feat/x"),
+            "t",
+            "emp-1",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+        )
     }
 }
 

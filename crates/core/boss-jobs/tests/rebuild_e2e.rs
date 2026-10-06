@@ -149,33 +149,28 @@ fn build_app(pool: PgPool) -> Router {
 fn fixture_job(id: &str, title: &str) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
-        kind: "service-visit".into(),
-        workflow_version: 1,
-        subject: Subject::new("account", "acc-001"),
-        title: title.into(),
-        owner_id: "emp-100".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
-        opened_at: None,
         due_on: Some(NaiveDate::from_ymd_opt(2026, 4, 30).unwrap()),
-        closed_on: None,
         metadata: serde_json::json!({"site": "main"}),
         tags: vec!["urgent".into(), "vip".into()],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "service-visit",
+            Subject::new("account", "acc-001"),
+            title,
+            "emp-100",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
+        )
     }
 }
 
 fn fixture_step(step_id: &str, job_id: &str, sort_order: i32, title: &str) -> Step {
     Step {
         id: StepId::from_uuid(Uuid::parse_str(step_id).unwrap()),
-        job_id: JobId::from_uuid(Uuid::parse_str(job_id).unwrap()),
         // `generic` has no required-on-done metadata fields, so the
         // step can flip to Done without us shaping a kind-specific
         // metadata payload — this test exercises rebuild, not
         // step-kind validation.
-        kind: "generic".into(),
-        title: title.into(),
         // A real slug, deliberately different from the title: the
         // before/after snapshot equality proves the rebuilder
         // reproduces the column (a projection column lands WITH its
@@ -183,20 +178,24 @@ fn fixture_step(step_id: &str, job_id: &str, sort_order: i32, title: &str) -> St
         spec_slug: Some(format!("slug-{sort_order}")),
         assignee_id: Some("emp-200".into()),
         status: StepStatus::Pending,
-        sort_order,
-        blocked_by: vec![],
-        sign_offs_required: Vec::new(),
-        assurance_required: None,
-        sign_offs: Vec::new(),
-        fields: Vec::new(),
-        completed_on: None,
-        completed_by: None,
-        completed_at: None,
         metadata: serde_json::json!({}),
-        notes: None,
-        step_plugin_version: 0,
-        embedded_job: None,
+        ..Step::new(
+            JobId::from_uuid(Uuid::parse_str(job_id).unwrap()),
+            "generic",
+            title,
+            sort_order,
+        )
     }
+}
+
+/// A step sent back as a whole row, WITHOUT its `metadata`: the step
+/// PUT refuses any body carrying metadata since e39a9d2a (the merge
+/// door is its one writer), and a whole-row write-back is not a
+/// metadata write.
+fn step_put_body(step: &Step) -> serde_json::Value {
+    let mut row = serde_json::to_value(step).unwrap();
+    row.as_object_mut().unwrap().remove("metadata");
+    row
 }
 
 async fn http_json(
@@ -323,7 +322,7 @@ async fn rebuild_reproduces_jobs_and_steps_after_drop() {
         "PUT",
         &format!("/api/jobs/{}/steps/{}", step1.job_id, step1.id),
         &ceo,
-        Some(&serde_json::to_value(&step1_done).unwrap()),
+        Some(&step_put_body(&step1_done)),
     )
     .await;
 
@@ -337,7 +336,7 @@ async fn rebuild_reproduces_jobs_and_steps_after_drop() {
         "PUT",
         &format!("/api/jobs/{}/steps/{}", step2.job_id, step2.id),
         &ceo,
-        Some(&serde_json::to_value(&step2_ready).unwrap()),
+        Some(&step_put_body(&step2_ready)),
     )
     .await;
 

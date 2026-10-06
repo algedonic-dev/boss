@@ -674,6 +674,7 @@ pub(crate) fn run_body(
             "packet": packet_id,
             "step": step_slug,
             "agent": agent,
+            "profile": settings.profile,
             "model": settings.model,
             "budget_usd": settings.budget_usd,
             "effort": settings.effort,
@@ -792,6 +793,33 @@ pub(crate) fn definition_in(repo: &Path, settings: &Settings) -> Option<String> 
         .join(boss_jobs::agent_spec::DEFINITIONS_DIR)
         .join(format!("{name}.md"));
     path.is_file().then_some(name)
+}
+
+/// THE UNHELD-REVIEW DOOR (review 0545d1b1 of car bc9ef34f,
+/// 2026-09-30). Every car's `review` step carries the reviewer block
+/// once ship-a-change declares it, held or not, and an unheld car
+/// boards on dock depth within minutes. A reviewer dispatched there
+/// spends a run on a verdict nothing waits for and holds a step the
+/// conductor is about to complete, so the step is refused before the
+/// claim unless its hold marker is set — read by
+/// `boss_jobs::stranded::hold_reason`, the one definition the dock and
+/// the loading-dock station share.
+pub(crate) fn unheld_review_refusal(kind: &str, slug: &str, step: &Value) -> Option<String> {
+    if kind != boss_jobs::regions::CAR_KIND || slug != boss_jobs::car::REVIEW_SLUG {
+        return None;
+    }
+    let held = step
+        .get("metadata")
+        .and_then(boss_jobs::stranded::hold_reason)
+        .is_some();
+    (!held).then(|| {
+        format!(
+            "step `{slug}` of this car carries no hold, so no adversarial review waits on it — \
+             an unheld car boards on its green, and a reviewer claimed here would hold the step \
+             the conductor completes at boarding. Hold the car first (boss hold) if it needs \
+             review; nothing claimed, nothing filed"
+        )
+    })
 }
 
 /// Whether a run gets a git worktree of its own — decided by the LANE
@@ -1301,6 +1329,9 @@ pub(crate) async fn dispatch_at(
     // the hosting and landed-work doors stop work that should not
     // happen, this one stops work that WOULD happen and then vanish.
     if let Some(why) = discarded_stdout_refusal() {
+        bail!("{why}");
+    }
+    if let Some(why) = unheld_review_refusal(&kind, &slug, step) {
         bail!("{why}");
     }
 
@@ -1815,7 +1846,7 @@ pub async fn next(
         bail!("--budget must be a positive number of dollars, got {b}");
     }
     next_at(
-        &crate::gate::machine_client().unwrap(),
+        &crate::gate::machine_client()?,
         &base,
         &repo,
         &station,
@@ -2062,8 +2093,8 @@ pub(crate) fn no_terminal_line(short: &str) -> String {
          work that ships no car. A run whose gate is still running needs nothing — its green \
          writes `gated` and this report lands on `{REPORTED_SLUG}` by itself ({LANDING_RULE}), \
          and the hourly clock writes `died` of a gate that never goes green. The agent_runs \
-         cost row is written only by a --report made once the run has an outcome; the landing \
-         does not write it"
+         cost row rides the packet as `{FINISH_RECORD_KEY}` until then: the landing posts it, \
+         and a --report made after the refusal writes it"
     )
 }
 
@@ -2072,6 +2103,12 @@ pub(crate) fn no_terminal_line(short: &str) -> String {
 /// file under `infra/dispatcher/rules/` is held to this name by
 /// `the_landing_rule_the_report_names_is_authored`.
 pub(crate) const LANDING_RULE: &str = "agent-run-lands-a-report-sent-before-green";
+
+/// The packet key a report sent before the run's terminal stores its
+/// `agent_runs` record under, outcome left out — the landing rule's
+/// `post_record` (backlog bb32b2a0), held to it by
+/// `the_landing_rule_posts_the_record_report_stores`.
+pub(crate) const FINISH_RECORD_KEY: &str = "finish_record";
 
 /// What `--report` says of a run whose `reported` step is neither open
 /// nor completed — read off the terminal `building` reached, because
@@ -2251,12 +2288,17 @@ pub(crate) async fn transcript_slice_at(
 /// evidence ([`run_branch`]) —
 /// the two together are what makes reliability-vs-cost a query rather
 /// than a guess (backlog 8f1de7bf).
+///
+/// `outcome` `None` is the record of a run that has reached no terminal
+/// yet (backlog bb32b2a0): the key is left OUT, never guessed, and the
+/// record is stored on the packet as [`FINISH_RECORD_KEY`] for the
+/// landing rule to post with the outcome its firing implies.
 pub(crate) fn run_record(
     run: &Value,
     actor_id: &str,
     r: &Report,
     finished_at: chrono::DateTime<chrono::Utc>,
-    outcome: &str,
+    outcome: Option<&str>,
 ) -> Result<Value> {
     let run_id = crate::envelope::job_id(run).context("the run has no id")?;
     let md = run.get("metadata").cloned().unwrap_or(Value::Null);
@@ -2339,6 +2381,11 @@ pub(crate) fn run_record(
     });
     if let (Some(dst), Some(src)) = (body.as_object_mut(), tokens.as_object()) {
         dst.extend(src.clone());
+    }
+    if outcome.is_none()
+        && let Some(dst) = body.as_object_mut()
+    {
+        dst.remove("outcome");
     }
     // The call count the record has carried since its first day and no
     // report ever filled (backlog 2f23f4c6): a metered run's transcript
@@ -2750,13 +2797,68 @@ pub(crate) async fn report_with_receipt_at(
     let receipt =
         tenant_receipt_verdict(short, &run, tenant).map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    // The run as it stands once this report is on it, so the finish
+    // record names the tenant branch the report puts there ([`run_branch`]).
+    let with_receipt = |run: Value| match &receipt {
+        Some(r) => {
+            let mut held = run;
+            held["metadata"][TENANT_RECEIPT_KEY] = r.clone();
+            held
+        }
+        None => run,
+    };
+    let run = with_receipt(run);
+
+    // WHO RAN IT: the registered id the finish record names. A run with
+    // no terminal yet reads it BEFORE the report is written, because it
+    // stores its record IN the report's own write (below); a run with
+    // one reads it after, where it always did. A failure is held, not
+    // raised, so the handback still reaches the packet.
+    let resolve_actor = || async {
+        let login = run
+            .pointer("/metadata/agent")
+            .and_then(Value::as_str)
+            .with_context(|| format!("run {short} names no agent"))?;
+        let agents =
+            crate::train::rows(api_at(Method::GET, "/api/agents".to_string(), None).await?)?;
+        resolve_agent(&agents, login).with_context(|| {
+            format!(
+                "run {short} signs as {login:?}, which no agents row names — register it (an \
+                 `[[agent]]` in seeds/agents.toml with that login among its aliases, then `boss \
+                 tenant publish`) so the run's record can name its CPU; the report itself is on \
+                 the packet"
+            )
+        })
+    };
+    let early_actor: Option<Result<String>> = match run_outcome(&run) {
+        None => Some(resolve_actor().await),
+        Some(_) => None,
+    };
+
     // THE RECORD FIRST: the handback rides the packet whether or not
     // the green has opened `reported` yet (rule 8 of the builder
     // rules: the report arrives at gate launch, ten minutes earlier).
+    //
+    // A run with no terminal yet carries its finish record in the SAME
+    // write (review de8a09bd B2): the landing rule completes `reported`
+    // as soon as `report` is on the packet, so a record stored in a
+    // second write, seconds later, lost every green that fell in the gap
+    // — the landing found `report`, posted nothing, and closed the step.
+    // One write, and the landing sees both or neither.
     let mut patch = report_patch(report);
     if let Some(r) = &receipt {
         patch[TENANT_RECEIPT_KEY] = r.clone();
     }
+    let unstored = match &early_actor {
+        Some(Ok(actor_id)) => match run_record(&run, actor_id, report, now, None) {
+            Ok(record) => {
+                patch[FINISH_RECORD_KEY] = record;
+                None
+            }
+            Err(e) => Some(e),
+        },
+        _ => None,
+    };
     api_at(
         Method::PATCH,
         format!("/api/jobs/{run_id}/metadata"),
@@ -2764,15 +2866,32 @@ pub(crate) async fn report_with_receipt_at(
     )
     .await
     .with_context(|| format!("recording the report on run {short}"))?;
-    // The run as it now stands, so the finish record below names the
-    // tenant branch this report just put on it ([`run_branch`]).
-    let run = match &receipt {
-        Some(r) => {
-            let mut held = run.clone();
-            held["metadata"][TENANT_RECEIPT_KEY] = r.clone();
-            held
-        }
-        None => run,
+
+    // A GREEN BETWEEN THE READ AND THE WRITE (backlog 9f9eee7d, review
+    // de8a09bd N2). A run read with no terminal can be landed by its
+    // gate's green before the write above arrives: `reported` opens,
+    // the landing rule fires on a packet holding no report and leaves
+    // the step alone, and nothing fires for that step again — so the
+    // run held a slot with its report on it. Read the run back AFTER
+    // the write: if it has reached a terminal, the steps below act on
+    // what it is now — a `reported` still open is completed from this
+    // report, exactly as the landing would have, and the cost row is
+    // posted with the outcome. Both sides are idempotent: a landing
+    // that fires after this finds the step closed, and the row is
+    // insert-once on `run_id`.
+    let run = match early_actor {
+        Some(_) => with_receipt(
+            api_at(Method::GET, format!("/api/jobs/{run_id}"), None)
+                .await
+                .with_context(|| {
+                    format!(
+                        "reading run {short} back after the report; the report is on the packet"
+                    )
+                })?
+                .context("the run read-back returned no body")?,
+        ),
+        // `resolve_actor` still borrows the first read.
+        None => run.clone(),
     };
 
     let reported = crate::envelope::steps(&run)
@@ -2868,27 +2987,28 @@ pub(crate) async fn report_with_receipt_at(
 
     // THE FINISH RECORD: what the run cost and how it went, where the
     // claim door reads it. The outcome is the terminal the run
-    // reached; a run that has reached none is not recorded at all,
-    // because the row is insert-once and the guess would stick
-    // (backlog 8f1de7bf).
+    // reached; a run that has reached none is not POSTED, because the
+    // row is insert-once and the guess would stick (backlog 8f1de7bf).
+    // Its record is STORED on the packet instead, without the outcome,
+    // and the landing rule posts it when the green opens `reported`
+    // (backlog bb32b2a0) — until then a pre-green report left no cost
+    // row at all, and the budget gate under-counted every such run. It
+    // was stored with the report above, in the same write.
+    let actor_id = match early_actor {
+        Some(actor) => actor?,
+        None => resolve_actor().await?,
+    };
     let Some(outcome) = run_outcome(&run) else {
+        if let Some(e) = unstored {
+            return Err(e.context(format!(
+                "run {short}'s finish record could not be built, so the landing will post no \
+                 cost row; the report itself is on the packet"
+            )));
+        }
         eprintln!("{}", no_terminal_line(short));
         return Ok(());
     };
-    let login = run
-        .pointer("/metadata/agent")
-        .and_then(Value::as_str)
-        .with_context(|| format!("run {short} names no agent"))?;
-    let agents = crate::train::rows(api_at(Method::GET, "/api/agents".to_string(), None).await?)?;
-    let actor_id = resolve_agent(&agents, login).with_context(|| {
-        format!(
-            "run {short} signs as {login:?}, which no agents row names — register it (an \
-             `[[agent]]` in seeds/agents.toml with that login among its aliases, then `boss \
-             tenant publish`) so the run's record can name its CPU; the report itself is on \
-             the packet"
-        )
-    })?;
-    let record = run_record(&run, &actor_id, report, now, outcome)?;
+    let record = run_record(&run, &actor_id, report, now, Some(outcome))?;
     let out = api_at(Method::POST, "/api/agent-runs".to_string(), Some(record))
         .await
         .with_context(|| format!("recording run {short} in agent_runs"))?;
@@ -2960,7 +3080,7 @@ pub async fn report(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let base = crate::gate::resolve_jobs_base(None)?;
     let actor = crate::identity::sign(&reqwest::Method::POST, "/api/jobs")?;
-    let http = crate::gate::machine_client().unwrap();
+    let http = crate::gate::machine_client()?;
     // METER THE RUN (backlog e6b2066f): its transcript's four counts
     // are what it consumed, and they supersede a typed count. Read here,
     // at the CLI boundary, because it is filesystem I/O. The week only
@@ -3089,7 +3209,7 @@ pub async fn run(
         bail!("--budget must be a positive number of dollars, got {b}");
     }
     dispatch_at(
-        &crate::gate::machine_client().unwrap(),
+        &crate::gate::machine_client()?,
         &base,
         &repo,
         &packet_ref,
@@ -3173,6 +3293,22 @@ mod tests {
             budget_usd: 5.0,
             effort: "high".into(),
         }
+    }
+
+    #[test]
+    fn a_dispatched_run_keeps_its_requested_profile_for_a_harness_adapter() {
+        let settings = block();
+        let body = run_body(
+            "packet",
+            "Title",
+            "build",
+            "agent-codex",
+            &settings,
+            "host",
+            "Brief",
+            "owner",
+        );
+        assert_eq!(body["metadata"]["profile"], settings.profile);
     }
 
     fn step(slug: &str, status: &str, metadata: Value) -> Value {
@@ -3731,7 +3867,7 @@ mod tests {
                 output: 5,
             }),
         };
-        let rec = run_record(&run, "agent-claude", &split, at, "success").unwrap();
+        let rec = run_record(&run, "agent-claude", &split, at, Some("success")).unwrap();
         assert_eq!(rec["run_id"], "5b1d2c3e-0000-4000-8000-000000000001");
         assert_eq!(
             rec["actor_id"], "agent-claude",
@@ -3763,14 +3899,14 @@ mod tests {
             meter: None,
             tokens: Some(Tokens::Total(761_000)),
         };
-        let rec = run_record(&run, "agent-claude", &total, at, "success").unwrap();
+        let rec = run_record(&run, "agent-claude", &total, at, Some("success")).unwrap();
         assert_eq!(rec["total_tokens"], 761_000);
         assert!(rec.get("input_tokens").is_none());
         // No stamp on briefed: the packet's opened_at is the start.
         let mut bare = run.clone();
         bare["steps"] = json!([{ "spec_slug": "reported", "status": "ready" }]);
         assert_eq!(
-            run_record(&bare, "agent-claude", &total, at, "success").unwrap()["started_at"],
+            run_record(&bare, "agent-claude", &total, at, Some("success")).unwrap()["started_at"],
             "2026-09-18T17:00:00Z"
         );
 
@@ -3811,7 +3947,7 @@ mod tests {
             }),
             tokens: Some(Tokens::Total(153_746)),
         };
-        let rec = run_record(&run, "agent-claude", &metered, at, "success").unwrap();
+        let rec = run_record(&run, "agent-claude", &metered, at, Some("success")).unwrap();
         // WHICH MODEL RAN (backlog 6bb85880): the transcript's, not the
         // block's. The block's word rides `detail` beside it, so a run
         // on a model other than the one its step declared is visible.
@@ -3860,7 +3996,7 @@ mod tests {
         if let Some(m) = silent.meter.as_mut() {
             m.models = crate::transcript_usage::RunModels::default();
         }
-        let rec = run_record(&run, "agent-claude", &silent, at, "success").unwrap();
+        let rec = run_record(&run, "agent-claude", &silent, at, Some("success")).unwrap();
         assert_eq!(rec["model"], "opus-5[1m]");
     }
 
@@ -3940,7 +4076,7 @@ mod tests {
             meter: None,
             tokens: None,
         };
-        let rec = run_record(&gated, "agent-claude", &silent, at, "success").unwrap();
+        let rec = run_record(&gated, "agent-claude", &silent, at, Some("success")).unwrap();
         assert_eq!(
             rec["branch"], "fix/a-probe-dates-its-cutoff-from-its-own-merge",
             "the column nothing used to fill"
@@ -4012,7 +4148,14 @@ mod tests {
             meter: None,
             tokens: Some(Tokens::Total(761_000)),
         };
-        let rec = run_record(&run(done("refused")), "agent-claude", &r, at, "cancelled").unwrap();
+        let rec = run_record(
+            &run(done("refused")),
+            "agent-claude",
+            &r,
+            at,
+            Some("cancelled"),
+        )
+        .unwrap();
         assert_eq!(rec["outcome"], "cancelled", "the terminal, not a literal");
         assert_eq!(
             rec["detail"]["effort"], "high",
@@ -5140,6 +5283,195 @@ mod wire_tests {
             "no car-lane gate facts: {brief}"
         );
         assert!(d.prompt.contains("WITHOUT isolation"), "{}", d.prompt);
+    }
+
+    /// A CAR HELD AT `review` DISPATCHES A REVIEWER (backlog bc9ef34f,
+    /// 2026-09-30). `boss dispatch <car>` refused with "step review of
+    /// ship-a-change declares no agent block", so every adversarial
+    /// review was a bare `boss job file --kind agent-run` sitting at
+    /// `briefed` until a hand closed it (23 read TROUBLED on
+    /// 2026-09-29). The block is read off the PLATFORM BUNDLE's own
+    /// ship-a-change row and projected onto the car's review step the
+    /// way admission projects it, so this test follows the row rather
+    /// than a literal. What the run is told is the reviewer's document
+    /// — ending on `boss review` inside its run — without a worktree.
+    /// And the run it files is one `boss release <car> --review <run>`
+    /// accepts once it records a RELEASE at the car's head
+    /// (`review_verdict::vouches`), while the car's builder run is
+    /// still refused by the same check.
+    const BUILDER_RUN: &str = "0b1d2c3e-0000-4000-8000-00000000000b";
+
+    /// The block the PLATFORM BUNDLE's ship-a-change row declares on
+    /// `review` — read, never typed, so the tests follow the row.
+    fn review_block() -> boss_jobs::agent_spec::AgentSpec {
+        boss_jobs::seed_loader::load_workflows(boss_jobs::registry::platform_bundle_path())
+            .expect("the platform bundle parses")
+            .iter()
+            .find(|w| w.kind == "ship-a-change")
+            .and_then(|w| w.steps.iter().find(|s| s.title == "review"))
+            .and_then(|s| s.agent.clone())
+            .expect("ship-a-change's review step declares an agent block")
+    }
+
+    /// A parked car at `review`, the block projected onto the step the
+    /// way admission projects it, held for `hold` when one is given.
+    fn car_at_review(hold: Option<&str>) -> Value {
+        let mut review_md = json!({ "authority_role": "platform-admin" });
+        if let Some(h) = hold {
+            review_md["hold"] = json!(h);
+        }
+        for (k, v) in boss_jobs::agent_spec::projection(&review_block()) {
+            review_md[k] = v;
+        }
+        json!({
+            "id": PACKET,
+            "kind": "ship-a-change",
+            "title": "fix/a-trust-boundary-change",
+            "status": "open",
+            "priority": "standard",
+            "opened_on": "2026-09-30",
+            "metadata": { "branch": "fix/a-trust-boundary-change", "agent_run": BUILDER_RUN },
+            "steps": [
+                { "id": "s-gate", "spec_slug": "gate", "status": "completed", "metadata": {} },
+                { "id": "s-review", "spec_slug": "review", "status": "ready",
+                  "title": "Open for review", "metadata": review_md },
+            ],
+        })
+    }
+
+    #[tokio::test]
+    async fn a_car_held_at_review_dispatches_a_reviewer_briefed_to_record_its_verdict() {
+        let block = review_block();
+        let car = car_at_review(Some("adversarial review of a trust-boundary change"));
+        let (base, log) = stub(car.clone(), row_with_block(), false).await;
+        let d = dispatch_at(
+            &crate::gate::machine_client().unwrap(),
+            &base,
+            &repo(),
+            PACKET,
+            None,
+            None,
+            &Overrides::default(),
+            false,
+            "claude@algedonic.dev",
+            "emp-david",
+            "h",
+            BriefSource::Rendered,
+        )
+        .await
+        .expect("a reviewer run is opened, not refused");
+        assert_eq!(d.run_id, RUN);
+        assert_eq!(
+            d.isolation,
+            Some(Isolation::Shared),
+            "a reviewer builds nothing in this tree: {:?}",
+            d.isolation
+        );
+        let calls = log.calls.lock().unwrap().clone();
+        assert!(
+            calls
+                .iter()
+                .any(|(m, p, _)| m == "POST" && p.ends_with("/steps/s-review/claim")),
+            "the review step is claimed: {calls:?}"
+        );
+        let filed = calls
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p == "/api/jobs")
+            .expect("the run is filed")
+            .2
+            .clone();
+        assert_eq!(filed["kind"], RUN_KIND);
+        assert_eq!(filed["metadata"]["step"], "review");
+        assert_eq!(filed["metadata"]["effort"], block.effort.as_str());
+        let brief = filed["metadata"]["brief"].as_str().unwrap();
+        assert!(brief.contains("# Reviewer rules"), "{brief}");
+        assert!(
+            brief.contains(
+                "BOSS_AGENT_RUN=<your run id> boss review <car> --verdict release|changes \
+                 --findings-file"
+            ),
+            "the brief ends the run on its recorded verdict: {brief}"
+        );
+        assert!(!brief.contains("# Builder rules"), "{brief}");
+        assert!(d.prompt.contains(RUN), "the prompt names the run to export");
+
+        // The run this dispatch filed, once `boss review` has written
+        // a RELEASE at the car's head onto it, is one the release door
+        // accepts — and the car's builder run, recording the same
+        // verdict, is not.
+        const HEAD: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
+        let verdict = crate::review_verdict::review_record(
+            &car,
+            HEAD,
+            crate::review_verdict::RELEASE,
+            "read the diff; nothing blocks",
+            "2026-09-30T16:00:00Z",
+        );
+        let mut run = filed.clone();
+        run["id"] = json!(RUN);
+        run["metadata"][crate::review_verdict::REVIEW_KEY] = verdict.clone();
+        assert_eq!(
+            crate::review_verdict::vouches(&run, &car, HEAD),
+            Ok(()),
+            "boss release <car> --review <this run> accepts a dispatched reviewer's verdict"
+        );
+        let mut builder = run.clone();
+        builder["id"] = json!(BUILDER_RUN);
+        let refused = crate::review_verdict::vouches(&builder, &car, HEAD)
+            .expect_err("the builder's own run is still no review");
+        assert!(refused.contains("built this car"), "{refused}");
+        // The run it filed names the car it was opened on, so its
+        // verdict cannot vouch for another car (review 0545d1b1).
+        assert_eq!(filed["metadata"]["packet"], PACKET);
+        let mut elsewhere = car.clone();
+        elsewhere["id"] = json!("0ther000-0000-4000-8000-000000000000");
+        let mut for_elsewhere = run.clone();
+        for_elsewhere["metadata"][crate::review_verdict::REVIEW_KEY] =
+            crate::review_verdict::review_record(
+                &elsewhere,
+                HEAD,
+                crate::review_verdict::RELEASE,
+                "x",
+                "2026-09-30T16:00:00Z",
+            );
+        assert!(
+            crate::review_verdict::vouches(&for_elsewhere, &elsewhere, HEAD).is_err(),
+            "a run opened on one car vouches for no other"
+        );
+        // The car's builder run is in front of the reviewer, which the
+        // rules tell it never to close (review 0545d1b1 item 5).
+        assert!(brief.contains(BUILDER_RUN), "{brief}");
+    }
+
+    /// A REVIEW STEP WITH NO HOLD IS NOT DISPATCHED (review 0545d1b1).
+    /// Every car's `review` step carries the reviewer block, held or
+    /// not, and an unheld car boards on depth within minutes: a
+    /// reviewer claimed there spends a run on a verdict nothing waits
+    /// for, and holds a step the conductor is about to complete. So the
+    /// refusal comes before the claim, and names why.
+    #[tokio::test]
+    async fn a_review_step_with_no_hold_is_refused_before_the_claim() {
+        let (base, log) = stub(car_at_review(None), row_with_block(), false).await;
+        let err = dispatch_at(
+            &crate::gate::machine_client().unwrap(),
+            &base,
+            &repo(),
+            PACKET,
+            None,
+            None,
+            &Overrides::default(),
+            false,
+            "claude@algedonic.dev",
+            "emp-david",
+            "h",
+            BriefSource::Rendered,
+        )
+        .await
+        .expect_err("an unheld review is refused");
+        let text = format!("{err:#}");
+        assert!(text.contains("no hold"), "{text}");
+        assert!(text.contains("nothing claimed, nothing filed"), "{text}");
+        assert_eq!(writes_of(&log), 0, "nothing claimed, nothing filed");
     }
 
     /// A repo no instance serves has nowhere to land — tenant main is
@@ -6290,12 +6622,13 @@ mod wire_tests {
         );
     }
 
-    /// A run that has reached no terminal records no cost row: the
+    /// A run that has reached no terminal POSTS no cost row: the
     /// `outcome` column would have to assert something the packet does
     /// not say, and the row is insert-once, so the assertion would
-    /// stick. The report still rides the packet, and a later
-    /// `--report` — after the green, the refusal, or the silence
-    /// rule — writes the row with the outcome it can then read.
+    /// stick. The report still rides the packet, and so does the finish
+    /// record, WITHOUT an outcome (backlog bb32b2a0) — the landing rule
+    /// posts it when the green opens `reported`, because nothing ever
+    /// sent the second `--report` that used to be the only writer.
     #[tokio::test]
     async fn a_report_before_any_terminal_records_no_outcome_it_cannot_read() {
         let mut run = run_packet("pending");
@@ -6329,6 +6662,89 @@ mod wire_tests {
             !calls.iter().any(|(m, _, _)| m == "POST"),
             "no row asserting an outcome the run has not reached: {calls:?}"
         );
+        // ONE write carries both (review de8a09bd B2): the landing rule
+        // fires on `report`, so a record written after it could miss a
+        // green that fell between the two.
+        let packet_writes: Vec<&Value> = calls
+            .iter()
+            .filter(|(m, p, _)| m == "PATCH" && p == &format!("/api/jobs/{RUN}/metadata"))
+            .map(|(_, _, b)| b)
+            .collect();
+        assert_eq!(packet_writes.len(), 1, "one packet write: {calls:?}");
+        assert_eq!(packet_writes[0]["report"], "handback");
+        let stored = &packet_writes[0][FINISH_RECORD_KEY];
+        assert!(
+            stored.is_object(),
+            "the finish record rides the report's own write: {calls:?}"
+        );
+        assert!(
+            stored.get("outcome").is_none(),
+            "an outcome the run has not reached is left out, not guessed: {stored}"
+        );
+        assert_eq!(stored["run_id"], RUN);
+        assert_eq!(stored["actor_id"], "agent-claude");
+        assert_eq!(stored["total_tokens"], 1000);
+        let parsed: Result<boss_jobs::agent_runs::NewAgentRun, _> = {
+            let mut landed = stored.clone();
+            landed["outcome"] = json!("success");
+            serde_json::from_value(landed)
+        };
+        assert!(
+            parsed.is_ok(),
+            "with the landing's outcome it is a record the door takes: {parsed:?}"
+        );
+    }
+
+    /// The landing rule posts what `--report` stores (backlog bb32b2a0):
+    /// the key it reads is [`FINISH_RECORD_KEY`], the outcome it fills
+    /// is what [`run_outcome`] reads off every terminal that opens
+    /// `reported` (`gated`, `delivered`), and the branch it fills is read
+    /// from the same evidence [`run_branch`] reads. Two files, one fact
+    /// each side reads (CLAUDE.md §9a).
+    #[test]
+    fn the_landing_rule_posts_the_record_report_stores() {
+        let path = boss_testing::repo_root()
+            .join("infra/dispatcher/rules")
+            .join(format!("{LANDING_RULE}.toml"));
+        let text = std::fs::read_to_string(&path).expect("the rule is authored");
+        let rule: toml::Value = toml::from_str(&text).expect("the rule parses");
+        let args = &rule["rule"][0]["do"][0]["args"];
+        let lit = |k: &str| -> String {
+            serde_json::from_str(
+                args[k]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{k} is authored")),
+            )
+            .unwrap_or_else(|e| panic!("{k} is a string literal: {e}"))
+        };
+        assert_eq!(lit("post_to"), "/api/agent-runs");
+        assert_eq!(lit("post_record"), FINISH_RECORD_KEY);
+        let fields: Value = serde_json::from_str(&lit("post_fields")).expect("post_fields");
+        for result in ["gated", "delivered"] {
+            let mut run = run_packet("ready");
+            run["steps"][2]["metadata"]["result"] = json!(result);
+            assert_eq!(
+                fields["outcome"].as_str(),
+                run_outcome(&run),
+                "`reported` opens on {result}, and the rule posts that outcome"
+            );
+        }
+        let fill: Value = serde_json::from_str(&lit("post_fill")).expect("post_fill");
+        assert_eq!(fill["branch"]["step"], BUILDING_SLUG);
+        for key in ["gate_run", "car"] {
+            let mut run = run_packet("ready");
+            run["steps"][2]["metadata"][key] = json!({ "branch": "fix/x" });
+            let pointer = format!("/metadata/{key}/branch");
+            assert!(
+                fill["branch"]["from"]
+                    .as_array()
+                    .expect("from is a list")
+                    .iter()
+                    .any(|p| p.as_str() == Some(pointer.as_str())),
+                "the rule reads {pointer}"
+            );
+            assert_eq!(run_branch(&run).as_deref(), Some("fix/x"), "{key}");
+        }
     }
 
     /// A run with no terminal is told the verb that ends it, and ONLY
@@ -6449,6 +6865,95 @@ mod wire_tests {
             patched.get(requires).is_some(),
             "the rule lands from `{requires}`, which --report writes: {patched}"
         );
+    }
+
+    /// A GREEN BETWEEN THE READ AND THE WRITE (backlog 9f9eee7d, review
+    /// de8a09bd N2). `--report` reads the run with no terminal; the
+    /// gate's green then lands it — `building` closes `gated`,
+    /// `reported` opens, and the landing rule fires on a packet holding
+    /// no report, so it leaves the step alone — and only then does the
+    /// report's PATCH arrive. The stub answers the first read before the
+    /// green and every later read after it. Nothing fires again for that
+    /// `reported`, so unless `--report` itself lands it, the run holds
+    /// a slot with its report on the packet.
+    #[tokio::test]
+    async fn a_green_between_the_reports_read_and_its_write_still_lands_the_run() {
+        let mut before = run_packet("pending");
+        before["steps"][2] = json!({ "id": "run-building", "spec_slug": "building",
+                                     "status": "active", "metadata": {} });
+        let after = run_packet("ready");
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (base, log) = {
+            let reads = reads.clone();
+            serve(move |method, path, target, body| match (method, path) {
+                ("GET", p) if p == format!("/api/jobs/{RUN}") => {
+                    let n = reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    ("200 OK", if n == 0 { &before } else { &after }.to_string())
+                }
+                ("PATCH", p) if p.starts_with(&format!("/api/jobs/{RUN}/")) => {
+                    ("204 No Content", String::new())
+                }
+                ("PUT", p) if p.starts_with(&format!("/api/jobs/{RUN}/steps/")) => {
+                    run_step_put(body)
+                }
+                ("GET", "/api/agents") => (
+                    "200 OK",
+                    json!({ "data": [{ "id": "agent-claude", "aliases": ["claude@algedonic.dev"],
+                                       "default_model": "opus-5[1m]" }], "total": 1 })
+                    .to_string(),
+                ),
+                ("POST", "/api/agent-runs") => (
+                    "200 OK",
+                    json!({ "recorded": true, "run": { "run_id": RUN } }).to_string(),
+                ),
+                _ => ("404 Not Found", format!("unstubbed {method} {target}")),
+            })
+            .await
+        };
+        report_at(
+            &crate::gate::machine_client().unwrap(),
+            &base,
+            RUN,
+            &Report {
+                summary: "handback".into(),
+                spend_usd: None,
+                meter: None,
+                tokens: Some(Tokens::Total(1000)),
+            },
+            None,
+            "claude@algedonic.dev",
+            "2026-09-18T19:00:00Z".parse().unwrap(),
+        )
+        .await
+        .expect("reports");
+        let calls = log.calls.lock().unwrap().clone();
+        let packet_write = calls
+            .iter()
+            .position(|(m, p, _)| m == "PATCH" && p == &format!("/api/jobs/{RUN}/metadata"))
+            .expect("the report is on the packet");
+        let landed = calls
+            .iter()
+            .position(|(m, p, b)| {
+                m == "PUT"
+                    && p == &format!("/api/jobs/{RUN}/steps/run-reported")
+                    && b["status"] == "completed"
+            })
+            .unwrap_or_else(|| panic!("`reported` is completed by the report: {calls:?}"));
+        assert!(packet_write < landed, "{calls:?}");
+        let summary = calls
+            .iter()
+            .find(|(m, p, _)| {
+                m == "PATCH" && p == &format!("/api/jobs/{RUN}/steps/run-reported/metadata")
+            })
+            .map(|(_, _, b)| b["summary"].clone())
+            .expect("the step carries the agent's own words");
+        assert_eq!(summary, "handback");
+        let rec = &calls
+            .iter()
+            .find(|(m, _, _)| m == "POST")
+            .expect("the landing rule posted nothing, so the report posts the cost row")
+            .2;
+        assert_eq!(rec["outcome"], "success", "{rec}");
     }
 
     /// Before the green, `reported` is pending: the report rides the

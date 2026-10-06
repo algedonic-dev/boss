@@ -39,7 +39,9 @@ test-support = []
 [dependencies]
 boss-clock-client = { path = "../boss-clock-client" }
 boss-ports = { path = "../boss-ports" }
-boss-core = { path = "../boss-core" }
+# `blocking`: the workflow bootstrap walk sends through
+# machine_token::BlockingClient (design 6805c764 car 2).
+boss-core = { path = "../boss-core", features = ["blocking"] }
 boss-expr = { path = "../boss-expr" }
 boss-classes-client = { path = "../boss-classes-client" }
 boss-events = { path = "../boss-events" }
@@ -121,11 +123,31 @@ name = "dispatcher_firings_pg"
 required-features = ["postgres"]
 
 [[test]]
+name = "the_adapters_agree_on_the_dispatcher_firings_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_sensor_registry_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_surface_opens_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_the_moves_record_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "yard_moves_pg"
 required-features = ["postgres"]
 
 [[test]]
 name = "estate_readers_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "every_writing_automation_holds_a_registry_row_pg"
 required-features = ["postgres"]
 
 [[test]]
@@ -162,6 +184,10 @@ required-features = ["postgres"]
 
 [[test]]
 name = "the_adapters_agree_on_every_list_filter_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_adapters_agree_on_a_kinds_newest_terminal_pg"
 required-features = ["postgres"]
 
 [[test]]

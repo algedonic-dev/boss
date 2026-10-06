@@ -69,11 +69,7 @@ pub(super) async fn add_step<R: JobsRepository + 'static, B: EventBus + 'static>
     // The same coarse (Update, step) authority every other step write
     // is gated on. This door had none at all (afbf4f73); a write that
     // creates a step is at least a write to steps.
-    match state
-        .policy
-        .check(&user, Action::Update, Resource::step())
-        .await
-    {
+    match state.policy.ask(&user, controls::UPDATE_STEP).await {
         Ok(Decision::Deny { reason }) => {
             return (StatusCode::FORBIDDEN, reason).into_response();
         }
@@ -683,9 +679,6 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     // `judge_assurance` before it is believed, so this handler judges
     // the same way (backlog 148549c5; verification 72fe3640).
     headers: axum::http::HeaderMap,
-    // The caller as a server-side credential door resolved it — the only
-    // identity a declared field writer believes (design f623e425).
-    caller: Option<axum::Extension<crate::field_writer::CredentialedCaller>>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let job_id = match parse_job_id(&id) {
@@ -707,11 +700,7 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     // still stamped `_simulated`), so this gate never stalls a regen.
     // The grant's SCOPE is judged against the packet once it is read
     // (`step_writable`, backlog 0a8a2463).
-    let scope = match state
-        .policy
-        .check(&user, Action::Update, Resource::step())
-        .await
-    {
+    let scope = match state.policy.ask(&user, controls::UPDATE_STEP).await {
         Ok(Decision::Deny { reason }) => {
             return (StatusCode::FORBIDDEN, reason).into_response();
         }
@@ -810,59 +799,57 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
         None => return (StatusCode::BAD_REQUEST, "body must be a JSON object").into_response(),
     };
 
-    // A METADATA BODY THAT DROPS A STORED KEY IS REFUSED (backlog
-    // e39a9d2a, design baf738b7 answered 2026-09-23 — the one-car rule).
+    // A STEP PUT DOES NOT WRITE METADATA (backlog e39a9d2a; design
+    // 93d2bddb, its decided end state — Stage 2's last car).
     //
-    // The overlay above replaces `metadata` WHOLESALE, so a body that
+    // The overlay below replaces `metadata` WHOLESALE, so a body that
     // omits a key deletes it. Three keys were hand-carried past that
     // replace — `authority_role`, `human_only`, `agent_run` — each
     // after someone lost it in production (the run edge: a completer
     // erased it and the run died four hours later on the silence clock,
     // b91a2103), and two more step-level keys were in flight. The list
-    // grew by incident; this removes the class instead.
+    // grew by incident; this removes the class instead: the merge door,
+    // `PATCH .../steps/{id}/metadata`, is the ONE writer of step
+    // metadata, and every writer in the tree sends its keys there and
+    // PUTs the status alone.
     //
     // WHY REFUSE AND NOT MERGE, since merging looks obviously nicer:
     // merging silently changes the meaning of EVERY existing call at
-    // once — a caller that clears a key by omitting it today would stop
+    // once — a caller that clears a key by omitting it would stop
     // clearing it, invisibly and retroactively. A refusal is loud and
     // arrives at the one call site that must change, which is the shape
-    // the terminal-step refusal below already has. A read-merge-write
-    // caller sends every stored key and is untouched; a PUT with no
-    // `metadata` key (a status-only flip) is not judged; a caller whose
-    // read went stale while a concurrent writer added a key is now
-    // caught instead of erasing that key. Clearing on purpose is the
-    // merge door's job, with the key sent as `null`.
+    // the terminal-step refusal below already has.
     //
-    // NOT ON A TERMINAL STEP. The merge door refuses a terminal step
+    // WHY ANY BODY, not only one that omits a key. Stage 1 (car
+    // b8a1d469) refused the omission, which stopped the silent wipe
+    // but kept a second writer: a read-merge-write sent every key it
+    // READ, so a key a concurrent writer landed between that read and
+    // this write was refused at best and, for a writer that re-read,
+    // overwritten with the value it read. The merge door lands only
+    // the keys a caller names, against the row as it stands.
+    //
+    // A TERMINAL STEP WHOSE METADATA THE BODY WOULD CHANGE is left to
+    // the terminal refusal below. The merge door refuses that change
     // too, so routing the caller there would send it from one 409 to
-    // another; the terminal refusal below speaks instead (an omitting
-    // body changes the metadata, so it fires), and its hint names the
-    // doors that work on a record. An unchanged re-send is not an
-    // omission and stays the no-op the freeze lets through.
-    //
-    // STAGE 1 of design 93d2bddb (decided_2026_09_24b on e39a9d2a): the
-    // decided end state refuses ANY metadata body; this omission rule
-    // removes the silent wipe now, and the tighten is this one block
-    // once the read-merge-write writers have moved to the merge door.
+    // another; the terminal hint names the doors that work on a record.
+    // An UNCHANGED re-send to a terminal step is refused here like any
+    // metadata body — the merge door answers that re-send 204
+    // (`patch_is_noop`), so the route works.
     let is_terminal = matches!(old.status, StepStatus::Completed | StepStatus::Skipped);
-    if let Some(sent) = body_obj.get("metadata")
-        && !is_terminal
+    if crate::step_metadata_write::put_carries_metadata(&body)
+        && !(is_terminal && body_obj.get("metadata") != Some(&old.metadata))
     {
-        let missing = crate::step_metadata_write::omitted_keys(&old.metadata, sent);
-        if !missing.is_empty() {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "metadata body omits stored keys — a step PUT replaces \
-                              metadata wholesale, so an omitted key would be deleted",
-                    "step_id": step_id.to_string(),
-                    "missing_keys": missing,
-                    "merge_door": format!("/api/jobs/{job_id}/steps/{step_id}/metadata"),
-                    "hint": crate::step_metadata_write::OMITTED_KEYS_HINT,
-                })),
-            )
-                .into_response();
-        }
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "a step PUT does not write metadata — send the keys through \
+                          this step's merge door, then PUT the status alone",
+                "step_id": step_id.to_string(),
+                "merge_door": format!("/api/jobs/{job_id}/steps/{step_id}/metadata"),
+                "hint": crate::step_metadata_write::METADATA_BODY_HINT,
+            })),
+        )
+            .into_response();
     }
 
     for (k, v) in body_obj {
@@ -985,75 +972,16 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
             .into_response();
     }
 
-    // `authority_role` is immutable across PUTs: the persisted value
-    // wins, so a body can neither raise nor lower the required sign-off
-    // authority — the sign-off gate reads `old.metadata` for its
-    // decision, and this keeps the stored row consistent with it. The
-    // merge door strips the key for the same reason. (Its OMISSION is
-    // the drop refusal above; `agent_run`, which was carried past
-    // omission beside it until e39a9d2a, needs nothing here now — a
-    // body that omits it is refused, and it remains writable through
-    // the merge door. `human_only` is not writable anywhere once the
-    // row carries it: the change refusal below, adac8fa4.)
-    if let Some(old_obj) = old.metadata.as_object()
-        && let Some(auth) = old_obj.get("authority_role").cloned()
-        && let Some(obj) = step.metadata.as_object_mut()
-    {
-        obj.insert("authority_role".into(), auth);
-    }
-
-    // THE DECLARATION IS FROZEN ON THE STEP (adac8fa4). The completion
-    // check below reads the STORED row, so a body that set `human_only`
-    // to false — in the completing PUT itself, or in an earlier one —
-    // would otherwise walk round it. Refused, not silently kept like
-    // `authority_role` above, so the caller learns the rule at the call.
-    if crate::human_only::declaration_changed(&old.metadata, &step.metadata) && !is_terminal {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(crate::human_only::change_refusal_body(
-                &step_id.to_string(),
-                &old.title,
-                &old.metadata,
-            )),
-        )
-            .into_response();
-    }
-
-    // `outcome_kind` IS THE PROTOCOL'S (b433bdf3). The abort exemption
-    // below reads the stored value, so a PUT that stored `aborted` on
-    // an ordinary terminal opened the gate for the next, bare, PUT.
-    // Same scope as the `human_only` refusal above: a terminal row's
-    // metadata is refused by the freeze below, which says it better.
-    let protocol_keys =
-        crate::step_metadata_write::protocol_keys_changed(&old.metadata, &step.metadata);
-    if !protocol_keys.is_empty() && !is_terminal {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "metadata body changes a key the protocol owns",
-                "step_id": step_id.to_string(),
-                "refused_keys": protocol_keys,
-                "hint": crate::step_metadata_write::PROTOCOL_KEYS_HINT,
-            })),
-        )
-            .into_response();
-    }
-
-    // A KEY WITH ONE DECLARED WRITER (design f623e425; backlog
-    // 6c9183de): the merge door's rule, on the same stored row. A
-    // terminal row is refused by the freeze below, which says it better.
-    if !is_terminal
-        && let Some(refusal) = refuse_undeclared_writer(
-            &old,
-            &step.metadata,
-            parent_job.as_ref(),
-            caller.as_ref().map(|axum::Extension(c)| c),
-            &user.id,
-            &format!("PUT /api/jobs/{job_id}/steps/{step_id}"),
-        )
-    {
-        return refusal;
-    }
+    // FOUR METADATA GUARDS LEFT THIS HANDLER WITH THE LAST METADATA BODY
+    // (backlog e39a9d2a, Stage 2's last car). The `authority_role`
+    // carry, the `human_only` change refusal (adac8fa4), the
+    // protocol-key refusal (b433bdf3) and the one-declared-writer
+    // refusal (f623e425) each judged what a body's `metadata` would do
+    // to an OPEN step. The refusal above now admits no metadata onto an
+    // open step at all, so each could only ever compare the stored row
+    // with itself; every one of them stands, unchanged, at the merge
+    // door (`patch_step_metadata`), which is where step metadata is
+    // written.
 
     // AN ACTIVE STEP KEEPS ITS HOLDER (backlog 650ebd0c, the review of
     // car e341f7cd). A claim is the Ready→Active CAS; nothing else may
@@ -2403,11 +2331,7 @@ pub(super) async fn patch_step_metadata<R: JobsRepository + 'static, B: EventBus
             .into_response();
     };
 
-    let scope = match state
-        .policy
-        .check(&user, Action::Update, Resource::step())
-        .await
-    {
+    let scope = match state.policy.ask(&user, controls::UPDATE_STEP).await {
         Ok(Decision::Deny { reason }) => {
             return (StatusCode::FORBIDDEN, reason).into_response();
         }
@@ -2536,6 +2460,32 @@ pub(super) async fn patch_step_metadata<R: JobsRepository + 'static, B: EventBus
             })),
         )
             .into_response();
+    }
+    // A RECORD ONE MACHINE ACTOR WRITES (backlog aa816dd4). ops-request's
+    // `nothing-to-do` record closes a request with nobody asked, and any
+    // caller with Update could write it; a step declaring `written_by`
+    // refuses its fields from every OTHER automation or agent session,
+    // and never from a person (`written_by` holds the rule and its why).
+    // Open steps only: a terminal row is the adapter's refusal below.
+    if !matches!(old.status, StepStatus::Completed | StepStatus::Skipped)
+        && let Some(writer) = crate::written_by::declared(&old.metadata)
+    {
+        let refused =
+            crate::written_by::refused_keys(&old.metadata, &merged_view, &old.fields, &user.id);
+        if !refused.is_empty() {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(crate::written_by::refusal_body(
+                    &step_id.to_string(),
+                    &old.title,
+                    &format!("PATCH /api/jobs/{job_id}/steps/{step_id}/metadata"),
+                    &user.id,
+                    writer,
+                    &refused,
+                )),
+            )
+                .into_response();
+        }
     }
     // A KEY WITH ONE DECLARED WRITER (design f623e425; backlog
     // 6c9183de). The approve step's runner keys were writable here by
@@ -2717,11 +2667,7 @@ pub(super) async fn post_step_correction<R: JobsRepository + 'static, B: EventBu
         Ok(None) => return (StatusCode::NOT_FOUND, "job not found").into_response(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    let scope = match state
-        .policy
-        .check(&user, Action::Update, Resource::job())
-        .await
-    {
+    let scope = match state.policy.ask(&user, controls::UPDATE_JOB).await {
         Ok(Decision::Deny { reason }) => return (StatusCode::FORBIDDEN, reason).into_response(),
         Ok(Decision::Allow { scope }) => scope,
         Err(e) => {
@@ -2847,11 +2793,7 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
         Some(id) => id,
         None => return (StatusCode::BAD_REQUEST, "invalid step id").into_response(),
     };
-    let scope = match state
-        .policy
-        .check(&user, Action::Update, Resource::step())
-        .await
-    {
+    let scope = match state.policy.ask(&user, controls::UPDATE_STEP).await {
         Ok(Decision::Deny { reason }) => {
             return (StatusCode::FORBIDDEN, reason).into_response();
         }
@@ -2954,11 +2896,7 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
             .and_then(|row| crate::active_holder::declared_executor(row, old.spec_slug.as_deref()));
         let is_executor = declared.as_deref() == Some(user.id.as_str());
         if !is_executor {
-            match state
-                .policy
-                .check(&user, Action::Update, Resource::step_assign())
-                .await
-            {
+            match state.policy.ask(&user, controls::UPDATE_STEP_ASSIGN).await {
                 Ok(Decision::Deny { .. }) => {
                     return (
                         StatusCode::FORBIDDEN,
@@ -3509,12 +3447,16 @@ async fn claimant_holds_authority<R: JobsRepository + 'static, B: EventBus + 'st
     if held_roles.contains(&authority) {
         return Ok(());
     }
+    // The sign-off route names a role only a workflow declares, so it is
+    // asked raw — coverage reads it off the workflows; the assign route
+    // is a declared control (design 1c4e42e1, backlog 47aed706).
+    let assign = controls::UPDATE_STEP_ASSIGN;
     for (action, resource) in [
         (
             Action::SignOff,
             Resource::new(format!("step-signoff:{authority}")),
         ),
-        (Action::Update, Resource::step_assign()),
+        (assign.action(), assign.resource()),
     ] {
         match state.policy.check(user, action, resource).await {
             Ok(Decision::Allow { .. }) => return Ok(()),

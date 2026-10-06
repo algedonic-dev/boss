@@ -319,6 +319,23 @@ if has_role cluster-operator; then
     # The node id picks which credentials this host is checked for — its
     # [ops_credentials.<id>] table in estate.toml (backlog f371c749).
     install_cluster_operator "$NODE_ID"
+    # THE DOOR ITS CREDENTIAL ARRIVES THROUGH (backlog 7336cb5f). This
+    # host's kubeconfig is SCOPED, so no person places it: the cluster's
+    # deposit CronJob pipes it over ssh to a forced-command receiver,
+    # and this installs that receiver and its one sudoers rule. Recorded,
+    # never fatal: a receiver that did not install leaves the credential
+    # undelivered, which ops_credentials above already reports, and no
+    # unit below depends on it.
+    rlog="$(mktemp -t boss-gcp-converge-recv.XXXXXX)"
+    rrc=0
+    bash "${BOSS_GCP_CONVERGE_INFRA:-$(dirname "$0")/..}/gcp/install-ops-credential-receiver.sh" >"$rlog" 2>&1 || rrc=$?
+    sed 's/^/  receiver: /' "$rlog"
+    rm -f "$rlog"
+    if [ "$rrc" -eq 0 ]; then
+        run_summary_field ops_credential_receiver "installed"
+    else
+        run_summary_field ops_credential_receiver "failed (exit $rrc) — see this tick's journal"
+    fi
 fi
 
 log="$(mktemp -t boss-gcp-converge-install.XXXXXX)"

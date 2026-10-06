@@ -4,11 +4,10 @@
 //! (#118 transactional outbox). All three land or none do.
 
 use async_trait::async_trait;
-use boss_core::event::Event;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
-use crate::port::{CustomersError, CustomersRepository};
+use crate::port::{CustomersError, CustomersRepository, refuse_nul};
 use crate::types::Customer;
 
 pub struct PgCustomers {
@@ -32,6 +31,7 @@ impl CustomersRepository for PgCustomers {
         customer: &Customer,
         now: DateTime<Utc>,
     ) -> Result<bool, CustomersError> {
+        refuse_nul(customer)?;
         let mut tx = self.pool.begin().await.map_err(storage)?;
         let insert = sqlx::query(
             "INSERT INTO customers (id, name, email, phone, metadata, created_at) \
@@ -71,21 +71,8 @@ impl CustomersRepository for PgCustomers {
             .await
             .map_err(CustomersError::Storage)?;
 
-            // email/phone ride the payload: the log is the system of
-            // record, and a column the log doesn't carry is a column
-            // every rebuild silently loses (live-vs-rebuilt
-            // divergence). This adds no exposure the system doesn't
-            // already have — /shop writes customer_email into Job
-            // metadata, which flows through jobs.job.created events
-            // today.
-            let payload = serde_json::json!({
-                "id": customer.id,
-                "name": customer.name,
-                "email": customer.email,
-                "phone": customer.phone,
-                "metadata": customer.metadata,
-            });
-            let event = Event::new("boss-customers", "customers.customer.created", payload, now);
+            // The one birth fact both adapters record (events.rs).
+            let event = crate::events::customer_created(customer, now);
             boss_events::outbox::record_event_in_tx(&mut tx, &event)
                 .await
                 .map_err(CustomersError::Storage)?;
@@ -96,6 +83,12 @@ impl CustomersRepository for PgCustomers {
     }
 
     async fn get_customer(&self, id: &str) -> Result<Option<Customer>, CustomersError> {
+        // No stored id can hold a NUL byte, and binding one is an
+        // encoding error Postgres answers as a 500 — so it is the miss
+        // it is (backlog be459ab9, found by the adapters-agree suite).
+        if id.contains('\0') {
+            return Ok(None);
+        }
         let row = sqlx::query_as::<_, CustomerRow>(
             "SELECT id, name, email, phone, metadata, created_at \
              FROM customers WHERE id = $1",
@@ -108,9 +101,13 @@ impl CustomersRepository for PgCustomers {
     }
 
     async fn list_customers(&self) -> Result<Vec<Customer>, CustomersError> {
+        // A tie on created_at breaks by id in BYTE order, as the double
+        // does: the database's locale put `suite-ab` before `suite-B`
+        // (backlog be459ab9, found by the adapters-agree suite; the
+        // class is 2987fb2d's).
         let rows = sqlx::query_as::<_, CustomerRow>(
             "SELECT id, name, email, phone, metadata, created_at \
-             FROM customers ORDER BY created_at DESC, id",
+             FROM customers ORDER BY created_at DESC, id COLLATE \"C\"",
         )
         .fetch_all(&self.pool)
         .await

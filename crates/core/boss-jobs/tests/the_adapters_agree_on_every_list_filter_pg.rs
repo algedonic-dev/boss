@@ -57,6 +57,8 @@ boss_testing::adapters_agree! {
         department,
         status,
         closed_since,
+        terminal,
+        terminal_inside_the_window,
         priority,
         owner_id,
         subject_id,
@@ -79,6 +81,7 @@ const _: fn(JobFilter) = |filter| {
         department: _,        // case `department`
         status: _,            // case `status`
         closed_since: _,      // case `closed_since`
+        terminal: _,          // cases `terminal`, `terminal_inside_the_window`
         priority: _,          // case `priority`
         owner_id: _,          // case `owner_id`
         subject_id: _,        // case `subject_id`
@@ -109,20 +112,16 @@ fn instant(secs: i64) -> DateTime<Utc> {
 fn packet(title: &str) -> Job {
     Job {
         id: JobId::new(),
-        kind: "backlog-item".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "s-0"),
-        title: title.into(),
-        owner_id: "emp-a".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: day(20),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: Partition::Real,
+        ..Job::new(
+            "backlog-item",
+            Subject::new("custom", "s-0"),
+            title,
+            "emp-a",
+            Priority::Standard,
+            day(20),
+        )
     }
 }
 
@@ -357,6 +356,80 @@ async fn closed_since<R: JobsRepository>(repo: &R, adapter: &str) {
         };
         narrows(repo, adapter, filter, &kept).await;
     }
+}
+
+/// Live (draft or open) or terminal (closed or cancelled) — ANDed with
+/// every other field, the status equality included. The department
+/// jobs view reads its live packets and its departures as two reads
+/// (backlog a22311a1): one page holding both let ~1,230 chores a day
+/// push the open work off it.
+async fn terminal<R: JobsRepository>(repo: &R, adapter: &str) {
+    seed_world(repo).await;
+    let departed = ["field-b", "field-trip", "closed-undated"];
+    let all: Vec<String> = world().into_iter().map(|j| j.title).collect();
+    let live: Vec<&str> = all
+        .iter()
+        .map(String::as_str)
+        .filter(|t| !departed.contains(t))
+        .collect();
+    let filter = JobFilter {
+        terminal: Some(true),
+        ..Default::default()
+    };
+    narrows(repo, adapter, filter, &departed).await;
+    let filter = JobFilter {
+        terminal: Some(false),
+        ..Default::default()
+    };
+    narrows(repo, adapter, filter, &live).await;
+    // AND, not OR: a live status asked for among the terminal is none.
+    let filter = JobFilter {
+        terminal: Some(true),
+        status: Some(JobStatus::Open),
+        ..Default::default()
+    };
+    narrows(repo, adapter, filter, &[]).await;
+    let filter = JobFilter {
+        terminal: Some(false),
+        status: Some(JobStatus::Draft),
+        ..Default::default()
+    };
+    narrows(repo, adapter, filter, &["draft"]).await;
+}
+
+/// The departures read: terminal AND inside the retention window — the
+/// window's "live OR closed since" with the live half taken away. An
+/// undated close and one before the cut are not recent departures.
+async fn terminal_inside_the_window<R: JobsRepository>(repo: &R, adapter: &str) {
+    seed_world(repo).await;
+    let filter = JobFilter {
+        terminal: Some(true),
+        closed_since: Some(day(10)),
+        ..Default::default()
+    };
+    narrows(repo, adapter, filter, &["field-b"]).await;
+    // And the department's departures are the department's: field-b is
+    // no pr-train and names no department.
+    let filter = JobFilter {
+        terminal: Some(true),
+        closed_since: Some(day(10)),
+        department: Some(DepartmentFilter {
+            code: "sales".into(),
+            declaring_kinds: vec!["field-service".into()],
+        }),
+        ..Default::default()
+    };
+    narrows(repo, adapter, filter, &["field-b"]).await;
+    let filter = JobFilter {
+        terminal: Some(true),
+        closed_since: Some(day(10)),
+        department: Some(DepartmentFilter {
+            code: "sales".into(),
+            declaring_kinds: vec!["pr-train".into()],
+        }),
+        ..Default::default()
+    };
+    narrows(repo, adapter, filter, &[]).await;
 }
 
 async fn priority<R: JobsRepository>(repo: &R, adapter: &str) {

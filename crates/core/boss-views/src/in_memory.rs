@@ -7,19 +7,29 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, TimeDelta, Utc};
 
 use crate::error::ViewsError;
 use crate::filter;
 use crate::port::ViewsRepo;
-use crate::types::{View, ViewInput, Visibility};
+use crate::types::{View, ViewInput, Visibility, refuse_unstorable};
 
 pub struct InMemoryViewsRepo {
     rows: Mutex<HashMap<String, View>>,
     /// Monotonic id source. Deterministic ids keep tests readable and
     /// keep this adapter free of a clock or RNG dependency.
     next: Mutex<u64>,
-    now: DateTime<Utc>,
+    /// The instant of the next write. Starts at the instant the adapter
+    /// is built with and ticks one microsecond per write.
+    ///
+    /// It used to be one fixed instant stamped on every write, so a
+    /// replace never moved `updated_at` and an edited View never rose
+    /// to the head of the list, while Postgres stamps each write
+    /// `NOW()`; and it kept whatever nanoseconds it was handed, which
+    /// the column truncates (backlog be459ab9, found by the
+    /// adapters-agree suite, 2026-09-30). A tick keeps the adapter
+    /// deterministic and free of a clock dependency.
+    clock: Mutex<DateTime<Utc>>,
 }
 
 impl InMemoryViewsRepo {
@@ -27,8 +37,18 @@ impl InMemoryViewsRepo {
         Self {
             rows: Mutex::new(HashMap::new()),
             next: Mutex::new(1),
-            now,
+            clock: Mutex::new(now.trunc_subsecs(6)),
         }
+    }
+
+    fn stamp(&self) -> Result<DateTime<Utc>, ViewsError> {
+        let mut t = self
+            .clock
+            .lock()
+            .map_err(|_| ViewsError::Storage("clock lock poisoned".into()))?;
+        let now = *t;
+        *t = now + TimeDelta::microseconds(1);
+        Ok(now)
     }
 
     fn mint_id(&self) -> Result<String, ViewsError> {
@@ -54,7 +74,14 @@ impl ViewsRepo for InMemoryViewsRepo {
             .filter(|v| v.owner_id == viewer_id || v.visibility == Visibility::Shared)
             .cloned()
             .collect();
-        out.sort_by(|a, b| a.id.cmp(&b.id));
+        // Most recently updated first, then id byte-wise — the order
+        // PgViewsRepo's ORDER BY states. It sorted by id alone until
+        // the adapters-agree suite (backlog be459ab9).
+        out.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         Ok(out)
     }
 
@@ -70,8 +97,10 @@ impl ViewsRepo for InMemoryViewsRepo {
     }
 
     async fn create(&self, owner_id: &str, input: &ViewInput) -> Result<View, ViewsError> {
+        refuse_unstorable(Some(owner_id), input)?;
         filter::compile(&input.filter)?;
         let id = self.mint_id()?;
+        let now = self.stamp()?;
         let view = View {
             id: id.clone(),
             owner_id: owner_id.to_string(),
@@ -81,8 +110,8 @@ impl ViewsRepo for InMemoryViewsRepo {
             columns: input.columns.clone(),
             layout: input.layout,
             visibility: input.visibility,
-            created_at: self.now,
-            updated_at: self.now,
+            created_at: now,
+            updated_at: now,
         };
         let mut rows = self
             .rows
@@ -98,7 +127,9 @@ impl ViewsRepo for InMemoryViewsRepo {
         owner_id: &str,
         input: &ViewInput,
     ) -> Result<View, ViewsError> {
+        refuse_unstorable(None, input)?;
         filter::compile(&input.filter)?;
+        let now = self.stamp()?;
         let mut rows = self
             .rows
             .lock()
@@ -122,7 +153,7 @@ impl ViewsRepo for InMemoryViewsRepo {
             // Creation time survives a replace: it records when the
             // View came into being, which an edit does not change.
             created_at: existing.created_at,
-            updated_at: self.now,
+            updated_at: now,
         };
         rows.insert(id.to_string(), updated.clone());
         Ok(updated)

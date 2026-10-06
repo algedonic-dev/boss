@@ -88,23 +88,22 @@ fn packet(
 ) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::new_v4()),
-        kind: kind.to_string(),
         workflow_version: version,
-        subject: Subject::new("custom", "subj-1"),
-        title: format!("{kind} packet"),
-        owner_id: "emp-1".into(),
         status,
-        priority: Priority::Standard,
-        opened_on: opened,
-        opened_at: None,
-        due_on: None,
         closed_on: closed,
         metadata: match outcome {
             Some(o) => serde_json::json!({ "outcome": o }),
             None => serde_json::json!({}),
         },
-        tags: vec![],
         partition,
+        ..Job::new(
+            kind.to_string(),
+            Subject::new("custom", "subj-1"),
+            format!("{kind} packet"),
+            "emp-1",
+            Priority::Standard,
+            opened,
+        )
     }
 }
 

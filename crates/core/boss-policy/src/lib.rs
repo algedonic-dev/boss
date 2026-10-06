@@ -14,6 +14,7 @@ pub mod postgres;
 
 pub mod authority;
 pub mod bootstrap;
+pub mod check_mode;
 pub mod coverage;
 pub mod http;
 

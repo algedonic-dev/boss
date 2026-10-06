@@ -34,10 +34,15 @@ pub(crate) fn to_kebab<T: serde::Serialize>(val: &T) -> String {
 #[async_trait]
 impl KbRepository for PgKb {
     async fn all_models(&self) -> Result<Vec<AssetModel>, KbError> {
-        let rows: Vec<ModelRow> = sqlx::query_as("SELECT * FROM asset_models ORDER BY sku")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| KbError::Storage(e.to_string()))?;
+        // Byte order (`COLLATE "C"`) here and in every satellite read
+        // below: the database's locale ordered `suite-ab` before
+        // `suite-B`, the double the other way round (backlog be459ab9,
+        // found by the adapters-agree suite; 2987fb2d's class).
+        let rows: Vec<ModelRow> =
+            sqlx::query_as("SELECT * FROM asset_models ORDER BY sku COLLATE \"C\"")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| KbError::Storage(e.to_string()))?;
 
         let mut models = Vec::with_capacity(rows.len());
         for row in rows {
@@ -48,6 +53,11 @@ impl KbRepository for PgKb {
     }
 
     async fn model_by_sku(&self, sku: &str) -> Result<Option<AssetModel>, KbError> {
+        // No stored SKU can hold a NUL, and TEXT refuses one as a bind:
+        // a miss, not a 500 (backlog be459ab9, the adapters-agree suite).
+        if sku.contains('\0') {
+            return Ok(None);
+        }
         let row: Option<ModelRow> = sqlx::query_as("SELECT * FROM asset_models WHERE sku = $1")
             .bind(sku)
             .fetch_optional(&self.pool)
@@ -66,6 +76,10 @@ impl KbRepository for PgKb {
         now: chrono::DateTime<chrono::Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<String, KbError> {
+        // A value the tables refuse is the caller's, refused before the
+        // write rather than answered as the database's error (backlog
+        // be459ab9; `validate.rs` says why).
+        crate::validate::refuse_unstorable(model)?;
         let mut tx = self
             .pool
             .begin()
@@ -114,6 +128,8 @@ impl KbRepository for PgKb {
         now: chrono::DateTime<chrono::Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), KbError> {
+        crate::validate::refuse_moved_sku(sku, model)?;
+        crate::validate::refuse_unstorable(model)?;
         let mut tx = self
             .pool
             .begin()
@@ -163,17 +179,36 @@ impl KbRepository for PgKb {
         now: chrono::DateTime<chrono::Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), KbError> {
+        // No stored SKU can hold a NUL (backlog be459ab9).
+        if sku.contains('\0') {
+            return Err(KbError::NotFound(sku.to_string()));
+        }
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| KbError::Storage(e.to_string()))?;
         delete_satellites(&mut tx, sku).await?;
-        let result = sqlx::query("DELETE FROM asset_models WHERE sku = $1")
+        let deleted = sqlx::query("DELETE FROM asset_models WHERE sku = $1")
             .bind(sku)
             .execute(&mut *tx)
-            .await
-            .map_err(|e| KbError::Storage(e.to_string()))?;
+            .await;
+        let result = match deleted {
+            Ok(r) => r,
+            // Backlog e9ff7ccb: `assets.sku REFERENCES asset_models(sku)`
+            // has no ON DELETE, and the HTTP guard counts only ACTIVE
+            // assets — so a model only decommissioned units still name
+            // passed the guard and failed here as a Storage 500. The
+            // foreign key is the one race-free answer; this turns it into
+            // a 409 naming the units (the tx, satellites included, rolls
+            // back on drop).
+            Err(sqlx::Error::Database(db)) if db.is_foreign_key_violation() => {
+                let cause = db.message().to_string();
+                drop(tx);
+                return Err(self.still_referenced(sku, &cause).await);
+            }
+            Err(e) => return Err(KbError::Storage(e.to_string())),
+        };
         if result.rows_affected() == 0 {
             return Err(KbError::NotFound(sku.to_string()));
         }
@@ -200,8 +235,13 @@ impl KbRepository for PgKb {
         // stocked item. Tenants that seed real catalog rows (device
         // refurb) shadow the synthesized rows; tenants that only
         // seed inventory_items (brewery) get auto-populated stubs.
+        //
+        // Byte order of part SKU, as the double answers (backlog
+        // be459ab9, 2987fb2d's class). A UNION's ORDER BY takes only
+        // output column names, so the collation sorts an outer select.
         let rows: Vec<(String, String, String, i64, String, i16)> = sqlx::query_as(
-            "SELECT part_sku, name, description, unit_price_cents, currency, lead_time_days \
+            "SELECT * FROM ( \
+             SELECT part_sku, name, description, unit_price_cents, currency, lead_time_days \
              FROM parts \
              UNION ALL \
              SELECT i.part_sku, \
@@ -212,7 +252,7 @@ impl KbRepository for PgKb {
                     7::int2 AS lead_time_days \
              FROM inventory_items i \
              WHERE NOT EXISTS (SELECT 1 FROM parts p WHERE p.part_sku = i.part_sku) \
-             ORDER BY part_sku",
+             ) every_part ORDER BY part_sku COLLATE \"C\"",
         )
         .fetch_all(&self.pool)
         .await
@@ -240,6 +280,11 @@ impl KbRepository for PgKb {
         entity_id: &str,
     ) -> Result<Vec<crate::types::EntityDocument>, KbError> {
         use crate::types::EntityDocument;
+        // No stored key can hold a NUL: an undocumented entity, not a
+        // 500 (backlog be459ab9).
+        if entity_kind.contains('\0') || entity_id.contains('\0') {
+            return Ok(Vec::new());
+        }
         let rows: Vec<(
             uuid::Uuid,
             String,
@@ -278,6 +323,42 @@ impl KbRepository for PgKb {
 
 impl PgKb {
     /// Fetch all satellite data for a SKU and assemble a full `AssetModel`.
+    /// The Conflict a model delete answers when assets still name it:
+    /// how many, and the first few ids, so the operator can act on the
+    /// refusal without a second query. If that read fails or finds no
+    /// asset (the key is held by some other table), the Conflict carries
+    /// the database's own message rather than a guess.
+    async fn still_referenced(&self, sku: &str, cause: &str) -> KbError {
+        const NAMED: i64 = 10;
+        let ids: Result<Vec<(String, i64)>, _> = sqlx::query_as(
+            "SELECT asset_id, COUNT(*) OVER () FROM assets WHERE sku = $1 \
+             ORDER BY asset_id LIMIT $2",
+        )
+        .bind(sku)
+        .bind(NAMED)
+        .fetch_all(&self.pool)
+        .await;
+        let named = match ids {
+            Ok(rows) if !rows.is_empty() => {
+                let total = rows[0].1;
+                let list: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
+                let more = if total > NAMED {
+                    format!(" (and {} more)", total - NAMED)
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{total} asset(s), decommissioned ones included: {}{more}",
+                    list.join(", ")
+                )
+            }
+            _ => return KbError::Conflict(format!("cannot delete kb model {sku}: {cause}")),
+        };
+        KbError::Conflict(format!(
+            "cannot delete kb model {sku}: {named} still reference it"
+        ))
+    }
+
     async fn assemble(&self, row: ModelRow) -> Result<AssetModel, KbError> {
         let sku = &row.sku;
 
@@ -301,19 +382,20 @@ impl PgKb {
     }
 
     async fn fetch_use_cases(&self, sku: &str) -> Result<Vec<String>, KbError> {
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT use_case FROM asset_use_cases WHERE sku = $1 ORDER BY use_case")
-                .bind(sku)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| KbError::Storage(e.to_string()))?;
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT use_case FROM asset_use_cases WHERE sku = $1 ORDER BY use_case COLLATE \"C\"",
+        )
+        .bind(sku)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| KbError::Storage(e.to_string()))?;
 
         Ok(rows.into_iter().map(|(s,)| s).collect())
     }
 
     async fn fetch_failure_modes(&self, sku: &str) -> Result<Vec<FailureMode>, KbError> {
         let rows: Vec<FailureModeRow> = sqlx::query_as(
-            "SELECT code, name, frequency, typical_fix FROM asset_failure_modes WHERE sku = $1 ORDER BY code",
+            "SELECT code, name, frequency, typical_fix FROM asset_failure_modes WHERE sku = $1 ORDER BY code COLLATE \"C\"",
         )
         .bind(sku)
         .fetch_all(&self.pool)
@@ -350,7 +432,7 @@ impl PgKb {
             FROM asset_spare_parts sp
             JOIN parts p ON p.part_sku = sp.part_sku
             WHERE sp.sku = $1
-            ORDER BY p.part_sku
+            ORDER BY p.part_sku COLLATE "C"
             "#,
         )
         .bind(sku)
@@ -379,7 +461,7 @@ impl PgKb {
             FROM asset_consumables dc
             JOIN parts p ON p.part_sku = dc.part_sku
             WHERE dc.sku = $1
-            ORDER BY p.part_sku
+            ORDER BY p.part_sku COLLATE "C"
             "#,
         )
         .bind(sku)

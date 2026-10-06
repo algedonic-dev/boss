@@ -5,8 +5,9 @@
 //! the merge door, `PATCH /api/jobs/{id}/steps/{step_id}/metadata`,
 //! which lands keys one at a time and deletes a key sent as `null`.
 //!
-//! The PUT refuses a metadata body that OMITS a stored key
-//! ([`omitted_keys`]); the merge door answers a re-send that changes
+//! The PUT refuses ANY body that carries `metadata`
+//! ([`put_carries_metadata`]), so the merge door is the one writer of
+//! step metadata; the merge door answers a re-send that changes
 //! nothing on a terminal step with success ([`patch_is_noop`]). Both
 //! rules are here, pure, so the handlers do only the I/O and the test
 //! doubles that answer the way the real API does (the boss-cli stub,
@@ -15,15 +16,28 @@
 
 use serde_json::{Map, Value};
 
-/// The hint the step PUT's omission refusal carries — ONE copy, the
+/// The hint the step PUT's metadata refusal carries — ONE copy, the
 /// same shape as [`crate::corrections::TERMINAL_STEP_HINT`]: the door
 /// that works, named, because the caller is by definition trying to
 /// change some keys and leave the rest alone.
-pub const OMITTED_KEYS_HINT: &str = "a step PUT replaces metadata wholesale, so a key its body \
-     leaves out would be deleted. Send only the keys you change through the step merge door, \
-     PATCH /api/jobs/{id}/steps/{step_id}/metadata, where a key sent as null is deleted; or \
-     read the step and send every stored key back with the PUT, which is what a \
-     read-merge-write does. A PUT without a metadata key is never judged.";
+///
+/// It named a second road until Stage 2 of design 93d2bddb ended
+/// (backlog e39a9d2a): "or read the step and send every stored key
+/// back". That read-merge-write was the form every writer in the tree
+/// used, and every one raced a concurrent key; each has moved to the
+/// merge door, so the road is closed and the hint no longer offers it.
+pub const METADATA_BODY_HINT: &str = "a step PUT does not write metadata. Send the keys you \
+     change through the step merge door, PATCH /api/jobs/{id}/steps/{step_id}/metadata, \
+     where a key sent as null is deleted and every key you leave out is kept; then PUT the \
+     status alone. A PUT without a metadata key is never judged by this rule.";
+
+/// PURE: does this step PUT body carry `metadata` — the one thing the
+/// PUT refuses (design 93d2bddb's decided end state)? A key present
+/// with ANY value counts, `null` included: the PUT stored a null
+/// wholesale, which is a clear the merge door does key by key.
+pub fn put_carries_metadata(body: &Value) -> bool {
+    body.get("metadata").is_some()
+}
 
 /// The `error` the step PUT answers, with 409, when the row moved
 /// between the handler's read and its write
@@ -66,24 +80,6 @@ pub fn is_step_race(body: &Value) -> bool {
         || body.get("error").and_then(Value::as_str) == Some(STEP_CHANGED_ERROR_BEFORE_THE_CODE)
 }
 
-/// PURE: the keys `stored` holds that `sent` leaves out, in stored
-/// order. Empty when `sent` carries every stored key (a read-merge-write)
-/// or when nothing is stored. A `sent` that is not an object leaves out
-/// every stored key.
-pub fn omitted_keys<'a>(stored: &'a Value, sent: &Value) -> Vec<&'a str> {
-    let sent = sent.as_object();
-    stored
-        .as_object()
-        .map(|stored| {
-            stored
-                .keys()
-                .filter(|k| !sent.is_some_and(|s| s.contains_key(*k)))
-                .map(String::as_str)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// Metadata keys the PROTOCOL writes and no step writer may (backlog
 /// b433bdf3). `outcome_kind` is materialised from the spec's
 /// `metadata_defaults`, and the step PUT reads the stored value to let
@@ -101,7 +97,12 @@ pub fn omitted_keys<'a>(stored: &'a Value, sent: &Value) -> Vec<&'a str> {
 /// state a declaration the protocol never made (the adversarial review
 /// of car 611fbffd, 2026-09-26: PATCH `{"audience":{"individual":<self>}}`
 /// answered 204).
-pub const PROTOCOL_KEYS: &[&str] = &["outcome_kind", "audience"];
+///
+/// `written_by` names the one machine actor whose record the step
+/// believes ([`crate::written_by`], backlog aa816dd4). A writer that
+/// could delete it could then write the record it guards, so it is
+/// frozen as the protocol materialised it.
+pub const PROTOCOL_KEYS: &[&str] = &["outcome_kind", "audience", crate::written_by::KEY];
 
 /// The hint a refused protocol key carries, on both doors.
 pub const PROTOCOL_KEYS_HINT: &str = "these metadata keys are materialised from the step's \
@@ -192,33 +193,20 @@ mod tests {
     }
 
     #[test]
-    fn a_body_that_leaves_a_stored_key_out_names_it() {
-        let stored = json!({"authority_role": "platform-admin", "station": "dock", "hold": "x"});
-        assert_eq!(
-            omitted_keys(&stored, &json!({"station": "dock"})),
-            vec!["authority_role", "hold"]
-        );
+    fn any_metadata_key_is_carried_whatever_its_value() {
+        for md in [json!({}), json!({"a": 1}), Value::Null, json!("x")] {
+            assert!(
+                put_carries_metadata(&json!({"status": "completed", "metadata": md})),
+                "{md}"
+            );
+        }
     }
 
     #[test]
-    fn a_read_merge_write_leaves_nothing_out_and_may_add_keys() {
-        let stored = json!({"authority_role": "platform-admin", "station": "dock"});
-        let sent = json!({"authority_role": "platform-admin", "station": "dock", "new": 1});
-        assert!(omitted_keys(&stored, &sent).is_empty());
-        // A key sent as null is still SENT: the PUT stores the null.
-        let sent = json!({"authority_role": null, "station": null});
-        assert!(omitted_keys(&stored, &sent).is_empty());
-    }
-
-    #[test]
-    fn nothing_stored_means_nothing_can_be_left_out() {
-        assert!(omitted_keys(&json!({}), &json!({})).is_empty());
-        assert!(omitted_keys(&Value::Null, &json!({"a": 1})).is_empty());
-    }
-
-    #[test]
-    fn a_non_object_body_leaves_out_every_stored_key() {
-        assert_eq!(omitted_keys(&json!({"a": 1}), &Value::Null), vec!["a"]);
+    fn a_status_only_body_carries_none() {
+        assert!(!put_carries_metadata(&json!({"status": "completed"})));
+        assert!(!put_carries_metadata(&json!({})));
+        assert!(!put_carries_metadata(&Value::Null));
     }
 
     #[test]
@@ -300,16 +288,9 @@ mod tests {
         after.fields = vec![];
         let mut with_fields = stored.clone();
         with_fields.fields = vec![boss_core::job::StepField {
-            name: "evidence".into(),
-            field_type: "string".into(),
             required: true,
             filled_by: Default::default(),
-            item_keys: Vec::new(),
-            covers: None,
-            binds: None,
-            item_value_max_bytes: None,
-            item_one_of: Vec::new(),
-            writer: None,
+            ..boss_core::job::StepField::new("evidence", "string")
         }];
         assert_eq!(
             reshaped_fields(&with_fields, &after),
@@ -370,9 +351,10 @@ mod tests {
     }
 
     #[test]
-    fn the_hint_names_the_merge_door_and_the_read_merge_write() {
-        assert!(OMITTED_KEYS_HINT.contains("PATCH /api/jobs/{id}/steps/{step_id}/metadata"));
-        assert!(OMITTED_KEYS_HINT.contains("sent as null is deleted"));
-        assert!(OMITTED_KEYS_HINT.contains("read-merge-write"));
+    fn the_hint_names_the_merge_door_and_offers_no_second_road() {
+        assert!(METADATA_BODY_HINT.contains("PATCH /api/jobs/{id}/steps/{step_id}/metadata"));
+        assert!(METADATA_BODY_HINT.contains("sent as null is deleted"));
+        assert!(METADATA_BODY_HINT.contains("PUT the status alone"));
+        assert!(!METADATA_BODY_HINT.contains("read-merge-write"));
     }
 }

@@ -14,7 +14,9 @@
 //!
 //! - `messages.message.sent` — full Message row state (id, sender_id,
 //!   recipient_id, subject, body, entity_ref, kind, sent_at, reply_to)
-//! - `messages.message.read` — `{id, read_at}`
+//! - `messages.message.read` — `{id, read_at}` (sets `read_at` once; a
+//!   repeat read the old door recorded is skipped, so the first read's
+//!   time stands — backlog 624e92eb)
 //! - `messages.message.archived` — `{id, archived_at}` (sets `archived_at`
 //!   once, beside `kind`; a repeat archive the old door recorded is
 //!   skipped, so the first archive's time stands — backlog 9bda9726)
@@ -71,6 +73,10 @@ struct SentPayload {
     read_at: Option<DateTime<Utc>>,
     #[serde(default)]
     reply_to: Option<String>,
+    /// Replayed as the live send stores it (backlog be459ab9): a
+    /// message sent already archived lands archived.
+    #[serde(default)]
+    archived_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,8 +145,8 @@ pub async fn rebuild_messages(pool: &PgPool) -> Result<RebuildReport, RebuildErr
                     sqlx::query(
                         "INSERT INTO messages \
                          (id, sender_id, recipient_id, subject, body, entity_type, entity_id, entity_path, \
-                          kind, sent_at, read_at, reply_to) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                          kind, sent_at, read_at, reply_to, archived_at) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
                     )
                     .bind(&p.id)
                     .bind(&p.sender_id)
@@ -154,6 +160,7 @@ pub async fn rebuild_messages(pool: &PgPool) -> Result<RebuildReport, RebuildErr
                     .bind(p.sent_at)
                     .bind(p.read_at)
                     .bind(&p.reply_to)
+                    .bind(p.archived_at)
                     .execute(&mut *conn)
                     .await
                     .map_err(|e| e.to_string())?;
@@ -171,17 +178,23 @@ pub async fn rebuild_messages(pool: &PgPool) -> Result<RebuildReport, RebuildErr
                             ev.audit_id, ev.kind
                         )
                     })?;
-                    let n = sqlx::query("UPDATE messages SET read_at = $1 WHERE id = $2")
-                        .bind(p.read_at)
-                        .bind(&p.id)
-                        .execute(&mut *conn)
-                        .await
-                        .map_err(|e| e.to_string())?
-                        .rows_affected();
+                    // The live doors' guard, replayed (backlog
+                    // 624e92eb): only an unread row moves, so a
+                    // repeat read the old door recorded is skipped
+                    // and the first read_at stands.
+                    let n = sqlx::query(
+                        "UPDATE messages SET read_at = $1 WHERE id = $2 AND read_at IS NULL",
+                    )
+                    .bind(p.read_at)
+                    .bind(&p.id)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .rows_affected();
                     if n == 0 {
                         // READ for a message we never SENT (or already
-                        // DELETED). Tolerate — the projection's already
-                        // in the right "row absent" state.
+                        // DELETED), or a repeat read. Tolerate — the
+                        // projection's already in the right state.
                         Ok(Applied::Skipped)
                     } else {
                         report.rows_marked_read += 1;

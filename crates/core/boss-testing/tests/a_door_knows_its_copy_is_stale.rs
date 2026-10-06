@@ -210,7 +210,7 @@ impl Pod {
             .env("STUB_ARGV", &self.argv)
             .env("BOSS_ACTOR", "agent:test")
             .env("BOSS_JOBS_URL", "http://sor.test:7900")
-            .env("BOSS_MACHINE_TOKEN_FILE", self.root.join("no-token"))
+            .env("BOSS_MACHINE_TOKEN_DIR", self.root.join("no-token"))
             // The shim's own candidates come from the fixture, never
             // from the pod's store and /scratch: its BINARY check is
             // another mechanism (it refuses a write from a CLI behind
@@ -496,7 +496,7 @@ fn a_copy_with_no_checkout_behind_it_runs_silently() {
         .env("STUB_ARGV", &pod.argv)
         .env("BOSS_ACTOR", "agent:test")
         .env("BOSS_JOBS_URL", "http://sor.test:7900")
-        .env("BOSS_MACHINE_TOKEN_FILE", pod.root.join("no-token"))
+        .env("BOSS_MACHINE_TOKEN_DIR", pod.root.join("no-token"))
         .args(["GET", "/api/jobs"])
         .output()
         .expect("run loose boss-api");

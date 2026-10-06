@@ -145,11 +145,13 @@ Diagram: [`architecture/02-service-map.mmd`](architecture/02-service-map.mmd) (d
   crates. Most of the blue + green clusters.
   Inherits the core's correctness contracts but the domain
   surface evolves at business speed.
-- **Orchestrators** (`crates/orchestrators/`, 6 crates). Cross-
+- **Orchestrators** (`crates/orchestrators/`, 7 crates). Cross-
   tier binaries that fan out across both: `boss-rebuild`,
   `boss-cli`, `boss-sim`,
   `boss-ml-api` (wires the Tier-1 ML framework + Tier-2 plugins),
-  `boss-simulator` (the standalone `/simulator` UX service).
+  `boss-simulator` (the standalone `/simulator` UX service),
+  `boss-dispatcher-handlers` (step effects), and `boss-events-api`
+  (the existing events service's Apps adapter above the memory layer).
 - **Tenants** (`crates/tenants/`, 1 crate).
   `boss-brewery-engine` (Algedonic Ales). Outside the tier system;
   tenant-shaped.

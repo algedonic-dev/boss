@@ -160,12 +160,18 @@ fn every_unit_run_maintenance_kind_ends_in_its_verdict() {
                     .map(|t| (t.outcome.as_str(), s.ready_when.as_str()))
             })
             .collect();
-        assert_eq!(
-            terminals.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
-            vec!["completed", "failed"],
-            "{}: a maintenance packet ends in completed or failed, nothing else",
+        // A kind MAY declare a `not-yet` ending between the two (backlog
+        // 17a7bd18): boss-chore.sh records a check's exit 75 as
+        // result=not-yet, and a run that cannot judge yet is neither
+        // completed nor failed. When it does, `failed` must exclude it by
+        // name, or the two terminals race off one write.
+        let outcomes: Vec<&str> = terminals.iter().map(|(o, _)| *o).collect();
+        assert!(
+            outcomes == ["completed", "failed"] || outcomes == ["completed", "not-yet", "failed"],
+            "{}: a maintenance packet ends in completed or failed (or not-yet between them), nothing else: {outcomes:?}",
             w.kind
         );
+        let failed = terminals[terminals.len() - 1].1;
         assert!(
             terminals[0]
                 .1
@@ -174,12 +180,24 @@ fn every_unit_run_maintenance_kind_ends_in_its_verdict() {
             w.kind
         );
         assert!(
-            terminals[1]
-                .1
-                .contains("steps.run.metadata.result != \"ok\""),
+            failed.contains("steps.run.metadata.result != \"ok\""),
             "{}: failed must be every other result",
             w.kind
         );
+        if terminals.len() == 3 {
+            assert!(
+                terminals[1]
+                    .1
+                    .contains("steps.run.metadata.result = \"not-yet\""),
+                "{}: not-yet must require the run's result to be not-yet",
+                w.kind
+            );
+            assert!(
+                failed.contains("steps.run.metadata.result != \"not-yet\""),
+                "{}: failed must exclude not-yet by name",
+                w.kind
+            );
+        }
     }
 }
 

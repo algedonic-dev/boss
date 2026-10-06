@@ -7,7 +7,11 @@ use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::port::{InventoryError, InventoryRepository};
+use crate::port::{
+    InventoryError, InventoryRepository, nul_key, on_hand_overflow, refuse_bad_invoice,
+    refuse_bad_item, refuse_bad_po, refuse_bad_vendor, refuse_negative_limit, refuse_non_positive,
+    refuse_nul, refuse_past_i32, unplaced_order, unregistered_vendor,
+};
 use crate::types::*;
 
 pub struct PgInventory {
@@ -24,7 +28,10 @@ impl PgInventory {
 impl InventoryRepository for PgInventory {
     async fn all_items(&self) -> Result<Vec<InventoryItem>, InventoryError> {
         let rows: Vec<InventoryItemRow> =
-            sqlx::query_as("SELECT * FROM inventory_items ORDER BY part_sku")
+            // Byte order (backlog be459ab9 / 2987fb2d): the database's locale
+            // ordered `suite-B` after `suite-a-z`; the double, and the
+            // port, order bytes.
+            sqlx::query_as("SELECT * FROM inventory_items ORDER BY part_sku COLLATE \"C\"")
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| InventoryError::Storage(e.to_string()))?;
@@ -33,6 +40,9 @@ impl InventoryRepository for PgInventory {
     }
 
     async fn item_by_sku(&self, part_sku: &str) -> Result<Option<InventoryItem>, InventoryError> {
+        if nul_key(part_sku) {
+            return Ok(None);
+        }
         let row: Option<InventoryItemRow> =
             sqlx::query_as("SELECT * FROM inventory_items WHERE part_sku = $1")
                 .bind(part_sku)
@@ -49,6 +59,7 @@ impl InventoryRepository for PgInventory {
         now: chrono::DateTime<chrono::Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), InventoryError> {
+        refuse_bad_item(item)?;
         let mut tx = self
             .pool
             .begin()
@@ -104,7 +115,12 @@ impl InventoryRepository for PgInventory {
 
     async fn all_purchase_orders(&self) -> Result<Vec<PurchaseOrder>, InventoryError> {
         let rows: Vec<PurchaseOrderRow> =
-            sqlx::query_as("SELECT * FROM purchase_orders ORDER BY placed_on DESC")
+            // Latest placement first (DESC puts an unplaced order's NULL
+            // first); a tie on the day in byte order of id — until
+            // backlog be459ab9 a tie came back in plan order.
+            sqlx::query_as(
+                "SELECT * FROM purchase_orders ORDER BY placed_on DESC, id COLLATE \"C\"",
+            )
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| InventoryError::Storage(e.to_string()))?;
@@ -121,6 +137,9 @@ impl InventoryRepository for PgInventory {
         &self,
         id: &str,
     ) -> Result<Option<PurchaseOrder>, InventoryError> {
+        if nul_key(id) {
+            return Ok(None);
+        }
         let row: Option<PurchaseOrderRow> =
             sqlx::query_as("SELECT * FROM purchase_orders WHERE id = $1")
                 .bind(id)
@@ -142,6 +161,7 @@ impl InventoryRepository for PgInventory {
         source_id: &str,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<ConsumeApplied, InventoryError> {
+        refuse_nul(&[("part_sku", part_sku), ("source_id", source_id)])?;
         // One tx wraps: (1) the proportional value drain + on_hand
         // decrement, (2) the `finance.inventory.transferred` fact
         // sized at exactly the drained value. The two land atomically
@@ -155,6 +175,23 @@ impl InventoryRepository for PgInventory {
             .await
             .map_err(|e| InventoryError::Storage(e.to_string()))?;
 
+        // Read the row under lock FIRST, then run the guard below. The
+        // guard is a read, not a lock: run before the lock (as it was
+        // until backlog 33af9e59), two concurrent deliveries of one
+        // source_id both read "no fact yet", queue here, and both
+        // apply — the fact insert is ON CONFLICT DO NOTHING, so it
+        // refused only the second fact, never the second decrement.
+        // Under the lock, the second delivery's guard is a fresh READ
+        // COMMITTED statement that sees the first one's fact.
+        let before: Option<(i32, i64)> = sqlx::query_as(
+            "SELECT on_hand, value_cents FROM inventory_items \
+             WHERE part_sku = $1 FOR UPDATE",
+        )
+        .bind(part_sku)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| InventoryError::Storage(e.to_string()))?;
+
         // Idempotency guard. `on_hand -= qty` is a relative mutation, so a
         // redelivered step-effect event (at-least-once JetStream delivery)
         // would double-decrement. The financial_fact this consume writes
@@ -163,10 +200,12 @@ impl InventoryRepository for PgInventory {
         // and return the current row unchanged, with NO fact payload: the
         // caller then emits no audit event, so a replay appends nothing.
         // (Also dodges a spurious InsufficientStock on replay once stock
-        // has since fallen below qty.) Sound when the consume drains value
-        // (the only case that writes a fact); a zero-value row writes none
-        // and isn't guarded — no GL impact, and the seeded brewery gives
-        // every part an opening value.
+        // has since fallen below qty.) The guard is the delivery's
+        // source_id, whatever it drained: a valued consume's proof is its
+        // transfer fact, a valueless one's the GL-inert
+        // `finance.inventory.consumed` marker written below. Until backlog
+        // 55f69172 a valueless consume wrote nothing for the guard to
+        // find, and its redelivery took the units a second time.
         if fact_exists(
             &mut tx,
             "finance.inventory.transferred",
@@ -174,6 +213,13 @@ impl InventoryRepository for PgInventory {
             source_id,
         )
         .await?
+            || fact_exists(
+                &mut tx,
+                "finance.inventory.consumed",
+                "inventory_consume",
+                source_id,
+            )
+            .await?
         {
             drop(tx);
             let item = self
@@ -186,19 +232,11 @@ impl InventoryRepository for PgInventory {
             });
         }
 
-        // Read the row under lock, compute the exact drain in one
-        // place, then apply it. The drain is the proportional share
-        // round-half-up(value × qty / on_hand); consuming the last
-        // unit takes the whole remaining value, so zero on_hand
+        // From the row read under lock above, compute the exact drain
+        // in one place, then apply it. The drain is the proportional
+        // share round-half-up(value × qty / on_hand); consuming the
+        // last unit takes the whole remaining value, so zero on_hand
         // forces zero value — nothing strands.
-        let before: Option<(i32, i64)> = sqlx::query_as(
-            "SELECT on_hand, value_cents FROM inventory_items \
-             WHERE part_sku = $1 FOR UPDATE",
-        )
-        .bind(part_sku)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| InventoryError::Storage(e.to_string()))?;
         let Some((on_hand_before, value_before)) = before else {
             drop(tx);
             return Err(InventoryError::NotFound(part_sku.to_string()));
@@ -281,6 +319,31 @@ impl InventoryRepository for PgInventory {
         } else {
             None
         };
+        // A consume that drained nothing moves no cents, so it has no
+        // transfer to prove it applied: it writes the GL-inert marker
+        // under its source_id instead (the receive's shape — see
+        // `insert_dedup_fact`), and records its payload verbatim as the
+        // rebuild source, so the fact rebuilt from the log is this one.
+        let marker_payload = if fact_payload.is_none() {
+            let payload = serde_json::json!({
+                "part_sku": part_sku,
+                "qty": qty,
+                "source_id": source_id,
+                "consumed_on": now.date_naive(),
+            });
+            insert_dedup_fact(
+                &mut tx,
+                "finance.inventory.consumed",
+                now.date_naive(),
+                &payload,
+                "inventory_consume",
+                source_id,
+            )
+            .await?;
+            Some(payload)
+        } else {
+            None
+        };
 
         // Outbox phase 2: both audit events commit with the mutation.
         // The state event is the post-consume row (last-write-wins
@@ -306,6 +369,14 @@ impl InventoryRepository for PgInventory {
             .await
             .map_err(InventoryError::Storage)?;
         }
+        if let Some(payload) = marker_payload {
+            boss_events::outbox::record_event_in_tx(
+                &mut tx,
+                &stamp.event(crate::events::ITEM_CONSUME_RECORDED, payload),
+            )
+            .await
+            .map_err(InventoryError::Storage)?;
+        }
 
         tx.commit()
             .await
@@ -314,6 +385,9 @@ impl InventoryRepository for PgInventory {
     }
 
     async fn inbound_reserved_for_part(&self, part_sku: &str) -> Result<i64, InventoryError> {
+        if nul_key(part_sku) {
+            return Ok(0);
+        }
         // Cross-domain projection — sums `expected_qty` across
         // every open ingredient-restock Job's receiving step
         // whose `expected_items` array carries `part_sku`. We
@@ -355,6 +429,9 @@ impl InventoryRepository for PgInventory {
     }
 
     async fn open_po_exists_for_part(&self, part_sku: &str) -> Result<bool, InventoryError> {
+        if nul_key(part_sku) {
+            return Ok(false);
+        }
         // Open PO = status NOT IN ('received', 'closed', 'cancelled') AND
         // has a line for this part_sku. The dispatcher's
         // reorder-threshold rule uses this as the idempotency check —
@@ -379,15 +456,22 @@ impl InventoryRepository for PgInventory {
         &self,
         part_sku: &str,
     ) -> Result<Option<String>, InventoryError> {
+        if nul_key(part_sku) {
+            return Ok(None);
+        }
         // Most recently associated vendor for the SKU via PO lines —
         // the recency heuristic (whoever supplied it last is who we'd
-        // reorder from).
+        // reorder from). An order naming no vendor (a draft)
+        // associates none: until backlog be459ab9 its NULL vendor was
+        // decoded as a String and the read failed `Storage` (a 500). A
+        // tie on the day goes to the lowest order id in byte order.
         let row: Option<(String,)> = sqlx::query_as(
             "SELECT po.vendor \
              FROM purchase_order_lines pol \
              JOIN purchase_orders po ON po.id = pol.po_id \
              WHERE pol.part_sku = $1 \
-             ORDER BY po.placed_on DESC NULLS LAST \
+               AND po.vendor IS NOT NULL \
+             ORDER BY po.placed_on DESC NULLS LAST, po.id COLLATE \"C\" \
              LIMIT 1",
         )
         .bind(part_sku)
@@ -413,7 +497,7 @@ impl InventoryRepository for PgInventory {
              FROM vendors v \
              JOIN inventory_items i ON i.vendor_category = v.category \
              WHERE i.part_sku = $1 \
-             ORDER BY v.id \
+             ORDER BY v.id COLLATE \"C\" \
              LIMIT 1",
         )
         .bind(part_sku)
@@ -433,11 +517,13 @@ impl InventoryRepository for PgInventory {
         happened_on: chrono::NaiveDate,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(uuid::Uuid, bool), InventoryError> {
-        if total_cost_cents <= 0 {
-            return Err(InventoryError::Storage(
-                "total_cost_cents must be positive".to_string(),
-            ));
-        }
+        refuse_non_positive(total_cost_cents)?;
+        refuse_nul(&[
+            ("debit_account", debit_account),
+            ("credit_account", credit_account),
+            ("memo", memo),
+            ("source_id", source_id),
+        ])?;
         let mut tx = self
             .pool
             .begin()
@@ -476,25 +562,11 @@ impl InventoryRepository for PgInventory {
         .await
         .map_err(|e| InventoryError::Storage(e.to_string()))?;
 
-        let fact_ref = boss_ledger::FactRef {
-            id: fact_id,
-            kind: "finance.inventory.transferred",
-            happened_on,
-            payload: &payload,
-        };
-        boss_ledger::post_fact_in_tx(&mut tx, &fact_ref)
-            .await
-            .map_err(|e| match e {
-                // A bad account code is request data, not storage: the
-                // step author (or seed) named an account the chart
-                // doesn't hold. Surfaced as InvalidAccount so the HTTP
-                // layer answers 422 with the offending code instead of
-                // a generic 500.
-                boss_ledger::LedgerError::UnknownAccount(code) => InventoryError::InvalidAccount(
-                    format!("GL account code `{code}` is not in the chart of accounts"),
-                ),
-                e => InventoryError::Storage(format!("ledger post: {e}")),
-            })?;
+        // `insert_fact` has already posted the journal entry (and maps
+        // an unknown account to `InvalidAccount`). This method posted
+        // it a second time, an idempotent no-op whose own
+        // `InvalidAccount` mapping could never run: the first post had
+        // already answered `Storage` (backlog be459ab9).
 
         // Outbox phase 2: the audit event (rebuild material for the
         // `inventory.overhead.absorbed → finance.inventory.transferred`
@@ -527,11 +599,14 @@ impl InventoryRepository for PgInventory {
         happened_on: chrono::NaiveDate,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<JeRecorded, InventoryError> {
-        if total_cost_cents <= 0 {
-            return Err(InventoryError::Storage(
-                "total_cost_cents must be positive".to_string(),
-            ));
-        }
+        refuse_non_positive(total_cost_cents)?;
+        refuse_nul(&[
+            ("debit_account", debit_account),
+            ("credit_account", credit_account),
+            ("memo", memo),
+            ("source_table", source_table),
+            ("source_id", source_id),
+        ])?;
         let mut tx = self
             .pool
             .begin()
@@ -572,15 +647,9 @@ impl InventoryRepository for PgInventory {
         .await
         .map_err(|e| InventoryError::Storage(e.to_string()))?;
 
-        let fact_ref = boss_ledger::FactRef {
-            id: fact_id,
-            kind: "finance.inventory.transferred",
-            happened_on,
-            payload: &payload,
-        };
-        boss_ledger::post_fact_in_tx(&mut tx, &fact_ref)
-            .await
-            .map_err(|e| InventoryError::Storage(format!("ledger post: {e}")))?;
+        // `insert_fact` has already posted the journal entry; the
+        // second, idempotent post this method made is gone with the
+        // overhead's (backlog be459ab9).
 
         // Outbox phase 2: the fact's WRITER owns its rebuild source —
         // `ledger.inventory.transferred` records in the SAME tx, only
@@ -615,6 +684,10 @@ impl InventoryRepository for PgInventory {
         source_id: &str,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<ReceiveApplied, InventoryError> {
+        refuse_nul(&[("part_sku", part_sku), ("source_id", source_id)])?;
+        // `qty` is bound as INTEGER: past i32::MAX it was bound NEGATIVE
+        // and the "receive" lowered stock (backlog 55f69172).
+        refuse_past_i32(&[("qty", qty)])?;
         // One tx wraps: (1) the idempotency check, (2) the on_hand
         // increment (+ weighted-avg-cost update), (3) the
         // `finance.inventory.received` proof-fact insert. The fact is
@@ -631,6 +704,18 @@ impl InventoryRepository for PgInventory {
             .begin()
             .await
             .map_err(|e| InventoryError::Storage(e.to_string()))?;
+
+        // The row lock comes FIRST and the guard below runs under it —
+        // the same order as `consume_part_at`, for the same race: a
+        // guard read before the lock let two concurrent deliveries of
+        // one receipt both pass it and both increment (backlog
+        // 33af9e59). The lock is the one the UPDATE takes anyway.
+        let held: Option<(i32,)> =
+            sqlx::query_as("SELECT on_hand FROM inventory_items WHERE part_sku = $1 FOR UPDATE")
+                .bind(part_sku)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| InventoryError::Storage(e.to_string()))?;
 
         // Idempotency guard. `on_hand += qty` is a relative mutation,
         // so a redelivered step-effect event (at-least-once JetStream
@@ -657,6 +742,17 @@ impl InventoryRepository for PgInventory {
                 item,
                 receipt_payload: None,
             });
+        }
+
+        // A receive that would carry on_hand past its INTEGER column is
+        // refused `Invalid` — the double's answer — rather than reaching
+        // the UPDATE, whose overflow error was a `Storage` 500 (backlog
+        // 55f69172). Read under the lock taken above.
+        if let Some((on_hand,)) = held
+            && i64::from(on_hand) + i64::from(qty) > i64::from(i32::MAX)
+        {
+            drop(tx);
+            return Err(on_hand_overflow(part_sku, on_hand.max(0) as u32, qty));
         }
 
         // Value-primary receive: the exact line total (qty × the PO
@@ -780,12 +876,33 @@ impl InventoryRepository for PgInventory {
         // dangling vendor in the SAME transaction (the PO_UPSERTED
         // event records in-tx below), and a Draft PO's absent
         // vendor skips per identity-first.
+        refuse_bad_po(po)?;
         let status_str = po_status_str(&po.status);
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| InventoryError::Storage(e.to_string()))?;
+        // The subject edge would abort a dangling vendor at the outbox
+        // insert, but with the trigger's error as `Storage` (a 500).
+        // Asked first, it is the `NotFound` naming the vendor that the
+        // double answers too (backlog be459ab9). An empty vendor is
+        // absent, and the session escape hatch a bundle import or a
+        // TestDb sets (`audit_log.ref_check = 'off'`) passes, both as
+        // the trigger reads them.
+        if let Some(vendor) = po.vendor.as_deref().filter(|v| !v.is_empty()) {
+            let held: bool = sqlx::query_scalar(
+                "SELECT current_setting('audit_log.ref_check', true) IS NOT DISTINCT FROM 'off' \
+                     OR EXISTS (SELECT 1 FROM subjects WHERE kind = 'vendor' AND id = $1)",
+            )
+            .bind(vendor)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| InventoryError::Storage(e.to_string()))?;
+            if !held {
+                return Err(unregistered_vendor(vendor));
+            }
+        }
         // Identity write-through (subject-model R1, Q1): the PO's
         // identity row commits with its header row.
         boss_subject_kinds::subjects::record_subject_in_tx(
@@ -863,6 +980,7 @@ impl InventoryRepository for PgInventory {
     ) -> Result<(), InventoryError> {
         // Status vocabulary is validated at the API boundary against
         // the Class registry; the storage adapter stores the code.
+        refuse_nul(&[("id", id), ("status", status)])?;
         let mut tx = self
             .pool
             .begin()
@@ -911,7 +1029,10 @@ impl InventoryRepository for PgInventory {
 
     async fn all_vendors(&self) -> Result<Vec<Vendor>, InventoryError> {
         let rows: Vec<VendorRow> =
-            sqlx::query_as("SELECT id, name, contact_name, contact_email, city, state, lead_time_days, payment_terms, category, behavior FROM vendors ORDER BY name")
+            // Byte order of name, nameless last, a tie by id (backlog
+            // be459ab9: the locale ordered names, and a tie came back in
+            // plan order).
+            sqlx::query_as("SELECT id, name, contact_name, contact_email, city, state, lead_time_days, payment_terms, category, behavior FROM vendors ORDER BY name COLLATE \"C\", id COLLATE \"C\"")
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| InventoryError::Storage(e.to_string()))?;
@@ -924,6 +1045,7 @@ impl InventoryRepository for PgInventory {
         now: chrono::DateTime<chrono::Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<String, InventoryError> {
+        refuse_bad_vendor(vendor)?;
         let mut tx = self
             .pool
             .begin()
@@ -986,6 +1108,11 @@ impl InventoryRepository for PgInventory {
         vendor: &Vendor,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), InventoryError> {
+        refuse_nul(&[("id", id)])?;
+        refuse_bad_vendor(&Vendor {
+            id: id.to_string(),
+            ..vendor.clone()
+        })?;
         let mut tx = self
             .pool
             .begin()
@@ -1048,6 +1175,7 @@ impl InventoryRepository for PgInventory {
         id: &str,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), InventoryError> {
+        refuse_nul(&[("id", id)])?;
         let mut tx = self
             .pool
             .begin()
@@ -1083,11 +1211,25 @@ impl InventoryRepository for PgInventory {
         now: chrono::DateTime<chrono::Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), InventoryError> {
+        refuse_bad_invoice(invoice)?;
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| InventoryError::Storage(e.to_string()))?;
+
+        // The `po_id` foreign key would refuse an order nobody placed,
+        // but as `Storage` (a 500); asked first, it is the `NotFound`
+        // the double answers too (backlog be459ab9).
+        let placed: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM purchase_orders WHERE id = $1)")
+                .bind(&invoice.po_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| InventoryError::Storage(e.to_string()))?;
+        if !placed {
+            return Err(unplaced_order(&invoice.po_id));
+        }
 
         sqlx::query(
             "INSERT INTO vendor_invoices (
@@ -1202,13 +1344,19 @@ impl InventoryRepository for PgInventory {
         status: Option<&str>,
         limit: i64,
     ) -> Result<Vec<VendorInvoice>, InventoryError> {
+        refuse_negative_limit(limit)?;
+        if status.is_some_and(nul_key) {
+            return Ok(vec![]);
+        }
+        // Latest received first, a tie on the day in byte order of id
+        // (backlog be459ab9: a tie came back in plan order).
         let rows: Vec<VendorInvoiceRow> = match status {
             Some(s) => sqlx::query_as(
                 "SELECT id, po_id, vendor, vendor_invoice_no, amount_cents, currency, received_on,
                     matched_on, approved_on, paid_on, status,
                     discrepancy_cents, discrepancy_kind
                  FROM vendor_invoices WHERE status = $1
-                 ORDER BY received_on DESC LIMIT $2",
+                 ORDER BY received_on DESC, id COLLATE \"C\" LIMIT $2",
             )
             .bind(s)
             .bind(limit)
@@ -1219,7 +1367,7 @@ impl InventoryRepository for PgInventory {
                     matched_on, approved_on, paid_on, status,
                     discrepancy_cents, discrepancy_kind
                  FROM vendor_invoices
-                 ORDER BY received_on DESC LIMIT $1",
+                 ORDER BY received_on DESC, id COLLATE \"C\" LIMIT $1",
             )
             .bind(limit)
             .fetch_all(&self.pool)
@@ -1233,6 +1381,9 @@ impl InventoryRepository for PgInventory {
         &self,
         id: &str,
     ) -> Result<Option<VendorInvoice>, InventoryError> {
+        if nul_key(id) {
+            return Ok(None);
+        }
         let row: Option<VendorInvoiceRow> = sqlx::query_as(
             "SELECT id, po_id, vendor, vendor_invoice_no, amount_cents, currency, received_on,
                 matched_on, approved_on, paid_on, status,
@@ -1312,12 +1463,14 @@ impl PgInventory {
                 .await
                 .map_err(|e| InventoryError::Storage(e.to_string()))?;
         let Some(row) = row else { return Ok(None) };
-        let lines: Vec<PoLineRow> =
-            sqlx::query_as("SELECT * FROM purchase_order_lines WHERE po_id = $1 ORDER BY part_sku")
-                .bind(&row.id)
-                .fetch_all(&mut **tx)
-                .await
-                .map_err(|e| InventoryError::Storage(e.to_string()))?;
+        let lines: Vec<PoLineRow> = sqlx::query_as(
+            "SELECT * FROM purchase_order_lines WHERE po_id = $1 \
+                 ORDER BY part_sku COLLATE \"C\"",
+        )
+        .bind(&row.id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|e| InventoryError::Storage(e.to_string()))?;
         Ok(Some(PurchaseOrder {
             id: row.id,
             vendor: row.vendor,
@@ -1331,12 +1484,14 @@ impl PgInventory {
 
     /// Fetch lines for a purchase order and assemble a full `PurchaseOrder`.
     async fn assemble(&self, row: PurchaseOrderRow) -> Result<PurchaseOrder, InventoryError> {
-        let lines: Vec<PoLineRow> =
-            sqlx::query_as("SELECT * FROM purchase_order_lines WHERE po_id = $1 ORDER BY part_sku")
-                .bind(&row.id)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| InventoryError::Storage(e.to_string()))?;
+        let lines: Vec<PoLineRow> = sqlx::query_as(
+            "SELECT * FROM purchase_order_lines WHERE po_id = $1 \
+                 ORDER BY part_sku COLLATE \"C\"",
+        )
+        .bind(&row.id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| InventoryError::Storage(e.to_string()))?;
 
         Ok(PurchaseOrder {
             id: row.id,
@@ -1486,7 +1641,9 @@ async fn fact_exists(
 /// gates a redelivered event), and an audit record of the receipt — but it
 /// is deliberately GL-INERT. It must NOT be projected to a journal line:
 /// the `receive` path's DR-1300 rides the idempotent bill-approval path, so
-/// posting here would double-post it. Contrast `insert_fact`, which DOES
+/// posting here would double-post it; a valueless consume's
+/// `finance.inventory.consumed` moved no cents at all (backlog 55f69172).
+/// Contrast `insert_fact`, which DOES
 /// call `post_fact_in_tx` because its fact kinds drive the GL. Idempotent
 /// on the unique (kind, source_table, source_id) index.
 async fn insert_dedup_fact(
@@ -1573,7 +1730,26 @@ async fn insert_fact(
     };
     boss_ledger::post_fact_in_tx(tx, &fact_ref)
         .await
-        .map_err(|e| InventoryError::Storage(format!("ledger post failed: {e}")))?;
+        .map_err(|e| match e {
+            // A bad account code is request data, not storage: the step
+            // author (or seed) named an account the chart doesn't hold —
+            // `InvalidAccount`, a 422 naming the code. Mapped here, at the
+            // one post every fact takes (backlog be459ab9: the overhead
+            // path mapped it only on a second post this one pre-empted).
+            boss_ledger::LedgerError::UnknownAccount(code) => InventoryError::InvalidAccount(
+                format!("GL account code `{code}` is not in the chart of accounts"),
+            ),
+            // The books refusing the post — a bill paid past what 1000
+            // Cash holds, a fact dated in a locked period — is a state
+            // the caller can act on, not storage trouble: `Conflict`
+            // naming the ledger's reason, a 409 (backlog 55f69172: it
+            // answered 500). The ledger's own door answers these 400.
+            e @ (boss_ledger::LedgerError::InvalidPayload { .. }
+            | boss_ledger::LedgerError::LockedPeriod { .. }) => {
+                InventoryError::Conflict(format!("the ledger refused the post: {e}"))
+            }
+            e => InventoryError::Storage(format!("ledger post failed: {e}")),
+        })?;
     Ok(result.rows_affected() > 0)
 }
 

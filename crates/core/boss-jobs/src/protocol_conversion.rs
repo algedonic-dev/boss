@@ -571,16 +571,8 @@ mod tests {
 
     fn field(name: &str, required: bool) -> StepField {
         StepField {
-            name: name.to_string(),
-            field_type: "string".to_string(),
             required,
-            filled_by: boss_core::job::FilledBy::Executor,
-            item_keys: Vec::new(),
-            covers: None,
-            binds: None,
-            item_value_max_bytes: None,
-            item_one_of: Vec::new(),
-            writer: None,
+            ..StepField::new(name.to_string(), "string".to_string())
         }
     }
 

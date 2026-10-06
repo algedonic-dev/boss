@@ -417,7 +417,7 @@ const SERVICES: &[(&str, Reader)] = &[
     (
         "boss-events-api.toml",
         Reader::Struct {
-            bin: "crates/core/boss-events/src/bin/boss_events_api.rs",
+            bin: "crates/orchestrators/boss-events-api/src/main.rs",
             file: "crates/core/boss-events/src/events_api_config.rs",
             name: "EventsApiConfig",
         },

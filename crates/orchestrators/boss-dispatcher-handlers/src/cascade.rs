@@ -184,6 +184,11 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // it; the request's answer completes the step through
         // complete-release-tag-on-tag-release-answered.
         ("ops.file_tag_release", vec!["jobs.job.created"]),
+        // An estate finding files the ops-request of each verb that
+        // declares it remedies it (3df309bf): one `jobs.job.created`, an
+        // ops-request, never an estate comparison, so the topic it
+        // fires on (`jobs.estate.compared`) cannot re-enter it.
+        ("ops.file_remedies", vec!["jobs.job.created"]),
         // A chore that closed red opens one backlog-item per RED route
         // on its recorded step (ac3270c7): items (`jobs.job.created`)
         // and a `judged` note on the chore it read (`jobs.job.updated`).
@@ -223,10 +228,13 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // A step going ready is completed from a record its own packet
         // already holds (b951c00a: a builder's pre-green report lands
         // on the green). The completion carries the packet to its own
-        // terminal, as the clock's does.
+        // terminal, as the clock's does. A rule naming `post_to` also
+        // posts the finish record the packet holds (bb32b2a0: the run's
+        // `agent_runs` cost row), which the agent-runs door records as
+        // `agents.run.recorded`; nothing listens for it.
         (
             "jobs.complete_step_from_record",
-            vec!["jobs.step.completed"],
+            vec!["jobs.step.completed", "agents.run.recorded"],
         ),
         // A fact that answers a machine-filed item withdraws the open
         // packets carrying its key (ac0a0abd: a redelivered or
@@ -363,6 +371,18 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
             "credential.rotate.github-app-installation",
             vec!["jobs.step.completed"],
         ),
+        // Fourth, the ops runner's credential (backlog 1e50e66b): on a
+        // rotation packet it completes that packet's `task` steps (issue,
+        // install, verify on the scope firing; revoke on the delivery
+        // firing), never a credential-rotation or credential-delivery
+        // step — the host's deposit completes `delivered` — so it cannot
+        // re-enter either trigger.
+        ("credential.rotate.ops-runner", vec!["jobs.step.completed"]),
+        // Fifth, the estate machine token (design 6805c764, car 3): on a
+        // rotation packet it completes that packet's `task` steps, never
+        // a credential-rotation step; its clock firing (`phase =
+        // "advance"`) advances the same packets and files nothing.
+        ("credential.rotate.self-issued", vec!["jobs.step.completed"]),
         // The zone observer (5e58922c): fires on a dns-zone-observation
         // packet's `observe` step, reads the zone with the broker's
         // Cloudflare root token, runs the tree's comparator, and
@@ -423,6 +443,20 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // to its OWN alarm; it grants and refuses nothing.
         (
             "policy.coverage.alarm",
+            vec![
+                "jobs.job.created",
+                "jobs.job.updated",
+                "jobs.step.completed",
+            ],
+        ),
+        // The lapsed-grant watch (backlog b8e75382 R3): the same shape
+        // as the coverage backstop — an hourly read of the policy
+        // check's refusal tally that files (`jobs.job.created`) at most
+        // one alarm per finding and withdraws it through its step
+        // (`jobs.step.completed`) or a note (`jobs.job.updated`). Every
+        // write is to its OWN alarm; it grants and refuses nothing.
+        (
+            "policy.check.refusals.alarm",
             vec![
                 "jobs.job.created",
                 "jobs.job.updated",

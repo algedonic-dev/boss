@@ -68,7 +68,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "An outage or degradation, worked as a packet: raise what was seen, stabilize the live system first, then learn from it in the order that forces the questions that get missed — the timeline before the theory, 'did we just ship this?' before the root cause, what should have found it, what can be REMOVED before anything is added, each action filed as its own packet — and a person reviews the findings. The platform's one incident protocol since 2026-09-24: incident-post-mortem and post-mortem were folded in and retired (backlog 59d15039)."
-metadata = { surfaces = ["system-incidents"] }
+metadata = { department = "it", surfaces = ["system-incidents"] }
 
 [[workflow.step]]
 title = "raised"

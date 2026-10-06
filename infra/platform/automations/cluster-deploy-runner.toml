@@ -1,0 +1,7 @@
+# automation:cluster-deploy-runner — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 284 audit-log facts.
+# Signs as platform-admin today: infra/forge/cluster-deploy-lib.sh, infra/forge/alert-lib.sh, infra/forge/registry-drift.sh.
+
+[[automation]]
+id = "automation:cluster-deploy-runner"
+role = "platform-admin"
+description = 'The forge cluster converge: deploys a merged build and records the converge (infra/forge/cluster-deploy-lib.sh).'

@@ -16,15 +16,21 @@
 //! ordinary `job` read scope, exactly as `queue_age` and `stations_load`
 //! do. The boarding predicate's numbers therefore come from the live
 //! registry, never a constant baked into the page.
+//!
+//! THE FIRINGS ARE THE EXCEPTION (backlog d0058c92). The cadence rows
+//! are configuration, but the board rules' last firings and the
+//! conductor's heartbeat are a RECORD — when the track last boarded and
+//! when the conductor last ran — that is not scoped by packet. They are
+//! read only for a caller whose scope reads every packet ([`Firings`]),
+//! the rule the IT map keeps for every such record; anyone narrower is
+//! told they were withheld.
 
 use super::*;
 
 use crate::yard;
 
-/// How wide the read windows are. Trains: `yard::TRAIN_WINDOW`, one per
-/// read. Gate-runs: `yard::GATE_RUN_WINDOW` for the recency read, and
-/// the held read below. Cars: the dock's backing cars.
-const CAR_WINDOW: i64 = 400;
+// Gate-runs have a recency read and a separate held read. The car
+// cross-reference below reads every scoped car, including closed ones.
 use yard::{GATE_RUN_WINDOW, HELD_RUN_PAGE, HELD_RUN_PAGES};
 /// Keep closed trains from the last two weeks in the "recent" window —
 /// "recently arrived/cancelled", the tail the surface shows beside the
@@ -40,16 +46,34 @@ pub(super) async fn yard_status<R: JobsRepository + 'static, B: EventBus + 'stat
     // slice. The registry reads (cadence, policy) are describing the
     // pipeline's configuration, not packet content, so they ride the
     // same gate rather than a second one.
-    let predicate = match state.policy.scope_predicate(&user, Resource::job()).await {
+    //
+    // THE TRANSLATED SCOPE DECIDES (backlog d0058c92), not the policy's
+    // own answer: a department grant held outside its department is a
+    // predicate, not `Predicate::None`, and translates to an empty scope
+    // — it read no packets here, but had the cadence record read in
+    // beside them. `Predicate::None` translates to the same empty scope.
+    let predicate = match state.policy.scope_of(&user, controls::READ_JOB).await {
         Ok(p) => p,
         Err(e) => {
             return e.into_response();
         }
     };
-    if matches!(predicate, boss_policy_client::Predicate::None) {
+    let scope = JobScope::from_predicate(&user, &predicate);
+    if matches!(scope, crate::port::JobScope::None) {
         return Json(empty_status()).into_response();
     }
-    let scope = job_scope_from_predicate(&user, &predicate);
+    // THE FIRINGS ONLY FOR A CALLER WHO READS EVERY PACKET (backlog
+    // d0058c92, from review b987dbc2). The board rule's last firing and
+    // the conductor's heartbeat are the cadence record, which is not
+    // scoped by packet: when the track last boarded and when the
+    // conductor last ran, whoever's packets they moved. The IT map
+    // withholds both below a full scope (the borders' machine firings,
+    // 0964ba80); this read handed them to the same caller one door over.
+    let firings = if matches!(scope, crate::port::JobScope::All) {
+        Firings::Read
+    } else {
+        Firings::Withheld
+    };
     let now = boss_clock_client::now_from(&state.clock).await;
     let YardRead {
         status,
@@ -57,7 +81,7 @@ pub(super) async fn yard_status<R: JobsRepository + 'static, B: EventBus + 'stat
         health,
         gate_runs_truncated,
         ..
-    } = match read_yard(&state, &user, scope, now).await {
+    } = match read_yard(&state, &user, scope, firings, now).await {
         Ok(read) => read,
         Err(resp) => return resp,
     };
@@ -84,6 +108,22 @@ pub(super) struct YardRead {
     pub open_trains: Vec<(boss_core::job::Job, Vec<boss_core::job::Step>)>,
 }
 
+/// Whether [`read_yard`] reads the cadence record's FIRINGS — the board
+/// rules' last firings and the conductor's heartbeat — for its caller
+/// (backlog d0058c92). An enum rather than a `bool` because the call
+/// site reads as the fact it states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Firings {
+    /// Read them: a caller whose scope reads every packet, and the map's
+    /// own pass (see `regions::read_map_as`, which decides its own).
+    Read,
+    /// Do not read them: the record is not scoped by packet, and this
+    /// caller's scope does not read every packet. The boarding block
+    /// carries [`yard::Reading::Withheld`] and the conductor block
+    /// [`yard::conductor_withheld`] — never a failure, never "never".
+    Withheld,
+}
+
 /// The yard status handler's read sequence, as a function. Every read
 /// that used to `return` a response returns it as `Err` here; the
 /// posture of each read (fail the request, or degrade to an admitted
@@ -92,6 +132,7 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
     state: &JobsApiState<R, B>,
     user: &boss_policy_client::User,
     scope: crate::port::JobScope,
+    firings: Firings,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<YardRead, Response> {
     // Trains: two reads, because one cannot hold both. The in-flight
@@ -166,22 +207,21 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
         closed_trains.push((job, steps));
     }
 
-    // The cars: the dock's parked cars come from the station queue lens
-    // (the registry predicate, not a hand-rolled filter); the car branch
-    // set for the stranded cross-ref comes from the same ship-a-change
-    // read the dock backs onto.
+    // Every scoped car, including closed ones: absence from this set
+    // means a gate never became a car, not that its car fell out of a
+    // recency window. The former 400-row read called nine merged cars
+    // stranded once their rows aged past it (d59c4a37). A failed page
+    // cannot prove absence, so it refuses the request like train reads.
+    // The dock's membership still comes from its station queue below.
     let cars = {
         let filter = JobFilter {
             kind: Some("ship-a-change".to_string()),
             scope: scope.clone(),
             ..Default::default()
         };
-        state
-            .jobs
-            .list_jobs(&filter, CAR_WINDOW, 0)
+        crate::list_every::list_every(state.jobs.as_ref(), &filter, MAX_LIMIT)
             .await
-            .map(|(rows, _)| rows)
-            .unwrap_or_default()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?
     };
     let branch_of = |c: &Job| {
         c.metadata
@@ -236,10 +276,15 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
     // conductor" means. Read straight from the repository this process
     // holds, like the rules and the policy above — and degraded to
     // "unknown" on any failure, never to "fine".
+    //
+    // Not READ at all for a caller the firings are withheld from
+    // ([`Firings::Withheld`]) — so nothing derived from it can reach that
+    // caller either, `silent_for_minutes` (the instant, beside `now`)
+    // among them.
     const HEARTBEAT_RULE: &str = "train-reconcile";
-    let last_firing = match state.cadence.as_ref() {
-        Some(repo) => repo.last_firing(HEARTBEAT_RULE).await.ok().flatten(),
-        None => None,
+    let last_firing = match (state.cadence.as_ref(), firings) {
+        (Some(repo), Firings::Read) => repo.last_firing(HEARTBEAT_RULE).await.ok().flatten(),
+        _ => None,
     };
     let heartbeat_rule = rules.iter().find(|r| r.name == HEARTBEAT_RULE);
     let heartbeat_minutes = heartbeat_rule.and_then(|r| r.every_minutes).map(i64::from);
@@ -263,7 +308,18 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
     // are one table on one connection, and a cooldown stated beside an
     // unknown last board would be half an answer wearing a whole one's
     // shape.
+    //
+    // Withheld from a caller whose scope does not read every packet
+    // (backlog d0058c92): neither firing is read, so the last board, the
+    // cooldown's minutes and the board's refusal line — each a function
+    // of a firing — are not derivable for it, and the block says
+    // WITHHELD where they would stand. Only when the rows were read:
+    // with them unread there is no rule to withhold a firing of, and the
+    // cadence reading already says so.
     let (depth_firing, clock_firing, last_board_reading) = match state.cadence.as_ref() {
+        Some(_) if cadence_reading == yard::Reading::Read && firings == Firings::Withheld => {
+            (None, None, yard::Reading::Withheld)
+        }
         Some(repo) if cadence_reading == yard::Reading::Read => {
             let (depth, clock) = tokio::join!(
                 firing_of(repo.as_ref(), yard::depth_rule(&rules)),
@@ -444,13 +500,16 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
     // The VERB the heartbeat rule runs (`reconcile`), read from its row.
     // This used to pass the rule's NAME, so `last_verb` said
     // `train-reconcile` — a label that was not the fact it named.
-    let health = yard::conductor_health(
-        last_firing.as_ref().map(|f| f.fired_at),
-        heartbeat_rule.map(|r| r.verb.as_str()),
-        last_firing.as_ref().and_then(|f| f.rc),
-        heartbeat_minutes,
-        Some(now),
-    );
+    let health = match firings {
+        Firings::Read => yard::conductor_health(
+            last_firing.as_ref().map(|f| f.fired_at),
+            heartbeat_rule.map(|r| r.verb.as_str()),
+            last_firing.as_ref().and_then(|f| f.rc),
+            heartbeat_minutes,
+            Some(now),
+        ),
+        Firings::Withheld => yard::conductor_withheld(heartbeat_minutes),
+    };
     Ok(YardRead {
         status,
         dock_reading,
@@ -616,6 +675,7 @@ fn with_dock_source(mut v: serde_json::Value, reading: yard::Reading) -> serde_j
             serde_json::json!(match reading {
                 yard::Reading::Read => "station",
                 yard::Reading::Unread => "unavailable",
+                yard::Reading::Withheld => "withheld",
             }),
         );
     }

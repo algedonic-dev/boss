@@ -40,7 +40,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use reqwest::blocking::Client;
+use boss_core::machine_token::BlockingClient;
 use serde::Deserialize;
 use tracing::{info, warn};
 
@@ -211,13 +211,15 @@ pub fn bootstrap_admin_row(email: &str) -> Employee {
 /// filter — so the answer is the roster's, not this binary's reading
 /// of a file. A transport error or a non-2xx is an Err, never None.
 pub fn holder_of_email(
-    client: &Client,
+    client: &BlockingClient,
     people_base: &str,
+    user_header: &str,
     email: &str,
 ) -> Result<Option<(String, Option<String>)>> {
     let url = format!("{}/api/people", people_base.trim_end_matches('/'));
     let resp = client
         .get(&url)
+        .header("x-boss-user", user_header)
         .query(&[("email", email)])
         .send()
         .with_context(|| format!("GET {url}?email=… (is the people-api up?)"))?;
@@ -379,11 +381,41 @@ fn log_injection(injection: &Injection) {
     }
 }
 
+/// A 409 is "already hired" only when the row is there. The people API
+/// answers 409 for every refusal the roster states — a taken email, an
+/// absent manager, a role or location the registries refuse — and
+/// since backlog be459ab9 the first two are 409s where Postgres
+/// answered 500s, so counting every 409 as hired would turn a loud
+/// failure into a silent skip. The same rule `boss tenant publish`
+/// learned (backlog 0d2d7daa). A failed read is not a row.
+fn is_hired(client: &BlockingClient, people_url: &str, user_header: &str, id: &str) -> bool {
+    client
+        .get(format!("{people_url}/{id}"))
+        .header("x-boss-user", user_header)
+        .send()
+        .is_ok_and(|r| r.status().is_success())
+}
+
 /// Read the seed file, decide the injection — the tenant's declared
 /// roster under `tenant_dir` first, then the live roster — and POST
 /// every hire. 409 on a duplicate id is "already hired"; any other
 /// failure fails the run.
-pub fn seed(people_base: &str, seed_path: &Path, tenant_dir: Option<&Path>) -> Result<Summary> {
+///
+/// `client` is the caller's [`BlockingClient`], which stamps the estate
+/// machine token on every request and follows no redirect (design
+/// 6805c764 car 2, the blocking-senders slice, 2026-09-29): until then
+/// the seed built a plain client whose default headers carried the
+/// identity and no token, so an enforcing people port would have
+/// refused the platform's founding hires. The identity now rides each
+/// request, since the client is not this function's to configure; a
+/// test hands it a fixed source, never the process's live one (backlog
+/// 2ee29275, F2).
+pub fn seed(
+    client: &BlockingClient,
+    people_base: &str,
+    seed_path: &Path,
+    tenant_dir: Option<&Path>,
+) -> Result<Summary> {
     let raw = std::fs::read_to_string(seed_path)
         .with_context(|| format!("reading operator-baseline seed at {}", seed_path.display()))?;
     let mut seed: OperatorSeed =
@@ -420,24 +452,9 @@ pub fn seed(people_base: &str, seed_path: &Path, tenant_dir: Option<&Path>) -> R
         "department": "it",
     })
     .to_string();
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        "x-boss-user",
-        reqwest::header::HeaderValue::from_str(&user_header)
-            .with_context(|| "x-boss-user header value")?,
-    );
-    headers.insert(
-        reqwest::header::CONTENT_TYPE,
-        reqwest::header::HeaderValue::from_static("application/json"),
-    );
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .default_headers(headers)
-        .build()
-        .with_context(|| "building reqwest client")?;
 
     let injection = injection_for(&mut seed, email, &roster, |e| {
-        holder_of_email(&client, people_base, e)
+        holder_of_email(client, people_base, &user_header, e)
     })?;
     log_injection(&injection);
 
@@ -446,7 +463,12 @@ pub fn seed(people_base: &str, seed_path: &Path, tenant_dir: Option<&Path>) -> R
     let mut skipped = 0u64;
     let mut failed = 0u64;
     for emp in &seed.hire {
-        let resp = match client.post(&url).json(emp).send() {
+        let sent = client
+            .post(&url)
+            .header("x-boss-user", &user_header)
+            .json(emp)
+            .send();
+        let resp = match sent {
             Ok(r) => r,
             Err(e) => {
                 warn!(operator_id = %emp.id, error = %e, "POST operator transport error");
@@ -458,7 +480,7 @@ pub fn seed(people_base: &str, seed_path: &Path, tenant_dir: Option<&Path>) -> R
         if status.is_success() {
             inserted += 1;
             info!(operator_id = %emp.id, role = emp.role.as_deref().unwrap_or(""), "operator hired");
-        } else if status.as_u16() == 409 {
+        } else if status.as_u16() == 409 && is_hired(client, &url, &user_header, &emp.id) {
             skipped += 1;
             info!(operator_id = %emp.id, "operator already hired, skipping");
         } else {

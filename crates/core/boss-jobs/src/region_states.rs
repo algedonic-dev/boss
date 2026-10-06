@@ -466,10 +466,25 @@ pub const MOVES_UNDECLARED: Band = band(
     0,
 );
 
-/// EVERY BAND, once. A region names a band by referring to its constant,
-/// so an undeclared band cannot be named at all; this list is what the
-/// uniqueness and coverage pins read.
-pub const BANDS: [Band; 30] = [
+/// An owed polled reading is older than its own declared polling period.
+pub const SENSOR_OVERDUE: Band = band(
+    "sensor-overdue",
+    "sensors",
+    Attention,
+    "the sensor's declared poll interval",
+    0,
+);
+/// The existing poller's loud unreadable-source packet is still open.
+pub const SENSOR_UNREADABLE: Band = band(
+    "sensor-unreadable",
+    "sensors",
+    Troubled,
+    "an open sensor unreadable finding",
+    0,
+);
+
+/// EVERY BAND, once; uniqueness and coverage pins read this roster.
+pub const BANDS: [Band; 32] = [
     UNREAD,
     MACHINE_FAILED,
     FULL,
@@ -500,6 +515,8 @@ pub const BANDS: [Band; 30] = [
     PUBLISH_HELD,
     BORDER_STILL,
     MOVES_UNDECLARED,
+    SENSOR_OVERDUE,
+    SENSOR_UNREADABLE,
 ];
 
 /// ONE CONDITION a region found true on this read.

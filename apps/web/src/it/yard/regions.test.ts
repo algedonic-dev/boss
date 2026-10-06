@@ -74,7 +74,9 @@ describe('parseRegions — the payload, parsed once', () => {
   it('reads the regions in the order the server sent them, with count, bound, state, why and trend', () => {
     const m = parseRegions(PAYLOAD);
     expect(m.window_hours).toBe(24);
-    expect(m.regions.map((r) => r.name)).toEqual([...REGION_NAMES]);
+    // This captured payload predates Sensors; parsing preserves the actual
+    // answer rather than inventing a row that the old server never read.
+    expect(m.regions.map((r) => r.name)).toEqual(PAYLOAD.regions.map((r) => r.name));
     const gates = m.regions[1]!;
     expect(gates).toEqual({
       name: 'gates',

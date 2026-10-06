@@ -111,29 +111,22 @@ pub fn policy() -> Arc<dyn PolicyClient> {
 pub fn step(id: &str, assurance: Option<Assurance>, sign_off: bool) -> Step {
     Step {
         id: StepId::from_uuid(Uuid::parse_str(id).unwrap()),
-        job_id: JobId::from_uuid(Uuid::parse_str(JOB).unwrap()),
-        kind: "generic".into(),
-        title: "Approve the plan".into(),
         spec_slug: Some("approve".into()),
         assignee_id: Some("emp-david".into()),
         status: StepStatus::Ready,
-        sort_order: 1,
-        blocked_by: vec![],
         sign_offs_required: if sign_off {
             vec!["platform-admin".into()]
         } else {
             Vec::new()
         },
         assurance_required: assurance,
-        sign_offs: Vec::new(),
-        fields: Vec::new(),
-        completed_on: None,
-        completed_by: None,
-        completed_at: None,
         metadata: serde_json::json!({ "plan": "{\"verb\":\"wipe-a-disk\"}" }),
-        notes: None,
-        step_plugin_version: 0,
-        embedded_job: None,
+        ..Step::new(
+            JobId::from_uuid(Uuid::parse_str(JOB).unwrap()),
+            "generic",
+            "Approve the plan",
+            1,
+        )
     }
 }
 
@@ -156,20 +149,17 @@ pub async fn seed(key: Option<&[u8]>) -> (Router, Arc<InMemoryJobs>) {
     };
     jobs.create_job(&Job {
         id: JobId::from_uuid(Uuid::parse_str(JOB).unwrap()),
-        kind: "ops-request".into(),
         workflow_version: 2,
-        subject: Subject::new("custom", "forge"),
-        title: "wipe a disk on forge".into(),
-        owner_id: "emp-david".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 24).unwrap(),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "ops-request",
+            Subject::new("custom", "forge"),
+            "wipe a disk on forge",
+            "emp-david",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 24).unwrap(),
+        )
     })
     .await
     .unwrap();

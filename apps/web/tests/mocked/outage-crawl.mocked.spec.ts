@@ -36,7 +36,7 @@
 // tests at the bottom) so it can only shrink.
 
 import { test, expect, type Page, type Request } from './_test';
-import { EMPLOYEE_DETAIL, SHELL_ENDPOINTS, installSmokeMocks } from './_smokeMocks';
+import { DEPARTMENTS_ENDPOINT, EMPLOYEE_DETAIL, SHELL_ENDPOINTS, installSmokeMocks } from './_smokeMocks';
 import { FAILURE_MARKER, ROUTES } from './_routes';
 import { nextFrame } from './_helpers';
 import { scaled } from '../../src/dev-load';
@@ -127,6 +127,9 @@ const SILENT: ReadonlyMap<string, string> = new Map([
 /// subjects-classes-page.mocked.spec.ts fails each of the three reads
 /// alone and pins each failure line by its words.
 const ALSO_BROKEN: ReadonlyMap<string, ReadonlyArray<RegExp>> = new Map([
+  // The company map owns the roster that chrome normally keeps healthy.
+  // Break it here too; an answered registry is not an outage control.
+  ['/map', [DEPARTMENTS_ENDPOINT]],
   ['/ux/people', [/\/api\/people$/]],
   ['/ux/people/emp-001', [/\/api\/people$/]],
   ['/hr', [/\/api\/people$/]],

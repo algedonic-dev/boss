@@ -31,6 +31,53 @@
 # itself, so a day of gate duration and w-1 I/O pressure is recorded on
 # that packet before five is considered.
 #
+# Version 4 (backlog 461159e7, 2026-09-30): gate_max_concurrent 4 -> 3,
+# bumped from the LIVE newest (v3, read off
+# /api/delivery/policy/train-conductor at 2026-09-30; versions/4 answered
+# null). v3 rested on "4 x 90Gi ephemeral fits the 929GB disk", but the
+# kubelet evicts on usage and a gate may fill its 160Gi workspace: on
+# 2026-09-29 22:30:29Z w-1 evicted a running gate. The same car raises
+# each gate's request to 160Gi, so the node itself now admits 3 x 160 +
+# the dev pod's 154 = 634 of ~790 GiB allocatable, and a fourth needs
+# 794. At 4, the fourth bay's gate would sit Pending for most of a busy
+# day, look like a running slot in the yard, queue ahead of the train
+# gate, and take the dev pod's room whenever the dev pod rolls
+# (Recreate, preemptionPolicy Never), which locks the session out. So
+# the policy states the capacity the node will honour. What restores
+# four is the second NVMe on w-1 (52ea56ac, planned for the morning of
+# 2026-09-30); David's throughput decision on v3 stands, deferred to
+# that disk rather than overturned.
+#
+# Version 5 (backlog e6dc7331, 2026-09-30): gate_max_concurrent 3 -> 4,
+# bumped from the LIVE newest (v4, read off
+# /api/delivery/policy/train-conductor at 2026-09-30 22:4xZ;
+# versions/5 answered null). The second NVMe landed (52ea56ac, #853):
+# a gate's workspace and the seed live on /var/mnt/gate, off the
+# install disk. Measured on w-1's nodefs across the first five
+# new-layout gates (21:03Z-22:37Z), a gate keeps roughly ~8 GB on
+# EPHEMERAL — inside that series' noise, with pgdata and /tmp
+# unmeasured (review be559bda) — so its request drops 160Gi -> 40Gi in
+# the same car, and four bays plus the train gate beside the dev pod
+# ask 5 x 40 + 154 = 354 of w-1's 789 GiB allocatable (pinned in boss-testing,
+# a_gate_requests_what_the_new_layout_uses_and_the_bays_fit). CPU and
+# memory: five gates request 20 CPU / 40Gi of w-1's 32 / 63Gi, with
+# the dev pod's 4 / 8Gi beside them. Four, not five: five was the I/O
+# cliff on ONE disk (2026-08-26) and four has never been measured with
+# the I/O split across two, so a day of gate duration at four is
+# recorded on e6dc7331 before any further step.
+#
+# Version 6 (backlog 0491b7d6, 2026-10-01): consist_budget_secs 60 ->
+# 120, bumped from the LIVE newest (v5, read off
+# /api/delivery/policy/train-conductor at 2026-10-01 02:4xZ). Run
+# 9f0faeea measured the 94-lint consist roster with no token in reach
+# at 85-89 s serial, all passing; the conductor logged "budget spent
+# (61s) after 68 of 94 checks" on every board, so 26 lints never ran
+# there. The lints are CPU-bound: pinned to the conductor's 1-CPU
+# limit, serial took 82.4 s and 8-wide 81.6 s, so a parallel runner
+# buys nothing at that limit. 120 is ~40% over the 85 s projection.
+# The larger option (conductor cpu 4 plus a parallel runner, ~20-25 s)
+# stays open on that packet.
+#
 # The compiled fallback in delivery_policy.rs is held equal to this
 # file by `the_bundle_equals_the_compiled_fallback` (boss-cli): the
 # conductor runs on these numbers whether or not the registry answers,
@@ -41,7 +88,7 @@
 
 [[delivery_policy]]
 name = "train-conductor"
-version = 3
+version = 6
 status = "active"
 # THE HOLD: red trains a car may be released from before boarding
 # leaves it behind until a human looks.
@@ -52,7 +99,7 @@ stall_hours = 6
 # THE CONSIST CHECK'S THREE BUDGETS: wall-clock seconds for the whole
 # check, characters of a failing lint's output on the record, and how
 # many filenames a refusal names.
-consist_budget_secs = 60
+consist_budget_secs = 120
 consist_output_budget = 1200
 consist_files_named = 6
 # THE TWO REASON BUDGETS, in characters: a left-behind car's
@@ -64,5 +111,5 @@ blip_cause_budget = 80
 ci_host_floor_gb = 40
 # How many gates `boss gate` admits at once before it refuses — the
 # number the CLI obeys and the number the yard draws as slots. Four
-# since v3 (see the header).
+# since v5, the workspace on w-1's second NVMe (see the header).
 gate_max_concurrent = 4

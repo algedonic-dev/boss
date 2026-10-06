@@ -266,6 +266,124 @@ pub struct Invoice {
 }
 
 impl Invoice {
+    /// PURE: the invoice as a store keeps it — every line under the
+    /// header's id, whatever the line carried, and the lines in byte
+    /// order of id. Postgres always stored it so (it binds the header's
+    /// id and reads lines by id) but answered a create with the body as
+    /// sent, and the double stored the body as sent; both now store,
+    /// answer and record this (backlog be459ab9, found by the
+    /// adapters-agree suite).
+    pub fn as_stored(&self) -> Invoice {
+        let mut lines: Vec<InvoiceLineItem> = self
+            .line_items
+            .iter()
+            .map(|l| InvoiceLineItem {
+                invoice_id: self.id.clone(),
+                ..l.clone()
+            })
+            .collect();
+        lines.sort_by(|a, b| a.id.cmp(&b.id));
+        Invoice {
+            line_items: lines,
+            ..self.clone()
+        }
+    }
+
+    /// PURE: why no store can keep this create body as a true document,
+    /// or `None` when it can. One statement both adapters refuse by, as
+    /// `Invalid` (backlog be459ab9): until the adapters-agree suite each
+    /// adapter carried its own copy — the double's had no tax, so it
+    /// refused every taxed invoice and accepted a negative tax — and
+    /// Postgres left the currency, payment method, a repeated line id
+    /// and a NUL byte to its constraints, each a 500.
+    ///
+    /// A line's `invoice_id` is not judged: the store writes the
+    /// header's id there ([`Invoice::as_stored`]).
+    pub fn malformed(&self) -> Option<String> {
+        let header = [
+            ("id", Some(self.id.as_str())),
+            ("account_id", Some(self.account_id.as_str())),
+            ("status", Some(self.status.as_str())),
+            ("currency", Some(self.currency.as_str())),
+            ("tax_jurisdiction", self.tax_jurisdiction.as_deref()),
+            ("payment_method", self.payment_method.as_deref()),
+        ]
+        .map(|(field, v)| (field.to_string(), v));
+        let lines = self.line_items.iter().enumerate().flat_map(|(n, l)| {
+            [
+                ("id", Some(l.id.as_str())),
+                ("revenue_category", Some(l.revenue_category.as_str())),
+                ("currency", Some(l.currency.as_str())),
+                ("description", Some(l.description.as_str())),
+                ("ref_id", l.ref_id.as_deref()),
+                ("sku", l.sku.as_deref()),
+            ]
+            .map(|(field, v)| (format!("line_items[{n}].{field}"), v))
+        });
+        if let Some((field, _)) = header
+            .into_iter()
+            .chain(lines)
+            .find(|(_, v)| v.is_some_and(|v| v.contains('\0')))
+        {
+            return Some(format!(
+                "{field} carries a NUL byte, which no store can keep"
+            ));
+        }
+        let id = &self.id;
+        let line_sum: i64 = self.line_items.iter().map(|l| l.amount_cents).sum();
+        if self.line_items.is_empty() {
+            return Some(format!("invoice {id} has no line items"));
+        }
+        if self.tax_cents < 0 {
+            return Some(format!(
+                "invoice {id} tax_cents={} must be non-negative",
+                self.tax_cents
+            ));
+        }
+        if self.tax_cents > 0 && self.tax_jurisdiction.is_none() {
+            return Some(format!(
+                "invoice {id} has tax_cents={} but no tax_jurisdiction",
+                self.tax_cents
+            ));
+        }
+        if line_sum + self.tax_cents != self.amount_cents {
+            return Some(format!(
+                "invoice {id} amount_cents={} but line items ({line_sum}) + tax ({}) sum to {}",
+                self.amount_cents,
+                self.tax_cents,
+                line_sum + self.tax_cents
+            ));
+        }
+        if self.line_items.iter().any(|l| l.currency != self.currency) {
+            return Some(format!(
+                "invoice {id} line items disagree on currency with header {}",
+                self.currency
+            ));
+        }
+        if self.currency.chars().count() != 3 {
+            return Some(format!(
+                "invoice {id} currency {:?} is not a three-letter code",
+                self.currency
+            ));
+        }
+        if let Some(method) = self.payment_method.as_deref()
+            && !crate::port::PAYMENT_METHODS.contains(&method)
+        {
+            return Some(format!(
+                "invoice {id} payment_method {method:?} is not one of {:?}",
+                crate::port::PAYMENT_METHODS
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        if let Some(twice) = self.line_items.iter().find(|l| !seen.insert(&l.id)) {
+            return Some(format!(
+                "invoice {id} carries line id {} twice; a line id names one line",
+                twice.id
+            ));
+        }
+        None
+    }
+
     /// PURE: every field fixed at issuance where `self` — a create body
     /// under an id `stored` already holds — does not read as `stored`
     /// (backlog 9d2af748). Empty means the body describes the invoice

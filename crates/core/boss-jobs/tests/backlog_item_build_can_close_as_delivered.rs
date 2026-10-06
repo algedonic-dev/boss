@@ -182,8 +182,10 @@ fn actionable(job: &serde_json::Value, slug: &str) -> bool {
     matches!(status_of(job, slug).as_str(), "ready" | "active")
 }
 
-/// Complete a step, merging `extra` over its current metadata —
-/// never replacing, because `authority_role` shares that object.
+/// Complete a step: `extra` through the step merge door — merged,
+/// never replacing, because `authority_role` shares that object — then
+/// the status alone through the PUT, which writes no metadata
+/// (e39a9d2a). A merge the door refuses is the answer.
 async fn try_complete(
     app: &axum::Router,
     job_id: &str,
@@ -192,22 +194,32 @@ async fn try_complete(
     extra: serde_json::Value,
 ) -> (StatusCode, serde_json::Value) {
     let step = step_of(job, slug);
-    let mut metadata = step["metadata"].clone();
-    for (k, v) in extra.as_object().into_iter().flatten() {
-        metadata[k] = v.clone();
+    let step_id = step["id"].as_str().expect("step id");
+    if extra.as_object().is_some_and(|o| !o.is_empty()) {
+        let (status, body) = send(
+            app,
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/jobs/{job_id}/steps/{step_id}/metadata"))
+                .header("content-type", "application/json")
+                .header("x-boss-user", admin_header())
+                .body(Body::from(extra.to_string()))
+                .unwrap(),
+        )
+        .await;
+        if !status.is_success() {
+            return (status, body);
+        }
     }
     send(
         app,
         Request::builder()
             .method("PUT")
-            .uri(format!(
-                "/api/jobs/{job_id}/steps/{}",
-                step["id"].as_str().expect("step id")
-            ))
+            .uri(format!("/api/jobs/{job_id}/steps/{step_id}"))
             .header("content-type", "application/json")
             .header("x-boss-user", admin_header())
             .body(Body::from(
-                serde_json::json!({ "status": "completed", "metadata": metadata }).to_string(),
+                serde_json::json!({ "status": "completed" }).to_string(),
             ))
             .unwrap(),
     )

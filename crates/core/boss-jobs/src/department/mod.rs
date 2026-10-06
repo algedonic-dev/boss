@@ -5,19 +5,23 @@
 //! tenant's rows declare `metadata.department` (`receive-an-inquiry`
 //! and `receive-a-sponsorship` say `sales`, `publish-the-landing-page`
 //! says `marketing`, `receive-a-payout` says `finance`; the platform
-//! bundle declares none). So "the sales department's jobs" is the
-//! packets of the kinds whose ACTIVE workflow row declares `sales` —
-//! the current operating model, read from the registry.
+//! bundle's rows say `it`, the department that runs them — backlog
+//! a8458043, which found them all silent and IT's readiness empty). So
+//! "the sales department's jobs" is the packets of the kinds whose
+//! ACTIVE workflow row declares `sales` — the current operating model,
+//! read from the registry.
 //!
 //! PLUS the packets that name the department themselves (backlog
 //! 481d7939, 2026-09-23). The kinds every department has —
-//! `department-retro`, `page-audit`, the `backlog-item`s an audit
-//! files — are platform rows that declare no department because they
-//! serve all of them; their packets carry `metadata.department`, and
-//! the retro and page-audit schemas require it. Joined over kinds
-//! alone they appeared on no department's view. A packet's own word
-//! wins over its kind's (`crate::port::DepartmentFilter`), and both are
-//! read by one rule (`carried`).
+//! `department-retro` and `page-audit` — are platform rows that declare
+//! no department because they serve all of them; their schemas require
+//! every packet to carry `metadata.department` instead, and
+//! `tests/every_platform_protocol_names_its_department.rs` holds each
+//! platform row to exactly one of those two arms. The `backlog-item`s an
+//! audit files carry the audited department too, over a kind that
+//! declares `it`. A packet's own word wins over its kind's
+//! (`crate::port::DepartmentFilter`), and both are read by one rule
+//! (`carried`).
 //!
 //! Measured before this existed (backlog cc76f755, 2026-09-18):
 //! `?department=sales` answered 1944 — the unfiltered total — because

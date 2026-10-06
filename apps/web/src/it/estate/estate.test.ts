@@ -47,6 +47,20 @@ import {
   OPEN_ALARMS_READ,
   parseAlarms,
   seenCell,
+  CLUSTER_CONVERGE_KIND,
+  parseZoneOpen,
+  parseZoneReadings,
+  tunnelLine,
+  ZONE_KIND,
+  ZONE_OPEN_READ,
+  ZONE_READINGS_READ,
+  zoneAlarms,
+  zoneVerdict,
+  parseVolumeReadings,
+  volumeAlarms,
+  volumeLine,
+  VOLUMES_READ,
+  VOLUMES_SCOPE,
   type Comparison,
   type EstateNode,
   type EstateState,
@@ -256,6 +270,32 @@ describe('unitsVerdict', () => {
 
   test('a reading with no units list says the units were unread, never "all healthy"', () => {
     expect(unitsVerdict({ id: 'forge' })).toEqual({ ok: false, text: 'no units list on the reading' });
+  });
+
+  // Backlog 6647ac9a (page audit 2cff1d6e, GAP 14): the retired
+  // boss-ml-api.service ran on boss-gcp from 2026-09-20 while this line
+  // read "15 units watched, all healthy" — the roster is the declaration,
+  // so it was outside what the observer watched. The observer now names
+  // what runs outside it.
+  test('a running unit nobody declared turns the line, and is named', () => {
+    expect(unitsVerdict({
+      id: 'boss-gcp',
+      units: [unit('boss-gcp-converge.timer', true)],
+      undeclared_units: [{ unit: 'boss-ml-api.service' }],
+    })).toEqual({ ok: false, text: '1 unit watched, all healthy; 1 running but not declared: boss-ml-api.service' });
+  });
+
+  test('an enumeration the observer could not make is said, never read as none', () => {
+    expect(unitsVerdict({
+      id: 'boss-gcp',
+      units: [unit('boss-gcp-converge.timer', true)],
+      undeclared_unread: 'systemctl list-units exited 1',
+    })).toEqual({ ok: false, text: '1 unit watched, all healthy; running units not enumerated: systemctl list-units exited 1' });
+  });
+
+  test('an empty undeclared list is the clean reading', () => {
+    expect(unitsVerdict({ id: 'boss-gcp', units: [unit('a.timer', true)], undeclared_units: [] }))
+      .toEqual({ ok: true, text: '1 unit watched, all healthy' });
   });
 });
 
@@ -574,6 +614,7 @@ describe('fetchEstate', () => {
     expect(s.comparisons.kind).toBe('failed');
     expect(s.hostComparisons.kind).toBe('failed');
     expect(s.alarms.kind).toBe('failed');
+    expect(s.volumes.kind).toBe('failed');
     // With neither host source answering, no host series was planned —
     // and the state says it does not know, rather than "no hosts".
     expect(s.hosts).toEqual({ known: false, series: [] });
@@ -678,6 +719,7 @@ describe('parseLoopPackets', () => {
       outcome: 'completed',
       at: '2026-09-24T11:14:34Z',
       host: null,
+      tunnel: null,
     });
   });
 
@@ -755,7 +797,7 @@ describe('loopHost', () => {
 
   test('a host row is its host; otherwise the host the newest packet names; otherwise it says so', () => {
     expect(loopHost(row({ host: 'forge' }))).toBe('forge');
-    const packet = { id: 'x', status: 'closed', outcome: 'completed', at: null, host: 'boss-gcp' };
+    const packet = { id: 'x', status: 'closed', outcome: 'completed', at: null, host: 'boss-gcp', tunnel: null };
     expect(loopHost(row({ latest: { kind: 'ready', data: packet } }))).toBe('boss-gcp');
     expect(loopHost(row({}))).toBe('not named on the packet');
   });
@@ -826,8 +868,8 @@ describe('the loops the page reads are in the registry', () => {
     const declared = new Set(
       kinds.flatMap((k) => [...workflow(k).matchAll(/terminal = \{ outcome = "([^"]+)" \}/g)].map((m) => m[1]!)),
     );
-    expect([...declared].sort()).toEqual(['answered', 'completed', 'failed', 'refused']);
-    expect([...LOOP_OK_OUTCOMES].sort()).toEqual(['answered', 'completed']);
+    expect([...declared].sort()).toEqual(['answered', 'completed', 'failed', 'nothing-to-do', 'refused']);
+    expect([...LOOP_OK_OUTCOMES].sort()).toEqual(['answered', 'completed', 'nothing-to-do']);
   });
 });
 
@@ -891,6 +933,8 @@ function estateOf(over: Partial<EstateState> = {}): EstateState {
     hosts: { known: true, series: [] },
     loops: [],
     alarms: ready({ rows: [], total: 0 }),
+    zones: { latest: ready([]), open: ready([]) },
+    volumes: ready([]),
     ...over,
   };
 }
@@ -1063,6 +1107,227 @@ describe('the open estate alarms', () => {
   });
 });
 
+// THE EDGE (backlog e0e183fb; page audit 2cff1d6e, GAP 11). The DNS
+// zone, the Access applications in front of it and the tunnel routes
+// behind it are declared in the tree and read back daily — the zone and
+// Access on a dns-zone-observation packet, the routes on the cluster
+// converge's run step — and the page rendered none of it, so the one
+// estate alarm about the zone had no line to stand beside. The shapes
+// below are the live ones measured 2026-10-01 (packet d6ecf14f and
+// converge 05ec4e89), with the names moved to example.org.
+
+const TUNNEL = 'd8a8ef3b-0000-0000-0000-000000000000.cfargotunnel.com';
+
+/** One dns-zone-observation packet as GET /api/jobs?full=true lists it. */
+function zoneRow(over: Record<string, unknown> = {}, observe: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 'd6ecf14f-0000-0000-0000-000000000000',
+    kind: 'dns-zone-observation',
+    status: 'closed',
+    subject: { id: 'example.org', subject_kind: 'custom' },
+    opened_at: '2026-10-01T00:00:10Z',
+    metadata: { zone: 'example.org', outcome: 'matched', closed_at: '2026-10-01T00:00:15Z' },
+    steps: [
+      { spec_slug: 'due', metadata: {} },
+      {
+        spec_slug: 'observe',
+        metadata: {
+          result: 'match',
+          verdicts: [
+            {
+              record: 'boss.example.org CNAME', name: 'boss.example.org', type: 'CNAME', verdict: 'MATCH',
+              declared: { content: TUNNEL, proxied: true, ttl: 1, target: 'tunnel:cloudflare-tunnel-credentials' },
+              live: { content: TUNNEL, proxied: true, ttl: 1 },
+              interlock: 'access', access: 'present', why: 'the operating site',
+            },
+            {
+              record: 'id.example.org CNAME', name: 'id.example.org', type: 'CNAME', verdict: 'MATCH',
+              declared: { content: TUNNEL, proxied: true, ttl: 1, target: 'tunnel:cloudflare-tunnel-credentials' },
+              live: { content: TUNNEL, proxied: true, ttl: 1 },
+              interlock: 'tunnel', tunnel: 'routed', why: 'the identity provider',
+            },
+            { record: 'example.org MX', name: 'example.org', type: 'MX', verdict: 'UNDECLARED', live: { content: 'mail.example.net' } },
+            { record: 'example.org TXT', name: 'example.org', type: 'TXT', verdict: 'UNDECLARED', live: { content: '"v=spf1 ~all"' } },
+          ],
+          access: [
+            {
+              application: 'boss.example.org', domain: 'boss.example.org', verdict: 'MATCH', why: 'the operating site behind Access',
+              declared: { name: 'BOSS', type: 'self_hosted', session_duration: '24h', policies: [{ name: 'operators', decision: 'allow', emails: ['op@example.org'] }] },
+              live: { id: 'x', name: 'BOSS', type: 'self_hosted', policies: [{ name: 'operators', decision: 'allow', include: [{ email: { email: 'op@example.org' } }] }] },
+            },
+          ],
+          ...observe,
+        },
+      },
+    ],
+    ...over,
+  };
+}
+
+describe('the edge: the zone, the Access applications, the tunnel routes', () => {
+  test('are read off the packets the daily zone observation leaves — whole steps, newest first, and the open ones', () => {
+    expect(ZONE_READINGS_READ).toBe('/api/jobs?kind=dns-zone-observation&status=closed&limit=7&full=true');
+    expect(ZONE_OPEN_READ).toBe('/api/jobs?kind=dns-zone-observation&status=open');
+  });
+
+  test('each declared record carries the tree\'s spelling, what the zone holds, what fronts it, and its verdict', () => {
+    const [z] = parseZoneReadings({ data: [zoneRow()], total: 1 });
+    expect(z?.zone).toBe('example.org');
+    expect(z?.id).toBe('d6ecf14f-0000-0000-0000-000000000000');
+    expect(z?.at).toBe('2026-10-01T00:00:15Z');
+    expect(z?.records).toEqual([
+      { record: 'boss.example.org CNAME', verdict: 'MATCH', declared: 'tunnel:cloudflare-tunnel-credentials', live: TUNNEL, front: 'access: present', note: null, why: 'the operating site' },
+      { record: 'id.example.org CNAME', verdict: 'MATCH', declared: 'tunnel:cloudflare-tunnel-credentials', live: TUNNEL, front: 'tunnel: routed', note: null, why: 'the identity provider' },
+    ]);
+    // Live records the tree names nowhere are reported, never listed as
+    // declared: a count.
+    expect(z?.undeclared).toBe(2);
+  });
+
+  test('each Access application carries its type and its policies by name and decision — never the people they admit', () => {
+    const [z] = parseZoneReadings([zoneRow()]);
+    expect(z?.access).toEqual([
+      { domain: 'boss.example.org', type: 'self_hosted', policies: ['operators (allow)'], verdict: 'MATCH', note: null, why: 'the operating site behind Access' },
+    ]);
+    expect(JSON.stringify(z?.access)).not.toContain('op@example.org');
+    expect(z?.accessUndeclared).toBe(0);
+  });
+
+  test('a drifted record keeps both values, a held one its reason, a declared-but-absent one no live value', () => {
+    const [z] = parseZoneReadings([zoneRow({}, {
+      result: 'findings',
+      verdicts: [
+        { record: 'www.example.org CNAME', verdict: 'DRIFT', declared: { content: TUNNEL }, live: { content: 'old.example.net' } },
+        { record: 'dev.example.org CNAME', verdict: 'HELD', declared: { content: TUNNEL }, held: 'flip held — Access app absent', interlock: 'access', access: 'absent' },
+        { record: 'gone.example.org A', verdict: 'ABSENT', declared: { content: '192.0.2.7' } },
+      ],
+      access: [{ domain: 'new.example.org', verdict: 'REFUSED', write: 'create', error: '12130 policy precedences must be unique' }],
+    })]);
+    expect(z?.records.map((r) => [r.verdict, r.declared, r.live, r.note])).toEqual([
+      ['DRIFT', TUNNEL, 'old.example.net', null],
+      ['HELD', TUNNEL, null, 'flip held — Access app absent'],
+      ['ABSENT', '192.0.2.7', null, null],
+    ]);
+    expect(z?.access.map((a) => [a.domain, a.verdict, a.note])).toEqual([
+      ['new.example.org', 'REFUSED', 'create: 12130 policy precedences must be unique'],
+    ]);
+  });
+
+  test('the newest reading per zone wins; an older reading of the same zone is not drawn twice', () => {
+    const zones = parseZoneReadings({ data: [
+      zoneRow(),
+      zoneRow({ id: 'older', metadata: { zone: 'example.org', closed_at: '2026-09-30T00:00:15Z' } }),
+      zoneRow({ id: 'other', subject: { id: 'example.net' }, metadata: { closed_at: '2026-09-30T00:00:15Z' } }),
+    ], total: 3 });
+    expect(zones.map((z) => [z.zone, z.id])).toEqual([
+      ['example.org', 'd6ecf14f-0000-0000-0000-000000000000'],
+      // The zone falls back to the packet's subject, which is the zone.
+      ['example.net', 'other'],
+    ]);
+  });
+
+  test('a row with no id is refused, not rendered as a link to nowhere', () => {
+    expect(() => parseZoneReadings([zoneRow({ id: undefined })])).toThrow();
+  });
+
+  test('the verdict counts what matches of what is declared, and only drift, absence and refusal are trouble', () => {
+    const [ok] = parseZoneReadings([zoneRow()]);
+    expect(zoneVerdict(ok!)).toEqual({ ok: true, text: '2 of 2 declared records match · 1 of 1 Access applications match' });
+    const [held] = parseZoneReadings([zoneRow({}, {
+      verdicts: [{ record: 'dev.example.org CNAME', verdict: 'HELD', declared: { content: TUNNEL }, held: 'flip held' }],
+      access: [],
+    })]);
+    // HELD is a designed wait, not a finding (dns_observe.rs).
+    expect(zoneVerdict(held!)).toEqual({ ok: true, text: '0 of 1 declared records match, 1 held · 0 of 0 Access applications match' });
+    const [bad] = parseZoneReadings([zoneRow({}, {
+      verdicts: [{ record: 'www.example.org CNAME', verdict: 'DRIFT', declared: { content: TUNNEL }, live: { content: 'x' } }],
+    })]);
+    expect(zoneVerdict(bad!).ok).toBe(false);
+  });
+
+  test('an open reading is a zone that could not be read or compared, dated from when it opened', () => {
+    expect(parseZoneOpen({ data: [zoneRow({ id: 'o', status: 'open', opened_at: '2026-10-01T00:00:10Z', metadata: { zone: 'example.org' } })], total: 1 }))
+      .toEqual([{ id: 'o', zone: 'example.org', at: '2026-10-01T00:00:10Z' }]);
+  });
+
+  test('the zone\'s alarm is the one its raiser keys dns_drift:<zone>, and lands beside it', () => {
+    const alarms = { kind: 'ready' as const, data: parseAlarms({ data: [
+      alarmRow(),
+      alarmRow({ id: 'z' }, { scope: 'dns-zone', host: undefined, estate_finding: 'dns_drift:example.org', zone: 'example.org' }),
+      alarmRow({ id: 'n' }, { scope: 'dns-zone', host: undefined, estate_finding: 'dns_drift:example.net', zone: 'example.net' }),
+    ], total: 3 }) };
+    expect(zoneAlarms(alarms, 'example.org').map((a) => a.id)).toEqual(['z']);
+    expect(zoneAlarms({ kind: 'failed', error: 'x' }, 'example.org')).toEqual([]);
+    // The key lives twice — the raiser writes it, this page reads it —
+    // so it is pinned to the raiser (CLAUDE.md §9a).
+    const raiser = readFileSync(
+      new URL('../../../../../crates/orchestrators/boss-dispatcher-handlers/src/handlers/dns_observe.rs', import.meta.url),
+      'utf8',
+    );
+    expect(raiser).toContain('format!("dns_drift:{zone}")');
+  });
+
+  test('the kind and the step keys the page reads are the ones the tree declares and records', () => {
+    const workflow = readFileSync(new URL(`../../../../../infra/platform/workflows/${ZONE_KIND}.toml`, import.meta.url), 'utf8');
+    expect(workflow).toContain(`kind = "${ZONE_KIND}"`);
+    expect(workflow).toContain('title = "observe"');
+    const handler = readFileSync(
+      new URL('../../../../../crates/orchestrators/boss-dispatcher-handlers/src/handlers/dns_observe.rs', import.meta.url),
+      'utf8',
+    );
+    expect(handler).toContain('metadata.insert("verdicts".into()');
+    expect(handler).toContain('metadata.insert("access".into()');
+    const converge = readFileSync(new URL('../../../../../infra/forge/cluster-deploy-lib.sh', import.meta.url), 'utf8');
+    expect(converge).toContain('run_summary_field tunnel_ingress');
+    expect(converge).toContain('run_summary_field cloudflared');
+    expect(ESTATE_LOOPS.map((l) => l.kind)).toContain(CLUSTER_CONVERGE_KIND);
+  });
+
+  test('a converge\'s run step carries the tunnel routes it applied and the connector\'s state', () => {
+    const [p] = parseLoopPackets([jobRow({ kind: CLUSTER_CONVERGE_KIND, steps: [{ spec_slug: 'run', metadata: {
+      result: 'ok', cloudflared: 'connected',
+      tunnel_ingress: 'boss.example.org → boss; www.example.org → boss (site); dev.example.org → ssh://boss-dev-ssh:22 (origin)',
+    } }] })]);
+    expect(p?.tunnel).toEqual({
+      connector: 'connected',
+      routes: ['boss.example.org → boss', 'www.example.org → boss (site)', 'dev.example.org → ssh://boss-dev-ssh:22 (origin)'],
+    });
+    // Every other loop records none.
+    expect(parseLoopPackets([jobRow()])[0]?.tunnel).toBeNull();
+  });
+
+  test('the tunnel line reads the newest cluster converge, and says which of unread, never run or unrecorded it is', () => {
+    const conv = (latest: LoopRow['latest']): LoopRow[] => [{
+      kind: CLUSTER_CONVERGE_KIND, label: 'cluster converge', host: null, latest, open: { kind: 'ready', data: [] },
+    }];
+    const packet = (tunnel: { connector: string | null; routes: string[] } | null) =>
+      ({ id: 'c', status: 'closed', outcome: 'completed', at: '2026-10-01T11:21:48Z', host: 'forge', tunnel });
+    expect(tunnelLine(conv({ kind: 'ready', data: packet({ connector: 'connected', routes: ['a → b', 'c → d'] }) }))).toEqual({
+      ok: true, text: 'connector connected · 2 routes', id: 'c', at: '2026-10-01T11:21:48Z', routes: ['a → b', 'c → d'],
+    });
+    expect(tunnelLine(conv({ kind: 'ready', data: packet({ connector: 'disconnected', routes: ['a → b'] }) })).ok).toBe(false);
+    expect(tunnelLine(conv({ kind: 'ready', data: packet(null) })).text).toBe('the newest cluster converge recorded no tunnel routes');
+    expect(tunnelLine(conv({ kind: 'ready', data: null })).text).toBe('no cluster converge has finished, so no route is recorded');
+    expect(tunnelLine(conv({ kind: 'failed', error: 'x: HTTP 503' }))).toMatchObject({ ok: false, text: 'unread: x: HTTP 503' });
+  });
+
+  test('fetchEstate reads the zone readings and the open ones, and a failed read lands failed — never as no zone', async () => {
+    const asked: string[] = [];
+    globalThis.fetch = (async (url: RequestInfo | URL) => {
+      const u = String(url);
+      asked.push(u);
+      if (u === ZONE_READINGS_READ) return new Response(JSON.stringify({ data: [zoneRow()], total: 1 }), { status: 200 });
+      if (u === ZONE_OPEN_READ) return new Response('', { status: 503 });
+      return new Response(JSON.stringify({ data: [], total: 0 }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const s = await fetchEstate();
+    expect(asked.filter((u) => u.includes(`kind=${ZONE_KIND}`)).sort()).toEqual([ZONE_READINGS_READ, ZONE_OPEN_READ].sort());
+    expect(s.zones.latest.kind).toBe('ready');
+    if (s.zones.latest.kind === 'ready') expect(s.zones.latest.data.map((z) => z.zone)).toEqual(['example.org']);
+    expect(s.zones.open).toEqual({ kind: 'failed', error: `${ZONE_OPEN_READ}: HTTP 503` });
+  });
+});
+
 describe('EstatePage renders the door from the module', () => {
   // Source-level pin, the TriageBoard posture: bun test has no Svelte
   // pass, and the coupling this guards against — an address or a
@@ -1105,5 +1370,90 @@ describe('registryFailure', () => {
     expect(registryFailure('/api/estate/nodes: HTTP 503')).toBe(
       'The registry did not answer: /api/estate/nodes: HTTP 503. This page refuses to guess — an unreachable registry is not an empty estate.',
     );
+  });
+});
+
+// THE INSTANCE VOLUMES (backlog 21ee3b4e, incident d3c0a67c): every
+// claim the forge read, judged by estate.compare, beside the machines.
+describe('the instance volumes', () => {
+  const GIB = 1024 ** 3;
+  const vol = (over: Record<string, unknown>): Record<string, unknown> => ({
+    id: 'boss/pgdata-postgres-0', namespace: 'boss', claim: 'pgdata-postgres-0',
+    volume: 'pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56',
+    capacity_bytes: 30 * GIB, used_bytes: 25 * GIB, free_bytes: 5 * GIB, floor_bytes: 6 * GIB, tight: true,
+    ...over,
+  });
+  const cmpEvent = (observed_at: string, volumes: unknown[], scope = VOLUMES_SCOPE): unknown => ({
+    payload: { scope, observed_at, observer: 'boss-estate-observe-volumes', counts: {}, findings: {}, volumes },
+  });
+
+  test('the volumes are read as their own judged series, scoped', () => {
+    expect(VOLUMES_SCOPE).toBe('instance-volumes');
+    expect(VOLUMES_READ).toBe('/api/estate/comparisons?scope=instance-volumes&limit=10');
+  });
+
+  test('a volume under its floor reads tight, with its free, capacity and floor', () => {
+    const [r] = parseVolumeReadings({ data: [cmpEvent('2026-10-01T16:00:00Z', [vol({})])], total: 1 });
+    expect(r?.volumes[0]?.claim).toBe('pgdata-postgres-0');
+    expect(volumeLine(r!.volumes[0]!)).toEqual({ state: 'tight', text: '5.0G free of 30.0G — under its 6.0G floor' });
+  });
+
+  test('a volume above its floor reads its headroom and the floor it is judged by', () => {
+    const [r] = parseVolumeReadings([cmpEvent('2026-10-01T16:00:00Z', [vol({ free_bytes: 20 * GIB, tight: false })])]);
+    expect(volumeLine(r!.volumes[0]!)).toEqual({ state: 'ok', text: '20.0G free of 30.0G · floor 6.0G' });
+  });
+
+  test('a volume that could not be read says unread and why, never fine', () => {
+    const unread = vol({
+      id: 'boss/boss-files', claim: 'boss-files', capacity_bytes: null, used_bytes: null, free_bytes: null,
+      floor_bytes: null, tight: null, unread: 'the kubelet stats of w-2 could not be read',
+    });
+    const [r] = parseVolumeReadings([cmpEvent('2026-10-01T16:00:00Z', [unread])]);
+    expect(volumeLine(r!.volumes[0]!)).toEqual({ state: 'unread', text: 'unread: the kubelet stats of w-2 could not be read' });
+    // A row that carries a verdict but no figures is not taken at its word.
+    const hollow = parseVolumeReadings([cmpEvent('2026-10-01T16:00:00Z', [vol({ free_bytes: null, tight: false })])]);
+    expect(volumeLine(hollow[0]!.volumes[0]!).state).toBe('unread');
+  });
+
+  test('only this scope\'s rows are kept, newest first as read', () => {
+    const rows = parseVolumeReadings([
+      cmpEvent('2026-10-01T16:00:00Z', [vol({})]),
+      cmpEvent('2026-10-01T16:00:00Z', [vol({})], 'host'),
+      cmpEvent('2026-10-01T15:45:00Z', [vol({})]),
+    ]);
+    expect(rows.map((r) => r.observed_at)).toEqual(['2026-10-01T16:00:00Z', '2026-10-01T15:45:00Z']);
+  });
+
+  test('a volume\'s alarm is the raiser\'s key for its claim — disk_tight or blind to it', () => {
+    const page = parseAlarms({
+      data: [
+        { id: 'a1', title: 't', metadata: { estate_finding: 'disk_tight:boss/pgdata-postgres-0', scope: VOLUMES_SCOPE } },
+        { id: 'a2', title: 't', metadata: { estate_finding: 'blind:disk_tight/boss/boss-files', scope: VOLUMES_SCOPE } },
+        { id: 'a3', title: 't', metadata: { estate_finding: 'disk_tight:boss-gcp', scope: 'host' } },
+      ],
+      total: 3,
+    });
+    const ready = { kind: 'ready', data: page } as const;
+    expect(volumeAlarms(ready, 'boss/pgdata-postgres-0').map((a) => a.id)).toEqual(['a1']);
+    expect(volumeAlarms(ready, 'boss/boss-files').map((a) => a.id)).toEqual(['a2']);
+  });
+
+  test('fetchEstate reads the volumes, and a failed read lands failed, never as no volumes', async () => {
+    const asked: string[] = [];
+    globalThis.fetch = (async (url: RequestInfo | URL) => {
+      const u = String(url);
+      asked.push(u);
+      if (u === VOLUMES_READ) return new Response('{}', { status: 503 });
+      return new Response(JSON.stringify(u.includes('/nodes') ? [node()] : []), { status: 200 });
+    }) as unknown as typeof fetch;
+    const s = await fetchEstate();
+    expect(asked).toContain(VOLUMES_READ);
+    expect(s.volumes.kind).toBe('failed');
+  });
+
+  test('the floor is never computed on the page: the comparator\'s verdict is what it draws', () => {
+    const page = readFileSync(new URL('./EstatePage.svelte', import.meta.url), 'utf8');
+    expect(page).toMatch(/volumeLine\(/);
+    expect(page).not.toMatch(/\b0\.2\b|\b20 ?%|4 ?GiB/);
   });
 });

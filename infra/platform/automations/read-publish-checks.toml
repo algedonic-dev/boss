@@ -1,0 +1,7 @@
+# automation:read-publish-checks — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 197 audit-log facts.
+# Signs as platform-admin today: infra/forge/read-publish-checks.sh.
+
+[[automation]]
+id = "automation:read-publish-checks"
+role = "platform-admin"
+description = 'Reads the GitHub publish PR checks and answers its step (infra/forge/read-publish-checks.sh).'

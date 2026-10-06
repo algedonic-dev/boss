@@ -313,7 +313,7 @@ The **StepType registry** (`boss-jobs/src/step_registry.rs`) is the alphabet of 
 
 Two rules shape the contract:
 - **Required-at-done, not required-at-create.** A `scheduling` step can exist with no `scheduled_at`; that field is required only when the step flips to `status=completed`. Metadata validators run on completion, not on create.
-- **PATCH semantics on PUT.** `PUT /api/jobs/{id}/steps/{step_id}` fetches the current step, overlays the body, then saves. Callers can send `{"status":"completed"}` and keep every other field intact. Top-level fields are replaced wholesale, so a `metadata` body that omits a key the step already holds is REFUSED 409, naming the keys (e39a9d2a) — it used to wipe them in silence. Write a key or two through the step merge door, `PATCH /api/jobs/{id}/steps/{step_id}/metadata` (a key sent as `null` is deleted), then PUT the status alone; or read the step and send every stored key back.
+- **PATCH semantics on PUT.** `PUT /api/jobs/{id}/steps/{step_id}` fetches the current step, overlays the body, then saves. Callers can send `{"status":"completed"}` and keep every other field intact. It writes no metadata: a body carrying `metadata` is REFUSED 409, naming the step's merge door (e39a9d2a) — it used to replace metadata wholesale and wipe omitted keys in silence. Write the keys through the step merge door, `PATCH /api/jobs/{id}/steps/{step_id}/metadata` (a key sent as `null` is deleted, a key left out is kept), then PUT the status alone.
 
 ### Events
 Every state change emits an immutable fact through NATS (`boss-nats`) and lands in `audit_log` (`boss-events`). **The log is the system of record.** Projections rebuild from it; rebuilders reproduce truth from it; the five-property correctness protocol (provenance, conservation, closure, idempotence, determinism) guarantees the system contributes zero error of its own. Every state-changing operation publishes an event; nothing else.
@@ -544,6 +544,13 @@ business in git.
 ---
 
 ## Engineering Session Startup — orient before you build
+
+If you are explicitly assigned to coordinate the BOSS queues, read
+[the coordinator rules](infra/platform/documents/coordinator-rules.md)
+in full before your first cycle, and follow them at startup/resume and
+on worker, gate, approval or train events. They add completion-first
+reconciliation and capacity refill to the startup reads below. This
+assignment does not grant new authority or implement an unattended wake.
 
 A new session starts blind, and the queue does not un-blind it. **This
 protocol exists because the durable pod session — the one meant to make
@@ -776,21 +783,25 @@ a door that stops being true is a defect worth a car.
   silent — and `BOSS_DOOR_FRESHNESS=off` runs anything anyway. **That
   fast-forward is the machine's now** (backlog 033d1fd3): the dev pod's
   reclaim sidecar takes the checkout to the origin/main it has already
-  fetched on every hourly pass, and defers while a `gate-run` packet is
-  LAUNCHING — opened in the last two minutes — because a gate renders
-  its runner from a tree as it starts. It deferred on ANY open gate-run
-  until 2026-09-22, and at 12 builders that was true 84% of the day, so
-  the pass landed one time in six and the checkout sat five commits
-  behind (backlog 475fbd10); `boss gate` reads the runner manifest once,
-  before it files its packet, and the runner Job clones from the forge,
-  so an older gate has already taken everything it will take from a
-  tree. The operator
+  fetched on every hourly pass, and no gate holds it. It used to defer
+  while a `gate-run` was open (narrowed to a two-minute launch window
+  by 475fbd10), and that guarded nothing: `boss gate` reads the runner
+  manifest once, BEFORE it files its packet, and the runner Job clones
+  from the forge and mounts no /work, so the deferral watched a window
+  that opened after the only read it named (backlog af27db95, measured
+  on 16 live deferrals, none for a reader still to come). **What a
+  fast-forward CAN tear** is a reader taking several files from the
+  tree in sequence, and none of them is tied to a gate: a door's
+  multi-file read (`boss-api` sources four sibling files, the shim,
+  `wt-cargo` and `wt-web` source `door-freshness.sh`), a cargo build
+  run inside `/work/boss` itself, and `boss orient` listing
+  `infra/step-plugins`. The first and last are milliseconds the next
+  call corrects; the build is why builders build in worktrees. The
+  operator
   typed that command by hand four times on 2026-09-19, and a warning
   fired four times a day is a warning nobody reads. A warning you still
-  see means the hour has not turned yet, a gate was launching, or the
-  merge was refused — and a refusal is loud, on the sidecar's own
-  packet, as is a deferral that leaves the checkout behind for more
-  than two hours. The pod's
+  see means the hour has not turned yet or the merge was refused — and
+  a refusal is loud, on the sidecar's own packet. The pod's
   system-of-record spelling is `infra/dev/sor-url`, which both
   `boss-api` and the shim read — WRITTEN from the one tree source,
   `infra/estate/estate.toml`, and held equal to it by a test (since
@@ -876,9 +887,11 @@ a door that stops being true is a defect worth a car.
 - **Before pushing — `infra/gate.sh --lint`.** `--quick` (fmt plus every
   build-free lint, run eight at a time: 23-36 s on the dev pod, measured
   2026-09-25 against 132 s one at a time, backlog dc5b6302; the closing
-  line names the three slowest lints) PLUS clippy scoped to the crates
-  the tree changed — seconds on a warm tree, against the ~11 minutes a
-  gate costs. Neither is a gate, and both say so: the build and the suites
+  line names the three slowest lints) PLUS workspace clippy when the tree
+  implies a crate, including dependent test targets. Warm leaf edits reuse
+  cached dependents; a core-type edit pays for the workspace check that
+  catches literals in other crates (4669e9d7, design caa2acc9). Neither is
+  a gate, and both say so: the build and the suites
   stay unproven either way. Skipping the pre-flight once cost 17 minutes
   of cluster time to learn that `cargo fmt` had been run on one crate and
   not another, and `--quick` alone cost two more gates to clippy errors
@@ -994,7 +1007,11 @@ a door that stops being true is a defect worth a car.
   tunnel credentials, and GitHub App installation tokens — minted from an
   App root David places once, and re-minted by a fifteen-minute clock rule
   because each lives one hour (design 76155676; the handler is
-  `credential.rotate.github-app-installation`).
+  `credential.rotate.github-app-installation`). The estate machine
+  token has no issuer at all: `credential.rotate.self-issued` generates
+  it and walks it through the `next`, `current` and `previous` slots
+  every service port's machine gate accepts, revoking the old value
+  only after a day in which no gate saw it (design 6805c764, car 3).
   Consumers read Secret mounts; for the residue a mount cannot reach — a
   token file on a writable path, the git credential helper — `boss
   credential pull forge` reads the one Secret the dev session's Role

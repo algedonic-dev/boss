@@ -95,8 +95,10 @@
 # (default: the one this script is in). BOSS_JOBS_URL names the system
 # of record (/etc/boss/sor.env through infra/lib/sor.sh); the rules are
 # read at BOSS_DISPATCHER_URL, else that host on sor-ports.env's
-# dispatcher port — the LAN machine door. BOSS_MACHINE_TOKEN, when set,
-# rides in a header file (infra/lib/secret-header.sh). The last line is
+# dispatcher port — the LAN machine door. The machine token, when this
+# host holds one, rides in a header file (infra/lib/secret-header.sh
+# machine_token_header, which reads the mounted Secret and stamps only an
+# estate host). The last line is
 #   registry-drift: <summary>
 # which the converge records on its packet as `registry_drift`.
 
@@ -132,19 +134,19 @@ done
 [ -f "$REPO/$PLINT" ] && [ -f "$REPO/$RLINT" ] \
     || finish "nothing compared — $REPO does not carry $PLINT and $RLINT"
 
-# The machine token rides to curl in a 0600 file, never in its argv
-# (backlog 5f3ad356). Made here, in the script's own shell, after the
-# trap above.
-# shellcheck source=infra/lib/secret-header.sh
-. "$SELF_DIR/../lib/secret-header.sh" || finish "nothing compared — infra/lib/secret-header.sh is missing"
-MT_HDR=""
-secret_header MT_HDR ${BOSS_MACHINE_TOKEN:+"x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
-    || finish "nothing compared — BOSS_MACHINE_TOKEN is set and its header file could not be written"
-
 # The system of record — no fallback address (infra/lib/sor.sh).
 # shellcheck source=infra/lib/sor.sh
 . "$SELF_DIR/../lib/sor.sh"
 [ -n "${BOSS_JOBS_URL:-}" ] || finish "nothing compared — BOSS_JOBS_URL is unset and $SOR_ENV names none"
+
+# The machine token rides to curl in a 0600 file, never in its argv
+# (backlog 5f3ad356). Made here, in the script's own shell, after the
+# trap above, and for the record just resolved: machine_token_header
+# stamps only an estate host (design 6805c764 car 4; 1876bbdb INFO-7).
+# shellcheck source=infra/lib/secret-header.sh
+. "$SELF_DIR/../lib/secret-header.sh" || finish "nothing compared — infra/lib/secret-header.sh is missing"
+machine_token_header MT_HDR "$BOSS_JOBS_URL" \
+    || finish "nothing compared — the machine token's header file could not be written"
 if [ -z "${BOSS_DISPATCHER_URL:-}" ]; then
     # shellcheck source=infra/forge/probe-bin/sor-routes.sh
     . "$SELF_DIR/probe-bin/sor-routes.sh"

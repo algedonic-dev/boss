@@ -428,6 +428,89 @@ fn the_playground_render_substitutes_the_four_parameters() {
     assert!(stream.contains("BOSS_TENANT_DIR, value: /opt/boss/tenant}"));
 }
 
+/// The machine token's host list follows the instance (backlog 2ee29275,
+/// review of 54d9a23a MEDIUM-1). boss-core stamps a Service name only
+/// when the process lists its namespace, so every instance manifest that
+/// sends to one of its own Services by DNS carries
+/// `BOSS_MACHINE_TOKEN_HOSTS` naming ITS namespace as a suffix — written
+/// `.boss.svc.cluster.local` in the tree and rewritten per instance —
+/// and the playground's render names the playground's namespace and
+/// never prod's, so prod's token cannot be stamped onto its Services
+/// and its own chores still stamp theirs.
+#[test]
+fn the_token_host_list_names_each_instances_own_namespace() {
+    const VAR: &str = "BOSS_MACHINE_TOKEN_HOSTS";
+    const PROD: &str = ".boss.svc.cluster.local";
+    let dir = repo_root().join(MANIFESTS);
+    let instance_set: BTreeSet<String> = roster_of(&repo_root())
+        .into_iter()
+        .filter(|(_, s)| s == "instance")
+        .map(|(f, _)| f)
+        .collect();
+    let value_line = |text: &str| -> Vec<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains(VAR) && !l.trim_start().starts_with('#'))
+            .map(|(i, l)| {
+                // Either `{name: VAR, value: "…"}` on one line, or the
+                // `value:` on the next.
+                let src = if l.contains("value:") {
+                    l
+                } else {
+                    lines[i + 1]
+                };
+                src.split("value:")
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim()
+                    .trim_end_matches('}')
+                    .trim()
+                    .trim_matches('"')
+                    .to_string()
+            })
+            .collect()
+    };
+    let mut carriers = 0;
+    for name in &instance_set {
+        let text = std::fs::read_to_string(dir.join(name)).unwrap();
+        let sends_to_own_service = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .any(|l| l.contains("http://boss-") && l.contains(PROD));
+        let values = value_line(&text);
+        if sends_to_own_service || name == "boss.yaml" {
+            assert!(
+                !values.is_empty(),
+                "{name} sends to its own Services by DNS (or is the stack), so it names its \
+                 namespace in {VAR}"
+            );
+        }
+        for v in &values {
+            assert_eq!(v, PROD, "{name}: {VAR} names the instance's own namespace");
+        }
+        carriers += values.len();
+    }
+    assert!(carriers > 0, "the scan found no carrier at all");
+
+    let out = scratch_dir("render-instance-token-hosts").join("out");
+    let (rc, _, err) = run(&repo_root(), &["--all", out.to_str().unwrap()]);
+    assert_eq!(rc, 0, "--all: {err}");
+    let mut rendered = 0;
+    for name in &instance_set {
+        let got = std::fs::read_to_string(out.join("boss-playground").join(name)).unwrap();
+        for v in value_line(&got) {
+            assert_eq!(
+                v, ".boss-playground.svc.cluster.local",
+                "{name}: the playground lists its own namespace, never prod's"
+            );
+            rendered += 1;
+        }
+    }
+    assert_eq!(rendered, carriers, "every carrier is rendered per instance");
+}
+
 #[test]
 fn each_guest_answer_renders_exactly_the_value_the_gateway_reads() {
     // Design 2830b6b7 (decided 2026-09-25): ONE instance key with three

@@ -15,10 +15,13 @@ required-features = ["postgres"]
 # wired (sim mode reads sim_clock; wall mode doesn't need
 # postgres but the binary supports both via runtime mode flag).
 default = ["postgres"]
-postgres = ["dep:sqlx"]
+postgres = ["dep:sqlx", "dep:boss-events"]
 
 [dependencies]
 boss-core = { path = "../boss-core" }
+# The machine gate states its facts through the outbox, in the binary
+# only (design 21946380).
+boss-events = { path = "../boss-events", default-features = false, features = ["postgres"], optional = true }
 boss-ports = { path = "../boss-ports" }
 async-trait = { workspace = true }
 chrono = { workspace = true }

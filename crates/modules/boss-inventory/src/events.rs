@@ -72,6 +72,22 @@ pub const ITEM_CONSUMED: &str = "inventory.item.consumed";
 /// ```
 pub const ITEM_RECEIVED: &str = "inventory.item.received";
 
+/// Proof that a consume which drained NO value was applied — the
+/// rebuild source for the GL-inert `finance.inventory.consumed`
+/// dedup-fact keyed `(inventory_consume, source_id)`, the guard a
+/// redelivered valueless consume is refused by (backlog 55f69172). A
+/// valued consume needs none: its `INVENTORY_TRANSFERRED` fact is its
+/// proof. Payload:
+/// ```text
+///   {
+///     "part_sku":    "<sku>",
+///     "qty":         <qty>,
+///     "source_id":   "{step_id}:{part_sku}",  // dedup-fact source_id
+///     "consumed_on": "YYYY-MM-DD"              // dedup-fact happened_on
+///   }
+/// ```
+pub const ITEM_CONSUME_RECORDED: &str = "inventory.item.consume_recorded";
+
 /// Inventory cost-transfer event, fires alongside ITEM_CONSUMED
 /// whenever the consumed SKU has a non-zero `avg_cost_cents`.
 /// Carries the raw → WIP cost-transfer payload so the ledger-

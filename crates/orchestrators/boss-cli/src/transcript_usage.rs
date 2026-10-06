@@ -46,12 +46,388 @@
 //! WHICH MODEL. The same transcript says which model every turn was
 //! billed as, so the record names that model rather than the one the
 //! step's agent block declared ([`RunModels`], backlog 6bb85880).
+//!
+//! CODEX RECEIPTS (backlog 2f7b8c00). An explicit `--transcript` may
+//! name a Codex rollout. [`transcript_turns`] adapts its owner-thread
+//! per-response receipts; cumulative counters alone remain unmetered.
+//! A receipt is dated when written, not when its request began. A
+//! report must wait for native task_complete evidence, so an available
+//! receipt prefix cannot freeze an in-flight task's incomplete spend.
+//! A native task may name only one run. Bounds through an owned task
+//! are refused unless they are its initial run marker; request-start
+//! evidence is not available to split its responses between runs.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+
+/// Adapt Codex's per-response receipts to the same turn contract used
+/// below (backlog 2f7b8c00). The FIRST session id owns a fork's file;
+/// later metadata and receipts can be inherited from its parent.
+/// Keep one output line per source line so slice receipts still name
+/// the original file. Cumulative token_count events are not receipts.
+fn transcript_turns(jsonl: &str) -> Result<std::borrow::Cow<'_, str>, String> {
+    let records: Vec<Option<Value>> = jsonl
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect();
+    fn kind(v: &Value) -> Option<&str> {
+        v.get("type").and_then(Value::as_str)
+    }
+    if !records.iter().flatten().any(|v| {
+        matches!(
+            kind(v),
+            Some("session_meta" | "token_usage_record" | "turn_context" | "response_item")
+        )
+    }) {
+        return Ok(std::borrow::Cow::Borrowed(jsonl));
+    }
+    let owner = records
+        .iter()
+        .flatten()
+        .find(|v| kind(v) == Some("session_meta"))
+        .and_then(|v| v.pointer("/payload/id"))
+        .and_then(Value::as_str);
+    let forked = records.iter().flatten().any(|v| {
+        kind(v) == Some("session_meta")
+            && v.pointer("/payload/id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| Some(id) != owner)
+    });
+    // Fork history can be restamped at child creation. The task span,
+    // linked to a receipt's thread, owns an arrival; its timestamp does not.
+    let mut turn_owners = std::collections::HashMap::<&str, &str>::new();
+    for v in records
+        .iter()
+        .flatten()
+        .filter(|v| kind(v) == Some("token_usage_record"))
+    {
+        if let (Some(turn), Some(thread)) = (
+            v.pointer("/payload/turn_id").and_then(Value::as_str),
+            v.pointer("/payload/thread_id").and_then(Value::as_str),
+        ) && turn_owners
+            .insert(turn, thread)
+            .is_some_and(|first| first != thread)
+        {
+            return Err(format!(
+                "Codex task {turn} has conflicting receipt thread ownership"
+            ));
+        }
+    }
+    let mut task_turn: Option<&str> = None;
+    let mut task_markers = std::collections::HashMap::<&str, Vec<String>>::new();
+    let mut models = std::collections::HashMap::<&str, &str>::new();
+    let mut seen = std::collections::HashMap::<String, Value>::new();
+    let mut normalized = Vec::with_capacity(records.len());
+    for record in &records {
+        let Some(v) = record else {
+            normalized.push(String::new());
+            continue;
+        };
+        let timestamp = v.get("timestamp").cloned().unwrap_or(Value::Null);
+        let mut row = serde_json::json!({"timestamp": timestamp});
+        match kind(v) {
+            Some("event_msg")
+                if matches!(
+                    v.pointer("/payload/type").and_then(Value::as_str),
+                    Some("task_started" | "task_complete")
+                ) =>
+            {
+                let turn = v
+                    .pointer("/payload/turn_id")
+                    .and_then(Value::as_str)
+                    .filter(|turn| !turn.is_empty())
+                    .ok_or("Codex native task event has no turn_id")?;
+                let started =
+                    v.pointer("/payload/type").and_then(Value::as_str) == Some("task_started");
+                if started {
+                    task_turn = Some(turn);
+                } else if task_turn == Some(turn) {
+                    task_turn = None;
+                }
+                // Without a receipt-linked owner, do not silently discard a
+                // task whose first response may still be in flight.
+                let owned = turn_owners
+                    .get(turn)
+                    .is_none_or(|thread| Some(*thread) == owner);
+                row = serde_json::json!({"type":if started {"codex_task_start"} else {"codex_task_complete"},
+                    "timestamp":timestamp,"turn_id":turn,"owned":owned,
+                    "started_at":v.pointer("/payload/started_at"),"completed_at":v.pointer("/payload/completed_at")});
+            }
+            Some("turn_context") => {
+                if let (Some(turn), Some(model)) = (
+                    v.pointer("/payload/turn_id").and_then(Value::as_str),
+                    v.pointer("/payload/model")
+                        .and_then(Value::as_str)
+                        .filter(|m| !m.is_empty()),
+                ) {
+                    models.insert(turn, model);
+                }
+            }
+            Some("token_usage_record") => {
+                let owner = owner.ok_or("Codex receipt has no owning session_meta id")?;
+                let thread = v
+                    .pointer("/payload/thread_id")
+                    .and_then(Value::as_str)
+                    .ok_or("Codex receipt has no thread_id")?;
+                if thread != owner {
+                    normalized.push(row.to_string());
+                    continue;
+                }
+                let response = v
+                    .pointer("/payload/response_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .ok_or("Codex receipt has no response_id")?;
+                let usage = v
+                    .pointer("/payload/usage")
+                    .filter(|u| u.is_object())
+                    .ok_or("Codex receipt has no usage object")?;
+                let count = |field: &str| {
+                    usage
+                        .get(field)
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| format!("Codex receipt {response} has no unsigned {field}"))
+                };
+                let input = count("input_tokens")?;
+                let cached = count("cached_input_tokens")?;
+                let output = count("output_tokens")?;
+                if usage.get("total_tokens").is_some()
+                    && (input.checked_add(output).is_none()
+                        || usage.get("total_tokens").and_then(Value::as_u64)
+                            != input.checked_add(output))
+                {
+                    return Err(format!(
+                        "Codex receipt {response} has total_tokens inconsistent with input_tokens + output_tokens"
+                    ));
+                }
+                let cache_write = count("cache_write_input_tokens")?;
+                if cache_write != 0 {
+                    return Err(format!(
+                        "Codex receipt {response} has nonzero cache_write_input_tokens; its billing semantics are unknown"
+                    ));
+                }
+                let uncached = input.checked_sub(cached).ok_or_else(|| {
+                    format!(
+                        "Codex receipt {response} has cached_input_tokens greater than input_tokens"
+                    )
+                })?;
+                let turn_id = v
+                    .pointer("/payload/turn_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        format!("Codex receipt {response} has no turn_id for its actual model")
+                    })?;
+                let model = models.get(turn_id).ok_or_else(|| {
+                    format!("Codex receipt {response} has no observed model for turn {turn_id}")
+                })?;
+                // Reasoning is already included in output_tokens. Cached
+                // input is already included in input_tokens, unlike Claude.
+                let message = serde_json::json!({"id": response, "model": model, "codex_turn_id":turn_id,"usage": {
+                    "input_tokens": uncached, "cache_read_input_tokens": cached,
+                    "cache_creation_input_tokens": 0, "output_tokens": output
+                }});
+                let message = match seen.get(response) {
+                    Some(first) if first != &message => {
+                        return Err(format!(
+                            "Codex response {response} has conflicting usage receipts"
+                        ));
+                    }
+                    Some(first) => first.clone(),
+                    None => {
+                        seen.insert(response.to_string(), message.clone());
+                        message
+                    }
+                };
+                row = serde_json::json!({"type":"assistant", "timestamp": timestamp, "message": message});
+            }
+            Some("response_item") => {
+                let payload = &v["payload"];
+                let incoming = payload.get("type").and_then(Value::as_str) == Some("message")
+                    && matches!(
+                        payload.get("role").and_then(Value::as_str),
+                        Some("user" | "tool")
+                    );
+                let tool_output = matches!(
+                    payload.get("type").and_then(Value::as_str),
+                    Some("function_call_output" | "custom_tool_call_output")
+                );
+                if incoming || tool_output {
+                    if forked {
+                        let thread = task_turn.and_then(|turn| turn_owners.get(turn)).copied()
+                            .ok_or("Codex fork has an arrival without a receipt-linked task span; refusing ambiguous run markers")?;
+                        if Some(thread) != owner {
+                            normalized.push(row.to_string());
+                            continue;
+                        }
+                    }
+                    let content = if incoming {
+                        &payload["content"]
+                    } else {
+                        &payload["output"]
+                    };
+                    if let Some(turn) = task_turn {
+                        let found = task_markers.entry(turn).or_default();
+                        for run in marked_runs(&content.to_string()) {
+                            if !found.contains(&run) {
+                                found.push(run);
+                            }
+                        }
+                        if found.len() > 1 {
+                            return Err(format!(
+                                "Codex task {turn} has multiple run markers; its responses cannot be split safely"
+                            ));
+                        }
+                    }
+                    row = serde_json::json!({"type":"user", "timestamp": timestamp, "message":{"content": content, "codex_turn_id":task_turn}});
+                }
+            }
+            _ => {}
+        }
+        normalized.push(row.to_string());
+    }
+    Ok(std::borrow::Cow::Owned(normalized.join("\n")))
+}
+
+/// Codex records response receipts, not response start. Only matching
+/// native task completion closes an owned task's execution for a report.
+fn codex_slice_bounds(jsonl: &str, slice: &Slice) -> Result<(), String> {
+    let records: Vec<Value> = jsonl
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let timestamp = |v: &Value| {
+        v.get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+    };
+    let mut starts = std::collections::HashMap::<&str, &Value>::new();
+    let mut completions = std::collections::HashMap::<&str, &Value>::new();
+    for v in &records {
+        if v.get("owned").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let events = match v.get("type").and_then(Value::as_str) {
+            Some("codex_task_start") => &mut starts,
+            Some("codex_task_complete") => &mut completions,
+            _ => continue,
+        };
+        let turn = v
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .ok_or("Codex native task event has no turn_id")?;
+        if events.insert(turn, v).is_some_and(|first| first != v) {
+            return Err(format!(
+                "Codex task {turn} has conflicting native task events"
+            ));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut receipts = std::collections::HashMap::<&str, (DateTime<Utc>, DateTime<Utc>)>::new();
+    let mut arrivals = std::collections::HashMap::<&str, DateTime<Utc>>::new();
+    for v in &records {
+        let Some(turn) = v.pointer("/message/codex_turn_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let at = timestamp(v)
+            .ok_or_else(|| format!("Codex task {turn} has no timestamp for a bound"))?;
+        match v.get("type").and_then(Value::as_str) {
+            Some("assistant") => {
+                if let Some(response) = turn_key(v)
+                    && seen.insert(response)
+                {
+                    receipts
+                        .entry(turn)
+                        .and_modify(|(first, last)| {
+                            *first = (*first).min(at);
+                            *last = (*last).max(at);
+                        })
+                        .or_insert((at, at));
+                }
+            }
+            Some("user") if !marked_runs(&v["message"]["content"].to_string()).is_empty() => {
+                arrivals.entry(turn).or_insert(at);
+            }
+            _ => {}
+        }
+    }
+    let owned: std::collections::HashSet<&str> =
+        starts.keys().chain(receipts.keys()).copied().collect();
+    for turn in owned {
+        let start_event = starts.get(turn).copied().ok_or_else(|| {
+            format!("Codex task {turn} has no task_started timestamp to establish its bounds")
+        })?;
+        let start = timestamp(start_event)
+            .ok_or_else(|| format!("Codex task {turn} has no task_started timestamp"))?;
+        let marker = arrivals.get(turn).copied();
+        let completion = completions.get(turn).copied();
+        let end = completion.and_then(timestamp);
+        let started_at = start_event.get("started_at").and_then(Value::as_i64);
+        if started_at != Some(start.timestamp()) {
+            return Err(format!(
+                "Codex task {turn} has inconsistent native task_started time"
+            ));
+        }
+        if let Some(completion) = completion {
+            let end =
+                end.ok_or_else(|| format!("Codex task {turn} has no task_complete timestamp"))?;
+            if completion.get("started_at").and_then(Value::as_i64) != started_at
+                || completion.get("completed_at").and_then(Value::as_i64) != Some(end.timestamp())
+                || end < start
+            {
+                return Err(format!(
+                    "Codex task {turn} has inconsistent native task_started/task_complete times"
+                ));
+            }
+        }
+        let received = receipts.get(turn).copied();
+        if marker.is_some_and(|at| at < start || received.is_some_and(|(first, _)| at > first)) {
+            return Err(format!(
+                "Codex task {turn} has a run marker outside its initial arrival; refusing ambiguous attribution"
+            ));
+        }
+        if received.is_some_and(|(first, last)| first < start || end.is_some_and(|end| last > end))
+        {
+            return Err(format!(
+                "Codex task {turn} has a receipt outside its native task_started/task_complete span"
+            ));
+        }
+        // A marker at the upper bound admits the next task to the next
+        // run. Unfinished later tasks cannot invalidate a closed earlier run.
+        if slice
+            .until
+            .is_some_and(|until| until <= marker.unwrap_or(start))
+            || end.is_some_and(|end| slice.after.is_some_and(|after| after >= end))
+        {
+            continue;
+        }
+        let end = end.ok_or_else(|| {
+            format!(
+                "Codex task {turn} has no matching native task_complete; refusing unfinished usage"
+            )
+        })?;
+        if received.is_none() {
+            return Err(format!("Codex task {turn} has no owned response receipts"));
+        }
+        if slice.until.is_some_and(|until| until < end) {
+            return Err(format!(
+                "Codex report bound precedes task_complete for owned task {turn}"
+            ));
+        }
+        if let Some(bound) = slice.after
+            && bound > start
+            && bound < end
+            && Some(bound) != marker
+        {
+            return Err(format!(
+                "Codex bound {bound} cuts owned task {turn}; response-start evidence is unavailable"
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// A run's four billed counts, summed over its turns, plus the two
 /// readings that say what the old figure was and where the floor is.
@@ -117,6 +493,7 @@ impl Turn {
 /// assistant turn, are skipped: the transcript holds user turns, tool
 /// results and summaries beside the turns that were billed.
 pub(crate) fn sum_usage(jsonl: &str) -> Option<Usage> {
+    let jsonl = transcript_turns(jsonl).ok()?;
     let mut order: Vec<String> = Vec::new();
     let mut turns: std::collections::HashMap<String, Turn> = std::collections::HashMap::new();
     for (n, line) in jsonl.lines().enumerate() {
@@ -311,6 +688,9 @@ pub(crate) fn card_spelling(api_id: &str) -> String {
 
 /// The models a transcript names, per [`RunModels`].
 pub(crate) fn read_models(jsonl: &str) -> RunModels {
+    let Ok(jsonl) = transcript_turns(jsonl) else {
+        return RunModels::default();
+    };
     jsonl
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -517,6 +897,9 @@ pub(crate) struct Mark {
 /// speaking, and it may quote a marker it has not reached. A line with
 /// no `timestamp` takes the last one above it, as in [`cut`].
 pub(crate) fn markers(jsonl: &str) -> Vec<Mark> {
+    let Ok(jsonl) = transcript_turns(jsonl) else {
+        return Vec::new();
+    };
     let mut last_seen: Option<DateTime<Utc>> = None;
     let mut found: Vec<Mark> = Vec::new();
     for line in jsonl.lines() {
@@ -614,6 +997,9 @@ fn turn_key(v: &Value) -> Option<&str> {
 /// run's whole and none of the other's. The model attachment is the
 /// session's, not a turn's, and belongs to every slice of it.
 pub(crate) fn cut(jsonl: &str, slice: &Slice) -> (String, Option<usize>, Option<usize>) {
+    let Ok(jsonl) = transcript_turns(jsonl) else {
+        return (String::new(), None, None);
+    };
     let mut last_seen: Option<DateTime<Utc>> = None;
     let mut turn_at: std::collections::HashMap<String, Option<DateTime<Utc>>> =
         std::collections::HashMap::new();
@@ -739,12 +1125,15 @@ pub(crate) fn locate(
 pub(crate) fn meter(path: &Path, run_id: &str, slice: &Slice) -> Result<Metered, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("could not read transcript {}: {e}", path.display()))?;
+    let text =
+        transcript_turns(&text).map_err(|e| format!("transcript {}: {e}", path.display()))?;
     if sum_usage(&text).is_none() {
         return Err(format!("transcript {} holds no turn usage", path.display()));
     }
     let named = text.contains(&needle(run_id));
     // Markers first, report instants second (backlog 11a0998a).
     let slice = &slice.clone().marked(&markers(&text), run_id);
+    codex_slice_bounds(&text, slice).map_err(|e| format!("transcript {}: {e}", path.display()))?;
     let (sliced, first_line, last_line) = match named {
         true => cut(&text, slice),
         false => (String::new(), None, None),
@@ -793,6 +1182,472 @@ pub(crate) fn meter(path: &Path, run_id: &str, slice: &Slice) -> Result<Metered,
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn codex_rollout() -> String {
+        [
+            json!({"type":"session_meta","payload":{"id":"child"}}),
+            json!({"type":"session_meta","payload":{"id":"parent"}}),
+            codex_task("task_started", "t-a", "2026-10-01T09:59:59Z", "2026-10-01T09:59:59Z"),
+            json!({"type":"turn_context","payload":{"turn_id":"t-a","model":"gpt-6.1-sol"}}),
+            json!({"type":"response_item","timestamp":"2026-10-01T10:00:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"run-marker: agent-run r-1 begins here"}]}}),
+            codex_receipt("parent", "inherited", "2026-10-01T10:00:01Z", 900, 800, 100),
+            codex_receipt("child", "a", "2026-10-01T10:00:02Z", 100, 70, 20),
+            codex_receipt("child", "a", "2026-10-01T10:00:03Z", 100, 70, 20),
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":99999,"output_tokens":99999}}}}),
+            codex_task("task_complete", "t-a", "2026-10-01T10:00:04Z", "2026-10-01T09:59:59Z"),
+            codex_task("task_started", "t-b", "2026-10-01T10:00:04.500Z", "2026-10-01T10:00:04.500Z"),
+            json!({"type":"turn_context","payload":{"turn_id":"t-b","model":"gpt-6.1-sol"}}),
+            json!({"type":"response_item","timestamp":"2026-10-01T10:00:04Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"run-marker: agent-run r-2 begins here"}]}}),
+            json!({"type":"response_item","timestamp":"2026-10-01T10:00:05Z","payload":{"type":"function_call_output","output":"run-marker: agent-run r-2 begins here"}}),
+            codex_receipt("child", "b", "2026-10-01T10:00:06Z", 200, 150, 30),
+            codex_task("task_complete", "t-b", "2026-10-01T10:00:06.250Z", "2026-10-01T10:00:04.500Z"),
+            codex_task("task_started", "t-c", "2026-10-01T10:00:06.500Z", "2026-10-01T10:00:06.500Z"),
+            json!({"type":"turn_context","payload":{"turn_id":"t-c","model":"gpt-6-astra"}}),
+            codex_receipt("child", "c", "2026-10-01T10:00:07Z", 300, 250, 40),
+            codex_task("task_complete", "t-c", "2026-10-01T10:00:08Z", "2026-10-01T10:00:06.500Z"),
+        ].iter().map(Value::to_string).collect::<Vec<_>>().join("\n")
+    }
+
+    fn codex_task(kind: &str, turn: &str, timestamp: &str, started: &str) -> Value {
+        let mut payload = json!({"type":kind,"turn_id":turn,"started_at":at(started).timestamp()});
+        if kind == "task_complete" {
+            payload["completed_at"] = json!(at(timestamp).timestamp());
+        }
+        json!({"type":"event_msg","timestamp":timestamp,"payload":payload})
+    }
+
+    fn codex_receipt(
+        thread: &str,
+        response: &str,
+        timestamp: &str,
+        input: u64,
+        cached: u64,
+        output: u64,
+    ) -> Value {
+        json!({"type":"token_usage_record","timestamp":timestamp,"payload":{"thread_id":thread,"turn_id":format!("t-{response}"),"response_id":response,"usage":{"input_tokens":input,"cached_input_tokens":cached,"cache_write_input_tokens":0,"output_tokens":output,"reasoning_output_tokens":10}}})
+    }
+
+    #[test]
+    fn codex_receipts_conserve_tokens_exclude_forks_and_deduplicate_responses() {
+        let usage = sum_usage(&codex_rollout()).expect("owned Codex receipts");
+        assert_eq!(usage.input, 30 + 50 + 50);
+        assert_eq!(usage.cache_read, 70 + 150 + 250);
+        assert_eq!(usage.cache_write, 0);
+        assert_eq!(usage.output, 20 + 30 + 40, "reasoning is already in output");
+        assert_eq!(usage.total(), 100 + 20 + 200 + 30 + 300 + 40);
+        assert_eq!(usage.turns, 3);
+        assert_eq!(usage.final_context, 340);
+        assert_eq!(
+            read_models(&codex_rollout()).recorded().as_deref(),
+            Some("gpt-6.1-sol+gpt-6-astra")
+        );
+    }
+
+    #[test]
+    fn codex_slices_keep_model_context_and_only_incoming_markers() {
+        let text = codex_rollout();
+        let marks = markers(&text);
+        assert_eq!(marks.len(), 2);
+        assert_eq!(marks[1].at, at("2026-10-01T10:00:05Z"));
+        let root = boss_testing::scratch_dir("codex-meter");
+        let path = write(&root, "rollout.jsonl", &text);
+        let one = meter(&path, "r-1", &Slice::default()).unwrap();
+        let two = meter(&path, "r-2", &Slice::default()).unwrap();
+        assert_eq!(one.usage.turns, 1);
+        assert_eq!(one.models.recorded().as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(two.usage.turns, 2);
+        assert_eq!(
+            (two.slice.first_line, two.slice.last_line),
+            (Some(15), Some(20)),
+            "bounds refer to original rollout lines"
+        );
+        assert_eq!(
+            two.models.recorded().as_deref(),
+            Some("gpt-6.1-sol+gpt-6-astra")
+        );
+        assert_eq!(
+            one.usage.total() + two.usage.total(),
+            sum_usage(&text).unwrap().total()
+        );
+        let bound = at("2026-10-01T10:00:02.500Z");
+        let before = cut(&text, &Slice::bounded(None, vec![], bound)).0;
+        let after = cut(
+            &text,
+            &Slice::bounded(Some(bound), vec![], at("2026-10-01T11:00:00Z")),
+        )
+        .0;
+        assert_eq!(sum_usage(&before).unwrap().turns, 1);
+        assert_eq!(
+            sum_usage(&after).unwrap().turns,
+            2,
+            "duplicate receipt belongs to its first instant"
+        );
+    }
+
+    #[test]
+    fn codex_missing_usage_is_none_and_ambiguous_cache_writes_are_refused() {
+        let no_receipt = json!({"type":"session_meta","payload":{"id":"child"}}).to_string();
+        assert_eq!(sum_usage(&no_receipt), None);
+        let root = boss_testing::scratch_dir("codex-meter-refusal");
+        for (field, count, expected) in [
+            ("cache_write_input_tokens", 1, "cache_write_input_tokens"),
+            ("cached_input_tokens", 101, "cached_input_tokens"),
+        ] {
+            let mut receipt = codex_receipt("child", "a", "2026-10-01T10:00:00Z", 100, 70, 20);
+            receipt["payload"]["usage"][field] = json!(count);
+            let text = format!("{no_receipt}\n{receipt}\nagent-run r-1\n");
+            let path = write(&root, "rollout.jsonl", &text);
+            let why = meter(&path, "r-1", &Slice::default()).unwrap_err();
+            assert!(why.contains(expected), "{why}");
+        }
+        assert!(
+            sum_usage(&codex_rollout()).is_some(),
+            "zero writes and valid cached input remain accepted"
+        );
+    }
+
+    #[test]
+    fn codex_receipts_require_complete_counts_and_consistent_response_identity() {
+        let meta = json!({"type":"session_meta","payload":{"id":"child"}});
+        let context =
+            json!({"type":"turn_context","payload":{"turn_id":"t-a","model":"gpt-6.1-sol"}});
+        let receipt = codex_receipt("child", "a", "2026-10-01T10:00:00Z", 100, 70, 20);
+        assert!(sum_usage(&format!("{meta}\n{context}\n{receipt}")).is_some());
+        for field in [
+            "input_tokens",
+            "cached_input_tokens",
+            "cache_write_input_tokens",
+            "output_tokens",
+        ] {
+            let mut missing = receipt.clone();
+            missing["payload"]["usage"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            let why = transcript_turns(&format!("{meta}\n{missing}")).unwrap_err();
+            assert!(why.contains(field), "{why}");
+        }
+        assert!(
+            transcript_turns(&receipt.to_string())
+                .unwrap_err()
+                .contains("session_meta")
+        );
+        let mut conflict = receipt.clone();
+        conflict["payload"]["usage"]["output_tokens"] = json!(21);
+        assert!(
+            transcript_turns(&format!("{meta}\n{context}\n{receipt}\n{conflict}"))
+                .unwrap_err()
+                .contains("conflicting")
+        );
+        let counters = format!(
+            "{meta}\n{}",
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20}}}})
+        );
+        assert_eq!(
+            sum_usage(&counters),
+            None,
+            "a cumulative counter is not a receipt"
+        );
+    }
+
+    #[test]
+    fn codex_models_are_linked_to_receipt_turns_and_missing_models_are_refused() {
+        let meta = json!({"type":"session_meta","payload":{"id":"child"}});
+        let receipt = codex_receipt("child", "a", "2026-10-01T10:00:00Z", 100, 70, 20);
+        let foreign = json!({"type":"turn_context","payload":{"turn_id":"parent-turn","model":"gpt-foreign"}});
+        let correct =
+            json!({"type":"turn_context","payload":{"turn_id":"t-a","model":"gpt-6.1-sol"}});
+        let missing = format!("{meta}\n{foreign}\n{receipt}");
+        let why = transcript_turns(&missing).unwrap_err();
+        assert!(why.contains("model") && why.contains("t-a"), "{why}");
+        let text = format!("{meta}\n{correct}\n{foreign}\n{receipt}");
+        assert_eq!(
+            read_models(&text).recorded().as_deref(),
+            Some("gpt-6.1-sol")
+        );
+        let tools = [
+            json!({"type":"response_item","timestamp":"2026-10-01T10:00:00Z","payload":{"type":"custom_tool_call_output","output":[{"type":"text","text":"run-marker: agent-run r-tools begins here"}]}}),
+            json!({"type":"response_item","timestamp":"2026-10-01T10:00:01Z","payload":{"type":"function_call","arguments":"run-marker: agent-run r-assistant begins here"}}),
+        ].iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+        assert_eq!(
+            markers(&tools)
+                .iter()
+                .map(|m| m.run.as_str())
+                .collect::<Vec<_>>(),
+            vec!["r-tools"]
+        );
+    }
+
+    #[test]
+    fn codex_fork_markers_follow_owned_task_spans_and_ambiguous_arrivals_are_refused() {
+        let text = codex_rollout();
+        let foreign = [
+            json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t-parent"}}),
+            codex_receipt("parent", "parent", "2026-10-01T08:59:00Z", 100, 70, 20),
+            json!({"type":"response_item","timestamp":"2026-10-01T09:00:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"run-marker: agent-run r-1 begins here"}]}}),
+            json!({"type":"response_item","timestamp":"2026-10-01T09:01:00Z","payload":{"type":"function_call_output","output":"run-marker: agent-run r-2 begins here"}}),
+        ].iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+        let text = text.replacen("\n", &format!("\n{foreign}\n"), 1);
+        let root = boss_testing::scratch_dir("codex-fork-markers");
+        let path = write(&root, "rollout.jsonl", &text);
+        let one = meter(&path, "r-1", &Slice::default()).unwrap();
+        assert_eq!(
+            one.usage.turns, 1,
+            "inherited r-2 marker must not end child's r-1 before its receipt"
+        );
+        assert_eq!(markers(&text)[0].at, at("2026-10-01T10:00:00Z"));
+        let ambiguous = text
+            .lines()
+            .filter(|line| !line.contains("task_started"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let why = transcript_turns(&ambiguous).unwrap_err();
+        assert!(why.contains("arrival") && why.contains("fork"), "{why}");
+    }
+
+    #[test]
+    fn codex_multiple_run_markers_in_one_native_task_are_refused() {
+        let text = codex_rollout();
+        let one_task = text
+            .replace("t-b", "t-a")
+            .replace("\"turn_id\":\"t-b\"", "\"turn_id\":\"t-a\"");
+        let root = boss_testing::scratch_dir("codex-bounds");
+        let path = write(&root, "one-task.jsonl", &one_task);
+        let why = meter(&path, "r-2", &Slice::default()).unwrap_err();
+        assert!(why.contains("task") && why.contains("marker"), "{why}");
+    }
+
+    #[test]
+    fn codex_a_report_bound_inside_an_owned_task_is_refused() {
+        let text = codex_rollout();
+        let root = boss_testing::scratch_dir("codex-report-bound");
+        let path = write(&root, "rollout.jsonl", &text);
+        let within = Slice::bounded(None, vec![], at("2026-10-01T10:00:01Z"));
+        let why = meter(&path, "r-1", &within).unwrap_err();
+        assert!(why.contains("bound") && why.contains("task"), "{why}");
+    }
+
+    #[test]
+    fn codex_unfinished_owned_task_after_first_receipt_is_refused() {
+        let text = codex_rollout();
+        let unfinished = text
+            .lines()
+            .take_while(|line| !line.contains("t-b"))
+            .filter(|line| !line.contains("task_complete"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let root = boss_testing::scratch_dir("codex-unfinished-task");
+        let path = write(&root, "rollout.jsonl", &unfinished);
+        let bound = Slice::bounded(None, vec![], at("2026-10-01T10:00:04Z"));
+        let why = meter(&path, "r-1", &bound).unwrap_err();
+        assert!(
+            why.contains("task_complete") && why.contains("t-a"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn codex_completion_bounds_include_exact_totals_only_at_or_after_native_completion() {
+        let text = codex_rollout()
+            .lines()
+            .take_while(|line| !line.contains("t-b"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let root = boss_testing::scratch_dir("codex-completion-bound");
+        let path = write(&root, "rollout.jsonl", &text);
+        for until in ["2026-10-01T10:00:03Z", "2026-10-01T10:00:03.999Z"] {
+            let why = meter(&path, "r-1", &Slice::bounded(None, vec![], at(until))).unwrap_err();
+            assert!(why.contains("bound") && why.contains("task"), "{why}");
+        }
+        for until in ["2026-10-01T10:00:04Z", "2026-10-01T10:00:05Z"] {
+            let usage = meter(&path, "r-1", &Slice::bounded(None, vec![], at(until)))
+                .unwrap()
+                .usage;
+            assert_eq!(
+                (
+                    usage.input,
+                    usage.cache_read,
+                    usage.cache_write,
+                    usage.output,
+                    usage.turns
+                ),
+                (30, 70, 0, 20, 1)
+            );
+        }
+        let mut second = codex_receipt(
+            "child",
+            "a-second",
+            "2026-10-01T10:00:03.500Z",
+            200,
+            150,
+            30,
+        );
+        second["payload"]["turn_id"] = json!("t-a");
+        let completed = format!(
+            "{}\n{}\n{}",
+            text.lines()
+                .take(text.lines().count() - 1)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            second,
+            text.lines().last().unwrap()
+        );
+        let path = write(&root, "rollout.jsonl", &completed);
+        let usage = meter(
+            &path,
+            "r-1",
+            &Slice::bounded(None, vec![], at("2026-10-01T10:00:04Z")),
+        )
+        .unwrap()
+        .usage;
+        assert_eq!(
+            (
+                usage.input,
+                usage.cache_read,
+                usage.cache_write,
+                usage.output,
+                usage.turns
+            ),
+            (80, 220, 0, 50, 2)
+        );
+    }
+
+    #[test]
+    fn codex_completed_task_cannot_certify_an_unfinished_later_owned_task() {
+        let text = codex_rollout();
+        let root = boss_testing::scratch_dir("codex-every-task-completes");
+        for turn in ["t-b", "t-c"] {
+            let unfinished = text
+                .lines()
+                .filter(|line| !(line.contains("task_complete") && line.contains(turn)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let path = write(&root, "rollout.jsonl", &unfinished);
+            let why = meter(
+                &path,
+                "r-2",
+                &Slice::bounded(None, vec![], at("2026-10-01T10:00:09Z")),
+            )
+            .unwrap_err();
+            assert!(why.contains("task_complete") && why.contains(turn), "{why}");
+        }
+        let path = write(&root, "rollout.jsonl", &text);
+        assert_eq!(
+            meter(
+                &path,
+                "r-2",
+                &Slice::bounded(None, vec![], at("2026-10-01T10:00:08Z"))
+            )
+            .unwrap()
+            .usage
+            .total(),
+            570
+        );
+        // An unfinished later task does not invalidate an already closed earlier run.
+        let unfinished = text
+            .lines()
+            .filter(|line| !(line.contains("task_complete") && line.contains("t-c")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let path = write(&root, "rollout.jsonl", &unfinished);
+        assert_eq!(
+            meter(&path, "r-1", &Slice::default())
+                .unwrap()
+                .usage
+                .total(),
+            120
+        );
+    }
+
+    #[test]
+    fn codex_task_completion_requires_consistent_native_identity_and_times() {
+        let text = codex_rollout()
+            .lines()
+            .take_while(|line| !line.contains("t-b"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let records: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let root = boss_testing::scratch_dir("codex-completion-consistency");
+        for (field, value) in [
+            ("turn_id", json!("t-foreign")),
+            ("turn_id", Value::Null),
+            ("started_at", json!(0)),
+            ("completed_at", json!(0)),
+            ("completed_at", Value::Null),
+        ] {
+            let mut altered = records.clone();
+            let end = altered.last_mut().unwrap();
+            end["payload"][field] = value;
+            let altered = altered
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let path = write(&root, "rollout.jsonl", &altered);
+            assert!(
+                meter(&path, "r-1", &Slice::default()).is_err(),
+                "accepted invalid completion {field}"
+            );
+        }
+        for timestamp in ["2026-10-01T09:59:58Z", "2026-10-01T10:00:01Z"] {
+            let mut altered = records.clone();
+            *altered.last_mut().unwrap() =
+                codex_task("task_complete", "t-a", timestamp, "2026-10-01T09:59:59Z");
+            let altered = altered
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let path = write(&root, "rollout.jsonl", &altered);
+            assert!(
+                meter(&path, "r-1", &Slice::default()).is_err(),
+                "accepted completion before its start or receipt"
+            );
+        }
+        for value in [Value::Null, json!(0)] {
+            let mut altered = records.clone();
+            altered[2]["payload"]["started_at"] = value;
+            let altered = altered
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let path = write(&root, "rollout.jsonl", &altered);
+            assert!(
+                meter(&path, "r-1", &Slice::default()).is_err(),
+                "accepted invalid native start time"
+            );
+        }
+        let mut foreign = codex_receipt("parent", "a-other", "2026-10-01T10:00:02Z", 100, 70, 20);
+        foreign["payload"]["turn_id"] = json!("t-a");
+        let path = write(&root, "rollout.jsonl", &format!("{text}\n{foreign}"));
+        let why = meter(&path, "r-1", &Slice::default()).unwrap_err();
+        assert!(why.contains("ownership"), "{why}");
+        let path = write(&root, "rollout.jsonl", &text);
+        assert_eq!(
+            meter(&path, "r-1", &Slice::default())
+                .unwrap()
+                .usage
+                .total(),
+            120
+        );
+    }
+
+    #[test]
+    fn codex_conflicting_native_token_totals_are_refused() {
+        let mut receipt = codex_receipt("child", "a", "2026-10-01T10:00:02Z", 100, 70, 20);
+        receipt["payload"]["usage"]["total_tokens"] = json!(121);
+        let meta = json!({"type":"session_meta","payload":{"id":"child"}});
+        let context =
+            json!({"type":"turn_context","payload":{"turn_id":"t-a","model":"gpt-6.1-sol"}});
+        let why = transcript_turns(&format!("{meta}\n{context}\n{receipt}")).unwrap_err();
+        assert!(why.contains("total_tokens"), "{why}");
+        receipt["payload"]["usage"]["total_tokens"] = json!(120);
+        assert!(sum_usage(&format!("{meta}\n{context}\n{receipt}")).is_some());
+    }
 
     /// Two lines of one turn (the thinking block, then the tool call,
     /// output growing 5 -> 155) and one line of the next — the shape

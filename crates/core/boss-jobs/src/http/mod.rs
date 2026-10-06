@@ -14,7 +14,7 @@ use axum::{Json, Router};
 use boss_core::job::{Job, JobStatus, Step, StepStatus};
 use boss_core::port::EventBus;
 use boss_core::publisher::DomainPublisher;
-use boss_policy_client::{Action, Decision, Resource};
+use boss_policy_client::{Action, Decision, Pair, Resource, controls};
 
 use boss_policy_client::{CurrentUser, PolicyClient};
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,7 @@ mod refusals;
 mod regions;
 mod routes;
 mod rule_firings;
+mod sensor_regions;
 mod sim_clock;
 mod stations;
 mod steps;
@@ -174,6 +175,9 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// `next_up` says the registry could not be read, never that no
     /// rotation is coming.
     pub credentials: Option<Arc<dyn crate::credentials::CredentialsRegistry>>,
+    /// The same telemetry port the existing sensor doors serve. Reads preserve
+    /// their Operator/Auditor boundary; absent data is an unread map station.
+    pub sensors: Option<Arc<dyn crate::sensors::Sensors>>,
     /// NEXT UP's scheduled rules (design ea906603 Q3): the dispatcher's
     /// `GET /api/dispatcher/schedule`, read as the viewer. `None` → the
     /// scheduled rules show as unread on the board.
@@ -236,6 +240,7 @@ impl<R: JobsRepository, B: EventBus> JobsApiState<R, B> {
             presence_key: None,
             yard_moves: None,
             credentials: None,
+            sensors: None,
             dispatcher_schedule: None,
         }
     }
@@ -628,38 +633,6 @@ pub(super) async fn validate_custom_subject<R: JobsRepository, B: EventBus>(
     check_custom_subject(state.subject_kinds.as_ref(), subject).await
 }
 
-// ---------------------------------------------------------------------------
-// Shared policy-scope translation
-// ---------------------------------------------------------------------------
-
-/// Translate the caller's read-scope `Predicate` into the `JobScope`
-/// the adapter can push into SQL. `DepartmentIs` is the odd one out:
-/// Jobs don't carry a department column, so it's either "all"
-/// (caller's department matches) or "none" (it doesn't). Shared by
-/// the /api/jobs list and the station queue lens so every packet
-/// read surface passes through ONE policy path.
-pub(super) fn job_scope_from_predicate(
-    user: &boss_policy_client::User,
-    predicate: &boss_policy_client::Predicate,
-) -> JobScope {
-    match predicate {
-        boss_policy_client::Predicate::Unrestricted => JobScope::All,
-        boss_policy_client::Predicate::None => JobScope::None,
-        boss_policy_client::Predicate::OwnerIs { user_id } => JobScope::OwnerIs(user_id.clone()),
-        boss_policy_client::Predicate::OwnerIn { user_ids } => JobScope::OwnerIn(user_ids.clone()),
-        boss_policy_client::Predicate::AccountIn { account_ids } => {
-            JobScope::AccountIn(account_ids.clone())
-        }
-        boss_policy_client::Predicate::DepartmentIs { department } => {
-            if user.department.as_deref() == Some(department.as_str()) {
-                JobScope::All
-            } else {
-                JobScope::None
-            }
-        }
-    }
-}
-
 /// The scope within which this caller may READ packets: policy Read on
 /// `job`, the same question the list's `scope_predicate` asks, answered
 /// as a `Scope` so a single row can be judged by [`scope_matches`] the
@@ -690,11 +663,7 @@ pub(super) async fn job_read_scope<R: JobsRepository, B: EventBus>(
     state: &JobsApiState<R, B>,
     user: &boss_policy_client::User,
 ) -> Result<boss_policy_client::Scope, Response> {
-    match state
-        .policy
-        .check(user, Action::Read, Resource::job())
-        .await
-    {
+    match state.policy.ask(user, controls::READ_JOB).await {
         Ok(Decision::Allow { scope }) => Ok(scope),
         Ok(Decision::Deny { reason }) => Err((
             StatusCode::FORBIDDEN,

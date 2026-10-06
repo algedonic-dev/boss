@@ -333,6 +333,19 @@ pub struct Machine {
     pub silent: Option<bool>,
     /// Where the last-fired time was read, or why there is none.
     pub why: String,
+    /// `true` when the firing record was WITHHELD from this caller by
+    /// policy scope ([`BorderInputs::machines_withheld`]) — a refusal,
+    /// not a read that failed. A flag, so a surface never has to
+    /// recognise the refusal by the words of `why` (backlog 1805bac0,
+    /// CLAUDE.md 9a). Absent from the wire when false, so a full scope's
+    /// payload is unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub withheld: bool,
+}
+
+/// serde's `skip_serializing_if` for a flag that is only ever sent set.
+pub(crate) fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// One border's rail, as the map draws it.
@@ -1222,6 +1235,11 @@ fn machine_of(spec: &BorderSpec, inputs: &BorderInputs<'_>, now: Instant) -> Mac
         expected_every_minutes: every,
         silent,
         why,
+        withheld: inputs.machines_withheld.is_some()
+            && matches!(
+                spec.machine_kind,
+                MachineKind::Cadence | MachineKind::DispatcherRule
+            ),
     }
 }
 
@@ -2261,6 +2279,7 @@ mod tests {
         for (from, to) in [("gates", "dock"), ("dock", "track")] {
             let m = &only(&out, from, to).machine;
             assert_eq!(m.last_fired, None, "{from}->{to}");
+            assert!(m.withheld, "{from}->{to}: the flag, not only the words");
             assert!(m.why.contains("withheld"), "{from}->{to}: {}", m.why);
             assert!(
                 m.why.contains("reads no packets"),
@@ -2954,6 +2973,7 @@ mod tests {
         status.held_cars.push(crate::yard::HeldCar {
             car: braked,
             reason: "held for the restart".to_string(),
+            kind: crate::yard::CarHoldKind::Operator,
         });
         status.gates.queued.push(crate::yard::QueuedGate {
             branch: "fix/in-line".to_string(),

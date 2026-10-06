@@ -56,7 +56,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "One change, from declaring its boundary to merging it. The Subject is a `custom` Subject whose id is the branch, so \"what shipped here\" is a Subject-history question. The `scope` step is the point of the kind: it asks a person what the change contains and what it deliberately excludes BEFORE the work, which is the only moment that decision keeps a PR small. Counted on /system/flow, so a cadence target needs no second mechanism. OPERATOR EDIT 2026-08-27, deliberate and load-bearing: this sentence exists only to make this registry row DIFFER from infra/platform/workflows.toml. The bundle was authored FROM the live specs, so every row matched and nothing could distinguish \"the seeder left my edit alone\" from \"the seeder rewrote it with identical bytes\". If this sentence is still here after the boss pod has restarted, the seeder is insert-if-absent in production and an operator edit survives a boot - the arbiter for the ship-a-change car \"ship-a-change is registry data\" (b10b3b52). If it has vanished, that claim is false and the car must not be stamped proven. Safe to delete once the observation is recorded. EVERY STEP CARRIES ITS OWN PROCEDURE in metadata_defaults, so how the work is actually done travels with the packet rather than living in a document someone has to know about. That also makes the procedure versioned and measurable: /api/workflows/ship-a-change/terminal-report reports cycle time and outcomes per version, so a change to the procedure can be compared against the versions before it instead of argued about."
-metadata = { owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "opened"
@@ -179,6 +179,20 @@ kind = "task"
 ready_when = "steps.gate.done"
 title_template = "Open for review"
 authority_role = "platform-admin"
+# WHO REVIEWS A HELD CAR (backlog bc9ef34f, 2026-09-30). A trust-
+# boundary car stands here HELD until an adversarial review releases it,
+# and `boss dispatch <car>` refused the step by name — it declared no
+# agent block — so every review was a bare `boss job file --kind
+# agent-run` that sat at `briefed` until a hand closed it (23 read
+# TROUBLED on the shop floor on 2026-09-29). The block makes it a
+# dispatched run like any other: the `reviewer` profile reads, records
+# its verdict with `boss review` inside its own run, and ships no car,
+# so it runs without a worktree (infra/platform/documents/reviewer-
+# rules.md). It does NOT complete this step: the conductor still does,
+# when the car boards on `boss release <car> --review <run>`. High
+# effort, because every car that waits here waits for exactly the
+# review a medium read would wave through.
+agent = { profile = "reviewer", model = "opus-5[1m]", budget_usd = 3, effort = "high" }
 metadata_defaults = { procedure = "Left ready for the conductor. It completes this when the car boards, recording the train's PR — cars do not open their own PRs, a train opens one for the batch. A car left behind gets a skip_reason on its metadata; if the branch legitimately moved, re-gate and put the fresh receipt in metadata.regate_receipt rather than abandoning the packet, which loses its history." }
 [[workflow.step.fields]]
 name = "pr_url"

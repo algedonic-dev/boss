@@ -61,20 +61,16 @@ const PACKET: &str = "bbbbbbbb-1111-4000-8000-000000000001";
 fn packet() -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(PACKET).expect("a fixed uuid")),
-        kind: "backlog-item".into(),
-        workflow_version: 1,
-        subject: Subject::new("custom", "bosspipeline"),
-        title: "The durable inbox as a station".into(),
-        owner_id: "emp-david".into(),
         status: JobStatus::Open,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 19).expect("a fixed date"),
-        opened_at: None,
-        due_on: None,
-        closed_on: None,
         metadata: serde_json::json!({}),
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            "backlog-item",
+            Subject::new("custom", "bosspipeline"),
+            "The durable inbox as a station",
+            "emp-david",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 19).expect("a fixed date"),
+        )
     }
 }
 
@@ -85,21 +81,8 @@ fn packet() -> Job {
 fn build_step(budget_usd: f64) -> Step {
     Step {
         id: StepId::from_uuid(Uuid::new_v4()),
-        job_id: JobId::from_uuid(Uuid::parse_str(PACKET).expect("a fixed uuid")),
-        kind: "task".into(),
-        title: "build".into(),
         spec_slug: Some("build".into()),
-        assignee_id: None,
         status: StepStatus::Ready,
-        sort_order: 0,
-        blocked_by: vec![],
-        sign_offs_required: Vec::new(),
-        assurance_required: None,
-        sign_offs: Vec::new(),
-        fields: Vec::new(),
-        completed_on: None,
-        completed_by: None,
-        completed_at: None,
         metadata: serde_json::json!({
             "authority_role": ROLE,
             "agent_profile": "builder",
@@ -107,9 +90,12 @@ fn build_step(budget_usd: f64) -> Step {
             "agent_budget_usd": budget_usd,
             "agent_effort": "high",
         }),
-        notes: None,
-        step_plugin_version: 0,
-        embedded_job: None,
+        ..Step::new(
+            JobId::from_uuid(Uuid::parse_str(PACKET).expect("a fixed uuid")),
+            "task",
+            "build",
+            0,
+        )
     }
 }
 

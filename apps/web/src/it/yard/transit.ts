@@ -97,6 +97,7 @@ export const STATIONS: ReadonlyArray<Station> = [
   { name: 'shed', x: 1880, y: MAIN_Y, below: false, line: 'delivery' },
   { name: 'garage', x: 1020, y: 340, below: true, line: 'siding' },
   { name: 'publish', x: 1770, y: 330, below: true, line: 'publish' },
+  { name: 'sensors', x: 220, y: 340, below: true, line: 'tenant' },
 ];
 
 export const stationOf = (name: string): Station | undefined => STATIONS.find((s) => s.name === name);

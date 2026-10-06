@@ -29,7 +29,10 @@ use boss_core::event::Event;
 use boss_core::publish::PublishMode;
 use boss_core::publisher::EventStamp;
 
-use super::port::{AgentsError, AgentsRegistry, declared_event, updated_event};
+use super::automations::{AutomationActor, AutomationsSeedOutcome, classify, validate_all};
+use super::port::{
+    AgentsError, AgentsRegistry, automation_declared_event, declared_event, updated_event,
+};
 use super::types::{AgentInput, AgentRow, AgentsBatchOutcome, KeptRow, UpdatedRow, is_agent_id};
 
 #[derive(Default)]
@@ -63,6 +66,9 @@ impl Rows {
 #[derive(Default)]
 pub struct InMemoryAgents {
     rows: Mutex<Rows>,
+    /// id -> the automation's row (`automation_actors`), byte-ordered
+    /// as the Pg listing's `COLLATE "C"` is.
+    automations: Mutex<BTreeMap<String, AutomationActor>>,
     events: Mutex<Vec<Event>>,
     rate_card: Option<BTreeSet<String>>,
 }
@@ -238,5 +244,47 @@ impl AgentsRegistry for InMemoryAgents {
             kept,
             unchanged,
         })
+    }
+
+    async fn list_automations(&self) -> Result<Vec<AutomationActor>, AgentsError> {
+        Ok(self
+            .automations
+            .lock()
+            .expect("automations lock")
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    async fn declare_automations(
+        &self,
+        declared: &[AutomationActor],
+        stamp: &EventStamp,
+    ) -> Result<AutomationsSeedOutcome, AgentsError> {
+        validate_all(declared).map_err(AgentsError::Storage)?;
+        let mut held = self.automations.lock().expect("automations lock");
+        // The table's CHECKs and the unique family, judged before
+        // anything lands — a refused bundle lands nothing, as its
+        // rolled-back transaction does in Postgres.
+        let mut after: Vec<AutomationActor> = held.values().cloned().collect();
+        after.extend(
+            declared
+                .iter()
+                .filter(|d| !held.contains_key(&d.id))
+                .cloned(),
+        );
+        if let Err(why) = validate_all(&after) {
+            return Err(AgentsError::Storage(format!(
+                "a constraint on automation_actors refuses the bundle: {why}"
+            )));
+        }
+        let before: Vec<AutomationActor> = held.values().cloned().collect();
+        let outcome = classify(&before, declared);
+        let mut events = self.events.lock().expect("events lock");
+        for d in declared.iter().filter(|d| outcome.inserted.contains(&d.id)) {
+            held.insert(d.id.clone(), d.clone());
+            events.push(automation_declared_event(stamp, d)?);
+        }
+        Ok(outcome)
     }
 }

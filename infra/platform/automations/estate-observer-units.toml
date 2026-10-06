@@ -1,0 +1,7 @@
+# automation:estate-observer-units — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 3,312 audit-log facts.
+# Signs as platform-admin today: infra/estate/observe-units.sh.
+
+[[automation]]
+id = "automation:estate-observer-units"
+role = "platform-admin"
+description = 'Observes the systemd units on each estate host and records them (infra/estate/observe-units.sh).'

@@ -1,0 +1,8 @@
+{
+  "about": "READ-ONLY — verify the newest remote GCS database archive (backlog 3a68ab36). Takes no arguments. Uses the existing forge ops_kubectl door to read only Secret boss/boss-gcs-offsite, privately in tmpfs; the existing uploader SDK image authenticates with that key without printing it. Reads every objects.list page, selects the newest exact boss-<UTC stamp>.sql.gz by creation instant with deterministic name/generation ties, records object metadata, downloads the pinned generation with its generation precondition, and performs bounded streaming validation without spooling an archive or whole SQL row. Compares byte length, records SHA-256, runs native gzip -t on the same bytes, validates gzip CRC/EOF, and verifies pg_dump's completion comment and optional matching unrestrict footer at the end. A bad newest generation fails; no fallback, uploads or deletes. The ops-request records the complete JSON receipt, native gzip exit, safe errno and exit status; a weekly dispatcher rule files the check, and an ops.judge watch alarms on failure or missing verdict. The claim is remote archive integrity, not an exercised database restore or permission to reclaim historical boss-gcp dumps. Temporary Secret and authentication cache are removed on exit. Timeout includes a bounded SDK image pull and the container's own 840-second bound.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/check-gcs-backup.sh"],
+  "params": [],
+  "timeout": 1200,
+  "effect": "^check-gcs-backup: READ . remote archive integrity verified$"
+}

@@ -34,8 +34,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use boss_core::machine_token::BlockingClient;
 use boss_core::publish::{FieldChange, KeptRow, UpdatedRow};
-use reqwest::blocking::Client;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
@@ -57,7 +57,18 @@ use crate::registry::WorkflowSpec;
 ///
 /// Idempotent + hard-fails on any non-2xx response — see the
 /// module docs.
+///
+/// `client` is the caller's, and it is a
+/// [`BlockingClient`]: it stamps the estate machine token on every
+/// request from the process's watched source and follows no redirect
+/// (design 6805c764 car 2, the blocking-senders slice, 2026-09-29).
+/// Until then the walk built its own client and baked the token read
+/// at walk start into its header map, so a walk outlasting a rotation's
+/// overlap window sent a revoked value. Taking the client also lets a
+/// test hand it a fixed source rather than the process's live one
+/// (backlog 2ee29275, F2).
 pub fn publish_workflows(
+    client: &BlockingClient,
     api_base: &str,
     seeds: &Path,
     owning_team: &str,
@@ -88,19 +99,10 @@ pub fn publish_workflows(
         "x-boss-user",
         reqwest::header::HeaderValue::from_str(&user_header).context("x-boss-user header value")?,
     );
-    boss_core::machine_token::attach(&mut headers);
     headers.insert(
         reqwest::header::CONTENT_TYPE,
         reqwest::header::HeaderValue::from_static("application/json"),
     );
-
-    // Every request below carries the token in its header map; a
-    // followed cross-host redirect would carry it too (review of
-    // 39949355, 2026-09-28).
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
 
     let specs = crate::seed_loader::load_workflows_with_owning_team(seeds, owning_team)
         .with_context(|| format!("loading workflows.toml for `{owning_team}`"))?;
@@ -121,7 +123,7 @@ pub fn publish_workflows(
         // landed via a Job have `created_by = "job-<uuid>"`,
         // rows that came from `platform_workflows()` carry
         // `created_by = "bootstrap"`.
-        let (provenance, live) = active_kind(&client, api_base, &headers, &spec.kind)?;
+        let (provenance, live) = active_kind(client, api_base, &headers, &spec.kind)?;
         let changes = match provenance {
             Provenance::OperatorPublished => {
                 // The kind is live: what does the file say differently?
@@ -146,7 +148,7 @@ pub fn publish_workflows(
             }
             Provenance::BootstrapOwned | Provenance::Missing => None,
         };
-        bootstrap_kind(&client, api_base, &headers, spec, dev, &signer)
+        bootstrap_kind(client, api_base, &headers, spec, dev, &signer)
             .with_context(|| format!("bootstrap of `{}`", spec.kind))?;
         match changes {
             Some(changes) => out.superseded.push(UpdatedRow {
@@ -503,7 +505,7 @@ fn provenance_of(body: &Value) -> Provenance {
 /// The active row for `kind` as the registry answers it, with its
 /// provenance; `Missing` rides an empty body.
 fn active_kind(
-    client: &Client,
+    client: &BlockingClient,
     api_base: &str,
     headers: &reqwest::header::HeaderMap,
     kind: &str,
@@ -525,7 +527,7 @@ fn active_kind(
 }
 
 fn bootstrap_kind(
-    client: &Client,
+    client: &BlockingClient,
     api_base: &str,
     headers: &reqwest::header::HeaderMap,
     target: &WorkflowSpec,
@@ -794,7 +796,7 @@ fn already_resolved(status: &str) -> bool {
 /// cannot hide anything, while bailing would brick a bootstrap on a
 /// single flaky GET.
 fn current_step(
-    client: &Client,
+    client: &BlockingClient,
     api_base: &str,
     headers: &reqwest::header::HeaderMap,
     job_id: &str,
@@ -830,7 +832,7 @@ fn current_step(
 
 #[allow(clippy::too_many_arguments)]
 fn walk_step(
-    client: &Client,
+    client: &BlockingClient,
     api_base: &str,
     headers: &reqwest::header::HeaderMap,
     job_id: &str,

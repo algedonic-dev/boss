@@ -24,7 +24,8 @@
 //! `reached_no_one`, backlog eba750db).
 
 use super::common::{
-    StepEvent, dispatcher_actor_header, dispatcher_reader_header, sim_origin_value,
+    StepEvent, dispatcher_actor_header, dispatcher_reader_header, get_json, rows_or_refuse,
+    sim_origin_value,
 };
 use async_trait::async_trait;
 use boss_dispatcher::rules::expr::Value;
@@ -47,14 +48,20 @@ struct EmployeeLite {
 
 pub struct MessagesNotify {
     client: boss_core::machine_token::Client,
+    jobs_base: String,
     people_base: String,
     messages_base: String,
 }
 
 impl MessagesNotify {
-    pub fn new(people_base: impl Into<String>, messages_base: impl Into<String>) -> Arc<Self> {
+    pub fn new(
+        jobs_base: impl Into<String>,
+        people_base: impl Into<String>,
+        messages_base: impl Into<String>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client: crate::handlers::common::api_client(),
+            jobs_base: jobs_base.into(),
             people_base: people_base.into(),
             messages_base: messages_base.into(),
         })
@@ -64,14 +71,56 @@ impl MessagesNotify {
     /// mock server; production passes a fresh client).
     pub fn with_client(
         client: boss_core::machine_token::Client,
+        jobs_base: impl Into<String>,
         people_base: impl Into<String>,
         messages_base: impl Into<String>,
     ) -> Arc<Self> {
         Arc::new(Self {
             client,
+            jobs_base: jobs_base.into(),
             people_base: people_base.into(),
             messages_base: messages_base.into(),
         })
+    }
+
+    /// Registry-declared assignment awareness excludes actors that read
+    /// queues (efd5a07d). No guessed agent prefix: aliases are registry data.
+    async fn machine_recipient(
+        &self,
+        recipient: &str,
+        rule_name: &str,
+    ) -> Result<bool, HandlerError> {
+        if recipient.starts_with("automation:") {
+            return Ok(true);
+        }
+        let url = format!("{}/api/agents", self.jobs_base.trim_end_matches('/'));
+        let listing = get_json(&self.client, &url, rule_name).await?;
+        let agents: Vec<boss_jobs::agents::AgentRow> =
+            rows_or_refuse(&listing, "GET /api/agents").map_err(HandlerError::Downstream)?;
+        // This reader returns the whole roster, without pagination. An
+        // incomplete/dark read cannot classify someone as a human.
+        if agents.is_empty()
+            || listing.get("total").and_then(serde_json::Value::as_u64) != Some(agents.len() as u64)
+            || listing.get("error").is_some_and(|e| !e.is_null())
+        {
+            return Err(HandlerError::Downstream(
+                "GET /api/agents did not answer a complete nonempty roster".into(),
+            ));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for agent in &agents {
+            if agent.id.trim().is_empty()
+                || !ids.insert(agent.id.as_str())
+                || agent.aliases.iter().any(|alias| alias.trim().is_empty())
+            {
+                return Err(HandlerError::Downstream(
+                    "GET /api/agents answered empty or duplicate identities".into(),
+                ));
+            }
+        }
+        Ok(agents.iter().any(|agent| {
+            agent.id == recipient || agent.aliases.iter().any(|alias| alias == recipient)
+        }))
     }
 }
 
@@ -87,6 +136,21 @@ impl Handler for MessagesNotify {
         ctx: &InvocationContext,
     ) -> Result<(), HandlerError> {
         let ev = StepEvent::from_payload(&ctx.event_payload)?;
+
+        let flags: Vec<_> = args
+            .iter()
+            .filter(|(key, _)| key == "skip_machine_recipients")
+            .map(|(_, value)| value)
+            .collect();
+        let skip_machine_recipients = match flags.as_slice() {
+            [] => false,
+            [Value::Bool(value)] => *value,
+            _ => {
+                return Err(HandlerError::Permanent(
+                    "skip_machine_recipients must be one boolean rule argument".into(),
+                ));
+            }
+        };
 
         // `id_prefix` (optional rule arg, default "notify"): a step
         // may legitimately notify twice in its life — at READY (this
@@ -283,6 +347,10 @@ impl Handler for MessagesNotify {
             },
         };
 
+        if skip_machine_recipients && self.machine_recipient(&recipient, &ctx.rule_name).await? {
+            return Ok(());
+        }
+
         // Name the Subject, not just the step kind. Seven feedback
         // Jobs produce seven identical "Ready: task step needs the
         // platform-admin team" lines, and an inbox where every row
@@ -401,6 +469,338 @@ fn reached_no_one(ctx: &InvocationContext, ev: &StepEvent<'_>, why: &str) -> Han
 mod tests {
     use super::*;
 
+    fn agent_roster() -> serde_json::Value {
+        json!({"data": [{
+            "id": "agent-unexpected-cpu", "display_name": "Registered queue executor",
+            "default_model": "test-model", "aliases": ["cpu-login@example.invalid"]
+        }], "total": 1})
+    }
+
+    async fn recipient_fixture(
+        roster: serde_json::Value,
+        status: axum::http::StatusCode,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use axum::{
+            Json, Router,
+            routing::{get, post},
+        };
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writes = sent.clone();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let read_count = reads.clone();
+        let app = Router::new()
+            .route(
+                "/api/agents",
+                get(move || {
+                    let roster = roster.clone();
+                    let read_count = read_count.clone();
+                    async move {
+                        read_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (status, Json(roster))
+                    }
+                }),
+            )
+            .route(
+                "/api/messages/send",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let writes = writes.clone();
+                    async move {
+                        writes.lock().unwrap().push(body);
+                        Json(json!({"ok": true}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), sent, reads)
+    }
+
+    async fn assert_queue_recipient_skipped(recipient: &str, expected_reads: usize) {
+        let (base, sent, reads) =
+            recipient_fixture(agent_roster(), axum::http::StatusCode::OK).await;
+        let h = MessagesNotify::with_client(
+            crate::handlers::common::api_client(),
+            base.clone(),
+            base.clone(),
+            base,
+        );
+        let mut payload = assigned_ready_payload();
+        payload["assignee_id"] = json!(recipient);
+        h.invoke(
+            &[("skip_machine_recipients".into(), Value::Bool(true))],
+            &ctx(payload),
+        )
+        .await
+        .unwrap();
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "queue recipient {recipient} received a message"
+        );
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            expected_reads
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_filter_skips_registered_id_without_prefix_guess() {
+        assert_queue_recipient_skipped("agent-unexpected-cpu", 1).await;
+    }
+
+    #[tokio::test]
+    async fn declared_filter_skips_registry_alias() {
+        assert_queue_recipient_skipped("cpu-login@example.invalid", 1).await;
+    }
+
+    #[tokio::test]
+    async fn declared_filter_skips_automation_without_registry_read() {
+        assert_queue_recipient_skipped("automation:fixture-worker", 0).await;
+    }
+
+    #[tokio::test]
+    async fn declared_filter_keeps_human_recipient_and_stable_message_id() {
+        let (base, sent, reads) =
+            recipient_fixture(agent_roster(), axum::http::StatusCode::OK).await;
+        let h = MessagesNotify::with_client(
+            crate::handlers::common::api_client(),
+            base.clone(),
+            base.clone(),
+            base,
+        );
+        for _ in 0..2 {
+            h.invoke(
+                &[("skip_machine_recipients".into(), Value::Bool(true))],
+                &ctx(assigned_ready_payload()),
+            )
+            .await
+            .unwrap();
+        }
+        let posted = sent.lock().unwrap();
+        assert_eq!(posted.len(), 2);
+        assert_eq!(posted[0]["recipient_id"], "emp-aa-001");
+        assert_eq!(
+            posted[0]["id"],
+            "notify:22222222-2222-2222-2222-222222222222:emp-aa-001"
+        );
+        assert_eq!(posted[0]["id"], posted[1]["id"]);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn declared_filter_refuses_dark_or_malformed_registry_before_sending() {
+        for (roster, status) in [
+            (agent_roster(), axum::http::StatusCode::SERVICE_UNAVAILABLE),
+            (json!([]), axum::http::StatusCode::OK),
+            (
+                json!({"data": agent_roster()["data"], "total": 2}),
+                axum::http::StatusCode::OK,
+            ),
+            (json!({"data": [], "total": 0}), axum::http::StatusCode::OK),
+            (
+                json!({"data": agent_roster()["data"]}),
+                axum::http::StatusCode::OK,
+            ),
+            (
+                json!({"data": agent_roster()["data"], "total": 1.5}),
+                axum::http::StatusCode::OK,
+            ),
+            (
+                json!({"data": agent_roster()["data"], "total": 1, "error": "unavailable"}),
+                axum::http::StatusCode::OK,
+            ),
+            (
+                json!({"data": [agent_roster()["data"][0], agent_roster()["data"][0]], "total": 2}),
+                axum::http::StatusCode::OK,
+            ),
+            (
+                json!({"data": [{"id": "agent-fixture", "display_name": "CPU", "default_model": "test", "aliases": false}], "total": 1}),
+                axum::http::StatusCode::OK,
+            ),
+            (
+                json!({"data": [{"id": "agent-fixture", "display_name": "CPU", "default_model": "test", "aliases": [""]}], "total": 1}),
+                axum::http::StatusCode::OK,
+            ),
+        ] {
+            let (base, sent, _) = recipient_fixture(roster, status).await;
+            let h = MessagesNotify::with_client(
+                crate::handlers::common::api_client(),
+                base.clone(),
+                base.clone(),
+                base,
+            );
+            let result = h
+                .invoke(
+                    &[("skip_machine_recipients".into(), Value::Bool(true))],
+                    &ctx(assigned_ready_payload()),
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "a dark/malformed registry must refuse before sends"
+            );
+            assert!(sent.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn declared_filter_refuses_invalid_argument_before_sending() {
+        let (base, sent, _) = recipient_fixture(agent_roster(), axum::http::StatusCode::OK).await;
+        let h = MessagesNotify::with_client(
+            crate::handlers::common::api_client(),
+            base.clone(),
+            base.clone(),
+            base,
+        );
+        assert!(
+            h.invoke(
+                &[(
+                    "skip_machine_recipients".into(),
+                    Value::String("true".into())
+                )],
+                &ctx(assigned_ready_payload())
+            )
+            .await
+            .is_err()
+        );
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn undeclared_done_notice_preserves_human_delivery_without_registry_read() {
+        let (base, sent, reads) =
+            recipient_fixture(json!([]), axum::http::StatusCode::SERVICE_UNAVAILABLE).await;
+        let h = MessagesNotify::with_client(
+            crate::handlers::common::api_client(),
+            base.clone(),
+            base.clone(),
+            base,
+        );
+        h.invoke(&[], &ctx_on("step.done.task", assigned_ready_payload()))
+            .await
+            .unwrap();
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn declared_filter_does_not_guess_agents_from_an_unregistered_prefix() {
+        let (base, sent, _) = recipient_fixture(agent_roster(), axum::http::StatusCode::OK).await;
+        let h = MessagesNotify::with_client(
+            crate::handlers::common::api_client(),
+            base.clone(),
+            base.clone(),
+            base,
+        );
+        let mut payload = assigned_ready_payload();
+        payload["assignee_id"] = json!("agent-unregistered");
+        h.invoke(
+            &[("skip_machine_recipients".into(), Value::Bool(true))],
+            &ctx(payload),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sent.lock().unwrap()[0]["recipient_id"],
+            "agent-unregistered"
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_filter_refuses_duplicate_argument_before_sending() {
+        let (base, sent, _) = recipient_fixture(agent_roster(), axum::http::StatusCode::OK).await;
+        let h = MessagesNotify::with_client(
+            crate::handlers::common::api_client(),
+            base.clone(),
+            base.clone(),
+            base,
+        );
+        let args = [
+            ("skip_machine_recipients".into(), Value::Bool(false)),
+            ("skip_machine_recipients".into(), Value::Bool(true)),
+        ];
+        assert!(
+            h.invoke(&args, &ctx(assigned_ready_payload()))
+                .await
+                .is_err()
+        );
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    /// The rule files are the policy: exercise their evaluated args
+    /// through the handler, rather than reproducing them in a fixture.
+    #[tokio::test]
+    async fn shipped_ready_and_assigned_rules_skip_queue_actors_and_keep_humans() {
+        use boss_dispatcher::rules::expr::NoHelpers;
+        use boss_dispatcher::rules::registry::{Registry, match_event};
+        for (rule_name, topic) in [
+            ("notify-assignee-on-step-ready", "step.ready.task"),
+            ("notify-assignee-on-step-assigned", "step.assigned.task"),
+        ] {
+            let source = std::fs::read_to_string(
+                boss_testing::dispatcher_rules_dir().join(format!("{rule_name}.toml")),
+            )
+            .unwrap();
+            let raw: toml::Value = toml::from_str(&source).unwrap();
+            assert_eq!(raw["rule"][0]["version"].as_integer(), Some(2));
+            let registry = Registry::from_toml(&source).unwrap();
+            let (base, sent, _) =
+                recipient_fixture(agent_roster(), axum::http::StatusCode::OK).await;
+            let h = MessagesNotify::with_client(
+                crate::handlers::common::api_client(),
+                base.clone(),
+                base.clone(),
+                base,
+            );
+            for recipient in [
+                "agent-unexpected-cpu",
+                "cpu-login@example.invalid",
+                "automation:fixture-worker",
+                "emp-aa-001",
+            ] {
+                let mut payload = assigned_ready_payload();
+                payload["assignee_id"] = json!(recipient);
+                let outcome = match_event(&registry, topic, &payload, &NoHelpers);
+                assert_eq!(outcome.matched.len(), 1, "{rule_name}: {recipient}");
+                let invocation = &outcome.matched[0].invocations[0];
+                let mut context = ctx_on(topic, payload);
+                context.rule_name = rule_name.into();
+                h.invoke(&invocation.args, &context).await.unwrap();
+            }
+            let posted = sent.lock().unwrap();
+            assert_eq!(posted.len(), 1, "only the human receives {rule_name}");
+            assert_eq!(posted[0]["recipient_id"], "emp-aa-001");
+            assert_eq!(
+                posted[0]["id"],
+                "notify:22222222-2222-2222-2222-222222222222:emp-aa-001"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_false_keeps_delivery_without_registry_dependency() {
+        let (base, sent, reads) =
+            recipient_fixture(json!({}), axum::http::StatusCode::SERVICE_UNAVAILABLE).await;
+        let h = MessagesNotify::with_client(
+            crate::handlers::common::api_client(),
+            base.clone(),
+            base.clone(),
+            base,
+        );
+        h.invoke(
+            &[("skip_machine_recipients".into(), Value::Bool(false))],
+            &ctx(assigned_ready_payload()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     fn ctx(payload: serde_json::Value) -> InvocationContext {
         ctx_on("step.ready.bill-approval", payload)
     }
@@ -424,8 +824,12 @@ mod tests {
     #[tokio::test]
     async fn a_done_topic_announces_done_not_ready() {
         let (people, messages, captured) = mock_services().await;
-        let h =
-            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
+        let h = MessagesNotify::with_client(
+            crate::handlers::common::api_client(),
+            people.clone(),
+            people,
+            messages,
+        );
         h.invoke(&[], &ctx_on("step.done.task", ready_payload()))
             .await
             .expect("notify");
@@ -551,8 +955,12 @@ mod tests {
     #[tokio::test]
     async fn an_assigned_step_notifies_its_assignee_with_no_role() {
         let (people, messages, captured) = mock_services().await;
-        let h =
-            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
+        let h = MessagesNotify::with_client(
+            crate::handlers::common::api_client(),
+            people.clone(),
+            people,
+            messages,
+        );
         let mut payload = ready_payload();
         payload["assignee_id"] = serde_json::json!("emp-bootstrap-admin");
         // No authority_role at all — the case that used to be a no-op.
@@ -574,8 +982,12 @@ mod tests {
     #[tokio::test]
     async fn the_assignee_wins_over_the_role() {
         let (people, messages, captured) = mock_services().await;
-        let h =
-            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
+        let h = MessagesNotify::with_client(
+            crate::handlers::common::api_client(),
+            people.clone(),
+            people,
+            messages,
+        );
         let mut payload = ready_payload();
         payload["assignee_id"] = serde_json::json!("emp-named");
         h.invoke(&[], &ctx(payload)).await.expect("notify");
@@ -594,8 +1006,12 @@ mod tests {
     #[tokio::test]
     async fn a_step_with_neither_assignee_nor_role_stays_silent() {
         let (people, messages, captured) = mock_services().await;
-        let h =
-            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
+        let h = MessagesNotify::with_client(
+            crate::handlers::common::api_client(),
+            people.clone(),
+            people,
+            messages,
+        );
         let mut payload = ready_payload();
         payload["metadata"] = serde_json::json!({});
         h.invoke(&[], &ctx(payload)).await.expect("no-op");
@@ -605,8 +1021,12 @@ mod tests {
     #[tokio::test]
     async fn links_to_the_step_not_the_job() {
         let (people, messages, captured) = mock_services().await;
-        let h =
-            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
+        let h = MessagesNotify::with_client(
+            crate::handlers::common::api_client(),
+            people.clone(),
+            people,
+            messages,
+        );
         h.invoke(&[], &ctx(assigned_ready_payload()))
             .await
             .expect("notify");
@@ -633,8 +1053,12 @@ mod tests {
     #[tokio::test]
     async fn subject_names_the_subject() {
         let (people, messages, captured) = mock_services().await;
-        let h =
-            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
+        let h = MessagesNotify::with_client(
+            crate::handlers::common::api_client(),
+            people.clone(),
+            people,
+            messages,
+        );
         h.invoke(&[], &ctx_on("step.done.task", ready_payload()))
             .await
             .expect("notify");
@@ -672,8 +1096,12 @@ mod tests {
     #[tokio::test]
     async fn notifies_the_lowest_id_holder_with_a_stable_id() {
         let (people, messages, captured) = mock_services().await;
-        let h =
-            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
+        let h = MessagesNotify::with_client(
+            crate::handlers::common::api_client(),
+            people.clone(),
+            people,
+            messages,
+        );
         h.invoke(&[], &ctx_on("step.done.task", ready_payload()))
             .await
             .expect("notify");
@@ -697,8 +1125,12 @@ mod tests {
     #[tokio::test]
     async fn a_done_step_with_a_role_still_reaches_the_role_not_the_owner() {
         let (people, messages, captured) = mock_services().await;
-        let h =
-            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
+        let h = MessagesNotify::with_client(
+            crate::handlers::common::api_client(),
+            people.clone(),
+            people,
+            messages,
+        );
         let mut payload = ready_payload();
         payload["job_owner_id"] = serde_json::json!("emp-owner");
         h.invoke(&[], &ctx_on("step.done.task", payload))
@@ -714,7 +1146,11 @@ mod tests {
     /// — with an owner on the event or not.
     #[tokio::test]
     async fn a_ready_step_never_falls_back_to_the_jobs_owner() {
-        let h = MessagesNotify::new("http://127.0.0.1:1", "http://127.0.0.1:1");
+        let h = MessagesNotify::new(
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+        );
         let mut payload = ready_payload();
         payload["metadata"] = serde_json::json!({});
         payload["job_owner_id"] = serde_json::json!("emp-owner");
@@ -737,7 +1173,11 @@ mod tests {
     /// Downstream error instead.
     #[tokio::test]
     async fn a_marked_done_step_that_names_no_one_dead_letters() {
-        let h = MessagesNotify::new("http://127.0.0.1:1", "http://127.0.0.1:1");
+        let h = MessagesNotify::new(
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+        );
         let mut payload = ready_payload();
         payload["metadata"] = serde_json::json!({});
         let res = h.invoke(&[], &ctx_on("step.done.task", payload)).await;
@@ -762,8 +1202,12 @@ mod tests {
     #[tokio::test]
     async fn a_marked_done_step_whose_role_nobody_holds_dead_letters() {
         let (people, messages, captured) = mock_services_with(serde_json::json!([])).await;
-        let h =
-            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
+        let h = MessagesNotify::with_client(
+            crate::handlers::common::api_client(),
+            people.clone(),
+            people,
+            messages,
+        );
         let res = h
             .invoke(&[], &ctx_on("step.done.task", ready_payload()))
             .await;
@@ -786,8 +1230,12 @@ mod tests {
     #[tokio::test]
     async fn a_ready_step_with_only_a_role_stays_silent_by_design() {
         let (people, messages, captured) = mock_services().await;
-        let h =
-            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
+        let h = MessagesNotify::with_client(
+            crate::handlers::common::api_client(),
+            people.clone(),
+            people,
+            messages,
+        );
         let res = h.invoke(&[], &ctx(ready_payload())).await;
         assert!(res.is_ok(), "a role-only ready step is a no-op: {res:?}");
         assert!(captured.lock().unwrap().is_none(), "nothing was sent");
@@ -801,7 +1249,11 @@ mod tests {
         // valuable one — with neither signal the handler returns
         // without touching the network, since the URLs are unreachable
         // and any call would error.
-        let h = MessagesNotify::new("http://127.0.0.1:1", "http://127.0.0.1:1");
+        let h = MessagesNotify::new(
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+        );
         let payload = serde_json::json!({
             "job_id": "11111111-1111-1111-1111-111111111111",
             "step_id": "22222222-2222-2222-2222-222222222222",
@@ -816,7 +1268,11 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_payload_errors() {
-        let h = MessagesNotify::new("http://127.0.0.1:1", "http://127.0.0.1:1");
+        let h = MessagesNotify::new(
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+        );
         let res = h
             .invoke(&[], &ctx(serde_json::json!("not-an-object")))
             .await;
@@ -831,8 +1287,12 @@ mod tests {
     #[tokio::test]
     async fn id_prefix_arg_separates_done_notifications_from_ready() {
         let (people, messages, captured) = mock_services().await;
-        let h =
-            MessagesNotify::with_client(crate::handlers::common::api_client(), people, messages);
+        let h = MessagesNotify::with_client(
+            crate::handlers::common::api_client(),
+            people.clone(),
+            people,
+            messages,
+        );
         let payload = assigned_ready_payload();
         let args = vec![(
             "id_prefix".to_string(),

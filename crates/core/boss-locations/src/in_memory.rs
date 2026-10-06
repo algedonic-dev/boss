@@ -7,7 +7,7 @@ use boss_core::primitives::Location;
 use boss_core::publisher::EventStamp;
 use std::sync::RwLock;
 
-use crate::port::{LocationError, LocationRepository, declared_event};
+use crate::port::{LocationError, LocationRepository, absent_parent, declared_event};
 
 /// Trivial in-memory store. Holds a snapshot of `Location` rows;
 /// lookups are linear scans because the registry is tiny in
@@ -76,16 +76,32 @@ impl LocationRepository for InMemoryLocations {
         // Mirror the Postgres `ON CONFLICT (id) DO NOTHING`: an id
         // already present is left untouched; only new rows append,
         // and only they record a `location.declared`.
+        //
+        // Built aside and written back only whole, as the Pg
+        // transaction commits: a batch inserting a row whose parent
+        // nothing holds is refused and leaves nothing (backlog
+        // be459ab9 — this double used to insert the orphan).
         let mut rows = self.rows.write().expect("rwlock poisoned");
         let mut events = self.events.write().expect("rwlock poisoned");
-        let mut inserted: u64 = 0;
+        let mut added: Vec<Location> = Vec::new();
+        let mut facts: Vec<Event> = Vec::new();
         for r in incoming {
-            if !rows.iter().any(|l| l.id == r.id) {
-                rows.push(r.clone());
-                events.push(declared_event(stamp, r)?);
-                inserted += 1;
+            if !rows.iter().chain(added.iter()).any(|l| l.id == r.id) {
+                added.push(r.clone());
+                facts.push(declared_event(stamp, r)?);
             }
         }
+        let orphan = added
+            .iter()
+            .filter_map(|l| l.parent_id.as_deref())
+            .filter(|p| !rows.iter().chain(added.iter()).any(|l| l.id == *p))
+            .min();
+        if let Some(parent) = orphan {
+            return Err(absent_parent(parent));
+        }
+        let inserted = added.len() as u64;
+        rows.extend(added);
+        events.extend(facts);
         Ok(inserted)
     }
 }

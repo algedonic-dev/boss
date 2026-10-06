@@ -126,16 +126,8 @@ fn packet(
     let id = Uuid::parse_str(&format!("112c0535-0000-0000-0000-{n:012}")).expect("uuid");
     Job {
         id: JobId::from_uuid(id),
-        kind: kind.into(),
         workflow_version: version,
-        subject: Subject::new("asset", "FV-1"),
-        title: format!("packet {n}"),
-        owner_id: owner.into(),
         status,
-        priority: Priority::Standard,
-        opened_on: NaiveDate::from_ymd_opt(2026, 9, 20).expect("day"),
-        opened_at: None,
-        due_on: None,
         closed_on: (status == JobStatus::Closed)
             .then(|| NaiveDate::from_ymd_opt(2026, 9, closed).expect("day")),
         metadata: if status == JobStatus::Closed {
@@ -143,8 +135,14 @@ fn packet(
         } else {
             Value::Null
         },
-        tags: vec![],
-        partition: boss_core::partition::Partition::Real,
+        ..Job::new(
+            kind,
+            Subject::new("asset", "FV-1"),
+            format!("packet {n}"),
+            owner,
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 9, 20).expect("day"),
+        )
     }
 }
 

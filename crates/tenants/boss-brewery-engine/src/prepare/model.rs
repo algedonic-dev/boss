@@ -42,7 +42,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use reqwest::blocking::Client;
+use boss_core::machine_token::BlockingClient;
 use tracing::info;
 
 use super::{SeedBases, publish_workflows, seed_tenant_data};
@@ -86,20 +86,31 @@ pub fn prepare_model(gateway_base: Option<&str>, seeds_dir: &Path) -> Result<()>
         "preparing brewery tenant model"
     );
 
+    // ONE client for the walk's own writes, the policy grants and the
+    // Workflow publish: it stamps the estate machine token on every
+    // request from the process's watched source and follows no redirect
+    // (design 6805c764 car 2, the blocking-senders slice, 2026-09-29).
+    // Each step used to build a plain client of its own, carrying no
+    // token, so an enforcing port would have refused the prepare. The
+    // tenant-data seed builds its own the same way (its timeout is 15s).
+    let client = BlockingClient::build(
+        reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(30)),
+    )?;
+
     // 1. Classes first — employee role + account-type writes validate
     //    against the Class registry.
-    seed_classes(&classes_base, seeds_dir)?;
+    seed_classes(&client, &classes_base, seeds_dir)?;
 
     // 1a. Departments — an employee's `department` validates against
     //     the departments registry (c87e3d6d), so the tenant's roster
     //     of departments lands before any employee; after the classes,
     //     because each row's `function` is a Class (backlog e22ee67a).
-    seed_departments(&jobs_base, seeds_dir)?;
+    seed_departments(&client, &jobs_base, seeds_dir)?;
 
     // 1b. Business calendars — reference data (banking/tax holidays) the
     //     dispatcher's timing triggers and the simulator resolve business
     //     days from. Like classes: load before anything that consumes them.
-    seed_business_calendars(&calendar_base, seeds_dir)?;
+    seed_business_calendars(&client, &calendar_base, seeds_dir)?;
 
     // 1c. The tenant's own identity — Q6: the organization being
     //     modeled is itself a Subject, one row per tenant. The
@@ -130,6 +141,7 @@ pub fn prepare_model(gateway_base: Option<&str>, seeds_dir: &Path) -> Result<()>
     //    needs the `workflow-approver` grant to resolve to its
     //    operational-leader holders.
     boss_policy::bootstrap::publish_policy_rules(
+        &client,
         &policy_base,
         &seeds_dir.join("policy_rules.toml"),
         false,
@@ -154,8 +166,9 @@ pub fn prepare_model(gateway_base: Option<&str>, seeds_dir: &Path) -> Result<()>
     //    first, then open the design Jobs. dev=true auto-walks the sign-off
     //    (unattended seed, same as `boss-brewery-bootstrap --dev`);
     //    publish_workflows takes the workflows.toml FILE (not the dir).
-    wait_for_people_projection(&people_base)?;
+    wait_for_people_projection(&client, &people_base)?;
     publish_workflows(
+        &client,
         &jobs_base,
         &seeds_dir.join("workflows.toml"),
         "brewery-bootstrap",
@@ -177,18 +190,17 @@ pub fn prepare_model(gateway_base: Option<&str>, seeds_dir: &Path) -> Result<()>
 /// `validate-brewery-sim.sh`, but inside the shared prepare path so every
 /// caller (offline regen, live demo, CI) gets it. Best-effort: a timeout
 /// logs and proceeds rather than aborting the seed.
-fn wait_for_people_projection(people_base: &str) -> Result<()> {
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
+fn wait_for_people_projection(client: &BlockingClient, people_base: &str) -> Result<()> {
     let url = format!("{}/api/people", people_base.trim_end_matches('/'));
     let (mut prev, mut stable) = (0usize, 0u32);
     for _ in 0..90 {
         // Signed: the roster answers a caller by grant, and one with no
         // identity is refused (backlog cda177ef) — which this loop would
-        // read as an empty roster for all 90 seconds.
+        // read as an empty roster for all 90 seconds. A poll: five
+        // seconds a read, not the walk's thirty.
         let count = client
             .get(&url)
+            .timeout(std::time::Duration::from_secs(5))
             .header(
                 "x-boss-user",
                 r#"{"id":"automation:brewery-seed","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}"#,
@@ -224,14 +236,11 @@ fn wait_for_people_projection(people_base: &str) -> Result<()> {
 /// `x-sim-origin: true` lets the batch land as seed-origin data
 /// (matching the reset-to-baseline curl); the seed-loader identity
 /// carries platform-admin provenance.
-fn seed_classes(api_base: &str, seeds_dir: &Path) -> Result<()> {
+fn seed_classes(client: &BlockingClient, api_base: &str, seeds_dir: &Path) -> Result<()> {
     let path = seeds_dir.join("classes.json");
     let body =
         std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
 
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
     let url = format!("{}/api/classes/batch", api_base.trim_end_matches('/'));
     let resp = client
         .post(&url)
@@ -257,14 +266,15 @@ fn seed_classes(api_base: &str, seeds_dir: &Path) -> Result<()> {
 /// tax calendars the dispatcher's timing triggers and the simulator
 /// resolve business days from — DATA, not hardcoded Rust. Same
 /// seed-origin provenance as the Class registry.
-fn seed_business_calendars(api_base: &str, seeds_dir: &Path) -> Result<()> {
+fn seed_business_calendars(
+    client: &BlockingClient,
+    api_base: &str,
+    seeds_dir: &Path,
+) -> Result<()> {
     let path = seeds_dir.join("business_calendars.json");
     let body =
         std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
 
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
     let url = format!(
         "{}/api/calendar/business-calendars/batch",
         api_base.trim_end_matches('/')
@@ -297,14 +307,11 @@ fn seed_business_calendars(api_base: &str, seeds_dir: &Path) -> Result<()> {
 /// the employees must land them first. Each row's `function` is a
 /// Class under `(department, function)`, so this runs after the
 /// classes.
-fn seed_departments(api_base: &str, seeds_dir: &Path) -> Result<()> {
+fn seed_departments(client: &BlockingClient, api_base: &str, seeds_dir: &Path) -> Result<()> {
     let path = seeds_dir.join("departments.toml");
     let rows = boss_jobs::department::declare::load_departments_toml(&path)
         .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
 
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
     let url = format!("{}/api/departments/batch", api_base.trim_end_matches('/'));
     let resp = client
         .post(&url)
@@ -331,11 +338,15 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
 
+    /// What the stand-in read: the request line, the header lines
+    /// (lowercased), and the body.
+    type Sent = (String, Vec<String>, String);
+
     /// One HTTP exchange: answer `status` to the first request and hand
-    /// back its request line and body. A stand-in for the jobs API's
-    /// batch door, so the test reads what the engine SENT rather than
-    /// what its source says it sends.
-    fn one_request_answering(status: &'static str) -> (String, mpsc::Receiver<(String, String)>) {
+    /// back what it read. A stand-in for the jobs API's batch door, so
+    /// the test reads what the engine SENT rather than what its source
+    /// says it sends.
+    fn one_request_answering(status: &'static str) -> (String, mpsc::Receiver<Sent>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
         let base = format!("http://{}", listener.local_addr().expect("its address"));
         let (tx, rx) = mpsc::channel();
@@ -345,6 +356,7 @@ mod tests {
             let mut request_line = String::new();
             reader.read_line(&mut request_line).expect("a request line");
             let mut length = 0usize;
+            let mut heads = Vec::new();
             loop {
                 let mut header = String::new();
                 reader.read_line(&mut header).expect("a header line");
@@ -356,6 +368,7 @@ mod tests {
                 {
                     length = value.trim().parse().expect("a numeric length");
                 }
+                heads.push(header.trim().to_lowercase());
             }
             let mut body = vec![0u8; length];
             reader.read_exact(&mut body).expect("the body");
@@ -367,6 +380,7 @@ mod tests {
             .expect("the answer");
             tx.send((
                 request_line.trim().to_string(),
+                heads,
                 String::from_utf8(body).expect("a UTF-8 body"),
             ))
             .expect("the test is listening");
@@ -378,6 +392,50 @@ mod tests {
         boss_testing::repo_root().join("examples/brewery/seeds")
     }
 
+    /// A client over a FIXED source — never the process's live one, so
+    /// a failing test that prints what it sent cannot put a mounted
+    /// Secret in a gate log (backlog 2ee29275, F2).
+    fn client_holding(token: Option<&str>) -> BlockingClient {
+        BlockingClient::build_with_source(
+            reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(30)),
+            std::sync::Arc::new(boss_core::machine_token::Source::fixed(
+                token.map(str::to_string),
+            )),
+        )
+        .expect("a blocking client")
+    }
+
+    /// Design 6805c764 car 2, the blocking-senders slice: the prepare
+    /// walk sends through the client it is handed, so the machine token
+    /// that client stamps reaches the port — before, each step built a
+    /// plain client and the token never left the process. The value is
+    /// made up for the test; no test reads the process's own.
+    #[test]
+    fn the_prepare_walk_presents_the_machine_token_its_client_stamps() {
+        let (base, rx) = one_request_answering("200 OK");
+        seed_departments(
+            &client_holding(Some("a-fixed-test-token")),
+            &base,
+            &brewery_seeds(),
+        )
+        .expect("a 200 is a publish");
+        let (_, heads, _) = rx.recv().expect("the engine sent a request");
+        assert!(
+            heads.contains(&"x-boss-machine-token: a-fixed-test-token".to_string()),
+            "the walk's request carries the token its client stamps: {heads:?}"
+        );
+
+        // The control: a client whose source holds nothing sends no header.
+        let (base, rx) = one_request_answering("200 OK");
+        seed_departments(&client_holding(None), &base, &brewery_seeds())
+            .expect("a 200 is a publish");
+        let (_, heads, _) = rx.recv().expect("the engine sent a request");
+        assert!(
+            !heads.iter().any(|h| h.starts_with("x-boss-machine-token:")),
+            "{heads:?}"
+        );
+    }
+
     /// Backlog e22ee67a: the prepare seeded classes, policy and
     /// employees but never the tenant's departments, so an instance
     /// prepared by the engine alone had 100 employees in `taproom` and
@@ -385,8 +443,9 @@ mod tests {
     #[test]
     fn the_prepare_publishes_every_declared_department_through_the_batch_door() {
         let (base, rx) = one_request_answering("200 OK");
-        seed_departments(&base, &brewery_seeds()).expect("a 200 is a publish");
-        let (request_line, body) = rx.recv().expect("the engine sent a request");
+        seed_departments(&client_holding(None), &base, &brewery_seeds())
+            .expect("a 200 is a publish");
+        let (request_line, _, body) = rx.recv().expect("the engine sent a request");
         assert!(
             request_line.starts_with("POST /api/departments/batch "),
             "the departments door, insert-if-absent by code: {request_line}"
@@ -409,7 +468,7 @@ mod tests {
     #[test]
     fn a_refused_publish_stops_the_prepare_naming_the_door() {
         let (base, _rx) = one_request_answering("422 Unprocessable Entity");
-        let err = seed_departments(&base, &brewery_seeds())
+        let err = seed_departments(&client_holding(None), &base, &brewery_seeds())
             .expect_err("a refusal is not a publish")
             .to_string();
         assert!(

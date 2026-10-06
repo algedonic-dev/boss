@@ -68,7 +68,13 @@ use boss_testing::TestDb;
 /// through the API with the last eight it installed, and it goes ready
 /// only for an off-host credential. The same class and the same
 /// registry gap as the four broker phases beside it.
-const ORPHANS_PINNED: usize = 30;
+///
+/// 30 -> 31 on 2026-09-30 (backlog 602fe95f): `publish-to-github/merge`,
+/// the third MACHINE step of that protocol — the forge ops-runner
+/// completes it through the merge-publish-pr verb (the GitHub App's
+/// fast-forward of the mirror's main), the same class and the same
+/// registry gap as `open-pr` and `read-checks` beside it.
+const ORPHANS_PINNED: usize = 31;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn every_persons_step_no_station_holds_is_named_and_the_count_is_pinned() {

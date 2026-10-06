@@ -90,7 +90,14 @@ impl Fixture {
             .env("STUB_DIR", &self.root)
             .env("TMPDIR", &self.tmp)
             .env("SECRET", SECRET)
-            .env_remove("RUNTIME_DIRECTORY");
+            .env_remove("RUNTIME_DIRECTORY")
+            // The machine token's inputs come from the test, never from
+            // the shell that ran the suite: a directory that does not
+            // exist, no host list, no rendered sor.env.
+            .env("BOSS_MACHINE_TOKEN_DIR", self.root.join("no-token-dir"))
+            .env_remove("BOSS_MACHINE_TOKEN_HOSTS")
+            .env("BOSS_SOR_ENV", self.root.join("no-sor.env"))
+            .env_remove("BOSS_MACHINE_TOKEN");
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -389,5 +396,368 @@ fn a_later_call_in_a_subshell_reuses_the_directory() {
             "{shell}: the subshell's rewrite is what the parent's next curl reads"
         );
         assert!(Fixture::entries(&f.tmp).is_empty(), "{shell}");
+    }
+}
+
+// ---------------------------------------------------------------------
+// machine_token_header — the shell senders' ONE reader of the estate
+// machine token (design 6805c764 car 4; backlog 1876bbdb INFO-6, INFO-7;
+// the car-4 mount checklist on backlog 2710c8fc). Until car 4 every
+// script stamped `$BOSS_MACHINE_TOKEN` — an env var the mount replaces —
+// onto whatever `$BASE` it was handed, with no host check, while
+// boss-core read the `current` slot of a mounted DIRECTORY and stamped
+// only estate hosts.
+// ---------------------------------------------------------------------
+
+/// A mounted-Secret-shaped directory under the fixture, holding `current`.
+fn token_dir(f: &Fixture, current: &str) -> PathBuf {
+    let dir = f.root.join("machine-token");
+    create_dir(&dir);
+    write_file(&dir.join("current"), current);
+    dir
+}
+
+/// The `current` slot of `BOSS_MACHINE_TOKEN_DIR`, trimmed, rides to a
+/// loopback URL in a header FILE, never in argv, and nothing is said.
+#[test]
+fn the_machine_token_is_read_from_the_current_slot_of_its_mount() {
+    for shell in SHELLS {
+        let f = Fixture::new(&format!("mt-current-{shell}"));
+        let dir = token_dir(&f, &format!("  {SECRET}\n"));
+        let r = f.run(
+            shell,
+            "set -eu\n\
+             machine_token_header MT_HDR http://127.0.0.1:7900\n\
+             curl ${MT_HDR:+-H \"$MT_HDR\"} http://127.0.0.1:7900/api/jobs\n",
+            &[("BOSS_MACHINE_TOKEN_DIR", dir.to_str().unwrap())],
+        );
+        assert_eq!(r.code, 0, "{shell}: {}", r.stderr);
+        assert_eq!(
+            f.read("headers.txt"),
+            format!("x-boss-machine-token: {SECRET}\n"),
+            "{shell}: the header carries the trimmed `current` slot"
+        );
+        assert!(!f.read("argv.txt").contains(SECRET), "{shell}: never argv");
+        assert_eq!(r.stderr, "", "{shell}: a stamped call says nothing");
+        assert!(Fixture::entries(&f.tmp).is_empty(), "{shell}: cleaned up");
+    }
+}
+
+/// The env var is not a source any longer (design choice 2: two sources
+/// for one fact drift). Exported with no mount, it sends nothing.
+#[test]
+fn the_env_var_is_not_a_source() {
+    for shell in SHELLS {
+        let f = Fixture::new(&format!("mt-env-{shell}"));
+        let r = f.run(
+            shell,
+            "set -eu\n\
+             machine_token_header MT_HDR http://127.0.0.1:7900\n\
+             curl ${MT_HDR:+-H \"$MT_HDR\"} http://127.0.0.1:7900/\n",
+            &[("BOSS_MACHINE_TOKEN", SECRET)],
+        );
+        assert_eq!(r.code, 0, "{shell}: {}", r.stderr);
+        assert!(
+            !f.read("argv.txt").lines().any(|a| a == "-H"),
+            "{shell}: no header from the env var: {}",
+            f.read("argv.txt")
+        );
+        assert!(Fixture::entries(&f.tmp).is_empty(), "{shell}");
+    }
+}
+
+/// No token is the state every host is in until the broker's first mint:
+/// no directory, a directory without `current` (an optional Secret that
+/// is absent mounts EMPTY), a blank `current` — no header, nothing
+/// written, nothing said, exit 0.
+#[test]
+fn no_token_sends_no_header_and_says_nothing() {
+    for shell in SHELLS {
+        let f = Fixture::new(&format!("mt-none-{shell}"));
+        let empty = f.root.join("empty-mount");
+        create_dir(&empty);
+        let blank = f.root.join("blank-mount");
+        create_dir(&blank);
+        write_file(&blank.join("current"), "  \n");
+        for dir in [f.root.join("absent"), empty, blank] {
+            let r = f.run(
+                shell,
+                "set -eu\n\
+                 machine_token_header MT_HDR http://127.0.0.1:7900\n\
+                 curl ${MT_HDR:+-H \"$MT_HDR\"} http://127.0.0.1:7900/\n",
+                &[("BOSS_MACHINE_TOKEN_DIR", dir.to_str().unwrap())],
+            );
+            assert_eq!(r.code, 0, "{shell} {}: {}", dir.display(), r.stderr);
+            assert_eq!(r.stderr, "", "{shell} {}: silent", dir.display());
+            assert!(
+                !f.read("argv.txt").lines().any(|a| a == "-H"),
+                "{shell} {}: no header",
+                dir.display()
+            );
+            assert!(Fixture::entries(&f.tmp).is_empty(), "{shell}");
+        }
+    }
+}
+
+/// What boss-core's reader refuses, this one refuses the same way — sent
+/// WITHOUT the token, said on stderr, never an exit that would stop the
+/// caller's work (a chore's packet, a runner's answer): the old FILE
+/// layout at the directory's path (what infra/dev/boss-api read until
+/// INFO-6), a `current` larger than 4096 bytes (MAX_SLOT_BYTES), and a
+/// `current` holding a line break, which no header can carry.
+#[test]
+fn a_slot_core_refuses_is_sent_without_and_said() {
+    for shell in SHELLS {
+        let f = Fixture::new(&format!("mt-bad-{shell}"));
+        let file = f.root.join("old-layout-token");
+        write_file(&file, &format!("{SECRET}\n"));
+        let big = f.root.join("big");
+        create_dir(&big);
+        write_file(&big.join("current"), &"a".repeat(4097));
+        let two = f.root.join("two-lines");
+        create_dir(&two);
+        write_file(
+            &two.join("current"),
+            &format!("{SECRET}\nx-boss-user: evil\n"),
+        );
+        for (dir, says) in [
+            (&file, "not a directory"),
+            (&big, "larger than 4096 bytes"),
+            (&two, "line break"),
+        ] {
+            let r = f.run(
+                shell,
+                "set -eu\n\
+                 machine_token_header MT_HDR http://127.0.0.1:7900\n\
+                 curl ${MT_HDR:+-H \"$MT_HDR\"} http://127.0.0.1:7900/\n",
+                &[("BOSS_MACHINE_TOKEN_DIR", dir.to_str().unwrap())],
+            );
+            assert_eq!(r.code, 0, "{shell} {says}: {}", r.stderr);
+            assert!(
+                r.stderr.contains(says),
+                "{shell}: says {says}: {}",
+                r.stderr
+            );
+            assert!(!r.stderr.contains(SECRET), "{shell}: never the value");
+            assert!(
+                !f.read("argv.txt").lines().any(|a| a == "-H"),
+                "{shell} {says}: no header"
+            );
+        }
+    }
+}
+
+/// The same host rule boss-core's clients take (backlog 2ee29275, F1;
+/// 1876bbdb INFO-7): loopback, and the hosts and `.namespace` suffixes
+/// the list names — held to `machine_token::Hosts` on this table's rows
+/// (CLAUDE.md §9a), the rows infra/dev/boss-api's own equality test holds
+/// the door to. Off the table the two can differ; the lib's header names
+/// how, as review ef2da426 F4 measured it against curl. A withheld call says so once, naming the scheme and host and
+/// never the path, the query or the userinfo.
+#[test]
+fn the_token_rides_only_to_an_estate_host_the_way_boss_core_decides() {
+    const PATH: &str = "/api/jobs?state=q-secret";
+    let list = "record.example.net, 192.0.2.34";
+    let prod = ".boss.svc.cluster.local";
+    let cases = [
+        ("http://127.0.0.1:7900", ""),
+        ("http://localhost:7900", ""),
+        ("http://[::1]:7900", ""),
+        ("http://boss-jobs-internal.boss.svc.cluster.local:7900", ""),
+        (
+            "http://boss-jobs-internal.boss.svc.cluster.local:7900",
+            prod,
+        ),
+        ("http://BOSS-JOBS.boss.svc.cluster.local.:7900", prod),
+        (
+            "http://boss-jobs-internal.boss-playground.svc.cluster.local:7900",
+            prod,
+        ),
+        ("http://boss.svc.cluster.local", prod),
+        ("http://192.0.2.34:7900", list),
+        ("http://Record.Example.Net", list),
+        ("http://192.0.2.34:7900", ""),
+        ("https://boss.algedonic.dev", list),
+        ("http://127.foo.example:7900", ""),
+        ("http://svc.cluster.local.example.com", prod),
+        ("http://operator@198.51.100.7:7900", list),
+        ("http://evil.com#@127.0.0.1", ""),
+        ("http://evil.com?@127.0.0.1:7900", ""),
+        (
+            "http://evil.com?x=@boss-jobs-internal.boss.svc.cluster.local",
+            prod,
+        ),
+        ("http://127.0.0.999:7900", ""),
+        ("http://127.0.0.256:7900", ""),
+        ("http://127.1000.0.1:7900", ""),
+        ("http://127.255.255.255:7900", ""),
+        ("http://127.0.0.1.evil.example:7900", ""),
+    ];
+    for shell in SHELLS {
+        let f = Fixture::new(&format!("mt-hosts-{shell}"));
+        let dir = token_dir(&f, SECRET);
+        for (base, listed) in cases {
+            let _ = std::fs::remove_file(f.root.join("headers.txt"));
+            let url = format!("{base}{PATH}");
+            let r = f.run(
+                shell,
+                "set -eu\n\
+                 machine_token_header MT_HDR \"$URL\"\n\
+                 curl ${MT_HDR:+-H \"$MT_HDR\"} \"$URL\"\n",
+                &[
+                    ("BOSS_MACHINE_TOKEN_DIR", dir.to_str().unwrap()),
+                    ("BOSS_MACHINE_TOKEN_HOSTS", listed),
+                    ("URL", &url),
+                ],
+            );
+            assert_eq!(r.code, 0, "{shell} {base}: {}", r.stderr);
+            let core = boss_core::machine_token::Hosts::parse(listed).allows_url(&url);
+            let lib = f.read("headers.txt").contains(SECRET);
+            assert_eq!(
+                lib, core,
+                "{shell} {base} (list {listed:?}): the lib stamped={lib}, boss-core allows={core}"
+            );
+            if lib {
+                assert_eq!(r.stderr, "", "{shell} {base}: stamped says nothing");
+            } else {
+                let scheme = base.split("://").next().unwrap();
+                assert!(
+                    r.stderr.contains("machine token withheld")
+                        && r.stderr.contains(&format!("{scheme}://")),
+                    "{shell} {base}: withheld says so, naming the scheme: {}",
+                    r.stderr
+                );
+                for never in ["q-secret", "/api/jobs", "operator@", SECRET] {
+                    assert!(
+                        !r.stderr.contains(never),
+                        "{shell} {base}: never {never}: {}",
+                        r.stderr
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// UNSET, the list is the rendered sor.env's `BOSS_MACHINE_TOKEN_HOSTS=`
+/// line — what boss-core's `Hosts::from_env` falls back to, for a script
+/// run by hand that inherits no unit's `EnvironmentFile=` — unless the
+/// caller hands a default of its own (the pod's door hands the host of
+/// its sor-url). SET, even empty, the variable wins over both.
+#[test]
+fn an_unset_list_is_the_rendered_sor_env_or_the_callers_default() {
+    for shell in SHELLS {
+        let f = Fixture::new(&format!("mt-default-{shell}"));
+        let dir = token_dir(&f, SECRET);
+        let env_file = f.root.join("sor.env");
+        write_file(
+            &env_file,
+            "BOSS_JOBS_URL=http://record.test:7900\nBOSS_MACHINE_TOKEN_HOSTS=record.test\n",
+        );
+        let stamped = |body: &str, env: &[(&str, &str)]| {
+            let _ = std::fs::remove_file(f.root.join("headers.txt"));
+            let mut all = vec![("BOSS_MACHINE_TOKEN_DIR", dir.to_str().unwrap())];
+            all.extend_from_slice(env);
+            let r = f.run(shell, body, &all);
+            assert_eq!(r.code, 0, "{shell}: {}", r.stderr);
+            f.read("headers.txt").contains(SECRET)
+        };
+        let plain = "set -eu\nmachine_token_header H \"$URL\"\ncurl ${H:+-H \"$H\"} \"$URL\"\n";
+        let with_default =
+            "set -eu\nmachine_token_header H \"$URL\" door.test\ncurl ${H:+-H \"$H\"} \"$URL\"\n";
+        let sor = env_file.to_str().unwrap();
+        assert!(stamped(
+            plain,
+            &[("BOSS_SOR_ENV", sor), ("URL", "http://record.test:7900/x")]
+        ));
+        assert!(!stamped(
+            plain,
+            &[("BOSS_SOR_ENV", sor), ("URL", "http://other.test/x")]
+        ));
+        // No rendered file: loopback only.
+        assert!(!stamped(plain, &[("URL", "http://record.test:7900/x")]));
+        assert!(stamped(plain, &[("URL", "http://127.0.0.1:7900/x")]));
+        // The caller's default outranks the file; the variable outranks both.
+        assert!(stamped(
+            with_default,
+            &[("BOSS_SOR_ENV", sor), ("URL", "http://door.test/x")]
+        ));
+        assert!(!stamped(
+            with_default,
+            &[("BOSS_SOR_ENV", sor), ("URL", "http://record.test/x")]
+        ));
+        assert!(!stamped(
+            with_default,
+            &[
+                ("BOSS_MACHINE_TOKEN_HOSTS", ""),
+                ("URL", "http://door.test/x")
+            ]
+        ));
+    }
+}
+
+/// THE LIST IS SPLIT ON SPACES WHATEVER THE CALLER'S IFS (review
+/// ef2da426 F8). The lib splits its host list by word splitting; a
+/// caller that set IFS to a comma or a newline for its own loop would
+/// have had a multi-entry list read as one word and every listed host
+/// withheld — safe today, a refused caller the day the gate enforces.
+/// The caller's IFS is kept afterwards, set or unset.
+#[test]
+fn the_host_list_splits_the_same_under_any_caller_ifs() {
+    for shell in SHELLS {
+        let f = Fixture::new(&format!("mt-ifs-{shell}"));
+        let dir = token_dir(&f, SECRET);
+        for (tag, set_ifs) in [
+            ("newline", "IFS='\n'"),
+            ("comma", "IFS=','"),
+            ("empty", "IFS=''"),
+            ("unset", "unset IFS"),
+        ] {
+            let _ = std::fs::remove_file(f.root.join("headers.txt"));
+            let r = f.run(
+                shell,
+                &format!(
+                    "{set_ifs}\n\
+                     before=\"${{IFS-unset}}\"\n\
+                     machine_token_header H http://second.test:7900\n\
+                     [ \"${{IFS-unset}}\" = \"$before\" ] || {{ echo 'IFS changed' >&2; exit 9; }}\n\
+                     [ -z \"$H\" ] || cat \"${{H#@}}\" > \"$STUB_DIR/headers.txt\"\n"
+                ),
+                &[
+                    ("BOSS_MACHINE_TOKEN_DIR", dir.to_str().unwrap()),
+                    ("BOSS_MACHINE_TOKEN_HOSTS", "first.test, second.test"),
+                ],
+            );
+            assert_eq!(r.code, 0, "{shell} {tag}: {}", r.stderr);
+            assert!(
+                f.read("headers.txt").contains(SECRET),
+                "{shell} {tag}: the second listed host is stamped: {}",
+                r.stderr
+            );
+        }
+    }
+}
+
+/// `machine_token_host URL` is the host the decision above is made on —
+/// public, because the pod's door derives its default list from its own
+/// sor-url with it rather than keeping a second copy of the parse.
+#[test]
+fn the_host_a_decision_reads_is_one_function() {
+    for shell in SHELLS {
+        let f = Fixture::new(&format!("mt-host-{shell}"));
+        let r = f.run(
+            shell,
+            "for u in 'http://Boss-Jobs.boss.svc.cluster.local.:7900/api' \
+                      'http://op@[::1]:7900' 'http://evil.com#@127.0.0.1'; do\n\
+                 machine_token_host \"$u\"; echo\n\
+             done > \"$STUB_DIR/hosts.txt\"\n",
+            &[],
+        );
+        assert_eq!(r.code, 0, "{shell}: {}", r.stderr);
+        assert_eq!(
+            f.read("hosts.txt"),
+            "boss-jobs.boss.svc.cluster.local\n::1\nevil.com\n",
+            "{shell}"
+        );
     }
 }

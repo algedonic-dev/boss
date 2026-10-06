@@ -14,7 +14,7 @@ pub mod rebuild;
 pub mod types;
 
 pub use in_memory::InMemoryMessages;
-pub use port::{MessageError, MessageRepository};
+pub use port::{InboxPage, InboxQuery, KindCount, MessageError, MessageRepository};
 #[cfg(feature = "postgres")]
 pub use postgres::PgMessages;
 #[cfg(feature = "postgres")]

@@ -316,11 +316,13 @@ pub struct CredentialRotateCloudflareTunnel {
     poll: VerifyPoll,
 }
 
-/// One step of the rotation packet as the jobs-api lists it.
-struct StepView {
-    id: String,
-    status: String,
-    metadata: serde_json::Map<String, JsonValue>,
+/// One step of the rotation packet as the jobs-api lists it. Shared
+/// with the self-issued handler, which reads the same packets the same
+/// way (design 6805c764, car 3).
+pub(super) struct StepView {
+    pub(super) id: String,
+    pub(super) status: String,
+    pub(super) metadata: serde_json::Map<String, JsonValue>,
 }
 
 /// The rule row's consumer declaration, parsed once. `hostnames` and
@@ -409,7 +411,7 @@ fn old_token_of(metadata: &serde_json::Map<String, JsonValue>) -> Option<&str> {
 }
 
 /// The packet's steps keyed by spec slug, from a job body.
-fn steps_of(body: &JsonValue) -> HashMap<String, StepView> {
+pub(super) fn steps_of(body: &JsonValue) -> HashMap<String, StepView> {
     let mut out = HashMap::new();
     for s in body
         .get("steps")
@@ -443,7 +445,7 @@ fn steps_of(body: &JsonValue) -> HashMap<String, StepView> {
 /// PURE: is this open packet about the credential the rule declares?
 /// The same two spellings the rotation rule's `when` matches: opened ON
 /// the credential (the subject), or naming it on the scope step.
-fn is_about_credential(
+pub(super) fn is_about_credential(
     job: &JsonValue,
     steps: &HashMap<String, StepView>,
     credential_id: &str,
@@ -458,6 +460,66 @@ fn is_about_credential(
             .and_then(|s| s.metadata.get("credential"))
             .and_then(|v| v.as_str())
             == Some(credential_id)
+}
+
+/// One jobs-API read as the dispatcher's reader, any non-2xx an error
+/// carrying the body. Shared with the self-issued handler.
+pub(super) async fn get_json(
+    client: &boss_core::machine_token::Client,
+    url: &str,
+) -> Result<JsonValue, HandlerError> {
+    let resp = client
+        .get(url)
+        .header("x-boss-user", dispatcher_reader_header())
+        .header("x-sim-origin", super::common::sim_origin_value())
+        .send()
+        .await
+        .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(HandlerError::Downstream(format!(
+            "GET {url} returned {status}: {text}"
+        )));
+    }
+    resp.json()
+        .await
+        .map_err(|e| HandlerError::Downstream(format!("{url}: {e}")))
+}
+
+/// Every open rotation packet, paged on `total` so one sorted past a
+/// page is still found (the same paging `jobs.run-car-probes` does, for
+/// the same reason). Shared with the self-issued handler, whose order
+/// guard reads the same list.
+pub(super) async fn open_rotations(
+    client: &boss_core::machine_token::Client,
+    jobs: &str,
+) -> Result<Vec<JsonValue>, HandlerError> {
+    const PAGE: usize = 200;
+    let mut rows: Vec<JsonValue> = Vec::new();
+    loop {
+        let body = get_json(
+            client,
+            &format!(
+                "{jobs}/api/jobs?kind={ROTATION_KIND}&status=open&full=true&limit={PAGE}&offset={}",
+                rows.len()
+            ),
+        )
+        .await?;
+        let total = body.get("total").and_then(JsonValue::as_u64).unwrap_or(0) as usize;
+        // A page with no `data` array is NO ANSWER. Read as zero rows it
+        // broke the loop on `got == 0` and the sweep ACKed having looked
+        // at nothing (backlog 37fc5837).
+        let page: Vec<JsonValue> =
+            super::common::rows_or_refuse(&body, "the open-rotation read (GET /api/jobs)")
+                .map_err(HandlerError::Downstream)?;
+        let got = page.len();
+        rows.extend(page);
+        if got == 0 || rows.len() >= total {
+            break;
+        }
+    }
+    Ok(rows)
 }
 
 impl CredentialRotateCloudflareTunnel {
@@ -497,62 +559,15 @@ impl CredentialRotateCloudflareTunnel {
         self.jobs_base.trim_end_matches('/')
     }
 
-    async fn get_json(&self, url: &str) -> Result<JsonValue, HandlerError> {
-        let resp = self
-            .client
-            .get(url)
-            .header("x-boss-user", dispatcher_reader_header())
-            .header("x-sim-origin", super::common::sim_origin_value())
-            .send()
-            .await
-            .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(HandlerError::Downstream(format!(
-                "GET {url} returned {status}: {text}"
-            )));
-        }
-        resp.json()
-            .await
-            .map_err(|e| HandlerError::Downstream(format!("{url}: {e}")))
-    }
-
     /// The packet's steps keyed by spec slug. One read serves every
     /// completion below.
     async fn fetch_steps(&self, job_id: &str) -> Result<HashMap<String, StepView>, HandlerError> {
         let url = format!("{}/api/jobs/{job_id}", self.jobs());
-        Ok(steps_of(&self.get_json(&url).await?))
+        Ok(steps_of(&get_json(&self.client, &url).await?))
     }
 
-    /// Every open rotation packet, paged on `total` so one sorted past
-    /// a page is still found (the same paging `jobs.run-car-probes`
-    /// does, for the same reason).
     async fn open_rotations(&self) -> Result<Vec<JsonValue>, HandlerError> {
-        const PAGE: usize = 200;
-        let mut rows: Vec<JsonValue> = Vec::new();
-        loop {
-            let body = self
-                .get_json(&format!(
-                    "{}/api/jobs?kind={ROTATION_KIND}&status=open&full=true&limit={PAGE}&offset={}",
-                    self.jobs(),
-                    rows.len()
-                ))
-                .await?;
-            let total = body.get("total").and_then(JsonValue::as_u64).unwrap_or(0) as usize;
-            // A page with no `data` array is NO ANSWER. Read as zero
-            // rows it broke the loop on `got == 0` and the sweep ACKed
-            // having looked at nothing (backlog 37fc5837).
-            let page: Vec<JsonValue> =
-                super::common::rows_or_refuse(&body, "the open-rotation read (GET /api/jobs)")
-                    .map_err(HandlerError::Downstream)?;
-            let got = page.len();
-            rows.extend(page);
-            if got == 0 || rows.len() >= total {
-                break;
-            }
-        }
-        Ok(rows)
+        open_rotations(&self.client, self.jobs()).await
     }
 
     /// Write one step: the evidence through the step merge door, then

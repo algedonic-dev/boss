@@ -294,6 +294,7 @@ async fn main() -> Result<()> {
             cancel_tx,
             cancel_rx,
             &cfg.http_bind,
+            boss_events::outbox::PgOutboxRecorder::shared(&pool),
         )
         .await;
     }
@@ -339,6 +340,7 @@ async fn run_server<R: JobsRepository + 'static>(
     cancel_tx: watch::Sender<bool>,
     cancel_rx: watch::Receiver<bool>,
     http_bind: &str,
+    gate_recorder: Arc<dyn boss_core::port::EventRecorder>,
 ) -> Result<()> {
     // Start axum HTTP server.
     let step_registry = Arc::new(boss_jobs::step_registry::StepRegistry::v1());
@@ -439,6 +441,7 @@ async fn run_server<R: JobsRepository + 'static>(
         // /api/credentials door serves below, and the dispatcher's
         // schedule read as the viewer.
         credentials: credentials.clone(),
+        sensors: sensors.clone(),
         dispatcher_schedule: Some(Arc::new(
             boss_jobs::dispatcher_schedule::ReqwestDispatcherSchedule::new(dispatcher_url.clone()),
         )),
@@ -606,8 +609,11 @@ async fn run_server<R: JobsRepository + 'static>(
     // API ran before (its env var was set nowhere). It wraps the merged
     // app so the scheduling/cadence routers are behind the same gate,
     // and exempts the health read the off-cluster watchdog
-    // (infra/forge/cluster-watchdog.sh) makes without a token.
-    let app = boss_core::machine_gate::mount(app, "jobs", &["/api/jobs/health"]);
+    // (infra/forge/cluster-watchdog.sh) makes without a token. What it
+    // would refuse is stated on the log through the outbox (design
+    // 21946380).
+    let app =
+        boss_core::machine_gate::mount(app, "jobs", &["/api/jobs/health"], Some(gate_recorder));
     let http_addr: SocketAddr = http_bind
         .parse()
         .with_context(|| format!("invalid http_bind `{http_bind}`"))?;

@@ -163,6 +163,25 @@ impl ActorId {
             Self::Agent { mode, model } => Cow::Owned(format!("{mode}:{model}")),
         }
     }
+
+    /// True when this actor's text form parses back to this same actor.
+    ///
+    /// Every actor that came off the wire does — `FromStr` only builds
+    /// values that print back to themselves — but the variants are public,
+    /// so Rust code can build one that does not: `Human("system")` reads
+    /// back as the `platform` automation, a Human or RegisteredAgent id
+    /// holding a colon as an agent, `Human("agent-x")` as a registered
+    /// agent, `RegisteredAgent("emp-1")` as a human, and an Agent whose
+    /// mode is `automation` as an automation. A store that keeps the text
+    /// form (a TEXT column) would then hand a DIFFERENT actor back than
+    /// one that keeps the value — the credit for the transition changes
+    /// on the way through, which is the misattribution this type exists
+    /// to refuse. A store's write door refuses such an actor with this
+    /// (backlog b8099caf); it is not refused at construction because the
+    /// variants are the type's public shape, built in hundreds of places.
+    pub fn text_form_round_trips(&self) -> bool {
+        self.to_string().parse::<Self>().as_ref() == Ok(self)
+    }
 }
 
 impl fmt::Display for ActorId {
@@ -426,6 +445,37 @@ mod tests {
             ActorId::Human("agent-".into()),
             "a bare prefix names no agent"
         );
+    }
+
+    /// The actors Rust can build whose text form reads back as someone
+    /// else, and one of each class that reads back as itself
+    /// (backlog b8099caf).
+    #[test]
+    fn text_form_round_trips_is_false_exactly_where_the_parse_names_someone_else() {
+        let drift = [
+            ActorId::Human("system".into()),
+            ActorId::Human("emp:032".into()),
+            ActorId::Human("agent-claude".into()),
+            ActorId::Human("automation:cron".into()),
+            ActorId::RegisteredAgent("emp-032".into()),
+            ActorId::RegisteredAgent("agent-x:y".into()),
+            ActorId::agent("automation", "cron"),
+            ActorId::agent("claude:x", "opus-5"),
+        ];
+        for a in drift {
+            assert!(!a.text_form_round_trips(), "{a:?} reads back as itself");
+        }
+        let whole = [
+            ActorId::human("emp-032"),
+            ActorId::human("agent-"),
+            ActorId::automation("rule:bill-approve"),
+            ActorId::automation("platform"),
+            ActorId::agent("claude", "opus-5:1m"),
+            ActorId::RegisteredAgent("agent-claude".into()),
+        ];
+        for a in whole {
+            assert!(a.text_form_round_trips(), "{a:?} reads back otherwise");
+        }
     }
 
     /// Model is a groupable dimension off `actor_id` alone — the retro

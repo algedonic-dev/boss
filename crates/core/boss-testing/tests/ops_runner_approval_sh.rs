@@ -110,6 +110,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// re-read, which a static record cannot otherwise show.
 /// `STUB_RACE_ONCE` answers the FIRST step PUT of a run 409 with that
 /// value as its `code` — the step race lost once (car 88123ae0).
+/// `STUB_REFUSE_URL` answers 403 to every write whose url ends with it —
+/// the `written_by` refusal (backlog aa816dd4).
 ///
 /// THE CLAIM DOOR JUDGES THE HOLDER THE WAY THE SERVER DOES (re-review of
 /// 2026-09-25). This stub used to answer every claim 200, so the happy
@@ -147,6 +149,7 @@ printf '%s' "$b" | jq -c --arg m "$m" --arg u "$url" --arg who "$user" \
     '{method: $m, url: $u, user: (($who | fromjson?) // $who), body: .}' >> "$STUB_DIR/writes.jsonl"
 code=200; said='{"error":"stub refused"}'
 if [ -n "${STUB_REFUSE_STATUS:-}" ] && [ "$(printf '%s' "$b" | jq -r '.status? // ""')" = "$STUB_REFUSE_STATUS" ]; then code=409; fi
+case "$url" in *"${STUB_REFUSE_URL:-//never//}") code=403; said='{"error":"this step'"'"'s record is written by its declared writer"}' ;; esac
 if [ -n "${STUB_RACE_ONCE:-}" ] && [ "$m" = PUT ] && [ ! -e "$STUB_DIR/raced" ]; then
     : > "$STUB_DIR/raced"; code=409
     said=$(jq -cn --arg c "$STUB_RACE_ONCE" '{error: "the stub lost a step race", code: $c}')
@@ -682,6 +685,476 @@ fn a_refused_close_that_lost_the_step_race_is_sent_once_more() {
     );
 }
 
+// --------------------------------------------------------- nothing to do
+
+/// The plan `plan-wipe` renders when there is nothing to wipe, and the
+/// `nothing_to_do` it declares: the WHOLE plan, anchored at BOTH ends
+/// (`\A` … `\z`), so a line copied into a plan with work in it cannot
+/// match. It was anchored at its end alone until backlog aa816dd4 — the
+/// fixture taught the shape the README forbids.
+const NOTHING_PLAN: &str = "PLAN wipe target-a\nnothing to wipe\n";
+const NOTHING_TO_DO: &str = "\\APLAN wipe target-a\\nnothing to wipe\\n\\z";
+
+/// The job metadata key the runner sets and `ops-request.toml`'s
+/// `nothing-to-do` terminal waits on — read out of the runner, so the
+/// pin below holds the two copies equal (CLAUDE.md §9a).
+fn nothing_marker() -> String {
+    let runner = std::fs::read_to_string(repo_root().join("infra/ops/ops-runner.sh")).unwrap();
+    runner
+        .lines()
+        .find_map(|l| l.strip_prefix("NOTHING_TO_DO_MARKER="))
+        .map(|v| v.trim_matches('\'').to_string())
+        .expect("ops-runner.sh defines NOTHING_TO_DO_MARKER")
+}
+
+impl Fixture {
+    /// `plan-wipe` declares `nothing_to_do = re`; the plan it renders is
+    /// [`NOTHING_PLAN`] (written beside it) when the case asks for it
+    /// through `PLAN_OVERRIDE`.
+    fn declare_nothing_to_do(&self, re: &str) {
+        let path = self.verbs.join("plan-wipe.json");
+        let mut spec: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        spec["nothing_to_do"] = json!(re);
+        std::fs::write(&path, spec.to_string()).unwrap();
+        std::fs::write(self.root.join("nothing.txt"), NOTHING_PLAN).unwrap();
+    }
+
+    fn nothing_plan(&self) -> String {
+        self.root.join("nothing.txt").display().to_string()
+    }
+}
+
+/// A request on the ops-request version that carries the `nothing-to-do`
+/// terminal.
+fn with_nothing_terminal(mut j: Value) -> Value {
+    j["steps"].as_array_mut().unwrap().push(json!(
+        {"id": "s-nothing", "spec_slug": "nothing-to-do",
+         "title": "Nothing to do — the plan names no change",
+         "status": "pending", "metadata": {"outcome_kind": "skipped"}}
+    ));
+    j
+}
+
+/// A PLAN THAT NAMES NOTHING TO DO CLOSES ITS REQUEST AND ASKS NOBODY
+/// (backlog b2f78bb9, car 3 of 3df309bf). The machine files a remedy
+/// when a finding persists; a remedy that already ran leaves a plan with
+/// nothing in it, and that plan used to land on the approve step as a
+/// passkey prompt in front of David for a no-op. Now the plan verb says
+/// in its own file what its empty plan looks like, and a plan matching
+/// it closes the request through its declared `nothing-to-do` terminal,
+/// carrying the plan and everything it was rendered for — the record of
+/// why nobody was asked. The approve step is never written, and nothing
+/// runs.
+#[test]
+fn a_plan_that_names_nothing_to_do_closes_its_request_and_asks_nobody() {
+    needs_tools!();
+    let f = Fixture::new("nothing-to-do");
+    f.declare_nothing_to_do(NOTHING_TO_DO);
+    f.packet(with_nothing_terminal(job(
+        "ready",
+        approve_meta(None),
+        json!([]),
+        "pending",
+    )));
+    let (out, writes) = f.run(&[("PLAN_OVERRIDE", &f.nothing_plan())]);
+    assert!(f.applied().is_none(), "nothing runs: {out}");
+    assert!(
+        writes_to(&writes, "s-approve").is_empty(),
+        "no plan reaches the approve step, so no passkey is asked for: {writes:?}\n{out}"
+    );
+    let md = step_completion(&writes, "s-nothing", &out);
+    assert_eq!(
+        md["plan"], NOTHING_PLAN,
+        "the plan rides on the record: {md}"
+    );
+    assert_eq!(md["verb"], "wipe", "{md}");
+    assert_eq!(md["host"], "forge", "{md}");
+    assert_eq!(md["args"], json!(["target-a"]), "{md}");
+    assert_eq!(md["plan_verb"], "plan-wipe", "{md}");
+    assert_eq!(md["nothing_to_do"], NOTHING_TO_DO, "{md}");
+    assert_eq!(
+        md["rendered_plan_sha256"],
+        sha256_hex(NOTHING_PLAN.as_bytes()),
+        "{md}"
+    );
+    // The terminal waits on the job marker, which is written AFTER the
+    // step's keys (so the step is never ready without its record) and
+    // BEFORE its status (so the completion meets a ready step).
+    let marker = writes
+        .iter()
+        .position(|w| {
+            w["method"] == "PATCH"
+                && w["url"].as_str().is_some_and(|u| {
+                    u.ends_with("/api/jobs/aaaaaaaa-0000-4000-8000-000000000000/metadata")
+                })
+        })
+        .unwrap_or_else(|| panic!("the job marker was never written: {writes:?}\n{out}"));
+    assert_eq!(
+        writes[marker]["body"],
+        json!({ nothing_marker(): true }),
+        "{writes:?}"
+    );
+    let keys = writes
+        .iter()
+        .position(|w| {
+            w["method"] == "PATCH"
+                && w["url"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with("/steps/s-nothing/metadata"))
+        })
+        .unwrap();
+    let put = writes
+        .iter()
+        .position(|w| {
+            w["method"] == "PUT"
+                && w["url"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with("/steps/s-nothing"))
+        })
+        .unwrap();
+    assert!(keys < marker && marker < put, "{writes:?}");
+    assert!(out.contains("nothing to do"), "the journal says so: {out}");
+}
+
+/// A plan with work in it is rendered for the passkey exactly as before,
+/// whatever the plan verb declares.
+#[test]
+fn a_plan_with_work_in_it_still_waits_for_a_passkey() {
+    needs_tools!();
+    let f = Fixture::new("nothing-but-work");
+    f.declare_nothing_to_do(NOTHING_TO_DO);
+    f.packet(with_nothing_terminal(job(
+        "ready",
+        approve_meta(None),
+        json!([]),
+        "pending",
+    )));
+    let (out, writes) = f.run(&[]);
+    let patch = writes_to(&writes, "s-approve")
+        .into_iter()
+        .find(|w| w["method"] == "PATCH")
+        .unwrap_or_else(|| panic!("the plan was not rendered for approval: {writes:?}\n{out}"));
+    assert_eq!(patch["body"]["plan"], PLAN, "{patch}");
+    assert!(writes_to(&writes, "s-nothing").is_empty(), "{writes:?}");
+    assert!(
+        !writes.iter().any(|w| w["url"]
+            .as_str()
+            .is_some_and(|u| u.ends_with("-000000000000/metadata"))),
+        "no marker on a plan with work: {writes:?}"
+    );
+}
+
+/// A REQUEST FILED BEFORE THE TERMINAL EXISTED is pinned to the version
+/// it was admitted under, which has nowhere to record "nothing to do":
+/// its plan is rendered for the passkey as before, and the journal says
+/// why. Asking is the safe side — a no-op signed is a no-op run.
+#[test]
+fn a_request_pinned_before_the_terminal_is_rendered_for_a_passkey_as_before() {
+    needs_tools!();
+    let f = Fixture::new("nothing-pinned");
+    f.declare_nothing_to_do(NOTHING_TO_DO);
+    f.packet(job("ready", approve_meta(None), json!([]), "pending"));
+    let (out, writes) = f.run(&[("PLAN_OVERRIDE", &f.nothing_plan())]);
+    let patch = writes_to(&writes, "s-approve")
+        .into_iter()
+        .find(|w| w["method"] == "PATCH")
+        .unwrap_or_else(|| panic!("the plan was not rendered for approval: {writes:?}\n{out}"));
+    assert_eq!(patch["body"]["plan"], NOTHING_PLAN, "{patch}");
+    assert!(
+        out.contains("no nothing-to-do terminal"),
+        "the journal names why it asked: {out}"
+    );
+}
+
+/// A declaration that cannot be judged — a regex jq will not compile —
+/// asks: a guess that there is nothing to do would close a request
+/// nobody looked at.
+#[test]
+fn a_nothing_to_do_that_cannot_be_judged_asks_for_a_passkey() {
+    needs_tools!();
+    let f = Fixture::new("nothing-unjudged");
+    f.declare_nothing_to_do("(unclosed");
+    f.packet(with_nothing_terminal(job(
+        "ready",
+        approve_meta(None),
+        json!([]),
+        "pending",
+    )));
+    let (out, writes) = f.run(&[("PLAN_OVERRIDE", &f.nothing_plan())]);
+    assert!(
+        writes_to(&writes, "s-approve")
+            .iter()
+            .any(|w| w["method"] == "PATCH"),
+        "the plan was rendered for approval: {writes:?}\n{out}"
+    );
+    assert!(writes_to(&writes, "s-nothing").is_empty(), "{writes:?}");
+    assert!(out.contains("could not be judged"), "{out}");
+}
+
+/// THE PROTOCOL HALF, held to the runner (§9a): `ops-request.toml`
+/// declares the `nothing-to-do` terminal, gated on exactly the job key
+/// the runner writes, false on a fresh request (absent reads false), its
+/// record required at done — so a filer setting the marker by hand
+/// cannot close a request with no plan on it — and `skipped`, the
+/// outcome vocabulary's word for "not applicable here".
+#[test]
+fn the_nothing_to_do_terminal_waits_on_the_marker_the_runner_writes() {
+    let path = repo_root().join("infra/platform/workflows/ops-request.toml");
+    let doc: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let step = doc["workflow"][0]["step"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s.get("title").and_then(|t| t.as_str()) == Some("nothing-to-do"))
+        .expect("ops-request declares a nothing-to-do terminal")
+        .clone();
+    assert_eq!(step["kind"].as_str(), Some("outcome"));
+    assert_eq!(step["terminal"]["outcome"].as_str(), Some("nothing-to-do"));
+    assert_eq!(
+        step["metadata_defaults"]["outcome_kind"].as_str(),
+        Some("skipped")
+    );
+    let ready = step["ready_when"].as_str().unwrap();
+    assert!(
+        ready.contains(&format!("job.metadata.{}", nothing_marker())),
+        "the terminal waits on the runner's marker: {ready}"
+    );
+    let required: Vec<&str> = step["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["required"].as_bool() == Some(true))
+        .filter_map(|f| f["name"].as_str())
+        .collect();
+    for k in [
+        "plan",
+        "verb",
+        "host",
+        "args",
+        "rendered_plan_sha256",
+        "plan_verb",
+        "nothing_to_do",
+    ] {
+        assert!(
+            required.contains(&k),
+            "{k} is required at done: {required:?}"
+        );
+    }
+}
+
+/// ONLY THE RUNNER WRITES THE RECORD (backlog aa816dd4, LOW-1 of review
+/// ea2ecfd4), held to the runner (§9a): the `nothing-to-do` terminal
+/// declares `written_by` as exactly the account ops-runner.sh signs as
+/// when no unit overrides it, so the jobs API refuses the record from
+/// every other automation or agent session and admits the runner's.
+#[test]
+fn the_nothing_to_do_record_is_written_by_the_runners_account() {
+    let runner = std::fs::read_to_string(repo_root().join("infra/ops/ops-runner.sh")).unwrap();
+    let actor = runner
+        .lines()
+        .find_map(|l| l.strip_prefix("ACTOR=\"${BOSS_OPS_ACTOR:-"))
+        .and_then(|rest| rest.strip_suffix("}\""))
+        .expect("ops-runner.sh defines ACTOR=\"${BOSS_OPS_ACTOR:-<account>}\"");
+    let path = repo_root().join("infra/platform/workflows/ops-request.toml");
+    let doc: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let step = doc["workflow"][0]["step"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s.get("title").and_then(|t| t.as_str()) == Some("nothing-to-do"))
+        .expect("ops-request declares a nothing-to-do terminal")
+        .clone();
+    assert_eq!(
+        step["metadata_defaults"]["written_by"].as_str(),
+        Some(actor),
+        "the nothing-to-do record's declared writer is the runner's account"
+    );
+}
+
+/// A record write the jobs API refuses — a runner signing as another
+/// account than the step declares — is a doubt, and a doubt asks: the
+/// plan is rendered onto the approve step for a passkey, rather than
+/// the request waiting forever on a close it can never make.
+#[test]
+fn a_nothing_to_do_record_the_server_refuses_asks_for_a_passkey() {
+    needs_tools!();
+    let f = Fixture::new("nothing-refused");
+    f.declare_nothing_to_do(NOTHING_TO_DO);
+    f.packet(with_nothing_terminal(job(
+        "ready",
+        approve_meta(None),
+        json!([]),
+        "pending",
+    )));
+    let (out, writes) = f.run(&[
+        ("PLAN_OVERRIDE", &f.nothing_plan()),
+        ("STUB_REFUSE_URL", "/steps/s-nothing/metadata"),
+    ]);
+    let patch = writes_to(&writes, "s-approve")
+        .into_iter()
+        .find(|w| w["method"] == "PATCH")
+        .unwrap_or_else(|| panic!("the plan was not rendered for approval: {writes:?}\n{out}"));
+    assert_eq!(patch["body"]["plan"], NOTHING_PLAN, "{patch}");
+    assert!(
+        out.contains("could not record nothing to do"),
+        "the journal names the refusal: {out}"
+    );
+}
+
+/// The plans each shipped `nothing_to_do` declaration is held to: plans
+/// its verb renders that name NO change (must match) and plans that name
+/// work (must not). A verb that declares `nothing_to_do` and has no row
+/// here is a red gate — the README says every declaration is held to its
+/// verb's plans, and until backlog aa816dd4 only the one verb hard-coded
+/// below the loop was.
+///
+/// `plan-a-gcp-root-reclaim` names nothing to do when its plan is the
+/// journal line alone: no backup, capture or checkout to remove, and a
+/// journal the converge already caps at 256M (infra/gcp/journald-cap.conf),
+/// so the fixed vacuum to 1G changes nothing. The plan David signed on
+/// 2026-10-01 (ops-request f302d620, which removed /opt/boss-dev-bak) is
+/// work, and so is a plan that keeps a checkout: it is shown to a person.
+fn nothing_to_do_plans(verb: &str) -> Option<(Vec<String>, Vec<String>)> {
+    match verb {
+        "plan-a-gcp-root-reclaim" => {
+            let journal = "would vacuum the journal to 1G (journalctl --vacuum-size=1G)\n";
+            Some((
+                vec![journal.to_string()],
+                vec![
+                    format!(
+                        "would remove /opt/boss-dev-bak (536 MiB), holding:\n  .git\n  Cargo.toml\n{journal}"
+                    ),
+                    format!(
+                        "would keep /opt/boss-binbak-x — it holds a git checkout, and this verb removes only /opt/boss-dev-bak's (when its plan proves it holds nothing unpushed). Its unpushed state, against its own remote-tracking refs as of its last fetch:\n  checkout /opt/boss-binbak-x:\n{journal}"
+                    ),
+                    format!("{journal}{journal}"),
+                ],
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// THE SHIPPED DECLARATIONS, EVERY ONE (backlog aa816dd4, LOW-3 of
+/// review ea2ecfd4). Each `nothing_to_do` in the tree:
+/// - is a regex jq compiles;
+/// - sits on a verb some approval verb names as its plan verb —
+///   anywhere else nothing would read it;
+/// - is anchored to the WHOLE plan, `\A` first and `\z` last, as the
+///   README requires: a plan can quote text it read off the host, and a
+///   pattern free at either end lets that text close a request. Judged
+///   on the text AND on the behaviour, because `\Aa|b\z` starts and ends
+///   right and still matches a `b` anywhere: no nothing-plan matches
+///   with a byte added before it or after it;
+/// - is held to its verb's plans ([`nothing_to_do_plans`]): every
+///   nothing-plan matches and every plan with work in it does not.
+#[test]
+fn the_shipped_nothing_to_do_declarations_hold() {
+    needs_tools!();
+    let judge = |re: &str, plan: &str| -> String {
+        let out = Command::new("jq")
+            .args(["-rn", "--arg", "p", plan, "--arg", "re", re])
+            .arg("$p | test($re)")
+            .output()
+            .expect("jq runs");
+        assert!(
+            out.status.success(),
+            "jq could not judge {re:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let dir = repo_root().join("infra/ops/verbs");
+    let mut specs = std::collections::BTreeMap::new();
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.extension().is_some_and(|x| x == "json") {
+            let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+            specs.insert(p.file_stem().unwrap().to_string_lossy().into_owned(), v);
+        }
+    }
+    let plan_verbs: Vec<&str> = specs
+        .values()
+        .filter(|v| v["requires_approval"] == json!(true))
+        .filter_map(|v| v["plan_verb"].as_str())
+        .collect();
+    let mut declared = 0;
+    for (name, v) in &specs {
+        let Some(re) = v.get("nothing_to_do") else {
+            continue;
+        };
+        declared += 1;
+        let re = re
+            .as_str()
+            .unwrap_or_else(|| panic!("{name}: nothing_to_do is a regex string"));
+        assert!(
+            plan_verbs.contains(&name.as_str()),
+            "{name} declares nothing_to_do but no approval verb renders its plan with it"
+        );
+        judge(re, "");
+        assert!(
+            re.starts_with("\\A") && re.ends_with("\\z"),
+            "{name}'s nothing_to_do {re:?} is not anchored to the whole plan: it must open \
+             with \\A and close with \\z (infra/ops/verbs/README.md)"
+        );
+        let (nothing, work) = nothing_to_do_plans(name).unwrap_or_else(|| {
+            panic!(
+                "{name} declares nothing_to_do but nothing_to_do_plans holds no plans for it: \
+                 add the plans its verb renders with nothing in them and with work in them"
+            )
+        });
+        assert!(
+            !nothing.is_empty() && !work.is_empty(),
+            "{name}: hold it to at least one plan of each"
+        );
+        for p in &nothing {
+            assert_eq!(
+                judge(re, p),
+                "true",
+                "{name}: a plan with nothing in it: {p:?}"
+            );
+            for forged in [format!("x{p}"), format!("{p}x")] {
+                assert_eq!(
+                    judge(re, &forged),
+                    "false",
+                    "{name}: {re:?} matches with a byte outside the plan, so it is not \
+                     anchored to the whole plan: {forged:?}"
+                );
+            }
+        }
+        for p in &work {
+            assert_eq!(
+                judge(re, p),
+                "false",
+                "{name}: a plan with work in it: {p:?}"
+            );
+        }
+    }
+    assert!(declared > 0, "no plan verb declares nothing_to_do");
+}
+
+/// The anchoring check above is not vacuous: a pattern free at its
+/// start — the shape this file's own fixture had until aa816dd4 — is
+/// caught by the forged-prefix leg, and one free at its end by the
+/// forged-suffix leg.
+#[test]
+fn an_unanchored_nothing_to_do_matches_a_forged_plan() {
+    needs_tools!();
+    let judge = |re: &str, plan: &str| -> bool {
+        let out = Command::new("jq")
+            .args(["-rn", "--arg", "p", plan, "--arg", "re", re])
+            .arg("$p | test($re)")
+            .output()
+            .expect("jq runs");
+        String::from_utf8_lossy(&out.stdout).trim() == "true"
+    };
+    assert!(judge("\\nnothing to wipe\\n\\z", "x\nnothing to wipe\n"));
+    assert!(judge("\\Anothing to wipe\\n", "nothing to wipe\nx"));
+    assert!(!judge(NOTHING_TO_DO, &format!("x{NOTHING_PLAN}")));
+    assert!(!judge(NOTHING_TO_DO, &format!("{NOTHING_PLAN}x")));
+}
+
 /// An approval verb whose write cannot re-render and compare is
 /// refused before any plan exists: its last param must be a required
 /// `plan_sha256`, or an approval could outlive the state it approved.
@@ -752,10 +1225,21 @@ fn the_shipped_approval_verbs_hold_the_contract_and_the_disk_verb_reaches_its_pl
             .collect()
     };
     for (write, plan) in [
+        ("set-longhorn-drain-policy", "plan-a-longhorn-drain-policy"),
         ("reap-terminated-pods", "plan-a-pod-reap"),
         ("merge-tenant-main", "plan-a-tenant-merge"),
         ("reclaim-gcp-root", "plan-a-gcp-root-reclaim"),
+        ("move-volume-replica", "plan-a-volume-replica-move"),
         ("commission-a-disk", "plan-a-disk-commission"),
+        ("shutdown-node", "plan-a-node-shutdown"),
+        ("node-converge", "plan-a-node-converge"),
+        ("set-volume-replicas", "plan-a-volume-replica-change"),
+        ("retire-volume-replica", "plan-a-volume-replica-retirement"),
+        (
+            "expand-instance-volume",
+            "plan-an-instance-volume-expansion",
+        ),
+        ("retire-ops-runner", "plan-retire-ops-runner"),
     ] {
         let w = read(write);
         let p = read(plan);
@@ -883,11 +1367,11 @@ fn a_fresh_presence_approval_bound_to_the_plan_runs_the_write_once() {
 }
 
 /// THE MACHINE-FILED SHAPE (backlog 3df309bf). The dispatcher rule
-/// `file-reclaim-gcp-root-while-disk-tight-boss-gcp` files a request for a
-/// write whose ONLY param is `plan_sha256`, so it carries `args: []` —
-/// an empty list, since `jobs.spawn` lands a list literal whole — beside
-/// the keys every spawn stamps (`spawned_by_rule`, `triggered_by_*`) and
-/// its own `requested_by` and `remedies`. Every other case here files
+/// `file-the-remedy-a-verb-declares-for-an-estate-finding` (handler
+/// `ops.file_remedies`) files a request for a verb whose ONLY param is
+/// `plan_sha256` — the only shape it will file — so it carries `args: []`,
+/// an empty list, beside the keys every dispatcher filing stamps
+/// (`spawned_by_rule`, `triggered_by_*`) and the `remedies` it answers. Every other case here files
 /// `wipe target-a`, so the arg-count check (`args` must be an array of
 /// exactly params - 1) was never run at zero, and none carried the
 /// spawn's keys. Both halves, through the real runner: a ready approve
@@ -917,8 +1401,8 @@ fn a_machine_filed_request_with_no_args_renders_its_plan_and_runs_on_approval() 
         let mut j = job(approve_status, meta, sign_offs, exec);
         j["metadata"] = json!({
             "host": "forge", "verb": "reclaim", "args": [], "requires_approval": true,
-            "requested_by": "automation:dispatcher", "remedies": "disk_tight:forge",
-            "spawned_by_rule": "file-reclaim-gcp-root-while-disk-tight-boss-gcp",
+            "remedies": "disk_tight:forge",
+            "spawned_by_rule": "file-the-remedy-a-verb-declares-for-an-estate-finding",
             "triggered_by_event_id": "b7c2d05a-b23b-4a91-b537-03fc38160347",
             "triggered_by_topic": "jobs.estate.compared"
         });

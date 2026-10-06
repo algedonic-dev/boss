@@ -73,6 +73,26 @@ const READERS: &[Reader] = &[
         proof: "-H \"x-boss-user: $(sor_reader_header \"automation:$prefix\")\"",
     },
     Reader {
+        file: "infra/forge/cluster-node-lib.sh",
+        door: "its own curl, signed by sor_reader_header (infra/lib/sor.sh) as \
+               automation:<verb> at the read role — the node verbs cordon-node, node-status, \
+               shutdown-node and talos-get (backlog f0aaa72f), run against a file:// \
+               registry in node_maintenance_verbs_sh.rs",
+        proof_file: "infra/forge/cluster-node-lib.sh",
+        proof: "-H \"x-boss-user: $(sor_reader_header \"automation:$ME\")\" \\\n\
+                -w '\\n%{http_code}' \"$url\"",
+    },
+    Reader {
+        file: "infra/ops/retire-ops-runner.sh",
+        door: "its own curl for the other runners, signed by sor_reader_header \
+               (infra/lib/sor.sh) as automation:retire-ops-runner at the read role, beside \
+               node-roles.sh's read_node_roles for its own host — run against a stub curl \
+               that records the signer in retire_ops_runner_sh.rs (backlog 98eb9349)",
+        proof_file: "infra/ops/retire-ops-runner.sh",
+        proof: "-H \"x-boss-user: $(sor_reader_header \"automation:$ME\")\" \\\n\
+                \"${BOSS_ESTATE_NODES_URL:-$BASE/api/estate/nodes}\"",
+    },
+    Reader {
         file: "infra/estate/observe-units.sh",
         door: "hands the URL to node-roles.sh's read_node_roles in a bash child; it \
                never curls the registry itself",
@@ -267,9 +287,12 @@ fn derived_readers() -> BTreeSet<String> {
 /// ONE READER SHAPE (CLAUDE.md §9a; review of car 4e9e75e3). The shell
 /// spelling lives once, in infra/lib/sor-reader.sh — node-roles.sh (via
 /// sor.sh) and every lint (via infra/lint/lib/sor-read.sh) source it —
-/// but the Rust one, `boss-cli identity.rs reader_header`, which signs a
-/// recorded probe and an unnamed CLI read, cannot source a shell file.
-/// So the two are held equal here: every field but the id, by value.
+/// but the Rust one, `boss_core::roles::reader_header`, which signs a
+/// recorded probe and an unnamed CLI read and which every machine gate
+/// stamps on a probe-reader match (design b35c22b4), cannot source a
+/// shell file. So the two are held equal here, by value: the Rust one is
+/// CALLED, not read out of its source, since it moved to a crate this
+/// one depends on.
 #[test]
 fn a_read_of_the_record_signs_one_shape() {
     let root = repo_root();
@@ -283,38 +306,17 @@ fn a_read_of_the_record_signs_one_shape() {
         .unwrap_or_else(|e| panic!("sor_reader_header printed no JSON ({e}): {out:?}"));
     assert_eq!(shell["id"], "automation:pin", "{shell}");
 
-    // The Rust copy's fields, read from its json! literal.
-    let src = std::fs::read_to_string(root.join("crates/orchestrators/boss-cli/src/identity.rs"))
-        .expect("identity.rs");
-    let start = src
-        .find("pub(crate) fn reader_header(")
-        .expect("identity.rs no longer defines reader_header — re-derive this pin");
-    let body = &src[start..start + src[start..].find("\n}\n").expect("reader_header closes")];
-    let rust: serde_json::Map<String, serde_json::Value> = body
-        .lines()
-        .filter_map(|l| {
-            let (k, v) = l.trim().trim_end_matches(',').split_once(": ")?;
-            let k = k.strip_prefix('"')?.strip_suffix('"')?;
-            let v = match v {
-                "READER_ROLE" => serde_json::json!(boss_core::roles::AUDIT_READONLY_ROLE),
-                "id" => return None,
-                other => serde_json::from_str(other)
-                    .unwrap_or_else(|e| panic!("identity.rs reader_header: `{k}: {other}` ({e})")),
-            };
-            Some((k.to_string(), v))
-        })
-        .collect();
-    let mut shell_fields = shell.as_object().expect("an object").clone();
-    shell_fields.remove("id");
+    let rust: serde_json::Value =
+        serde_json::from_str(&boss_core::roles::reader_header("automation:pin"))
+            .expect("reader_header is JSON");
     assert!(
-        rust.len() >= 5,
-        "read too few fields from reader_header: {rust:?}"
+        rust.as_object().is_some_and(|o| o.len() >= 6),
+        "too few fields in reader_header: {rust}"
     );
     assert_eq!(
-        serde_json::Value::Object(shell_fields),
-        serde_json::Value::Object(rust),
-        "infra/lib/sor-reader.sh and boss-cli identity.rs reader_header sign different \
-         shapes — a machine read and a probe read must carry the same identity"
+        shell, rust,
+        "infra/lib/sor-reader.sh and boss_core::roles::reader_header sign different shapes — \
+         a machine read and a probe read must carry the same identity"
     );
 }
 

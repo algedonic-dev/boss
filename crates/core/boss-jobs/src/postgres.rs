@@ -7,8 +7,8 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use crate::port::{
-    Admission, AssignmentRow, JobFilter, JobScope, JobsError, JobsRepository, StepVersion,
-    spent_nonce,
+    Admission, AssignmentRow, DepartmentFilter, JobFilter, JobScope, JobsError, JobsRepository,
+    StepVersion, spent_nonce,
 };
 
 pub struct PgJobs {
@@ -929,13 +929,29 @@ impl JobsRepository for PgJobs {
     /// closed packet of the kind: `closed_on` is a DATE, so the
     /// admission instant then id break the tie the way `list_jobs`
     /// does, and the answer is deterministic on a busy day.
-    async fn newest_closed_job(&self, kind: &str) -> Result<Option<Job>, JobsError> {
+    ///
+    /// The department clause is the listing's (`DepartmentFilter::keeps`,
+    /// spelled as the same CASE `list_jobs` binds): the packet's own word
+    /// first, its kind's declaration only when it names none.
+    async fn newest_closed_job(
+        &self,
+        kind: &str,
+        department: Option<&DepartmentFilter>,
+    ) -> Result<Option<Job>, JobsError> {
         let row = sqlx::query_as::<_, JobRow>(
             "SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, opened_at, due_on, closed_on, metadata, tags, partition \
              FROM jobs WHERE kind = $1 AND status = 'closed' \
+               AND ($2::text IS NULL \
+                    OR CASE WHEN jsonb_typeof(metadata->'department') = 'string' \
+                                 AND metadata->>'department' <> '' \
+                            THEN metadata->>'department' = $2 \
+                            ELSE kind = ANY($3::text[]) \
+                       END) \
              ORDER BY closed_on DESC NULLS LAST, opened_on DESC, created_at DESC, id LIMIT 1",
         )
         .bind(kind)
+        .bind(department.map(|d| d.code.as_str()))
+        .bind(department.map(|d| d.declaring_kinds.as_slice()))
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
@@ -1787,6 +1803,11 @@ impl JobsRepository for PgJobs {
               -- packet (backlog 74569e94: the top board's outranks read
               -- was its first caller).
               AND ($19::text IS NULL OR priority = $19)
+              -- $20 is live (false) or terminal (true), ANDed with the
+              -- window above: `terminal = true` plus $13 is the
+              -- window's departures alone (backlog a22311a1).
+              AND ($20::bool IS NULL
+                   OR (status IN ('closed', 'cancelled')) = $20)
               -- opened_on is a DATE: a busy day is one big tie, and a
               -- LIMIT over an arbitrary order returns an arbitrary
               -- subset (2026-09-07 held 398 closed pr-trains; the
@@ -1818,6 +1839,7 @@ impl JobsRepository for PgJobs {
             .bind(department_code)
             .bind(department_kinds)
             .bind(filter.priority.map(priority_str))
+            .bind(filter.terminal)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
@@ -1872,6 +1894,10 @@ impl JobsRepository for PgJobs {
               -- Same priority clause as the list query, for the same
               -- reason.
               AND ($17::text IS NULL OR priority = $17)
+              -- Same live-or-terminal clause as the list query, for
+              -- the same reason.
+              AND ($18::bool IS NULL
+                   OR (status IN ('closed', 'cancelled')) = $18)
             "#,
         )
         .bind(filter.kind.as_deref())
@@ -1891,6 +1917,7 @@ impl JobsRepository for PgJobs {
         .bind(department_code)
         .bind(department_kinds)
         .bind(filter.priority.map(priority_str))
+        .bind(filter.terminal)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;

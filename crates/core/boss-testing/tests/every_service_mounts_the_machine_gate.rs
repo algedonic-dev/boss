@@ -41,16 +41,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Servers that deliberately do NOT mount the gate, each with the
-/// reason. A stale row (the file no longer serves) fails the pin too.
-const UNGATED: &[(&str, &str, &str)] = &[(
-    "crates/core/boss-gateway/src/main.rs",
-    "gateway",
-    "the edge, not a machine door: its first act on every request is the edge strip \
-     (role_headers.rs strip_boss_headers), which removes every inbound x-boss-* header \
-     INCLUDING x-boss-machine-token, so it trusts no asserted identity and a gate on it \
-     could only ever refuse the browsers it exists to serve. The gateway's side of the \
-     design is stamping the token on what it forwards (car 2).",
-)];
+/// reason — ONE definition in `boss_core::machine_gate`, which the
+/// credential broker's rotation roster reads too, so a port this pin
+/// excuses is never counted as a gate that must accept a token (review
+/// 70d449f9 of car 3, B1). A stale row (the file no longer serves) fails
+/// the pin too.
+use boss_core::machine_gate::UNGATED;
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -200,7 +196,7 @@ fn every_server_outside_a_test_mounts_the_machine_gate() {
             continue;
         }
         servers += 1;
-        if UNGATED.iter().any(|(p, _, _)| *p == rel) {
+        if UNGATED.iter().any(|u| u.file == rel) {
             ungated_seen.push(rel);
             continue;
         }
@@ -226,7 +222,7 @@ fn every_server_outside_a_test_mounts_the_machine_gate() {
          or add the file to UNGATED with the reason:\n  {}",
         offenders.join("\n  ")
     );
-    for (p, _, _) in UNGATED {
+    for p in UNGATED.iter().map(|u| u.file) {
         assert!(
             ungated_seen.iter().any(|s| s == p),
             "UNGATED names {p}, which no longer serves HTTP outside its tests — delete the row"
@@ -306,6 +302,110 @@ fn a_cfg_test_module_declaration_does_not_end_the_production_part() {
     assert_eq!(prod.matches("axum::serve(").count(), 1, "{prod}");
     assert!(!prod.contains("mod tests"), "{prod}");
     assert_eq!(production_part("fn main() {}\n"), "fn main() {}\n");
+}
+
+/// The gated servers that hand their gate NO recorder, each with why:
+/// what they tally reaches no log, so a clean window that names them is
+/// never clean (design 21946380 point 7). Every other mount passes one.
+const NO_RECORDER: [(&str, &str); 2] = [
+    (
+        "sim-control",
+        "the brewery engine's control server holds no database, so it has no outbox",
+    ),
+    (
+        "simulator",
+        "the /simulator UX server holds no database, so it has no outbox",
+    ),
+];
+
+/// Every gated server states what it would refuse on the LOG (design
+/// 21946380, backlog b0787727): its mount's recorder is a value, or the
+/// server is named in [`NO_RECORDER`] with the reason. A mount added
+/// with `None` and no reason is a service whose clean window can never
+/// be read — the hole this pin exists to name before an enforce flip
+/// finds it. A stale row (the mount now records) fails too.
+#[test]
+fn every_mount_states_its_facts_on_the_log_or_says_why_not() {
+    let root = repo_root();
+    let none = Regex::new(
+        r#"machine_gate::mount\(\s*[^,"]+?\s*,\s*"([^"]+)"\s*,\s*&\[[^\]]*\]\s*,\s*None\s*,?\s*\)"#,
+    )
+    .unwrap();
+    let mut files = Vec::new();
+    walk(&root.join("crates"), &mut files);
+    let tests = test_only_modules(&files);
+    let mut unrecorded: Vec<String> = files
+        .iter()
+        .filter(|f| !is_test_file(&tests, f))
+        .flat_map(|f| {
+            let text = std::fs::read_to_string(f).unwrap_or_default();
+            none.captures_iter(production_part(&text))
+                .map(|c| c[1].to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    unrecorded.sort();
+    let mut excused: Vec<String> = NO_RECORDER.iter().map(|(s, _)| s.to_string()).collect();
+    excused.sort();
+    assert_eq!(
+        unrecorded, excused,
+        "a machine gate mounted with no recorder states nothing on the log, so its service's \
+         clean window can never be read (design 21946380). Pass the outbox recorder of the \
+         binary's pool (`boss_events::outbox`), or name the service in NO_RECORDER with the \
+         reason"
+    );
+    // A control: the scan sees the mounts it judges.
+    assert!(mounts(&root).len() >= 25);
+}
+
+/// The gate's evidence owns SIGTERM in every binary that records it
+/// (`boss_core::gate_evidence`): it drains, states the process's end and
+/// exits, because registering a listener replaces the signal's default
+/// for the whole process. A gated crate that registered its own SIGTERM
+/// shutdown would be cut short by that exit within milliseconds, in
+/// silence (review c49cb4e1, S2) — so it is refused here, naming the
+/// module to change first. No gated crate does today: jobs, assets and
+/// ledger shut down on SIGINT.
+#[test]
+fn a_gated_binary_does_not_listen_for_sigterm() {
+    let root = repo_root();
+    let sigterm = Regex::new(r"SignalKind::terminate\b|\bSIGTERM\b\s*[,)]").unwrap();
+    // The control: the one owner is seen by the same pattern.
+    let owner = std::fs::read_to_string(root.join("crates/core/boss-core/src/gate_evidence.rs"))
+        .expect("gate_evidence.rs is readable");
+    assert!(
+        sigterm.is_match(&owner),
+        "the scan cannot see the evidence's own listener"
+    );
+    let crates: std::collections::BTreeSet<PathBuf> = mounts(&root)
+        .values()
+        .map(|(file, _)| Path::new(file).components().take(3).collect::<PathBuf>())
+        .collect();
+    assert!(
+        crates.len() >= 20,
+        "found only {} gated crates",
+        crates.len()
+    );
+    let mut offenders = Vec::new();
+    for dir in &crates {
+        let mut files = Vec::new();
+        walk(&root.join(dir).join("src"), &mut files);
+        let tests = test_only_modules(&files);
+        for f in files.iter().filter(|f| !is_test_file(&tests, f)) {
+            let text = std::fs::read_to_string(f).unwrap_or_default();
+            if sigterm.is_match(production_part(&text)) {
+                offenders.push(f.strip_prefix(&root).unwrap().display().to_string());
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a gated crate registers its own SIGTERM, which boss_core::gate_evidence already owns \
+         and exits on once its end is stated — the crate's shutdown would be cut short in \
+         silence. Make the end something this binary awaits from its own shutdown path in \
+         gate_evidence first (review c49cb4e1, S2):\n  {}",
+        offenders.join("\n  ")
+    );
 }
 
 #[test]
@@ -429,7 +529,7 @@ fn every_probe_and_the_watchdog_read_are_exempt_where_they_land() {
 
     let mut missing = Vec::new();
     for (svc, path, from) in needs {
-        if UNGATED.iter().any(|(_, s, _)| *s == svc) {
+        if UNGATED.iter().any(|u| u.service == svc) {
             continue;
         }
         match m.get(&svc) {

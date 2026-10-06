@@ -1,0 +1,10 @@
+[
+  {
+    "namespace": "boss",
+    "claim": "boss-backups",
+    "workflow": "maintenance-backup",
+    "step": "run",
+    "cronjob": "boss-pg-backup",
+    "actor": "automation:boss-step"
+  }
+]

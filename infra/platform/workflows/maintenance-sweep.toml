@@ -65,6 +65,7 @@ label = "Maintenance sweep"
 category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
+metadata = { department = "it" }
 description = "A recurring inspection of one piece of infrastructure, admitted on a cadence rather than remembered. Forks on what the inspection finds: remediate when it must change, clear when it need not — and a remediation says whether it was discharged here (operational) or needs a change to the tree (code-change), which is what decides whether a delivery packet is owed. Either way the log carries the measurement, so a threshold trend is a query instead of someone's recollection."
 
 [[workflow.step]]

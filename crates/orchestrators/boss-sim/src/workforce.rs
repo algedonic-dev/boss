@@ -207,7 +207,7 @@ struct ClockNowResp {
 /// The sim-as-workforce executor. Holds no job/step state — every
 /// decision reads the live system.
 pub struct Workforce {
-    client: reqwest::blocking::Client,
+    client: boss_core::machine_token::BlockingClient,
     api_base: String,
     /// StepType kind → typical duration hours, sourced from the
     /// StepRegistry. Drives the duration-gated completion — as the
@@ -258,10 +258,18 @@ impl Workforce {
     /// `durations` maps StepType kind → typical_duration_hours;
     /// `required_fields` maps StepType kind → its required-at-done fields
     /// (so the worker can fill any the Workflow didn't default).
+    /// `token` is the machine-token source every request is stamped
+    /// from (design 6805c764 car 2, the blocking-senders slice,
+    /// 2026-09-29; until then the workforce's claims and completions
+    /// carried no token): the daemon passes
+    /// `boss_core::machine_token::shared()`, a test a
+    /// `Source::fixed(None)` — never the process's live value (backlog
+    /// 2ee29275, F2).
     pub fn new(
         api_base: &str,
         durations: HashMap<String, f64>,
         required_fields: HashMap<String, Vec<RequiredField>>,
+        token: std::sync::Arc<boss_core::machine_token::Source>,
     ) -> Self {
         // Same actor identity as LiveApiOutput: id=system, role=
         // system-sim, plus x-sim-origin so the receiving services'
@@ -284,11 +292,14 @@ impl Workforce {
             "x-sim-origin",
             reqwest::header::HeaderValue::from_static("true"),
         );
-        let client = reqwest::blocking::Client::builder()
-            .default_headers(headers)
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("HTTP client");
+        // Stamps the token per request and follows no redirect.
+        let client = boss_core::machine_token::BlockingClient::build_with_source(
+            reqwest::blocking::Client::builder()
+                .default_headers(headers)
+                .timeout(std::time::Duration::from_secs(30)),
+            token,
+        )
+        .expect("HTTP client");
         Self {
             client,
             api_base: api_base.to_string(),
@@ -1297,6 +1308,14 @@ mod tests {
 
     use serde_json::json;
 
+    /// The machine-token source every test Workforce stamps from: FIXED
+    /// and empty, never the process's live one, so a failing test's
+    /// captured request cannot carry a mounted Secret into a gate log
+    /// (backlog 2ee29275, F2).
+    fn no_token() -> std::sync::Arc<boss_core::machine_token::Source> {
+        std::sync::Arc::new(boss_core::machine_token::Source::fixed(None))
+    }
+
     /// A Workforce whose kind-default map says `task` takes 8h, with a
     /// primed spec-duration cache (no HTTP in tests — a cached
     /// (workflow, version) entry short-circuits the registry fetch).
@@ -1305,6 +1324,7 @@ mod tests {
             "http://127.0.0.1:9", // never dialed: the cache is primed
             HashMap::from([("task".to_string(), 8.0)]),
             HashMap::new(),
+            no_token(),
         );
         wf.spec_durations
             .lock()
@@ -1502,9 +1522,14 @@ mod tests {
             ("emp-3".to_string(), "shipping-clerk".to_string()),
             ("emp-admin".to_string(), "platform-admin".to_string()),
         ]);
-        let wf = Workforce::new("http://127.0.0.1:9", HashMap::new(), HashMap::new())
-            .with_actor_telemetry(crate::api_activity::new_handle(), emp_roles)
-            .with_excluded_assignees(["emp-admin".to_string()]);
+        let wf = Workforce::new(
+            "http://127.0.0.1:9",
+            HashMap::new(),
+            HashMap::new(),
+            no_token(),
+        )
+        .with_actor_telemetry(crate::api_activity::new_handle(), emp_roles)
+        .with_excluded_assignees(["emp-admin".to_string()]);
 
         // Before any completion: both simulatable roles are dormant and
         // platform-admin reads operator — never dormant.
@@ -1726,7 +1751,7 @@ mod tests {
                 },
             ],
         );
-        let wf = Workforce::new("direct://127.0.0.1", HashMap::new(), req);
+        let wf = Workforce::new("direct://127.0.0.1", HashMap::new(), req, no_token());
         let now = fixed_now();
 
         let mut md = serde_json::Map::new();
@@ -1818,6 +1843,7 @@ mod tests {
             &base,
             HashMap::from([("task".to_string(), 0.0)]),
             HashMap::new(),
+            no_token(),
         );
         let row = json!({
             "job_id": "job-1",
@@ -1871,6 +1897,7 @@ mod tests {
             &base,
             HashMap::from([("task".to_string(), 4.0)]),
             HashMap::new(),
+            no_token(),
         );
         let row = json!({
             "job_id": "job-3",
@@ -1929,7 +1956,7 @@ mod tests {
     #[test]
     fn a_sign_off_completion_merges_its_fields_then_stamps_then_flips() {
         let (base, log, _) = recording_api();
-        let wf = Workforce::new(&base, HashMap::new(), HashMap::new());
+        let wf = Workforce::new(&base, HashMap::new(), HashMap::new(), no_token());
         let row = json!({
             "job_id": "job-2",
             "step": { "id": "step-2", "kind": "task", "status": "active",

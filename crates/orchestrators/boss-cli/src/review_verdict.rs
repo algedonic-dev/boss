@@ -37,12 +37,45 @@
 //! is read off the record rather than re-derived. It is not re-checked:
 //! design 6af5acdf (2026-09-26) made the train gate the backstop.
 //!
-//! NOT HERE. Refusing a release by the actor that built the car, and a
-//! human's own-review road through his passkey session, are design
-//! 7cedfa29 Q1 — car 3, sequenced behind DR readiness 62dac114. The
-//! per-field `writer` declaration for `hold`, `hold_sha` and `release`
-//! (D7) waits on a credential door: `field_writer::RESOLVABLE_PRINCIPALS`
-//! is empty, and the viability lint refuses a writer no door resolves.
+//! THE BUILDER DOES NOT RELEASE EITHER (car 3, design 7cedfa29 Q1,
+//! enforcement order design b08725c2 row A, after DR readiness
+//! 62dac114): `boss release`, in both its forms, refuses a shell whose
+//! `BOSS_AGENT_RUN` is the car's builder run ([`may_release`]), or is
+//! not a full run id. The refusal binds runs, never a person: a shell
+//! with no run is not refused, so the three-verb human road in `boss
+//! release --help` stands, and a person who gated the car inside a run
+//! of his own releases from a shell without it.
+//!
+//! WHAT A RELEASE RECORDS OF ITS SHELL, AND WHAT IT CANNOT (reviews
+//! 5aa91689 B1, c91ba45b B1'). Every release — the review's (`release`)
+//! and the bare one ([`BARE_RELEASE`]) — carries `agent_shell`
+//! (CLAUDECODE set) and, when one is exported, `run`, beside `by`
+//! ([`Releaser`]). So the record DISTINGUISHES an agent's shell from a
+//! person's, and names the run when there is one. It does NOT
+//! distinguish a dispatched builder from the operator session: a builder
+//! exports its run only in the one shell it gates from, so its later
+//! shells have none, and in the dev pod every agent shell — the
+//! operator's included — is a child of one process carrying the same
+//! session markers (measured 2026-09-30: the operator's shell reads
+//! CLAUDE_CODE_CHILD_SESSION=1 and the same CLAUDE_CODE_SESSION_ID as
+//! the subagents'). No field built on those markers is recorded, because
+//! it could not mean what its name says. Every field here is what the
+//! shell SAYS; a shell that unsets CLAUDECODE is recorded as a person's.
+//! The real fix is per-actor credentials (design 7cedfa29 D7).
+//!
+//! WHAT HOLDS REGARDLESS: a review-held car is released only on a
+//! RELEASE verdict recorded by a run that is not the builder's — `boss
+//! review` refuses the builder's run, and [`vouches`] refuses a verdict
+//! the builder's run recorded — so a builder's self-release can only act
+//! on another run's verdict at the car's current head.
+//!
+//! NOT HERE. A human's own-review road through his passkey session (the
+//! rest of Q1) is unbuilt. No server-side writer refuses the builder:
+//! the merge door cannot know which run a caller is, and the per-field
+//! `writer` declaration for `hold`, `hold_sha` and `release` (D7) waits
+//! on a credential door — `field_writer::RESOLVABLE_PRINCIPALS` is
+//! empty, and the viability lint refuses a writer no door resolves. The
+//! conductor does not read the shell fields at boarding.
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -99,6 +132,31 @@ pub(crate) fn vouches(run: &Value, car: &Value, head: &str) -> Result<(), String
             short(run_id)
         ));
     }
+    // A DISPATCHED run names the packet and step it claimed (`boss
+    // dispatch` writes both). Held to them, a run opened on car A's
+    // review cannot vouch for car B (review 0545d1b1, 2026-09-30). A
+    // hand-filed run names none, and is judged as before.
+    let opened_on = str_at(run, "/metadata/packet");
+    if !opened_on.is_empty() {
+        if opened_on != car_id {
+            return Err(format!(
+                "run {} was opened on {}, not on car {} — a reviewer vouches only for the \
+                 car it was dispatched to",
+                short(run_id),
+                short(opened_on),
+                short(car_id)
+            ));
+        }
+        let step = str_at(run, "/metadata/step");
+        if step != boss_jobs::car::REVIEW_SLUG {
+            return Err(format!(
+                "run {} was opened on step `{step}` of car {}, not on its `{}` step",
+                short(run_id),
+                short(car_id),
+                boss_jobs::car::REVIEW_SLUG
+            ));
+        }
+    }
     let Some(review) = run
         .pointer(&format!("/metadata/{REVIEW_KEY}"))
         .filter(|r| r.is_object())
@@ -137,6 +195,130 @@ pub(crate) fn vouches(run: &Value, car: &Value, head: &str) -> Result<(), String
         ));
     }
     Ok(())
+}
+
+/// The review-step key a BARE release records itself under: `{hold, by,
+/// at, agent_shell, run?}` — what was lifted, and who and what kind of
+/// shell lifted it (review 5aa91689 N2). One record: the next bare
+/// release overwrites it, and earlier ones survive in the audit log's
+/// PATCH events. Not `boss_jobs::car::RELEASE`: the conductor reads that
+/// key as a review's release and checks the review it names, and a bare
+/// release names none — nor may it overwrite one a review gave.
+pub(crate) const BARE_RELEASE: &str = "hold_released";
+
+/// The shell a release is given from, as its environment says: the run
+/// it is (`BOSS_AGENT_RUN`), and whether it is an agent's shell at all
+/// (`CLAUDECODE`). That tells an agent's shell from a person's; it does
+/// NOT tell a dispatched builder from the operator session, whose shells
+/// share one process's markers in the dev pod (review c91ba45b, measured
+/// 2026-09-30) — so none of those markers is recorded. Recorded, not
+/// trusted: a shell can unset either, which is the forgeability design
+/// 7cedfa29 D7 leaves until per-actor credentials land.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Releaser {
+    /// `BOSS_AGENT_RUN`, when set and not blank.
+    pub run: Option<String>,
+    /// `CLAUDECODE` is set and not blank: an agent's (Claude Code) shell.
+    pub agent_shell: bool,
+}
+
+impl Releaser {
+    /// The shell this process runs in.
+    pub(crate) fn from_env() -> Self {
+        Self::from_vars(|k| std::env::var(k).ok())
+    }
+
+    /// PURE: a shell read through `get`, so a test hands in its own.
+    pub(crate) fn from_vars(get: impl Fn(&str) -> Option<String>) -> Self {
+        let set = |k: &str| {
+            get(k)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        Self {
+            run: set(crate::gate::AGENT_RUN_ENV),
+            agent_shell: set("CLAUDECODE").is_some(),
+        }
+    }
+
+    /// The run this shell is, if any.
+    pub(crate) fn run(&self) -> Option<&str> {
+        self.run.as_deref()
+    }
+
+    /// What every release records of its shell: `agent_shell` always,
+    /// `run` when set.
+    pub(crate) fn provenance(&self) -> Value {
+        let mut out = serde_json::Map::new();
+        if let Some(run) = self.run() {
+            out.insert("run".into(), json!(run));
+        }
+        out.insert("agent_shell".into(), json!(self.agent_shell));
+        Value::Object(out)
+    }
+}
+
+/// The record a bare release writes ([`BARE_RELEASE`]).
+pub(crate) fn bare_release_record(hold: &str, by: &str, at: &str, releaser: &Releaser) -> Value {
+    let mut rec = releaser.provenance();
+    rec["hold"] = json!(hold);
+    rec["by"] = json!(by);
+    rec["at"] = json!(at);
+    rec
+}
+
+/// PURE: may the run this shell is (`releaser`, its `BOSS_AGENT_RUN`)
+/// release `car`? Refused when it is not a full run id — the record
+/// carries the id that was checked, never whatever the variable held
+/// (review 5aa91689 N5) — and when it is the car's builder run
+/// (backlog b7b02024 car 3, design 7cedfa29 Q1, design b08725c2 row A).
+///
+/// THE BUILDER RUN is the car's `agent_run`: the run the gate that filed
+/// the car stamped, re-stamped by every later green that carries a run
+/// (the auto-park refresh). A green with NO run — a gate launched by
+/// hand, or the dock's own replay — keeps the one before, so after a
+/// hand repair the refusal still binds the run that built the car, not
+/// the repairer (review 5aa91689 N1: fails open, locks no one out).
+///
+/// No run in the shell, another run, or a car with no builder run is
+/// not refused: the refusal binds agent runs, never a person, and a
+/// person's road is the release from a shell that is not the builder
+/// run. The error is the whole refusal — the car, the run and that road
+/// — because a refusal that leaves its reader to find the way round is
+/// a dead end at the wrong moment.
+pub(crate) fn may_release(car: &Value, releaser: Option<&str>) -> Result<(), String> {
+    let env = crate::gate::AGENT_RUN_ENV;
+    let id = str_at(car, "/id");
+    let branch = str_at(car, "/metadata/branch");
+    let target = if branch.is_empty() { short(id) } else { branch };
+    let Some(run) = releaser.map(str::trim).filter(|r| !r.is_empty()) else {
+        return Ok(());
+    };
+    if !crate::job::looks_like_uuid(run) {
+        return Err(format!(
+            "boss release: REFUSED — {env}={run:?} is not a full run id (36 characters, \
+             8-4-4-4-12), and a release records the run that gave it. Nothing was written. \
+             Export the run's full id, or release from a shell that is no run: `env -u {env} \
+             boss release {target} …`."
+        ));
+    }
+    let Some(builder) = builder_run(car) else {
+        return Ok(());
+    };
+    if !run.eq_ignore_ascii_case(builder) {
+        return Ok(());
+    }
+    Err(format!(
+        "boss release: REFUSED — this shell is run {builder} ({env}), the run that built car \
+         {} {branch} (the car's agent_run, stamped by the green that filed or last refreshed \
+         it), and the run that built a car does not release it (backlog b7b02024 car 3). \
+         Nothing was written; the car stays held. The road around it: any other actor \
+         releases it on its review, from a shell that is not this run — `boss release \
+         {target} --review <the reviewer's run, full id>`, the three verbs `boss release \
+         --help` names. A person who gated the car inside a run of his own releases from a \
+         shell without it: `env -u {env} boss release {target} --review <run>`.",
+        short(id)
+    ))
 }
 
 /// The review a reviewer's run records ([`REVIEW_KEY`]).
@@ -322,10 +504,14 @@ pub(crate) async fn record(
 
 /// `boss release <car> --review <run>`: release the car on a review
 /// verdict of RELEASE at its current forge head, recording the release.
+/// `releaser` is the shell it is given from: the car's builder run is
+/// refused ([`may_release`]) before anything is read from the forge or
+/// written, and the shell's [`Releaser::provenance`] rides on the record.
 pub(crate) async fn release(
     wire: &Wire,
     car: &str,
     review: &str,
+    releaser: &Releaser,
     forge: impl Fn(&str) -> Result<String>,
 ) -> Result<()> {
     if !crate::job::looks_like_uuid(review) {
@@ -336,6 +522,7 @@ pub(crate) async fn release(
     }
     let packet = wire.car(car).await?;
     let step = crate::steps::holdable(&packet).map_err(|e| anyhow!("{e}"))?;
+    may_release(&packet, releaser.run()).map_err(|why| anyhow!("{why}"))?;
     let branch = branch_of(&packet)?;
     let head = forge(&format!("refs/heads/{branch}"))?;
     let main = forge("refs/heads/main")?;
@@ -345,7 +532,13 @@ pub(crate) async fn release(
         .caller_id()
         .context("an unnamed release is refused before it is sent")?;
     let at = crate::gate::stamp(boss_clock_client::wall_now());
-    let rec = release_record(&head, review, by, &at, &main);
+    // Which run and which shell released it, beside `by`: every agent
+    // signs as agent-claude, so the actor alone cannot say (car 3,
+    // review 5aa91689 B1).
+    let mut rec = release_record(&head, review, by, &at, &main);
+    if let (Some(fields), Value::Object(shell)) = (rec.as_object_mut(), releaser.provenance()) {
+        fields.extend(shell);
+    }
     let jid = str_at(&packet, "/id");
     let sid = str_at(step, "/id");
     wire.call(
@@ -425,6 +618,137 @@ mod tests {
         let mut gate = run(REVIEWER, release_at(H1));
         gate["kind"] = json!("gate-run");
         refused(gate, H1, "not an agent-run");
+    }
+
+    /// A DISPATCHED REVIEWER VOUCHES ONLY FOR THE CAR IT WAS OPENED ON
+    /// (review 0545d1b1 of car bc9ef34f, 2026-09-30). `boss dispatch`
+    /// files a reviewer run naming the packet and step it claimed
+    /// (`metadata.packet`, `metadata.step`). Its recorded review names a
+    /// car too, and nothing held the two equal: a run opened on car A's
+    /// review could record a verdict on car B, and car B's release would
+    /// accept it. A run that names a packet is held to it — the car, at
+    /// its `review` step. A run that names none (the three-verb human
+    /// road, `boss job file --kind agent-run`) is judged as before.
+    #[test]
+    fn a_dispatched_review_vouches_only_for_the_car_it_was_opened_on() {
+        let opened_on = |packet: &str, step: &str| {
+            let mut r = run(REVIEWER, release_at(H1));
+            r["metadata"]["packet"] = json!(packet);
+            r["metadata"]["step"] = json!(step);
+            r
+        };
+        assert_eq!(vouches(&opened_on(CAR, "review"), &car(), H1), Ok(()));
+        let why = vouches(
+            &opened_on("0ther000-0000-4000-8000-000000000000", "review"),
+            &car(),
+            H1,
+        )
+        .expect_err("a run opened on another car");
+        assert!(why.contains("opened on 0ther000"), "{why}");
+        let why = vouches(&opened_on(CAR, "build"), &car(), H1)
+            .expect_err("a run opened on another step");
+        assert!(why.contains("`build`"), "{why}");
+        // No packet named: the hand-filed road is untouched.
+        assert_eq!(vouches(&run(REVIEWER, release_at(H1)), &car(), H1), Ok(()));
+    }
+
+    /// Car 3 (design b08725c2 row A): the RELEASER is judged too, not
+    /// only the review it names. The run that gated the car's head is
+    /// refused, the refusal names the car, that run and the road around
+    /// it; every other shell — another run, or none (a person with no
+    /// agent running) — is not.
+    #[test]
+    fn the_run_that_gated_the_car_does_not_release_it() {
+        let why = may_release(&car(), Some(BUILDER)).expect_err("the builder releasing");
+        for want in [
+            "REFUSED",
+            "c0ffee00",
+            "feat/x",
+            BUILDER,
+            "boss release feat/x --review",
+            "env -u BOSS_AGENT_RUN",
+        ] {
+            assert!(why.contains(want), "{want} in {why}");
+        }
+        // Spelled with stray case or space, it is still that run.
+        assert!(may_release(&car(), Some(" B0B0B0B0-0000-4000-8000-000000000000 ")).is_err());
+        assert_eq!(may_release(&car(), Some(REVIEWER)), Ok(()));
+        assert_eq!(may_release(&car(), None), Ok(()));
+        assert_eq!(may_release(&car(), Some("  ")), Ok(()));
+        // A car gated with no run (a person, by hand) has no builder
+        // run to refuse: whoever releases it is judged on the review.
+        let mut by_hand = car();
+        by_hand["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("agent_run");
+        assert_eq!(may_release(&by_hand, Some(BUILDER)), Ok(()));
+        // A padded agent_run on a hand-edited car is still that run
+        // (review 5aa91689 N4): both sides are trimmed.
+        let mut padded = car();
+        padded["metadata"]["agent_run"] = json!(format!("  {BUILDER} "));
+        assert!(may_release(&padded, Some(BUILDER)).is_err());
+    }
+
+    /// A run that is not a full id is refused before anything is
+    /// written, naming the shape (review 5aa91689 N5): the record carries
+    /// the id that was checked, never whatever the variable held.
+    #[test]
+    fn a_releasing_run_that_is_not_a_full_id_is_refused_by_its_shape() {
+        for typo in [
+            "b0b0b0b0",
+            "not-a-run",
+            "b0b0b0b0-0000-4000-8000-00000000000",
+        ] {
+            let why = may_release(&car(), Some(typo)).expect_err(typo);
+            assert!(why.contains("not a full run id"), "{why}");
+            assert!(why.contains("env -u BOSS_AGENT_RUN"), "{why}");
+        }
+    }
+
+    /// What a release records of its shell (reviews 5aa91689 B1 and
+    /// c91ba45b B1'): `agent_shell` — an agent's shell or a person's —
+    /// and `run` when one is exported. NOTHING that claims to tell a
+    /// dispatched builder from the operator session: in the dev pod every
+    /// agent shell, the operator's included, is a child of one process
+    /// and carries the same CLAUDE_CODE_CHILD_SESSION=1 and session id
+    /// (measured 2026-09-30), so no field built on them is recorded.
+    #[test]
+    fn a_releasers_provenance_is_read_from_its_shell() {
+        let shell = |vars: &'static [(&'static str, &'static str)]| {
+            Releaser::from_vars(|k| {
+                vars.iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| v.to_string())
+            })
+        };
+        let agent = shell(&[
+            ("CLAUDECODE", "1"),
+            ("CLAUDE_CODE_CHILD_SESSION", "1"),
+            (
+                "CLAUDE_CODE_SESSION_ID",
+                "f267c9a2-1e61-4860-bc7b-9f9d19684876",
+            ),
+        ]);
+        assert_eq!(agent.run(), None);
+        assert_eq!(
+            agent.provenance(),
+            json!({"agent_shell": true}),
+            "the shared session markers are not recorded as if they were an identity"
+        );
+        let person = shell(&[]);
+        assert_eq!(person.provenance(), json!({"agent_shell": false}));
+        assert_eq!(
+            shell(&[("CLAUDECODE", "  ")]).provenance(),
+            json!({"agent_shell": false}),
+            "a blank marker is no marker"
+        );
+        let run = shell(&[("BOSS_AGENT_RUN", REVIEWER), ("CLAUDECODE", "1")]);
+        assert_eq!(run.run(), Some(REVIEWER));
+        assert_eq!(
+            run.provenance(),
+            json!({"run": REVIEWER, "agent_shell": true})
+        );
     }
 
     /// A car gated by hand has no builder run to refuse; its reviewer

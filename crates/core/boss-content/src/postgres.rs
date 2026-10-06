@@ -84,6 +84,9 @@ impl ContentRepository for PgContent {
                 .cmp(&b.priority.sort_key())
                 .then(b.posted_on.cmp(&a.posted_on))
                 .then(b.created_at.cmp(&a.created_at))
+                // Two rows sharing all three answered in plan order
+                // (backlog be459ab9, found by the adapters-agree suite).
+                .then(a.id.cmp(&b.id))
         });
         Ok(out)
     }
@@ -94,7 +97,7 @@ impl ContentRepository for PgContent {
                     priority, audience, created_at, updated_at, \
                     false AS dismissed \
              FROM bulletins \
-             ORDER BY posted_on DESC, created_at DESC",
+             ORDER BY posted_on DESC, created_at DESC, id",
         )
         .fetch_all(&self.pool)
         .await
@@ -349,12 +352,19 @@ impl ContentRepository for PgContent {
     }
 
     async fn manual_tree(&self, user: &UserContext) -> Result<Vec<ManualSection>, ContentError> {
+        // Byte order (`COLLATE "C"`), the only order the in-memory
+        // adapter's `String::cmp` can hold: the database's locale
+        // ignores `-` at first level and folds case, so `suite-ab`
+        // sorted before `suite-a-z` here and after it there (backlog
+        // be459ab9, found by the adapters-agree suite; 2987fb2d's
+        // class). The unique slug settles a shared title.
         let rows = sqlx::query(
             "SELECT id, slug, parent_slug, title, body, sort_order, audience, \
                     current_version, published, created_at, updated_at \
              FROM manual_sections \
              WHERE published = true \
-             ORDER BY parent_slug NULLS FIRST, sort_order, title",
+             ORDER BY parent_slug COLLATE \"C\" NULLS FIRST, sort_order, \
+                      title COLLATE \"C\", slug COLLATE \"C\"",
         )
         .fetch_all(&self.pool)
         .await
@@ -417,7 +427,7 @@ impl ContentRepository for PgContent {
         .bind(draft.published)
         .execute(&mut *tx)
         .await
-        .map_err(|e| ContentError::Validation(e.to_string()))?;
+        .map_err(|e| section_insert_refused(e, &draft))?;
         sqlx::query(
             "INSERT INTO manual_section_history \
                 (section_id, version, title, body, audience, edited_by, reason) \
@@ -579,6 +589,28 @@ fn row_to_bulletin(row: &sqlx::postgres::PgRow) -> Result<Bulletin, ContentError
 
 fn store(e: sqlx::Error) -> ContentError {
     ContentError::Storage(e.to_string())
+}
+
+/// A section INSERT's failure, in the in-memory adapter's words. Until
+/// the adapters-agree suite (backlog be459ab9) every insert failure was
+/// `Validation` carrying the raw constraint text — a lost connection
+/// included — where the double named the slug. A taken slug (the
+/// UNIQUE, 23505) and a missing parent (the self-FK, 23503) are the
+/// caller's to fix; anything else is the store's.
+fn section_insert_refused(e: sqlx::Error, draft: &ManualSectionDraft) -> ContentError {
+    let code = e
+        .as_database_error()
+        .and_then(|d| d.code())
+        .map(|c| c.into_owned());
+    match (code.as_deref(), draft.parent_slug.as_deref()) {
+        (Some("23505"), _) => {
+            ContentError::Validation(format!("slug '{}' already exists", draft.slug))
+        }
+        (Some("23503"), Some(parent)) => {
+            ContentError::Validation(format!("parent slug '{parent}' not found"))
+        }
+        _ => store(e),
+    }
 }
 
 fn row_to_section(row: &sqlx::postgres::PgRow) -> Result<ManualSection, ContentError> {

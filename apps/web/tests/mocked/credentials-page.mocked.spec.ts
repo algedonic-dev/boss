@@ -50,12 +50,12 @@ const ROWS = [
     notes: '',
   },
   {
-    id: 'dauld-github-token',
-    kind: 'github-personal-access-token',
-    issuer: 'github.com (minted by David in the GitHub UI, as dauld)',
-    principal: 'user dauld',
+    id: 'hand-placed-vendor-key',
+    kind: 'api-key',
+    issuer: 'vendor.example (minted by hand in its web UI)',
+    principal: 'account example-operator',
     scopes: [],
-    storage_location: '/etc/boss-publish/github.token on the forge host',
+    storage_location: '/etc/example/vendor.key on the forge host',
     consumers: [],
     rotation_policy: 'on-demand',
     rotated_at: null,
@@ -117,7 +117,7 @@ test.describe('/it/registry/credentials', () => {
     await expect(fact(page, 'forge-host-checkout-token', 'Provenance')).toContainText('broker-rotates-the-forge-host-checkout-token');
     // Which root it is minted from is not a registry fact: a gap, not a guess.
     await expect(fact(page, 'forge-host-checkout-token', 'Provenance').locator('.cr-gap')).toContainText('Minted from: not recorded');
-    await expect(fact(page, 'dauld-github-token', 'Provenance')).toContainText('Placed by hand');
+    await expect(fact(page, 'hand-placed-vendor-key', 'Provenance')).toContainText('Placed by hand');
 
     // Every registry fact, drawn.
     await expect(fact(page, 'forge-host-checkout-token', 'Scopes')).toHaveText('write:repository');
@@ -127,12 +127,12 @@ test.describe('/it/registry/credentials', () => {
     await expect(fact(page, 'forge-host-checkout-token', 'Next rotation due')).toContainText('on demand');
     await expect(card(page, 'forge-host-checkout-token').locator('.cr-gaps')).toHaveCount(0);
 
-    // The hand-placed PAT: no consumer, no rotation, unverified scopes — each a gap.
-    await expect(fact(page, 'dauld-github-token', 'Consumers').locator('.cr-gap')).toHaveText('none declared');
-    await expect(fact(page, 'dauld-github-token', 'Last rotation')).toHaveClass(/cr-gap/);
-    await expect(fact(page, 'dauld-github-token', 'Last rotation')).toHaveText('never recorded');
-    await expect(fact(page, 'dauld-github-token', 'Scopes')).toHaveClass(/cr-gap/);
-    await expect(card(page, 'dauld-github-token').locator('.cr-gaps')).toContainText(
+    // The hand-placed key: no consumer, no rotation, unverified scopes — each a gap.
+    await expect(fact(page, 'hand-placed-vendor-key', 'Consumers').locator('.cr-gap')).toHaveText('none declared');
+    await expect(fact(page, 'hand-placed-vendor-key', 'Last rotation')).toHaveClass(/cr-gap/);
+    await expect(fact(page, 'hand-placed-vendor-key', 'Last rotation')).toHaveText('never recorded');
+    await expect(fact(page, 'hand-placed-vendor-key', 'Scopes')).toHaveClass(/cr-gap/);
+    await expect(card(page, 'hand-placed-vendor-key').locator('.cr-gaps')).toContainText(
       'no consumer declared · no rotation recorded · scopes unverified',
     );
 
@@ -167,8 +167,8 @@ test.describe('/it/registry/credentials', () => {
     await install(page, { posts });
     await mountPage(page, PAGE, { titleMatch: /Credentials/ });
 
-    await card(page, 'dauld-github-token').getByRole('button', { name: 'Retire' }).click();
-    await expect(card(page, 'dauld-github-token').locator('.cr-filed')).toContainText('Retire item filed');
+    await card(page, 'hand-placed-vendor-key').getByRole('button', { name: 'Retire' }).click();
+    await expect(card(page, 'hand-placed-vendor-key').locator('.cr-filed')).toContainText('Retire item filed');
 
     const form = page.locator('form.cr-declare');
     const submit = form.getByRole('button', { name: 'File a declare item' });
@@ -181,7 +181,7 @@ test.describe('/it/registry/credentials', () => {
     await expect(form).toContainText('looks like a value, not a name');
     await expect(page.locator('body')).not.toContainText('ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8');
     await expect(submit).toBeDisabled();
-    await form.locator('input').fill('dauld-github-token');
+    await form.locator('input').fill('hand-placed-vendor-key');
     await expect(form).toContainText('already declared');
     await expect(submit).toBeDisabled();
     await form.locator('input').fill('github-app-installation');
@@ -189,7 +189,7 @@ test.describe('/it/registry/credentials', () => {
     await expect(form.locator('.cr-filed')).toContainText('Declare item filed');
 
     expect(posts.map((p) => [p.kind, p.title, (p.subject as { id: string }).id])).toEqual([
-      ['backlog-item', 'Retire the credential dauld-github-token', 'dauld-github-token'],
+      ['backlog-item', 'Retire the credential hand-placed-vendor-key', 'hand-placed-vendor-key'],
       ['backlog-item', 'Declare the credential github-app-installation in the registry', 'github-app-installation'],
     ]);
   });
@@ -225,7 +225,7 @@ test.describe('/it/registry/credentials', () => {
     await expect(page.locator('section.cr-card')).toHaveCount(3);
     // A root is known from where it lives; the others cannot be told.
     await expect(fact(page, 'boss-credential-broker-root', 'Provenance')).toContainText('Root — placed by David');
-    await expect(fact(page, 'dauld-github-token', 'Provenance').locator('.load-failed')).toContainText(
+    await expect(fact(page, 'hand-placed-vendor-key', 'Provenance').locator('.load-failed')).toContainText(
       "could not tell — the broker's rules did not answer",
     );
     await expect(page.locator('.cr-summary')).not.toContainText('placed by hand');

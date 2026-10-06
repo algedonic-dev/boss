@@ -987,3 +987,105 @@ async fn out_of_order_event_falls_back_to_full_reproject() {
         "out-of-order Shipped at ts=15 must not unwind the Installed at ts=20"
     );
 }
+
+const WIDER_TICKET_KEY: &str =
+    "infra/postgres/schema/20261001080134-an-open-ticket-is-keyed-by-its-asset.sql";
+
+/// Every open-ticket row, and each account's count off the table.
+async fn open_ticket_rows_and_counts(
+    pool: &PgPool,
+) -> (Vec<(String, String, String, NaiveDate)>, Vec<(String, i64)>) {
+    let rows = sqlx::query_as(
+        "SELECT asset_id, ticket_id, summary, opened_on FROM asset_open_tickets \
+         ORDER BY asset_id, ticket_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let counts = sqlx::query_as(
+        "SELECT d.holder_id, count(*) FROM asset_open_tickets t \
+         JOIN assets d ON d.asset_id = t.asset_id \
+         WHERE d.holder_kind = 'account' GROUP BY d.holder_id ORDER BY d.holder_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    (rows, counts)
+}
+
+/// Conservation for backlog b8099caf's migration: the rows the OLD key
+/// (`ticket_id` alone) admitted — every ticket id distinct, across two
+/// accounts, an asset holding two, an asset holding none, a closed one
+/// gone — are every row after the key widens to (asset_id, ticket_id),
+/// each account's count unchanged; and the key is then the pair.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_wider_ticket_key_keeps_every_row_and_count() {
+    let db = TestDb::new().await;
+    seed_device_model(&db.pool, TEST_SKU).await;
+    let assets = PgAssets::new(db.pool.clone());
+    let received = || AssetEventKind::Received {
+        sku: Some(TEST_SKU.into()),
+        source: IntakeSource::new("oem-new"),
+        oem_serial: None,
+    };
+    let installed = |acct: &str| AssetEventKind::Installed {
+        holder_kind: "account".into(),
+        holder_id: acct.into(),
+    };
+    let opened = |t: &str| AssetEventKind::ServiceJobOpened {
+        job_id: t.into(),
+        summary: format!("summary of {t}"),
+    };
+    for e in [
+        evt("a1", "SN-KEY-A", 1, received()),
+        evt("a2", "SN-KEY-A", 2, installed("acct-1")),
+        evt("a3", "SN-KEY-A", 3, opened("tkt-1")),
+        evt("a4", "SN-KEY-A", 4, opened("tkt-2")),
+        evt("b1", "SN-KEY-B", 1, received()),
+        evt("b2", "SN-KEY-B", 2, installed("acct-2")),
+        evt("b3", "SN-KEY-B", 3, opened("tkt-3")),
+        evt("b4", "SN-KEY-B", 4, opened("tkt-4")),
+        evt(
+            "b5",
+            "SN-KEY-B",
+            5,
+            AssetEventKind::ServiceJobClosed {
+                job_id: "tkt-4".into(),
+                turnaround_days: 1,
+            },
+        ),
+        evt("c1", "SN-KEY-C", 1, received()),
+        evt("c2", "SN-KEY-C", 2, installed("acct-2")),
+    ] {
+        assets.append(e).await.unwrap();
+    }
+    // Put the table back in the shape 21-assets.sql gave it.
+    sqlx::raw_sql(
+        "ALTER TABLE asset_open_tickets DROP CONSTRAINT asset_open_tickets_pkey; \
+         ALTER TABLE asset_open_tickets ADD CONSTRAINT asset_open_tickets_pkey \
+             PRIMARY KEY (ticket_id);",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let before = open_ticket_rows_and_counts(&db.pool).await;
+    assert_eq!(before.0.len(), 3, "the fleet leaves three open tickets");
+    assert_eq!(
+        before.1,
+        vec![("acct-1".to_string(), 2), ("acct-2".to_string(), 1)]
+    );
+
+    let migration = std::fs::read_to_string(boss_testing::repo_root().join(WIDER_TICKET_KEY))
+        .unwrap_or_else(|e| panic!("reading {WIDER_TICKET_KEY}: {e}"));
+    sqlx::raw_sql(&migration).execute(&db.pool).await.unwrap();
+
+    assert_eq!(open_ticket_rows_and_counts(&db.pool).await, before);
+    let (key,): (String,) = sqlx::query_as(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+         WHERE conname = 'asset_open_tickets_pkey'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(key, "PRIMARY KEY (asset_id, ticket_id)");
+}

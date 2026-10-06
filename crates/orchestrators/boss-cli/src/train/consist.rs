@@ -26,7 +26,13 @@ use super::*;
 //   - CHEAP ONLY. Text lints, run out of the assembled `infra/lint/`.
 //     No cargo, no bun, no database. Measured: the 23 included scripts
 //     total ~9 seconds. The full gate is what CI is for; this is not a
-//     second gate and must never grow into one.
+//     second gate and must never grow into one. Re-measured 2026-10-01
+//     (backlog 0491b7d6): 94 lints, 82-89 s one at a time on the dev pod
+//     — and CPU-bound, so pinned to ONE cpu (the conductor's limit) they
+//     took 82.4 s serial, 81.6 s eight-wide and 81.5 s four-wide. Running
+//     them concurrently, as gate.sh's pre-flight does on its 16 cpus,
+//     buys the conductor nothing; the budget (`consist_budget_secs`) is
+//     the knob, and at 60 s it is spent after 68 of the 94.
 //   - DISCOVERED, NOT LISTED. Every `infra/lint/*.sh` in the ASSEMBLED
 //     tree runs, minus a named exclusion set — which is the whole point
 //     of the second failure above: the lint that catches the next
@@ -174,6 +180,34 @@ pub(crate) fn consist_refusal_reason(failed: &[LintFailure], file_budget: usize)
     )
 }
 
+// The environment every child of the consist check runs in: NO machine
+// token in reach, no system-of-record address, no host list (backlog
+// 0491b7d6).
+//
+// THE DEFECT (920524dc, 2026-10-01 00:04Z to 01:15Z). The conductor
+// ran each lint in its own environment: the estate machine token
+// mounted at boss-core's DEFAULT directory, `BOSS_JOBS_URL` and
+// `BOSS_MACHINE_TOKEN_HOSTS` naming the estate. `door_env::isolate`
+// (since deleted) removed the doors' directory NAME, which on the conductor changes
+// nothing — the default is the token. So when the first token was
+// minted, a lint whose fixtures sourced a header-making lib inside a
+// subshell began to fail, and every train was held by a credential
+// event that changed no code. A lint is a question about a TREE; the
+// answer must not depend on what credentials the asker happens to hold.
+//
+// So each child gets an EMPTY token directory named explicitly (unset
+// would fall back to the default, which is the token), an absent
+// sor.env named explicitly (unset would fall back to /etc/boss/sor.env,
+// which a managed host renders), and neither address nor host list nor
+// the old single-variable token. Measured on the dev pod the same day,
+// all 94 roster lints pass in that environment.
+//
+// The struct itself moved to `crate::door_env` (backlog 844b936e): the
+// brief and both probe doors had the same rule written the removal-only
+// way, which on the conductor is no rule at all, so all three now call
+// the one helper (CLAUDE.md §9a).
+use crate::door_env::NoTokenInReach;
+
 /// The lint script names the assembled tree's OWN gate leaves out of
 /// its pre-flight, asked of `infra/gate.sh --exclusions` in that tree.
 ///
@@ -191,8 +225,12 @@ pub(crate) fn consist_refusal_reason(failed: &[LintFailure], file_budget: usize)
 /// A refusal (a declaration with no reason) or a tree with no gate.sh
 /// is an error the caller turns into a warning on a `Proceed`, by
 /// name — never a silent "then run everything".
-fn gate_exclusions(tree: &Path) -> Result<BTreeSet<String>> {
-    let out = Command::new("bash")
+fn gate_exclusions(tree: &Path, env: &NoTokenInReach) -> Result<BTreeSet<String>> {
+    // The tree's code, so nothing this CLI holds rides into it
+    // (crate::door_env; review ef2da426 F1 of design 6805c764 car 4;
+    // NoTokenInReach, backlog 0491b7d6).
+    let out = env
+        .apply(&mut Command::new("bash"))
         .arg("infra/gate.sh")
         .arg("--exclusions")
         .current_dir(tree)
@@ -219,8 +257,8 @@ fn gate_exclusions(tree: &Path) -> Result<BTreeSet<String>> {
 /// minus what the tree's gate declares out — nothing in code to edit
 /// when a lint lands, and nothing anywhere but the lint's own header
 /// to edit when one needs more than a tree.
-fn cheap_lints(tree: &Path) -> Result<Vec<PathBuf>> {
-    let excluded = gate_exclusions(tree)?;
+fn cheap_lints(tree: &Path, env: &NoTokenInReach) -> Result<Vec<PathBuf>> {
+    let excluded = gate_exclusions(tree, env)?;
     let dir = tree.join("infra/lint");
     let mut scripts: Vec<PathBuf> = fs::read_dir(&dir)
         .with_context(|| format!("reading {}", dir.display()))?
@@ -244,11 +282,23 @@ fn cheap_lints(tree: &Path) -> Result<Vec<PathBuf>> {
 /// it directly: the checkout may not carry the executable bit, and
 /// every one of these scripts is a bash script that locates the repo
 /// root from its own path.
-fn run_one_lint(tree: &Path, script: &Path, output_budget: usize) -> LintResult {
+fn run_one_lint(
+    tree: &Path,
+    script: &Path,
+    output_budget: usize,
+    env: &NoTokenInReach,
+) -> LintResult {
     if !script.is_file() {
         return LintResult::Unrunnable("not a readable file".to_string());
     }
-    let out = Command::new("bash").arg(script).current_dir(tree).output();
+    // A train's lints are branch code: no name a door handed this CLI,
+    // and no token the conductor holds, rides into them (crate::door_env,
+    // review ef2da426 F1; NoTokenInReach, backlog 0491b7d6).
+    let out = env
+        .apply(&mut Command::new("bash"))
+        .arg(script)
+        .current_dir(tree)
+        .output();
     let out = match out {
         Ok(out) => out,
         Err(e) => return LintResult::Unrunnable(format!("could not spawn bash: {e}")),
@@ -424,7 +474,18 @@ pub(super) fn freshen_trunk(clone: &str) {
 /// seconds each, and learning ONE bit per attempt is precisely the
 /// cost this exists to stop paying.
 pub(crate) fn consist_check(tree: &Path, policy: &DeliveryPolicy) -> ConsistVerdict {
-    let scripts = match cheap_lints(tree) {
+    let env = match NoTokenInReach::new() {
+        Ok(env) => env,
+        Err(e) => {
+            return ConsistVerdict::Proceed {
+                ran: 0,
+                warnings: vec![format!(
+                    "could not run the lints with no token in reach ({e:#})"
+                )],
+            };
+        }
+    };
+    let scripts = match cheap_lints(tree, &env) {
         Ok(s) if s.is_empty() => {
             return ConsistVerdict::Proceed {
                 ran: 0,
@@ -454,7 +515,7 @@ pub(crate) fn consist_check(tree: &Path, policy: &DeliveryPolicy) -> ConsistVerd
             .to_string();
         runs.push(LintRun {
             name,
-            result: run_one_lint(tree, script, policy.consist_output_budget),
+            result: run_one_lint(tree, script, policy.consist_output_budget, &env),
         });
         if started.elapsed() > policy.consist_budget && done + 1 < total {
             let mut verdict = consist_verdict(&runs, policy.consist_files_named);
@@ -798,7 +859,8 @@ mod tests {
     #[test]
     fn the_roster_is_the_lint_directory_minus_what_the_gate_declares_out() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-        let names: Vec<String> = cheap_lints(&root)
+        let env = NoTokenInReach::new().expect("an empty token dir");
+        let names: Vec<String> = cheap_lints(&root, &env)
             .expect("the tree has an infra/lint and a gate.sh")
             .iter()
             .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into())
@@ -811,7 +873,8 @@ mod tests {
             names.iter().any(|n| n == "migration-numbers-unique.sh"),
             "the lint that catches duplicate migration numbers is in: {names:?}"
         );
-        let declared_out = gate_exclusions(&root).expect("the tree's gate.sh answers --exclusions");
+        let declared_out =
+            gate_exclusions(&root, &env).expect("the tree's gate.sh answers --exclusions");
         assert!(
             !declared_out.is_empty(),
             "the lints that need a live database, a built workspace or a package manager \
@@ -844,7 +907,8 @@ mod tests {
              exit 1\n",
         )
         .expect("write the declaring lint");
-        let names: Vec<String> = cheap_lints(&tree)
+        let env = NoTokenInReach::new().expect("an empty token dir");
+        let names: Vec<String> = cheap_lints(&tree, &env)
             .expect("the fixture carries gate.sh and infra/lint")
             .iter()
             .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into())
@@ -962,6 +1026,92 @@ mod tests {
         assert!(
             fields.contains(&("consist_unchecked_reason", None)),
             "a checked consist carries no unchecked reason: {fields:?}"
+        );
+    }
+
+    /// NO TOKEN IN REACH (backlog 0491b7d6, after 920524dc). From
+    /// 2026-10-01 00:04Z every train was held: the conductor ran each
+    /// lint in its OWN environment — the machine token mounted at
+    /// boss-core's default directory, `BOSS_JOBS_URL` and
+    /// `BOSS_MACHINE_TOKEN_HOSTS` naming the estate — and one lint whose
+    /// fixtures sourced a header-making lib broke the moment the first
+    /// token was minted. A credential event changed no code and stopped
+    /// the railway. The runner now hands every lint an empty token
+    /// directory, no address, no host list, and a sor.env that does not
+    /// exist, whatever the conductor itself carries.
+    ///
+    /// Proven by effect, the way prove.rs proves its strips: this test's
+    /// own binary is re-run with a REAL token directory, an estate
+    /// address, a host list and a readable sor.env in its environment,
+    /// and the consist check it runs there drives a lint that fails on
+    /// any of them, naming which.
+    #[test]
+    fn a_lint_run_by_the_consist_check_has_no_token_in_reach() {
+        const INNER: &str = "BOSS_CONSIST_NO_TOKEN_INNER";
+        if let Ok(tree) = std::env::var(INNER) {
+            let verdict = consist_check(std::path::Path::new(&tree), &policy());
+            println!("CONSIST-VERDICT={verdict:?}");
+            return;
+        }
+        let (_g, tree) = consist_fixture("no-token", &twelve_migrations());
+        // mode-bits-ok: a new file, created 0644, run as bash <path>
+        std::fs::write(
+            tree.join("infra/lint/what-a-lint-can-reach.sh"),
+            "#!/usr/bin/env bash\n\
+             saw=''\n\
+             [ -n \"${BOSS_JOBS_URL+set}\" ] && saw=\"$saw BOSS_JOBS_URL=$BOSS_JOBS_URL\"\n\
+             [ -n \"${BOSS_MACHINE_TOKEN_HOSTS+set}\" ] && saw=\"$saw BOSS_MACHINE_TOKEN_HOSTS\"\n\
+             [ -n \"${BOSS_MACHINE_TOKEN+set}\" ] && saw=\"$saw BOSS_MACHINE_TOKEN\"\n\
+             [ -z \"${BOSS_MACHINE_TOKEN_DIR:-}\" ] && saw=\"$saw no-token-dir-named(the-default-is-the-conductors-token)\"\n\
+             dir=\"${BOSS_MACHINE_TOKEN_DIR:-/etc/boss/machine-token}\"\n\
+             [ -n \"$(ls -A \"$dir\" 2>/dev/null)\" ] && saw=\"$saw a-token-in:$dir\"\n\
+             [ -e \"${BOSS_SOR_ENV:-/etc/boss/sor.env}\" ] && saw=\"$saw sor.env:${BOSS_SOR_ENV:-/etc/boss/sor.env}\"\n\
+             [ -z \"$saw\" ] && exit 0\n\
+             echo \"IN-REACH:$saw\"\n\
+             exit 1\n",
+        )
+        .expect("write the reaching lint");
+        // What the conductor pod carries, in a scratch copy.
+        let held = tree.join("held");
+        let token_dir = held.join("machine-token");
+        std::fs::create_dir_all(&token_dir).expect("mkdir token dir");
+        std::fs::write(token_dir.join("current"), "x".repeat(43)).expect("write token");
+        let sor_env = held.join("sor.env");
+        std::fs::write(
+            &sor_env,
+            "BOSS_JOBS_URL=http://192.0.2.34:7900\nBOSS_MACHINE_TOKEN_HOSTS=192.0.2.34\n",
+        )
+        .expect("write sor.env");
+
+        let me = std::env::current_exe().expect("this test's binary");
+        let out = std::process::Command::new(me)
+            .args([
+                "--exact",
+                "train::consist::tests::a_lint_run_by_the_consist_check_has_no_token_in_reach",
+                "--nocapture",
+            ])
+            .env(INNER, &tree)
+            .env(boss_core::machine_token::TOKEN_DIR_ENV, &token_dir)
+            .env(boss_core::machine_token::HOSTS_ENV, "192.0.2.34")
+            .env(boss_core::machine_token::SOR_ENV_FILE_ENV, &sor_env)
+            .env("BOSS_JOBS_URL", "http://192.0.2.34:7900")
+            .env("BOSS_MACHINE_TOKEN", "x".repeat(43))
+            .output()
+            .expect("re-run this test");
+        let printed = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{printed}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let verdict = printed
+            .lines()
+            .find(|l| l.starts_with("CONSIST-VERDICT="))
+            .unwrap_or_else(|| panic!("the inner leg printed no verdict: {printed}"));
+        assert!(
+            verdict.contains("Proceed { ran: 2, warnings: [] }"),
+            "both lints ran and neither saw a token, an address, a host list or a sor.env: \
+             {verdict}"
         );
     }
 

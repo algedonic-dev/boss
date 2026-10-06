@@ -93,11 +93,13 @@ async fn a_replayed_batch_writes_nothing_twice_and_reads_back_in_order() {
                 r.moves
             ))
             .collect::<Vec<_>>(),
+        // Off the map first, as the in-memory key orders it (backlog
+        // be459ab9's adapters-agree suite holds the two to one order).
         [
-            (Some("dock"), Some("track"), None, None, 1),
-            (Some("track"), Some("shed"), None, None, 1),
-            (Some("track"), None, Some("pr-train"), Some("merge-lost"), 1),
             (None, Some("track"), None, None, 1),
+            (Some("dock"), Some("track"), None, None, 1),
+            (Some("track"), None, Some("pr-train"), Some("merge-lost"), 1),
+            (Some("track"), Some("shed"), None, None, 1),
         ]
     );
     assert!(

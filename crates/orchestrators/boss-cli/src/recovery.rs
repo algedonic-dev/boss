@@ -36,8 +36,10 @@
 //! WHAT THE PAPER MAY CARRY (design 125d405d Q1): locations, addresses
 //! and order, never a value. The renderer refuses a resolved value
 //! shaped like key material, every string of the source (words, keys and
-//! patterns) shaped like a secret (`secret_in`), and a prose line that
-//! carries a literal a fact should have supplied. Those are tripwires
+//! patterns) shaped like a secret (`secret_in`), a prose line that
+//! carries a literal a fact should have supplied, and a string a road's
+//! needs DERIVE (an Access application's name, domain and e-mails) that
+//! is a secret shape or a sentence (backlog 71dab51d). Those are tripwires
 //! for the shapes a regex can see; a short secret or an oblique sentence
 //! passes them, and Q3 — which key opens which door — is held by review
 //! alone (review of car 67e78997).
@@ -1345,6 +1347,49 @@ pub fn looks_like_key_material(v: &str) -> bool {
 
 // ----- derived dependencies ---------------------------------------------
 
+/// A SENTENCE, as the sheet's tripwires read one: three or more words
+/// made of letters. Not "has a space": an Access application's name is a
+/// name ("BOSS dev", "boss-playground"), an e-mail or a domain is no
+/// word at all, and a phrase that says which key opens which door has
+/// five. Car 27272837's pin in `mutating_verb.rs`'s tests holds every
+/// single read of the sheet to this same function — it kept its own
+/// copy until backlog aa8a47bf.
+pub fn reads_as_a_sentence(text: &str) -> bool {
+    text.split_whitespace()
+        .filter(|w| {
+            let w = w.trim_matches(|c: char| !c.is_alphanumeric());
+            !w.is_empty() && w.chars().all(char::is_alphabetic)
+        })
+        .count()
+        >= 3
+}
+
+/// Judge one string a road's `needs` line prints that was DERIVED from
+/// a file rather than read by a line of the source (backlog 71dab51d,
+/// review 2d9dc9f7 F2). An Access application's name, its domain and
+/// the e-mails its allow policy lists went onto the paper with neither
+/// the value check every resolved fact gets nor any hold on the file —
+/// `access.toml` changes with the edge, and only two of its names are
+/// looked up by the source — so renaming an application to a phrase
+/// printed that phrase, unreviewed. Refused the way a resolved value is
+/// (every secret shape but the bare number, R2-3), and refused if it
+/// reads as a sentence: a name, an address and a domain are values, so
+/// a derived string stays a value and its file need not be held as a
+/// prose source. Named by what it is and its length, never printed.
+fn derived_value(what: &str, text: &str) -> Result<(), String> {
+    let kind = secret_in_value(text).or_else(|| {
+        reads_as_a_sentence(text)
+            .then_some("a sentence (three or more words), where a derived line prints a value")
+    });
+    match kind {
+        Some(kind) => Err(format!(
+            "{what} is {kind} ({} chars) — {NEVER_ON_PAPER}",
+            text.len()
+        )),
+        None => Ok(()),
+    }
+}
+
 fn host_of(v: &str) -> String {
     let rest = v.split_once("://").map(|(_, r)| r).unwrap_or(v);
     rest.split(['/', ':'])
@@ -1378,6 +1423,19 @@ fn derive_needs(
             h == host && (p.is_empty() || path.starts_with(&p))
         })
         .max_by_key(|a| a.domain.len());
+    // Every string of the covering application this line prints, judged
+    // before it is printed (backlog 71dab51d). Named by the host and path
+    // it covers, which were resolved and judged already.
+    if let Some(app) = covering {
+        let at = format!("{ACCESS}: the application covering {host}{path}");
+        derived_value(&format!("{at}: its name"), &app.name)?;
+        derived_value(&format!("{at}: its domain"), &app.domain)?;
+        app.policy
+            .iter()
+            .filter(|p| p.decision == "allow")
+            .flat_map(|p| p.include.emails.iter())
+            .try_for_each(|e| derived_value(&format!("{at}: an e-mail it allows"), e))?;
+    }
     match covering {
         Some(app) if app.policy.iter().any(|p| p.decision == "bypass") => needs.push(format!(
             "Cloudflare Access lets this path through without a sign-in (application {:?}, bypass)",
@@ -1467,6 +1525,10 @@ fn derive_needs(
             .ok_or_else(|| {
                 format!("{GATEWAY_MANIFEST}: no Service boss-gateway port found — cannot say what the LAN offers this host")
             })?;
+        derived_value(
+            &format!("{GATEWAY_MANIFEST}: Service boss-gateway's port name"),
+            &name,
+        )?;
         needs.push(if name == "http" {
             format!(
                 "the gateway up. Its only LAN address serves plain HTTP (Service boss-gateway, port {port}), where a passkey cannot run — so there is no LAN road to this door"
@@ -1494,6 +1556,9 @@ fn derive_workload_needs(tree: &mut Tree, manifest: &str) -> Result<String, Stri
         c.get(1).map(|m| m.as_str()).unwrap_or_default(),
         c.get(2).map(|m| m.as_str()).unwrap_or_default(),
     );
+    // One rule for every derived string on the paper (aa8a47bf).
+    derived_value(&format!("{manifest}: its Deployment name"), name)?;
+    derived_value(&format!("{manifest}: its Deployment namespace"), ns)?;
     Ok(format!(
         "the cluster up, and Deployment {name} running in namespace {ns} — the workspace is a pod, so a dark cluster closes this road"
     ))
@@ -2174,10 +2239,6 @@ mod tests {
         );
         let backups = road(&r, "restore-the-record");
         assert_eq!(
-            fact(backups, "Into the directory"),
-            &Value::Text("/var/backups/boss-cluster-pg".into())
-        );
-        assert_eq!(
             fact(backups, "Offsite dumps kept"),
             &Value::Text("21".into())
         );
@@ -2185,6 +2246,54 @@ mod tests {
             fact(backups, "In-cluster copies kept"),
             &Value::Text("14".into())
         );
+    }
+
+    /// Backlog 4bf7bdd1 (David, 2026-10-01: "boss-gcp doesn't need to be
+    /// storage backup"). The GCS bucket is the one offsite copy, so the
+    /// backups road names it and no bastion directory, and it prints the
+    /// four commands that fetch a dump from it — each read from the kit
+    /// README's step 6, the place the bucket's key and name are opened,
+    /// so the stick and the paper say the same thing.
+    #[test]
+    fn the_backups_road_names_the_bucket_as_the_offsite_copy_and_how_to_fetch_from_it() {
+        let r = tree_sheet();
+        let backups = road(&r, "restore-the-record");
+        assert_eq!(
+            fact(backups, "The offsite copy"),
+            &Value::Text("boss-gcs-offsite".into())
+        );
+        for line in &backups.lines {
+            let text = match line {
+                LineOut::Fact { label, value, .. } => format!("{label} {}", value.canonical()),
+                LineOut::Prose(p) | LineOut::NotHeld(p) => p.clone(),
+            };
+            assert!(
+                !text.contains("boss-cluster-pg")
+                    && !text.contains("shipped to")
+                    && !text.contains("receiver"),
+                "the backups road still names the retired boss-gcp copy: {text}"
+            );
+        }
+        for (label, want) in [
+            (
+                "Sign in",
+                "gcloud auth activate-service-account --key-file gcs/sa.json",
+            ),
+            (
+                "List the bucket",
+                "gcloud storage ls \"gs://$(cat gcs/bucket)/\"",
+            ),
+            (
+                "Fetch a dump",
+                "gcloud storage cp \"gs://$(cat gcs/bucket)/boss-<stamp>.sql.gz\" .",
+            ),
+            (
+                "Fetch the file-store archive",
+                "gcloud storage cp \"gs://$(cat gcs/bucket)/boss-files-<stamp>.tar.gz\" .",
+            ),
+        ] {
+            assert_eq!(fact(backups, label), &Value::Text(want.into()), "{label}");
+        }
     }
 
     /// Review F8: the workspace roads say the cluster must be up, and the
@@ -2369,6 +2478,152 @@ mod tests {
             problems.iter().any(|p| p.contains("dns observer refuses")),
             "{problems:?}"
         );
+    }
+
+    /// Backlog 71dab51d (review 2d9dc9f7 F2): an Access application's
+    /// name and the e-mails it allows are DERIVED onto a road's needs,
+    /// not read by a line of the source — so a more specific application
+    /// on the break-glass path, named as a phrase or a secret, printed
+    /// that phrase unchecked. Now it refuses the sheet, naming the file
+    /// and the path covered, never the string it refused; a short name is
+    /// a value and still prints.
+    #[test]
+    fn a_derived_access_name_or_email_that_is_prose_or_a_secret_is_refused() {
+        let with = |name: &str, email: &str, case: &str| {
+            let dir = copied_tree(case);
+            let access = dir.join(ACCESS);
+            let text = std::fs::read_to_string(&access).unwrap();
+            write_file(
+                &access,
+                &format!(
+                    "{text}\n[[application]]\nname = \"{name}\"\n\
+                     domain = \"boss.algedonic.dev/break-glass\"\ntype = \"self_hosted\"\n\
+                     session_duration = \"24h\"\nwhy = \"a test of the derived needs\"\n\n\
+                     [[application.policy]]\nname = \"operators\"\ndecision = \"allow\"\n\
+                     include.emails = [\"{email}\"]\n"
+                ),
+            );
+            load(&dir)
+        };
+        let ok = with("Break glass", "david@algedonic.dev", "recovery-derived-ok")
+            .expect("a two-word name and an address are values");
+        assert!(
+            ok.roads
+                .iter()
+                .flat_map(|r| r.needs.iter())
+                .any(|n| n.contains("\"Break glass\"")),
+            "the more specific application is the one printed"
+        );
+        for (name, email, refused, case) in [
+            (
+                "the blue keychain opens this door",
+                "david@algedonic.dev",
+                "its name is a sentence",
+                "recovery-derived-sentence",
+            ),
+            (
+                "password: hunter2x",
+                "david@algedonic.dev",
+                "its name is a secret stated",
+                "recovery-derived-secret",
+            ),
+            (
+                "Break glass",
+                "pin is 7731 at david@algedonic.dev",
+                "an e-mail it allows is a secret stated",
+                "recovery-derived-email",
+            ),
+        ] {
+            let problems = match with(name, email, case) {
+                Err(p) => p,
+                Ok(_) => panic!("{case}: the sheet rendered {name:?} / {email:?}"),
+            };
+            assert!(
+                problems.iter().any(|p| p.contains(ACCESS)
+                    && p.contains("/break-glass")
+                    && p.contains(refused)),
+                "{case}: {problems:?}"
+            );
+            for p in &problems {
+                assert!(
+                    !p.contains("keychain") && !p.contains("hunter2x") && !p.contains("7731"),
+                    "a refusal never prints what it refused: {p}"
+                );
+            }
+        }
+    }
+
+    /// THE REAL TREE: every application access.toml declares — not only
+    /// the ones a road covers today — has a name, domain and allowed
+    /// e-mails the derived-needs check passes, so retargeting a road (or
+    /// renaming "BOSS site" or "boss-playground") cannot be the first
+    /// moment a phrase reaches the paper (backlog 71dab51d).
+    #[test]
+    fn on_the_real_tree_every_access_name_and_email_is_a_value() {
+        let root = boss_testing::repo_root();
+        let text = std::fs::read_to_string(root.join(ACCESS)).unwrap();
+        let access = access_declaration(&text).expect("the observer parses the tree's file");
+        assert!(
+            access.application.len() >= 4,
+            "{}",
+            access.application.len()
+        );
+        for app in &access.application {
+            let emails = app
+                .policy
+                .iter()
+                .filter(|p| p.decision == "allow")
+                .flat_map(|p| p.include.emails.iter());
+            for s in [&app.name, &app.domain].into_iter().chain(emails) {
+                assert_eq!(derived_value(&app.domain, s), Ok(()), "{}", app.domain);
+            }
+        }
+    }
+
+    /// Backlog aa8a47bf (review 1173f533, N1): the workload line's
+    /// Deployment name and namespace are derived strings like an Access
+    /// name, so they pass the one derived-value rule too. Each is a
+    /// single token, so only the secret shapes can bite.
+    #[test]
+    fn a_derived_workload_name_or_namespace_is_judged_as_a_value() {
+        let dir = scratch_dir("recovery-workload-derived");
+        let manifest = "m.yaml";
+        for (name, ns) in [("password=hunter2", "boss"), ("boss", "token:abc")] {
+            write_file(
+                &dir.join(manifest),
+                &format!("kind: Deployment\nmetadata:\n  name: {name}\n  namespace: {ns}\n"),
+            );
+            let err = derive_workload_needs(&mut Tree::new(&dir), manifest)
+                .expect_err("a secret-shaped derived token is refused");
+            assert!(err.contains("a secret stated"), "{err}");
+            assert!(!err.contains(name) && !err.contains(ns), "{err}");
+        }
+        write_file(
+            &dir.join(manifest),
+            "kind: Deployment\nmetadata:\n  name: boss\n  namespace: boss\n",
+        );
+        assert!(derive_workload_needs(&mut Tree::new(&dir), manifest).is_ok());
+    }
+
+    #[test]
+    fn a_sentence_is_three_words_and_a_name_an_address_or_a_schedule_is_not() {
+        for value in [
+            "BOSS dev",
+            "boss-playground-auth",
+            "david@algedonic.dev",
+            "playground.algedonic.dev/auth",
+            "10 9 * * *",
+            "24h",
+        ] {
+            assert!(!reads_as_a_sentence(value), "{value}");
+        }
+        for prose in [
+            "Install cloudflared, once per machine",
+            "the blue key",
+            "ssh root@{host} opens it",
+        ] {
+            assert!(reads_as_a_sentence(prose), "{prose}");
+        }
     }
 
     #[test]
@@ -2949,6 +3204,223 @@ prose = "p"
             )),
             "{:?}",
             admin.lines
+        );
+    }
+
+    /// Backlog e4a9a9b3 (reviews 89c716e0 and 87fc0e0c, n2 and n4): the
+    /// bastion road named the roll SCRIPT and gave its holder nothing to
+    /// type, and it said the credential "cannot deploy or delete" while an
+    /// ownerReference patch deletes through the garbage collector until
+    /// the policy denies, and any tag in the repository stays a legal roll
+    /// after. The paper now carries the whole two-image roll, every value
+    /// in it read from the policy that judges it, and says both.
+    #[test]
+    fn the_bastion_road_prints_a_runnable_two_image_roll_and_what_its_patch_can_still_do() {
+        let r = tree_sheet();
+        let scoped = road(&r, "bastion-cluster-credential");
+        // The repository deploy/boss pulls from, read the way the image-
+        // only policy's own pin reads it: boss.yaml's main image, untagged.
+        let workloads = std::fs::read_to_string(
+            boss_testing::repo_root().join("infra/cluster/manifests/boss.yaml"),
+        )
+        .expect("boss.yaml");
+        let image = workloads
+            .lines()
+            .map(str::trim)
+            .find_map(|l| {
+                l.strip_prefix("image: ")
+                    .filter(|i| i.contains("/david/boss:"))
+            })
+            .expect("deploy/boss names its image");
+        let repo = &image[..image.rfind(':').expect("a tagged image")];
+        let Value::Text(list) = fact(scoped, "Find the build to roll to") else {
+            panic!("a command is one line")
+        };
+        assert_eq!(
+            list,
+            "sudo kubectl --kubeconfig=/etc/boss-ops/kubeconfig -n boss get replicasets -o wide"
+        );
+        let Value::Text(roll) = fact(scoped, "The two-image roll") else {
+            panic!("a command is one line")
+        };
+        assert_eq!(
+            roll,
+            &format!(
+                "sudo kubectl --kubeconfig=/etc/boss-ops/kubeconfig -n boss set image deployment/boss boss={repo}:BUILD boss-init={repo}:BUILD"
+            ),
+            "ONE patch moving the main AND the init container, as the estate's roll does"
+        );
+        let prose: String = scoped
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                LineOut::Prose(p) => Some(p.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !prose.contains("deploy or delete"),
+            "the old claim is gone: {prose}"
+        );
+        assert!(
+            prose.contains("garbage collector") && prose.contains("ANY tag"),
+            "the paper says what the patch can still do, before Deny and after: {prose}"
+        );
+        // Review d133e704, L1: the boss Deployment is Recreate, so the
+        // running pod stops BEFORE the new one pulls — and on this road
+        // the registry is down with the forge. The paper reads the
+        // strategy and says what it costs.
+        assert_eq!(
+            fact(scoped, "The boss Deployment replaces its pod by"),
+            &Value::Text("Recreate".into())
+        );
+        assert!(
+            prose.contains("before the new one pulls") && prose.contains("outage"),
+            "the paper says a build not already on the node is an outage: {prose}"
+        );
+        assert!(
+            scoped.lines.iter().any(|l| matches!(
+                l,
+                LineOut::NotHeld(n) if n.contains("kubectl client")
+            )),
+            "the tree installs no kubectl on the bastion, and the paper says so: {:?}",
+            scoped.lines
+        );
+    }
+
+    /// Backlog e4a9a9b3, the image-only policy's Deny car: design
+    /// b08725c2 names its misfire rollback — delete the binding over the
+    /// LAN kube road, with the admin kubeconfig — and a way back that is
+    /// written only in a manifest comment is not on the paper the one
+    /// human holds. The command is whole, and the bastion road, whose own
+    /// credential cannot delete it, points there. The sheet reads the
+    /// binding's name from the deposit Job, because the manifest that
+    /// declares it also declares a Secret and so is never read for a
+    /// fact; break_glass_deposit_sh.rs holds the two equal, and this
+    /// holds the printed name to the manifest.
+    #[test]
+    fn the_cluster_admin_road_prints_the_break_glass_policys_named_rollback() {
+        let r = tree_sheet();
+        let admin = road(&r, "cluster-admin");
+        let manifest = std::fs::read_to_string(
+            boss_testing::repo_root()
+                .join("infra/cluster/manifests/boss-break-glass-operator.yaml"),
+        )
+        .expect("the operator manifest");
+        let binding = manifest
+            .split("kind: ValidatingAdmissionPolicyBinding\nmetadata:\n  name: ")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .expect("the manifest declares the binding");
+        let Value::Text(delete) = fact(admin, "If the break-glass policy refuses a roll") else {
+            panic!("a command is one line")
+        };
+        assert!(
+            delete.starts_with("sudo docker run --rm --network host -v ")
+                && delete.contains("/kubeconfig:/kc:ro alpine/k8s:")
+                && delete.ends_with(&format!(
+                    " kubectl --kubeconfig=/kc delete validatingadmissionpolicybinding {binding}"
+                )),
+            "the admin kubeconfig deletes the binding, in the kubectl image the forge uses: {delete}"
+        );
+        let prose = |road: &RoadOut| -> String {
+            road.lines
+                .iter()
+                .filter_map(|l| match l {
+                    LineOut::Prose(p) => Some(p.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            prose(admin).contains("revert car"),
+            "the paper says the next converge binds it again: {}",
+            prose(admin)
+        );
+        let scoped = prose(road(&r, "bastion-cluster-credential"));
+        assert!(
+            scoped.contains("REFUSES") && !scoped.contains("TODAY an admission policy REPORTS"),
+            "the bastion road says the policy denies now: {scoped}"
+        );
+        assert!(
+            scoped.contains("deleting the policy's binding with the admin kubeconfig"),
+            "{scoped}"
+        );
+    }
+
+    /// Backlog ad54fbe9 (review 43b3d4c0 of the Deny car, follow-up 2):
+    /// the bastion road is the forge-DARK road, and it sent its reader to
+    /// a command that runs ON the forge. The recovery kit carries the
+    /// admin kubeconfig (recovery-kit.sh takes it as an item), and the
+    /// kit's README step 2 says where to place it on any host with
+    /// kubectl — so the paper prints that delete too, AFTER the forge's,
+    /// every value read from the file that decides it: the item's name
+    /// from the kit writer, the path from the kit's README, the binding
+    /// from the deposit Job.
+    #[test]
+    fn the_forge_dark_way_back_deletes_the_binding_with_the_kits_kubeconfig() {
+        let r = tree_sheet();
+        let admin = road(&r, "cluster-admin");
+        let read = |rel: &str| {
+            std::fs::read_to_string(boss_testing::repo_root().join(rel))
+                .unwrap_or_else(|e| panic!("{rel}: {e}"))
+        };
+        let binding = read("infra/cluster/break-glass-deposit.sh")
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("POLICY_BINDING=\"${BOSS_DEPOSIT_POLICY_BINDING:-")
+                    .and_then(|r| r.strip_suffix("}\""))
+            })
+            .map(str::to_string)
+            .expect("the deposit Job names the binding");
+        let placed = read("infra/forge/recovery-kit-README.txt")
+            .lines()
+            .find_map(|l| {
+                l.trim()
+                    .strip_prefix("and kubectl) as ")
+                    .and_then(|r| r.split(" and ").nth(1))
+                    .and_then(|p| p.strip_suffix(','))
+            })
+            .map(str::to_string)
+            .expect("the kit's README step 2 places the kubeconfig");
+        let position = |start: &str| {
+            admin
+                .lines
+                .iter()
+                .position(|l| matches!(l, LineOut::Fact { label, .. } if label.starts_with(start)))
+                .unwrap_or_else(|| panic!("no line {start}: {:?}", admin.lines))
+        };
+        let forge = position("If the break-glass policy refuses a roll");
+        let kit = position("With the forge dark");
+        assert!(forge < kit, "the forge's delete is the first road");
+        let Value::Text(item) = fact(admin, "The kit item that is the admin kubeconfig") else {
+            panic!("an item is one line")
+        };
+        assert_eq!(item, "secrets/kubeconfig");
+        let Value::Text(delete) = fact(admin, "With the forge dark") else {
+            panic!("a command is one line")
+        };
+        assert_eq!(
+            delete,
+            &format!(
+                "sudo kubectl --kubeconfig={placed} delete validatingadmissionpolicybinding {binding}"
+            ),
+            "the kit's kubeconfig, where its README places it, deletes the same binding"
+        );
+        let scoped = road(&r, "bastion-cluster-credential")
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                LineOut::Prose(p) => Some(p.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            scoped.contains("recovery kit") && !scoped.contains("the last command of"),
+            "the forge-dark road names the kit's way back, not only the forge's: {scoped}"
         );
     }
 

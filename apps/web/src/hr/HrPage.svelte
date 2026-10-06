@@ -2,7 +2,7 @@
   // HR admin — port of apps/web/src/hr/HrPage.tsx.
   //
   // Four tabs: Overview, Workflows (onboarding/offboarding task
-  // tracking with POST mutations), Certifications, Headcount.
+  // tracking through their Job surfaces), Certifications, Headcount.
   //
   // A fifth, Requisitions, went with page audit b959394e (backlog
   // 0ab0fbac): it said the requisitions API was not implemented when it
@@ -39,7 +39,6 @@
   import { countedRoster, headcount, rosterHeader } from '../people/roster-counts';
   import { readStateOfLoad } from '../data/readState';
   import { href, navigate } from '../router';
-  import { putStep } from '../steps/stepWrite';
 
   type Tab = 'overview' | 'certs' | 'headcount' | 'workflows';
 
@@ -304,18 +303,6 @@
     tasksLoading = false;
   }
 
-  async function updateTask(taskId: string, status: string): Promise<void> {
-    // #101 — Step transitions go through PUT /api/jobs/{job}/steps/{step},
-    // on the Job whose tasks are open (backlog 5b27ed56).
-    if (!selectedJob) return;
-    const jobId = selectedJob;
-    // Through the step door, the one file that builds a step's URL
-    // (backlog e39a9d2a): the reload below shows whatever it answered.
-    await putStep(jobId, taskId, { status });
-    await loadTasks(jobId);
-    await fetchWorkflows();
-  }
-
   function startWorkflow(kind: string): void {
     if (!startTarget) return;
     // #101 — Route to the canonical Job-creation flow. JobsList
@@ -547,11 +534,10 @@
                       <td>{t.task}</td>
                       <td><span class="chip chip-task-{t.status}">{t.status}</span></td>
                       <td>
-                        {#if t.status !== 'completed'}
-                          <button class="hr-done-btn" onclick={() => updateTask(t.id, 'completed')}>
-                            Mark done
-                          </button>
-                        {/if}
+                        <!-- Required-at-done fields, sign-offs and plugins
+                             belong to the Job's step surface (36132827,
+                             audit b959394e), not a second executor here. -->
+                        <Link to={href(`/jobs/${encodeURIComponent(t.job_id)}`)}>Open job</Link>
                       </td>
                     </tr>
                   {/each}

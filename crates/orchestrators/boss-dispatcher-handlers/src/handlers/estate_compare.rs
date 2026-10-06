@@ -412,8 +412,9 @@ pub(crate) fn compare_host(declared: &[Json], observation: &Json) -> Json {
 /// under its ops directory (`infra/estate/roles.toml`, design 1bc4b4ed).
 const CLUSTER_OPERATOR_ROLE: &str = "cluster-operator";
 
-/// The tree's estate declaration, compiled in for ONE part of it: the
-/// `[ops_credentials.<host>]` tables, which say which credentials each
+/// The tree's estate declaration, compiled in for credentials and
+/// report-only PVC intent (design 32e7cf87). The
+/// `[ops_credentials.<host>]` tables say which credentials each
 /// cluster-operator holds and who brings each into being (design
 /// 835c0c9c, decision 3; backlog f371c749). The shell check on the
 /// hosts reads the same tables from the same file; a test in
@@ -899,9 +900,34 @@ pub(crate) fn compare_units(observation: &Json) -> Json {
     // id the raiser keys a unit by. A unit the observer stopped watching
     // is no longer judged, so its alarm is not closed by its absence.
     let mut units_evaluated: Vec<Json> = Vec::new();
+    // Running units outside the host's declared roster (backlog
+    // 6647ac9a): the observer names them as `undeclared_units`, and they
+    // are the paperwork class `observed_not_declared` already is for a
+    // machine nobody declared — not HARD, so estate.alarm does not raise
+    // on them. An observer that could not ask says `undeclared_unread`,
+    // carried here so a zero count is never the only record of it.
+    let mut observed_not_declared: Vec<Json> = Vec::new();
+    let mut undeclared_unread: Vec<Json> = Vec::new();
 
     for node in &nodes {
         let host = node.get("id").and_then(Json::as_str).unwrap_or("");
+        for u in node
+            .get("undeclared_units")
+            .and_then(Json::as_array)
+            .map(|a| a.iter())
+            .into_iter()
+            .flatten()
+        {
+            observed_not_declared.push(json!({
+                "host": host,
+                "unit": u.get("unit"),
+                "active_state": u.get("active_state"),
+                "sub_state": u.get("sub_state"),
+            }));
+        }
+        if let Some(reason) = node.get("undeclared_unread").and_then(Json::as_str) {
+            undeclared_unread.push(json!({ "host": host, "reason": reason }));
+        }
         for unit in node
             .get("units")
             .and_then(Json::as_array)
@@ -951,9 +977,12 @@ pub(crate) fn compare_units(observation: &Json) -> Json {
             "hosts": nodes.len(),
             "units": units,
             "units_unhealthy": units_unhealthy.len(),
+            "observed_not_declared": observed_not_declared.len(),
         },
         "findings": {
             "units_unhealthy": units_unhealthy,
+            "observed_not_declared": observed_not_declared,
+            "undeclared_unread": undeclared_unread,
         },
         EVALUATED: {
             "units_unhealthy": units_evaluated,
@@ -1087,6 +1116,165 @@ pub(crate) fn compare_nodefs(observation: &Json) -> Json {
     })
 }
 
+/// The forge's reading of every PersistentVolumeClaim in the instance
+/// namespaces (`infra/estate/observe-volumes.sh`, backlog 21ee3b4e).
+///
+/// WHY IT EXISTS (incident d3c0a67c, 2026-10-01). The system of
+/// record's Postgres volume, `boss/pgdata-postgres-0`, filled and every
+/// write failed with No space left on device. Nothing observed it: the
+/// estate's disk floor judged hosts and cluster nodes, and a Longhorn
+/// volume is neither — it is a filesystem of its own, inside a pod,
+/// which is the "third thing again" [`DISK_TIGHT_FLOOR_GB`]'s comment
+/// warned about. A builder found it through a 500, and the remedy was an
+/// admin patch by hand.
+///
+/// ONE SERIES FOR THE SCOPE, like the door's and the cluster's: one
+/// observation carries every volume, so its comparisons carry no `host`
+/// and the alarm it raises carries none (3908d555). Each volume's id is
+/// `<namespace>/<claim>` — a claim name alone is not unique, every
+/// instance has a `pgdata-postgres-0` — so the alarm key is
+/// `disk_tight:boss/pgdata-postgres-0`.
+pub(crate) const VOLUMES_SCOPE: &str = "instance-volumes";
+
+/// The volume floor, as David set it for this packet: free below 20% of
+/// the claim's capacity, or below 4 GiB. Its own pair and not the
+/// machines' ([`disk_floor_gb`]): those are derived from what stops the
+/// pipeline on a host — a 70 GB CI floor — and 16 GiB of headroom is
+/// more than most claims hold at all.
+const VOLUME_FLOOR_PCT: i64 = 20;
+const VOLUME_FLOOR_BYTES: i64 = 4 << 30;
+
+/// The effective floor of a volume of `capacity` bytes: free strictly
+/// below it is `disk_tight`.
+///
+/// `max(20% of capacity, min(4 GiB, half the capacity))`. The cap on
+/// the absolute clause is the one change to the rule as stated, and the
+/// reason is the host floor's own (8e425862): a floor at or above a
+/// volume's capacity is true on every reading, and a permanently-true
+/// alarm is a check nobody reads. `boss/boss-auth` is a 1 GiB claim
+/// (infra/cluster/manifests/boss.yaml), so "free below 4 GiB" alone
+/// would file it from the first reading for ever. Half the capacity
+/// rules only below 8 GiB; from 8 to 20 GiB the 4 GiB clause rules, and
+/// above 20 GiB the percentage does — 6 GiB on the 30 GiB database
+/// volume. The percentage is rounded up, as the host floor's is.
+fn volume_floor_bytes(capacity: i64) -> i64 {
+    let pct = (capacity.saturating_mul(VOLUME_FLOOR_PCT) + 99) / 100;
+    pct.max(VOLUME_FLOOR_BYTES.min(capacity / 2))
+}
+
+/// Bytes as GiB to one decimal — the unit a claim is requested in, and
+/// precise enough to read a 0.5 GiB floor on a 1 GiB claim.
+fn gib(bytes: i64) -> f64 {
+    (bytes as f64 / 1_073_741_824.0 * 10.0).round() / 10.0
+}
+
+/// The volume comparison, pure: each volume read is judged against
+/// [`volume_floor_bytes`]; each one that could NOT be read is
+/// `disk_unmeasured`, carrying the observer's reason verbatim as its
+/// `state` — a failed read says unread, never fine — and is not listed
+/// as evaluated, so its absence from `disk_tight` is no evidence of
+/// room (c11bfb77). `estate.alarm` raises `disk_tight:<ns>/<claim>`
+/// after [`super::estate_alarm::PERSIST_N`] readings in a row, and
+/// `blind:disk_tight/<ns>/<claim>` for a volume unread as long.
+///
+/// The finding names the claim, its namespace, the Longhorn volume
+/// behind it and the act that relieves it. No ops verb expands a claim
+/// yet, and the remedy says so rather than naming one that does not
+/// exist. The alarm quotes the entry cut at 400 characters, so the
+/// entry stays short enough to arrive whole.
+///
+/// The reading rides the comparison whole and judged (`volumes`, each
+/// row with its `floor_bytes` and `tight`), so /it/estate draws the
+/// verdict this function reached rather than a second copy of the floor.
+pub(crate) fn compare_volumes(observation: &Json) -> Json {
+    let observed: Vec<&Json> = observation
+        .get("nodes")
+        .and_then(Json::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+
+    let mut disk_tight: Vec<Json> = Vec::new();
+    let mut disk_unmeasured: Vec<Json> = Vec::new();
+    let mut evaluated: Vec<Json> = Vec::new();
+    let mut volumes: Vec<Json> = Vec::new();
+
+    for v in &observed {
+        let Some(id) = v.get("id").and_then(Json::as_str) else {
+            continue;
+        };
+        let figures = (
+            v.get("capacity_bytes").and_then(Json::as_i64),
+            v.get("free_bytes").and_then(Json::as_i64),
+        );
+        let mut row = (*v).clone();
+        match figures {
+            (Some(capacity), Some(free)) if capacity > 0 && free >= 0 => {
+                let floor = volume_floor_bytes(capacity);
+                let tight = free < floor;
+                evaluated.push(json!(id));
+                if tight {
+                    let claim = v.get("claim").and_then(Json::as_str).unwrap_or(id);
+                    let ns = v.get("namespace").and_then(Json::as_str).unwrap_or("?");
+                    disk_tight.push(json!({
+                        "id": id,
+                        "namespace": ns,
+                        "claim": claim,
+                        "volume": v.get("volume"),
+                        "free_gib": gib(free),
+                        "capacity_gib": gib(capacity),
+                        "floor_gib": gib(floor),
+                        "remedy": format!(
+                            "expand {claim} in {ns}: raise spec.resources.requests.storage \
+                             (Longhorn grows it online); no ops verb expands a claim yet"
+                        ),
+                    }));
+                }
+                if let Some(o) = row.as_object_mut() {
+                    o.insert("floor_bytes".into(), json!(floor));
+                    o.insert("tight".into(), json!(tight));
+                }
+            }
+            _ => {
+                let state = v
+                    .get("unread")
+                    .and_then(Json::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        "the reading carries no capacity or free figure for this claim, \
+                         and no reason"
+                            .to_string()
+                    });
+                disk_unmeasured.push(json!({ "id": id, "state": state }));
+                if let Some(o) = row.as_object_mut() {
+                    o.insert("tight".into(), Json::Null);
+                    o.insert("unread".into(), json!(state));
+                }
+            }
+        }
+        volumes.push(row);
+    }
+
+    super::volume_intent::enrich(
+        json!({
+            "counts": {
+                "volumes": observed.len(),
+                "disk_tight": disk_tight.len(),
+                "disk_unmeasured": disk_unmeasured.len(),
+            },
+            "findings": {
+                "disk_tight": disk_tight,
+                "disk_unmeasured": disk_unmeasured,
+            },
+            EVALUATED: {
+                "disk_tight": evaluated,
+            },
+            "volumes": volumes,
+        }),
+        observation,
+        ESTATE_TOML,
+    )
+}
+
 /// The stage name, and therefore the subdirectory the retained
 /// observations wait in under the one estate spool.
 const STAGE: &str = "estate.compare";
@@ -1160,6 +1348,11 @@ async fn compare_and_record(
         // An input to the kubernetes-nodes observation, recorded and
         // never judged here (backlog eeac3d56).
         envelope(compare_nodefs(observation))
+    } else if scope == VOLUMES_SCOPE {
+        // Filesystem floors and explicit requested-capacity intent are
+        // judged independently, from this observation and the estate
+        // declaration. No storage mutation follows either verdict.
+        envelope(compare_volumes(observation))
     } else {
         // An observation from an instrument this comparator does
         // not understand. Guessing which declared rows it should
@@ -2356,6 +2549,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_running_unit_nobody_declared_is_observed_not_declared() {
+        // Backlog 6647ac9a: the retired boss-ml-api.service ran on
+        // boss-gcp from 2026-09-20 while every reading said "15 units
+        // watched, all healthy" — the roster is the declaration, so it
+        // was outside what the observer watched. The observer now names
+        // what runs outside the roster, and the comparison counts it as
+        // the paperwork class it already has for an undeclared machine.
+        let mut obs = units_obs(json!([
+            {"unit":"boss-gcp-converge.timer","load_state":"loaded","active_state":"active",
+             "sub_state":"waiting","result":"success","healthy":true},
+        ]));
+        obs["nodes"][0]["undeclared_units"] = json!([
+            {"unit":"boss-ml-api.service","active_state":"active","sub_state":"running"},
+        ]);
+        let body = compare_units(&obs);
+        assert_eq!(body["counts"]["observed_not_declared"], 1);
+        assert_eq!(
+            body["findings"]["observed_not_declared"],
+            json!([{"host":"boss-gcp","unit":"boss-ml-api.service",
+                    "active_state":"active","sub_state":"running"}])
+        );
+        // Paperwork, not a sick unit: units_unhealthy (the HARD class
+        // estate.alarm raises on) is untouched.
+        assert_eq!(body["counts"]["units_unhealthy"], 0);
+    }
+
+    #[test]
+    fn an_unread_enumeration_is_carried_never_counted_clean() {
+        // An observer that could not ask systemd what runs says so; the
+        // comparison carries the reason beside a zero count, so "none
+        // undeclared" and "could not look" stay two different records.
+        let mut obs = units_obs(json!([]));
+        obs["nodes"][0]["undeclared_unread"] = json!("systemctl list-units exited 1");
+        let body = compare_units(&obs);
+        assert_eq!(body["counts"]["observed_not_declared"], 0);
+        assert_eq!(
+            body["findings"]["undeclared_unread"],
+            json!([{"host":"boss-gcp","reason":"systemctl list-units exited 1"}])
+        );
+        let clean = compare_units(&units_obs(json!([])));
+        assert_eq!(clean["findings"]["undeclared_unread"], json!([]));
+    }
+
     // ----- the door scope (backlog e6406701) -----
 
     /// A `door` observation as `infra/estate/observe-door.sh` posts it:
@@ -2760,5 +2997,286 @@ mod tests {
             body.get("host").is_none(),
             "one series for the scope: {body}"
         );
+    }
+
+    // ----- the instance volumes (backlog 21ee3b4e, incident d3c0a67c) -----
+
+    const GIB: f64 = 1_073_741_824.0;
+
+    /// One volume row as `infra/estate/observe-volumes.sh` records it.
+    fn volume(ns: &str, claim: &str, pv: &str, capacity_gib: f64, free_gib: f64) -> Json {
+        let cap = (capacity_gib * GIB) as i64;
+        let free = (free_gib * GIB) as i64;
+        json!({
+            "id": format!("{ns}/{claim}"), "namespace": ns, "claim": claim, "volume": pv,
+            "capacity_bytes": cap, "used_bytes": cap - free, "free_bytes": free,
+        })
+    }
+
+    fn volumes_observation(rows: Vec<Json>) -> Json {
+        json!({
+            "scope": VOLUMES_SCOPE,
+            "observed_at": "2026-10-01T16:00:00Z",
+            "observer": "boss-estate-observe-volumes",
+            "nodes": rows,
+        })
+    }
+
+    #[test]
+    fn pvc_capacity_intent_compares_request_not_filesystem_and_keeps_namespaces_distinct() {
+        let mut prod = volume("boss", "pgdata-postgres-0", "pvc-a", 29.362, 20.0);
+        prod["requested"] = json!("30Gi");
+        let mut playground = volume("boss-playground", "pgdata-postgres-0", "pvc-b", 20.0, 10.0);
+        playground["requested"] = json!("20Gi");
+        let body = compare_volumes(&volumes_observation(vec![prod, playground]));
+        assert_eq!(body["volumes"][0]["capacity_intent"]["verdict"], "match");
+        assert_eq!(
+            body["volumes"][0]["capacity_intent"]["desired_bytes"],
+            30_i64 << 30
+        );
+        assert_eq!(
+            body["volumes"][0]["capacity_intent"]["assignment"]["packet"],
+            "32e7cf87-7d8e-4764-94a3-3b0cfa8548c4"
+        );
+        assert_eq!(body["volumes"][0]["tight"], false);
+        assert_eq!(body["volumes"][1]["capacity_intent"]["verdict"], "unknown");
+    }
+
+    #[test]
+    fn pvc_capacity_intent_reports_exact_drift_and_missing_request_without_guessing() {
+        let mut row = volume("boss", "pgdata-postgres-0", "pvc-a", 20.0, 10.0);
+        row["requested"] = json!("20Gi");
+        let body = compare_volumes(&volumes_observation(vec![row.clone()]));
+        assert_eq!(body["volumes"][0]["capacity_intent"]["verdict"], "drift");
+        assert_eq!(
+            body["volumes"][0]["capacity_intent"]["requested_bytes"],
+            20_i64 << 30
+        );
+        assert_eq!(
+            body["findings"]["capacity_drift"][0]["id"],
+            "boss/pgdata-postgres-0"
+        );
+        row.as_object_mut().unwrap().remove("requested");
+        let body = compare_volumes(&volumes_observation(vec![row]));
+        assert_eq!(body["volumes"][0]["capacity_intent"]["verdict"], "unknown");
+        assert!(
+            body["volumes"][0]["capacity_intent"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("request")
+        );
+    }
+
+    #[test]
+    fn pvc_capacity_intent_missing_claim_is_visible_and_duplicates_never_match() {
+        let body = compare_volumes(&volumes_observation(vec![]));
+        assert_eq!(body["volumes"][0]["id"], "boss/pgdata-postgres-0");
+        assert_eq!(body["volumes"][0]["capacity_intent"]["verdict"], "unknown");
+        assert_eq!(body["volumes"][0]["tight"], Json::Null);
+        let mut row = volume("boss", "pgdata-postgres-0", "pvc-a", 30.0, 20.0);
+        row["requested"] = json!("30Gi");
+        let body = compare_volumes(&volumes_observation(vec![row.clone(), row]));
+        assert!(
+            body["volumes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["capacity_intent"]["verdict"] == "unknown")
+        );
+    }
+
+    fn ids(body: &Json, field: &str) -> Vec<String> {
+        body["findings"][field]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v["id"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_volume_under_its_floor_is_disk_tight_naming_its_claim_volume_and_remedy() {
+        let body = compare_volumes(&volumes_observation(vec![
+            // Incident d3c0a67c's volume, expanded to 30 GiB by hand and
+            // filling again: 5 GiB free is under 20% (6 GiB).
+            volume(
+                "boss",
+                "pgdata-postgres-0",
+                "pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56",
+                30.0,
+                5.0,
+            ),
+            // 10 GiB with 3.9 free: under the 4 GiB absolute floor.
+            volume("boss-playground", "jsdata-nats-0", "pvc-b", 10.0, 3.9),
+            // 10 GiB with 4.5 free: above both.
+            volume("boss", "jsdata-nats-0", "pvc-c", 10.0, 4.5),
+            // 1 GiB with 0.6 free: the absolute floor cannot exceed half a
+            // small volume, or boss-auth would be tight on every reading.
+            volume("boss", "boss-auth", "pvc-d", 1.0, 0.6),
+            // 1 GiB with 0.4 free: under that half.
+            volume("boss-playground", "boss-auth", "pvc-e", 1.0, 0.4),
+        ]));
+        assert_eq!(
+            ids(&body, "disk_tight"),
+            [
+                "boss/pgdata-postgres-0",
+                "boss-playground/jsdata-nats-0",
+                "boss-playground/boss-auth"
+            ],
+            "{body}"
+        );
+        assert_eq!(body["counts"]["disk_tight"], 3, "{body}");
+        let pg = &body["findings"]["disk_tight"][0];
+        assert_eq!(pg["claim"], "pgdata-postgres-0", "{pg}");
+        assert_eq!(pg["namespace"], "boss", "{pg}");
+        assert_eq!(
+            pg["volume"], "pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56",
+            "{pg}"
+        );
+        assert_eq!(pg["capacity_gib"], 30.0, "{pg}");
+        assert_eq!(pg["free_gib"], 5.0, "{pg}");
+        assert_eq!(pg["floor_gib"], 6.0, "{pg}");
+        assert!(
+            pg["remedy"]
+                .as_str()
+                .is_some_and(|r| r.contains("expand") && r.contains("requests.storage")),
+            "the finding names the act that relieves it: {pg}"
+        );
+        assert!(
+            pg.to_string().chars().count() <= 400,
+            "the alarm quotes the entry cut at 400 characters, so all of it must fit: {pg}"
+        );
+        let evaluated: Vec<&str> = body[EVALUATED]["disk_tight"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Json::as_str).collect())
+            .unwrap_or_default();
+        assert_eq!(evaluated.len(), 5, "every volume read was judged: {body}");
+        assert!(
+            body.get("host").is_none(),
+            "one series for the scope: {body}"
+        );
+        // The whole reading rides the comparison, judged, for the page.
+        let rows = body["volumes"].as_array().expect("volumes ride whole");
+        assert_eq!(rows.len(), 5, "{body}");
+        assert_eq!(rows[0]["tight"], true, "{body}");
+        assert_eq!(rows[2]["tight"], false, "{body}");
+        assert_eq!(rows[2]["floor_bytes"], 4 * (1_i64 << 30), "{body}");
+    }
+
+    #[test]
+    fn a_volume_that_could_not_be_read_is_unread_never_fine() {
+        let mut unread = volume("boss", "boss-files", "pvc-f", 20.0, 0.0);
+        unread["capacity_bytes"] = Json::Null;
+        unread["used_bytes"] = Json::Null;
+        unread["free_bytes"] = Json::Null;
+        unread["unread"] = json!(
+            "no running pod on any node reports this claim's filesystem; \
+             the kubelet stats of w-2 could not be read: connection refused"
+        );
+        let bare = json!({"id": "boss/boss-backups", "namespace": "boss", "claim": "boss-backups"});
+        let body = compare_volumes(&volumes_observation(vec![
+            volume("boss", "pgdata-postgres-0", "pvc-a", 30.0, 20.0),
+            unread,
+            bare,
+        ]));
+        assert!(ids(&body, "disk_tight").is_empty(), "{body}");
+        assert_eq!(
+            ids(&body, "disk_unmeasured"),
+            ["boss/boss-files", "boss/boss-backups"],
+            "{body}"
+        );
+        assert_eq!(body["counts"]["disk_unmeasured"], 2, "{body}");
+        let states: Vec<&str> = body["findings"]["disk_unmeasured"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v["state"].as_str()).collect())
+            .unwrap_or_default();
+        assert!(states[0].contains("connection refused"), "verbatim: {body}");
+        assert!(
+            states[1].contains("no capacity or free figure"),
+            "a row with no figures and no reason says so: {body}"
+        );
+        let evaluated = body[EVALUATED]["disk_tight"].to_string();
+        assert!(
+            !evaluated.contains("boss-files") && !evaluated.contains("boss-backups"),
+            "an unread volume was not judged, so its absence from disk_tight is no evidence: {body}"
+        );
+        let rows = body["volumes"].as_array().expect("volumes ride whole");
+        assert!(
+            rows[1]["tight"].is_null() && rows[1]["unread"].as_str().is_some(),
+            "the page must say unread, never fine: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_instance_volumes_reading_is_compared_not_an_unknown_scope() {
+        let (record, base) = StubRecord::start().await;
+        let dir = SpoolDir::new("volumes");
+        let handler = EstateCompare::with_spool(&base, Spool::at(&dir.0, 10));
+        handler
+            .invoke(
+                &[],
+                &firing(volumes_observation(vec![volume(
+                    "boss",
+                    "pgdata-postgres-0",
+                    "pvc-a",
+                    30.0,
+                    2.0,
+                )])),
+            )
+            .await
+            .expect("the record takes the comparison");
+        let recorded = record.recorded.lock().expect("recorded lock").clone();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        let body = &recorded[0];
+        assert_eq!(body["scope"], VOLUMES_SCOPE, "{body}");
+        assert!(body["findings"].get("unknown_scope").is_none(), "{body}");
+        assert_eq!(
+            ids(body, "disk_tight"),
+            ["boss/pgdata-postgres-0"],
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pvc_capacity_intent_recording_and_replay_keep_exact_values_provenance_and_observation_time()
+     {
+        let (record, base) = StubRecord::start().await;
+        let dir = SpoolDir::new("volume-intent-replay");
+        let handler = EstateCompare::with_spool(&base, Spool::at(&dir.0, 10));
+        let mut row = volume("boss", "pgdata-postgres-0", "pvc-a", 29.362, 20.0);
+        row["requested"] = json!("20Gi");
+        let mut observation = volumes_observation(vec![row]);
+        observation["observed_at"] = json!("2026-10-03T00:00:00Z");
+        let original = firing(observation);
+        record.set_down(true);
+        assert!(handler.invoke(&[], &original).await.is_err());
+        assert!(handler.invoke(&[], &original).await.is_err());
+        assert_eq!(handler.spool.waiting(), 1);
+        record.set_down(false);
+        handler
+            .invoke(&[], &firing(volumes_observation(vec![])))
+            .await
+            .unwrap();
+        assert_eq!(handler.spool.waiting(), 0);
+        let recorded = record.recorded.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 2);
+        let replayed = &recorded[1];
+        assert_eq!(replayed["observed_at"], "2026-10-03T00:00:00Z");
+        assert_eq!(replayed["observer"], "boss-estate-observe-volumes");
+        assert_eq!(
+            replayed["volumes"][0]["capacity_intent"]["verdict"],
+            "drift"
+        );
+        assert_eq!(
+            replayed["volumes"][0]["capacity_intent"]["requested_bytes"],
+            20_i64 << 30
+        );
+        assert_eq!(
+            replayed["volumes"][0]["capacity_intent"]["assignment"]["packet"],
+            "32e7cf87-7d8e-4764-94a3-3b0cfa8548c4"
+        );
+        assert_eq!(replayed["volumes"][0]["tight"], false);
     }
 }

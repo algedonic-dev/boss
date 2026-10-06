@@ -92,6 +92,22 @@ pub struct FileRefDraft {
 }
 
 impl FileRefDraft {
+    /// What both `FileRepository` adapters refuse before writing
+    /// anything. The table CHECKs `size_bytes >= 0`; until the
+    /// adapters-agree suite (backlog be459ab9) Postgres answered a
+    /// negative size with that CHECK's raw text as a `Repository`
+    /// error and the in-memory double stored it. One definition, so
+    /// the two cannot word it differently.
+    pub fn validate(&self) -> Result<(), crate::files::error::FileError> {
+        if self.size_bytes < 0 {
+            return Err(crate::files::error::FileError::Validation(format!(
+                "size_bytes must not be negative, got {}",
+                self.size_bytes
+            )));
+        }
+        Ok(())
+    }
+
     /// Convenience for tests + HTTP layer: turn a draft into a row
     /// shape with `deleted_at: None`. Repository implementations are
     /// free to use this or build the FileRef themselves.

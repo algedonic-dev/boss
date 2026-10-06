@@ -1,0 +1,7 @@
+# automation:tenant-seed — measured 2026-09-24T14:00Z to 2026-10-01T14:00Z: 13 audit-log facts.
+# Signs as platform-admin today: crates/core/boss-jobs/src/bootstrap.rs (the tenant publish header).
+
+[[automation]]
+id = "automation:tenant-seed"
+role = "platform-admin"
+description = 'The tenant publish at every start: lands the tenant repo declarations through their batch doors (boss tenant publish).'

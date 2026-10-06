@@ -875,7 +875,8 @@ async fn until_waiting<T>(pool: &sqlx::PgPool, n: i64, racer: &tokio::task::Join
 /// WAITING on it before the hold is released. Let through, the older
 /// write must read the `v5` that committed ahead of it and refuse.
 ///
-/// This is the case the cadence registry's floor shape does not pass:
+/// This is the case the cadence registry's floor shape did not pass
+/// (until backlog 4541d511 moved it onto this module's floor):
 /// `MAX(version)` over rows locked `FOR UPDATE` in ONE statement waits
 /// on `v3`'s lock, then re-reads `v3` alone — a row the lock holder
 /// INSERTED is not in the snapshot that statement began with — so it

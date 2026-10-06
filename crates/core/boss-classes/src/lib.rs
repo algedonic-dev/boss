@@ -18,6 +18,7 @@ pub mod port;
 pub mod postgres;
 #[cfg(feature = "postgres")]
 pub mod rebuild;
+pub mod role_reports;
 
 pub use in_memory::InMemoryClasses;
 pub use port::{ClassError, ClassRepository};

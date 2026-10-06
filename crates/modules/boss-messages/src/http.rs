@@ -88,7 +88,7 @@ async fn batch_messages<R: MessageRepository + 'static>(
     let mut inserted = 0usize;
     for msg in &body {
         if let Err(e) = state.messages.send(msg, &stamp).await {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            return send_refused(e);
         }
         inserted += 1;
     }
@@ -140,11 +140,44 @@ struct OkResponse {
     ok: bool,
 }
 
+/// An inbox page holds this many rows unless the caller asks for a
+/// different number, and never more than `INBOX_MAX_LIMIT` — the
+/// `{data, total, limit, offset}` list convention's figures
+/// (boss-accounts' `DEFAULT_LIST_LIMIT` / `MAX_LIST_LIMIT`).
+pub const INBOX_DEFAULT_LIMIT: u32 = 100;
+pub const INBOX_MAX_LIMIT: u32 = 1000;
+
+#[derive(Deserialize)]
+struct InboxParams {
+    include_archived: Option<String>,
+    kind: Option<String>,
+    unread: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+/// What `GET /api/messages/inbox/{employee_id}` answers (backlog
+/// 74da899d, page audit 5477d9eb GAP 3): one page of the narrowed
+/// inbox, the `{data, total, limit, offset}` envelope every boss-* list
+/// answers, and `kinds` — the whole inbox counted per kind, all and
+/// unread, so a page showing one filtered page can still head it with
+/// the inbox's numbers. Until 2026-10-01 it was every row as a bare
+/// array — 5,129 to one recipient in the audit window — and the page
+/// filtered them in the browser.
+#[derive(Serialize)]
+struct InboxEnvelope {
+    data: Vec<Message>,
+    total: u64,
+    limit: u32,
+    offset: u32,
+    kinds: Vec<crate::port::KindCount>,
+}
+
 async fn inbox<R: MessageRepository + 'static>(
     State(state): State<Arc<MessageApiState<R>>>,
     CurrentUser(user): CurrentUser,
     Path(employee_id): Path<String>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
+    Query(params): Query<InboxParams>,
 ) -> Response {
     // Security gate: a real session may only read its own inbox;
     // operators or trusted internal callers may read any.
@@ -152,11 +185,37 @@ async fn inbox<R: MessageRepository + 'static>(
         return StatusCode::FORBIDDEN.into_response();
     }
     // Archived rows have left the inbox (backlog 8578b91e); a reader
-    // that needs them anyway says `?include_archived=true`.
-    let include_archived = params.get("include_archived").is_some_and(|v| v == "true");
-    match state.messages.inbox(&employee_id, include_archived).await {
-        Ok(msgs) => Json(msgs).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    // that needs them anyway says `?include_archived=true`. `kind` and
+    // `unread=true` narrow the rows (74da899d): the page's filters,
+    // answered by the store rather than over every row in the browser.
+    let flag = |v: &Option<String>| v.as_deref() == Some("true");
+    let query = crate::port::InboxQuery {
+        include_archived: flag(&params.include_archived),
+        kind: params.kind.filter(|k| !k.is_empty()),
+        unread_only: flag(&params.unread),
+        limit: params
+            .limit
+            .unwrap_or(INBOX_DEFAULT_LIMIT)
+            .clamp(1, INBOX_MAX_LIMIT),
+        offset: params.offset.unwrap_or(0),
+    };
+    let page = state.messages.inbox(&employee_id, &query).await;
+    let kinds = state
+        .messages
+        .inbox_counts(&employee_id, query.include_archived)
+        .await;
+    match (page, kinds) {
+        (Ok(page), Ok(kinds)) => Json(InboxEnvelope {
+            data: page.rows,
+            total: page.total,
+            limit: query.limit,
+            offset: query.offset,
+            kinds,
+        })
+        .into_response(),
+        (Err(e), _) | (_, Err(e)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }
 
@@ -495,7 +554,19 @@ async fn send_message<R: MessageRepository + 'static>(
             Json(serde_json::json!({"ok": true, "id": msg.id})),
         )
             .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => send_refused(e),
+    }
+}
+
+/// A send the store refused. A message it cannot hold (a NUL byte, a
+/// reply to a message nobody sent) is the caller's 400, not a 500
+/// (backlog be459ab9). Every caller of the send and batch doors — the
+/// dispatcher's notifiers, the escalation sweep, the inventory restock
+/// alert — treats any non-2xx alike, so none changes with it.
+fn send_refused(e: MessageError) -> Response {
+    match e {
+        MessageError::BadRequest(m) => (StatusCode::BAD_REQUEST, m).into_response(),
+        e => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -712,6 +783,40 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
+    /// A message the store cannot hold is the caller's 400 naming the
+    /// field, not a 500 (backlog be459ab9): a reply to a message nobody
+    /// sent, and a NUL byte in any field.
+    #[tokio::test]
+    async fn a_send_the_store_refuses_is_a_400_naming_the_field() {
+        for (body, field) in [
+            (
+                serde_json::json!({
+                    "sender_id": "emp-1", "recipient_id": "emp-2",
+                    "subject": "re", "body": "b", "reply_to": "msg-nobody",
+                }),
+                "reply_to",
+            ),
+            (
+                serde_json::json!({
+                    "sender_id": "emp-1", "recipient_id": "emp-2",
+                    "subject": "s\u{0}", "body": "b",
+                }),
+                "subject",
+            ),
+        ] {
+            let resp = post_send(test_app(), body).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{field}");
+            let text = http_body_util::BodyExt::collect(resp.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            assert!(
+                String::from_utf8_lossy(&text).contains(field),
+                "{field}: {text:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn health_ok() {
         let resp = test_app()
@@ -742,8 +847,81 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-        let msgs: Vec<Message> = serde_json::from_slice(&body).unwrap();
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let msgs: Vec<Message> = serde_json::from_value(page["data"].clone()).unwrap();
         assert_eq!(msgs.len(), 2);
+    }
+
+    /// emp-001's own inbox read at `query`: the status and the body.
+    async fn own_inbox(query: &str) -> (StatusCode, serde_json::Value) {
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/messages/inbox/emp-001{query}"))
+                    .header("x-boss-user", as_user("emp-001", AccessTier::User))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// THE INBOX READ IS BOUNDED (backlog 74da899d, page audit 5477d9eb
+    /// GAP 3). It answered every row as a bare array, and the page
+    /// filtered them in the browser. Now it is one page of the narrowed
+    /// inbox in the `{data, total, limit, offset}` envelope, the total
+    /// the narrowing's, and `kinds` counting the WHOLE inbox whatever
+    /// the narrowing — the page's header and filter counts. A limit is
+    /// clamped to 1..=1000 and defaults to 100; one that is not a
+    /// number is the caller's 400, not a silent default.
+    #[tokio::test]
+    async fn the_inbox_read_is_one_narrowed_page_with_its_total_and_the_kinds() {
+        let ids = |v: &serde_json::Value| -> Vec<String> {
+            v["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let whole = serde_json::json!([{"kind": "direct", "all": 2, "unread": 1}]);
+
+        let (status, v) = own_inbox("?limit=1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ids(&v).len(), 1);
+        assert_eq!(
+            (&v["total"], &v["limit"], &v["offset"]),
+            (&2.into(), &1.into(), &0.into())
+        );
+        assert_eq!(v["kinds"], whole);
+
+        let (_, v) = own_inbox("?limit=1&offset=1").await;
+        assert_eq!((ids(&v).len(), &v["total"]), (1, &2.into()));
+
+        let (_, v) = own_inbox("?unread=true").await;
+        assert_eq!((ids(&v), &v["total"]), (vec!["msg-001".into()], &1.into()));
+
+        let (_, v) = own_inbox("?kind=direct&unread=true").await;
+        assert_eq!((ids(&v), &v["total"]), (vec!["msg-001".into()], &1.into()));
+
+        let (_, v) = own_inbox("?kind=signal").await;
+        assert_eq!((ids(&v).len(), &v["total"]), (0, &0.into()));
+        assert_eq!(v["kinds"], whole, "the kinds count the whole inbox");
+
+        for (query, limit) in [("", 100), ("?limit=0", 1), ("?limit=5000", 1000)] {
+            let (_, v) = own_inbox(query).await;
+            assert_eq!(v["limit"], limit, "{query:?}");
+        }
+        let (status, _) = own_inbox("?limit=lots").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
