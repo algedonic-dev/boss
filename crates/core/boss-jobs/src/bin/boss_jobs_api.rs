@@ -12,6 +12,10 @@ use boss_jobs::http::{JobsApiState, router_shared, run_mover};
 use boss_jobs::jobs_config::JobsApiConfig;
 use boss_jobs::port::JobsRepository;
 use boss_nats::NatsEventBus;
+use boss_policy_client::role_reader::{
+    HttpRoleReader, MonotonicRoleSnapshotClock, MountedReportMode, SnapshotRoleReader,
+};
+use boss_policy_client::role_reporting::{ReportTally, ReportingPolicyClient};
 use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -83,6 +87,10 @@ async fn main() -> Result<()> {
     );
 
     let (cancel_tx, cancel_rx) = watch::channel(false);
+
+    // Both publication holder evidence and ordinary policy asks use
+    // the same configured authority service.
+    let policy_url = policy_service_url();
 
     // Build the publisher: bus + (optional) Postgres audit writer.
     let mut publisher = boss_core::publisher::DomainPublisher::new(
@@ -172,7 +180,14 @@ async fn main() -> Result<()> {
             cfg.nats_url.clone(),
         ));
         let kind_registry: Arc<dyn boss_jobs::WorkflowRegistry> =
-            Arc::new(boss_jobs::PgWorkflows::new(pool.clone()));
+            Arc::new(boss_jobs::PgWorkflows::guarded(
+                pool.clone(),
+                Arc::new(
+                    boss_policy_client::coverage::HttpCoverageSnapshotSource::new(
+                        policy_url.clone(),
+                    ),
+                ),
+            ));
         reconcile_platform_workflows(kind_registry.as_ref(), jobs.as_ref(), &clock).await;
         let plugin_registry: Arc<dyn boss_jobs::StepPluginRegistry> =
             Arc::new(boss_jobs::PgStepPlugins::new(pool.clone()));
@@ -306,6 +321,10 @@ async fn main() -> Result<()> {
     )
 }
 
+fn policy_service_url() -> String {
+    std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy"))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_server<R: JobsRepository + 'static>(
     job_edges: Option<std::sync::Arc<dyn boss_jobs::job_edges::JobEdgesRegistry>>,
@@ -354,7 +373,7 @@ async fn run_server<R: JobsRepository + 'static>(
     // of truth shared with the config generator. Override via
     // BOSS_POLICY_URL. The 7060/7250 collision (`bb60c58` +
     // `8bf0f0a`) that motivated boss-ports lived right here.
-    let policy_url = std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy"));
+    let policy_url = policy_service_url();
     // Banner so a port-collision misconfiguration surfaces in
     // journalctl immediately — not 30 minutes later when the
     // landing page won't load — a guard against the historical
@@ -365,9 +384,29 @@ async fn run_server<R: JobsRepository + 'static>(
     // other caller, and every caller on an instance without a sim, is
     // enforced per-role by the inner ReqwestPolicyClient (backlog
     // 85e7f10f — the header alone used to pass every check).
-    let policy: Arc<dyn boss_policy_client::PolicyClient> =
+    let original_policy: Arc<dyn boss_policy_client::PolicyClient> =
         boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
             boss_policy_client::ReqwestPolicyClient::new("jobs", policy_url),
+        ));
+    let role_mode = Arc::new(MountedReportMode::mount());
+    let roles = Arc::new(SnapshotRoleReader::new(
+        boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+        Arc::new(MonotonicRoleSnapshotClock),
+    ));
+    let role_source = Arc::new(HttpRoleReader::new(
+        std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
+        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
+        boss_policy_client::User::service("jobs"),
+    )?);
+    let role_tally = Arc::new(ReportTally::new(
+        boss_policy_client::role_service::REPORT_CAPACITY,
+    ));
+    let policy: Arc<dyn boss_policy_client::PolicyClient> =
+        Arc::new(ReportingPolicyClient::with_mode_source(
+            original_policy.clone(),
+            roles.clone(),
+            role_tally.clone(),
+            role_mode.clone(),
         ));
     // The cadence door's publish / retire ask the same client the
     // workflow routes do; clone before the state takes it.
@@ -389,6 +428,15 @@ async fn run_server<R: JobsRepository + 'static>(
     // registry and the sensor registry with the main router and the
     // sensors door; clone the Arcs before the state takes them.
     let department_jobs: Arc<dyn JobsRepository> = jobs.clone();
+    // The broker-stage door (design 6e28ed42; backlog 1e50e66b): OFF
+    // unless all five BOSS_BROKER_STAGE_* variables are set, and no
+    // manifest sets one — the decision authorized no activation. One Arc,
+    // read by the layer that takes the token off the request and by the
+    // rotation door that judges a runner credential's stage with it.
+    let stage_door = Arc::new(boss_jobs::credentials::broker_stage::Door::from_env());
+    let stage_packets: Arc<dyn boss_jobs::credentials::broker_stage::StagePackets> = Arc::new(
+        boss_jobs::credentials::broker_stage::JobsStagePackets(jobs.clone()),
+    );
     let department_kinds = kind_registry.clone();
     let department_sensors = sensors.clone();
     // The dispatcher's own surface, read twice here: the departments'
@@ -445,6 +493,13 @@ async fn run_server<R: JobsRepository + 'static>(
         dispatcher_schedule: Some(Arc::new(
             boss_jobs::dispatcher_schedule::ReqwestDispatcherSchedule::new(dispatcher_url.clone()),
         )),
+        role_guards: Some(Arc::new(
+            boss_policy_client::role_guard::RoleGuardReporter::new(
+                roles.clone(),
+                role_tally.clone(),
+                role_mode.clone(),
+            ),
+        )),
     };
     let state = Arc::new(state);
     // The mover loop beside the routes: one per replica, reading the
@@ -452,11 +507,21 @@ async fn run_server<R: JobsRepository + 'static>(
     // the server does.
     tokio::spawn(run_mover(state.clone(), cancel_rx.clone()));
     info!("yard mover started: /api/yard/moves and /api/yard/moves/stream");
+    let scheduling_role_guards = state.role_guards.clone();
     let mut app = router_shared(state);
+    app = app.merge(boss_policy_client::role_inventory::router(
+        "jobs",
+        "/api/jobs/actor-role-reports",
+        original_policy,
+        roles.clone(),
+        role_mode.clone(),
+        role_tally,
+    ));
     if let Some(repo) = scheduling {
         info!("scheduling routes mounted at /api/scheduling/*");
         app = app.merge(boss_jobs::scheduling::http::router(
             boss_jobs::scheduling::http::SchedulingApiState {
+                role_guards: scheduling_role_guards,
                 repo,
                 publisher: Some(scheduling_publisher),
                 clock: clock.clone(),
@@ -484,7 +549,8 @@ async fn run_server<R: JobsRepository + 'static>(
     if let Some(registry) = credentials {
         info!("credentials registry routes mounted at /api/credentials (locations, never values)");
         app = app.merge(boss_jobs::credentials::http::router(
-            boss_jobs::credentials::http::CredentialsApiState { registry },
+            boss_jobs::credentials::http::CredentialsApiState::new(registry)
+                .with_stage(stage_door.clone(), Some(stage_packets)),
         ));
     }
     if let Some(log) = agent_runs {
@@ -602,6 +668,12 @@ async fn run_server<R: JobsRepository + 'static>(
         boss_jobs::runner_credential::WHOAMI_PATH,
     );
     let app = boss_jobs::runner_credential::mount(app, runner_slots);
+    info!(
+        "broker-stage door mounted: {} is taken off every request; {}",
+        boss_jobs::credentials::broker_stage::HEADER,
+        stage_door.describe(),
+    );
+    let app = boss_jobs::credentials::broker_stage::mount(app, stage_door);
     // The machine gate (design 6805c764; it was 7fcd78fa phase 1 here
     // alone): the shared boss-core middleware every service port
     // mounts, reading its mode and token slots from mounted files —
@@ -622,6 +694,13 @@ async fn run_server<R: JobsRepository + 'static>(
         .with_context(|| format!("binding HTTP listener on {http_addr}"))?;
     info!(addr = %http_addr, "jobs HTTP API listening");
 
+    let role_refresh = tokio::spawn(roles.run_refresh_loop(
+        role_source,
+        role_mode,
+        boss_policy_client::role_service::REFRESH_CADENCE,
+        cancel_rx.clone(),
+    ));
+
     let mut http_rx = cancel_rx.clone();
     let http_task = tokio::spawn(async move {
         let shutdown = async move {
@@ -635,10 +714,19 @@ async fn run_server<R: JobsRepository + 'static>(
         }
     });
 
-    // Wait for Ctrl+C.
-    tokio::signal::ctrl_c().await.ok();
+    let interrupt = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(%error, "jobs interrupt signal unavailable");
+            std::future::pending::<()>().await;
+        }
+    };
+    // Gate evidence owns process termination; this path owns interrupts.
+    interrupt.await;
     info!("shutdown signal received");
     let _ = cancel_tx.send(true);
+    role_refresh
+        .await
+        .context("joining jobs actor-role refresh")??;
 
     let _ = http_task.await;
     info!("boss-jobs-api shut down cleanly");

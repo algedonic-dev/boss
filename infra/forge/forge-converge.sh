@@ -83,6 +83,53 @@ deposit_rc=0
     --rule "$INFRA/dispatcher/rules/broker-rotates-the-forge-host-checkout-token.toml" \
     --checkout "$REPO" --dest "$FORGE_TOKEN_FILE" --owner "$OWNER" || deposit_rc=$?
 
+# THE ESTATE MACHINE TOKEN, ALL THREE SLOTS, ROOT-ONLY (design-doc
+# 20058482, question forge-token, David 2026-10-06; backlog 88379df3).
+# Every shell caller on this host already asks infra/lib/secret-header.sh
+# for the token and found no file; machine-token-deposit.sh reads Secret
+# boss/boss-machine-token through the admin kubeconfig this host already
+# holds, makes /etc/boss/machine-token equal to it (root:root, 0700 and
+# 0600), and proves it by the gate's own answer to a stamped read.
+#
+# HERE, BEFORE THE FETCH: the fetch is the first step `set -e` can end
+# this run on, and a rotation's drain (1440 minutes, the rule's line)
+# is counted against how often this runs, not how often the forge
+# token works. Ten minutes a tick is 144 ticks inside one drain.
+#
+# ITS EXIT IS RECORDED AND NEVER CARRIED. Every other step's exit below
+# reds this run; this one's does not, on purpose. The converge installs
+# this host's repairs and owes the token nothing — a host with no token
+# is a host whose callers send without one, which a gate in `report`
+# admits and tallies (CLAUDE.md §Diagnosis: an arm that needs the patient
+# is not an arm). The script names its own fault on stderr and on this
+# run's packet (machine_token_secret / _action / _effect), and the
+# status rides beside them.
+#
+# ITS TIME IS BOUNDED TOO (adversarial review 9a1e289b, B1). An exit that
+# is not carried is half of owing nothing: the first draft ran this in
+# the foreground with no bound, and a sleeping kubectl held the converge
+# at this line until the unit's TimeoutStartSec killed it — before the
+# fetch, before install.sh, on every tick for as long as the cluster API
+# or the docker daemon stalled. The script bounds each of its own waits;
+# this bounds the script, so a wait nobody thought of costs
+# FORGE_DEPOSIT_BOUND_S and never a tick. A stop reads 124 (or 137 when
+# TERM was not enough) in machine_token_deposit_status, the action line
+# says what that means, and the converge goes on. Nothing alarms on a
+# non-zero status yet: it rides a green packet, and until something reads
+# it the gates' own tally of this host's misses is the alarm.
+FORGE_DEPOSIT_BOUND_S="${BOSS_FORGE_DEPOSIT_BOUND_S:-180}"
+machine_token_rc=0
+timeout -k 5 "$FORGE_DEPOSIT_BOUND_S" "$INFRA/forge/machine-token-deposit.sh" \
+    --rule "$INFRA/dispatcher/rules/broker-rotates-the-machine-token.toml" \
+    --dest "${BOSS_MACHINE_TOKEN_DIR:-/etc/boss/machine-token}" || machine_token_rc=$?
+run_summary_field machine_token_deposit_status "$machine_token_rc"
+case "$machine_token_rc" in
+    124 | 137)
+        echo "forge-converge: the machine token deposit did not finish inside $FORGE_DEPOSIT_BOUND_S seconds and was stopped; the converge goes on, and the next tick deposits again" >&2
+        run_summary_field machine_token_action "STOPPED: the deposit did not finish inside $FORGE_DEPOSIT_BOUND_S seconds (a stalled cluster API or docker daemon); any slot it had written stands, and the next tick follows the Secret again"
+        ;;
+esac
+
 # Fetch and check out forge main as the checkout's OWNER, never as root
 # — a root `git` in a david-owned clone leaves root-owned objects that
 # break the owner's later pulls. `-l` gives the owner's login env so the

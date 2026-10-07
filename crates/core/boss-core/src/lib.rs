@@ -26,6 +26,7 @@ pub mod publisher;
 pub mod rebuild;
 pub mod role_of_record;
 pub mod roles;
+pub mod session_claims;
 pub mod sim_origin;
 pub mod startup;
 pub mod tenant_manifest;

@@ -174,6 +174,46 @@ exit 0
 }
 
 #[test]
+fn a_preparation_declaration_creates_only_its_named_empty_secret() {
+    let c = Case::new("prepare");
+    write_file(
+        &c.rules.join("broker-prepares-key.toml"),
+        r#"[[rule]]
+name = "broker-prepares-key"
+why = "fixture"
+on_event = "step.done.credential-rotation"
+[[rule.do]]
+handler = "credential.prepare.ssh-deposit"
+args = { secret_namespace = "\"boss\"", secret_name = "\"transport-key-fixture\"" }
+"#,
+    );
+    c.present(&["forge-token-fixture", "tunnel-creds-fixture"]);
+    let (rc, out, err) = c.run(r#"ensure_declared_secrets "$K" "$R""#, &[]);
+    assert_eq!(rc, 0, "{err}");
+    assert!(out.contains("created boss/transport-key-fixture"), "{out}");
+    let creates: Vec<_> = c
+        .calls()
+        .lines()
+        .filter(|line| line.contains("create secret"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        creates,
+        ["kubectl -n boss create secret generic transport-key-fixture"]
+    );
+    assert!(!c.calls().contains("patch") && !c.calls().contains("--from-"));
+    c.present(&[
+        "forge-token-fixture",
+        "tunnel-creds-fixture",
+        "transport-key-fixture",
+    ]);
+    write_file(&c.root.join("calls"), "");
+    let (rc, _, err) = c.run(r#"ensure_declared_secrets "$K" "$R""#, &[]);
+    assert_eq!(rc, 0, "{err}");
+    assert!(!c.calls().contains("create secret"));
+}
+
+#[test]
 fn the_secrets_are_derived_from_the_broker_rules_and_nothing_else() {
     let c = Case::new("derive");
     let (rc, out, err) = c.run(r#"broker_secrets "$R""#, &[]);

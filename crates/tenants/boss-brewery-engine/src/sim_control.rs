@@ -285,22 +285,59 @@ async fn health() -> &'static str {
 
 /// Run the control + telemetry server. Binds `bind` (e.g.
 /// `127.0.0.1:7011`); localhost-only. Spawned by the daemon as a
-/// background task — returns only on listener error.
+/// background task; report refresh shares its listener and shutdown lifetime.
 pub async fn serve(bind: String, telemetry: SharedTelemetry, seeds: PathBuf) -> anyhow::Result<()> {
     let state = ControlState { telemetry, seeds };
-    let app = Router::new()
-        .route("/telemetry", get(get_telemetry))
-        .route("/config", get(get_config).post(post_config))
-        .route("/health", get(health))
-        .with_state(state);
+    let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+        boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+        Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+    ));
+    let mode = Arc::new(boss_policy_client::role_reader::MountedReportMode::mount());
+    let source = Arc::new(boss_policy_client::role_reader::HttpRoleReader::new(
+        std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
+        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
+        boss_policy_client::User::service("sim-control"),
+    )?);
+    let wiring = boss_policy_client::role_service::assemble(
+        "sim-control",
+        "/actor-role-reports",
+        Arc::new(boss_policy_client::ReqwestPolicyClient::new(
+            "sim-control",
+            std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
+        )),
+        roles.clone(),
+        mode.clone(),
+        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
+            boss_policy_client::role_service::REPORT_CAPACITY,
+        )),
+    );
+    let app = control_http_router(state, wiring.inventory);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(%bind, "sim control + telemetry server listening");
     // No database here, so no outbox: this gate's facts reach no log,
     // and a clean window that names `sim-control` is never clean
     // (design 21946380) — said at WARN by the mount.
     let app = boss_core::machine_gate::mount(app, "sim-control", &["/health"], None);
-    axum::serve(listener, app).await?;
+    boss_policy_client::role_service::serve_with_refresh(
+        listener,
+        app,
+        roles,
+        source,
+        mode,
+        boss_policy_client::role_service::REFRESH_CADENCE,
+        boss_policy_client::role_service::shutdown_signal(),
+    )
+    .await?;
     Ok(())
+}
+
+fn control_http_router(state: ControlState, inventory: Router) -> Router {
+    Router::new()
+        .route("/telemetry", get(get_telemetry))
+        .route("/config", get(get_config).post(post_config))
+        .route("/health", get(health))
+        .with_state(state)
+        .merge(inventory)
 }
 
 #[cfg(test)]
@@ -310,6 +347,95 @@ mod tests {
     use boss_sim::actor_coverage;
 
     use super::*;
+
+    #[tokio::test]
+    async fn control_inventory_preserves_telemetry_and_has_no_durable_window() {
+        use boss_policy_client::{Action, FakePolicyClient, Resource, Scope, User};
+        let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+            boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+            Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+        ));
+        let tally = Arc::new(boss_policy_client::role_reporting::ReportTally::new(8));
+        let wiring = boss_policy_client::role_service::assemble(
+            "sim-control",
+            "/actor-role-reports",
+            Arc::new(
+                FakePolicyClient::builder()
+                    .allow(
+                        "report-reader",
+                        Action::Read,
+                        Resource::policy_rule(),
+                        Scope::All,
+                    )
+                    .build(),
+            ),
+            roles,
+            Arc::new(boss_policy_client::role_reporting::ReportMode::Report),
+            tally.clone(),
+        );
+        let telemetry = SimTelemetry::new(
+            "automation:sim".into(),
+            "system-sim".into(),
+            "direct://127.0.0.1".into(),
+        );
+        let expected = serde_json::to_value(&telemetry).unwrap();
+        let app = control_http_router(
+            ControlState {
+                telemetry: Arc::new(Mutex::new(telemetry)),
+                seeds: PathBuf::from("unused-control-fixture"),
+            },
+            wiring.inventory,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        assert_eq!(
+            client
+                .get(format!("{url}/health"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            client
+                .get(format!("{url}/telemetry"))
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap(),
+            expected
+        );
+        let denied = client
+            .get(format!("{url}/actor-role-reports"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
+        let mut user = User::service("reader");
+        user.role = "report-reader".into();
+        let allowed = client
+            .get(format!("{url}/actor-role-reports"))
+            .header("x-boss-user", serde_json::to_string(&user).unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), reqwest::StatusCode::OK);
+        let body = allowed.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(body["service"], "sim-control");
+        assert_eq!(body["snapshot"]["state"], "never-loaded");
+        assert_eq!(body["report"]["durable_window"], false);
+        assert!(tally.snapshot().rows.is_empty());
+        server.abort();
+    }
 
     #[test]
     fn record_tick_stores_actor_coverage_on_the_wire() {

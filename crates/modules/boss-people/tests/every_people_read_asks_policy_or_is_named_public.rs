@@ -157,7 +157,7 @@ fn derived_get_routes() -> BTreeSet<String> {
         };
         let ident =
             |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c == '_');
-        if ident(module) && ident(func) && func.ends_with("_router") {
+        if ident(module) && ident(func) && is_router_function(func) {
             sources.push((format!("src/{module}.rs"), format!("pub fn {func}(")));
         }
     }
@@ -178,6 +178,31 @@ fn derived_get_routes() -> BTreeSet<String> {
         gets.extend(routes.into_iter().filter(|(_, get)| *get).map(|(p, _)| p));
     }
     gets
+}
+
+fn is_router_function(name: &str) -> bool {
+    name.ends_with("_router")
+        || name
+            .strip_suffix("_with_reports")
+            .is_some_and(|base| base.ends_with("_router"))
+}
+
+#[test]
+fn the_route_reader_includes_report_routers_and_excludes_other_helpers() {
+    for name in [
+        "scope_router",
+        "scope_router_with_reports",
+        "workflow_router",
+    ] {
+        assert!(is_router_function(name), "lost router {name}");
+    }
+    for name in [
+        "scope_router_settings",
+        "scope_with_reports",
+        "bootstrap_by_email",
+    ] {
+        assert!(!is_router_function(name), "read helper {name} as a router");
+    }
 }
 
 // ---------------------------------------------------------------------------

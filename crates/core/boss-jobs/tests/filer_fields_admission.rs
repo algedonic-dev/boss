@@ -45,7 +45,7 @@ fn admin_header() -> String {
 
 /// A router over an in-memory stack seeded with the given Workflows.
 fn app_with(specs: Vec<WorkflowSpec>) -> (axum::Router, Arc<InMemoryJobs>) {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     for spec in specs {
         kinds.seed(spec).expect("spec seeds");
     }

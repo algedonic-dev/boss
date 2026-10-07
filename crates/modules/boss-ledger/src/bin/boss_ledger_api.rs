@@ -96,6 +96,35 @@ async fn main() -> Result<()> {
         }
     };
 
+    let policy = boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
+        boss_policy_client::ReqwestPolicyClient::new(
+            "ledger",
+            std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
+        ),
+    ));
+
+    let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+        boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+        Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+    ));
+    let mode = Arc::new(boss_policy_client::role_reader::MountedReportMode::mount());
+    let source = Arc::new(boss_policy_client::role_reader::HttpRoleReader::new(
+        std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
+        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
+        boss_policy_client::User::service("ledger"),
+    )?);
+    let wiring = boss_policy_client::role_service::assemble(
+        "ledger",
+        "/api/ledger/actor-role-reports",
+        policy,
+        roles.clone(),
+        mode.clone(),
+        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
+            boss_policy_client::role_service::REPORT_CAPACITY,
+        )),
+    );
+    let policy = wiring.policy;
+
     let state = LedgerApiState {
         pool: pool.clone(),
         publisher,
@@ -105,14 +134,9 @@ async fn main() -> Result<()> {
         // authorized at the boundary; everything else is enforced
         // per-role (backlog 85e7f10f). Required since backlog 7048afa8:
         // the surface has no open configuration.
-        policy: boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
-            boss_policy_client::ReqwestPolicyClient::new(
-                "ledger",
-                std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
-            ),
-        )),
+        policy,
     };
-    let app = router(state);
+    let app = router(state).merge(wiring.inventory);
     // Sim-origin middleware: extract x-sim-origin header and set the
     // per-request task-local so the publisher inherits the sim
     // marker. Closes the gap where a sim chain could trigger a
@@ -140,9 +164,16 @@ async fn main() -> Result<()> {
         let _ = http_cancel.changed().await;
     };
     let http_task = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown)
-            .await
+        if let Err(e) = boss_policy_client::role_service::serve_with_refresh(
+            listener,
+            app,
+            roles,
+            source,
+            mode,
+            boss_policy_client::role_service::REFRESH_CADENCE,
+            shutdown,
+        )
+        .await
         {
             tracing::error!(error = %e, "HTTP server exited with error");
         }

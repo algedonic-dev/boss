@@ -1,15 +1,15 @@
-//! Rebuild the `bulletins` + `bulletin_dismissals` projections from
-//! `audit_log`. Tenth (and final per-service) projection rebuilder.
+//! Rebuild bulletins, dismissals, manual sections and version history from audit_log.
 //!
 //! State events consumed:
 //! - `content.bulletin.created` / `.updated` — full Bulletin row
 //! - `content.bulletin.deleted` — `{id, deleted_at}`
 //! - `content.bulletin.dismissed` — `{bulletin_id, employee_id, dismissed_at}`
 //!
-//! Manual sections (manual_sections + manual_section_history) are
-//! out of scope for this commit — separate rebuilder.
+//! Manual facts carry the full resulting section, new version and stored
+//! history identity. Incomplete legacy coverage or malformed manual facts
+//! refuse the protected transaction before any content table is cleared.
 
-use boss_events::replay::{Applied, replay_projection};
+use boss_events::replay::{Applied, replay_projection_checked};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use sqlx::PgPool;
@@ -33,6 +33,7 @@ pub struct RebuildReport {
     pub bulletins_upserted: u64,
     pub bulletins_deleted: u64,
     pub dismissals_inserted: u64,
+    pub manual_versions_replayed: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,16 +46,24 @@ struct DismissPayload {
 pub async fn rebuild_content(pool: &PgPool) -> Result<RebuildReport, RebuildError> {
     let mut report = RebuildReport::default();
 
-    let stats = replay_projection(
+    let stats = replay_projection_checked(
         pool,
         REBUILD_LOCK_KEY,
         &[
             "DELETE FROM bulletin_dismissals",
             "DELETE FROM bulletins",
+            "DELETE FROM manual_section_history",
+            "DELETE FROM manual_sections",
         ],
-        "kind LIKE 'content.bulletin.%'",
+        "kind LIKE 'content.bulletin.%' OR kind LIKE 'content.manual.%'",
+        crate::manual_rebuild::validate_manual,
         async |conn, ev| {
             match ev.kind.as_str() {
+                crate::events::SECTION_CREATED | crate::events::SECTION_UPDATED => {
+                    crate::manual_rebuild::apply_manual(conn, &ev).await?;
+                    report.manual_versions_replayed += 1;
+                    Ok(Applied::Yes)
+                }
                 "content.bulletin.created" | "content.bulletin.updated" => {
                     let b: Bulletin = match serde_json::from_value(ev.payload.clone()) {
                         Ok(b) => b,

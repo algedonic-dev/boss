@@ -39,6 +39,20 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde_json::json;
 use uuid::Uuid;
 
+#[tokio::test]
+async fn an_over_bound_pg_population_refuses_instead_of_returning_a_clean_prefix() {
+    let db = boss_testing::TestDb::new().await;
+    sqlx::query("INSERT INTO audit_log(event_id,timestamp,source,kind,payload) SELECT gen_random_uuid(),$1,'suite-bound','machine_gate.previous_presented','{}'::jsonb FROM generate_series(1,65537)")
+        .bind(at(1)).execute(&db.pool).await.unwrap();
+    let result = PgGateEvidence::new(db.pool.clone())
+        .facts(Gate::MachineGate, at(0))
+        .await;
+    assert!(
+        result.is_err(),
+        "a bounded adapter must not return an incomplete clean prefix"
+    );
+}
+
 /// The port, and the one way into a read-only port: record a fact the
 /// way a gate does.
 trait World {
@@ -213,14 +227,15 @@ async fn the_window_holds_every_fact_from_its_start_inclusive<W: World>(w: &W, a
 
 /// The mode each service was in when the window opened is its NEWEST
 /// `recording_began` before the start — one per service, never an older
-/// one, and never another kind from before the start.
+/// one. Facts from that opening epoch remain visible: a first sighting
+/// cannot prove when the final usage stopped.
 async fn each_service_opens_the_window_in_its_newest_earlier_mode<W: World>(w: &W, adapter: &str) {
     for e in [
         began("suite-jobs", Mode::Report, at(1)),
         began("suite-jobs", Mode::Off, at(2)),
         began("suite-jobs", Mode::Report, at(6)),
         began("suite-people", Mode::Report, at(0)),
-        missed("suite-people", at(2), "10.20.0.2"),
+        missed("suite-people", at(3), "10.20.0.2"),
     ] {
         w.record(e).await;
     }
@@ -230,6 +245,7 @@ async fn each_service_opens_the_window_in_its_newest_earlier_mode<W: World>(w: &
         vec![
             row("machine_gate.recording_began", "suite-people", at(0)),
             row("machine_gate.recording_began", "suite-jobs", at(2)),
+            row("machine_gate.would_refuse", "suite-people", at(3)),
             row("machine_gate.recording_began", "suite-jobs", at(6)),
         ],
         "{adapter}"
@@ -493,4 +509,55 @@ async fn every_gate_evidence_kind_is_registered() {
     let mut kinds: Vec<String> = KINDS.iter().map(|k| k.to_string()).collect();
     kinds.sort();
     assert_eq!(registered, kinds);
+}
+
+#[tokio::test]
+async fn opening_epoch_sightings_survive_a_later_clean_retirement_in_both_adapters() {
+    let db = boss_testing::TestDb::new().await;
+    let memory = InMemory(Mutex::new(Vec::new()));
+    let postgres = Postgres(db.pool.clone());
+    let service = "suite-retired";
+    let start = began(service, Mode::Report, at(0));
+    let sighting = fact(
+        Gate::MachineGate,
+        Fact::PreviousPresented,
+        service,
+        at(1),
+        json!({"instance":format!("{service}-p1"),"mode":"report","recording_since":at(0),"key":{"presented":"previous"}}),
+    );
+    let end = fact(
+        Gate::MachineGate,
+        Fact::RecordingEnded,
+        service,
+        at(3),
+        json!({"instance":format!("{service}-p1"),"clean":true}),
+    );
+    for record in [start, sighting.clone(), end] {
+        memory.record(record.clone()).await;
+        postgres.record(record).await;
+    }
+    let expected = memory.log().facts(Gate::MachineGate, at(2)).await.unwrap();
+    let actual = postgres
+        .log()
+        .facts(Gate::MachineGate, at(2))
+        .await
+        .unwrap();
+    assert!(actual.iter().any(|record| record.id == sighting.id));
+    assert_eq!(
+        serde_json::to_value(actual).unwrap(),
+        serde_json::to_value(expected).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn an_over_byte_bound_pg_fact_refuses_instead_of_allocating_a_clean_prefix() {
+    let db = boss_testing::TestDb::new().await;
+    sqlx::query("INSERT INTO audit_log(event_id,timestamp,source,kind,payload) VALUES(gen_random_uuid(),$1,'suite-byte-bound','machine_gate.previous_presented',jsonb_build_object('oversized',repeat('x',8388609)))")
+        .bind(at(1)).execute(&db.pool).await.unwrap();
+    assert!(
+        PgGateEvidence::new(db.pool.clone())
+            .facts(Gate::MachineGate, at(0))
+            .await
+            .is_err()
+    );
 }

@@ -63,11 +63,33 @@ async fn main() -> Result<()> {
             ),
         ));
 
+    let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+        boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+        Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+    ));
+    let mode = Arc::new(boss_policy_client::role_reader::MountedReportMode::mount());
+    let source = Arc::new(boss_policy_client::role_reader::HttpRoleReader::new(
+        std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
+        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
+        boss_policy_client::User::service("subject-kinds"),
+    )?);
+    let wiring = boss_policy_client::role_service::assemble(
+        "subject-kinds",
+        "/api/subject-kinds/actor-role-reports",
+        policy,
+        roles.clone(),
+        mode.clone(),
+        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
+            boss_policy_client::role_service::REPORT_CAPACITY,
+        )),
+    );
+    let policy = wiring.policy;
+
     let state = SubjectKindsApiState {
         subject_kinds,
         policy,
     };
-    let mut app = router(state);
+    let mut app = router(state).merge(wiring.inventory);
     // The subjects identity surface (R1): mint + existence probe.
     // Postgres-only — the identity table has no in-memory twin.
     if let Some(pool) = subjects_pool.clone() {
@@ -98,6 +120,15 @@ async fn main() -> Result<()> {
             .as_ref()
             .map(boss_events::outbox::PgOutboxRecorder::shared),
     );
-    axum::serve(listener, app).await?;
+    boss_policy_client::role_service::serve_with_refresh(
+        listener,
+        app,
+        roles,
+        source,
+        mode,
+        boss_policy_client::role_service::REFRESH_CADENCE,
+        boss_policy_client::role_service::shutdown_signal(),
+    )
+    .await?;
     Ok(())
 }

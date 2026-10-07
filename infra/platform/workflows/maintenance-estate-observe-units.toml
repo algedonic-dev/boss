@@ -6,7 +6,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "The five-minute unit half of the host observation loop (boss-estate-observe-units): non-cluster hosts report their own unit health, so 'is boss-train.service alive' is a SoR read instead of a human on the host (729329c6)."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
 
 [[workflow.step]]
 title = "scheduled"

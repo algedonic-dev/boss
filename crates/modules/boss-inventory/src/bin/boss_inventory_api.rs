@@ -129,6 +129,30 @@ async fn main() -> Result<()> {
             clock: proc_clock,
         }))
     };
+    let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+        boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+        Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+    ));
+    let mode = Arc::new(boss_policy_client::role_reader::MountedReportMode::mount());
+    let source = Arc::new(boss_policy_client::role_reader::HttpRoleReader::new(
+        std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
+        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
+        boss_policy_client::User::service("inventory"),
+    )?);
+    let wiring = boss_policy_client::role_service::assemble(
+        "inventory",
+        "/api/inventory/actor-role-reports",
+        Arc::new(boss_policy_client::ReqwestPolicyClient::new(
+            "inventory",
+            std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
+        )),
+        roles.clone(),
+        mode.clone(),
+        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
+            boss_policy_client::role_service::REPORT_CAPACITY,
+        )),
+    );
+    let app = inventory_http_router(app, wiring.inventory);
     // Sim-origin middleware: extract x-sim-origin header and set the
     // per-request task-local so the publisher inherits the sim
     // marker. Closes the gap where a sim chain could trigger a
@@ -152,6 +176,134 @@ async fn main() -> Result<()> {
         &["/api/inventory/health"],
         Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
     );
-    axum::serve(listener, app).await?;
+    boss_policy_client::role_service::serve_with_refresh(
+        listener,
+        app,
+        roles,
+        source,
+        mode,
+        boss_policy_client::role_service::REFRESH_CADENCE,
+        boss_policy_client::role_service::shutdown_signal(),
+    )
+    .await?;
     Ok(())
+}
+
+fn inventory_http_router(domain: axum::Router, inventory: axum::Router) -> axum::Router {
+    domain.merge(inventory)
+}
+
+#[cfg(test)]
+mod role_inventory_tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use boss_policy_client::{Action, FakePolicyClient, Resource, Scope, User};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn inventory_mount_preserves_domain_and_protects_inventory() {
+        let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+            boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+            Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+        ));
+        let tally = Arc::new(boss_policy_client::role_reporting::ReportTally::new(8));
+        let policy = Arc::new(
+            FakePolicyClient::builder()
+                .allow(
+                    "report-reader",
+                    Action::Read,
+                    Resource::policy_rule(),
+                    Scope::All,
+                )
+                .build(),
+        );
+        let wiring = boss_policy_client::role_service::assemble(
+            "inventory",
+            "/api/inventory/actor-role-reports",
+            policy,
+            roles,
+            Arc::new(boss_policy_client::role_reporting::ReportMode::Report),
+            tally.clone(),
+        );
+        let app = inventory_http_router(
+            router(InventoryApiState {
+                inventory: Arc::new(boss_inventory::InMemoryInventory::new(vec![], vec![])),
+                publisher: None,
+                clients: None,
+                classes_client: None,
+                clock: Arc::new(boss_clock_client::WallClockClient),
+            }),
+            wiring.inventory,
+        );
+        let domain = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/inventory/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(domain.status(), StatusCode::OK);
+        let health: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(domain.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(health["status"], "ok");
+        let items = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/inventory/items")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(items.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(items.into_body(), 4096).await.unwrap(),
+            "[]"
+        );
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/inventory/actor-role-reports")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let mut user = User::service("reader");
+        user.role = "report-reader".into();
+        let allowed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/inventory/actor-role-reports")
+                    .header("x-boss-user", serde_json::to_string(&user).unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(allowed.into_body(), 16384)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["service"], "inventory");
+        assert_eq!(body["snapshot"]["state"], "never-loaded");
+        assert_eq!(body["report"]["durable_window"], false);
+        assert!(tally.snapshot().rows.is_empty());
+    }
 }

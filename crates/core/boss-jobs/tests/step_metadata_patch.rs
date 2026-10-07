@@ -645,7 +645,7 @@ fn admin() -> User {
 }
 
 fn registry_app() -> Router {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds
         .seed(metadata_gated_spec())
         .expect("seed the metadata-gated kind");

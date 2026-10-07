@@ -65,7 +65,7 @@ fn app() -> (axum::Router, Arc<InMemoryJobs>) {
 fn app_with_clock(
     clock: Arc<dyn boss_clock_client::ClockClient>,
 ) -> (axum::Router, Arc<InMemoryJobs>) {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds.seed(test_kind()).unwrap();
     let jobs = Arc::new(InMemoryJobs::new());
     let policy: Arc<dyn PolicyClient> = Arc::new(

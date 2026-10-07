@@ -20,6 +20,7 @@ mod delivery_policy;
 mod design;
 mod dispatch;
 mod dispatch_hook;
+mod dispatch_started;
 mod disprove;
 mod dock_preview;
 mod doctor;
@@ -31,6 +32,7 @@ mod estate;
 mod events;
 mod freshness;
 mod gate;
+mod gemini_execution;
 mod git_auth;
 mod host_readiness;
 mod identity;
@@ -50,6 +52,7 @@ mod own_temp;
 mod owner;
 mod park;
 mod prior_work;
+mod probe_reader;
 mod prose;
 mod prove;
 mod publish;
@@ -109,6 +112,9 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
+    /// Installer compatibility check for the published dev controller.
+    #[command(hide = true)]
+    DevControlContract,
     #[command(flatten)]
     Roster(roster::Cmd),
     #[command(flatten)]
@@ -602,6 +608,11 @@ enum Commands {
     /// and the prompt's rules carry them as the commit trailer, saying
     /// where they came from (89d1572c).
     Dispatch {
+        /// After reading the whole START: record the declared own-run
+        /// worker receipt. Requires BOSS_AGENT_RUN and your ACTIVE building
+        /// assignment; carries no timestamp, never creates/reassigns a run.
+        #[arg(long, conflicts_with_all=["report","from_hook","next","step","model","budget","effort","force"])]
+        started: bool,
         /// The hook's door (design 511fa7d4 car 2b): read a Claude Code
         /// PreToolUse payload on stdin and record the Agent call as a
         /// run — dispatch the packet the prompt names with the prompt as
@@ -871,7 +882,8 @@ enum Commands {
         /// (`--park-probe` / `--park-expect` on `boss gate`, copied to
         /// the car's `proof_probe` / `proof_expect`) instead of one
         /// given here. `--verified` defaults to the car's summary.
-        /// Runs HERE, on this box — as you, with no timeout — but in
+        /// Runs HERE, on this box — as you, with no timeout unless a
+        /// reader door opens for it (60 s, and it says so) — but in
         /// the environment the forge's own door builds: the sanctioned
         /// reader first on PATH and the read-scoped identity and port
         /// table exported, so the two doors run one text one way
@@ -1632,6 +1644,7 @@ enum ScriptAction {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
@@ -1641,6 +1654,10 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::DevControlContract => {
+            println!("{}", door_env::DEV_CONTROL_CONTRACT.trim());
+            Ok(())
+        }
         Commands::Launch(cmd) => launch::dispatch(cmd).await,
         Commands::Roster(cmd) => roster::dispatch(cmd).await,
         Commands::Doctor => doctor::run_install().await,
@@ -1883,6 +1900,11 @@ async fn main() -> Result<()> {
         },
         Commands::Orient { all } => orient::run(all).await,
         Commands::Brief { packet, profile } => brief::run(packet, profile).await,
+        Commands::Dispatch {
+            started: true,
+            packet,
+            ..
+        } => dispatch_started::started(packet.expect("clap requires an exact run")).await,
         Commands::Dispatch {
             from_hook: true,
             packet,
@@ -2305,6 +2327,11 @@ async fn cmd_emit(kind: String, payload: String) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_published_cli_can_state_its_dev_routing_contract_before_activation() {
+        use clap::Parser;
+        assert!(super::Cli::try_parse_from(["boss", "dev-control-contract"]).is_ok());
+    }
     use super::*;
     use clap::CommandFactory;
 

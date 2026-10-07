@@ -12,6 +12,31 @@ use crate::types::{
     ManualSectionVersion, UserContext,
 };
 
+/// Observe already-read audience inputs without changing visibility.
+/// Implementations must not perform repository operations.
+pub trait AudienceObserver: Send + Sync {
+    fn observe(
+        &self,
+        guard: &str,
+        user: &UserContext,
+        audience: &crate::types::Audience,
+        original: bool,
+    );
+}
+
+pub(crate) fn matches_observed(
+    observer: Option<&dyn AudienceObserver>,
+    guard: &str,
+    audience: &crate::types::Audience,
+    user: &UserContext,
+) -> bool {
+    let original = audience.matches(user);
+    if let Some(observer) = observer {
+        observer.observe(guard, user, audience, original);
+    }
+    original
+}
+
 #[async_trait]
 pub trait ContentRepository: Send + Sync {
     /// Return the live bulletins for this user as of `today`, sorted
@@ -122,15 +147,38 @@ pub trait ContentRepository: Send + Sync {
         &self,
         draft: ManualSectionDraft,
         editor_id: &str,
+    ) -> Result<ManualSection, ContentError> {
+        let actor = editor_id
+            .parse()
+            .map_err(|e| ContentError::Validation(format!("invalid editor: {e}")))?;
+        let stamp = EventStamp::new("content", actor);
+        self.create_section_at(draft, &stamp).await
+    }
+    async fn create_section_at(
+        &self,
+        draft: ManualSectionDraft,
+        stamp: &EventStamp,
     ) -> Result<ManualSection, ContentError>;
 
-    /// Apply a patch, bumping `current_version` and writing an
-    /// append-only history row with the pre-patch state.
+    /// Apply a patch, bumping `current_version` and writing the resulting
+    /// version plus its fact atomically. Earlier history is not invented.
     async fn update_section(
         &self,
         slug: &str,
         patch: ManualPatch,
         editor_id: &str,
+    ) -> Result<ManualSection, ContentError> {
+        let actor = editor_id
+            .parse()
+            .map_err(|e| ContentError::Validation(format!("invalid editor: {e}")))?;
+        let stamp = EventStamp::new("content", actor);
+        self.update_section_at(slug, patch, &stamp).await
+    }
+    async fn update_section_at(
+        &self,
+        slug: &str,
+        patch: ManualPatch,
+        stamp: &EventStamp,
     ) -> Result<ManualSection, ContentError>;
 
     /// Version history for a section, newest first.

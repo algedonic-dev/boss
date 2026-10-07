@@ -41,6 +41,7 @@ mod regions;
 mod routes;
 mod rule_firings;
 mod sensor_regions;
+mod signer;
 mod sim_clock;
 mod stations;
 mod steps;
@@ -86,6 +87,9 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// Cross-service client for row-level authorization. Plumb in a
     /// `ReqwestPolicyClient` in prod, `FakePolicyClient` in tests.
     pub policy: Arc<dyn PolicyClient>,
+    /// Report-only comparisons of pure direct guards. Absent preserves the
+    /// original predicates; presence never changes their returned answers.
+    pub role_guards: Option<Arc<boss_policy_client::role_guard::RoleGuardReporter>>,
     /// Workflow registry — authored via /api/workflows. None until a
     /// caller wires the adapter in; endpoints respond with 503 in that
     /// case to keep the seam explicit.
@@ -223,6 +227,7 @@ impl<R: JobsRepository, B: EventBus> JobsApiState<R, B> {
             publisher,
             step_registry: Arc::new(crate::step_registry::StepRegistry::v1()),
             policy,
+            role_guards: None,
             clock,
             kind_registry: None,
             plugin_registry: None,
@@ -336,6 +341,10 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
         // read, so a stalled rule no longer paints like an idle one
         // (backlog 43c4451a).
         .route("/api/yard/rule-firings", get(yard_rule_firings::<R, B>))
+        .route(
+            "/api/yard/rule-firings/{rule}/dead-letters",
+            get(rule_firings::retained_dead_letters::<R, B>),
+        )
         // THE MOVES RECORD (design e765b3fc §3, car M1): every packet
         // whose place on the map changed and the event that moved it,
         // as a page after a seq and as a stream that resumes from one.
@@ -347,6 +356,7 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
         .route("/api/yard/routes", get(yard_routes::<R, B>))
         .route("/api/jobs", get(list_jobs::<R, B>))
         .route("/api/jobs", post(create_job::<R, B>))
+        .route("/api/jobs/steps/{step_id}", get(get_step_reference::<R, B>))
         .route("/api/jobs/{id}", get(get_job::<R, B>))
         .route("/api/jobs/{id}", put(update_job::<R, B>))
         // The packet's own slice of the audit log — who flipped each
@@ -430,12 +440,30 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
         .route("/api/jobs/{id}/steps", get(list_steps::<R, B>))
         .route("/api/jobs/{id}/steps", post(add_step::<R, B>))
         .route("/api/jobs/{id}/steps/{step_id}", put(update_step::<R, B>))
+        .route(
+            "/api/jobs/{id}/steps/{step_id}/records/{key}",
+            get(get_first_step_record::<R, B>),
+        )
+        .route(
+            "/api/jobs/{id}/steps/{step_id}/complete-if",
+            post(complete_step_if::<R, B>)
+                .layer(axum::middleware::from_fn(without_persisted_refusal)),
+        )
+        .route(
+            "/api/jobs/{id}/steps/{step_id}/version",
+            get(get_step_version::<R, B>),
+        )
         // Top-level metadata merge — the step-side twin of the job
         // route above, and the same contract: `null` removes; status
         // and assignee are untouchable through it.
         .route(
             "/api/jobs/{id}/steps/{step_id}/metadata",
             patch(patch_step_metadata::<R, B>),
+        )
+        .route(
+            "/api/jobs/{id}/steps/{step_id}/metadata/records",
+            post(record_step_metadata::<R, B>)
+                .layer(axum::middleware::from_fn(without_persisted_refusal)),
         )
         // A correction beside a completed step — the one writer of the
         // job's append-only `corrections` list (design 4105b020).
@@ -742,6 +770,29 @@ pub(super) fn packet_readable(
     scope_matches(user, scope, job) || steps.iter().any(|s| step_is_callers(user, open, s))
 }
 
+/// Observe the role-dependent work exception under the grant already read.
+/// This is visibility within that captured grant, not a second policy verdict.
+/// Candidate evaluation reuses stored rows and performs no repository reads.
+pub(super) fn packet_readable_reported<R: JobsRepository, B: EventBus>(
+    state: &JobsApiState<R, B>,
+    user: &boss_policy_client::User,
+    scope: &boss_policy_client::Scope,
+    job: &Job,
+    steps: &[Step],
+) -> bool {
+    let predicate =
+        |candidate: &boss_policy_client::User| packet_readable(candidate, scope, job, steps);
+    match &state.role_guards {
+        Some(report) => report.evaluate(
+            "packet-read-under-granted-scope",
+            "visibility",
+            user,
+            predicate,
+        ),
+        None => predicate(user),
+    }
+}
+
 /// Whether `user` may write `step` — whose packet is `job` — under the
 /// `scope` its `(Update, step)` grant carries: the packet is inside that
 /// scope, or the step AS STORED is already the caller's own work
@@ -772,6 +823,28 @@ pub(super) fn step_writable(
         None => {
             matches!(scope, boss_policy_client::Scope::All) || step_is_callers(user, false, step)
         }
+    }
+}
+
+/// Compare the stored-row scope/holder predicate under the captured grant.
+/// This neither changes the grant nor observes later completion checks.
+pub(super) fn step_writable_reported<R: JobsRepository, B: EventBus>(
+    state: &JobsApiState<R, B>,
+    user: &boss_policy_client::User,
+    scope: &boss_policy_client::Scope,
+    job: Option<&Job>,
+    step: &Step,
+) -> bool {
+    let predicate =
+        |candidate: &boss_policy_client::User| step_writable(candidate, scope, job, step);
+    match &state.role_guards {
+        Some(report) => report.evaluate(
+            "step-write-under-granted-scope",
+            "admission",
+            user,
+            predicate,
+        ),
+        None => predicate(user),
     }
 }
 
@@ -809,7 +882,7 @@ pub(super) async fn readable_job<R: JobsRepository, B: EventBus>(
         return Err(packet_not_found());
     }
     match state.jobs.list_steps(job_id).await {
-        Ok(steps) if packet_readable(user, scope, &job, &steps) => Ok(job),
+        Ok(steps) if packet_readable_reported(state, user, scope, &job, &steps) => Ok(job),
         Ok(_) => Err(packet_not_found()),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()),
     }

@@ -1,3 +1,4 @@
+import { isPageWrite } from './_smokeMocks';
 // /it/registry/rules — every control the page audit counted, pinned
 // (page-audit 08a444bc, step `test`).
 //
@@ -187,14 +188,13 @@ async function install(page: Page, rules: unknown[] = ROWS): Promise<void> {
 /// navigation (shell/surface-opens.ts), on every route alike. It is
 /// chrome, not a control of this page, so the page's write count
 /// excludes it — and only it.
-const SHELL_WRITE = /\/api\/surface-opens$/;
 
 /// Every non-GET issued from the moment it is installed.
 function watchWrites(page: Page): Request[] {
   const writes: Request[] = [];
   page.on('request', (r) => {
     const url = r.url();
-    if (url.includes('/api/') && r.method() !== 'GET' && !SHELL_WRITE.test(new URL(url).pathname)) {
+    if (url.includes('/api/') && r.method() !== 'GET' && isPageWrite(r.method(), new URL(url).pathname)) {
       writes.push(r);
     }
   });

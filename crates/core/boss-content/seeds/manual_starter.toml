@@ -1,8 +1,8 @@
 # Starter HR-manual skeleton — platform default. Loaded at boot
 # by `seed::seed_starter_sections`. Every row has a TBD placeholder
 # body so HR has obvious next-action targets instead of staring at
-# a blank tree. Tenants can override post-boot by editing the
-# rows through the /content admin surface; the seeder is idempotent
+# a blank tree. Authorized clients can update sections through the
+# content API; the SPA manual is a read surface, not an editor. The seeder is idempotent
 # (skips slugs already present) so it never overwrites edited
 # content.
 #
@@ -11,8 +11,8 @@
 # child whose parent hasn't been inserted yet fails the FK check.
 # Keep the array ordered by slug-depth.
 #
-# `body` is markdown. The SPA renders it via the same renderer the
-# manual-edit surface uses. Owner annotations follow the same
+# `body` is markdown. The SPA renders it through the shared escape-first
+# markdown renderer; no manual-edit surface is supplied. Owner annotations follow the same
 # `_TBD, owner: <role>._` convention so a future linter can grep
 # them.
 

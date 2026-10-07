@@ -116,6 +116,7 @@ async fn declare_the_protocol(db: &TestDb) {
     wf.steps[0].authority_role = Some(ROLE.into());
     wf.steps[0].audience = None;
     wf.steps[0].agent = Some(boss_jobs::agent_spec::AgentSpec {
+        executor_provenance: Default::default(),
         profile: "builder".into(),
         model: MODEL.into(),
         budget_usd: 5.0,
@@ -124,7 +125,7 @@ async fn declare_the_protocol(db: &TestDb) {
     let kind = wf.kind.clone();
     let actor = ActorId::Automation("test".into());
     let now = Utc::now();
-    let registry = PgWorkflows::new(db.pool.clone());
+    let registry = PgWorkflows::for_fixture(db.pool.clone());
     registry
         .create_draft(wf, &actor, now)
         .await
@@ -208,7 +209,9 @@ async fn an_api(url: &str) -> axum::Router {
     let agents: Arc<dyn AgentsRegistry> = Arc::new(PgAgents::new(pool.clone()));
     let runs: Arc<dyn AgentRunLog> = Arc::new(PgAgentRuns::new(pool.clone()));
     router(JobsApiState {
-        kind_registry: Some(Arc::new(PgWorkflows::new(pool.clone())) as Arc<dyn WorkflowRegistry>),
+        kind_registry: Some(
+            Arc::new(PgWorkflows::for_fixture(pool.clone())) as Arc<dyn WorkflowRegistry>
+        ),
         stations: Some(Arc::new(PgStations::new(pool.clone())) as Arc<dyn StationRegistry>),
         agent_budget: Some(Arc::new(BudgetDoor { agents, runs })),
         ..JobsApiState::minimal(

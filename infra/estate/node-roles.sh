@@ -82,7 +82,26 @@ read_node_roles() { # <node-id>
         # and who signed, in the log AND the run's packet. `000` is a
         # non-HTTP URL (a file:// fixture), which answers with a body.
         if [ -n "${BOSS_JOBS_URL:-}${BOSS_ESTATE_NODES_URL:-}" ]; then
+            # THE MACHINE TOKEN IS PRESENTED, NEVER REQUIRED (design
+            # 6805c764; backlog 2710c8fc). Made here, in the converge's
+            # own shell and before the `$(…)` below — the reader refuses
+            # a first call inside a subshell. Every way it can come back
+            # without a header (no lib, no slot, a refused slot, a host
+            # off the estate's list, a file that cannot be made) sends
+            # the read exactly as before: a converge that could not learn
+            # its roles because of a token would be the dark-registry
+            # path taken for no reason. Only an http(s) address is
+            # offered to the reader; a file:// fixture has no host.
+            local NODE_ROLES_MT_HDR=""
+            # shellcheck source=infra/lib/secret-header.sh
+            if [ -r "$(dirname "${BASH_SOURCE[0]}")/../lib/secret-header.sh" ]; then . "$(dirname "${BASH_SOURCE[0]}")/../lib/secret-header.sh"; fi
+            if declare -F machine_token_header >/dev/null; then
+                case "$nodes_url" in
+                    http://* | https://*) machine_token_header NODE_ROLES_MT_HDR "$nodes_url" || NODE_ROLES_MT_HDR="" ;;
+                esac
+            fi
             if roles_out="$(curl -sS --max-time 10 \
+                ${NODE_ROLES_MT_HDR:+-H "$NODE_ROLES_MT_HDR"} \
                 -H "x-boss-user: $(sor_reader_header "automation:$prefix")" \
                 -w '\n%{http_code}' "$nodes_url" 2>/dev/null)"; then
                 roles_code="${roles_out##*$'\n'}"

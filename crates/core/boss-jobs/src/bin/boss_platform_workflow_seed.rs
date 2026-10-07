@@ -288,7 +288,7 @@ async fn main() -> Result<()> {
         .connect(&cli.database_url)
         .await
         .context("connecting to Postgres")?;
-    let registry = PgWorkflows::new(pool.clone());
+    let registry = PgWorkflows::for_bootstrap(pool.clone());
     let actor = ActorId::Automation(SEED_ACTOR.trim_start_matches("automation:").to_string());
     // Bootstrap runs before the clock-api is necessarily up, so this
     // takes the wall client explicitly rather than reaching for

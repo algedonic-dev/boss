@@ -14,7 +14,7 @@
 //! a warn. With the policy check's mode mounted at `report` (checklist
 //! F4), each such check is tallied at `/api/policy/check/refusals` as an
 //! arm `service` row with its `last_seen`, and this handler reads that
-//! tally hourly.
+//! joined protected durable window hourly.
 //!
 //! WHAT IT FILES. At most one open alarm per finding, keyed on
 //! [`FINDING_KEY`] — never one per caller, because the tally's callers
@@ -23,13 +23,14 @@
 //!
 //! * [`LAPSED`] — a service caller the read bound refused within the
 //!   last [`LOOKBACK_MINUTES`]. Withdrawn by a read that shows none AND
-//!   whose tally began before the lookback opened: the tally lives in
-//!   memory and every train Recreates the boss pod, so a younger empty
-//!   tally watched only part of the window and holds the alarm (review
-//!   b14f0e1b, B1).
+//!   whose sourced durable watch and healthy live recorder cover the
+//!   complete lookback. A restart conserves recorded findings. A retired
+//!   epoch's first sighting has no proven final use time; its retirement
+//!   must age out before recovery can be claimed.
 //! * [`OVERFLOW`] — the tally is full, so a lapsed grant that arrives now
 //!   is counted where it names nobody, and the tally is not clean.
-//!   Withdrawn once the tally begins again (a restart or a mode move).
+//!   Recovery requires a whole clean durable lookback; a restart alone
+//!   cannot erase the recorded overflow.
 //! * [`UNREADABLE`] — the read could not be judged, said rather than
 //!   swallowed, as `policy.coverage.alarm` says its own. Withdrawn by the
 //!   next whole read; the firing still fails.
@@ -39,9 +40,9 @@
 //!
 //! TWO CLOCKS. The tick's `_at` comes from the clock service, while
 //! `last_seen` and `recording_since` are the policy service's wall clock.
-//! They agree in production (wall mode); on an instance whose clock is
-//! warped (a playground sim clock) the lookback compares unrelated
-//! instants and means nothing there.
+//! The tick remains firing provenance. Evidence is judged against the
+//! wall-clock interval captured by the protected reader; future or
+//! simulated evidence and an unbound observation refuse recovery.
 //!
 //! IT REFUSES NOTHING. It reads, files and withdraws its own alarms.
 
@@ -56,8 +57,9 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value as Json, json};
 
 use super::common::{
-    RECOVERED_AT, Retraction, api_client, complete_step, get_json, jobs_where, owner_for_filing,
-    post_json, recovery_note, relapse_patch, retraction, with_lane, withdrawal_fields, write_json,
+    RECOVERED_AT, Retraction, api_client, complete_step, dispatcher_actor_header, jobs_where,
+    owner_for_filing, post_json, recovery_note, relapse_patch, retraction, with_lane,
+    withdrawal_fields, write_json,
 };
 
 /// The handler's registered name.
@@ -83,6 +85,10 @@ pub const UNREADABLE: &str = "refusals-unreadable";
 /// lapse still happening, and a grant restored is withdrawn within two
 /// hours of its last refused check.
 pub const LOOKBACK_MINUTES: i64 = 120;
+
+fn window_path() -> String {
+    format!("{}?gate=policy-check&hours=2", boss_core::gate_window::PATH)
+}
 
 /// How many callers one alarm lists; the rest are counted.
 const LISTED: usize = 12;
@@ -165,6 +171,109 @@ pub fn judge(body: &Json, now: DateTime<Utc>) -> Result<Judged, String> {
     })
 }
 
+fn judge_durable(
+    snapshot: &boss_core::gate_window::JoinedWindow,
+    before: DateTime<Utc>,
+    after: DateTime<Utc>,
+) -> Result<Judged, String> {
+    use boss_core::gate_evidence::{Fact, Gate};
+    let required = vec!["policy".to_string()];
+    let observation = super::gate_window_read::observation(
+        snapshot,
+        Gate::PolicyCheck,
+        &required,
+        Duration::minutes(LOOKBACK_MINUTES),
+        before,
+        after,
+    )?;
+    let projected = boss_core::gate_window::join_policy_watch(
+        &required,
+        observation.from,
+        observation.now,
+        observation.facts.clone(),
+        observation.reads.clone(),
+    );
+    if !projected.input_errors.is_empty()
+        || projected
+            .live
+            .iter()
+            .any(|report| !report.not_clean.is_empty())
+    {
+        return Err(format!(
+            "durable policy watch has malformed inputs or unhealthy live recorder: {:?}; {:?}",
+            projected.input_errors, projected.live
+        ));
+    }
+    let facts = observation.facts.as_ref().map_err(Clone::clone)?;
+    if facts.iter().any(|event| {
+        Gate::PolicyCheck.fact_of(&event.kind) == Some(Fact::FactsLost)
+            && event.timestamp >= observation.from
+    }) {
+        return Err("policy watch contains recorded lost facts; recovery is not evidenced".into());
+    }
+    let body = projected
+        .live
+        .first()
+        .and_then(|report| report.snapshot.as_ref())
+        .ok_or("policy watch supplies no live snapshot")?;
+    let mut judged = judge(body, observation.now)?;
+    judged.watched_lookback = projected.covers_requested_window;
+    let mut lapsed = judged
+        .lapsed
+        .into_iter()
+        .map(|row| {
+            (
+                (row.caller.clone(), row.role.clone(), row.peer.clone()),
+                row,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for event in facts
+        .iter()
+        .filter(|event| event.timestamp >= observation.from)
+    {
+        match Gate::PolicyCheck.fact_of(&event.kind) {
+            Some(Fact::TallyOverflowed) => judged.overflow = judged.overflow.max(1),
+            Some(Fact::WouldRefuse | Fact::Refused) => {
+                let key = event
+                    .payload
+                    .get("key")
+                    .ok_or("policy finding carries no caller key")?;
+                let text = |field| {
+                    key.get(field)
+                        .and_then(Json::as_str)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| format!("policy finding has no valid {field}"))
+                };
+                match text("arm")? {
+                    "unsigned" => {}
+                    "service" => {
+                        let caller = text("caller")?.to_string();
+                        let role = text("role")?.to_string();
+                        let peer = text("peer")?.to_string();
+                        let row = lapsed
+                            .entry((caller.clone(), role.clone(), peer.clone()))
+                            .or_insert(Lapsed {
+                                caller,
+                                role,
+                                peer,
+                                count: 1,
+                                last_seen: event.timestamp.to_rfc3339(),
+                            });
+                        if instant(&row.last_seen, "live last_seen")? < event.timestamp {
+                            row.last_seen = event.timestamp.to_rfc3339();
+                        }
+                    }
+                    _ => return Err("policy finding has an unknown caller arm".into()),
+                }
+            }
+            _ => {}
+        }
+    }
+    judged.lapsed = lapsed.into_values().collect();
+    Ok(judged)
+}
+
 fn body(finding: &str, title: String, detail: String, extra: Json, owner: &str) -> Json {
     let mut metadata = json!({
         "area": "policy",
@@ -195,7 +304,7 @@ pub fn lapsed_body(j: &Judged, owner: &str, now: &str, rule: &str) -> Json {
         .take(LISTED)
         .map(|l| {
             format!(
-                "{} (role {}, from {}, {} check(s), last {})",
+                "{} (role {}, from {}, at least {} observed check(s), last {})",
                 l.caller, l.role, l.peer, l.count, l.last_seen
             )
         })
@@ -207,9 +316,11 @@ pub fn lapsed_body(j: &Judged, owner: &str, now: &str, rule: &str) -> Json {
         named.join("; ")
     };
     let detail = format!(
-        "Raised by {HANDLER} (rule {rule}, backlog b8e75382 R3) at {now}: GET {REFUSALS_PATH} \
-         (mode {mode}, recording since {since}) shows a service's POST /api/policy/check refused \
-         by the read bound within the last {LOOKBACK_MINUTES} minutes: {callers}. Each is \
+        "Raised by {HANDLER} (rule {rule}, backlog b8e75382 R3) at {now}: GET {window} \
+         joins immutable findings and the live policy tally (mode {mode}, live recording since \
+         {since}). A service's POST /api/policy/check was refused by the read bound within the \
+         last {LOOKBACK_MINUTES} minutes: {callers}. Counts are lower bounds from cumulative \
+         live counters and durable first sightings across processes. Each is \
          ANSWERED today, as an unsigned check; under mode `enforce` each would be 403 and that \
          service's every door would fail (enforce checklist F3). Restore the grant: \
          platform-admin:policy-rule:read at scope all, and no scope-none override on the \
@@ -218,6 +329,7 @@ pub fn lapsed_body(j: &Judged, owner: &str, now: &str, rule: &str) -> Json {
          no service refused for {LOOKBACK_MINUTES} minutes.",
         mode = j.mode,
         since = j.recording_since,
+        window = window_path(),
     );
     body(
         LAPSED,
@@ -230,6 +342,7 @@ pub fn lapsed_body(j: &Judged, owner: &str, now: &str, rule: &str) -> Json {
             "callers": j.lapsed.iter().take(LISTED).map(|l| l.caller.clone()).collect::<Vec<_>>(),
             "caller_count": j.lapsed.len(),
             "measured_at": now,
+            "count_basis": "lower bounds from live cumulative counters and durable first sightings",
         }),
         owner,
     )
@@ -239,15 +352,17 @@ pub fn lapsed_body(j: &Judged, owner: &str, now: &str, rule: &str) -> Json {
 pub fn overflow_body(j: &Judged, owner: &str, now: &str, rule: &str) -> Json {
     let detail = format!(
         "Raised by {HANDLER} (rule {rule}, backlog b8e75382 checklist F2) at {now}: GET \
-         {REFUSALS_PATH} (mode {mode}, recording since {since}) counts overflow {overflow}: the \
+         {window} (mode {mode}, live recording since {since}) records at least {overflow} \
+         unnamed check(s): the \
          tally's keys are full, so a lapsed service grant that arrives now names no caller, and \
          the policy check's window is not clean. Read the rows' callers and peers — ids nobody \
-         runs, from one address, are a spray on the policy port. It begins again on a restart of \
-         the policy service or a move of its mode; this alarm is withdrawn when a read shows no \
-         overflow.",
+         runs, from one address, are a spray on the policy port. A restart does not erase a \
+         recorded overflow. This alarm is withdrawn when complete captured evidence contains \
+         no overflow.",
         mode = j.mode,
         since = j.recording_since,
         overflow = j.overflow,
+        window = window_path(),
     );
     body(
         OVERFLOW,
@@ -256,7 +371,7 @@ pub fn overflow_body(j: &Judged, owner: &str, now: &str, rule: &str) -> Json {
             j.overflow
         ),
         detail,
-        json!({"overflow": j.overflow, "measured_at": now}),
+        json!({"overflow": j.overflow, "overflow_is_lower_bound": true, "measured_at": now}),
         owner,
     )
 }
@@ -264,11 +379,12 @@ pub fn overflow_body(j: &Judged, owner: &str, now: &str, rule: &str) -> Json {
 /// The alarm a dark read files, naming the error it got.
 pub fn unreadable_body(error: &str, owner: &str, now: &str, rule: &str) -> Json {
     let detail = format!(
-        "Raised by {HANDLER} (rule {rule}, backlog b8e75382 R3) at {now}: GET {REFUSALS_PATH} \
+        "Raised by {HANDLER} (rule {rule}, backlog b8e75382 R3) at {now}: GET {window} \
          could not be judged — {error}. While it stays so, a service whose Read on policy-rule \
          lapses is seen by nobody; the alarms already open stay open. A 403 here is itself the \
          lapse this alarm watches for, on the dispatcher's own id. Withdrawn by the next whole \
-         read."
+         read.",
+        window = window_path(),
     );
     body(
         UNREADABLE,
@@ -295,22 +411,38 @@ pub fn alarms_by_finding(rows: &[Json]) -> BTreeMap<String, Json> {
 
 pub struct PolicyCheckRefusalsAlarm {
     client: boss_core::machine_token::Client,
-    policy_base: String,
+    evidence_base: String,
     jobs_base: String,
     owner: Arc<dyn boss_core::platform_owner::PlatformOwner>,
+    wall: Arc<dyn boss_core::clock::Clock>,
 }
 
 impl PolicyCheckRefusalsAlarm {
     pub fn new(
-        policy_base: impl Into<String>,
+        evidence_base: impl Into<String>,
         jobs_base: impl Into<String>,
         owner: Arc<dyn boss_core::platform_owner::PlatformOwner>,
     ) -> Arc<Self> {
+        Self::with_clock(
+            evidence_base,
+            jobs_base,
+            owner,
+            Arc::new(boss_core::clock::WallClock),
+        )
+    }
+
+    fn with_clock(
+        evidence_base: impl Into<String>,
+        jobs_base: impl Into<String>,
+        owner: Arc<dyn boss_core::platform_owner::PlatformOwner>,
+        wall: Arc<dyn boss_core::clock::Clock>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client: api_client(),
-            policy_base: policy_base.into().trim_end_matches('/').to_string(),
+            evidence_base: evidence_base.into().trim_end_matches('/').to_string(),
             jobs_base: jobs_base.into().trim_end_matches('/').to_string(),
             owner,
+            wall,
         })
     }
 
@@ -423,7 +555,7 @@ impl Handler for PolicyCheckRefusalsAlarm {
                      tick's instant and needs a sub-day cadence (hourly, every-<n>-minutes)"
                 ))
             })?;
-        let at = instant(&now, TICK_AT).map_err(HandlerError::Permanent)?;
+        let _at = instant(&now, TICK_AT).map_err(HandlerError::Permanent)?;
 
         // The dedup read first: a dark tally read still needs it, to keep
         // its one UNREADABLE alarm.
@@ -438,15 +570,18 @@ impl Handler for PolicyCheckRefusalsAlarm {
         );
         let owner = owner_for_filing(self.owner.as_ref(), rule).await;
 
-        let read = match get_json(
+        let before = self.wall.now();
+        let read = match super::gate_window_read::read(
             &self.client,
-            &format!("{}{REFUSALS_PATH}", self.policy_base),
-            rule,
+            &format!("{}{}", self.evidence_base, window_path()),
+            &dispatcher_actor_header(rule),
         )
         .await
         {
-            Ok(body) => judge(&body, at).map_err(HandlerError::Downstream),
-            Err(e) => Err(e),
+            Ok(body) => {
+                judge_durable(&body, before, self.wall.now()).map_err(HandlerError::Downstream)
+            }
+            Err(e) => Err(HandlerError::Downstream(e)),
         };
         let judged = match read {
             Ok(judged) => judged,
@@ -456,7 +591,7 @@ impl Handler for PolicyCheckRefusalsAlarm {
                 return Err(e);
             }
         };
-        let whole = format!("{HANDLER} read {REFUSALS_PATH} whole at {now}");
+        let whole = format!("{HANDLER} read {} whole at {now}", window_path());
         self.withdraw(
             UNREADABLE,
             &filed,
@@ -503,7 +638,7 @@ impl Handler for PolicyCheckRefusalsAlarm {
             let body = lapsed_body(&judged, &owner, &now, rule);
             self.raise(LAPSED, body, &filed, rule).await?;
         }
-        if judged.overflow == 0 {
+        if judged.overflow == 0 && judged.watched_lookback {
             self.withdraw(
                 OVERFLOW,
                 &filed,
@@ -515,7 +650,7 @@ impl Handler for PolicyCheckRefusalsAlarm {
                 rule,
             )
             .await?;
-        } else {
+        } else if judged.overflow != 0 {
             let body = overflow_body(&judged, &owner, &now, rule);
             self.raise(OVERFLOW, body, &filed, rule).await?;
         }
@@ -538,6 +673,7 @@ mod tests {
     const NOW: &str = "2026-10-01T03:00:00+00:00";
     const ALARMS: &str =
         "/api/jobs?kind=backlog-item&status=open&metadata_has=policy_check_finding";
+    const WINDOW_PATH: &str = "/api/events/gate-window?gate=policy-check&hours=2";
 
     fn ctx() -> InvocationContext {
         InvocationContext {
@@ -551,14 +687,79 @@ mod tests {
 
     fn row(arm: &str, caller: &str, last_seen: &str) -> Json {
         json!({"arm": arm, "caller": caller, "role": "platform-admin", "peer": "10.20.0.7",
-               "count": 4, "first_seen": "2026-10-01T00:00:00Z", "last_seen": last_seen})
+               "count": 4, "first_seen": last_seen, "last_seen": last_seen})
     }
 
     fn tally(mode: &str, rows: Vec<Json>, overflow: u64) -> Json {
         json!({"switch": "policy check", "file": "/etc/boss/machine-gate/policy-check",
                "mode": mode, "mode_error": null, "rows": rows, "overflow": overflow,
-               "recording_since": "2026-09-30T23:00:00Z", "clean_since": null,
+               "recording_since": "2026-09-30T19:00:00Z", "clean_since": null,
                "not_clean": []})
+    }
+
+    fn window_fixture(mut live: Json) -> Json {
+        use boss_core::gate_evidence::{EvidenceHealth, Fact, Gate, policy_tally_reasons};
+        let health = EvidenceHealth {
+            recorder: true,
+            instance: "fixture".into(),
+            lost: 0,
+            unstated: 0,
+            retrying: false,
+            last_error: None,
+        };
+        let mode = serde_json::from_value(live["mode"].clone()).unwrap();
+        let rows = live["rows"].as_array().unwrap();
+        let reasons = policy_tally_reasons(
+            mode,
+            rows.len(),
+            rows.iter().map(|row| row["count"].as_u64().unwrap()).sum(),
+            live["overflow"].as_u64().unwrap(),
+            &health,
+        );
+        live["clean_since"] = if reasons.is_empty() {
+            live["recording_since"].clone()
+        } else {
+            Json::Null
+        };
+        live["not_clean"] = json!(reasons);
+        live["evidence"] = serde_json::to_value(health).unwrap();
+        let since = instant(live["recording_since"].as_str().unwrap(), "fixture start").unwrap();
+        let facts = vec![boss_core::event::Event::new(
+            "policy",
+            Gate::PolicyCheck.kind(Fact::RecordingBegan),
+            json!({"service":"policy","instance":"fixture","mode":mode,"since":since}),
+            since,
+        )];
+        serde_json::to_value(boss_core::gate_window::join_window(
+            Gate::PolicyCheck,
+            &["policy".into()],
+            at() - Duration::minutes(LOOKBACK_MINUTES),
+            at(),
+            Ok(facts),
+            vec![boss_core::gate_window::LiveRead {
+                service: "policy".into(),
+                answer: Ok(live),
+            }],
+        ))
+        .unwrap()
+    }
+
+    async fn serve_window(answers: Vec<(&'static str, Json)>) -> listing_stub::Stub {
+        assert_eq!(WINDOW_PATH, window_path());
+        let supplied = answers.iter().any(|(path, _)| *path == WINDOW_PATH);
+        listing_stub::serve(
+            answers
+                .into_iter()
+                .filter_map(|(path, body)| {
+                    if path == REFUSALS_PATH {
+                        (!supplied).then(|| (WINDOW_PATH, window_fixture(body)))
+                    } else {
+                        Some((path, body))
+                    }
+                })
+                .collect(),
+        )
+        .await
     }
 
     fn alarm_row(finding: &str) -> Json {
@@ -575,15 +776,234 @@ mod tests {
     }
 
     fn handler(stub: &listing_stub::Stub) -> Arc<PolicyCheckRefusalsAlarm> {
-        PolicyCheckRefusalsAlarm::new(
+        PolicyCheckRefusalsAlarm::with_clock(
             stub.base.clone(),
             stub.base.clone(),
             Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
+            Arc::new(boss_core::clock::SimClock::new(at())),
         )
     }
 
     fn at() -> DateTime<Utc> {
         instant(NOW, "now").unwrap()
+    }
+
+    /// The approved log/live watch survives an observed clean restart.
+    /// The legacy reader holds this alarm solely because the live tally
+    /// is ten minutes old, despite two hours of durable coverage.
+    fn restart_window(
+        extra: Option<boss_core::event::Event>,
+    ) -> (Json, boss_core::gate_window::JoinedWindow) {
+        use boss_core::event::Event;
+        use boss_core::gate_evidence::{Fact, Gate};
+        use boss_core::gate_window::{LiveRead, join_window};
+        let mut live = tally("report", vec![], 0);
+        live["recording_since"] = json!("2026-10-01T02:50:00Z");
+        live["clean_since"] = live["recording_since"].clone();
+        live["evidence"] = json!({"recorder":true,"instance":"new","lost":0,
+            "unstated":0,"retrying":false,"last_error":null});
+        let fact = |kind, stamp: &str, fields: Json| {
+            let mut payload = fields;
+            payload["service"] = json!("policy");
+            Event::new(
+                "policy",
+                Gate::PolicyCheck.kind(kind),
+                payload,
+                instant(stamp, "fact").unwrap(),
+            )
+        };
+        let mut facts = vec![
+            fact(
+                Fact::RecordingBegan,
+                "2026-09-30T23:00:00Z",
+                json!({"mode":"report","since":"2026-09-30T23:00:00Z","instance":"old"}),
+            ),
+            fact(
+                Fact::RecordingEnded,
+                "2026-10-01T02:49:00Z",
+                json!({"clean":true,"instance":"old"}),
+            ),
+            fact(
+                Fact::RecordingBegan,
+                "2026-10-01T02:50:00Z",
+                json!({"mode":"report","since":"2026-10-01T02:50:00Z","instance":"new"}),
+            ),
+        ];
+        facts.extend(extra);
+        let joined = join_window(
+            Gate::PolicyCheck,
+            &["policy".into()],
+            at() - Duration::minutes(LOOKBACK_MINUTES),
+            at(),
+            Ok(facts),
+            vec![LiveRead {
+                service: "policy".into(),
+                answer: Ok(live.clone()),
+            }],
+        );
+        (live, joined)
+    }
+
+    #[tokio::test]
+    async fn a_healthy_restart_with_a_durable_watch_recovers_the_lapsed_alarm() {
+        let (live, joined) = restart_window(None);
+        assert!(joined.covers_requested_window, "{joined:?}");
+        let stub = serve_window(vec![
+            (REFUSALS_PATH, live),
+            (
+                "/api/events/gate-window?gate=policy-check&hours=2",
+                serde_json::to_value(joined).unwrap(),
+            ),
+            (ALARMS, listing(vec![alarm_row(LAPSED)])),
+        ])
+        .await;
+        handler(&stub).invoke(&[], &ctx()).await.unwrap();
+        assert!(
+            stub.writes()
+                .iter()
+                .any(|path| path == "PUT /api/jobs/al-1/steps/al-1-triage"),
+            "a durable healthy restart must recover the alarm: {:?}",
+            stub.writes()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restart_retains_a_recent_durable_service_lapse() {
+        let fact = boss_core::event::Event::new(
+            "policy",
+            "policy.check.would_refuse",
+            json!({
+                "service":"policy","instance":"old","mode":"report","recording_since":"2026-09-30T23:00:00Z",
+                "key":{"arm":"service","caller":"automation:jobs","role":"platform-admin","peer":"fixture"}
+            }),
+            instant("2026-10-01T02:30:00Z", "fact").unwrap(),
+        );
+        let (live, joined) = restart_window(Some(fact));
+        let stub = serve_window(vec![
+            (REFUSALS_PATH, live),
+            (
+                "/api/events/gate-window?gate=policy-check&hours=2",
+                serde_json::to_value(joined).unwrap(),
+            ),
+            (ALARMS, listing(vec![])),
+        ])
+        .await;
+        handler(&stub).invoke(&[], &ctx()).await.unwrap();
+        let sent = stub.sent();
+        assert_eq!(
+            sent.len(),
+            1,
+            "durable first sighting must survive restart: {sent:?}"
+        );
+        assert_eq!(sent[0].1["metadata"][FINDING_KEY], LAPSED);
+        assert!(
+            sent[0].1["metadata"]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("automation:jobs")
+        );
+    }
+
+    #[tokio::test]
+    async fn unhealthy_or_unbound_observations_never_withdraw_a_lapse() {
+        for case in [
+            "retrying",
+            "instance",
+            "future",
+            "simulated",
+            "old-producer",
+            "roster",
+            "interval",
+        ] {
+            let (_, joined) = restart_window(None);
+            let mut body = serde_json::to_value(joined).unwrap();
+            match case {
+                "retrying" => {
+                    body["observation"]["reads"][0]["answer"]["Ok"]["evidence"]["retrying"] =
+                        json!(true)
+                }
+                "instance" => {
+                    body["observation"]["reads"][0]["answer"]["Ok"]["evidence"]["instance"] =
+                        json!("unbound")
+                }
+                "future" => {
+                    body["observation"]["facts"]["Ok"][0]["timestamp"] =
+                        json!(at() + Duration::minutes(1))
+                }
+                "simulated" => {
+                    body["observation"]["facts"]["Ok"][0]["payload"]["_simulated"] = json!(true)
+                }
+                "old-producer" => {
+                    body.as_object_mut().unwrap().remove("observation");
+                }
+                "roster" => {
+                    body["observation"]["required_services"] = json!(["policy", "unknown"]);
+                    body["required_services"] = json!(["policy", "unknown"]);
+                }
+                "interval" => {
+                    body["observation"]["from"] = json!(at() - Duration::minutes(60));
+                    body["from"] = json!(at() - Duration::minutes(60));
+                }
+                _ => unreachable!(),
+            }
+            let stub = serve_window(vec![
+                (WINDOW_PATH, body),
+                (ALARMS, listing(vec![alarm_row(LAPSED)])),
+            ])
+            .await;
+            assert!(handler(&stub).invoke(&[], &ctx()).await.is_err(), "{case}");
+            let sent = stub.sent();
+            assert_eq!(
+                sent.len(),
+                1,
+                "{case}: only the unreadable finding: {sent:?}"
+            );
+            assert_eq!(sent[0].1["metadata"][FINDING_KEY], UNREADABLE, "{case}");
+            assert_eq!(sent[0].0, "POST /api/jobs", "{case}: no withdrawal");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pre_window_sighting_with_unknown_final_last_seen_cannot_recover_a_lapse() {
+        use boss_core::gate_evidence::{Gate, GateEvidenceLog, InMemoryGateEvidence};
+        let first = boss_core::event::Event::new(
+            "policy",
+            "policy.check.would_refuse",
+            json!({
+                "service":"policy","instance":"old","mode":"report","recording_since":"2026-09-30T23:00:00Z",
+                "key":{"arm":"service","caller":"automation:jobs","role":"platform-admin","peer":"fixture"}
+            }),
+            instant("2026-09-30T23:30:00Z", "first sighting").unwrap(),
+        );
+        let (live, snapshot) = restart_window(Some(first));
+        let observation = snapshot.observation.unwrap();
+        let log = InMemoryGateEvidence::new(observation.facts.unwrap());
+        let records = log
+            .facts(Gate::PolicyCheck, observation.from)
+            .await
+            .unwrap();
+        let joined = boss_core::gate_window::join_window(
+            Gate::PolicyCheck,
+            &observation.required_services,
+            observation.from,
+            observation.now,
+            Ok(records),
+            vec![boss_core::gate_window::LiveRead {
+                service: "policy".into(),
+                answer: Ok(live),
+            }],
+        );
+        let stub = serve_window(vec![
+            (WINDOW_PATH, serde_json::to_value(joined).unwrap()),
+            (ALARMS, listing(vec![alarm_row(LAPSED)])),
+        ])
+        .await;
+        let _result = handler(&stub).invoke(&[], &ctx()).await;
+        assert!(
+            !stub.writes().iter().any(|path| path.starts_with("PUT ")),
+            "a clean end states recorder health, not the old caller's final last_seen: {:?}",
+            stub.writes()
+        );
     }
 
     /// Only a SERVICE row counted within the lookback is a lapse now: an
@@ -627,7 +1047,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_lapsed_service_grant_files_one_alarm_naming_it() {
-        let stub = listing_stub::serve(vec![
+        let stub = serve_window(vec![
             (
                 REFUSALS_PATH,
                 tally(
@@ -669,7 +1089,7 @@ mod tests {
                 )
             })
             .collect();
-        let stub = listing_stub::serve(vec![
+        let stub = serve_window(vec![
             (REFUSALS_PATH, tally("report", rows, 0)),
             (ALARMS, listing(vec![])),
         ])
@@ -685,7 +1105,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_open_alarm_is_not_filed_again() {
-        let stub = listing_stub::serve(vec![
+        let stub = serve_window(vec![
             (
                 REFUSALS_PATH,
                 tally(
@@ -703,7 +1123,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_restored_grant_withdraws_its_alarm() {
-        let stub = listing_stub::serve(vec![
+        let stub = serve_window(vec![
             (
                 REFUSALS_PATH,
                 tally(
@@ -732,7 +1152,7 @@ mod tests {
     async fn a_tally_younger_than_the_lookback_withdraws_no_lapse() {
         let mut young = tally("report", vec![], 0);
         young["recording_since"] = json!("2026-10-01T02:30:00Z");
-        let stub = listing_stub::serve(vec![
+        let stub = serve_window(vec![
             (REFUSALS_PATH, young),
             (ALARMS, listing(vec![alarm_row(LAPSED)])),
         ])
@@ -741,11 +1161,28 @@ mod tests {
         assert!(stub.writes().is_empty(), "{:?}", stub.writes());
     }
 
+    #[tokio::test]
+    async fn a_short_watch_cannot_erase_an_overflow_alarm() {
+        let mut young = tally("report", vec![], 0);
+        young["recording_since"] = json!("2026-10-01T02:30:00Z");
+        let stub = serve_window(vec![
+            (REFUSALS_PATH, young),
+            (ALARMS, listing(vec![alarm_row(OVERFLOW)])),
+        ])
+        .await;
+        handler(&stub).invoke(&[], &ctx()).await.unwrap();
+        assert!(
+            stub.writes().is_empty(),
+            "a partial watch cannot prove that overflow went away: {:?}",
+            stub.writes()
+        );
+    }
+
     /// Overflow is its own alarm: the tally is full, so a lapse now
     /// names nobody, and the window is not clean (checklist F2).
     #[tokio::test]
     async fn a_full_tally_files_the_overflow_alarm() {
-        let stub = listing_stub::serve(vec![
+        let stub = serve_window(vec![
             (REFUSALS_PATH, tally("report", vec![], 3)),
             (ALARMS, listing(vec![])),
         ])
@@ -760,7 +1197,7 @@ mod tests {
     /// `off` tallies nothing: its empty tally withdraws no alarm.
     #[tokio::test]
     async fn an_off_tally_withdraws_nothing() {
-        let stub = listing_stub::serve(vec![
+        let stub = serve_window(vec![
             (REFUSALS_PATH, tally("off", vec![], 0)),
             (
                 ALARMS,
@@ -779,7 +1216,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_read_is_said_once_and_withdraws_nothing() {
         // No route for the tally: the stub answers 404.
-        let stub = listing_stub::serve(vec![(ALARMS, listing(vec![alarm_row(LAPSED)]))]).await;
+        let stub = serve_window(vec![(ALARMS, listing(vec![alarm_row(LAPSED)]))]).await;
         assert!(handler(&stub).invoke(&[], &ctx()).await.is_err());
         let sent = stub.sent();
         assert_eq!(sent.len(), 1, "one alarm, and no withdrawal: {sent:?}");
@@ -794,7 +1231,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_whole_read_withdraws_the_unreadable_alarm() {
-        let stub = listing_stub::serve(vec![
+        let stub = serve_window(vec![
             (REFUSALS_PATH, tally("report", vec![], 0)),
             (ALARMS, listing(vec![alarm_row(UNREADABLE)])),
         ])
@@ -806,13 +1243,13 @@ mod tests {
             sent[0].1["evidence"]
                 .as_str()
                 .unwrap()
-                .contains("read /api/policy/check/refusals whole")
+                .contains(&format!("read {} whole", window_path()))
         );
     }
 
     #[tokio::test]
     async fn a_firing_without_an_instant_is_a_permanent_refusal() {
-        let stub = listing_stub::serve(vec![]).await;
+        let stub = serve_window(vec![]).await;
         let mut c = ctx();
         c.event_payload = json!({"_day": "2026-10-01"});
         let err = handler(&stub).invoke(&[], &c).await.unwrap_err();

@@ -19,6 +19,7 @@ fn row(code: &str, name: &str, kind: &str, nb: &str, parent: Option<&str>) -> Ac
     AccountInput {
         code: code.into(),
         name: name.into(),
+        description: None,
         kind: kind.into(),
         normal_balance: nb.into(),
         parent: parent.map(str::to_string),
@@ -33,6 +34,40 @@ async fn staged(db: &TestDb) -> Vec<(String, serde_json::Value)> {
     .fetch_all(&db.pool)
     .await
     .expect("outbox reads")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_authored_description_is_stored_and_emitted_once_and_a_difference_is_kept() {
+    let db = TestDb::new().await;
+    let mut account = row("2450", "Tenant obligation", "liability", "credit", None);
+    account.description = Some("  Authored tenant description  ".into());
+    let first = declare_accounts(&db.pool, &[account.clone()], &stamp())
+        .await
+        .unwrap();
+    assert_eq!(first.inserted, 1);
+    let stored: (Option<String>,) =
+        sqlx::query_as("SELECT description FROM gl_accounts WHERE code = '2450'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored.0, account.description);
+    let facts = staged(&db).await;
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].1["description"], "  Authored tenant description  ");
+    assert_eq!(facts[0].1["declared_by"], "automation:tenant-seed");
+    account.description = Some("A different proposal".into());
+    let second = declare_accounts(&db.pool, &[account], &stamp())
+        .await
+        .unwrap();
+    assert_eq!(second.inserted, 0);
+    assert_eq!(second.kept[0].differs, vec!["description"]);
+    assert_eq!(staged(&db).await, facts);
+    let kept: (Option<String>,) =
+        sqlx::query_as("SELECT description FROM gl_accounts WHERE code = '2450'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(kept, stored);
 }
 
 #[tokio::test(flavor = "multi_thread")]

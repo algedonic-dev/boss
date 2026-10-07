@@ -1,6 +1,6 @@
 //! HMAC-signed session cookies.
 //!
-//! Wire format: `base64url(payload_json).base64url(hmac_sha256(payload_json, key))`
+//! Wire format: `base64url(payload_json).base64url(hmac_sha256(payload_base64url, key))`
 //!
 //! Payload carries the authenticated username and an absolute expiry.
 //! Verification is constant-time and rejects expired tokens.
@@ -10,33 +10,29 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use boss_core::session_claims::SessionWire;
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
 
-pub const COOKIE_NAME: &str = "boss_session";
+pub use boss_core::session_claims::{COOKIE_NAME, SessionError};
 // 24 hours (David, 2026-08-13, filed from the front door itself:
 // "TTL on sign-in auth is too short... I think it should be 24 hrs
 // for now"). Scope staleness (territory/reports baked at login)
 // is now bounded by a day instead of a workday.
 pub const DEFAULT_TTL_SECONDS: u64 = 24 * 60 * 60;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     /// Authenticated username.
-    #[serde(rename = "u")]
     pub username: String,
     /// Absolute expiry, seconds since epoch.
-    #[serde(rename = "e")]
     pub expiry: u64,
     /// Boss role (e.g., "cto", "service-tech"). None for unknown users.
-    #[serde(rename = "r", default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     /// Boss employee ID. None for unknown users.
-    #[serde(rename = "i", default, skip_serializing_if = "Option::is_none")]
     pub employee_id: Option<String>,
     /// Access tier: "operator" (full system) or "user" (frontend only).
     /// Every login mints "user" — OIDC, password, guest and break-glass
@@ -47,18 +43,15 @@ pub struct Session {
     /// passkey (backlog 3c92c5b8; until then this comment promised an
     /// elevation nothing did). Read it through [`Session::access_tier`],
     /// which says "operator" only when `elevated_at` is set too.
-    #[serde(rename = "t", default = "default_tier")]
     access_tier: String,
     /// When the passkey assertion that elevated this session was
     /// verified, seconds since epoch. `None` on every session that was
     /// never elevated; serialised only when set. The elevation lives no
     /// longer than the cookie it rides: `expiry` is not extended.
-    #[serde(rename = "ea", default, skip_serializing_if = "Option::is_none")]
     elevated_at: Option<u64>,
     /// Department for the authenticated employee (e.g. "executive").
     /// None for unknown users; serialised only when populated. Fed into
     /// `x-boss-user` so Department-scoped policy rules can match.
-    #[serde(rename = "d", default, skip_serializing_if = "Option::is_none")]
     pub department: Option<String>,
     /// Accounts the employee is accountable for — union of territory
     /// rep + account-team membership. Captured at login from
@@ -66,11 +59,9 @@ pub struct Session {
     /// (empty covers every unrecognized user without cookie bloat).
     /// Staleness bounded by the 24h session TTL — a newly-assigned rep
     /// picks up their territory at next login.
-    #[serde(rename = "tp", default, skip_serializing_if = "Vec::is_empty")]
     pub territory_account_ids: Vec<String>,
     /// Employees who report directly to this session's user. Captured
     /// alongside territory; same staleness bound.
-    #[serde(rename = "dr", default, skip_serializing_if = "Vec::is_empty")]
     pub direct_report_ids: Vec<String>,
 }
 
@@ -78,21 +69,46 @@ pub struct Session {
 pub const USER_TIER: &str = "user";
 pub const OPERATOR_TIER: &str = "operator";
 
-fn default_tier() -> String {
-    USER_TIER.to_string()
+// The gateway keeps its private issuance/elevation state. The shared wire
+// owns serialization and verification; converting it never elevates a session.
+impl Serialize for Session {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.wire().serialize(serializer)
+    }
 }
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum SessionError {
-    #[error("malformed cookie")]
-    Malformed,
-    #[error("signature mismatch")]
-    BadSignature,
-    #[error("session expired")]
-    Expired,
+impl<'de> Deserialize<'de> for Session {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        SessionWire::deserialize(deserializer).map(Self::from_wire)
+    }
 }
 
 impl Session {
+    fn wire(&self) -> SessionWire {
+        SessionWire {
+            username: self.username.clone(),
+            expiry: self.expiry,
+            role: self.role.clone(),
+            employee_id: self.employee_id.clone(),
+            access_tier: self.access_tier.clone(),
+            elevated_at: self.elevated_at,
+            department: self.department.clone(),
+            territory_account_ids: self.territory_account_ids.clone(),
+            direct_report_ids: self.direct_report_ids.clone(),
+        }
+    }
+    fn from_wire(wire: SessionWire) -> Self {
+        Self {
+            username: wire.username,
+            expiry: wire.expiry,
+            role: wire.role,
+            employee_id: wire.employee_id,
+            access_tier: wire.access_tier,
+            elevated_at: wire.elevated_at,
+            department: wire.department,
+            territory_account_ids: wire.territory_account_ids,
+            direct_report_ids: wire.direct_report_ids,
+        }
+    }
     pub fn new(username: impl Into<String>, ttl_seconds: u64) -> Self {
         Self {
             username: username.into(),
@@ -176,27 +192,8 @@ impl Session {
 
     /// Verify signature and expiry, returning the decoded session.
     pub fn decode(cookie_value: &str, key: &[u8]) -> Result<Self, SessionError> {
-        let (payload_b64, sig_b64) = cookie_value
-            .split_once('.')
-            .ok_or(SessionError::Malformed)?;
-        let sig = URL_SAFE_NO_PAD
-            .decode(sig_b64)
-            .map_err(|_| SessionError::Malformed)?;
-        let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-        mac.update(payload_b64.as_bytes());
-        let expected = mac.finalize().into_bytes();
-        if expected.ct_eq(&sig).unwrap_u8() != 1 {
-            return Err(SessionError::BadSignature);
-        }
-        let payload = URL_SAFE_NO_PAD
-            .decode(payload_b64)
-            .map_err(|_| SessionError::Malformed)?;
-        let session: Session =
-            serde_json::from_slice(&payload).map_err(|_| SessionError::Malformed)?;
-        if session.expiry <= now() {
-            return Err(SessionError::Expired);
-        }
-        Ok(session)
+        boss_core::session_claims::verify(cookie_value, key, now())
+            .map(|verified| Self::from_wire(verified.claims().clone()))
     }
 }
 
@@ -228,6 +225,45 @@ mod tests {
     use super::*;
 
     const KEY: &[u8; 32] = b"test-key-0123456789abcdef0123456";
+
+    #[test]
+    fn shared_verified_wire_preserves_every_gateway_claim_and_private_elevation() {
+        let mut session = Session::new("david", 3600);
+        session.employee_id = Some("emp-david".into());
+        session.role = Some("platform-admin".into());
+        session.department = Some("executive".into());
+        session.territory_account_ids = vec!["account-a".into()];
+        session.direct_report_ids = vec!["employee-b".into()];
+        // Construct the signed-wire fixture inside its owning test module;
+        // production elevation remains the sole caller of its private mutator.
+        session.access_tier = "operator".into();
+        session.elevated_at = Some(42);
+        let encoded = session.encode(KEY);
+        let verified = boss_core::session_claims::verify(&encoded, KEY, now()).unwrap();
+        assert_eq!(verified.claims(), &session.wire());
+        assert_eq!(verified.policy_id(), session.policy_id());
+        assert_eq!(verified.effective_role(), session.effective_role());
+        assert_eq!(verified.access_tier(), session.access_tier());
+        assert_eq!(Session::decode(&encoded, KEY).unwrap(), session);
+        assert_eq!(
+            serde_json::to_value(&session).unwrap(),
+            serde_json::json!({
+                "u":"david","e":session.expiry,"r":"platform-admin","i":"emp-david", "t":"operator","ea":42,
+                "d":"executive","tp":["account-a"],"dr":["employee-b"]
+            })
+        );
+        let mut wire = session.wire();
+        wire.elevated_at = None;
+        let not_elevated = Session::from_wire(wire);
+        let claims =
+            boss_core::session_claims::verify(&not_elevated.encode(KEY), KEY, now()).unwrap();
+        assert_eq!(claims.access_tier(), "user");
+        assert_eq!(not_elevated.access_tier(), "user");
+        let roleless = Session::new("guest", 3600);
+        let claims = boss_core::session_claims::verify(&roleless.encode(KEY), KEY, now()).unwrap();
+        assert_eq!(claims.effective_role(), roleless.effective_role());
+        assert_eq!(claims.policy_id(), roleless.policy_id());
+    }
 
     #[test]
     fn round_trip_encode_decode() {

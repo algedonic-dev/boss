@@ -17,6 +17,7 @@ use crate::types::{
 #[derive(Default)]
 pub struct InMemoryContent {
     state: Mutex<State>,
+    audience_observer: Option<std::sync::Arc<dyn crate::port::AudienceObserver>>,
 }
 
 #[derive(Default)]
@@ -30,6 +31,13 @@ struct State {
 impl InMemoryContent {
     pub fn new() -> Self {
         Self::default()
+    }
+    pub fn with_audience_observer(
+        mut self,
+        observer: std::sync::Arc<dyn crate::port::AudienceObserver>,
+    ) -> Self {
+        self.audience_observer = Some(observer);
+        self
     }
 }
 
@@ -46,7 +54,14 @@ impl ContentRepository for InMemoryContent {
             .bulletins
             .values()
             .filter(|b| b.expires_on.is_none_or(|d| d >= today))
-            .filter(|b| b.audience.matches(user))
+            .filter(|b| {
+                crate::port::matches_observed(
+                    self.audience_observer.as_deref(),
+                    "content-bulletin-audience",
+                    &b.audience,
+                    user,
+                )
+            })
             .map(|b| {
                 let dismissed = state.dismissals.contains(&(b.id, user.id.clone()));
                 Bulletin {
@@ -202,7 +217,14 @@ impl ContentRepository for InMemoryContent {
             .manual
             .values()
             .filter(|s| s.published)
-            .filter(|s| s.audience.matches(user))
+            .filter(|s| {
+                crate::port::matches_observed(
+                    self.audience_observer.as_deref(),
+                    "content-manual-tree-audience",
+                    &s.audience,
+                    user,
+                )
+            })
             .cloned()
             .collect();
         out.sort_by(|a, b| {
@@ -226,15 +248,24 @@ impl ContentRepository for InMemoryContent {
         Ok(state
             .manual
             .get(slug)
-            .filter(|s| s.published && s.audience.matches(user))
+            .filter(|s| {
+                s.published
+                    && crate::port::matches_observed(
+                        self.audience_observer.as_deref(),
+                        "content-section-audience",
+                        &s.audience,
+                        user,
+                    )
+            })
             .cloned())
     }
 
-    async fn create_section(
+    async fn create_section_at(
         &self,
         draft: ManualSectionDraft,
-        editor_id: &str,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<ManualSection, ContentError> {
+        let editor_id = stamp.actor().to_string();
         if draft.slug.trim().is_empty() {
             return Err(ContentError::Validation("slug is required".into()));
         }
@@ -255,7 +286,7 @@ impl ContentRepository for InMemoryContent {
                 "parent slug '{parent}' not found"
             )));
         }
-        let now = Utc::now();
+        let now = stamp.timestamp;
         let section = ManualSection {
             id: Uuid::new_v4(),
             slug: draft.slug.clone(),
@@ -283,12 +314,13 @@ impl ContentRepository for InMemoryContent {
         Ok(section)
     }
 
-    async fn update_section(
+    async fn update_section_at(
         &self,
         slug: &str,
         patch: ManualPatch,
-        editor_id: &str,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<ManualSection, ContentError> {
+        let editor_id = stamp.actor().to_string();
         let mut state = self.state.lock().map_err(poisoned)?;
         let existing = state
             .manual
@@ -313,7 +345,7 @@ impl ContentRepository for InMemoryContent {
             existing.published = published;
         }
         existing.current_version += 1;
-        existing.updated_at = Utc::now();
+        existing.updated_at = stamp.timestamp;
         let snapshot = ManualSectionVersion {
             section_id: existing.id,
             version: existing.current_version,

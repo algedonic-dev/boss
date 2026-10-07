@@ -179,13 +179,27 @@ async fn locked_session(pool: &PgPool) -> Result<PgConnection, ViewsError> {
     Ok(conn)
 }
 
-/// End the locked session, which releases the lock with it, and hand
-/// back what the run answered. A failed close is reported rather than
-/// swallowed: the socket is dropped either way, so the server ends the
-/// session, but the run should not claim a clean finish it did not see.
-async fn end_session<T>(conn: PgConnection, run: Result<T, ViewsError>) -> Result<T, ViewsError> {
+/// Observe the server releasing the lock before reporting a finished
+/// run. Closing sends Terminate without waiting for server cleanup, so
+/// close alone can leave the lock held after this function returns.
+/// Still close after either error, so the detached session is never
+/// returned to the pool with a lock it may hold.
+async fn end_session<T>(
+    mut conn: PgConnection,
+    run: Result<T, ViewsError>,
+) -> Result<T, ViewsError> {
+    let released = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
+        .bind(REBUILD_LOCK_KEY)
+        .fetch_one(&mut conn)
+        .await
+        .map_err(storage);
     let closed = conn.close().await.map_err(storage);
     let answer = run?;
+    if !released? {
+        return Err(ViewsError::Storage(
+            "event-facts session did not hold its release lock".into(),
+        ));
+    }
     closed?;
     Ok(answer)
 }

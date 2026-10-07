@@ -14,7 +14,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "Nightly forgejo dump on the forge host - the repositories and Forgejo's database (SQL through Forgejo's own connection, never a copy of the live SQLite file), app.ini and the signing keys; the 35G OCI registry, logs and indexes skipped as regenerable. Verified before it is kept (gzip -t; forgejo-db.sql, app.ini and a repository present; no registry data; a minimum size), refused below the disk floor, kept locally in a bounded count. Local only: the offsite legs need a credential on the forge, and every run records offsite=none."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
 
 [[workflow.step]]
 title = "scheduled"

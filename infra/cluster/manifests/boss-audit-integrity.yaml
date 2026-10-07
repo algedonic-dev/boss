@@ -66,8 +66,14 @@ spec:
               args:
                 - |
                   set -euo pipefail
+                  # One report belongs to one invocation; the existing step door
+                  # consumes it even when the check fails. Never reuse an old file.
+                  BOSS_RUN_SUMMARY_FILE=$(mktemp)
+                  export BOSS_RUN_SUMMARY_FILE
+                  trap 'rm -f "$BOSS_RUN_SUMMARY_FILE"' EXIT
+                  rm -f "$BOSS_RUN_SUMMARY_FILE"
                   # The binary reads DATABASE_URL directly — no config file needed.
-                  /usr/local/bin/boss-chore.sh maintenance-audit-integrity "Audit-log integrity check" -- /usr/local/bin/boss-audit-integrity-check
+                  /usr/local/bin/boss-chore.sh maintenance-audit-integrity "Audit-log integrity check" -- /usr/local/bin/boss-audit-integrity-check --summary-file "$BOSS_RUN_SUMMARY_FILE"
               # The estate machine token (the pod's machine-token volume): its
               # wrap and step stamp `current` on the packet writes, only to
               # the hosts BOSS_MACHINE_TOKEN_HOSTS names (design 6805c764 car 4).

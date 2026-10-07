@@ -123,7 +123,7 @@ async fn app_with(wired: bool, registries: bool) -> axum::Router {
         None
     };
     let (kind_registry, stations) = if registries {
-        let kinds = Arc::new(InMemoryWorkflows::new());
+        let kinds = Arc::new(InMemoryWorkflows::for_fixture());
         for spec in boss_jobs::registry::seedable_platform_workflows() {
             kinds.seed(spec).unwrap();
         }

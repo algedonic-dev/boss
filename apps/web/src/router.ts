@@ -26,6 +26,9 @@ export type Route =
       kind: 'jobs';
       workflow?: string;
       workflowPrefix?: string;
+      jobKindGroup?: string;
+      jobOrder?: string;
+      jobDepartment?: string;
       jobStatus?: string;
       // #93: filter by Job.owner_id so "View this employee's
       // assigned jobs" links actually filter the list.
@@ -427,6 +430,9 @@ export function parseRoute(pathname: string, search = ''): Route {
     const ownerId = sp.get('owner_id');
     const filterSubjectId = sp.get('subject_id');
     const r: Route = { kind: 'jobs' };
+    if (sp.has('kind_group')) r.jobKindGroup = sp.get('kind_group') ?? '';
+    if (sp.has('order')) r.jobOrder = sp.get('order') ?? '';
+    if (sp.has('department')) r.jobDepartment = sp.get('department') ?? '';
     // Under `new=1` the kind is the new job's Kind, as the subject_id
     // below is its subject: HrPage's link names its workflow there, and
     // read as the list's filter it narrowed the list behind the form

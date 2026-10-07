@@ -138,8 +138,16 @@ async fn every_name(db: &TestDb) -> Vec<String> {
 /// pins failed for a reason that had nothing to do with what they
 /// test (backlog cab50f4c).
 async fn ahead_of_live(registry: &PgCadence, names: &[String]) -> usize {
+    ahead_of_live_for(registry, names, &bundle()).await
+}
+
+async fn ahead_of_live_for(
+    registry: &PgCadence,
+    names: &[String],
+    specs: &[CadenceRuleSpec],
+) -> usize {
     let live = declarations(&active_rows(registry, names).await);
-    bundle()
+    specs
         .iter()
         .filter(|spec| {
             live.get(spec.name())
@@ -419,13 +427,40 @@ async fn a_bundle_row_that_differs_from_the_live_row_is_refused_by_field() {
     let registry = PgCadence::new(db.pool.clone());
     let names = every_name(&db).await;
     let before = declarations(&active_rows(&registry, &names).await);
+    let mut versions_before = Vec::new();
+    for name in &names {
+        versions_before.push(registry.live_versions(name).await.expect("whole lineage"));
+    }
+    let events_before: Vec<serde_json::Value> =
+        sqlx::query_scalar("SELECT to_jsonb(event_outbox) FROM event_outbox ORDER BY id")
+            .fetch_all(&db.pool)
+            .await
+            .expect("whole outbox before refusal");
 
     let mut specs = bundle();
     let edited = specs
         .iter_mut()
         .find(|s| s.name() == "train-reconcile")
         .expect("the bundle declares the reconcile rule");
-    edited.row.every_minutes = Some(5);
+    // Same-version drift is a fixture of the ACTUAL active row, not of
+    // a bundle that may legitimately declare a newer version (8eca7b2f).
+    let live = registry
+        .live_versions("train-reconcile")
+        .await
+        .expect("reconcile lineage")
+        .into_iter()
+        .find(|row| row.status == WorkflowStatus::Active)
+        .expect("reconcile is active");
+    let live_version = live.version;
+    *edited = live;
+    edited.row.every_minutes = Some(
+        edited
+            .row
+            .every_minutes
+            .expect("wall interval")
+            .checked_add(1)
+            .expect("fixture interval can increase"),
+    );
 
     let err = seed_cadence_rules(&registry, &specs, &actor(), chrono::Utc::now(), false)
         .await
@@ -434,7 +469,7 @@ async fn a_bundle_row_that_differs_from_the_live_row_is_refused_by_field() {
         CadenceSeedError::Refused { rows: refusals, .. } => {
             assert_eq!(refusals.len(), 1, "{err}");
             assert_eq!(refusals[0].name, "train-reconcile");
-            assert_eq!(refusals[0].version, 1);
+            assert_eq!(refusals[0].version, live_version);
             assert_eq!(
                 refusals[0].fields,
                 vec!["every_minutes".to_string()],
@@ -455,6 +490,25 @@ async fn a_bundle_row_that_differs_from_the_live_row_is_refused_by_field() {
         declarations(&active_rows(&registry, &names).await),
         before,
         "a refused seed writes nothing"
+    );
+    assert_eq!(every_name(&db).await, names, "no new lineage appears");
+    let mut versions_after = Vec::new();
+    for name in &names {
+        versions_after.push(registry.live_versions(name).await.expect("whole lineage"));
+    }
+    assert_eq!(
+        serde_json::to_value(versions_after).unwrap(),
+        serde_json::to_value(versions_before).unwrap(),
+        "all historical and active rows, including original timestamps, are conserved"
+    );
+    let events_after: Vec<serde_json::Value> =
+        sqlx::query_scalar("SELECT to_jsonb(event_outbox) FROM event_outbox ORDER BY id")
+            .fetch_all(&db.pool)
+            .await
+            .expect("whole outbox after refusal");
+    assert_eq!(
+        events_after, events_before,
+        "a refusal adds or changes no event"
     );
 }
 
@@ -482,17 +536,16 @@ async fn a_version_bump_publishes_and_retires_the_live_row() {
     bumped.version = live.version + 1;
     bumped.row.every_minutes = Some(15);
 
-    // The rule THIS test bumped, plus any the bundle already carries
-    // ahead of live. Counting a bare 1 assumed the bundle never leads
-    // the migrations, which stopped being true the first time a rule
-    // was edited the way the lint requires.
-    let ahead = ahead_of_live(&registry, &every_name(&db).await).await;
+    // Count the actual declarations this invocation publishes. Adding
+    // one to the unmodified bundle's count counted reconcile twice once
+    // its own bundle version led the migrations (8eca7b2f).
+    let ahead = ahead_of_live_for(&registry, &every_name(&db).await, &specs).await;
     let report = seed_cadence_rules(&registry, &specs, &actor(), chrono::Utc::now(), false)
         .await
         .expect("a version bump publishes");
     assert_eq!(
         report.count(|o| matches!(o, SeedOutcome::Published { .. })),
-        ahead + 1,
+        ahead,
         "the bumped rule publishes, and so does anything the bundle already led: {report}"
     );
 

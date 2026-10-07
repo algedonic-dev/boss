@@ -86,6 +86,7 @@ fn agent_blocks() -> WorkflowSpec {
         title_template: format!("{title} it"),
         authority_role: Some("platform-admin".into()),
         agent: agent.then(|| boss_jobs::agent_spec::AgentSpec {
+            executor_provenance: Default::default(),
             profile: "analyst".into(),
             model: "opus-5[1m]".into(),
             budget_usd: 2.0,
@@ -110,7 +111,7 @@ fn agent_blocks() -> WorkflowSpec {
 }
 
 fn app() -> axum::Router {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds.seed(mixed_kind()).expect("seed");
     kinds.seed(agent_blocks()).expect("seed");
     let policy: Arc<dyn PolicyClient> = Arc::new(

@@ -224,6 +224,8 @@ MEMBER="usr/local/bin/boss"
 # pinned to <STORE default>/current/<that basename>.
 COUNTER_MEMBER="usr/local/bin/boss-leaked-policy"
 COUNTER="${COUNTER_MEMBER##*/}"
+CONTROL_MEMBER="opt/boss/dev-control.tar"
+BOOTSTRAP_MEMBER="opt/boss/dev-control"
 case "${BOSS_CLI_PLATFORM:-}" in
     "") case "$(uname -m 2>/dev/null)" in
             x86_64) PLATFORM="amd64/linux" ;;
@@ -394,6 +396,8 @@ stage=""
 # The counter's verdict: empty until a layer decides it, then
 # `installed` or `absent: <why>`.
 counter=""
+control=""
+bootstrap=""
 if [ -x "$STORE/$SHA/boss" ]; then
     # Already on disk: a previous tick installed (and confirmed) it, or
     # `current` was moved away by hand. Re-link below; never re-pull.
@@ -522,6 +526,45 @@ else
         # The counter, decided in the first layer that mentions it —
         # BEFORE the CLI's check below, which ends the walk and removes
         # the pull. A problem with it is recorded, never refused.
+        # The optional controller is DATA beside this exact CLI image.
+        # It is never unpacked, executed or activated by this installer.
+        # Topmost mention wins, including directory whiteouts.
+        if [ -z "$bootstrap" ]; then
+            if grep -qx -- "$BOOTSTRAP_MEMBER" "$pull/layer.list"; then
+                if python3 -I -c 'import sys,tarfile; archive=tarfile.open(sys.argv[1],"r:gz"); members=[m for m in archive if m.name==sys.argv[2]]; sys.exit(0 if len(members)==1 and members[0].isfile() else 1)' "$blob" "$BOOTSTRAP_MEMBER" \
+                    && tar -xOzf "$blob" -- "$BOOTSTRAP_MEMBER" > "$stage/dev-control"; then
+                    bootstrap="installed"
+                    chmod 0755 "$stage/dev-control"
+                else
+                    refuse "refused: control bootstrap in layer $i is not a regular readable file" "no activation was attempted"
+                fi
+            else
+                for deleted in opt/boss/.wh.dev-control opt/boss/.wh..wh.opq opt/.wh.boss opt/.wh..wh.opq .wh.opt .wh..wh.opq; do
+                    if grep -qx -- "$deleted" "$pull/layer.list"; then
+                        bootstrap="absent: whiteout $deleted in layer $i"
+                        break
+                    fi
+                done
+            fi
+        fi
+        if [ -z "$control" ]; then
+            if grep -qx -- "$CONTROL_MEMBER" "$pull/layer.list"; then
+                if python3 -I -c 'import sys,tarfile; archive=tarfile.open(sys.argv[1],"r:gz"); member=archive.getmember(sys.argv[2]); sys.exit(0 if member.isfile() else 1)' "$blob" "$CONTROL_MEMBER" \
+                    && tar -xOzf "$blob" -- "$CONTROL_MEMBER" > "$stage/dev-control.tar"; then
+                    control="installed"
+                    chmod 0644 "$stage/dev-control.tar"
+                else
+                    refuse "refused: control artifact in layer $i is not a regular readable file" "no controller artifact was installed or activated"
+                fi
+            else
+                for deleted in opt/boss/.wh.dev-control.tar opt/boss/.wh..wh.opq opt/.wh.boss opt/.wh..wh.opq .wh.opt .wh..wh.opq; do
+                    if grep -qx -- "$deleted" "$pull/layer.list"; then
+                        control="absent: whiteout $deleted in layer $i"
+                        break
+                    fi
+                done
+            fi
+        fi
         if [ -z "$counter" ]; then
             if grep -qx -- "$COUNTER_MEMBER" "$pull/layer.list"; then
                 if tar -xzf "$blob" -C "$pull" -- "$COUNTER_MEMBER" 2>"$pull/counter.err" \
@@ -632,6 +675,12 @@ elif [ -z "$counter" ]; then
 fi
 say "counter: $STORE/current/$COUNTER — $counter"
 run_summary_field cli_leaked_policy "$counter"
+if [ -f "$STORE/$SHA/dev-control.tar" ] && [ ! -L "$STORE/$SHA/dev-control.tar" ]; then
+    control="installed"
+else
+    control="${control:-absent: this verified image generation carries no controller artifact}"
+fi
+run_summary_field cli_dev_control "$control"
 run_summary_field cli_result ok
 run_summary_field cli_action "$action"
 say "CONFIRMED — $LINK is the tree's CLI at ${SHA:0:8} ($action, image $IMAGE): $line"

@@ -128,7 +128,7 @@ async fn publish_workflow(pool: &PgPool) {
             field.filled_by = boss_core::job::FilledBy::Executor;
         }
     }
-    let registry = PgWorkflows::new(pool.clone());
+    let registry = PgWorkflows::for_fixture(pool.clone());
     registry
         .create_draft(wf, &author(), Utc::now())
         .await
@@ -156,8 +156,8 @@ fn build_app(pool: PgPool, with_workflows: bool) -> Router {
             .allow("ceo", Action::Update, Resource::step(), Scope::All)
             .build(),
     );
-    let kind_registry: Option<Arc<dyn WorkflowRegistry>> =
-        with_workflows.then(|| Arc::new(PgWorkflows::new(pool)) as Arc<dyn WorkflowRegistry>);
+    let kind_registry: Option<Arc<dyn WorkflowRegistry>> = with_workflows
+        .then(|| Arc::new(PgWorkflows::for_fixture(pool)) as Arc<dyn WorkflowRegistry>);
     router(JobsApiState {
         step_registry: Arc::new(StepRegistry::v1()),
         kind_registry,

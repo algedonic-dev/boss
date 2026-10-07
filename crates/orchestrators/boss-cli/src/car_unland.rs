@@ -674,7 +674,7 @@ pub(crate) mod tests {
         use boss_jobs::WorkflowRegistry;
         use boss_policy_client::{Action, FakePolicyClient, PolicyClient, Resource, Scope};
         use std::sync::Arc;
-        let kinds = Arc::new(boss_jobs::InMemoryWorkflows::new());
+        let kinds = Arc::new(boss_jobs::InMemoryWorkflows::for_fixture());
         for spec in boss_jobs::registry::seedable_platform_workflows() {
             kinds.seed(spec).expect("seed platform kind");
         }

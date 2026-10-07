@@ -59,13 +59,10 @@ export function manifestFromInline(raw: unknown): ManifestState | null {
 /// playground's Simulator tab, storefront and QA hub. A tenant now
 /// declares what it uses; the names are in docs/tenant-contract.md.
 ///
-/// A manifest that is still loading or unreachable hides nothing.
-/// That is a deployment fault, not a tenant decision, and a blank
-/// shell would hide the fault instead of showing it; the gateway
-/// inlines the manifest into index.html, so on a served page this
-/// state does not reach the first paint.
+/// An unread manifest cannot authorize a module. The route boundary
+/// distinguishes loading and failure from a known disabled module.
 export function moduleOn(state: ManifestState, module_id: string): boolean {
-  if (state.kind !== 'ready') return true;
+  if (state.kind !== 'ready') return false;
   return state.modules[module_id] === true;
 }
 

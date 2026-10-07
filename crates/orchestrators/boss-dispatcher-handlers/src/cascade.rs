@@ -185,10 +185,22 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // complete-release-tag-on-tag-release-answered.
         ("ops.file_tag_release", vec!["jobs.job.created"]),
         // An estate finding files the ops-request of each verb that
-        // declares it remedies it (3df309bf): one `jobs.job.created`, an
-        // ops-request, never an estate comparison, so the topic it
-        // fires on (`jobs.estate.compared`) cannot re-enter it.
-        ("ops.file_remedies", vec!["jobs.job.created"]),
+        // declares it remedies it (3df309bf), including a declared
+        // read-only argument discovery (53c8cb72). The shared admission
+        // guards may also PATCH a held request's metadata. Neither fact
+        // is an estate comparison, so it cannot re-enter this reactor.
+        (
+            "ops.file_remedies",
+            vec!["jobs.job.created", "jobs.job.updated"],
+        ),
+        // A completed discovery's conserved stdout may file an explicit
+        // passkey remedy request. The same admission guards may annotate
+        // an incumbent hold; neither path completes an ops task or grants
+        // approval, so the completion reactor does not feed itself.
+        (
+            "ops.file_discovered_remedies",
+            vec!["jobs.job.created", "jobs.job.updated"],
+        ),
         // A chore that closed red opens one backlog-item per RED route
         // on its recorded step (ac3270c7): items (`jobs.job.created`)
         // and a `judged` note on the chore it read (`jobs.job.updated`).
@@ -277,6 +289,16 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
                 "jobs.step.completed",
             ],
         ),
+        // Report-only receipt observation files/retracts its own alarm;
+        // no event claims that the watched worker died or delivered.
+        (
+            "jobs.receipt_overdue",
+            vec![
+                "jobs.job.created",
+                "jobs.job.updated",
+                "jobs.step.completed",
+            ],
+        ),
         // The routing half of the same judgement (a3397b01): a step
         // held by a run that DIED is released — `ready`, unassigned,
         // the dead run's edge cleared. A step UPDATE, never a
@@ -354,6 +376,17 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // by the forge host's deposit, never by this handler — the same
         // argument holds.
         ("credential.rotate.forgejo", vec!["jobs.step.completed"]),
+        // Installation diagnostics (99a2649d) record immutable evidence
+        // through the first-record door, then complete the task. The
+        // read grants no permission and emits no credential lifecycle fact.
+        (
+            "credential.observe.github-installation",
+            vec![
+                "jobs.step.first_recorded",
+                "jobs.step.updated",
+                "jobs.step.completed",
+            ],
+        ),
         // Same shape, second issuer (04e5f833): completes `task`
         // steps of the rotation packet, never a credential-rotation
         // step, so it cannot re-enter its own trigger.
@@ -378,6 +411,10 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // step — the host's deposit completes `delivered` — so it cannot
         // re-enter either trigger.
         ("credential.rotate.ops-runner", vec!["jobs.step.completed"]),
+        (
+            "credential.prepare.ssh-deposit",
+            vec!["jobs.step.completed"],
+        ),
         // Fifth, the estate machine token (design 6805c764, car 3): on a
         // rotation packet it completes that packet's `task` steps, never
         // a credential-rotation step; its clock firing (`phase =

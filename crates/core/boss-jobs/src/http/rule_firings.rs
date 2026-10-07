@@ -28,11 +28,72 @@
 //! healthy.
 
 use super::*;
+use axum::extract::{Path, Query};
 
 use crate::dispatcher_firings::{
     DEAD_LETTER_KEY, DeadLetterRollup, RETENTION_DAYS, RuleLastFiring, UnroutedDeadLetters,
     dead_letter_rollup, with_unrouted,
 };
+
+#[derive(serde::Deserialize)]
+pub(super) struct DeadLetterQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+/// Full retained failures share the machinery record's full-scope boundary.
+/// Policy and unavailable storage refuse explicitly; neither means zero failures.
+pub(super) async fn retained_dead_letters<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    CurrentUser(user): CurrentUser,
+    Path(rule): Path<String>,
+    Query(query): Query<DeadLetterQuery>,
+) -> Response {
+    if user.id.trim().is_empty()
+        || boss_core::roles::ANONYMOUS_VISITOR_IDS.contains(&user.id.as_str())
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error":"identified caller required"})),
+        )
+            .into_response();
+    }
+    match state.policy.scope_of(&user, controls::READ_JOB).await {
+        Ok(predicate) if matches!(JobScope::from_predicate(&user, &predicate), JobScope::All) => {}
+        Ok(_) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error":"full packet read scope required"})),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error":"policy could not be read"})),
+            )
+                .into_response();
+        }
+    }
+    let limit = query.limit.unwrap_or(20);
+    let offset = query.offset.unwrap_or(0);
+    if !(1..=100).contains(&limit) || offset > i64::MAX as usize {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"limit must be 1..100 and offset must fit the storage bound"}))).into_response();
+    }
+    let Some(repo) = &state.dispatcher_firings else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":"dispatcher firing record is not wired"})),
+        )
+            .into_response();
+    };
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let since = now - chrono::Duration::days(RETENTION_DAYS);
+    match repo.dead_letter_page(&rule, since, limit, offset).await {
+        Ok(page) => Json(serde_json::json!({"data":page.data,"total":page.total,"limit":limit,"offset":offset,"since":since,"retention_days":RETENTION_DAYS})).into_response(),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"retained dispatcher failures could not be read"}))).into_response(),
+    }
+}
 
 pub(super) async fn yard_rule_firings<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,

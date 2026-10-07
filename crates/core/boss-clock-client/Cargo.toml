@@ -22,6 +22,7 @@ futures = { workspace = true }
 
 [dev-dependencies]
 boss-clock = { path = "../boss-clock" }
+boss-testing = { path = "../boss-testing" }
 
 [lints]
 workspace = true

@@ -9,10 +9,11 @@
 //!
 //! Every admin WRITE authorizes its caller against `policy-rule` and
 //! records that caller as `changed_by` (backlog 42c25542; see
-//! [`authorize`]).
+//! [`authorize`]), and is refused 409 when it would leave a control held
+//! by no real person (`crate::guard`, car 3 of design 1c4e42e1).
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::Json;
 use axum::Router;
@@ -25,16 +26,23 @@ use serde::Deserialize;
 use boss_policy_client::engine::PolicyEngine;
 use boss_policy_client::port::{PolicyError, PolicyRepository};
 use boss_policy_client::types::{
-    Action, PolicyRule, Resource, User, UserOverride, refuse_ambiguous_role, rule_id,
+    Action, PolicyRule, Resource, Scope, User, UserOverride, refuse_ambiguous_role, rule_id,
 };
 use boss_policy_client::{CurrentUser, Pair, controls};
 
 use crate::authority::{self, Holdings};
 use crate::check_mode::{self, Arm, CheckMode, Mode};
+use crate::coverage::CoverageSources;
+use crate::guard::{self, Dark, Refusal, Standing};
+use boss_policy_client::coverage;
 
 pub struct PolicyApiState<R: PolicyRepository> {
     pub repo: Arc<R>,
     pub engine: Arc<PolicyEngine<R>>,
+    /// The roster, passkeys and workflows the lockout guard judges every
+    /// write against (`crate::guard`) — the same reads the coverage read
+    /// takes, so both answer "who holds this" the same way.
+    pub sources: Arc<dyn CoverageSources>,
     /// What `/check` does with F7's two open arms — `off` as shipped
     /// (backlog b8e75382, design b08725c2 row D). The service binary
     /// mounts it from its file ([`CheckMode::mount`]); a router built in
@@ -111,7 +119,8 @@ async fn health() -> Json<boss_core::startup::HealthResponse> {
 // The two arms still answered about anyone — UNSIGNED, and a service the
 // bound refuses — are F7 of b8e75382, and they ride the policy check's
 // own mode word (`crate::check_mode`, design b08725c2 row D), shipped
-// `off` and mounted `report` since the report-prep car (checklist F4):
+// `off`, mounted `report` by the report-prep car (checklist F4) and
+// `enforce` by row D's car:
 // `an_unsigned_check_answers_about_anyone_while_the_check_mode_is_off`
 // and `a_retired_policy_read_does_not_lock_the_services_out` hold `off` to
 // the answer before the mode existed, and the `the_check_mode_*` tests
@@ -200,10 +209,13 @@ struct CheckBody {
 ///   every user, the operator's included, is refused. So a refused
 ///   service is answered and the gap logged, and an unsigned check is not
 ///   judged at all.
-/// * `report` (mounted by boss.yaml): answered, and counted as what
-///   `enforce` would refuse — a refused service's lapsed grant included,
-///   which the hourly lapsed-grant alarm reads off the tally.
-/// * `enforce`: refused, naming the mode and the file that turns it back.
+/// * `report`: answered, and counted as what `enforce` would refuse — a
+///   refused service's lapsed grant included, which the hourly
+///   lapsed-grant alarm reads off the tally.
+/// * `enforce` (mounted by boss.yaml since row D's car): refused, naming
+///   the mode and the file that turns it back. A service arm that HOLDS
+///   its grant is answered on its asserted id — proof of that id is the
+///   machine token's, row C.
 ///
 /// Why a mode and not a deploy: a misfire here denies every signed-in
 /// write, so the car that reverts it might not be able to ride. The mode
@@ -554,11 +566,30 @@ async fn write_rule<R: PolicyRepository + 'static>(
         Ok(held) => held,
         Err(refused) => return refused,
     };
-    let judge = |existing: Option<&PolicyRule>| authority::judge_rule(&held, existing, &rule);
-    match state.repo.upsert_rule_judged(&rule, &user.id, &judge).await {
-        Ok(()) => (StatusCode::OK, Json(rule)).into_response(),
-        Err(e) => err_response(e),
-    }
+    // Break-glass restores a rule core ships, exactly — the one rule
+    // write `judge_rule` lets it make — and is the recovery of last
+    // resort, so it is judged without the guard's reads (decision 4).
+    let standing = if held.role == boss_core::roles::BREAK_GLASS_ROLE {
+        None
+    } else {
+        match guard_standing(state, &held).await {
+            Ok(s) => Some(s),
+            Err(refused) => return refused,
+        }
+    };
+    let taken = OnceLock::new();
+    let judge = |existing: Option<&PolicyRule>| {
+        authority::judge_rule(&held, existing, &rule)?;
+        standing
+            .as_ref()
+            .map_or(Ok(()), |s| guarded(&taken, s.rule_write(existing, &rule)))
+    };
+    let written = state.repo.upsert_rule_judged(&rule, &user.id, &judge).await;
+    answer(
+        written,
+        &taken,
+        (StatusCode::OK, Json(rule)).into_response(),
+    )
 }
 
 async fn deactivate_rule<R: PolicyRepository + 'static>(
@@ -569,9 +600,94 @@ async fn deactivate_rule<R: PolicyRepository + 'static>(
     if let Err(refused) = authorize(&state, &user, controls::DELETE_POLICY_RULE).await {
         return refused;
     }
-    match state.repo.deactivate_rule(&id, &user.id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => err_response(e),
+    // The retirement is a judged write now (car 3 of design 1c4e42e1):
+    // retiring the one grant a control rests on is the lockout the
+    // triage of backlog 47aed706 found no judge looking at.
+    let standing = match read_standing(&state).await {
+        Ok(s) => s,
+        Err(refused) => return refused,
+    };
+    let taken = OnceLock::new();
+    let judge = |existing: Option<&PolicyRule>| {
+        let Some(row) = existing else {
+            return Ok(());
+        };
+        let retired = PolicyRule {
+            active: false,
+            ..row.clone()
+        };
+        guarded(&taken, standing.rule_write(existing, &retired))
+    };
+    let written = state
+        .repo
+        .deactivate_rule_judged(&id, &user.id, &judge)
+        .await;
+    answer(written, &taken, StatusCode::NO_CONTENT.into_response())
+}
+
+// ----- the lockout guard (car 3 of design 1c4e42e1) --------------------------
+
+/// What the guard judges a write against, read before the write's
+/// transaction — for a caller that holds some policy write at all, so a
+/// caller the judge will refuse anyway sends no read to another service.
+async fn guard_standing<R: PolicyRepository + 'static>(
+    state: &PolicyApiState<R>,
+    held: &Holdings,
+) -> Result<Standing, Response> {
+    held.may_write_policy().map_err(forbidden)?;
+    read_standing(state).await
+}
+
+/// A source the guard cannot read leaves the write unjudgeable: refused
+/// 503, naming it, and nothing written — never passed on a guess.
+async fn read_standing<R: PolicyRepository + 'static>(
+    state: &PolicyApiState<R>,
+) -> Result<Standing, Response> {
+    Standing::read(state.repo.as_ref(), state.sources.as_ref())
+        .await
+        .map_err(|Dark(why)| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "the lockout guard cannot judge this write, so nothing was written: {why} \
+                     (design 1c4e42e1 — a write that might take a control's last real holder \
+                     away is not made on a guess)"
+                ),
+            )
+                .into_response()
+        })
+}
+
+/// The guard's verdict as a judge's: the refusal names each control (or
+/// what could not be read), and is kept so the door answers 409 or 503
+/// rather than 403.
+fn guarded(kept: &OnceLock<Refusal>, verdict: Result<(), Refusal>) -> Result<(), String> {
+    verdict.map_err(|refusal| {
+        let why = match &refusal {
+            Refusal::Taken(held) => coverage::refusal(held),
+            Refusal::Blind(why) => {
+                format!("the lockout guard cannot judge this write, so nothing was written: {why}")
+            }
+        };
+        // Set once: the adapter asks a write's judge once.
+        let _ = kept.set(refusal);
+        why
+    })
+}
+
+/// A judged write's answer: a control taken is a 409 — the write
+/// conflicts with the table's coverage, and adding a holder first
+/// resolves it — a blind guard a 503, every other refusal what it was.
+fn answer(written: Result<(), PolicyError>, kept: &OnceLock<Refusal>, ok: Response) -> Response {
+    match (written, kept.get()) {
+        (Ok(()), _) => ok,
+        (Err(PolicyError::Refused(why)), Some(Refusal::Taken(_))) => {
+            (StatusCode::CONFLICT, why).into_response()
+        }
+        (Err(PolicyError::Refused(why)), Some(Refusal::Blind(_))) => {
+            (StatusCode::SERVICE_UNAVAILABLE, why).into_response()
+        }
+        (Err(e), _) => err_response(e),
     }
 }
 
@@ -606,18 +722,48 @@ async fn upsert_user_override<R: PolicyRepository + 'static>(
         Ok(held) => held,
         Err(refused) => return refused,
     };
-    let now = boss_policy_client::engine::expiry_now();
-    let judge = |existing: Option<&UserOverride>| {
-        authority::judge_override(&held, existing, Some(&body.ov), now)
+    if let Err(refused) = held.may_write_policy() {
+        return forbidden(refused);
+    }
+    // The guard reads as its own identity; an override there — a deny on
+    // `read workflow` made every guarded write unjudgeable, its own
+    // repair included (review 782257de, B1) — is refused, whatever its
+    // scope: that identity's reads come from its role, never an override.
+    if guard::is_the_guards_reader(&body.ov) {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "no override is written on {}: it is the identity the lockout guard and the \
+                 coverage read read the roster, the passkeys and the workflows as, and an \
+                 override there can blind the guard to every policy write (design 1c4e42e1); \
+                 its reads come from its role",
+                body.ov.user_id
+            ),
+        )
+            .into_response();
+    }
+    let standing = match read_standing(&state).await {
+        Ok(s) => s,
+        Err(refused) => return refused,
     };
-    match state
+    let now = boss_policy_client::engine::expiry_now();
+    let taken = OnceLock::new();
+    let judge = |existing: Option<&UserOverride>| {
+        authority::judge_override(&held, existing, Some(&body.ov), now)?;
+        guarded(
+            &taken,
+            standing.override_write(existing, Some(&body.ov), now),
+        )
+    };
+    let written = state
         .repo
         .upsert_user_override_judged(&body.ov, &user.id, &judge)
-        .await
-    {
-        Ok(()) => (StatusCode::CREATED, Json(body.ov)).into_response(),
-        Err(e) => err_response(e),
-    }
+        .await;
+    answer(
+        written,
+        &taken,
+        (StatusCode::CREATED, Json(body.ov.clone())).into_response(),
+    )
 }
 
 async fn deactivate_user_override<R: PolicyRepository + 'static>(
@@ -641,17 +787,42 @@ async fn deactivate_user_override<R: PolicyRepository + 'static>(
         Ok(held) => held,
         Err(refused) => return refused,
     };
+    // Retiring a deny takes no one's hold, so it reads nothing (review
+    // 782257de, B1): the lockout it lifts may be the very thing that
+    // darkened a source, and break-glass's one override power must owe
+    // nothing to the people or jobs API. Any other retirement — break-
+    // glass's included — is guarded like anyone's (decision 4). Which one
+    // this is, is decided again inside the judge on the row as locked:
+    // a concurrent rewrite can turn a deny into a grant.
+    let standing = if about.scope == Scope::None {
+        None
+    } else {
+        match guard_standing(&state, &held).await {
+            Ok(s) => Some(s),
+            Err(refused) => return refused,
+        }
+    };
     let now = boss_policy_client::engine::expiry_now();
-    let judge =
-        |existing: Option<&UserOverride>| authority::judge_override(&held, existing, None, now);
-    match state
+    let taken = OnceLock::new();
+    let judge = |existing: Option<&UserOverride>| {
+        authority::judge_override(&held, existing, None, now)?;
+        if guard::retires_a_deny(existing, None) {
+            return Ok(());
+        }
+        let verdict = match &standing {
+            Some(s) => s.override_write(existing, None, now),
+            None => Err(Refusal::Blind(format!(
+                "override {id} was a deny when this retirement was read and is not one now; \
+                 send it again so the guard reads what it now grants"
+            ))),
+        };
+        guarded(&taken, verdict)
+    };
+    let written = state
         .repo
         .deactivate_user_override_judged(&id, &user.id, &judge)
-        .await
-    {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => err_response(e),
-    }
+        .await;
+    answer(written, &taken, StatusCode::NO_CONTENT.into_response())
 }
 
 #[cfg(test)]
@@ -714,8 +885,13 @@ mod tests {
             self.note("rule.upsert", by);
             Ok(())
         }
-        async fn deactivate_rule(&self, id: &str, by: &str) -> Result<(), PolicyError> {
-            self.inner.deactivate_rule(id, by).await?;
+        async fn deactivate_rule_judged(
+            &self,
+            id: &str,
+            by: &str,
+            judge: Judge<'_, PolicyRule>,
+        ) -> Result<(), PolicyError> {
+            self.inner.deactivate_rule_judged(id, by, judge).await?;
             self.note("rule.deactivate", by);
             Ok(())
         }
@@ -788,9 +964,21 @@ mod tests {
         })
     }
 
-    /// The router as it ships: the policy check mode `off`.
+    /// The door as every authority test drives it: one real person who
+    /// holds nothing, so every control is a gap before any write, the
+    /// lockout guard has nothing to take, and these tests judge authority
+    /// alone. The guard's own tests use [`guarded_app`].
     fn app(repo: &Arc<Recording>) -> Router {
-        app_in(repo, &CheckMode::fixed(Mode::Off))
+        guarded_app(repo, crate::guard::fixtures::Fixed::bystander())
+    }
+
+    fn guarded_app(repo: &Arc<Recording>, sources: crate::guard::fixtures::Fixed) -> Router {
+        router(PolicyApiState {
+            repo: repo.clone(),
+            engine: Arc::new(PolicyEngine::new(repo.clone())),
+            sources: Arc::new(sources),
+            check_mode: CheckMode::fixed(Mode::Off),
+        })
     }
 
     fn app_in(repo: &Arc<Recording>, check_mode: &Arc<CheckMode>) -> Router {
@@ -798,6 +986,7 @@ mod tests {
             repo: repo.clone(),
             engine: Arc::new(PolicyEngine::new(repo.clone())),
             check_mode: Arc::clone(check_mode),
+            sources: Arc::new(crate::guard::fixtures::Fixed::bystander()),
         })
     }
 
@@ -1942,7 +2131,8 @@ mod tests {
     /// with no header. F7 closes it behind its own mode (design b08725c2
     /// row D): `enforce` refuses it, which
     /// `the_check_mode_enforce_refuses_both_open_arms` pins; this pin
-    /// holds `off` to today's answer until the mode word is flipped.
+    /// holds `off` — an instance with no mode file, the OSS quickstart
+    /// among them — to that answer.
     #[tokio::test]
     async fn an_unsigned_check_answers_about_anyone_while_the_check_mode_is_off() {
         let repo = reads_repo().await;
@@ -2261,5 +2451,742 @@ mod tests {
             let (status, text) = ask(&repo, Method::POST, uri, Some(&body), Some(&admin)).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {text}");
         }
+    }
+
+    // ----- the lockout guard (car 3 of design 1c4e42e1; G1 of b08725c2) --
+    //
+    // The instance as it stands: one real person, the founder, holding
+    // every pair a door asks for through platform-admin. So the founder's
+    // own writes are the ones that can lock the policy table.
+
+    use crate::guard::fixtures::Fixed;
+
+    async fn guarded(
+        repo: &Arc<Recording>,
+        sources: Fixed,
+        method: Method,
+        uri: &str,
+        body: Option<&serde_json::Value>,
+        caller: &str,
+    ) -> (StatusCode, String) {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("x-boss-user", caller);
+        let req = match body {
+            Some(b) => req
+                .header("content-type", "application/json")
+                .body(Body::from(b.to_string())),
+            None => {
+                req = req.header("content-length", "0");
+                req.body(Body::empty())
+            }
+        }
+        .expect("request");
+        let resp = guarded_app(repo, sources)
+            .oneshot(req)
+            .await
+            .expect("infallible");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn founder() -> String {
+        user("emp-founder", "platform-admin")
+    }
+
+    /// THE LOCKOUT the triage of backlog 47aed706 measured, at every
+    /// write door: the founder narrowing, retiring or overriding away
+    /// their own `policy-rule:update`. Each is refused 409 naming the
+    /// control and whom it would be taken from, and nothing is written.
+    #[tokio::test]
+    async fn the_founder_cannot_take_the_policy_table_from_themselves() {
+        let repo = repo(vec![]).await;
+        let before = snapshot(&repo).await;
+        let own = "platform-admin:policy-rule:update";
+        let narrowed = PolicyRule::new(
+            "platform-admin",
+            Resource::policy_rule(),
+            Action::Update,
+            Scope::None,
+        );
+        let deny = UserOverride {
+            id: "ov-lockout".into(),
+            user_id: "emp-founder".into(),
+            resource: Resource::policy_rule(),
+            action: Action::Update,
+            scope: Scope::None,
+            reason: "a mistake".into(),
+            expires_at: None,
+        };
+        let writes = [
+            (
+                Method::PUT,
+                format!("/api/policy/rules/{own}"),
+                Some(serde_json::json!({"rule": narrowed})),
+            ),
+            (
+                Method::POST,
+                "/api/policy/rules".to_string(),
+                Some(serde_json::json!({"rule": narrowed})),
+            ),
+            (Method::DELETE, format!("/api/policy/rules/{own}"), None),
+            (
+                Method::POST,
+                "/api/policy/user-overrides".to_string(),
+                Some(serde_json::json!({"override": deny})),
+            ),
+        ];
+        for (method, uri, body) in writes {
+            let (status, text) = guarded(
+                &repo,
+                Fixed::founder_only(),
+                method.clone(),
+                &uri,
+                body.as_ref(),
+                &founder(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{method} {uri}: {text}");
+            assert!(text.contains("policy:update:policy-rule"), "{text}");
+            assert!(
+                text.contains("emp-founder"),
+                "whom it is taken from: {text}"
+            );
+            assert!(text.contains("second real person"), "the way past: {text}");
+        }
+        assert_eq!(repo.writes(), vec![], "no refused write reaches the table");
+        assert!(snapshot(&repo).await == before, "the table changed");
+    }
+
+    /// The guard refuses only what takes a last holder: a write about a
+    /// role no real person carries goes, and so does the repair of a
+    /// lockout already in the table (decision 3).
+    #[tokio::test]
+    async fn a_write_that_leaves_every_holder_goes_and_a_repair_goes() {
+        let repo = repo(vec![]).await;
+        let clerk = PolicyRule::new("clerk", Resource::job(), Action::Read, Scope::Team);
+        let (status, text) = guarded(
+            &repo,
+            Fixed::founder_only(),
+            Method::POST,
+            "/api/policy/rules",
+            Some(&serde_json::json!({"rule": clerk})),
+            &founder(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+
+        // A lockout put there by a route no door judges — a seed, a
+        // restore — is repaired through the door.
+        let deny = UserOverride {
+            id: "ov-lockout".into(),
+            user_id: "emp-founder".into(),
+            resource: Resource::policy_rule(),
+            action: Action::Update,
+            scope: Scope::None,
+            reason: "restored from an old dump".into(),
+            expires_at: None,
+        };
+        repo.inner
+            .upsert_user_override(&deny, "restore")
+            .await
+            .expect("the lockout");
+        let (status, text) = guarded(
+            &repo,
+            Fixed::founder_only(),
+            Method::DELETE,
+            "/api/policy/user-overrides/ov-lockout",
+            None,
+            &founder(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "the repair: {text}");
+    }
+
+    /// A read the guard cannot trust is a refusal, never a pass: the
+    /// people service down leaves the write unjudged, so unmade.
+    #[tokio::test]
+    async fn a_dark_source_refuses_the_write_and_names_it() {
+        let repo = repo(vec![]).await;
+        let dark = Fixed {
+            roster: Err("GET /api/people: connection refused".into()),
+            ..Fixed::founder_only()
+        };
+        let clerk = PolicyRule::new("clerk", Resource::job(), Action::Read, Scope::Team);
+        let (status, text) = guarded(
+            &repo,
+            dark,
+            Method::POST,
+            "/api/policy/rules",
+            Some(&serde_json::json!({"rule": clerk})),
+            &founder(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{text}");
+        assert!(text.contains("connection refused"), "{text}");
+        assert_eq!(repo.writes(), vec![]);
+    }
+
+    /// Break-glass, the recovery of last resort, restores a shipped rule
+    /// with every guard source dark — it needs none of them — and its
+    /// retirement of an override is still guarded.
+    #[tokio::test]
+    async fn break_glass_restores_without_the_guard_and_retires_under_it() {
+        let repo = repo(vec![]).await;
+        let shipped = default_rules()
+            .into_iter()
+            .find(|r| r.id == "platform-admin:policy-rule:update")
+            .expect("core ships the operator's policy update");
+        repo.inner
+            .upsert_rule(
+                &PolicyRule {
+                    scope: Scope::None,
+                    ..shipped.clone()
+                },
+                "emp-mistake",
+            )
+            .await
+            .expect("break it");
+        let key = user("emp-oncall", "break-glass");
+        let all_dark = Fixed {
+            roster: Err("down".into()),
+            keys: Err("down".into()),
+            workflows: Err("down".into()),
+        };
+        let uri = format!("/api/policy/rules/{}", shipped.id);
+        let body = serde_json::json!({"rule": shipped});
+        let (status, text) = guarded(&repo, all_dark, Method::PUT, &uri, Some(&body), &key).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+
+        let dark = Fixed {
+            roster: Err("down".into()),
+            ..Fixed::founder_only()
+        };
+        let (status, text) = guarded(
+            &repo,
+            dark,
+            Method::DELETE,
+            &format!("/api/policy/user-overrides/{SEEDED_OVERRIDE}"),
+            None,
+            &key,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "guarded, so unjudgeable: {text}"
+        );
+        assert_eq!(repo.writes().len(), 1, "{:?}", repo.writes());
+    }
+
+    /// Review 782257de, B1: retiring a deny override takes no one's hold,
+    /// so it needs no read — with every guard source dark, the founder
+    /// lifts their own lockout and break-glass lifts another, both 204.
+    #[tokio::test]
+    async fn retiring_a_deny_with_every_source_dark_goes_for_the_founder_and_break_glass() {
+        let repo = repo(vec![]).await;
+        for (id, who) in [("ov-lockout", "emp-founder"), ("ov-other", "emp-other")] {
+            repo.inner
+                .upsert_user_override(
+                    &UserOverride {
+                        id: id.into(),
+                        ..grant(who, Resource::policy_rule(), Action::Update, Scope::None)
+                    },
+                    "restore",
+                )
+                .await
+                .expect("the deny");
+        }
+        for (id, caller) in [
+            ("ov-lockout", founder()),
+            ("ov-other", user("emp-oncall", "break-glass")),
+        ] {
+            let (status, text) = guarded(
+                &repo,
+                Fixed::all_dark(),
+                Method::DELETE,
+                &format!("/api/policy/user-overrides/{id}"),
+                None,
+                &caller,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{caller}: {text}");
+        }
+        assert_eq!(repo.writes().len(), 2, "{:?}", repo.writes());
+    }
+
+    /// Review 782257de, B1, the reviewer's reproduction: a deny on the
+    /// guard's own reader for `read workflow` makes `/api/workflows`
+    /// answer 403, so every guarded write reads dark. Its retirement
+    /// still goes — 204 for the founder — and the door no longer accepts
+    /// that override in the first place: 409, naming why.
+    #[tokio::test]
+    async fn a_deny_on_the_guards_reader_is_refused_and_one_already_there_is_retired() {
+        use crate::coverage::COVERAGE_READER_ID;
+        let repo = repo(vec![]).await;
+        let blinding = UserOverride {
+            id: "ov-blind".into(),
+            ..grant(
+                COVERAGE_READER_ID,
+                Resource::workflow(),
+                Action::Read,
+                Scope::None,
+            )
+        };
+        let (status, text) = guarded(
+            &repo,
+            Fixed::founder_only(),
+            Method::POST,
+            "/api/policy/user-overrides",
+            Some(&serde_json::json!({"override": blinding})),
+            &founder(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{text}");
+        assert!(text.contains(COVERAGE_READER_ID), "{text}");
+        assert!(text.contains("guard"), "says why: {text}");
+        assert_eq!(repo.writes(), vec![]);
+
+        // Already in the table by a route no door judges.
+        repo.inner
+            .upsert_user_override(&blinding, "restore")
+            .await
+            .expect("the blinding deny");
+        let blinded = Fixed {
+            workflows: Err("GET /api/workflows answered 403 Forbidden".into()),
+            ..Fixed::founder_only()
+        };
+        // Every other guarded write reads dark, as the reviewer found.
+        let clerk = PolicyRule::new("clerk", Resource::job(), Action::Read, Scope::Team);
+        let (status, _) = guarded(
+            &repo,
+            blinded,
+            Method::POST,
+            "/api/policy/rules",
+            Some(&serde_json::json!({"rule": clerk})),
+            &founder(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let blinded = Fixed {
+            workflows: Err("GET /api/workflows answered 403 Forbidden".into()),
+            ..Fixed::founder_only()
+        };
+        let (status, text) = guarded(
+            &repo,
+            blinded,
+            Method::DELETE,
+            "/api/policy/user-overrides/ov-blind",
+            None,
+            &founder(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "the repair: {text}");
+    }
+
+    /// Review 782257de, N1, at the door: an empty roster is blind — a
+    /// narrowing is refused 503 naming the roster — while the new rules a
+    /// fresh instance's tenant publish posts still go.
+    #[tokio::test]
+    async fn an_empty_roster_refuses_a_narrowing_and_passes_a_new_rule() {
+        let repo = repo(vec![]).await;
+        let empty = || Fixed {
+            roster: Ok(vec![]),
+            ..Fixed::all_dark()
+        };
+        let own = "platform-admin:policy-rule:update";
+        let narrowed = PolicyRule::new(
+            "platform-admin",
+            Resource::policy_rule(),
+            Action::Update,
+            Scope::None,
+        );
+        let (status, text) = guarded(
+            &repo,
+            empty(),
+            Method::PUT,
+            &format!("/api/policy/rules/{own}"),
+            Some(&serde_json::json!({"rule": narrowed})),
+            &founder(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{text}");
+        assert!(text.contains("roster"), "{text}");
+        let fresh = PolicyRule::new("ceo", Resource::job(), Action::Read, Scope::All);
+        let (status, text) = guarded(
+            &repo,
+            empty(),
+            Method::POST,
+            "/api/policy/rules",
+            Some(&serde_json::json!({"rule": fresh})),
+            &founder(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+    }
+
+    /// A caller with no policy write at all is refused before the guard
+    /// sends a read to another service: every source here would fail the
+    /// test if it were read.
+    #[tokio::test]
+    async fn a_caller_without_policy_authority_costs_no_guard_read() {
+        let repo = repo(vec![]).await;
+        let unread = Fixed {
+            roster: Err("read for a caller the judge refuses".into()),
+            ..Fixed::founder_only()
+        };
+        let clerk = PolicyRule::new("clerk", Resource::job(), Action::Read, Scope::Team);
+        let (status, text) = guarded(
+            &repo,
+            unread,
+            Method::POST,
+            "/api/policy/rules",
+            Some(&serde_json::json!({"rule": clerk})),
+            &user("emp-audit", "audit-readonly"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+        assert!(!text.contains("read for a caller"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_rule_write_cannot_create_an_intermediate_expiry_gap() {
+        for (deny_hours, expected) in [(2, StatusCode::CONFLICT), (1, StatusCode::OK)] {
+            let repo = repo(vec![PolicyRule::new(
+                "second-holder",
+                Resource::policy_rule(),
+                Action::Update,
+                Scope::All,
+            )])
+            .await;
+            let now = chrono::Utc::now();
+            let mut founder_grant = grant(
+                "emp-founder",
+                Resource::policy_rule(),
+                Action::Update,
+                Scope::All,
+            );
+            founder_grant.expires_at = Some(now + chrono::Duration::hours(1));
+            let mut second_deny = grant(
+                "emp-second",
+                Resource::policy_rule(),
+                Action::Update,
+                Scope::None,
+            );
+            second_deny.expires_at = Some(now + chrono::Duration::hours(deny_hours));
+            repo.inner
+                .upsert_user_override(&founder_grant, "fixture")
+                .await
+                .unwrap();
+            repo.inner
+                .upsert_user_override(&second_deny, "fixture")
+                .await
+                .unwrap();
+            let mut sources = Fixed::founder_and_delegate();
+            let person = &mut sources.roster.as_mut().unwrap()[1];
+            person.id = "emp-second".into();
+            person.role = Some("second-holder".into());
+            sources.keys.as_mut().unwrap()[1].employee_id = "emp-second".into();
+            let before = snapshot(&repo).await;
+            let narrowed = PolicyRule::new(
+                "platform-admin",
+                Resource::policy_rule(),
+                Action::Update,
+                Scope::None,
+            );
+            let (status, text) = guarded(
+                &repo,
+                sources,
+                Method::PUT,
+                "/api/policy/rules/platform-admin:policy-rule:update",
+                Some(&serde_json::json!({"rule": narrowed})),
+                &founder(),
+            )
+            .await;
+            assert_eq!(status, expected, "{text}");
+            if expected == StatusCode::CONFLICT {
+                assert!(text.contains("policy:update:policy-rule"), "{text}");
+                assert!(
+                    text.contains(&founder_grant.expires_at.unwrap().to_rfc3339()),
+                    "{text}"
+                );
+                assert!(text.contains("emp-founder"), "{text}");
+                assert_eq!(snapshot(&repo).await, before);
+                assert!(repo.writes().is_empty());
+            } else {
+                assert_eq!(
+                    repo.writes(),
+                    vec![("rule.upsert".into(), "emp-founder".into())]
+                );
+                assert_eq!(
+                    repo.inner
+                        .rule_for("platform-admin:policy-rule:update")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .scope,
+                    Scope::None
+                );
+            }
+            assert_eq!(
+                repo.inner.list_user_overrides("emp-founder").await.unwrap(),
+                vec![founder_grant]
+            );
+            assert_eq!(
+                repo.inner.list_user_overrides("emp-second").await.unwrap(),
+                vec![second_deny]
+            );
+        }
+    }
+
+    /// Table's live-snapshot contract also applies to the submitted row:
+    /// an expired deny must not enter the future-expiry sweep and turn an
+    /// ordinary write into a refusal (review of the temporal repair).
+    #[tokio::test]
+    async fn an_already_expired_override_does_not_create_a_future_refusal() {
+        let repo = repo(vec![]).await;
+        let before = snapshot(&repo).await;
+        let mut expired = grant(
+            "emp-founder",
+            Resource::policy_rule(),
+            Action::Update,
+            Scope::None,
+        );
+        expired.expires_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        let (status, text) = guarded(
+            &repo,
+            Fixed::founder_only(),
+            Method::POST,
+            "/api/policy/user-overrides",
+            Some(&serde_json::json!({"override": expired})),
+            &founder(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{text}");
+        assert_eq!(snapshot(&repo).await, before);
+        assert_eq!(
+            repo.writes(),
+            vec![("override.upsert".into(), "emp-founder".into())]
+        );
+        assert!(
+            repo.inner
+                .list_user_overrides("emp-founder")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let stored: UserOverride = serde_json::from_str(&text).unwrap();
+        assert_eq!(stored.expires_at, expired.expires_at);
+        assert_eq!(
+            repo.inner
+                .user_override(&stored.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .expires_at,
+            expired.expires_at
+        );
+    }
+
+    // ----- row D's enforce flip (design b08725c2; checklist F3 of review
+    // 1c2860f4): what the landed guard keeps, and what it does not --------
+
+    /// A router with the guard's sources AND a named check mode: the two
+    /// halves checklist F3 joins.
+    fn guarded_app_in(repo: &Arc<Recording>, mode: &Arc<CheckMode>) -> Router {
+        router(PolicyApiState {
+            repo: repo.clone(),
+            engine: Arc::new(PolicyEngine::new(repo.clone())),
+            sources: Arc::new(Fixed::founder_only()),
+            check_mode: Arc::clone(mode),
+        })
+    }
+
+    async fn service_check(repo: &Arc<Recording>, mode: &Arc<CheckMode>, svc: &str) -> StatusCode {
+        let service = serde_json::to_string(&User::service(svc)).expect("identity");
+        ask_via(
+            guarded_app_in(repo, mode),
+            Method::POST,
+            "/api/policy/check",
+            Some(&check_about("emp-cover", "reviewer")),
+            Some(&service),
+        )
+        .await
+        .0
+    }
+
+    /// CHECKLIST F3, THE HALF G1 CLOSES. Under `enforce` every service's
+    /// every check hangs on ONE rule, `platform-admin:policy-rule:read`
+    /// (each signs as `automation:<svc>` at platform-admin). Retiring or
+    /// narrowing it is refused by the lockout guard (G1, 47aed706 car 3)
+    /// at every rule door, because it is also the founder's own Read on
+    /// the table — so the one edit that would 503 every door of every
+    /// service at once cannot be written, and a service check is still
+    /// answered after each attempt.
+    #[tokio::test]
+    async fn under_enforce_the_guard_keeps_the_rule_every_service_check_hangs_on() {
+        let repo = repo(vec![]).await;
+        let mode = CheckMode::fixed(Mode::Enforce);
+        let own = "platform-admin:policy-rule:read";
+        let narrowed = PolicyRule::new(
+            "platform-admin",
+            Resource::policy_rule(),
+            Action::Read,
+            Scope::None,
+        );
+        for (method, uri, body) in [
+            (Method::DELETE, format!("/api/policy/rules/{own}"), None),
+            (
+                Method::PUT,
+                format!("/api/policy/rules/{own}"),
+                Some(serde_json::json!({"rule": narrowed})),
+            ),
+            (
+                Method::POST,
+                "/api/policy/rules".to_string(),
+                Some(serde_json::json!({"rule": narrowed})),
+            ),
+        ] {
+            let (status, text) = ask_via(
+                guarded_app_in(&repo, &mode),
+                method.clone(),
+                &uri,
+                body.as_ref(),
+                Some(&founder()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{method} {uri}: {text}");
+            assert!(text.contains("policy:read:policy-rule"), "{text}");
+            assert_eq!(
+                service_check(&repo, &mode, "jobs").await,
+                StatusCode::OK,
+                "{method} {uri}"
+            );
+        }
+        assert_eq!(repo.writes(), vec![], "no refused write reaches the table");
+    }
+
+    /// CHECKLIST F3, THE HALF G1 DOES NOT CLOSE — pinned so the limit is
+    /// a fact on the record, not a belief. A scope-none override on ONE
+    /// service's id takes no control from a real person, so the guard
+    /// passes it (only its own reader is refused by name). Under
+    /// `enforce` that service's every check is then refused 403, which
+    /// its client reads as policy-unreachable: every door of THAT service
+    /// answers 503 until the override is retired or the mode word goes
+    /// back to `report`. Bounded three ways: only a holder of policy
+    /// authority at scope all can write it; it stops one service, never
+    /// the policy service's own doors; and the repair needs no read
+    /// (`retires_a_deny`), so the same caller retires it through the
+    /// policy door while the service is dark — after which the check is
+    /// answered again.
+    #[tokio::test]
+    async fn under_enforce_a_deny_on_one_service_id_stops_that_service_until_it_is_retired() {
+        let repo = repo(vec![]).await;
+        let mode = CheckMode::fixed(Mode::Enforce);
+        let deny = UserOverride {
+            id: "ov-svc".into(),
+            reason: "a mistake".into(),
+            ..grant(
+                "automation:jobs",
+                Resource::policy_rule(),
+                Action::Read,
+                Scope::None,
+            )
+        };
+        let (status, text) = ask_via(
+            guarded_app_in(&repo, &mode),
+            Method::POST,
+            "/api/policy/user-overrides",
+            Some(&serde_json::json!({"override": deny})),
+            Some(&founder()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "the guard passes it: {text}");
+        assert_eq!(
+            service_check(&repo, &mode, "jobs").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            service_check(&repo, &mode, "people").await,
+            StatusCode::OK,
+            "one service, not the estate"
+        );
+        assert_eq!(
+            service_check(&repo, &CheckMode::fixed(Mode::Report), "jobs").await,
+            StatusCode::OK,
+            "the mode word is one way back"
+        );
+        let (status, text) = ask_via(
+            guarded_app_in(&repo, &mode),
+            Method::DELETE,
+            "/api/policy/user-overrides/ov-svc",
+            None,
+            Some(&founder()),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "retiring the deny is the other: {text}"
+        );
+        assert_eq!(service_check(&repo, &mode, "jobs").await, StatusCode::OK);
+    }
+
+    /// THE ROLLBACK, REHEARSED as far as a tree can take it: the word in
+    /// the mounted file is the whole road. One router, never rebuilt — no
+    /// restart — over a switch reading a real file the way the service's
+    /// re-read does (`read_mode`, then `observe`). `enforce` in the file
+    /// refuses both open arms and names that file; `report` written over
+    /// it answers both on the next reading, and the tally begins again so
+    /// the refusals of the misfire are not carried into the next window.
+    /// What the tree cannot rehearse is the hop before it — kubectl to
+    /// the ConfigMap, kubelet to the mount — which is the manifest's.
+    #[tokio::test]
+    async fn the_word_report_in_the_mode_file_is_the_whole_way_back_from_enforce() {
+        use boss_core::machine_gate::{ModeSwitch, read_mode};
+        let dir = boss_testing::scratch_dir("policy-check-rollback");
+        let file = dir.join("policy-check");
+        std::fs::write(&file, "enforce\n").expect("the mounted word");
+        let switch = Arc::new(ModeSwitch::new(
+            check_mode::SWITCH,
+            &file,
+            read_mode(&file, check_mode::SWITCH),
+        ));
+        let mode = Arc::new(CheckMode::over(Arc::clone(&switch)));
+        for (arm, status, text) in the_open_arms(&mode).await {
+            assert_eq!(status, StatusCode::FORBIDDEN, "{arm}: {text}");
+            assert!(
+                text.contains(&file.display().to_string()),
+                "the refusal names the way back: {text}"
+            );
+        }
+        assert_eq!(mode.refusals().rows.len(), 2);
+
+        std::fs::write(&file, "report\n").expect("the rollback");
+        assert!(
+            switch.observe(read_mode(&file, check_mode::SWITCH)),
+            "the next reading moves the mode"
+        );
+        for (arm, status, text) in the_open_arms(&mode).await {
+            assert_eq!(status, StatusCode::OK, "{arm}: {text}");
+        }
+        let after = mode.refusals();
+        assert_eq!(after.mode, Mode::Report);
+        assert_eq!(
+            after.rows.len(),
+            2,
+            "only the two would-refuse checks made since the move: {after:?}"
+        );
+        assert!(after.rows.iter().all(|row| row.count == 1), "{after:?}");
+
+        // An emptied or mistyped word is never `enforce` again, and never
+        // silently `off`: unreadable is `report`, said with its reason.
+        std::fs::write(&file, "reprot\n").expect("a typo under pressure");
+        let (typo, why) = read_mode(&file, check_mode::SWITCH);
+        assert_eq!(typo, Mode::Report);
+        assert!(why.is_some(), "and it says so");
     }
 }

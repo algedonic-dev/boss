@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# train-reconcile — the conductor's ten-minute early-warning pass:
+# train-reconcile — the conductor's two-minute early-warning pass:
 # CI verdicts, merges, arrival reports, stall checks, branch sweeps.
 # No boarding.
 #
@@ -9,6 +9,10 @@
 # this bundle, published insert-if-missing by boss-platform-workflow-
 # seed, and migrations newer than the cutover stamp in
 # infra/lint/migrations-declare-schema-only.sh declare schema only.
+# Version 2 shortens the interval after a green train waited 8m56s
+# for v1's next judgment (backlog 8eca7b2f). This is five times as many
+# nominal polls; the per-rule in-flight guard and conductor lock still
+# bound overlap. A long pass skips windows rather than stacking work.
 #
 # `wall` basis: fires every `every_minutes` on the wall clock, the
 # window stamp a pure function of (rule, window) so a restarted loop
@@ -22,8 +26,8 @@
 
 [[cadence_rule]]
 name = "train-reconcile"
-version = 1
+version = 2
 status = "active"
 verb = "reconcile"
 basis = "wall"
-every_minutes = 10
+every_minutes = 2

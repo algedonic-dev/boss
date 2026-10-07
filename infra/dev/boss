@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+if [[ -e /etc/boss-dev-control/enabled || -L /etc/boss-dev-control/enabled ]]; then
+    exec /opt/boss-dev-control/boss "$@"
+fi
 # boss — the BOSS CLI on the dev pod's PATH.
 #
 # The pod image ships no `boss`; the binary is a build artifact in
@@ -194,6 +197,19 @@ if [ -n "$image_sha" ] && [ -x "$store/boss" ] && [ -x "$store/$image_sha/boss" 
   image_bin="$store/boss"
 else
   image_bin=""; image_sha=""
+fi
+
+# Selecting a published image is not permission to execute a candidate
+# to learn its version (dev isolation b3071bf4, 2026-10-05). Even
+# --version can read credentials. Decide the winning image before
+# looking at any writable build artifact.
+if [ "$prefer" = image ] && [ -n "$main" ] && [ -n "$image_bin" ] \
+    && git -C "$here" merge-base --is-ancestor "$main" "$image_sha" 2>/dev/null; then
+  if [ -n "${BOSS_SHIM_VERBOSE:-}" ]; then
+    if [ "$image_sha" = "$main" ]; then rel="= origin/main"; else rel="ahead of origin/main ${main:0:8}"; fi
+    echo "boss: running the image CLI at ${image_sha:0:8} ($rel) — $image_bin" >&2
+  fi
+  exec "$image_bin" "$@"
 fi
 
 # The build: the newer profile, and what it says it was built from —

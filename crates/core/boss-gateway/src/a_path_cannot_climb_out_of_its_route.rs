@@ -229,7 +229,7 @@ fn main_enters_the_gateway_through_the_refusal_last() {
     };
     let inquiries = at("let app = inquiries::mount(app, door);");
     let refusal = at("let app = dot_segments::mount(app);");
-    let serve = at("axum::serve(");
+    let serve = at("boss_policy_client::role_service::serve_with_refresh(");
     assert!(
         inquiries < refusal && refusal < serve,
         "the dot-segment refusal must wrap the finished app, after inquiries::mount and \

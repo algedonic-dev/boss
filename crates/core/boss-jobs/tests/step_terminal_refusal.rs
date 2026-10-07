@@ -87,7 +87,7 @@ fn admin_header() -> String {
 /// The router plus the in-memory jobs adapter, kept so the test can
 /// read back the events the outbox paths recorded.
 fn app() -> (axum::Router, Arc<InMemoryJobs>) {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     for spec in seedable_platform_workflows() {
         kinds.seed(spec).expect("seed platform kind");
     }

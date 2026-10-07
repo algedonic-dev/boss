@@ -409,3 +409,177 @@ fn the_image_carries_the_module_reader_beside_the_launcher() {
         "the launcher sources it"
     );
 }
+
+/// The launcher's `--record` door, with a PATH that holds a stand-in
+/// for every binary the launcher names except `absent`.
+fn record(env: &[(&str, &str)], bin: &Path, absent: &[&str]) -> (i32, String) {
+    let launcher = std::fs::read_to_string(repo_root().join(LAUNCHER)).unwrap();
+    create_dir(bin);
+    for name in launcher.lines().filter_map(|l| {
+        l.trim()
+            .strip_prefix("\"boss-")
+            .and_then(|l| l.strip_suffix('"'))
+    }) {
+        let name = format!("boss-{name}");
+        if !absent.contains(&name.as_str()) {
+            boss_testing::write_exec(&bin.join(&name), "#!/bin/sh\nexit 0\n");
+        }
+    }
+    let mut cmd = Command::new("bash");
+    cmd.arg(repo_root().join(LAUNCHER)).arg("--record");
+    for k in [
+        "BOSS_TENANT_DIR",
+        "BOSS_TENANT_MANIFEST_TOML",
+        "BOSS_SIM_ENABLED",
+        "BOSS_SIM_CALLBACK_BIND",
+        "BOSS_EVENT_WEBHOOK_URL",
+        "BOSS_LAUNCH_RECORD",
+    ] {
+        cmd.env_remove(k);
+    }
+    cmd.env(
+        "PATH",
+        format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    );
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("run the launcher");
+    let text = String::from_utf8_lossy(&out.stdout);
+    // The record is the text from its version line on; the module and
+    // sim lines the launcher prints above it are the log's, not its.
+    let at = text.find("boss-launch-record v1").unwrap_or(text.len());
+    (out.status.code().unwrap_or(-1), text[at..].to_string())
+}
+
+/// Every gated row of the port registry with the binaries that could
+/// serve it: the reader's own input, built the way it builds it.
+fn gated() -> Vec<(String, Vec<String>)> {
+    boss_ports::all()
+        .filter(|s| boss_core::machine_gate::is_gated(s.name))
+        .map(|s| (s.name.to_string(), boss_ports::launcher_binaries(s.name)))
+        .collect()
+}
+
+/// Backlog 93e0814a (2026-10-06): the machine-gate window required all
+/// 27 gated rows of the port registry while this instance's launcher
+/// starts 21 of them, so it named six gaps forever. The launcher now
+/// records what it decided and the reader requires exactly that. This
+/// pins the two ends together on the instance's own shape — a tenant
+/// with no sim, equipment, warehouse or shipping module and the sim
+/// parked by the deployment — because the record's grammar lives twice
+/// (bash writes it, Rust reads it; CLAUDE.md 9a).
+#[test]
+fn the_launch_record_excuses_exactly_what_the_launcher_skips() {
+    let root = scratch_dir("launcher-record-llc-shape");
+    let acme = tenant(&root, "acme", &[]);
+    let (rc, text) = record(
+        &[
+            ("BOSS_TENANT_DIR", &acme.display().to_string()),
+            ("BOSS_SIM_ENABLED", "false"),
+        ],
+        &root.join("bin"),
+        &[],
+    );
+    assert_eq!(rc, 0, "{text}");
+    let roster = boss_core::gate_window::launch_roster(&gated(), Ok(&text));
+    assert!(roster.errors.is_empty(), "{:?}\n{text}", roster.errors);
+    let mut out: Vec<&str> = roster
+        .not_launched
+        .iter()
+        .map(|n| n.service.as_str())
+        .collect();
+    out.sort();
+    assert_eq!(
+        out,
+        [
+            "assets",
+            "catalog",
+            "inventory",
+            "shipping",
+            "sim-control",
+            "simulator"
+        ],
+        "{text}"
+    );
+    assert_eq!(roster.required.len() + out.len(), gated().len(), "{text}");
+    for service in ["jobs", "events", "policy", "dispatcher", "ml", "ledger"] {
+        assert!(
+            roster.required.iter().any(|s| s == service),
+            "{service} is started, so it is required:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn a_started_service_is_required_whatever_else_the_record_excuses() {
+    // The playground shape: every module on, the sim running. Nothing
+    // is excused, the sim daemon's control port included.
+    let root = scratch_dir("launcher-record-everything-on");
+    let brew = tenant(
+        &root,
+        "brewery",
+        &["sim", "equipment", "warehouse", "shipping"],
+    );
+    let (rc, text) = record(
+        &[("BOSS_TENANT_DIR", &brew.display().to_string())],
+        &root.join("bin"),
+        &[],
+    );
+    assert_eq!(rc, 0, "{text}");
+    let roster = boss_core::gate_window::launch_roster(&gated(), Ok(&text));
+    assert!(roster.errors.is_empty(), "{:?}\n{text}", roster.errors);
+    assert!(roster.not_launched.is_empty(), "{:?}", roster.not_launched);
+    assert_eq!(roster.required.len(), gated().len());
+
+    // A binary the image does not carry is skipped by the launcher and
+    // says so; the service it would have served is excused BY NAME, and
+    // the reader still probes its port.
+    let (rc, text) = record(
+        &[("BOSS_TENANT_DIR", &brew.display().to_string())],
+        &root.join("bin-without-ml"),
+        &["boss-ml-api"],
+    );
+    assert_eq!(rc, 0, "{text}");
+    assert!(
+        text.lines()
+            .any(|l| l == "skip boss-ml-api binary not in image"),
+        "{text}"
+    );
+    let roster = boss_core::gate_window::launch_roster(&gated(), Ok(&text));
+    assert_eq!(
+        roster
+            .not_launched
+            .iter()
+            .map(|n| (n.service.as_str(), n.reason.as_str()))
+            .collect::<Vec<_>>(),
+        [("ml", "binary not in image")]
+    );
+}
+
+#[test]
+fn the_launch_loop_and_the_record_take_one_decision() {
+    // The record is trusted because the loop that starts services asks
+    // the same function; a second copy of the skip rules in the loop is
+    // how the two would come to disagree.
+    let launcher = std::fs::read_to_string(repo_root().join(LAUNCHER)).unwrap();
+    let at = launcher
+        .find("echo \"==> boss-launch starting")
+        .expect("the launch loop");
+    let lp = &launcher[at..];
+    assert!(lp.contains("if ! launch_decision \"$svc\"; then"), "{lp}");
+    assert!(
+        !lp.contains("service_wanted") && !lp.contains("command -v"),
+        "the loop decides through launch_decision alone"
+    );
+    assert!(
+        launcher.contains(
+            "export BOSS_LAUNCH_RECORD=\"${BOSS_LAUNCH_RECORD:-/etc/boss-launch-record}\""
+        ),
+        "the path the children read is the one this launch wrote"
+    );
+}

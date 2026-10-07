@@ -53,7 +53,7 @@ impl RosterLookup for AdminRoster {
 }
 
 fn app_with_bus() -> (axum::Router, Arc<InMemoryJobs>) {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     for spec in seedable_platform_workflows() {
         kinds.seed(spec).expect("seed platform kind");
     }

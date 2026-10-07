@@ -150,6 +150,52 @@ DIR="infra/cluster/manifests"
 problems=0
 fail() { echo "a-deleted-manifest-leaves-no-object: $*" >&2; problems=$((problems + 1)); }
 
+# WHAT THE CONVERGE'S PACKET CARRIES: `orphans_check` (backlog cb0c9937).
+# The converge runs this as its `check orphans` stage, and until
+# 2026-10-06 a finding left exactly one fact on the converge packet:
+# `failed_stage: check orphans`. WHICH object was in the forge journal
+# alone — packets 8d5c8f93 and 79f23714 both failed on
+# ConfigMap/boss/boss-instance-config, and learning that name took an
+# ops-request for the journal. A verdict must name what failed
+# (CLAUDE.md §Diagnosis), on the packet that carries it.
+#
+# So every named thing a `fail` reports is also kept in $findings as a
+# short `Kind/ns/name (why)` entry, and the run's last act records the
+# count and the names through infra/run-summary.sh — the one definition of
+# how a unit's run leaves facts for its own packet, whose rule is that the
+# script that KNOWS a fact records it, so the converge parses none of this
+# script's prose. BOUNDED: a packet is not a log store, so names past
+# $ORPHANS_SUMMARY_CAP characters are counted ("and N more"), never
+# dropped in silence, and the full list is always above on stderr.
+#
+# A NO-OP WITHOUT A PACKET: a gate, a hand run and every fixture leave
+# BOSS_RUN_SUMMARY_FILE unset and nothing is written; and it never
+# decides this script's exit — visibility is not a precondition.
+findings=()
+ORPHANS_SUMMARY_CAP="${BOSS_ORPHANS_SUMMARY_CAP:-1200}"
+record_orphans_check() { # <verdict when there are no findings>
+    [ -n "${BOSS_RUN_SUMMARY_FILE:-}" ] || return 0
+    [ -f infra/run-summary.sh ] || return 0
+    local text="$1" names="" shown=0 f
+    if [ "${#findings[@]}" -gt 0 ]; then
+        for f in "${findings[@]}"; do
+            if [ "$shown" -gt 0 ] && [ $(( ${#names} + ${#f} + 2 )) -gt "$ORPHANS_SUMMARY_CAP" ]; then
+                break
+            fi
+            names="${names:+$names; }$f"
+            shown=$((shown + 1))
+        done
+        text="${#findings[@]} finding(s): $names"
+        [ "$shown" -eq "${#findings[@]}" ] \
+            || text="$text; and $(( ${#findings[@]} - shown )) more — the full list is in this run's journal"
+    fi
+    [ "${unreadable:-0}" -eq 0 ] || text="$text; UNVERIFIED: ${unreadable} thing(s) this credential could not read"
+    # A subshell: run-summary.sh's functions and its sourced lib stay out
+    # of this script's namespace, and a failure in it stays in there.
+    ( . infra/run-summary.sh && run_summary_field orphans_check "$text" ) || true
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # Static half — always runs, needs no network.
 # ---------------------------------------------------------------------------
@@ -268,6 +314,7 @@ skip() {
     echo "  here is the expected result of a gate, not a finding. The" >&2
     echo "  converge runs this with the admin kubeconfig." >&2
     echo "  Nothing is claimed about what the cluster is running." >&2
+    record_orphans_check "skipped the live comparison — $1; nothing is claimed about the cluster"
     [ "$problems" -eq 0 ] || exit 1
     exit 0
 }
@@ -331,6 +378,8 @@ declared_rows=$("$DERIVE" --declared 2>"$PARSEERR") || {
     sed 's/^/    /' "$PARSEERR" >&2
     echo "  A declared set missing a file is not a smaller declared set; every object that" >&2
     echo "  file declares would read as an orphan. Nothing is claimed about the cluster." >&2
+    findings+=("CANNOT ANSWER: $DERIVE --declared exit $rc — $(LC_ALL=C tr '\n\t' '  ' < "$PARSEERR" | cut -c1-300)")
+    record_orphans_check ""
     exit 1
 }
 # Anything it said while still answering is the reader's too: a warning
@@ -349,6 +398,8 @@ declared_tree=$(printf '%s\n' "$declared_rows" \
 if [ -z "$declared_tree" ]; then
     fail "CANNOT ANSWER — $DERIVE answered, but no row of it parsed as kind<TAB>ns<TAB>name"
     echo "  Its output format has changed under this reader. Nothing is claimed about the cluster." >&2
+    findings+=("CANNOT ANSWER: no row of $DERIVE --declared parsed")
+    record_orphans_check ""
     exit 1
 fi
 
@@ -412,6 +463,7 @@ while IFS= read -r path; do
         fail "cannot parse the DELETED manifest $path as of the commit that removed it:"
         sed 's/^/    /' "$PARSEERR" >&2
         echo "  So nothing here knows what it declared, and a pass would mean 'could not look'." >&2
+        findings+=("CANNOT ANSWER: the deleted manifest $path will not parse")
         continue
     fi
     while IFS= read -r line; do
@@ -452,6 +504,7 @@ while IFS=$'\t' read -r kind name path ns; do
         0)
             deleted_still_live+=("$kind/$name${ns:+ -n $ns} (was declared in $path)")
             deleted_still_live_ids+=("$kind/$ns/$name")
+            findings+=("$kind/$ns/$name (its manifest $path was deleted; the object is still running)")
             ;;
         1) ;; # the server says it is gone, which is the whole point
         *)
@@ -514,6 +567,7 @@ if [ "$list_rc" -ne 0 ]; then
     fail "CANNOT ANSWER — $DERIVE could not sweep the cluster (exit $list_rc; 4 is its CANNOT ANSWER):"
     echo "    its reason is quoted above." >&2
     echo "  No object has been shown to be undeclared and nothing is claimed about the cluster." >&2
+    findings+=("CANNOT ANSWER: $DERIVE --list exit $list_rc — $(LC_ALL=C tr '\n\t' '  ' < "$LISTERR" | cut -c1-300)")
 else
     # Anything property A already reported is dropped, so one orphan
     # reads as one finding — A's message is the better one, because it
@@ -534,7 +588,8 @@ else
         for d in ${deleted_still_live_ids+"${deleted_still_live_ids[@]}"}; do
             [ "$d" = "$kind/$ns/$name" ] && dup=1
         done
-        [ "$dup" -eq 0 ] && orphans+=("$kind/$name (ns $ns)")
+        [ "$dup" -eq 0 ] && orphans+=("$kind/$name (ns $ns)") \
+            && findings+=("$kind/$ns/$name (live, and no manifest declares it)")
     done <<EOF
 $orphan_rows
 EOF
@@ -553,7 +608,9 @@ EOF
         echo "       manifest for it (hand-applied state is drift: $DIR/README.md);" >&2
         echo "    3. it is generated from sources already in the tree, like the" >&2
         echo "       step-plugins ConfigMap — add it to EXEMPT in $DERIVE with" >&2
-        echo "       the reason, which is a decision and belongs in the diff." >&2
+        echo "       the reason, which is a decision and belongs in the diff; or," >&2
+        echo "       when a script renders it per instance, derive it there" >&2
+        echo "       (derived_exemptions) from that script and the instance list." >&2
     fi
 fi
 
@@ -572,6 +629,7 @@ fi
 exemptions=$("$DERIVE" --exemptions 2>"$PARSEERR") || {
     rc=$?
     fail "CANNOT ANSWER — $DERIVE --exemptions failed (exit $rc):"
+    findings+=("CANNOT ANSWER: $DERIVE --exemptions exit $rc")
     sed 's/^/    /' "$PARSEERR" >&2
 }
 any_ns_exemptions=0
@@ -581,6 +639,7 @@ while IFS= read -r e; do
         */*/*) ;;
         */*) any_ns_exemptions=$((any_ns_exemptions + 1)); continue ;;
         *) fail "$DERIVE --exemptions printed \`$e\`, which is neither Kind/name nor Kind/ns/name"
+           findings+=("the exemption \`$e\` is neither Kind/name nor Kind/ns/name")
            continue ;;
     esac
     kind="${e%%/*}"; rest="${e#*/}"; ns="${rest%%/*}"; name="${rest#*/}"
@@ -598,6 +657,7 @@ while IFS= read -r e; do
     fi
     [ -n "$stale" ] || continue
     fail "the exemption for \`$e\` is stale — $stale"
+    findings+=("the exemption for $e is stale: $stale")
     echo "  Drop it from EXEMPT in $DERIVE." >&2
 done <<EOF
 $exemptions
@@ -622,8 +682,10 @@ report_unverified() { # stream
 if [ "$problems" -ne 0 ]; then
     echo "" >&2
     report_unverified 2
+    record_orphans_check "FAILED with nothing named — read this run's journal"
     exit 1
 fi
+record_orphans_check "ok — nothing the tree deleted is still running, no undeclared object, no stale exemption"
 
 echo "a-deleted-manifest-leaves-no-object: OK — nothing the tree deleted is still running, $DERIVE found no undeclared object, and none of its exemptions has gone stale"
 echo "  Coverage is the derivation's line above, and so are the scope, the excluded kinds and the exemptions (see its header, and this script's)."

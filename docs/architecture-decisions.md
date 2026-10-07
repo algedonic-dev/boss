@@ -456,6 +456,50 @@ is two writes, the keys then the status; the break-glass spend, the one
 writer that had been one PUT for atomicity (review F2), makes a refused
 close fatal and withdraws the spend it followed.
 
+**First step evidence has an opt-in immutable recording door**
+(design `3bb90d7b`, generic source car `b2a4c481`, merged as
+`d1d242927172`). Ordinary metadata PATCH still replaces supplied keys
+and deletes a key supplied as null. A first observation instead uses
+`POST /api/jobs/{job}/steps/{step}/metadata/records`, with exactly a
+nonblank bounded `key`, a `value`, and `expected_absence: true`. Null
+is a present recorded value. An ordinary key already present cannot be
+adopted or overwritten through this door.
+
+The first successful insertion stores the full value and its original
+server receipt: actor, timestamp, Job/Step/key, event identity,
+canonical representation and digest. Object-key order does not change
+equality; array order and scalar representation do. Equal replay returns
+the original receipt and emits no new event; a different candidate
+refuses with a conflict. The checked HTTP call verifies the judged step
+version before insertion **or replay**, so a changed declaration requires
+a fresh read and retry. A terminal step permits equal replay of an
+existing record, but refuses absent new evidence and conflicting replay.
+
+The record and completion share the adapter's serialization boundary.
+Postgres locks the step row and commits metadata, receipt and outbox
+events together; the in-memory adapter acquires state and event locks
+before mutation. Recorded keys remain immutable through ordinary writes
+and workflow reprojection. Rebuild checks the receipt against the full
+step value and immutable event's actor, timestamp and identity, and
+refuses a contradictory receipt rather than replacing it.
+
+The door retains existing policy, row scope, authored-field, declared
+writer and human admission checks; it grants no authority. Policy denial
+or outage precedes Jobs repository access. Other authorization paths read
+the versioned step at most once and its Job at most once; human admission
+may separately read the people roster. Missing or incorrectly bound steps
+and missing or narrowed Jobs receive the same protected not-found
+response. Rejected recording requests change no Job or Step state and
+emit no recording event. This is a bounded-read contract, not a
+constant-time or universal pre-read
+identity guarantee, and ordinary step-write refusal telemetry is unchanged.
+
+This primitive records evidence; it does not complete the downstream
+conditional publication lifecycle, establish provider attestation, make
+Secret and Job writes one distributed transaction, grant installation
+permissions, or prove a public publication succeeded. Those obligations
+remain with their owning packets.
+
 **A Job carries the instant it was admitted, not only the day**
 (design `f2cdff23`, David 2026-09-20, all three questions accepted as
 proposed; landed as backlog `6c2eba00`). `opened_on` is a date, and
@@ -1314,9 +1358,12 @@ through Reject answers the completion 409 naming the role, a rebuild
 reproduces the voids, and `ops_runner_approval_sh` refuses the A-B-A
 job), and, as a trust-boundary car, is held for an adversarial review
 before it boards. Out of scope: replaying a presence nonce within its
-ticket's life (`3977b3d2`) and a per-key writer rule for the runner's
-own keys (`6c9183de`), which would not cover `decision`, a key the
-human's surface writes.
+ticket's life (`3977b3d2`) and the per-key writer rule (`6c9183de`).
+Design `f623e425` reserves the runner's keys to `runner:ops` and
+`decision` and `comment` to `signer`, a holder of a required sign-off
+role through the gateway session. That restriction narrows who may
+edit the shape; stamp voiding still prevents a signer's A-B-A edit
+from reviving an earlier stamp.
 
 **A presence ticket stamps its step once** (`3977b3d2`, 2026-09-26).
 The void above left one replay: stamp on A, the content moves to B
@@ -4807,6 +4854,137 @@ genuinely empty and deletes the concept rather than shrinking it.
 What was done on the day is a pin, not the destination: 131 over-long
 index hooks were trimmed (25,675 → 21,388 bytes, no entries deleted),
 purely to stop the live truncation.
+
+## Credential phase recovery keeps the original command and receipt
+
+Settled by design packet `5840c3bf-85f8-49b0-96b6-5b3829a8d8bc`,
+reviewed by David on 2026-10-04. A retry is the same observation,
+not a new fact. The existing rotation route remains append-on-call for
+legacy requests. A request carrying a durable, bounded `observation_id`
+opts into an owner receipt keyed by credential, phase and observation.
+The owner stamps the authenticated actor, instant and event identity;
+the receipt retains the complete canonical evidence and original JSON.
+An identical retry by that actor returns that receipt without another
+event or rotation timestamp. A changed actor or any changed canonical
+evidence conflicts. Ordinary callers cannot supply the reserved receipt.
+Actor equality binds the identity accepted by the existing jobs door;
+it is not host or executor attestation and does not repair its
+machine-token completion proxy.
+
+The credential row lock orders the PostgreSQL decision before the state
+change. Receipt, state and outbox event commit together. The memory
+adapter uses one critical section. Receipts live independently of outbox
+retention, and their full envelope rides in the original event. The
+credential owner's reconstruction path restores declarations and phase
+receipts from complete audit history, preserving original actor, time,
+identity and scalar spelling, refusing conflicting receipts, and emitting
+nothing. Historical registry knowledge predating declaration events is
+preserved; it is not invented from incomplete history.
+
+A Secret effect and its value-free recovery witness commit in the same
+object write, conditioned on the observed UID and resource version.
+The server assigns the next version; the witness never predicts it.
+The durable candidate exists before a completed Minted fact is recorded.
+Original commands are namespaced by packet so a newer stage cannot erase
+an unacknowledged packet's history. Private old and carried candidates
+stay in separate Secret keys that the credential resolver ignores;
+they never ride in a witness, receipt, event, packet or error. A retry
+reads the actual candidate and witness, resends identical phase commands,
+and requires the owner's original receipt before advancing a step.
+Promotion preserves the first old/carried history on restart. Missing,
+foreign or malformed witnesses, a changed UID/version, an unknown owner
+receipt, or a superseded candidate hold rather than silently remint.
+Witness storage remains bounded by the Secret object's enforced size:
+there is no silent deletion of unfinished recovery history or guessed
+reclamation policy in this change.
+The stage and delivery rules remain distinct actors. Delivery requires
+the source issue/install steps that followed their acknowledged owner
+phases; it cannot replay those phases under the stage actor's name.
+When delivery independently verifies the credential, that actual new
+read has its own stable observation identity, which subsequent delivery
+retries conserve.
+
+These are two local atomic boundaries, not a distributed transaction.
+A Secret witness does not prove the owner committed; an owner receipt
+does not prove an unobserved Secret effect. The runner broker records
+only the effects it verifies through the existing credential door.
+This decision grants no credential, host delivery or writer authority.
+Both host deliveries, DR rehearsal, authenticated executor evidence,
+the remaining R4 proxy-forgery boundary, and declared writer activation
+remain separate held obligations on their original packets.
+
+## A runner credential's broker stage is believed from a verified workload token
+
+Settled by design packet `6e28ed42-38af-4dae-87cb-3b208de27d41`, answered
+by David on 2026-10-05 and confirmed in his own words on 2026-10-06: the
+existing shared `boss` workload identity is permitted for runner
+credential stages ONLY, with a distinct verified audience and a maximum
+ten-minute token lifetime. The alternative — a dispatcher-exclusive
+workload and ServiceAccount first — was not chosen. The decision
+authorizes no TokenReview grant and no live activation.
+
+**What is trusted, stated as its limit.** Every process that can use
+the pod's ServiceAccount shares this authority, the jobs API included.
+A verified token proves workload membership — not which process asked,
+not that a particular dispatcher rule fired, not that the pod still
+exists. Verification is offline, so a retired workload keeps the
+authority until its token expires, ten minutes at most. Nothing asks the
+cluster whether a token is still live.
+
+**What is verified** (`boss_jobs::credentials::broker_stage`). The
+caller presents a separately projected ServiceAccount token in
+`x-boss-broker-stage-token`. The door reads RS256 only, a signing key
+the trusted key set names, the signature, and only then the claims: the
+configured issuer; exactly one audience and it is the configured one (a
+token also good for the cluster's own API is refused, and an audience
+equal to the issuer is refused as configuration); the namespace and
+ServiceAccount, in `sub` and in the `kubernetes.io` claim, which must
+agree; an expiry not yet reached; a lifetime of at most 600 seconds. An
+unknown key, an unavailable key set and a key under 2048 bits each
+refuse. A refusal is a 403 carrying one of a closed set of fixed
+sentences; no token, claim or key byte reaches a log, an event or an
+error. The header is taken off the request before any handler runs.
+
+**What it authorizes.** Only `POST /api/credentials/{id}/rotation/
+{phase}` for a registry row of kind `ops-runner-credential`, and only
+when the command's `job_id` names the open `rotate-a-credential` packet
+whose subject is that row. The phase is then recorded as
+`automation:credential-broker-stage` — the actor is assigned from the
+verified workload, and the rule label, operator tier and host the caller
+typed confer nothing. Every other credential's phases are recorded
+exactly as the phase-recovery decision above left them, and a token
+neither helps nor hinders them. A host's runner credential cannot stage,
+and a stage token is not consulted by the delivery door.
+
+**Off until configured.** The door is on only when all five
+`BOSS_BROKER_STAGE_*` variables are set (issuer, audience, namespace,
+ServiceAccount, key-set file); the dispatcher presents a token only when
+`BOSS_BROKER_STAGE_TOKEN_FILE` names one. No manifest sets any of them
+and none projects the token. Unconfigured, a runner row's phases are
+recorded under the typed label as before — the gap this decision closes
+stays open until an activation. Partly configured refuses runner stages
+by name; a token presented to an unconfigured door is refused, never
+ignored; a dispatcher told to present a token it cannot read mints
+nothing.
+
+**In flight.** A phase recorded before activation keeps its original
+actor, event and instant. The verified workload's replay of it is a
+conflict, never a rewrite, so an activation requires that no runner
+rotation packet is open. None had ever been filed when this was
+written (three rotation packets in the record, none for a runner).
+
+**What remains, and is not decided here.** The trusted key set arrives
+through a port whose one adapter reads a key-set file on every
+verification. Who fills that file is open: the cluster's issuer
+discovery and key set answer 401 to an anonymous read and 200 to a
+ServiceAccount (measured from the dev pod, 2026-10-06: the issuer is
+the cluster API endpoint and publishes one RS256 key), so a retrieval inside the
+jobs API would present the pod's own ServiceAccount token to the API
+server, and a file needs a filler that proves the cluster's TLS trust.
+That choice, the projected volume, the actual audience, the ordered
+rollout and the registered actor row belong to the independently
+reviewed activation packet the design requires before any live
+configuration.
 
 ## Open findings — where two live decisions disagree
 

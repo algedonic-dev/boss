@@ -232,20 +232,50 @@ pub async fn resolve_runner_credential(
         }
     };
     let path = req.uri().path().to_string();
-    let resolution = tokio::task::spawn_blocking(move || resolve(&dir, &presented))
+    let (resolution, delivery) = tokio::task::spawn_blocking(move || {
+        let resolution = resolve(&dir, &presented);
+        let delivery = match &resolution {
+            Resolution::Resolved { host, slot } =>
+                crate::credentials::runner_delivery::resolve_context(&dir, &presented, host, slot),
+            _ => None,
+        };
+        (resolution, delivery)
+    })
         .await
         .unwrap_or_else(|e| {
             tracing::error!(error = %e, "the runner credential resolution did not finish; the request passes with no credential");
-            Resolution::Unmatched
+            (Resolution::Unmatched, None)
         });
     match resolution {
         Resolution::Resolved { host, slot } => {
+            // Option A binds the request actor, not only field authority.
+            // Preserve policy inputs: the credential supplies identity,
+            // never a new role, scope, tier or grant. Invalid user headers
+            // remain invalid for CurrentUser to refuse in the ordinary way.
+            let user = match req.headers().get("x-boss-user") {
+                Some(raw) => raw
+                    .to_str()
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<boss_policy_client::User>(s).ok()),
+                None => Some(boss_policy_client::User::anonymous()),
+            };
+            if let Some(mut user) = user {
+                user.id = ACTOR.to_string();
+                if let Ok(encoded) = serde_json::to_string(&user)
+                    && let Ok(header) = axum::http::HeaderValue::from_str(&encoded)
+                {
+                    req.headers_mut().insert("x-boss-user", header);
+                }
+            }
             req.extensions_mut().insert(CredentialedCaller {
                 principal: PRINCIPAL.to_string(),
                 actor_id: ACTOR.to_string(),
                 host: Some(host),
             });
             req.extensions_mut().insert(ResolvedSlot(slot));
+            if let Some(delivery) = delivery {
+                req.extensions_mut().insert(delivery);
+            }
         }
         Resolution::Unmatched => {
             tracing::warn!(%path, "a runner credential no slot holds was presented; the request passes with no credential");
@@ -263,15 +293,27 @@ pub async fn resolve_runner_credential(
 async fn whoami(
     caller: Option<axum::Extension<CredentialedCaller>>,
     slot: Option<axum::Extension<ResolvedSlot>>,
+    delivery: Option<axum::Extension<crate::credentials::runner_delivery::ResolvedDelivery>>,
 ) -> Json<Value> {
     Json(match caller {
-        Some(axum::Extension(c)) => json!({
+        Some(axum::Extension(c)) => {
+            let mut answer = json!({
             "resolved": true,
             "principal": c.principal,
             "actor_id": c.actor_id,
             "host": c.host,
             "slot": slot.map(|axum::Extension(ResolvedSlot(s))| s),
-        }),
+            });
+            if let Some(axum::Extension(delivery)) = delivery {
+                answer["delivery"] = json!({
+                    "credential_id":delivery.credential_id,
+                    "job_id":delivery.request.job_id,
+                    "attempt":delivery.request.attempt,
+                    "secret_uid":delivery.request.secret_uid,
+                });
+            }
+            answer
+        }
         None => json!({ "resolved": false, "header": HEADER }),
     })
 }

@@ -191,6 +191,28 @@ async fn run_server<R: AssetsRepository + 'static>(
             std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
         ),
     ));
+    let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+        boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+        Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+    ));
+    let mode = Arc::new(boss_policy_client::role_reader::MountedReportMode::mount());
+    let source = Arc::new(boss_policy_client::role_reader::HttpRoleReader::new(
+        std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
+        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
+        boss_policy_client::User::service("assets"),
+    )?);
+    let wiring = boss_policy_client::role_service::assemble(
+        "assets",
+        "/api/assets/actor-role-reports",
+        policy,
+        roles.clone(),
+        mode.clone(),
+        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
+            boss_policy_client::role_service::REPORT_CAPACITY,
+        )),
+    );
+    let policy = wiring.policy;
+
     // The Parts writes stage their facts stamped by the same publisher
     // (and so the same sim probe) as the event doors.
     let parts_app = boss_assets::asset_parts::asset_parts_router(
@@ -219,7 +241,7 @@ async fn run_server<R: AssetsRepository + 'static>(
         .with_context(|| format!("binding HTTP listener on {http_addr}"))?;
     info!(addr = %http_addr, "assets HTTP API listening");
     // The per-asset Parts router rides the same pool.
-    let app = router(state).merge(parts_app);
+    let app = router(state).merge(parts_app).merge(wiring.inventory);
     // Sim-origin middleware: extract x-sim-origin header and set the
     // per-request task-local so the publisher inherits the sim
     // marker. Closes the gap where a sim chain could trigger a
@@ -238,9 +260,16 @@ async fn run_server<R: AssetsRepository + 'static>(
         let shutdown = async move {
             let _ = http_rx.changed().await;
         };
-        if let Err(e) = axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown)
-            .await
+        if let Err(e) = boss_policy_client::role_service::serve_with_refresh(
+            listener,
+            app,
+            roles,
+            source,
+            mode,
+            boss_policy_client::role_service::REFRESH_CADENCE,
+            shutdown,
+        )
+        .await
         {
             error!(error = %e, "HTTP server exited with error");
         }

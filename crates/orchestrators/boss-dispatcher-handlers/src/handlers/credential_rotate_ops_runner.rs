@@ -33,8 +33,10 @@
 //!   rotation abandoned, or not yet promoted, when this one was scoped) is
 //!   carried to `previous` in the same write rather than dropped: whatever
 //!   the host presents keeps resolving (review 3930a3eb, F1). Only the
-//!   newest displaced value is kept; a host that missed two stages inside
-//!   one converge interval holds one no slot names until its next pass.
+//!   newest displaced value is kept; a host that missed two stages holds
+//!   one no slot names until its next installing pass. A held converge
+//!   makes that window unbounded. The installed event names the dropped
+//!   previous value by its last eight, so the retirement remains visible.
 //!   Kubelet refreshes a Secret mount in about 60-90 s, so a
 //!   verify that does not see the value yet answers "not yet" and the
 //!   redelivery schedule carries the wait; a redelivery finds its own
@@ -60,9 +62,18 @@
 //! delivery record is that fact), so nothing is left for it to keep
 //! valid — the review of 8e5de104's finding 4(b), "clear previous once
 //! the host has moved", held structurally rather than by a second step.
-//! The delivery record is believed only from the deposit's own actor
-//! ([`DEPOSIT_ACTOR`]): a `delivered` step completed by hand promotes
-//! nothing (review 3930a3eb, N2).
+//! Promotion requires the canonical resolved runner completer AND the
+//! credential owner's original authenticated-delivery receipt, bound to
+//! the actual packet, attempt, Secret UID and original installed command.
+//! A copied actor label or printed suffix cannot substitute for that receipt.
+//!
+//! THE STAGE'S OWN IDENTITY (design 6e28ed42, David 2026-10-06). When the
+//! deployment names a projected ServiceAccount token ([`STAGE_TOKEN_FILE_ENV`])
+//! every phase command presents it, and the jobs API records the phase as
+//! the workload it verified (`boss_jobs::credentials::broker_stage`) — not
+//! as the rule label this handler types. No deployment names one yet: the
+//! decision authorized no activation, so today the stage still goes out
+//! under operator attribution, and this source claims no live proof.
 //!
 //! ## What it deliberately does not do
 //!
@@ -83,14 +94,17 @@ use base64::Engine as _;
 use boss_dispatcher::rules::expr::Value;
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext, arg_string};
 use boss_jobs::credentials::RotationPhase;
+use boss_jobs::credentials::runner_delivery::InstalledCommand;
 use boss_jobs::runner_credential::{HEADER, WHOAMI_PATH, slot_of};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::common::{StepEvent, dispatcher_reader_header};
-use super::credential_issuer::SecretStore;
+use super::credential_issuer::{SecretData, SecretStore, WriteAt};
 use super::credential_rotate_forgejo::last_eight;
 
 /// The handler's registered name — the `handler = "…"` of both rules.
@@ -100,19 +114,21 @@ pub const HANDLER: &str = "credential.rotate.ops-runner";
 /// ready on it, and the promotion waits for that step.
 pub const DELIVERY_OFF_HOST: &str = "off-host";
 
-/// The one completer whose `delivered` record the promotion believes:
-/// the host's deposit (infra/forge/runner-credential-deposit.sh signs as
-/// it; pinned equal by the handler's tests). The promotion kills the old
-/// value, and the last eight a delivery carries is printed on the install
-/// step for anyone to copy, so a hand-completed `delivered` would kill a
-/// value the host still presents (review 3930a3eb, N2). The actor rides
-/// `x-boss-user`, which a machine-token holder can type (backlog
-/// 2710c8fc), so this refuses the honest mistake, not the forger.
-pub const DEPOSIT_ACTOR: &str = "automation:credential-deposit";
+/// Registered deposit client attribution. The resolver replaces the caller
+/// identity with its canonical runner actor; promotion additionally requires
+/// the original owner receipt, never this asserted client label.
+pub const DEPOSIT_ACTOR: &str = "automation:runner-credential-deposit";
+
+/// Names the file a separately projected ServiceAccount token sits in —
+/// one audience, ten minutes (design 6e28ed42, David 2026-10-06). Set
+/// NOWHERE today: no manifest projects that volume, because the decision
+/// authorized no activation. Unset, the stage commands go out as before.
+pub const STAGE_TOKEN_FILE_ENV: &str = "BOSS_BROKER_STAGE_TOKEN_FILE";
 
 /// The step kinds of the two firings.
 const SCOPE_KIND: &str = "credential-rotation";
 const DELIVERY_KIND: &str = "credential-delivery";
+const ISSUER: &str = "credential-broker (32 random bytes, base64url)";
 
 /// A slot's Secret key: `<host>.<slot>` — the file the door reads.
 pub fn slot_key(host: &str, slot: &str) -> String {
@@ -124,6 +140,91 @@ pub fn slot_key(host: &str, slot: &str) -> String {
 /// part), so it rides in the same Secret without being a credential.
 pub fn minted_for_key(host: &str, slot: &str) -> String {
     format!("{host}.{slot}.minted-for")
+}
+
+fn witness_key(host: &str, job_id: &str) -> String {
+    format!("{host}.recovery.{job_id}.witness")
+}
+fn recovery_key(host: &str, job_id: &str, slot: &str) -> String {
+    format!("{host}.recovery.{job_id}.{slot}")
+}
+
+/// Commands are intentions, not proof that their effects or owner commits
+/// happened. The witness contains identifiers only; candidate/old values stay
+/// in separate Secret keys excluded from the credential resolver.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryWitness {
+    version: u32,
+    job_id: String,
+    credential_id: String,
+    namespace: String,
+    name: String,
+    host: String,
+    uid: String,
+    attempt: String,
+    last_eight: String,
+    promoted: bool,
+    commands: std::collections::BTreeMap<String, JsonValue>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MintedCommand {
+    issuer: String,
+    value_length: usize,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedCommand {
+    method: String,
+    observed: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevokedCommand {
+    delivered_last_eight: String,
+    old_last_eight: JsonValue,
+    carried_last_eight: JsonValue,
+    confirmed_dead: String,
+}
+
+fn specific_command<T: serde::de::DeserializeOwned>(command: &JsonValue) -> Option<T> {
+    let mut command = command.clone();
+    let fields = command.as_object_mut()?;
+    for field in ["job_id", "host", "observation_id"] {
+        fields.remove(field);
+    }
+    serde_json::from_value(command).ok()
+}
+
+fn nullable_identifier(value: &JsonValue) -> bool {
+    value.is_null()
+        || value.as_str().is_some_and(|value| {
+            value.len() == 8
+                && value
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
+        })
+}
+
+impl Held {
+    fn from_secret(secret: &SecretData, host: &str) -> Self {
+        let get = |key: String| {
+            secret
+                .data
+                .get(&key)
+                .cloned()
+                .filter(|v| !v.trim().is_empty())
+        };
+        Self {
+            current: get(slot_key(host, "current")),
+            current_for: get(minted_for_key(host, "current")),
+            next: get(slot_key(host, "next")),
+            next_for: get(minted_for_key(host, "next")),
+            previous: get(slot_key(host, "previous")),
+        }
+    }
 }
 
 /// 32 random bytes, base64url without padding: 43 characters, no
@@ -337,6 +438,10 @@ pub struct CredentialRotateOpsRunner {
     jobs_base: String,
     secrets: Arc<dyn SecretStore>,
     poll: ResolvePoll,
+    /// The projected broker-stage token's file (design 6e28ed42), when
+    /// the deployment names one. `None` — every deployment today — sends
+    /// the phases exactly as before.
+    stage_token_file: Option<PathBuf>,
 }
 
 struct StepView {
@@ -356,11 +461,24 @@ impl CredentialRotateOpsRunner {
         secrets: Arc<dyn SecretStore>,
         poll: ResolvePoll,
     ) -> Arc<Self> {
+        let stage_token_file = std::env::var_os(STAGE_TOKEN_FILE_ENV)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+        Self::with_stage_token(jobs_base, secrets, poll, stage_token_file)
+    }
+
+    pub fn with_stage_token(
+        jobs_base: impl Into<String>,
+        secrets: Arc<dyn SecretStore>,
+        poll: ResolvePoll,
+        stage_token_file: Option<PathBuf>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client: super::common::api_client(),
             jobs_base: jobs_base.into(),
             secrets,
             poll,
+            stage_token_file,
         })
     }
 
@@ -368,23 +486,144 @@ impl CredentialRotateOpsRunner {
         self.jobs_base.trim_end_matches('/')
     }
 
-    async fn read(&self, d: &Declaration<'_>, key: String) -> Result<Option<String>, HandlerError> {
-        Ok(self
+    async fn observed_secret(&self, d: &Declaration<'_>) -> Result<SecretData, HandlerError> {
+        let secret = self
             .secrets
-            .read_key(d.secret_namespace, d.secret_name, &key)
+            .read_secret(d.secret_namespace, d.secret_name)
             .await
             .map_err(HandlerError::Downstream)?
-            .filter(|v| !v.trim().is_empty()))
+            .ok_or_else(|| HandlerError::Downstream("declared Secret is unavailable".into()))?;
+        if secret.uid.is_empty() || secret.version.is_empty() {
+            return Err(HandlerError::Downstream(
+                "Secret has no usable UID/version precondition".into(),
+            ));
+        }
+        Ok(secret)
     }
 
-    async fn read_held(&self, d: &Declaration<'_>) -> Result<Held, HandlerError> {
-        Ok(Held {
-            current: self.read(d, d.key("current")).await?,
-            current_for: self.read(d, minted_for_key(d.host, "current")).await?,
-            next: self.read(d, d.key("next")).await?,
-            next_for: self.read(d, minted_for_key(d.host, "next")).await?,
-            previous: self.read(d, d.key("previous")).await?,
-        })
+    fn witness(
+        &self,
+        d: &Declaration<'_>,
+        secret: &SecretData,
+        job_id: &str,
+    ) -> Result<RecoveryWitness, HandlerError> {
+        let raw = secret
+            .data
+            .get(&witness_key(d.host, job_id))
+            .ok_or_else(|| {
+                HandlerError::Downstream("staged effect has no original recovery witness".into())
+            })?;
+        let witness: RecoveryWitness = serde_json::from_str(raw)
+            .map_err(|_| HandlerError::Downstream("recovery witness is malformed".into()))?;
+        if witness.version != 1
+            || witness.job_id != job_id
+            || witness.credential_id != d.credential_id
+            || witness.namespace != d.secret_namespace
+            || witness.name != d.secret_name
+            || witness.host != d.host
+            || witness.uid != secret.uid
+            || uuid::Uuid::parse_str(&witness.attempt).is_err()
+            || witness.last_eight.len() != 8
+            || witness.commands.len() != RotationPhase::ALL.len()
+            || RotationPhase::ALL.iter().any(|phase| {
+                witness.commands.get(phase.as_str()).is_none_or(|command| {
+                    command["job_id"] != job_id
+                        || command["host"] != d.host
+                        || command["observation_id"]
+                            != format!("{}:{}", witness.attempt, phase.as_str())
+                })
+            })
+        {
+            return Err(HandlerError::Downstream(
+                "recovery witness is foreign or incomplete".into(),
+            ));
+        }
+        let held = Held::from_secret(secret, d.host);
+        let candidate = if witness.promoted {
+            held.promoted_by(job_id)
+        } else {
+            held.staged_for(job_id)
+        }
+        .ok_or_else(|| {
+            HandlerError::Downstream("witness has no exact packet-bound candidate".into())
+        })?;
+        let invalid = || {
+            HandlerError::Downstream(
+                "original phase command is malformed or disagrees with the effect witness".into(),
+            )
+        };
+        let minted: MintedCommand =
+            specific_command(&witness.commands["minted"]).ok_or_else(invalid)?;
+        let installed: InstalledCommand =
+            specific_command(&witness.commands["installed"]).ok_or_else(invalid)?;
+        let verified: VerifiedCommand =
+            specific_command(&witness.commands["verified"]).ok_or_else(invalid)?;
+        let revoked: RevokedCommand =
+            specific_command(&witness.commands["revoked"]).ok_or_else(invalid)?;
+        let prior = |slot: &str| {
+            secret
+                .data
+                .get(&recovery_key(d.host, job_id, slot))
+                .filter(|value| !value.is_empty())
+                .map(|value| last_eight(value))
+        };
+        if last_eight(candidate) != witness.last_eight
+            || minted.issuer != ISSUER
+            || minted.value_length != candidate.len()
+            || installed.secret_namespace != d.secret_namespace
+            || installed.secret_name != d.secret_name
+            || installed.secret_key != d.key("next")
+            || installed.secret_uid != secret.uid
+            || installed.precondition_version.is_empty()
+            || installed.value_length != candidate.len()
+            || installed.last_eight != witness.last_eight
+            || installed.delivery != DELIVERY_OFF_HOST
+            || !(installed.replaced_staged_for.is_null()
+                || installed
+                    .replaced_staged_for
+                    .as_str()
+                    .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok()))
+            || !nullable_identifier(&installed.carried_to_previous)
+            || !nullable_identifier(&installed.dropped_previous)
+            || (!installed.carried_to_previous.is_null()
+                && installed.carried_to_previous != json!(prior("carried")))
+            || verified.method != "api"
+            || verified.observed != format!("resolved to host {}", d.host)
+            || revoked.delivered_last_eight != witness.last_eight
+            || revoked.old_last_eight != json!(prior("old"))
+            || revoked.carried_last_eight != json!(prior("carried"))
+            || revoked.confirmed_dead
+                != format!(
+                    "GET {WHOAMI_PATH} confirms host {} current; original old and carried values resolve to nothing",
+                    d.host
+                )
+        {
+            return Err(invalid());
+        }
+        Ok(witness)
+    }
+
+    async fn write_observed(
+        &self,
+        d: &Declaration<'_>,
+        observed: &SecretData,
+        entries: &[(String, String)],
+    ) -> Result<(), HandlerError> {
+        let entries: Vec<_> = entries
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        match self
+            .secrets
+            .write_keys_if(d.secret_namespace, d.secret_name, &entries, observed)
+            .await
+            .map_err(HandlerError::Downstream)?
+        {
+            WriteAt::Written => Ok(()),
+            WriteAt::Moved => Err(HandlerError::Downstream(
+                "Secret UID/version moved; nothing written".into(),
+            )),
+        }
     }
 
     /// Present `value` to the door and read what it resolved to. The value
@@ -452,6 +691,52 @@ impl CredentialRotateOpsRunner {
         Ok((false, seen))
     }
 
+    /// The projected broker-stage token, read afresh for every command —
+    /// kubelet rotates the file well inside its ten minutes, and a value
+    /// held in memory would be the stale one. `Ok(None)` when no file is
+    /// named. A named file that cannot be presented is an ERROR, never a
+    /// fall back to the typed label: the deployment said this workload
+    /// proves itself. The error names the path and the fault, not a byte
+    /// of the content.
+    fn stage_token(&self) -> Result<Option<reqwest::header::HeaderValue>, HandlerError> {
+        const MAX_BYTES: u64 = 8 * 1024;
+        let Some(path) = &self.stage_token_file else {
+            return Ok(None);
+        };
+        // The estate's own hosts only, by the rule the machine token is
+        // stamped under (`machine_token::Hosts`): the client beside this
+        // header withholds the estate token from any other host, and a
+        // workload token must not travel further than that one does.
+        if !boss_core::machine_token::hosts().allows_url(self.jobs()) {
+            return Err(HandlerError::Permanent(
+                "the jobs API this handler was given is not one of the estate's own hosts; \
+                 the broker-stage token is not sent there and no runner credential stage is sent without it"
+                    .into(),
+            ));
+        }
+        let unavailable = |why: &str| {
+            HandlerError::Downstream(format!(
+                "the broker-stage token at {} {why}; no runner credential stage is sent without it",
+                path.display()
+            ))
+        };
+        let meta =
+            std::fs::metadata(path).map_err(|e| unavailable(&format!("is unreadable ({e})")))?;
+        if !meta.is_file() || meta.len() > MAX_BYTES {
+            return Err(unavailable("is not a regular token file within bounds"));
+        }
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| unavailable(&format!("is unreadable ({e})")))?;
+        let token = text.trim();
+        if token.is_empty() {
+            return Err(unavailable("is empty"));
+        }
+        let mut header = reqwest::header::HeaderValue::from_str(token)
+            .map_err(|_| unavailable("is not one header-safe line"))?;
+        header.set_sensitive(true);
+        Ok(Some(header))
+    }
+
     async fn record_phase(
         &self,
         rule_name: &str,
@@ -464,7 +749,88 @@ impl CredentialRotateOpsRunner {
             self.jobs(),
             phase.as_str()
         );
-        super::common::post_json(&self.client, &url, &evidence, rule_name).await
+        use boss_jobs::credentials::receipt::RotationOutcome;
+        let actor = super::common::dispatcher_actor_header(rule_name);
+        let user: boss_policy_client::User = serde_json::from_str(&actor)
+            .map_err(|_| HandlerError::Permanent("dispatcher actor header is malformed".into()))?;
+        // With a token the owner records the stage as the WORKLOAD the
+        // token proves, whatever label rides beside it (design 6e28ed42);
+        // the receipt must name that actor, or it is not this command's.
+        let stage_token = self.stage_token()?;
+        let expected_actor = match &stage_token {
+            Some(_) => boss_jobs::credentials::broker_stage::ACTOR.to_string(),
+            None => user
+                .ambient_actor()
+                .ok_or_else(|| {
+                    HandlerError::Permanent("dispatcher phase command has no actor identity".into())
+                })?
+                .to_string(),
+        };
+        let mut request = self
+            .client
+            .post(&url)
+            .header("x-boss-user", &actor)
+            .header("x-sim-origin", super::common::sim_origin_value());
+        if let Some(token) = stage_token {
+            request = request.header(boss_jobs::credentials::broker_stage::HEADER, token);
+        }
+        let response = request
+            .json(&evidence)
+            .send()
+            .await
+            .map_err(|e| HandlerError::Downstream(format!("POST {url}: {e}")))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.map_err(|e| {
+                HandlerError::Downstream(format!("POST {url} error body unreadable: {e}"))
+            })?;
+            return Err(HandlerError::Downstream(format!(
+                "POST {url} returned {status}: {body}"
+            )));
+        }
+        let body: JsonValue = response
+            .json()
+            .await
+            .map_err(|_| HandlerError::Downstream("phase owner response is unreadable".into()))?;
+        let outcome: RotationOutcome =
+            serde_json::from_value(body.get("observation").cloned().ok_or_else(|| {
+                HandlerError::Downstream("phase owner response has no original receipt".into())
+            })?)
+            .map_err(|_| HandlerError::Downstream("phase owner receipt is malformed".into()))?;
+        let receipt = match outcome {
+            RotationOutcome::Recorded { receipt } | RotationOutcome::Replayed { receipt } => {
+                receipt
+            }
+            RotationOutcome::LegacyRecorded => {
+                return Err(HandlerError::Downstream(
+                    "phase owner did not retain the original observation".into(),
+                ));
+            }
+        };
+        let mut expected = evidence.clone();
+        let observation_id = boss_jobs::credentials::receipt::observation(&mut expected)
+            .map_err(|_| HandlerError::Permanent("phase command observation is invalid".into()))?
+            .ok_or_else(|| {
+                HandlerError::Permanent("phase command has no durable observation identity".into())
+            })?;
+        expected["credential_id"] = json!(credential_id);
+        let original: JsonValue = serde_json::from_str(&receipt.evidence_json).map_err(|_| {
+            HandlerError::Downstream("phase owner original evidence is unreadable".into())
+        })?;
+        if receipt.version != 1
+            || receipt.credential_id != credential_id
+            || receipt.phase != phase.as_str()
+            || receipt.observation_id != observation_id
+            || receipt.actor != expected_actor
+            || receipt.event_id.is_nil()
+            || receipt.canonical != boss_core::job::canonical_json_bytes(&expected)
+            || receipt.canonical != boss_core::job::canonical_json_bytes(&original)
+        {
+            return Err(HandlerError::Downstream(
+                "phase owner receipt disagrees with the original exact command".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// The registry row must exist BEFORE anything is minted: every phase
@@ -482,7 +848,25 @@ impl CredentialRotateOpsRunner {
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
         match resp.status() {
-            s if s.is_success() => Ok(()),
+            s if s.is_success() => {
+                // A successful read is not proof of the declared credential:
+                // a different row/kind could otherwise receive runner mint
+                // events after the first Secret write (1e50e66b).
+                let row: boss_jobs::credentials::CredentialRow = resp.json().await.map_err(|_| {
+                    HandlerError::Downstream(format!(
+                        "GET {url} returned no complete credential registry row; nothing is minted"
+                    ))
+                })?;
+                if row.id != credential_id
+                    || row.kind != "ops-runner-credential"
+                    || row.principal != boss_jobs::runner_credential::PRINCIPAL
+                {
+                    return Err(HandlerError::Permanent(format!(
+                        "credential {credential_id} registry identity is not its declared runner kind and principal; nothing is minted"
+                    )));
+                }
+                Ok(())
+            }
             reqwest::StatusCode::NOT_FOUND => Err(HandlerError::Permanent(format!(
                 "credential {credential_id} has no registry row (GET {url} answered 404): its \
                  rotation events would have nowhere to land, so nothing is minted. Declare the \
@@ -581,22 +965,30 @@ impl CredentialRotateOpsRunner {
             // the rest.
             return Ok(());
         }
-        let held = self.read_held(d).await?;
-        let value = match held.staged_for(ev.job_id) {
-            // A prior firing minted and wrote this packet's value; it
-            // recorded `minted` and `installed` on the log before its
-            // steps. Converge what is left.
-            Some(v) => v.to_string(),
+        // Before anything is minted: a stage told to present a token it
+        // cannot read would leave a value staged whose events cannot land.
+        self.stage_token()?;
+        let observed = self.observed_secret(d).await?;
+        let held = Held::from_secret(&observed, d.host);
+        let (value, witness) = match held.staged_for(ev.job_id) {
+            Some(value) => {
+                let witness = self.witness(d, &observed, ev.job_id)?;
+                if witness.promoted || witness.last_eight != last_eight(value) {
+                    return Err(HandlerError::Downstream(
+                        "staged value disagrees with its original witness".into(),
+                    ));
+                }
+                (value.to_owned(), witness)
+            }
             None if done("install") => {
-                return Err(HandlerError::Permanent(format!(
-                    "this packet's install is on record, but {}.next no longer holds its value \
-                     (it names {}): a later rotation replaced it. Nothing is minted; abandon \
-                     this packet",
-                    d.host,
-                    held.next_for.as_deref().unwrap_or("no packet")
-                )));
+                return Err(HandlerError::Permanent(
+                    "this packet's installed candidate is no longer staged; nothing minted".into(),
+                ));
             }
             None => {
+                if observed.data.contains_key(&witness_key(d.host, ev.job_id)) {
+                    return Err(HandlerError::Downstream("original candidate was superseded; its witness remains, no new attempt is minted".into()));
+                }
                 judge_scope_naming(
                     meta_str(ev.metadata, "old_token"),
                     meta_str(ev.metadata, "old_token_last_eight"),
@@ -606,58 +998,92 @@ impl CredentialRotateOpsRunner {
                 .map_err(HandlerError::Permanent)?;
                 self.require_registry_row(d.credential_id).await?;
                 let value = fresh_value();
-                self.record_phase(
-                    rule,
-                    d.credential_id,
-                    RotationPhase::Minted,
-                    json!({
-                        "job_id": ev.job_id,
-                        "host": d.host,
-                        "issuer": "credential-broker (32 random bytes, base64url)",
-                        "value_length": value.len(),
-                    }),
-                )
-                .await?;
-                let (next, next_for) = (d.key("next"), minted_for_key(d.host, "next"));
-                let previous = d.key("previous");
-                // A value already staged may already be INSTALLED on the
-                // host — the deposit installs `next` as soon as the door
-                // resolves it, before any promotion — so it is carried to
-                // `previous` in this same write, never dropped: the door
-                // resolves `previous`, and the promotion blanks it (review
-                // 3930a3eb, F1).
-                let mut entries = vec![
-                    (next.as_str(), value.as_str()),
-                    (next_for.as_str(), ev.job_id),
-                ];
-                if let Some(displaced) = held.next.as_deref() {
-                    entries.push((previous.as_str(), displaced));
+                let attempt = uuid::Uuid::new_v4().to_string();
+                let mut commands = std::collections::BTreeMap::new();
+                commands.insert(
+                    "minted".into(),
+                    json!({"job_id":ev.job_id,"host":d.host,
+                    "issuer":ISSUER,"value_length":value.len()}),
+                );
+                commands.insert("installed".into(),json!({"job_id":ev.job_id,"host":d.host,
+                    "secret_namespace":d.secret_namespace,"secret_name":d.secret_name,"secret_key":d.key("next"),
+                    "secret_uid":observed.uid,"precondition_version":observed.version,
+                    "value_length":value.len(),"last_eight":last_eight(&value),"replaced_staged_for":held.next_for,
+                    "carried_to_previous":held.next.as_deref().map(last_eight),
+                    "dropped_previous":held.previous.as_deref().filter(|previous| held.next.as_deref().is_some_and(|next| next != *previous)).map(last_eight),
+                    "delivery":DELIVERY_OFF_HOST}));
+                commands.insert(
+                    "verified".into(),
+                    json!({"job_id":ev.job_id,"host":d.host,"method":"api",
+                    "observed":format!("resolved to host {}",d.host)}),
+                );
+                commands.insert("revoked".into(),json!({"job_id":ev.job_id,"host":d.host,
+                    "delivered_last_eight":last_eight(&value),"old_last_eight":held.current.as_deref().map(last_eight),
+                    "carried_last_eight":held.next.as_deref().or(held.previous.as_deref()).map(last_eight),
+                    "confirmed_dead":format!("GET {WHOAMI_PATH} confirms host {} current; original old and carried values resolve to nothing",d.host)}));
+                for (phase, command) in &mut commands {
+                    command["observation_id"] = json!(format!("{attempt}:{phase}"));
                 }
-                self.secrets
-                    .write_keys(d.secret_namespace, d.secret_name, &entries)
-                    .await
-                    .map_err(HandlerError::Downstream)?;
-                self.record_phase(
-                    rule,
-                    d.credential_id,
-                    RotationPhase::Installed,
-                    json!({
-                        "job_id": ev.job_id,
-                        "host": d.host,
-                        "secret_namespace": d.secret_namespace,
-                        "secret_name": d.secret_name,
-                        "secret_key": next,
-                        "value_length": value.len(),
-                        "last_eight": last_eight(&value),
-                        "replaced_staged_for": held.next_for,
-                        "carried_to_previous": held.next.as_deref().map(last_eight),
-                        "delivery": DELIVERY_OFF_HOST,
-                    }),
-                )
-                .await?;
-                value
+                let witness = RecoveryWitness {
+                    version: 1,
+                    job_id: ev.job_id.into(),
+                    credential_id: d.credential_id.into(),
+                    namespace: d.secret_namespace.into(),
+                    name: d.secret_name.into(),
+                    host: d.host.into(),
+                    uid: observed.uid.clone(),
+                    attempt,
+                    last_eight: last_eight(&value).into(),
+                    promoted: false,
+                    commands,
+                };
+                let raw = serde_json::to_string(&witness).map_err(|_| {
+                    HandlerError::Downstream("cannot encode recovery witness".into())
+                })?;
+                let mut entries = vec![
+                    (d.key("next"), value.clone()),
+                    (minted_for_key(d.host, "next"), ev.job_id.into()),
+                    (witness_key(d.host, ev.job_id), raw),
+                    (
+                        recovery_key(d.host, ev.job_id, "old"),
+                        held.current.clone().unwrap_or_default(),
+                    ),
+                    (
+                        recovery_key(d.host, ev.job_id, "carried"),
+                        held.next
+                            .clone()
+                            .or_else(|| held.previous.clone())
+                            .unwrap_or_default(),
+                    ),
+                ];
+                if let Some(displaced) = held.next {
+                    entries.push((d.key("previous"), displaced));
+                }
+                // The candidate and original commands commit together before a
+                // completed Minted fact is recorded. A lost Secret ack is read back.
+                self.write_observed(d, &observed, &entries).await?;
+                let readback = self.observed_secret(d).await?;
+                let actual = self.witness(d, &readback, ev.job_id)?;
+                if Held::from_secret(&readback, d.host).staged_for(ev.job_id)
+                    != Some(value.as_str())
+                    || actual != witness
+                {
+                    return Err(HandlerError::Downstream(
+                        "Secret write lacks exact candidate/witness readback".into(),
+                    ));
+                }
+                (value, witness)
             }
         };
+        for phase in [RotationPhase::Minted, RotationPhase::Installed] {
+            self.record_phase(
+                rule,
+                d.credential_id,
+                phase,
+                witness.commands[phase.as_str()].clone(),
+            )
+            .await?;
+        }
 
         self.complete_step(
             rule,
@@ -740,14 +1166,10 @@ impl CredentialRotateOpsRunner {
             rule,
             d.credential_id,
             RotationPhase::Verified,
-            json!({
-                "job_id": ev.job_id,
-                "host": d.host,
-                "method": "api",
-                "observed": seen.describe(),
-            }),
+            witness.commands["verified"].clone(),
         )
         .await?;
+
         self.complete_step(
             rule,
             ev.job_id,
@@ -782,13 +1204,13 @@ impl CredentialRotateOpsRunner {
         if done("revoke") {
             return Ok(());
         }
+        self.stage_token()?;
         let completer = steps
             .get("delivered")
             .and_then(|s| s.completed_by.as_deref());
-        if completer != Some(DEPOSIT_ACTOR) {
+        if completer != Some(boss_jobs::runner_credential::ACTOR) {
             return Err(HandlerError::Permanent(format!(
-                "the delivered step was completed by {}, not by the host's deposit \
-                 ({DEPOSIT_ACTOR}): only the deposit proves the host holds the new value, and \
+                "the delivered step was completed by {}, not by the resolved host runner: authenticated owner delivery is required, and \
                  the promotion kills the old one. Nothing is promoted and {}'s current value \
                  stays valid; abandon this packet and scope another",
                 completer.unwrap_or("no recorded completer"),
@@ -802,9 +1224,88 @@ impl CredentialRotateOpsRunner {
                     .into(),
             )
         })?;
-        let held = self.read_held(d).await?;
+        let observed = self.observed_secret(d).await?;
+        let held = Held::from_secret(&observed, d.host);
+        let mut witness = self.witness(d, &observed, ev.job_id)?;
         let plan =
             plan_promotion(&held, ev.job_id, delivered, d.host).map_err(HandlerError::Permanent)?;
+        if witness.last_eight != delivered
+            || witness.promoted != matches!(plan, Promotion::Done { .. })
+        {
+            return Err(HandlerError::Downstream(
+                "promotion slots disagree with original recovery witness".into(),
+            ));
+        }
+        // A completed-by label is not proof. Read the original credential
+        // owner observation and bind it to this actual Secret generation.
+        let url = format!(
+            "{}/api/credentials/{}/delivery/{}",
+            self.jobs(),
+            d.credential_id,
+            witness.attempt
+        );
+        let response = self
+            .client
+            .get(&url)
+            .header("x-boss-user", dispatcher_reader_header())
+            .header("x-sim-origin", super::common::sim_origin_value())
+            .send()
+            .await
+            .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
+        if !response.status().is_success() {
+            return Err(HandlerError::Downstream(format!(
+                "authenticated delivery owner receipt unavailable: GET {url} returned {}",
+                response.status()
+            )));
+        }
+        let body: JsonValue = response
+            .json()
+            .await
+            .map_err(|_| HandlerError::Downstream("delivery owner response unreadable".into()))?;
+        let receipt: boss_jobs::credentials::receipt::RotationReceipt =
+            serde_json::from_value(body["receipt"].clone())
+                .map_err(|_| HandlerError::Downstream("delivery owner receipt malformed".into()))?;
+        let request = boss_jobs::credentials::runner_delivery::DeliveryRequest {
+            job_id: uuid::Uuid::parse_str(ev.job_id).map_err(|_| {
+                HandlerError::Permanent("delivery packet identity malformed".into())
+            })?,
+            attempt: uuid::Uuid::parse_str(&witness.attempt)
+                .map_err(|_| HandlerError::Downstream("recovery attempt malformed".into()))?,
+            secret_uid: witness.uid.clone(),
+        };
+        if !boss_jobs::credentials::runner_delivery::receipt_matches_delivery(
+            &receipt,
+            d.credential_id,
+            d.host,
+            &request,
+            &witness.commands["installed"],
+        ) {
+            return Err(HandlerError::Downstream(
+                "original delivery receipt disagrees with actual recovery generation".into(),
+            ));
+        }
+        // The original private candidates remain in separate Secret keys,
+        // never in this witness, receipt, packet, log or error.
+        let original = |slot: &str| {
+            observed
+                .data
+                .get(&recovery_key(d.host, ev.job_id, slot))
+                .cloned()
+                .filter(|value| !value.is_empty())
+        };
+        let old = original("old");
+        let carried = original("carried");
+        if witness.commands["revoked"]["old_last_eight"] != json!(old.as_deref().map(last_eight))
+            || witness.commands["revoked"]["carried_last_eight"]
+                != json!(carried.as_deref().map(last_eight))
+        {
+            return Err(HandlerError::Downstream(
+                "recovery candidates disagree with original retirement history".into(),
+            ));
+        }
+        if !done("issue") || !done("install") {
+            return Err(HandlerError::Downstream("source issue/install lack their acknowledged owner phases; delivery cannot impersonate the stage actor".into()));
+        }
         let host = d.host;
 
         // Verify, when the scope firing ran out of redeliveries before the
@@ -828,13 +1329,13 @@ impl CredentialRotateOpsRunner {
                     seen.describe()
                 )));
             }
-            self.record_phase(
-                rule,
-                d.credential_id,
-                RotationPhase::Verified,
-                json!({"job_id": ev.job_id, "host": host, "method": "api", "observed": seen.describe()}),
-            )
-            .await?;
+            // A real independent delivery read is a distinct observation,
+            // not a replay under another actor or a forged source header.
+            let mut command = witness.commands["verified"].clone();
+            command["observation_id"] = json!(format!("{}:verified-delivery", witness.attempt));
+            self.record_phase(rule, d.credential_id, RotationPhase::Verified, command)
+                .await?;
+
             self.complete_step(
                 rule,
                 ev.job_id,
@@ -856,39 +1357,33 @@ impl CredentialRotateOpsRunner {
             .await?;
         }
 
-        // The old value: held only by the firing that promotes. A
-        // redelivery after the write judges by the slot alone.
-        let old = match &plan {
-            Promotion::Promote { .. } => held.current.clone(),
-            Promotion::Done { .. } => None,
-        };
-        // A value an earlier stage carried to `previous` (F1) dies here too.
-        let carried = match &plan {
-            Promotion::Promote { .. } => held.previous.clone(),
-            Promotion::Done { .. } => None,
-        };
         if let Promotion::Promote { value } = &plan {
-            let keys = [
-                d.key("current"),
-                minted_for_key(host, "current"),
-                d.key("next"),
-                minted_for_key(host, "next"),
-                d.key("previous"),
-            ];
-            self.secrets
-                .write_keys(
-                    d.secret_namespace,
-                    d.secret_name,
-                    &[
-                        (keys[0].as_str(), value.as_str()),
-                        (keys[1].as_str(), ev.job_id),
-                        (keys[2].as_str(), ""),
-                        (keys[3].as_str(), ""),
-                        (keys[4].as_str(), ""),
-                    ],
-                )
-                .await
-                .map_err(HandlerError::Downstream)?;
+            witness.promoted = true;
+            let raw = serde_json::to_string(&witness)
+                .map_err(|_| HandlerError::Downstream("cannot encode promotion witness".into()))?;
+            self.write_observed(
+                d,
+                &observed,
+                &[
+                    (d.key("current"), value.clone()),
+                    (minted_for_key(host, "current"), ev.job_id.into()),
+                    (d.key("next"), String::new()),
+                    (minted_for_key(host, "next"), String::new()),
+                    (d.key("previous"), String::new()),
+                    (witness_key(host, ev.job_id), raw),
+                ],
+            )
+            .await?;
+            let readback = self.observed_secret(d).await?;
+            let actual = self.witness(d, &readback, ev.job_id)?;
+            if !actual.promoted
+                || Held::from_secret(&readback, host).promoted_by(ev.job_id) != Some(value.as_str())
+                || actual != witness
+            {
+                return Err(HandlerError::Downstream(
+                    "promotion lacks exact effect/witness readback".into(),
+                ));
+            }
         }
 
         // Confirm by effect. The new value at slot `current` means the jobs
@@ -972,14 +1467,7 @@ impl CredentialRotateOpsRunner {
             rule,
             d.credential_id,
             RotationPhase::Revoked,
-            json!({
-                "job_id": ev.job_id,
-                "host": host,
-                "delivered_last_eight": delivered,
-                "old_last_eight": old.as_deref().map(last_eight),
-                "carried_last_eight": carried.as_deref().map(last_eight),
-                "confirmed_dead": confirmed,
-            }),
+            witness.commands["revoked"].clone(),
         )
         .await?;
         self.complete_step(
@@ -1014,6 +1502,11 @@ impl Handler for CredentialRotateOpsRunner {
     ) -> Result<(), HandlerError> {
         let d = Declaration::parse(args)?;
         let ev = StepEvent::from_payload(&ctx.event_payload)?;
+        if uuid::Uuid::parse_str(ev.job_id).is_err() {
+            return Err(HandlerError::Permanent(
+                "rotation packet identity is not a UUID; nothing read or minted".into(),
+            ));
+        }
         if ev.subject_id != d.credential_id {
             return Err(HandlerError::Permanent(format!(
                 "{} fired for subject {:?}, but its declaration is credential {:?}: nothing is \

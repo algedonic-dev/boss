@@ -1,3 +1,4 @@
+import { isPageWrite } from './_smokeMocks';
 // HR's task table is a read view, not a second step executor (36132827,
 // audit b959394e). Required fields, sign-offs and plugins belong on the
 // existing Job surface. No task transition may leave this table.
@@ -29,7 +30,7 @@ const packet = {
 async function openTasks(page: Page, stepsStatus = 200, jobStatus = 200): Promise<string[]> {
   const writes: string[] = [];
   page.on('request', (r) => {
-    if (r.method() !== 'GET' && r.url().includes('/api/') && !r.url().includes('/api/surface-opens')) {
+    if (isPageWrite(r.method(), new URL(r.url()).pathname)) {
       writes.push(`${r.method()} ${r.url()}`);
     }
   });

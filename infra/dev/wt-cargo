@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+if [[ -e /etc/boss-dev-control/enabled || -L /etc/boss-dev-control/enabled ]]; then
+    exec /opt/boss-dev-control/wt-cargo "$@"
+fi
 # wt-cargo — run cargo in a WORKTREE with its own target dir, seeded by
 # reflink from the warm shared one (bottleneck #6, 2026-09-12).
 #

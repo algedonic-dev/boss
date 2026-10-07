@@ -16,6 +16,7 @@ path = "src/bin/boss_brewery_sim.rs"
 default = []
 
 [dependencies]
+boss-policy-client = { path = "../../core/boss-policy-client" }
 boss-clock-client = { path = "../../core/boss-clock-client" }
 futures = { workspace = true }
 boss-ports = { path = "../../core/boss-ports" }
@@ -59,10 +60,6 @@ boss-calendar-client = { path = "../../core/boss-calendar-client" }
 [dev-dependencies]
 # `scratch_dir`: a temp fixture carries the uid and the pid (307df975).
 boss-testing = { path = "../../core/boss-testing" }
-# The seed loader, core's default rules and the in-memory policy client,
-# so the seed's grants are judged by the decision admission runs
-# (tests/every_role_may_open_what_its_surfaces_file.rs, design 222fc982).
-boss-policy-client = { path = "../../core/boss-policy-client" }
 
 [lints]
 workspace = true

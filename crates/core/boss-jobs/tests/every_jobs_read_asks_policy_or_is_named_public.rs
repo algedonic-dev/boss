@@ -487,7 +487,7 @@ fn assembled(asked: Arc<AtomicUsize>) -> Router {
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let publisher = DomainPublisher::new(bus_dyn, "jobs");
     let kinds: Arc<dyn boss_jobs::registry::WorkflowRegistry> =
-        Arc::new(boss_jobs::registry::InMemoryWorkflows::new());
+        Arc::new(boss_jobs::registry::InMemoryWorkflows::for_fixture());
     let cadence = Arc::new(boss_jobs::cadence::InMemoryCadence::new(Vec::new()));
     let delivery = Arc::new(boss_jobs::delivery::InMemoryDeliveryPolicy::new(Vec::new()));
     let sensors = Arc::new(boss_jobs::sensors::InMemorySensors::new());
@@ -519,6 +519,7 @@ fn assembled(asked: Arc<AtomicUsize>) -> Router {
     router(state)
         .merge(boss_jobs::scheduling::http::router(
             boss_jobs::scheduling::http::SchedulingApiState {
+                role_guards: None,
                 repo: Arc::new(NoSchedules),
                 publisher: None,
                 clock: clock.clone(),
@@ -537,9 +538,9 @@ fn assembled(asked: Arc<AtomicUsize>) -> Router {
             boss_jobs::delivery::http::DeliveryPolicyApiState { repo: delivery },
         ))
         .merge(boss_jobs::credentials::http::router(
-            boss_jobs::credentials::http::CredentialsApiState {
-                registry: Arc::new(boss_jobs::credentials::InMemoryCredentials::new(Vec::new())),
-            },
+            boss_jobs::credentials::http::CredentialsApiState::new(Arc::new(
+                boss_jobs::credentials::InMemoryCredentials::new(Vec::new()),
+            )),
         ))
         .merge(boss_jobs::agent_runs::http::router(
             boss_jobs::agent_runs::http::AgentRunsApiState {

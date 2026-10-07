@@ -105,7 +105,7 @@ fn authored_dock() -> StationSpec {
 }
 
 fn app(extra: Option<StationSpec>) -> axum::Router {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds.seed(bill_kind()).unwrap();
     let stations = Arc::new(InMemoryStations::new());
     stations.seed(authored_dock()).unwrap();

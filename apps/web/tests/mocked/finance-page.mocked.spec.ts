@@ -1,3 +1,4 @@
+import { isPageWrite } from './_smokeMocks';
 // /ux/finance — the page's own spec: every control it renders, pinned
 // as it behaves on main (page audit 3f964c57, its `test` step; backlog
 // e0732f75, gap 13 of that audit).
@@ -182,8 +183,8 @@ const TAX_FILING = {
 const TAX_LIABILITY = {
   as_of: '2026-09-23',
   liabilities: [
-    { account_code: '2150', account_name: 'Payroll liabilities', balance_cents: 0 },
-    { account_code: '2300', account_name: 'Sales tax payable', balance_cents: 800 },
+    { account_code: '2150', account_name: 'Payroll liabilities', account_description: 'Tenant payroll obligation', balance_cents: 0 },
+    { account_code: '2300', account_name: 'Sales tax payable', account_description: 'Tenant sales obligation', balance_cents: 800 },
     { account_code: '2310', account_name: 'Income tax payable', balance_cents: 0 },
   ],
   accrued_filings: [TAX_FILING], next_due: TAX_FILING, currency: 'USD',
@@ -271,6 +272,18 @@ async function install(
   return sent;
 }
 
+// Page mount and polling reads may arrive during the download. Keep every
+// ledger request, including unexpected endpoints/methods/queries and duplicates.
+const closeReads = (sent: ReadonlyArray<Sent>, before: number): string[] =>
+  sent.slice(before).filter((s) => new URL(s.url).pathname.startsWith('/api/ledger/'))
+    .map((s) => { const u = new URL(s.url); return `${s.method} ${u.pathname}${u.search}`; }).sort();
+const AUGUST_CLOSE_READS = [
+  'GET /api/ledger/balance-sheet?as_of=2026-08-31',
+  'GET /api/ledger/cash-flow?from=2026-08-01&to=2026-08-31',
+  'GET /api/ledger/income-statement?from=2026-08-01&to=2026-08-31',
+  'GET /api/ledger/trial-balance?as_of=2026-08-31',
+] as const;
+
 const tab = (page: Page, name: string) => page.getByRole('tab', { name, exact: true });
 const panel = (page: Page) => page.locator('.tab-panel');
 const prints = (page: Page): Promise<number> =>
@@ -279,7 +292,7 @@ const reads = (sent: ReadonlyArray<Sent>, re: RegExp): string[] =>
   sent.filter((s) => s.method === 'GET' && re.test(s.url)).map((s) => s.url);
 /// A policy check is a POST that writes nothing (9dad102c), so it is not one.
 const writes = (sent: ReadonlyArray<Sent>): Sent[] =>
-  sent.filter((s) => s.method !== 'GET' && !/surface-opens|\/api\/policy\/check$/.test(s.url));
+  sent.filter((s) => isPageWrite(s.method, new URL(s.url).pathname) && !/\/api\/policy\/check$/.test(s.url));
 
 /// The catalog entry a link lands under — its own path, or the nearest
 /// catalogued parent of a detail route — read from nav-catalog.ts, and
@@ -408,24 +421,41 @@ test.describe('/ux/finance — the monthly close package', () => {
     await expect(opener(page)).toHaveText('Monthly close package');
   });
 
-  test('Download ZIP reads the four statements for the chosen month and downloads one ZIP', async ({ page }) => {
+  for (const background of [false, true]) test(`Download ZIP reads the four statements for the chosen month and downloads one ZIP${background ? ' while a delayed background request arrives' : ''}`, async ({ page }) => {
     const sent = await install(page);
     await mountPage(page, PATH);
     await opener(page).click();
     await dialog(page).getByLabel('Month').fill('2026-08');
     const before = sent.length;
 
-    const zip = await download(page, () => dialog(page).getByRole('button', { name: 'Download ZIP' }).click());
+    const zip = await download(page, async () => {
+      // An unrelated page request crosses the action's measurement boundary.
+      // No clock wait: this awaited request deterministically arrives after before.
+      if (background) await page.evaluate(async () => { await fetch('/api/commerce/summary'); });
+      await dialog(page).getByRole('button', { name: 'Download ZIP' }).click();
+    });
     expect(zip.name).toMatch(/^monthly-close-2026-08-\d{4}-\d{2}-\d{2}\.zip$/);
-    const asked = sent.slice(before).map((s) => { const u = new URL(s.url); return `${u.pathname}${u.search}`; }).sort();
-    expect(asked).toEqual([
-      '/api/ledger/balance-sheet?as_of=2026-08-31',
-      '/api/ledger/cash-flow?from=2026-08-01&to=2026-08-31',
-      '/api/ledger/income-statement?from=2026-08-01&to=2026-08-31',
-      '/api/ledger/trial-balance?as_of=2026-08-31',
-    ]);
+    expect(closeReads(sent, before)).toEqual(AUGUST_CLOSE_READS);
+    for (const filename of ['trial-balance.csv', 'income-statement.csv', 'balance-sheet.csv', 'cash-flow.csv', 'README.txt']) {
+      expect(zip.text).toContain(filename);
+    }
+    expect(zip.text).toContain('Period: 2026-08-01 through 2026-08-31 (inclusive).');
     await expect(dialog(page).locator('.mcp-ok')).toHaveText('Download started.');
     await expect(dialog(page).locator('.mcp-warn-list')).toHaveCount(0);
+  });
+
+  test('the close request judge rejects missing, duplicate, wrong-month and unexpected ledger calls', () => {
+    const sent = AUGUST_CLOSE_READS.map((read) => {
+      const [method, path] = read.split(' ');
+      return { method: method!, url: `http://fixture.invalid${path}`, body: null };
+    });
+    expect(closeReads(sent, 0)).toEqual(AUGUST_CLOSE_READS);
+    for (const invalid of [sent.slice(1), [...sent, sent[0]!],
+      [ { ...sent[0]!, url: sent[0]!.url.replace('2026-08', '2026-07') }, ...sent.slice(1) ],
+      [...sent, { method: 'GET', url: 'http://fixture.invalid/api/ledger/accounts', body: null }],
+      [ { ...sent[0]!, method: 'POST' }, ...sent.slice(1) ]]) {
+      expect(() => expect(closeReads(invalid, 0)).toEqual(AUGUST_CLOSE_READS)).toThrow();
+    }
   });
 
   test('a statement that fails to load is named, and the ZIP ships without it', async ({ page }) => {
@@ -1026,12 +1056,11 @@ test.describe('/ux/finance — Tax liability', () => {
     await mountPage(page, `${PATH}?tab=tax-liability`);
     const [outstanding, filings] = [0, 1].map((i) => panel(page).locator('section.tab-section').nth(i));
     await expect(outstanding!.locator('.tb-asof')).toHaveText('As of 2026-09-23');
-    // c8b71886: these three descriptions are literals in TaxLiabilityTab,
-    // not read from the chart of accounts.
+    // c8b71886: descriptions are chart data; a historical omission is unknown.
     await expect(outstanding!.locator('tbody tr')).toHaveText([
-      /2150 · Payroll liabilities\s*Payroll withholdings \+ employer-side tax; drained quarterly \(941\)\s*\$0\.00/,
-      /2300 · Sales tax payable\s*Sales tax collected on invoices; drained monthly per jurisdiction\s*\$8\.00/,
-      /2310 · Income tax payable\s*Estimated income tax; drained quarterly\s*\$0\.00/,
+      /2150 · Payroll liabilities\s*Tenant payroll obligation\s*\$0\.00/,
+      /2300 · Sales tax payable\s*Tenant sales obligation\s*\$8\.00/,
+      /2310 · Income tax payable\s*—\s*\$0\.00/,
       /Total\s*\$8\.00/,
     ]);
     await expect(outstanding!.locator('p.empty')).toHaveText('Next due: Sales tax · US-CA · $8.00 by 2026-09-20');
@@ -1044,16 +1073,40 @@ test.describe('/ux/finance — Tax liability', () => {
     expect(await prints(page)).toBe(1);
   });
 
-  test('no filings: the empty line describes a generator this instance does not run', async ({ page }) => {
+  test('no filings: states the counted result without inventing a generator or protocol', async ({ page }) => {
     await install(page, { taxLiability: { as_of: '2026-09-23', liabilities: [], accrued_filings: [], next_due: null, currency: 'USD' } });
     await mountPage(page, `${PATH}?tab=tax-liability`);
     await expect(panel(page).getByRole('button', { name: 'Download CSV' })).toBeDisabled();
     await expect(panel(page).locator('h3')).toHaveText(['Outstanding tax liability', 'Accrued filings (0)']);
-    // c8b71886: the brewery simulator's tax-authorities generator; no
-    // Algedonic protocol accrues a filing (/api/ledger/tax-filings is []).
     await expect(panel(page).locator('section.tab-section').nth(1).locator('p.empty')).toHaveText(
-      'No filings awaiting remittance. The tax-authorities generator sweeps sales tax on the 20th of each month and payroll-941 on the 15th of Jan / Apr / Jul / Oct.',
+      '0 accrued tax filings.',
     );
+  });
+
+  test('missing, null and blank chart descriptions stay unknown', async ({ page }) => {
+    await install(page, { taxLiability: {
+      ...TAX_LIABILITY,
+      liabilities: [
+        { account_code: '2150', account_name: 'Tenant payroll name', account_description: null, balance_cents: 0 },
+        { account_code: '2300', account_name: 'Tenant sales name', account_description: '  ', balance_cents: 800 },
+        { account_code: '2310', account_name: 'Tenant income name', balance_cents: 0 },
+      ],
+    } });
+    await mountPage(page, `${PATH}?tab=tax-liability`);
+    await expect(panel(page).locator('section.tab-section').first().locator('tbody tr')).toHaveText([
+      /2150 · Tenant payroll name\s*—\s*\$0\.00/,
+      /2300 · Tenant sales name\s*—\s*\$8\.00/,
+      /2310 · Tenant income name\s*—\s*\$0\.00/,
+      /Total\s*\$8\.00/,
+    ]);
+  });
+
+  test('a refused tax read shows unavailable rather than a counted empty result', async ({ page }) => {
+    await install(page);
+    await page.route(ENDPOINTS.taxLiability, refuse(503, 'ledger unavailable'));
+    await mountPage(page, `${PATH}?tab=tax-liability`);
+    await expect(panel(page).getByRole('alert')).toHaveText('Tax liability unavailable.');
+    await expect(panel(page).locator('table')).toHaveCount(0);
   });
 });
 

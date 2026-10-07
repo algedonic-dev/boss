@@ -265,6 +265,13 @@ grep -qE '\$HOME' <<<"$(grep -vE '^\s*#' "$repo/infra/forge/rollback-to.sh")" &&
 grep -qE '\$HOME' <<<"$(grep -vE '^\s*#' "$repo/infra/forge/converge-hold.sh")" && fail "converge-hold.sh still reads \$HOME"
 bash "$repo/infra/forge/converge-hold.sh" hold learning-the-new-runner >/dev/null || fail "hold failed"
 [[ "$(<"$tmp/hold")" == "learning-the-new-runner" ]] || fail "the hold file does not carry the reason"
+# No token in reach (a-lint-sources-a-header-lib-only-hermetic): the lib
+# sourced below now sources the machine token's reader, and a lint's
+# answer must not depend on what credentials its runner holds
+# (backlog 920524dc; 2710c8fc).
+export BOSS_MACHINE_TOKEN_DIR=/nonexistent/no-machine-token
+export BOSS_SOR_ENV=/nonexistent/no-sor.env
+unset BOSS_JOBS_URL BOSS_MACHINE_TOKEN_HOSTS
 # shellcheck source=/dev/null
 . "$repo/infra/forge/cluster-deploy-lib.sh"
 reason=$(converge_held "$tmp/hold") || fail "the runner's hold check did not see the hold"

@@ -51,6 +51,7 @@ use boss_dispatcher_handlers::handlers::{
     jobs_complete_step_from_record::JobsCompleteStepFromRecord,
     jobs_complete_step_matching::JobsCompleteStepMatching,
     jobs_flight_overdue::JobsFlightOverdue,
+    jobs_receipt_overdue::JobsReceiptOverdue,
     jobs_reclaim_abandoned_step::JobsReclaimAbandonedStep,
     jobs_retract_matching::JobsRetractMatching,
     jobs_run_car_probes::JobsRunCarProbes,
@@ -65,6 +66,7 @@ use boss_dispatcher_handlers::handlers::{
     messages_notify::MessagesNotify,
     messages_notify_job_terminal::MessagesNotifyJobTerminal,
     network_census::NetworkCensus,
+    ops_discover_remedies::OpsDiscoveredRemedies,
     ops_file_remedies::OpsFileRemedies,
     ops_file_tag_release::OpsFileTagRelease,
     ops_judge::OpsJudge,
@@ -471,7 +473,7 @@ async fn main() -> Result<()> {
             // every door 503 under `enforce` — and one when the tally is
             // full. It refuses nothing.
             handlers.register(PolicyCheckRefusalsAlarm::new(
-                cfg.policy_api_url.clone(),
+                boss_ports::url("events"),
                 cfg.jobs_api_url.clone(),
                 platform_owner.clone(),
             ));
@@ -489,6 +491,7 @@ async fn main() -> Result<()> {
             // new remedy is a verb-file edit, not a rule. Files only a
             // verb that runs under a passkey on its rendered plan.
             handlers.register(OpsFileRemedies::new(cfg.jobs_api_url.clone()));
+            handlers.register(OpsDiscoveredRemedies::new(cfg.jobs_api_url.clone()));
             // A chore that closed red opens one backlog-item per RED
             // route on its recorded step (ac3270c7): on the close, parse
             // `RED <route> <kind>: <error>` lines off the step the rule
@@ -543,6 +546,10 @@ async fn main() -> Result<()> {
             // how many hours ride the rule row; it files and withdraws
             // its own alarm and never touches the late step.
             handlers.register(JobsAgentStepOverdue::new(
+                cfg.jobs_api_url.clone(),
+                platform_owner.clone(),
+            ));
+            handlers.register(JobsReceiptOverdue::new(
                 cfg.jobs_api_url.clone(),
                 platform_owner.clone(),
             ));
@@ -671,23 +678,33 @@ async fn main() -> Result<()> {
                 // Unconfigured carrying the refusal that names every
                 // missing key, so the refresh cadence records WHAT to
                 // place on every firing instead of tripping UnknownHandler.
-                let github: Arc<dyn credential_issuer::GitHubAppIssuer> =
-                    match credential_issuer::GitHubAppRoot::from_values(
-                        cfg.broker_github_app_id.as_deref(),
-                        cfg.broker_github_app_installation_id.as_deref(),
-                        cfg.broker_github_app_private_key.as_deref(),
-                    )
-                    .and_then(|root| {
-                        credential_issuer::GitHubApi::new(cfg.broker_github_api_url.clone(), root)
-                    }) {
-                        Ok(api) => api,
-                        Err(why) => Arc::new(Unconfigured(why)),
-                    };
+                let (github, installation_reader): (
+                    Arc<dyn credential_issuer::GitHubAppIssuer>,
+                    Arc<dyn credential_issuer::installation_read::InstallationReader>,
+                ) = match credential_issuer::GitHubAppRoot::from_values(
+                    cfg.broker_github_app_id.as_deref(),
+                    cfg.broker_github_app_installation_id.as_deref(),
+                    cfg.broker_github_app_private_key.as_deref(),
+                )
+                .and_then(|root| {
+                    credential_issuer::GitHubApi::new(cfg.broker_github_api_url.clone(), root)
+                }) {
+                    Ok(api) => (api.clone(), api),
+                    Err(why) => (
+                        Arc::new(Unconfigured(why.clone())),
+                        Arc::new(Unconfigured(why)),
+                    ),
+                };
                 handlers.register(CredentialRotateGitHubApp::new(
                     cfg.jobs_api_url.clone(),
                     github,
                     secrets.clone(),
                 ));
+                handlers.register(
+                    boss_dispatcher_handlers::handlers::credential_installation_observe::CredentialObserveInstallation::new(
+                        &cfg.jobs_api_url, installation_reader,
+                    ),
+                );
                 // The ops runner's credential (design f623e425 Q1, backlog
                 // 1e50e66b): no issuer outside the estate — the handler
                 // mints 32 random bytes into its host's `next` slot of the
@@ -698,6 +715,15 @@ async fn main() -> Result<()> {
                     cfg.jobs_api_url.clone(),
                     secrets.clone(),
                 ));
+                // Public preparation only; native human scope is checked
+                // before storage access. Receiver enrollment is separate.
+                handlers.register(
+                    boss_dispatcher_handlers::handlers::broker_transport_key::CredentialPrepareSshDeposit::new(
+                        &cfg.jobs_api_url,
+                        secrets.clone(),
+                        Arc::new(boss_dispatcher_handlers::handlers::broker_transport_key::RsaSshIssuer),
+                    ),
+                );
                 // The self-issued estate machine token (design 6805c764,
                 // car 3): no issuer and no root, so nothing to configure
                 // but the Secret store — the value is generated here and
@@ -1039,6 +1065,31 @@ async fn main() -> Result<()> {
         Arc::new(boss_jobs::dispatcher_firings::PgDispatcherFirings::new(
             pool.clone(),
         ));
+    let policy = boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
+        boss_policy_client::ReqwestPolicyClient::new("dispatcher", cfg.policy_api_url.clone()),
+    ));
+    let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+        boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+        Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+    ));
+    let mode = Arc::new(boss_policy_client::role_reader::MountedReportMode::mount());
+    let source = Arc::new(boss_policy_client::role_reader::HttpRoleReader::new(
+        cfg.jobs_api_url.clone(),
+        cfg.people_api_url.clone(),
+        boss_policy_client::User::service("dispatcher"),
+    )?);
+    let wiring = boss_policy_client::role_service::assemble(
+        "dispatcher",
+        "/api/dispatcher/actor-role-reports",
+        policy,
+        roles.clone(),
+        mode.clone(),
+        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
+            boss_policy_client::role_service::REPORT_CAPACITY,
+        )),
+    );
+    let policy = wiring.policy;
+
     let app = router(HttpState {
         live,
         pool: pool.clone(),
@@ -1049,15 +1100,14 @@ async fn main() -> Result<()> {
         // `GET /api/dispatcher/schedule` (design ea906603): its scope
         // gate, the clock and calendars the schedule runner fires by,
         // and the firing record's one reader.
-        policy: boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
-            boss_policy_client::ReqwestPolicyClient::new("dispatcher", cfg.policy_api_url.clone()),
-        )),
+        policy,
         clock: Arc::new(boss_clock_client::ReqwestClockClient::new(
             cfg.clock_api_url.clone(),
         )),
         calendar: Arc::new(ReqwestCalendarClient::new(cfg.calendar_api_url.clone())),
         firings: Some(firings_reader),
-    });
+    })
+    .merge(wiring.inventory);
     let bind: SocketAddr = cfg
         .http_bind
         .parse()
@@ -1066,12 +1116,32 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding HTTP listener on {bind}"))?;
     info!(addr = %bind, "boss-dispatcher HTTP listening (health-only surface)");
+    // TWO exempt reads, the two boss-dispatcher's http.rs keeps open by
+    // decision: `health`, and `readyz` — liveness numbers and flags, read
+    // with no identity by the estate observer's dead-letter read, the OSS
+    // quickstart's launch wait and a tenant sim's pre-Go gate. The gate
+    // exempted `health` alone until backlog 37742794 (2026-10-06), so the
+    // observer's read was a would-refuse fact every fifteen minutes and
+    // enforce would have answered the alarm's own reader 401 — a watchdog
+    // answered 401 goes blind (design 6805c764 choice 5). GET only, the
+    // exact path; `readyz_answers_anyone_and_names_no_rule` holds what it
+    // may say, and every_service_mounts_the_machine_gate.rs holds this
+    // list to the observer's read.
     let app = boss_core::machine_gate::mount(
         app,
         "dispatcher",
-        &["/api/dispatcher/health"],
+        &["/api/dispatcher/health", "/api/dispatcher/readyz"],
         Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
     );
-    axum::serve(listener, app).await?;
+    boss_policy_client::role_service::serve_with_refresh(
+        listener,
+        app,
+        roles,
+        source,
+        mode,
+        boss_policy_client::role_service::REFRESH_CADENCE,
+        boss_policy_client::role_service::shutdown_signal(),
+    )
+    .await?;
     Ok(())
 }

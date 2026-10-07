@@ -86,5 +86,13 @@ name = "rebuild_e2e"
 required-features = ["postgres"]
 
 [[test]]
+name = "manual_events_rebuild_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "the_adapters_agree_on_the_content_store_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "audience_observation_preserves_visibility"
 required-features = ["postgres"]

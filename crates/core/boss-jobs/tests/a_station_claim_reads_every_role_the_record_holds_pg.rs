@@ -129,6 +129,7 @@ async fn project_station(db: &TestDb, role: &str) -> String {
     wf.steps[0].authority_role = Some(role.to_string());
     wf.steps[0].audience = None;
     wf.steps[0].agent = Some(boss_jobs::agent_spec::AgentSpec {
+        executor_provenance: Default::default(),
         profile: "builder".into(),
         model: MODEL.into(),
         budget_usd: 1.0,
@@ -147,6 +148,15 @@ async fn project_station(db: &TestDb, role: &str) -> String {
 /// The jobs API with the Pg station registry and the agents door wired
 /// — the same shape `boss dispatch` claims through.
 async fn app_with(db: &TestDb, step: Step) -> (axum::Router, String) {
+    let (app, id, _) = app_with_reporter(db, step, None).await;
+    (app, id)
+}
+
+async fn app_with_reporter(
+    db: &TestDb,
+    step: Step,
+    reporter: Option<Arc<boss_policy_client::role_guard::RoleGuardReporter>>,
+) -> (axum::Router, String, Arc<RecordingEventBus>) {
     let jobs = Arc::new(PgJobs::new(db.pool.clone()));
     jobs.create_job(&packet()).await.expect("packet lands");
     let id = step.id.to_string();
@@ -167,19 +177,20 @@ async fn app_with(db: &TestDb, step: Step) -> (axum::Router, String) {
     let agents: Arc<dyn AgentsRegistry> = Arc::new(PgAgents::new(db.pool.clone()));
     let runs: Arc<dyn AgentRunLog> = Arc::new(PgAgentRuns::new(db.pool.clone()));
     let app = router(JobsApiState {
+        role_guards: reporter,
         stations: Some(
             Arc::new(boss_jobs::PgStations::new(db.pool.clone())) as Arc<dyn StationRegistry>
         ),
         agent_budget: Some(Arc::new(BudgetDoor { agents, runs })),
         ..JobsApiState::minimal(
             jobs.clone(),
-            bus,
+            bus.clone(),
             DomainPublisher::new(bus_dyn, "jobs"),
             policy,
             Arc::new(boss_clock_client::WallClockClient),
         )
     });
-    (app, id)
+    (app, id, bus)
 }
 
 async fn claim_at(
@@ -257,4 +268,82 @@ async fn a_roleless_row_and_a_person_are_judged_on_the_request_alone() {
     // there has ever been — and this station does not admit it.
     let body = claim_at(&app, &step_id, &station, "emp-david", StatusCode::FORBIDDEN).await;
     assert_eq!(body["actor_roles"], serde_json::json!(["platform-admin"]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn observed_station_capability_keeps_original_roles_and_captured_registry_fallback() {
+    use boss_policy_client::role_reader::{
+        MonotonicRoleSnapshotClock, RegistryRoles, SnapshotRoleReader,
+    };
+    use boss_policy_client::role_reporting::{ReportMode, ReportTally};
+    for (station_role, recorded, original_allowed, candidate_allowed) in [
+        ("platform-admin", "service-tech", true, false),
+        ("bookkeeper", "bookkeeper", false, true),
+        ("engineering-agent", "service-tech", true, true),
+    ] {
+        let db = TestDb::new().await;
+        declare_agent(&db, Some("engineering-agent")).await;
+        let station = project_station(&db, station_role).await;
+        let roles = Arc::new(SnapshotRoleReader::new(
+            std::time::Duration::from_secs(30),
+            Arc::new(MonotonicRoleSnapshotClock),
+        ));
+        let ticket = roles.begin_refresh();
+        assert!(roles.finish_refresh(ticket,Ok(RegistryRoles::from_sources(serde_json::json!({"data":[{"id":AGENT,"aliases":[],"role":recorded}],"total":1}),serde_json::json!({"data":[],"total":0}),serde_json::json!([])).unwrap())));
+        let tally = Arc::new(ReportTally::new(16));
+        let reporter = Arc::new(boss_policy_client::role_guard::RoleGuardReporter::new(
+            roles,
+            tally.clone(),
+            Arc::new(ReportMode::Report),
+        ));
+        let (app, step_id, bus) =
+            app_with_reporter(&db, step_for(station_role), Some(reporter)).await;
+        let response = claim_at(
+            &app,
+            &step_id,
+            &station,
+            AGENT,
+            if original_allowed {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            },
+        )
+        .await;
+        if original_allowed {
+            assert_eq!(response["assignee_id"], AGENT);
+            assert_eq!(response["status"], "active");
+        } else {
+            let stored = PgJobs::new(db.pool.clone())
+                .get_step(&StepId::from_uuid(Uuid::parse_str(&step_id).unwrap()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.status, StepStatus::Ready);
+            assert!(
+                bus.events().is_empty(),
+                "a refused capability must publish no state change"
+            );
+            assert_eq!(
+                response["actor_roles"],
+                serde_json::json!(["platform-admin", "engineering-agent"])
+            );
+        }
+        let report = tally.snapshot();
+        let rows: Vec<_> = report
+            .rows
+            .iter()
+            .filter(|row| row.observation.resource == "station-claim-capability")
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "every actual capability decision must be observed"
+        );
+        assert_eq!(rows[0].observation.asserted_allowed, Some(original_allowed));
+        assert_eq!(
+            rows[0].observation.recorded_allowed,
+            Some(candidate_allowed)
+        );
+    }
 }

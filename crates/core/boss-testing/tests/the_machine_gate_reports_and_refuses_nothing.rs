@@ -11,11 +11,12 @@
 //! enforcement is earned — a clean window, read, never a belief
 //! (operator decision (4) on 2710c8fc).
 //!
-//! REFUSES NOTHING, and this file is what holds that line:
+//! THE MACHINE GATE REFUSES NOTHING, and this file is what holds that
+//! line:
 //!
-//!   * the mode is `report` and no manifest says `enforce` anywhere.
-//!     Enforcement is row C of decision b08725c2 — its own car, after a
-//!     72-hour clean window, on a Pacific-hours train;
+//!   * its mode is `report` and no manifest says `enforce` for it
+//!     anywhere. Enforcement is row C of decision b08725c2 — its own car,
+//!     after a 72-hour clean window, on a Pacific-hours train;
 //!   * both mounts are `optional: true`. A Secret the broker has not
 //!     filled, or a ConfigMap an apply has not reached, mounts EMPTY:
 //!     no token is a gate with no slots and a caller that sends none, no
@@ -29,10 +30,17 @@
 //!
 //! THE SECOND KEY (backlog b8e75382, enforce checklist F4 of review
 //! 1c2860f4): the policy check's own mode word, `policy-check`, rides the
-//! same ConfigMap and the same mount, at `report`, under the same rule —
-//! no manifest says `enforce` for it either. Its enforce car waits on G1
-//! (47aed706 car 3) and row C, and its rollback road, the kubectl patch
-//! over the LAN kube road, is written beside the key and pinned here.
+//! same ConfigMap and the same mount. ROW D's car (design b08725c2)
+//! moved it to `enforce`, and this file holds that flip to its one
+//! place: the plain `policy-check: enforce` line of that ConfigMap, and
+//! nowhere else in any manifest, in any shape. Its rollback road, the
+//! kubectl patch over the LAN kube road, is written beside the key and
+//! pinned here. THE MACHINE GATE'S HALF IS NOT LOOSENED BY IT: `mode`
+//! is still `report`, and `enforce` for it is still refused everywhere,
+//! the ConfigMap included — so until row C lands, the policy check's
+//! service arm is bounded by an ASSERTED `automation:` id, not a proven
+//! one (boss-policy-client `is_sim_identity`: "HOW THAT IS PROVEN TODAY:
+//! it is not").
 //!
 //! WHO HOLDS THE TOKEN is a roster, pinned here, with the reason each
 //! workload is on it or deliberately off it. The token lets its holder
@@ -214,27 +222,50 @@ fn mode_config_map(boss: &str) -> &str {
 }
 
 #[test]
-fn the_mode_is_report_and_nothing_says_enforce() {
+fn the_machine_gate_reports_and_only_the_policy_check_enforces() {
     let all = manifests();
     let doc = mode_config_map(&all["boss.yaml"]);
-    for key in mode_keys() {
+    let [gate, check] = mode_keys();
+    for (key, want, why) in [
+        (
+            gate,
+            "report",
+            "what the machine gate would refuse is admitted and tallied (design 6805c764 car 4); \
+             its `enforce` is row C of decision b08725c2, its own car, after a 72-hour clean \
+             window, on a Pacific-hours train — NOT the policy check's car",
+        ),
+        (
+            check,
+            "enforce",
+            "row D of decision b08725c2 (F7 of backlog b8e75382): an unsigned check and a \
+             service whose Read on policy-rule has lapsed are refused. The way back is the \
+             word `report` on this line, by the kubectl road written above it",
+        ),
+    ] {
         let modes: Vec<&str> = live_lines(doc)
             .filter_map(|l| l.trim().strip_prefix(&format!("{key}:")))
             .map(|v| v.trim().trim_matches('"'))
             .collect();
-        assert_eq!(
-            modes,
-            ["report"],
-            "{CONFIG_MAP}'s `{key}` is `report`: what it would refuse is admitted and tallied \
-             (the machine gate: design 6805c764 car 4; the policy check: the report-prep car of \
-             backlog b8e75382, checklist F4). `enforce` is each one's own car, after a clean \
-             window, on a Pacific-hours train (decision b08725c2)"
-        );
+        assert_eq!(modes, [want], "{CONFIG_MAP}'s `{key}` is `{want}`: {why}");
     }
     for (name, text) in &all {
         let lines: Vec<&str> = live_lines(text).collect();
-        if let Some(line) = sets_enforce(&lines) {
-            panic!("{name}: `{line}` — no manifest sets a gate to enforce in this car");
+        if let Some(line) = sets_enforce(&lines, &[gate]) {
+            panic!(
+                "{name}: `{line}` — no manifest sets the MACHINE gate to enforce: that is row \
+                 C's car, and row D's flip of `{check}` does not carry it"
+            );
+        }
+        // The policy check's `enforce` lives on ONE line, counted above:
+        // the plain key of the ConfigMap. Any other spelling, in this
+        // file or another, is a second fact the rollback would miss.
+        let outside = text.replace(doc, "");
+        let lines: Vec<&str> = live_lines(&outside).collect();
+        if let Some(line) = sets_enforce(&lines, &[check]) {
+            panic!(
+                "{name}: `{line}` — `{check}: enforce` is spelled once, in ConfigMap \
+                 {CONFIG_MAP}, where its rollback road names it"
+            );
         }
         for env in [
             "BOSS_MACHINE_GATE_MODE_FILE",
@@ -272,21 +303,22 @@ fn the_policy_checks_way_back_is_written_beside_its_key() {
     }
 }
 
-/// The first line in `lines` (comments already dropped) that gives a
-/// mode key ([`mode_keys`]: `mode`, `policy-check`) a value the gate's
+/// The first line in `lines` (comments already dropped) that gives one
+/// of `keys` (from [`mode_keys`]: `mode`, `policy-check`) a value the gate's
 /// own parser reads as `enforce` — in any shape a manifest can spell it
 /// (review ef2da426 F3): YAML block or flow, JSON, any case, any quotes,
 /// or a block scalar (`mode: |`) whose next non-blank line holds the
 /// word. The value goes through `Mode::parse`, the one parse every mode
 /// word takes, so this can never be narrower than what a mounted file
 /// would enforce.
-fn sets_enforce(lines: &[&str]) -> Option<String> {
+fn sets_enforce(lines: &[&str], keys: &[&str]) -> Option<String> {
     use boss_core::machine_gate::Mode;
     let norm = |l: &str| l.to_ascii_lowercase().replace(['"', '\''], "");
     for (i, raw) in lines.iter().enumerate() {
         let line = norm(raw);
-        let found = mode_keys()
-            .into_iter()
+        let found = keys
+            .iter()
+            .copied()
             .flat_map(|key| line.match_indices(key).map(move |(at, _)| (at, key.len())))
             .collect::<Vec<_>>();
         for (at, len) in found {
@@ -330,7 +362,7 @@ fn the_enforce_matcher_reads_every_shape_the_parser_would() {
         vec!["data: {mode: report, policy-check: enforce}"],
         vec!["  policy-check: |", "    enforce"],
     ] {
-        assert!(sets_enforce(&shape).is_some(), "{shape:?}");
+        assert!(sets_enforce(&shape, &mode_keys()).is_some(), "{shape:?}");
     }
     for shape in [
         vec!["  mode: report"],
@@ -342,8 +374,17 @@ fn the_enforce_matcher_reads_every_shape_the_parser_would() {
         vec!["  policy-check: report"],
         vec!["  x-policy-check: enforce"],
     ] {
-        assert!(sets_enforce(&shape).is_none(), "{shape:?}");
+        assert!(sets_enforce(&shape, &mode_keys()).is_none(), "{shape:?}");
     }
+    // Each key is judged alone, so the policy check's flip (row D) cannot
+    // carry the machine gate's (row C) past the pin, in either direction.
+    let [gate, check] = mode_keys();
+    let both = ["data: {mode: enforce, policy-check: report}"];
+    assert!(sets_enforce(&both, &[gate]).is_some());
+    assert!(sets_enforce(&both, &[check]).is_none());
+    let flipped = ["  mode: report", "  policy-check: enforce"];
+    assert!(sets_enforce(&flipped, &[gate]).is_none());
+    assert!(sets_enforce(&flipped, &[check]).is_some());
 }
 
 #[test]

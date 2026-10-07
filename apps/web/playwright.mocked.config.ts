@@ -114,10 +114,10 @@ export default defineConfig({
   // (backlog 55ca0748): the default read w-1's 32 CPUs and ran 16 workers
   // in a pod whose quota is 16 (dev) or 20 (gate). See src/dev-workers.ts.
   workers: mockedWorkers(readCpuMax(), cpus().length),
-  // No retry in the gate, deliberately: the gate sets no CI marker (its
-  // receipt records `ci: false`), and docs/design/testing-strategy.md
-  // names a flaky-test retry as an anti-pattern. Only forge CI gets one.
-  retries: process.env['CI'] ? 1 : 0,
+  // Keep the first failure in every lane (backlog a128f720). Forge CI
+  // used to retry once while the cluster gate did not; that could turn
+  // a real failed attempt into green. The testing standard rejects it.
+  retries: 0,
   // The list reporter is what a person and the gate-runner's parser read.
   // Inside the gate the timings reporter also appends every test's
   // duration to the file the gate names, for the receipt's

@@ -203,12 +203,33 @@ impl PolicyRepository for PgPolicy {
         Ok(())
     }
 
-    async fn deactivate_rule(&self, id: &str, changed_by: &str) -> Result<(), PolicyError> {
+    async fn deactivate_rule_judged(
+        &self,
+        id: &str,
+        changed_by: &str,
+        judge: Judge<'_, PolicyRule>,
+    ) -> Result<(), PolicyError> {
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| PolicyError::Storage(e.to_string()))?;
+
+        // The row this retirement changes, locked until it commits and
+        // judged here (car 3 of design 1c4e42e1: the retirement was the
+        // one policy write no judge saw).
+        let existing: Option<RuleRow> = sqlx::query_as(
+            "SELECT id, role, resource, action, scope, active \
+             FROM policy_rules WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| PolicyError::Storage(e.to_string()))?;
+        let Some(existing) = existing.map(RuleRow::into_rule).transpose()? else {
+            return Err(PolicyError::NotFound(id.to_string()));
+        };
+        judge(Some(&existing)).map_err(PolicyError::Refused)?;
 
         let before: Option<serde_json::Value> =
             sqlx::query_scalar("SELECT row_to_json(r) FROM policy_rules r WHERE id = $1")

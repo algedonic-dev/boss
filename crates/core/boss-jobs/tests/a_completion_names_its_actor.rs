@@ -53,6 +53,13 @@ impl RosterLookup for AdminRoster {
 /// the append-a-step guard — the only route to POSTing an ad-hoc step
 /// straight in as `completed`.
 fn app(with_registry: bool) -> axum::Router {
+    app_with_guard(with_registry, None)
+}
+
+fn app_with_guard(
+    with_registry: bool,
+    guard: Option<Arc<boss_policy_client::role_guard::RoleGuardReporter>>,
+) -> axum::Router {
     let jobs = Arc::new(InMemoryJobs::new());
     let policy: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()
@@ -74,7 +81,7 @@ fn app(with_registry: bool) -> axum::Router {
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let kind_registry: Option<Arc<dyn WorkflowRegistry>> = if with_registry {
-        let kinds = Arc::new(InMemoryWorkflows::new());
+        let kinds = Arc::new(InMemoryWorkflows::for_fixture());
         for spec in seedable_platform_workflows() {
             kinds.seed(spec).expect("seed platform kind");
         }
@@ -83,6 +90,7 @@ fn app(with_registry: bool) -> axum::Router {
         None
     };
     let state = JobsApiState {
+        role_guards: guard,
         kind_registry,
         roster: Some(Arc::new(AdminRoster)),
         ..JobsApiState::minimal(
@@ -456,4 +464,71 @@ async fn a_step_born_completed_carries_the_same_stamps() {
     assert_eq!(step["completed_by"], ADMIN_ID, "{step}");
     assert_ne!(step["completed_at"], "1999-01-01T00:00:00Z", "{step}");
     assert!(step["completed_at"].is_string(), "{step}");
+}
+
+#[tokio::test]
+async fn completion_proxy_attribution_is_reported_without_changing_the_actor() {
+    use boss_policy_client::role_guard::RoleGuardReporter;
+    use boss_policy_client::role_reader::{RegistryRoles, RoleSnapshotClock, SnapshotRoleReader};
+    use boss_policy_client::role_reporting::{ReportMode, ReportTally};
+    use std::time::{Duration, Instant};
+    struct Clock;
+    impl RoleSnapshotClock for Clock {
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+    }
+    let roles = Arc::new(SnapshotRoleReader::new(
+        Duration::from_secs(30),
+        Arc::new(Clock),
+    ));
+    let ticket = roles.begin_refresh();
+    assert!(
+        roles.finish_refresh(
+            ticket,
+            Ok(RegistryRoles::from_sources(
+                serde_json::json!({"data":[],"total":0}),
+                serde_json::json!({"data":[],"total":0}),
+                serde_json::json!([{"id":ADMIN_ID,"role":"system","status":"active"}]),
+            )
+            .unwrap())
+        )
+    );
+    let tally = Arc::new(ReportTally::new(100));
+    let app = app_with_guard(
+        true,
+        Some(Arc::new(RoleGuardReporter::new(
+            roles,
+            tally.clone(),
+            Arc::new(ReportMode::Report),
+        ))),
+    );
+    let (job, scope) = open_packet(&app).await;
+    let _ = completion_body(&app, &job).await;
+    let (status, body) = send(
+        &app,
+        req(
+            "PUT",
+            &format!("/api/jobs/{job}/steps/{scope}"),
+            serde_json::json!({"status":"completed","completed_by":"emp-other"}),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    let row = scope_step(&app, &job).await;
+    assert_eq!(row["completed_by"], ADMIN_ID);
+    let report = tally.snapshot();
+    let observations: Vec<_> = report
+        .rows
+        .iter()
+        .filter(|row| row.observation.resource == "step-writer-proxy")
+        .collect();
+    assert_eq!(
+        observations.len(),
+        1,
+        "actual attribution boundary must report"
+    );
+    assert_eq!(observations[0].observation.asserted_allowed, Some(false));
+    assert_eq!(observations[0].observation.recorded_allowed, Some(true));
+    assert_eq!(observations[0].observation.would_deny, None);
 }

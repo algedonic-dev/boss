@@ -31,6 +31,8 @@ const RUNNER: &str = "infra/ops/ops-runner.sh";
 const CRED: &str = "ops-runner-credential-forge";
 const JOB: &str = "1e50e66b-b501-4d45-8da7-c162a0f41d54";
 const OTHER_JOB: &str = "6c9183de-0000-4000-8000-000000000001";
+const ATTEMPT: &str = "00000000-0000-4000-8000-000000000104";
+const SECRET_UID: &str = "00000000-0000-4000-8000-000000000105";
 
 // 43-character base64url fixtures, fake.
 const OLD: &str = "oldOLDoldOLDoldOLDoldOLDoldOLDoldOLDold0001";
@@ -59,6 +61,8 @@ struct Req {
     method: String,
     path: String,
     body: String,
+    actor: Option<String>,
+    runner_credential_presented: bool,
 }
 
 #[derive(Default)]
@@ -69,7 +73,17 @@ struct State {
     jobs: HashMap<String, serde_json::Value>,
     /// The jobs API has no credential door: whoami answers 404.
     no_door: bool,
+    whoami_status: Option<u16>,
+    packet_status: Option<u16>,
     requests: Vec<Req>,
+    delivery_context: Option<serde_json::Value>,
+    delivery_receipt: Option<serde_json::Value>,
+    delivery_refusal: bool,
+    foreign_holder: bool,
+    malformed_delivery_receipt: bool,
+    completion_refusal: bool,
+    empty_reply_at: Option<String>,
+    blank_reply: bool,
 }
 
 /// The jobs API: the credential door's whoami, a packet read, and the step
@@ -106,11 +120,12 @@ impl Api {
     /// is ready, its install recorded `installed_secs_ago`.
     fn awaiting(&self, id: &str, installed_secs_ago: i64) {
         let job = serde_json::json!({
-            "id": id, "status": "open", "subject": {"subject_kind": "custom", "id": CRED},
+            "id": id, "status": "open", "opened_at": ago(installed_secs_ago), "subject": {"subject_kind": "custom", "id": CRED},
             "steps": [
                 {"id": format!("step-install-{}", &id[..8]), "spec_slug": "install", "status": "completed",
                  "completed_at": ago(installed_secs_ago)},
                 {"id": format!("step-delivered-{}", &id[..8]), "spec_slug": "delivered", "status": "ready"}
+                ,{"id": format!("step-scope-{}", &id[..8]), "spec_slug": "scope", "status": "completed", "completed_at": ago(installed_secs_ago)}
             ]
         });
         self.state.lock().unwrap().jobs.insert(id.into(), job);
@@ -152,6 +167,7 @@ fn serve(conn: std::net::TcpStream, state: &Mutex<State>) {
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("").to_string();
     let (mut presented, mut len) = (None::<String>, 0usize);
+    let mut actor = None;
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
@@ -161,6 +177,11 @@ fn serve(conn: std::net::TcpStream, state: &Mutex<State>) {
             let v = v.trim().to_string();
             match k.to_ascii_lowercase().as_str() {
                 "x-boss-runner-credential" => presented = Some(v),
+                "x-boss-user" => {
+                    actor = serde_json::from_str::<serde_json::Value>(&v).unwrap()["id"]
+                        .as_str()
+                        .map(str::to_string);
+                }
                 "content-length" => len = v.parse().unwrap_or(0),
                 _ => {}
             }
@@ -174,9 +195,20 @@ fn serve(conn: std::net::TcpStream, state: &Mutex<State>) {
         method: method.clone(),
         path: path.clone(),
         body,
+        actor,
+        runner_credential_presented: presented.is_some(),
     });
     let (status, text) = if path == "/api/jobs/runner-credential" {
-        if st.no_door {
+        if let Some(code) = st.whoami_status {
+            (
+                if code == 401 {
+                    "401 Unauthorized"
+                } else {
+                    "503 Unavailable"
+                },
+                "{}".to_string(),
+            )
+        } else if st.no_door {
             ("404 Not Found", "Not Found".to_string())
         } else {
             let hit = presented.and_then(|p| st.known.iter().find(|(v, _, _)| *v == p).cloned());
@@ -185,21 +217,67 @@ fn serve(conn: std::net::TcpStream, state: &Mutex<State>) {
                 match hit {
                     Some((_, host, slot)) => serde_json::json!({
                         "resolved": true, "principal": "runner:ops",
-                        "actor_id": "automation:ops-runner", "host": host, "slot": slot
+                        "actor_id": "automation:ops-runner", "host": host, "slot": slot,
+                        "delivery":st.delivery_context
                     })
                     .to_string(),
                     None => r#"{"resolved":false,"header":"x-boss-runner-credential"}"#.to_string(),
                 },
             )
         }
+    } else if method == "POST" && path == format!("/api/credentials/{CRED}/delivery") {
+        let authenticated = presented.as_ref().is_some_and(|presented| {
+            st.known
+                .iter()
+                .any(|(value, host, _)| value == presented && host == "forge")
+        });
+        if authenticated && !st.delivery_refusal {
+            let context = st.delivery_context.clone().unwrap();
+            let evidence = serde_json::json!({"purpose":"authenticated-runner-delivery",
+                "credential_id":CRED,"host":"forge","job_id":context["job_id"],
+                "attempt":ATTEMPT,"secret_uid":SECRET_UID});
+            let mut receipt = serde_json::json!({"version":1,"credential_id":CRED,
+                "phase":"verified","observation_id":format!("{ATTEMPT}:delivered"),
+                "actor":"automation:ops-runner","timestamp":ago(0),
+                "event_id":"00000000-0000-4000-8000-000000000106",
+                "evidence_json":evidence.to_string(),
+                "canonical":boss_core::job::canonical_json_bytes(&evidence)});
+            if st.malformed_delivery_receipt {
+                receipt["actor"] = serde_json::json!("forged-caller");
+            }
+            st.delivery_receipt = Some(receipt.clone());
+            ("202 Accepted", serde_json::json!({"recorded":true,
+                "kind":"credential.verified","observation":{"outcome":"recorded","receipt":receipt}}).to_string())
+        } else {
+            ("403 Forbidden", "{}".into())
+        }
+    } else if method == "GET" && path.ends_with("/version") {
+        ("200 OK", serde_json::json!({"step":{"status":"ready","assignee_id":if st.foreign_holder { Some("fake-other-holder") } else { None }},
+            "version":"fake-scoped-version"}).to_string())
+    } else if method == "POST" && path.ends_with("/complete-if") {
+        if st.completion_refusal {
+            ("409 Conflict", "{}".into())
+        } else {
+            ("200 OK", "{\"outcome\":\"completed\"}".into())
+        }
     } else if method == "GET" && path.starts_with("/api/jobs/") {
         let id = path.trim_start_matches("/api/jobs/");
-        match st.jobs.get(id) {
-            Some(j) => ("200 OK", j.to_string()),
-            None => ("404 Not Found", "{}".to_string()),
+        match (st.packet_status, st.jobs.get(id)) {
+            (Some(_), _) => ("401 Unauthorized", "{}".to_string()),
+            (_, Some(j)) => ("200 OK", j.to_string()),
+            (_, None) => ("404 Not Found", "{}".to_string()),
         }
     } else {
         ("200 OK", "{}".to_string())
+    };
+    let text = if st.empty_reply_at.as_deref() == Some(path.as_str()) {
+        if st.blank_reply {
+            " \n\t".into()
+        } else {
+            String::new()
+        }
+    } else {
+        text
     };
     drop(st);
     let mut conn = conn;
@@ -255,6 +333,9 @@ impl Case {
             ("forge.next", NEW),
             ("forge.next.minted-for", job),
         ]);
+        self.api.state.lock().unwrap().delivery_context = Some(serde_json::json!({
+            "credential_id":CRED,"job_id":job,"attempt":ATTEMPT,"secret_uid":SECRET_UID
+        }));
     }
 
     fn held(&self, value: &str) {
@@ -287,6 +368,14 @@ impl Case {
             .env("BOSS_NODE_ID", node)
             .env("BOSS_API_RETRY_DEADLINE", "0")
             .env("TMPDIR", &self.root)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.root.join("bin").display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
             .env("NO_PROXY", "127.0.0.1")
             .env("no_proxy", "127.0.0.1")
             .env_remove("http_proxy")
@@ -338,6 +427,287 @@ impl Case {
 }
 
 #[test]
+fn credential_http_refusals_are_red_with_their_status_and_no_delivery() {
+    for status in [401, 503] {
+        let c = Case::new(&format!("http-refusal-{status}"));
+        c.staged_for(JOB);
+        c.held(OLD);
+        c.api.state.lock().unwrap().whoami_status = Some(status);
+        let (rc, out) = c.run();
+        assert_eq!(rc, 1, "{out}");
+        assert!(
+            c.summary("runner_credential_action")
+                .contains(&format!("HTTP {status}")),
+            "{out}"
+        );
+        assert_eq!(c.file().as_deref(), Some(OLD));
+        assert!(c.api.writes().is_empty());
+    }
+}
+
+#[test]
+fn a_resolving_held_value_does_not_hide_unbounded_mount_lag() {
+    let c = Case::new("held-too-old");
+    c.staged_for(JOB);
+    c.held(OLD);
+    c.api.resolves(OLD, "forge", "current");
+    c.api.awaiting(JOB, 7201);
+    let (rc, out) = c.run();
+    assert_eq!(rc, 1, "{out}");
+    assert!(
+        c.summary("runner_credential_action").contains("lag bound"),
+        "{out}"
+    );
+    assert_eq!(c.file().as_deref(), Some(OLD));
+    assert!(c.api.writes().is_empty());
+}
+
+#[test]
+fn a_rotation_packet_http_refusal_is_red_and_names_its_status() {
+    let c = Case::new("packet-refused");
+    c.staged_for(JOB);
+    c.held(NEW);
+    c.api.state.lock().unwrap().packet_status = Some(401);
+    let (rc, out) = c.run();
+    assert_eq!(rc, 1, "{out}");
+    assert!(
+        c.summary("runner_credential_delivery").contains("HTTP 401"),
+        "{out}"
+    );
+    assert!(c.api.writes().is_empty());
+}
+
+#[test]
+fn packet_selection_jq_failures_always_reach_the_durable_summary() {
+    let real = Command::new("sh")
+        .args(["-c", "command -v jq"])
+        .output()
+        .unwrap();
+    assert!(real.status.success());
+    let real = String::from_utf8(real.stdout).unwrap().trim().to_string();
+    for expression in ["].id // empty", "].completed_at // empty"] {
+        let c = Case::new(&format!("jq-selection-{}", expression.len()));
+        c.staged_for(JOB);
+        c.held(NEW);
+        c.api.resolves(NEW, "forge", "next");
+        c.api.awaiting(JOB, 30);
+        std::fs::create_dir_all(c.root.join("bin")).unwrap();
+        write_exec(
+            &c.root.join("bin/jq"),
+            &format!(
+                "#!/bin/bash\nif [[ \"$*\" == *'{expression}'* ]]; then exit 7; fi\nexec '{real}' \"$@\"\n"
+            ),
+        );
+        let (rc, out) = c.run();
+        assert_eq!(rc, 1, "{out}");
+        assert!(
+            c.summary("runner_credential_delivery")
+                .contains("did not parse"),
+            "{out}"
+        );
+        assert!(c.api.writes().is_empty());
+        assert_eq!(c.file().as_deref(), Some(NEW));
+    }
+}
+
+#[test]
+fn an_existing_delivery_record_does_not_claim_unobserved_promotion() {
+    let c = Case::new("recorded-not-promoted");
+    c.staged_for(JOB);
+    c.held(NEW);
+    c.api.awaiting(JOB, 30);
+    c.api.state.lock().unwrap().jobs.get_mut(JOB).unwrap()["steps"][1]["status"] =
+        "completed".into();
+    let (rc, out) = c.run();
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains("already recorded"), "{out}");
+    assert!(!out.contains("broker promotes"), "{out}");
+    assert!(
+        c.summary("runner_credential_delivery")
+            .contains("promotion not observed"),
+        "{out}"
+    );
+    assert!(c.api.writes().is_empty());
+}
+
+#[test]
+fn a_held_value_lag_without_a_valid_past_install_has_no_grace() {
+    for timestamp in [
+        serde_json::Value::Null,
+        serde_json::json!(ago(-3600)),
+        serde_json::json!("invalid"),
+    ] {
+        let c = Case::new("held-invalid-age");
+        c.staged_for(JOB);
+        c.held(OLD);
+        c.api.resolves(OLD, "forge", "current");
+        c.api.awaiting(JOB, 30);
+        c.api.state.lock().unwrap().jobs.get_mut(JOB).unwrap()["steps"][0]["completed_at"] =
+            timestamp;
+        let (rc, out) = c.run();
+        assert_eq!(rc, 1, "{out}");
+        assert!(
+            c.summary("runner_credential_action").contains("lag bound"),
+            "{out}"
+        );
+        assert_eq!(c.file().as_deref(), Some(OLD));
+        assert!(c.api.writes().is_empty());
+    }
+}
+
+#[test]
+fn a_staged_value_before_install_completion_is_diagnosed_pending() {
+    let c = Case::new("install-not-completed");
+    c.staged_for(JOB);
+    c.api.awaiting(JOB, 30);
+    {
+        let mut state = c.api.state.lock().unwrap();
+        let job = state.jobs.get_mut(JOB).unwrap();
+        job["steps"][0]["status"] = "active".into();
+        job["steps"][0]["completed_at"] = serde_json::Value::Null;
+        job["steps"][1]["status"] = "pending".into();
+    }
+    let (rc, out) = c.run();
+    assert_eq!(rc, 0, "{out}");
+    assert!(
+        c.summary("runner_credential_action")
+            .contains("install is not completed"),
+        "{out}"
+    );
+    assert_eq!(c.file(), None);
+    assert!(c.api.writes().is_empty());
+}
+
+#[test]
+fn pending_install_without_a_known_young_scope_is_not_an_unbounded_retry() {
+    for opened in [
+        serde_json::Value::Null,
+        serde_json::json!(ago(7201)),
+        serde_json::json!(ago(-3600)),
+    ] {
+        let c = Case::new("pending-install-no-grace");
+        c.staged_for(JOB);
+        c.api.awaiting(JOB, 30);
+        {
+            let mut state = c.api.state.lock().unwrap();
+            let job = state.jobs.get_mut(JOB).unwrap();
+            job["steps"][2]["completed_at"] = opened;
+            job["steps"][0]["status"] = "active".into();
+            job["steps"][0]["completed_at"] = serde_json::Value::Null;
+            job["steps"][1]["status"] = "pending".into();
+        }
+        let (rc, out) = c.run();
+        assert_eq!(rc, 1, "{out}");
+        assert!(!c.summary("runner_credential_action").is_empty(), "{out}");
+        assert_eq!(c.file(), None);
+        assert!(c.api.writes().is_empty());
+    }
+}
+
+#[test]
+fn old_admission_with_a_newly_completed_scope_can_wait_for_install() {
+    let c = Case::new("old-admission-new-scope");
+    c.staged_for(JOB);
+    c.api.awaiting(JOB, 30);
+    {
+        let mut state = c.api.state.lock().unwrap();
+        let job = state.jobs.get_mut(JOB).unwrap();
+        job["opened_at"] = ago(86400).into();
+        job["steps"][0]["status"] = "active".into();
+        job["steps"][0]["completed_at"] = serde_json::Value::Null;
+        job["steps"][1]["status"] = "pending".into();
+    }
+    let (rc, out) = c.run();
+    assert_eq!(rc, 0, "{out}");
+    assert!(
+        c.summary("runner_credential_action")
+            .contains("install is not completed"),
+        "{out}"
+    );
+    assert_eq!(c.file(), None);
+    assert!(c.api.writes().is_empty());
+}
+
+#[test]
+fn an_installed_value_http_refusal_cannot_record_delivery() {
+    let c = Case::new("held-http-refusal");
+    c.staged_for(JOB);
+    c.held(NEW);
+    c.api.awaiting(JOB, 30);
+    c.api.state.lock().unwrap().whoami_status = Some(401);
+    let (rc, out) = c.run();
+    assert_eq!(rc, 1, "{out}");
+    assert!(
+        c.summary("runner_credential_delivery").contains("HTTP 401"),
+        "{out}"
+    );
+    assert_eq!(c.file().as_deref(), Some(NEW));
+    assert!(c.api.writes().is_empty());
+}
+
+#[test]
+fn a_delivery_body_jq_failure_is_diagnosed_without_writes() {
+    let real = Command::new("sh")
+        .args(["-c", "command -v jq"])
+        .output()
+        .unwrap();
+    assert!(real.status.success());
+    let real = String::from_utf8(real.stdout).unwrap().trim().to_string();
+    let c = Case::new("delivery-body-jq-failure");
+    c.staged_for(JOB);
+    c.held(NEW);
+    c.api.resolves(NEW, "forge", "next");
+    c.api.awaiting(JOB, 30);
+    std::fs::create_dir_all(c.root.join("bin")).unwrap();
+    write_exec(
+        &c.root.join("bin/jq"),
+        &format!(
+            "#!/bin/bash\nif [[ \"$*\" == *'secret_uid: .secret_uid'* ]]; then exit 7; fi\nexec '{real}' \"$@\"\n"
+        ),
+    );
+    let (rc, out) = c.run();
+    assert_eq!(rc, 1, "{out}");
+    assert!(
+        c.summary("runner_credential_delivery")
+            .contains("did not serialize"),
+        "{out}"
+    );
+    assert_eq!(c.file().as_deref(), Some(NEW));
+    assert!(c.api.writes().is_empty());
+}
+
+#[test]
+fn a_delivery_attempt_read_failure_is_diagnosed_without_writes() {
+    let real = Command::new("sh")
+        .args(["-c", "command -v jq"])
+        .output()
+        .unwrap();
+    assert!(real.status.success());
+    let real = String::from_utf8(real.stdout).unwrap().trim().to_string();
+    let c = Case::new("delivery-attempt-jq-failure");
+    c.staged_for(JOB);
+    c.held(NEW);
+    c.api.resolves(NEW, "forge", "next");
+    c.api.awaiting(JOB, 30);
+    std::fs::create_dir_all(c.root.join("bin")).unwrap();
+    write_exec(
+        &c.root.join("bin/jq"),
+        &format!(
+            "#!/bin/bash\nif [[ \"$*\" == *'-r .attempt'* ]]; then exit 7; fi\nexec '{real}' \"$@\"\n"
+        ),
+    );
+    let (rc, out) = c.run();
+    assert_eq!(rc, 1, "{out}");
+    assert!(
+        c.summary("runner_credential_delivery")
+            .contains("did not serialize"),
+        "{out}"
+    );
+    assert_eq!(c.file().as_deref(), Some(NEW));
+    assert!(c.api.writes().is_empty());
+}
+
+#[test]
 fn a_staged_value_the_door_resolves_is_installed_root_only_and_its_delivery_recorded() {
     let c = Case::new("staged");
     c.staged_for(JOB);
@@ -356,23 +726,39 @@ fn a_staged_value_the_door_resolves_is_installed_root_only_and_its_delivery_reco
     );
     let writes = c.api.writes();
     assert_eq!(writes.len(), 2, "{writes:?}");
-    assert_eq!(writes[0].method, "PATCH");
-    assert_eq!(
-        writes[0].path,
-        format!(
-            "/api/jobs/{JOB}/steps/step-delivered-{}/metadata",
-            &JOB[..8]
-        )
+    assert!(writes.iter().all(|request|
+        request.actor.as_deref() == Some("automation:runner-credential-deposit")),
+        "client attribution is preserved; the real server independently resolves the credential actor");
+    assert!(
+        writes
+            .iter()
+            .all(|request| request.runner_credential_presented),
+        "delivery writes present the installed host credential: {writes:?}"
     );
+    assert_eq!(writes[0].method, "POST");
+    assert_eq!(writes[0].path, format!("/api/credentials/{CRED}/delivery"));
     let body: serde_json::Value = serde_json::from_str(&writes[0].body).unwrap();
-    assert_eq!(body["delivered_last_eight"], last8(NEW));
+    assert_eq!(body["job_id"], JOB);
+    assert_eq!(body["attempt"], ATTEMPT);
+    assert_eq!(body["secret_uid"], SECRET_UID);
+    assert_eq!(writes[1].method, "POST");
+    assert!(writes[1].path.ends_with("/complete-if"));
+    let body: serde_json::Value = serde_json::from_str(&writes[1].body).unwrap();
+    assert_eq!(body["evidence"]["delivered_last_eight"], last8(NEW));
     assert_eq!(
-        body["delivered_to"],
-        format!("forge:{}", c.dest.display()),
-        "{body}"
+        body["evidence"]["delivered_to"],
+        format!("forge:{}", c.dest.display())
     );
-    assert_eq!(writes[1].method, "PUT");
-    assert!(writes[1].body.contains("completed"));
+    assert_eq!(
+        body["evidence"]["delivered_receipt"],
+        c.api
+            .state
+            .lock()
+            .unwrap()
+            .delivery_receipt
+            .clone()
+            .unwrap()
+    );
     assert!(
         c.summary("runner_credential_delivery")
             .starts_with(&format!("recorded on {}", &JOB[..8])),
@@ -520,11 +906,15 @@ fn delivery_is_recorded_on_the_packet_the_staged_value_names() {
     assert_eq!(rc, 0, "{out}");
     let writes = c.api.writes();
     assert_eq!(writes.len(), 2, "{writes:?}");
+    assert_eq!(writes[0].path, format!("/api/credentials/{CRED}/delivery"));
+    let acknowledged: serde_json::Value = serde_json::from_str(&writes[0].body).unwrap();
+    assert_eq!(
+        acknowledged["job_id"], JOB,
+        "the actual mounted generation names the packet"
+    );
     assert!(
-        writes
-            .iter()
-            .all(|w| w.path.starts_with(&format!("/api/jobs/{JOB}/"))),
-        "only the named packet: {writes:?}"
+        writes[1].path.starts_with(&format!("/api/jobs/{JOB}/")),
+        "only that named packet is conditionally completed: {writes:?}"
     );
 
     // Minted for a packet that is not awaiting delivery: nothing recorded.
@@ -667,4 +1057,82 @@ fn the_converge_deposits_the_file_the_runner_presents() {
             .any(|l| l.contains("runner_rc") && l.contains("exit")),
         "its verdict decides the converge's exit"
     );
+}
+
+#[test]
+fn delivery_owner_holder_receipt_and_completion_refusals_preserve_the_installed_file() {
+    for (case, writes, cause) in [
+        ("holder", 0, "holder refused"),
+        ("owner", 1, "HTTP 403"),
+        ("receipt", 1, "original receipt is unavailable"),
+        ("completion", 2, "conditional completion refused (HTTP 409)"),
+    ] {
+        let c = Case::new(case);
+        c.staged_for(JOB);
+        c.held(NEW);
+        c.api.resolves(NEW, "forge", "next");
+        c.api.awaiting(JOB, 30);
+        {
+            let mut state = c.api.state.lock().unwrap();
+            state.foreign_holder = case == "holder";
+            state.delivery_refusal = case == "owner";
+            state.malformed_delivery_receipt = case == "receipt";
+            state.completion_refusal = case == "completion";
+        }
+        let (rc, out) = c.run();
+        assert_eq!(rc, 1, "{case}: {out}");
+        assert!(
+            c.summary("runner_credential_delivery").contains(cause),
+            "{case}: {out}"
+        );
+        assert_eq!(c.file().as_deref(), Some(NEW));
+        assert_eq!(c.mode(), 0o600);
+        assert_eq!(c.api.writes().len(), writes, "{case}: {:?}", c.api.writes());
+        if case == "completion" {
+            assert!(
+                c.api.state.lock().unwrap().delivery_receipt.is_some(),
+                "a Jobs CAS refusal does not discard the original owner receipt"
+            );
+        }
+    }
+}
+
+#[test]
+fn silent_version_owner_and_completion_replies_never_record_delivery() {
+    for (stage, writes) in [("version", 0), ("owner", 1), ("completion", 2)] {
+        for blank in [false, true] {
+            let c = Case::new(&format!("silent-{stage}-{blank}"));
+            c.staged_for(JOB);
+            c.api.resolves(NEW, "forge", "next");
+            c.api.awaiting(JOB, 3600);
+            {
+                let mut state = c.api.state.lock().unwrap();
+                state.empty_reply_at = Some(match stage {
+                    "version" => {
+                        format!("/api/jobs/{JOB}/steps/step-delivered-{}/version", &JOB[..8])
+                    }
+                    "owner" => format!("/api/credentials/{CRED}/delivery"),
+                    _ => format!(
+                        "/api/jobs/{JOB}/steps/step-delivered-{}/complete-if",
+                        &JOB[..8]
+                    ),
+                });
+                state.blank_reply = blank;
+            }
+            let (rc, out) = c.run();
+            assert_eq!(rc, 1, "{stage}/{blank}: {out}");
+            assert_eq!(c.file().as_deref(), Some(NEW));
+            assert!(
+                c.summary("runner_credential_delivery")
+                    .starts_with("not recorded:")
+            );
+            assert_eq!(
+                c.api.writes().len(),
+                writes,
+                "{stage}/{blank}: {:?}",
+                c.api.writes()
+            );
+            assert!(!out.contains(NEW));
+        }
+    }
 }

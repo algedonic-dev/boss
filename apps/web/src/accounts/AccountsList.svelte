@@ -24,7 +24,7 @@
   import type { Asset, Job, Account, AccountOpenAr } from './types';
   import { fetchPaged, isCapped, type Paged } from '../data/paginated';
   import { ACCOUNTS_LIST_URL, fetchAccountsPage } from './api';
-  import { moduleEnabled } from '@boss/web-kit/session/manifest.svelte';
+  import { manifest, moduleEnabled } from '@boss/web-kit/session/manifest.svelte';
   import { emptyState, okRead, readStateOf, readStateOfLoad, type ReadState } from '../data/readState';
   import ListEmpty from '../data/ListEmpty.svelte';
   import { loadClasses, classesFor } from '@boss/web-kit/session/classes.svelte';
@@ -55,6 +55,7 @@
   // list, its emptiness folded into a wider view and nothing looked
   // wrong, which is why it outlived the page that shared the defect.
   const supportOn = $derived(moduleEnabled('support'));
+  const supportKnown = $derived(manifest.value.kind === 'ready');
 
   let openArPage = $state<Paged<AccountOpenAr> | null>(null);
   // What each secondary read did. Their `failed` arms were dropped on
@@ -78,8 +79,7 @@
     loading = true;
     (async () => {
       try {
-        const includeJobs = supportOn;
-        const [pPaged, dPaged, jPaged, arPaged] = await Promise.all([
+        const [pPaged, dPaged, arPaged] = await Promise.all([
           // The directory itself is enveloped since backlog 2d1d298e
           // (2026-09-23) — it was an unbounded bare array, so this list
           // could not say when it was incomplete.
@@ -89,9 +89,6 @@
           // `/api/assets/{asset_id}` → 404, so this list rendered
           // empty since the rename.
           fetchPaged<Asset>('/api/assets?limit=1000'),
-          includeJobs
-            ? fetchPaged<Job>('/api/jobs?department=support&limit=5000')
-            : Promise.resolve(null),
           // Open AR — the service's per-account sum over every invoice
           // still owed. This read was `/api/commerce/invoices?limit=10000`
           // summed here, and its comment promised an OverflowBanner that
@@ -109,10 +106,8 @@
           // side-load degrades those columns, it does not fail the
           // account list itself.
           devicesPage = dPaged.kind === 'ready' ? dPaged.page : null;
-          jobsPage = jPaged && jPaged.kind === 'ready' ? jPaged.page : null;
           openArPage = arPaged.kind === 'ready' ? arPaged.page : null;
           devicesRead = readStateOf(dPaged);
-          jobsRead = jPaged ? readStateOf(jPaged) : okRead;
           openArRead = readStateOf(arPaged);
           loading = false;
         }
@@ -126,6 +121,25 @@
     return () => {
       cancelled = true;
     };
+  });
+
+  // Support depends on the manifest; the account directory does not.
+  // A manifest transition must never repeat the three core reads.
+  $effect(() => {
+    const known = supportKnown;
+    const enabled = supportOn;
+    let cancelled = false;
+    jobsPage = null;
+    jobsRead = okRead;
+    if (known && enabled) {
+      void fetchPaged<Job>('/api/jobs?department=support&limit=5000').then((result) => {
+        if (!cancelled) {
+          jobsPage = result.kind === 'ready' ? result.page : null;
+          jobsRead = readStateOf(result);
+        }
+      });
+    }
+    return () => { cancelled = true; };
   });
 
   let rows = $derived(
@@ -240,6 +254,10 @@
         'Account count unknown — the read failed'
       : subtitleLine}
   />
+
+  {#if manifest.value.kind !== 'ready'}
+    <p role="status">Support availability unknown</p>
+  {/if}
 
   {#if isCapped(accountsPage)}
     <OverflowBanner

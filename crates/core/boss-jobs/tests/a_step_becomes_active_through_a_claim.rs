@@ -321,7 +321,7 @@ fn build_app_with_agents(
             .allow("system", Action::Update, Resource::step(), Scope::All)
             .build(),
     );
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds.seed(spec()).expect("seed the kind");
     let state = JobsApiState {
         calendar: Some(calendar.clone() as Arc<dyn CalendarClient>),
@@ -1210,10 +1210,14 @@ fn every_individual_executor_in_the_platform_bundle_is_an_automation() {
 fn only_the_claim_door_starts_a_step_and_reserves() {
     let src = include_str!("../src/http/steps.rs");
     let body_of = |name: &str| -> &str {
-        let head = format!("pub(super) async fn {name}<");
+        let head = format!("async fn {name}<");
         let start = src.find(&head).unwrap_or_else(|| panic!("no fn {name}"));
         let rest = &src[start + head.len()..];
-        let end = rest.find("\npub(super) async fn ").unwrap_or(rest.len());
+        let end = ["\npub(super) async fn ", "\nasync fn "]
+            .into_iter()
+            .filter_map(|boundary| rest.find(boundary))
+            .min()
+            .unwrap_or(rest.len());
         &rest[..end]
     };
     let claim = body_of("claim_step");
@@ -1221,17 +1225,22 @@ fn only_the_claim_door_starts_a_step_and_reserves() {
         assert!(claim.contains(call), "claim_step must call {call}");
     }
     let put = body_of("update_step");
+    assert!(
+        put.contains("update_step_with_condition("),
+        "the PUT must use the shared status-write handler"
+    );
+    let write = body_of("update_step_with_condition");
     for call in ["start_hold(", "settle_start_hold("] {
         assert!(
-            !put.contains(call),
+            !put.contains(call) && !write.contains(call),
             "update_step must not call {call}: a PUT never starts a step"
         );
     }
     assert!(
-        put.contains("calendar_hook::after_step_written("),
+        write.contains("calendar_hook::after_step_written("),
         "a PUT's skip of an Active step still releases its hold"
     );
-    for door in ["add_step", "update_step"] {
+    for door in ["add_step", "update_step", "update_step_with_condition"] {
         assert!(
             !body_of(door).contains("apply_step_transition("),
             "{door} must not reserve"

@@ -1224,7 +1224,7 @@ fn walk(doc: &Json, path: &str) -> Result<Json, String> {
 /// /it/estate page applies (estate.ts devDoorSteps). No other file is
 /// filled (round-2 review R2-6): a value read from anywhere else prints
 /// exactly as written.
-const DEV_DOOR: &str = "apps/web/src/it/estate/dev-door.json";
+const DEV_DOOR: &str = "infra/estate/dev-door.json";
 
 fn fill(rel: &str, doc: &Json, s: &str) -> Result<String, String> {
     let Json::Object(top) = doc else {

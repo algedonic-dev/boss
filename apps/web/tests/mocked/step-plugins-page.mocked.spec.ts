@@ -1,3 +1,4 @@
+import { isPageWrite } from './_smokeMocks';
 // /it/registry/step-plugins — every control the page audit counted,
 // pinned (page-audit 5ff999f8, step `test`).
 //
@@ -71,20 +72,24 @@ const ROWS = [
 async function install(page: Page, rows: unknown = ROWS): Promise<void> {
   await installSmokeMocks(page);
   await page.route(PLUGINS, (r) => json(r, rows));
+  await page.route(/\/api\/workflows$/, (r) => json(r, []));
+  await page.route(/\/api\/jobs\/step-plugins\/[^/]+\/in-flight-count$/, (r) => {
+    const kind = new URL(r.request().url()).pathname.split('/').at(-2)!;
+    return json(r, {kind, in_flight: 0});
+  });
 }
 
 /// The shell's own write: App.svelte posts one surface-open per
 /// navigation (shell/surface-opens.ts), on every route alike. It is
 /// chrome, not a control of this page, so the page's write count
 /// excludes it — and only it.
-const SHELL_WRITE = /\/api\/surface-opens$/;
 
 /// Every non-GET the page issues, from the moment it is installed.
 function watchWrites(page: Page): Request[] {
   const writes: Request[] = [];
   page.on('request', (r) => {
     const url = r.url();
-    if (url.includes('/api/') && r.method() !== 'GET' && !SHELL_WRITE.test(new URL(url).pathname)) {
+    if (url.includes('/api/') && r.method() !== 'GET' && isPageWrite(r.method(), new URL(url).pathname)) {
       writes.push(r);
     }
   });
@@ -115,7 +120,7 @@ function catalogued(path: string): string | null {
 }
 
 test.describe('/it/registry/step-plugins — the rows', () => {
-  test('groups rows by category, sorts each by kind, and renders the five columns', async ({ page }) => {
+  test('groups rows by category, sorts each by kind, and renders registry and usage columns', async ({ page }) => {
     await install(page);
     await mountPage(page, PAGE, { titleMatch: new RegExp(TITLE) });
 
@@ -130,10 +135,10 @@ test.describe('/it/registry/step-plugins — the rows', () => {
     ]);
 
     const heads = await page.locator('.catalog table').first().locator('thead th').allTextContents();
-    expect(heads.map((h) => h.trim())).toEqual(['Kind', 'Label', 'Owner', 'Version', 'Frontend bundle']);
+    expect(heads.map((h) => h.trim())).toEqual(['Kind', 'Label', 'Owner', 'Version', 'Frontend bundle', 'Active workflow steps', 'In flight (all packets)']);
 
     const row = (kind: string) => page.locator('.catalog tbody tr').filter({ hasText: kind });
-    await expect(row('sign-off').locator('td')).toHaveText(['sign-off', 'Sign off', 'system', '3', 'sign-off.js']);
+    await expect(row('sign-off').locator('td')).toHaveText(['sign-off', 'Sign off', 'system', '3', 'sign-off.js', 'None in active workflows', '0']);
     // The second Owner branch: a team that is not `platform` is named.
     await expect(row('marketing-brief').locator('td').nth(2)).toHaveText('marketing');
     // The bundle is text, not a link to /plugins/<url>.
@@ -150,7 +155,7 @@ test.describe('/it/registry/step-plugins — the rows', () => {
 });
 
 test.describe('/it/registry/step-plugins — the controls', () => {
-  test('one read, no buttons, no forms, no writes', async ({ page }) => {
+  test('one registry read plus usage reads, no buttons, no forms, no writes', async ({ page }) => {
     const writes = watchWrites(page);
     const reads: string[] = [];
     page.on('request', (r) => {
@@ -225,8 +230,9 @@ test.describe('/it/registry/step-plugins — the controls', () => {
 
 test.describe('/it/registry/step-plugins — empty and failed are never the same paint', () => {
   const EMPTY =
-    'No plugins installed yet. See infra/step-plugins/README.md for the shape; ' +
-    'seed one with POST /api/jobs/step-plugins.';
+    'No plugins installed yet. Declare a row in infra/platform/step-plugins/ and add its JavaScript bundle. ' +
+    'Land the car; boss-platform-workflow-seed publishes the row on the next start. ' +
+    'See infra/step-plugins/README.md for the shape and delivery steps.';
 
   test('an empty registry says so, with no failure line and no tables', async ({ page }) => {
     await install(page, []);
@@ -266,4 +272,70 @@ test.describe('/it/registry/step-plugins — empty and failed are never the same
     await expect(subtitle).toHaveText('Plugin count unknown — the registry read failed');
     await expect(subtitle).not.toContainText(/\d/);
   });
+});
+
+
+test('usage binds actual active workflow steps independently of native in-flight counts', async ({ page }) => {
+  await install(page);
+  await page.route(/\/api\/workflows$/, (r) => json(r, [
+    {kind: 'incident', version: 7, status: 'active', steps: [{kind: 'review-design', title: 'review-cause'}]},
+    {kind: 'approval', version: 3, status: 'active', steps: [{kind: 'sign-off', title: 'approve'}, {kind: 'sign-off', title: 'confirm'}]},
+  ]));
+  await page.route(/\/api\/jobs\/step-plugins\/[^/]+\/in-flight-count$/, (r) => {
+    const kind = new URL(r.request().url()).pathname.split('/').at(-2)!;
+    return json(r, {kind, in_flight: kind === 'sign-off' ? 23 : 0});
+  });
+  await mountPage(page, PAGE, { titleMatch: new RegExp(TITLE) });
+  const review = page.locator('.catalog tbody tr').filter({has: page.getByRole('link', {name: 'review-design', exact: true})});
+  await expect(review.getByRole('link', {name: 'incident v7 · review-cause', exact: true})).toHaveAttribute('href', '/it/registry/incident');
+  await expect(review.locator('[data-usage="in-flight"]')).toHaveText('0');
+  const signoff = page.locator('.catalog tbody tr').filter({has: page.getByRole('link', {name: 'sign-off', exact: true})});
+  await expect(signoff.locator('[data-usage="bindings"] a')).toHaveText(['approval v3 · approve', 'approval v3 · confirm']);
+  await expect(signoff.locator('[data-usage="in-flight"]')).toHaveText('23');
+  await expect(page.getByRole('columnheader', {name: 'In flight (all packets)', exact: true})).toHaveCount(3);
+});
+
+
+test('usage failure stays unknown without hiding installed plugins or a known zero', async ({page}) => {
+  await install(page);
+  await page.route(/\/api\/workflows$/, (r) => r.fulfill({status: 503, body: 'registry unavailable'}));
+  await page.route(/\/api\/jobs\/step-plugins\/sign-off\/in-flight-count$/, (r) => r.fulfill({status: 403, body: 'all-packets scope required'}));
+  await mountPage(page, PAGE, {titleMatch: new RegExp(TITLE)});
+  await expect(page.locator('.catalog tbody tr')).toHaveCount(4);
+  await expect(page.locator('[data-usage="bindings"]')).toHaveText(['Unknown', 'Unknown', 'Unknown', 'Unknown']);
+  const signoff = page.locator('.catalog tbody tr').filter({has: page.getByRole('link', {name: 'sign-off', exact: true})});
+  await expect(signoff.locator('[data-usage="in-flight"]')).toHaveText('Unknown');
+  await expect(signoff.locator('[data-usage="in-flight"] span')).toHaveAttribute('title', 'HTTP 403: all-packets scope required');
+  const review = page.locator('.catalog tbody tr').filter({has: page.getByRole('link', {name: 'review-design', exact: true})});
+  await expect(review.locator('[data-usage="in-flight"]')).toHaveText('0');
+  await expect(page.locator('header.exec-header p')).toHaveText('4 active plugins across 3 categories');
+});
+
+test('usage malformed replies remain unknown while the independent binding read stays known', async ({page}) => {
+  await install(page, [ROWS[0]!]);
+  await page.route(/\/api\/jobs\/step-plugins\/sign-off\/in-flight-count$/, (r) => json(r, {kind: 'sign-off', in_flight: '0'}));
+  await mountPage(page, PAGE, {titleMatch: new RegExp(TITLE)});
+  await expect(page.locator('[data-usage="bindings"]')).toHaveText('None in active workflows');
+  await expect(page.locator('[data-usage="in-flight"]')).toHaveText('Unknown');
+});
+
+
+test('usage loading is explicit and one slow count does not block another plugin', async ({page}) => {
+  await install(page, [ROWS[0]!, ROWS[1]!]);
+  let release: (() => void) | undefined;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  await page.route(/\/api\/workflows$/, async (r) => { await pending; await json(r, []); });
+  await page.route(/\/api\/jobs\/step-plugins\/sign-off\/in-flight-count$/, async (r) => {
+    await pending; await json(r, {kind: 'sign-off', in_flight: 8});
+  });
+  await mountPage(page, PAGE, {titleMatch: new RegExp(TITLE)});
+  const signoff = page.locator('.catalog tbody tr').filter({has: page.getByRole('link', {name: 'sign-off', exact: true})});
+  const review = page.locator('.catalog tbody tr').filter({has: page.getByRole('link', {name: 'review-design', exact: true})});
+  try {
+    await expect(signoff.locator('[data-usage="bindings"]')).toHaveText('Loading…');
+    await expect(signoff.locator('[data-usage="in-flight"]')).toHaveText('Loading…');
+    await expect(review.locator('[data-usage="in-flight"]')).toHaveText('0');
+  } finally { release?.(); }
+  await expect(signoff.locator('[data-usage="bindings"]')).toHaveText('None in active workflows');
+  await expect(signoff.locator('[data-usage="in-flight"]')).toHaveText('8');
 });

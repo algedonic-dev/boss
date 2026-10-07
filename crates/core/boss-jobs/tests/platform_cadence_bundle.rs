@@ -249,3 +249,59 @@ fn the_dock_refreshes_on_its_own_clock() {
         refresh.row.every_minutes
     );
 }
+
+/// A new declared interval keeps the existing verb and every other column;
+/// boot replay must conserve the original transition rather than publish twice.
+#[tokio::test]
+async fn reconciliation_is_versioned_to_two_minutes_without_changing_its_work() {
+    let declared = bundle()
+        .into_iter()
+        .find(|s| s.name() == "train-reconcile")
+        .unwrap();
+    assert_eq!(declared.version, 2);
+    assert_eq!(declared.row.every_minutes, Some(2));
+    let mut original = declared.clone();
+    original.version = 1;
+    original.row.every_minutes = Some(10);
+    let registry = InMemoryCadence::default();
+    let actor = boss_core::actor::ActorId::Automation("platform-workflow-seed".into());
+    let now = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
+    registry
+        .publish_declared(original.clone(), &actor, now)
+        .await
+        .unwrap();
+    boss_jobs::cadence_seed::seed_cadence_rules(
+        &registry,
+        std::slice::from_ref(&declared),
+        &actor,
+        now,
+        false,
+    )
+    .await
+    .unwrap();
+    let versions = registry.live_versions("train-reconcile").await.unwrap();
+    assert_eq!(versions.len(), 2);
+    assert_eq!(
+        versions[0].status,
+        boss_jobs::registry::WorkflowStatus::Retired
+    );
+    assert_eq!(
+        versions[1].status,
+        boss_jobs::registry::WorkflowStatus::Active
+    );
+    let served = registry.active_rules().await.unwrap();
+    let mut conserved = served[0].clone();
+    conserved.every_minutes = Some(10);
+    assert_eq!(
+        serde_json::to_value(conserved).unwrap(),
+        serde_json::to_value(original.row).unwrap()
+    );
+    let events = registry.recorded_events();
+    boss_jobs::cadence_seed::seed_cadence_rules(&registry, &[declared], &actor, now, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(registry.recorded_events()).unwrap(),
+        serde_json::to_value(events).unwrap()
+    );
+}

@@ -8,6 +8,13 @@ lib="$here/../forge/alert-lib.sh"; wd="$here/../forge/cluster-watchdog.sh"
 [[ -f "$lib" && -f "$wd" ]] || { echo "alerts-are-packets: missing $lib or $wd" >&2; exit 1; }
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 export ALERT_SPOOL="$tmp/spool" JOBS_API="http://stub"
+# No token in reach (a-lint-sources-a-header-lib-only-hermetic): the lib
+# sourced below now sources the machine token's reader, and a lint's
+# answer must not depend on what credentials its runner holds
+# (backlog 920524dc; 2710c8fc).
+export BOSS_MACHINE_TOKEN_DIR=/nonexistent/no-machine-token
+export BOSS_SOR_ENV=/nonexistent/no-sor.env
+unset BOSS_JOBS_URL BOSS_MACHINE_TOKEN_HOSTS
 # shellcheck source=/dev/null
 . "$lib"
 fail() { echo "FAIL: $*" >&2; exit 1; }

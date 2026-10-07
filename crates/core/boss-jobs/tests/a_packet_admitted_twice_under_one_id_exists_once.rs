@@ -99,7 +99,7 @@ fn rule_header() -> String {
 }
 
 fn harness() -> (axum::Router, Arc<InMemoryJobs>) {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds.seed(spec()).expect("seed the kind");
     let jobs = Arc::new(InMemoryJobs::new());
     let policy: Arc<dyn PolicyClient> = Arc::new(

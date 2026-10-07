@@ -239,6 +239,11 @@ pub fn plan(
             let (metadata, kept_keys) =
                 reproject_metadata(&row.metadata, &was.metadata, &t.metadata);
             next.metadata = metadata;
+            if row.metadata.get(crate::credential_executor::KEY).is_some()
+                && row.assignee_id != next.assignee_id
+            {
+                refused.push(format!("step `{slug}`: a re-pin is not the credentialed executor and cannot change its assignee"));
+            }
             kept.extend(kept_keys.into_iter().map(|k| format!("`{k}`")));
             // A KEY WITH ONE DECLARED WRITER (backlog 6c9183de, review
             // S1): the fields and metadata above came from the target,
@@ -519,6 +524,7 @@ mod tests {
             fields: Vec::new(),
             authority_role: None,
             claimable: None,
+            executor: None,
             audience: None,
             agent: None,
             metadata_defaults: json!({}),

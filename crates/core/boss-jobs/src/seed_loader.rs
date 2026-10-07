@@ -181,6 +181,8 @@ struct StepToml {
     /// nominating one holder. See `StepSpec::claimable`.
     #[serde(default)]
     claimable: Option<bool>,
+    #[serde(default)]
+    executor: Option<String>,
     /// Who the step is for, declared ONCE — `audience = { role = "x" }`
     /// / `{ individual = "id" }` / `{ department = "code" }` /
     /// `{ station = "name" }` (design f5ebd2e1, backlog 67a58840).
@@ -429,6 +431,7 @@ fn workflow_toml_to_spec(
                 fields: s.fields,
                 authority_role: s.authority_role.or(derived_role),
                 claimable: s.claimable,
+                executor: s.executor,
                 audience,
                 agent,
                 metadata_defaults: s.metadata_defaults,
@@ -1264,6 +1267,7 @@ terminal = { outcome = "done" }
         assert_eq!(
             specs[0].steps[1].agent,
             Some(crate::agent_spec::AgentSpec {
+                executor_provenance: Default::default(),
                 profile: "builder".into(),
                 model: "opus-5[1m]".into(),
                 budget_usd: 5.0,

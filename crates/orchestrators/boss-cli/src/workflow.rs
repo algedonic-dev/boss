@@ -227,9 +227,121 @@ fn load_spec(kind: &str, path: &std::path::Path) -> Result<Value> {
     serde_json::from_str(&raw).with_context(|| format!("{} is not JSON", path.display()))
 }
 
+/// What the tree says about holding `kind` out of the unattended drift
+/// publish, as this verb reports it (backlog 083d240e).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DriftHold {
+    /// Held: `(source, why, lifts)`, the reader's own columns.
+    Held(String, String, String),
+    /// Not held (open, or released on the record).
+    Open,
+    /// The holds could not be read, in the reader's words.
+    Unreadable(String),
+}
+
+/// The reader's relative path in a checkout — ONE reader for every
+/// consumer (`infra/gcp/publish-drift.sh` is the one a hold binds), so
+/// what this verb says about a hold is what that verb will do with it.
+const HOLDS_READER: &str = "infra/gcp/workflow-holds.py";
+
+/// Read `kind` out of `infra/gcp/workflow-holds.py`'s answer: its exit
+/// status and its tab-separated stdout (`held|released <kind> <source>
+/// <why> <lifts>`, or `problem <text>`). Pure, so the three answers are
+/// pinned without a checkout.
+pub(crate) fn drift_hold(kind: &str, reader_ok: bool, stdout: &str, stderr: &str) -> DriftHold {
+    if !reader_ok {
+        let said: Vec<&str> = stdout
+            .lines()
+            .filter_map(|l| l.strip_prefix("problem\t"))
+            .chain(stderr.lines())
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        return DriftHold::Unreadable(if said.is_empty() {
+            "the hold reader failed and said nothing".to_string()
+        } else {
+            said.join("; ")
+        });
+    }
+    stdout
+        .lines()
+        .map(|l| l.split('\t').collect::<Vec<_>>())
+        .find(|c| c.len() >= 5 && c[0] == "held" && c[1] == kind)
+        .map(|c| DriftHold::Held(c[2].to_string(), c[3].to_string(), c[4].to_string()))
+        .unwrap_or(DriftHold::Open)
+}
+
+/// The checkout whose holds describe this publish: the nearest ancestor
+/// of the spec that carries the reader and a bundle, else of the working
+/// directory — a ROLLBACK publishes an old row out of a scratch file, and
+/// is run from the checkout.
+fn holds_checkout(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let carries = |d: &std::path::Path| {
+        d.join(HOLDS_READER).is_file() && d.join("infra/platform/workflows").is_dir()
+    };
+    let from = |start: std::path::PathBuf| {
+        start
+            .ancestors()
+            .find(|d| carries(d))
+            .map(|d| d.to_path_buf())
+    };
+    path.canonicalize()
+        .ok()
+        .and_then(from)
+        .or_else(|| std::env::current_dir().ok().and_then(from))
+}
+
+/// Ask the tree whether `kind` is held out of the drift publish. `None`
+/// when no checkout is around to ask — a JSON spec published from a
+/// directory that is not a checkout — which the caller says rather than
+/// reading as "not held".
+fn read_drift_hold(kind: &str, path: &std::path::Path) -> Option<DriftHold> {
+    let repo = holds_checkout(path)?;
+    Some(
+        match std::process::Command::new("python3")
+            .arg(repo.join(HOLDS_READER))
+            .arg(&repo)
+            .output()
+        {
+            Ok(out) => drift_hold(
+                kind,
+                out.status.success(),
+                &String::from_utf8_lossy(&out.stdout),
+                &String::from_utf8_lossy(&out.stderr),
+            ),
+            Err(e) => DriftHold::Unreadable(format!("python3 did not run: {e}")),
+        },
+    )
+}
+
+/// The lines this verb prints about a hold. A hold NEVER refuses this
+/// verb: one kind, typed by an operator, is the deliberate act a hold
+/// waits for, and the same act is the rollback. What it owes the
+/// operator is the fact that the publish does not lift the hold, which
+/// is what keeps the drift publish from undoing a rollback.
+pub(crate) fn drift_hold_lines(kind: &str, hold: Option<&DriftHold>) -> Vec<String> {
+    match hold {
+        Some(DriftHold::Held(source, why, lifts)) => vec![
+            format!(
+                "boss workflow: {kind} is HELD out of the unattended drift publish ({source}): {why}"
+            ),
+            format!(
+                "boss workflow: this hand publish is the deliberate act that hold waits for, and it does not lift it — {kind} STAYS HELD (neither publish-drift nor the publish-workflow verb will publish it, before or after a rollback) until a car changes the tree; lifts: {lifts}"
+            ),
+        ],
+        Some(DriftHold::Open) => vec![],
+        Some(DriftHold::Unreadable(said)) => vec![format!(
+            "boss workflow: WARNING — the tree's drift-publish holds cannot be read ({said}); publish-drift refuses every run until a car fixes that. A hold does not bind this verb, so the publish goes on."
+        )],
+        None => vec![format!(
+            "boss workflow: whether {kind} is held out of the unattended drift publish was NOT read — no checkout carrying {HOLDS_READER} around the spec or the working directory"
+        )],
+    }
+}
+
 pub async fn publish(kind: &str, path: &std::path::Path, dry: bool) -> Result<()> {
     let http = crate::gate::machine_client()?;
     let mut spec = load_spec(kind, path)?;
+    let hold = read_drift_hold(kind, path);
 
     // The active row, for the fields a draft needs and for the
     // before/after comparison. A failed read is still "no active row"
@@ -292,6 +404,9 @@ pub async fn publish(kind: &str, path: &std::path::Path, dry: bool) -> Result<()
         "boss workflow: {kind} lints clean ({} steps)",
         want_titles.len()
     );
+    for line in drift_hold_lines(kind, hold.as_ref()) {
+        println!("{line}");
+    }
 
     if dry {
         println!("boss workflow: DRY — would create a draft and publish it");
@@ -342,6 +457,11 @@ pub async fn publish(kind: &str, path: &std::path::Path, dry: bool) -> Result<()
          reading the active row back",
         want_titles.len()
     );
+    if matches!(hold, Some(DriftHold::Held(..))) {
+        println!(
+            "boss workflow: {kind} is still held out of the unattended drift publish — this publish did not lift the hold"
+        );
+    }
     Ok(())
 }
 
@@ -349,6 +469,113 @@ pub async fn publish(kind: &str, path: &std::path::Path, dry: bool) -> Result<()
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Backlog 083d240e. A hand publish of a kind the tree holds out of
+    /// the drift publish SAYS so, and says the hold outlives it — the
+    /// sentence that tells an operator a rollback will stick. It never
+    /// refuses: the lines are advice beside a publish that goes on.
+    #[test]
+    fn a_hand_publish_of_a_held_kind_says_it_is_held_and_stays_held() {
+        let held = "held\tops-request\tdeclared in infra/platform/workflow-holds/ops-request.toml\tturns on the signer refusal\tbacklog 6c9183de\nheld\tother\tby default: step x declares executor y\tw\tl\n";
+        let hold = drift_hold("ops-request", true, held, "");
+        assert_eq!(
+            hold,
+            DriftHold::Held(
+                "declared in infra/platform/workflow-holds/ops-request.toml".into(),
+                "turns on the signer refusal".into(),
+                "backlog 6c9183de".into()
+            )
+        );
+        let said = drift_hold_lines("ops-request", Some(&hold)).join("\n");
+        for needle in [
+            "ops-request is HELD out of the unattended drift publish",
+            "turns on the signer refusal",
+            "STAYS HELD",
+            "does not lift it",
+            "backlog 6c9183de",
+        ] {
+            assert!(said.contains(needle), "expected `{needle}` in:\n{said}");
+        }
+
+        // A kind the answer does not hold, and a released one, say nothing.
+        assert_eq!(drift_hold("pr-train", true, held, ""), DriftHold::Open);
+        let released = "released\tops-request\tdeclared in x\tcontrol passed\t-\n";
+        assert_eq!(
+            drift_hold("ops-request", true, released, ""),
+            DriftHold::Open
+        );
+        assert!(drift_hold_lines("pr-train", Some(&DriftHold::Open)).is_empty());
+
+        // Unreadable holds are a warning naming the problem, never
+        // silence and never "not held"; no checkout is said as such.
+        let bad = drift_hold(
+            "ops-request",
+            false,
+            "problem\tinfra/platform/workflow-holds/ops-request.toml: `why` is required\n",
+            "",
+        );
+        let said = drift_hold_lines("ops-request", Some(&bad)).join("\n");
+        assert!(
+            said.contains("cannot be read") && said.contains("`why` is required"),
+            "{said}"
+        );
+        let said = drift_hold_lines("ops-request", None).join("\n");
+        assert!(said.contains("was NOT read"), "{said}");
+    }
+
+    /// The same question asked of the REAL reader over a planted
+    /// checkout: found from the spec's own path, and from a scratch
+    /// file's working directory never (that case says "not read").
+    #[test]
+    fn the_hold_is_read_by_the_trees_one_reader_from_the_specs_checkout() {
+        let has_tomllib = std::process::Command::new("python3")
+            .args(["-c", "import tomllib"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !has_tomllib {
+            eprintln!("skipping: the hold reader needs python3 with tomllib");
+            return;
+        }
+        let root = boss_testing::scratch_dir("workflow-publish-hold");
+        let bundle = root.join("infra/platform/workflows");
+        let holds = root.join("infra/platform/workflow-holds");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::create_dir_all(&holds).unwrap();
+        std::fs::create_dir_all(root.join("infra/gcp")).unwrap();
+        std::fs::copy(
+            boss_testing::repo_root().join(HOLDS_READER),
+            root.join(HOLDS_READER),
+        )
+        .unwrap();
+        let row = |k: &str| format!("[[workflow]]\nkind = \"{k}\"\nlabel = \"{k}\"\n");
+        boss_testing::write_file(&bundle.join("ops-request.toml"), &row("ops-request"));
+        boss_testing::write_file(&bundle.join("pr-train.toml"), &row("pr-train"));
+        boss_testing::write_file(
+            &holds.join("ops-request.toml"),
+            "drift_publish = \"held\"\nwhy = 'This row turns on the signer refusal on the approve path.'\nlifts = 'backlog 6c9183de'\n",
+        );
+        match read_drift_hold("ops-request", &bundle.join("ops-request.toml")) {
+            Some(DriftHold::Held(source, why, lifts)) => {
+                assert!(
+                    source.contains("workflow-holds/ops-request.toml"),
+                    "{source}"
+                );
+                assert!(why.contains("signer refusal"), "{why}");
+                assert_eq!(lifts, "backlog 6c9183de");
+            }
+            other => panic!("expected the declared hold, got {other:?}"),
+        }
+        assert_eq!(
+            read_drift_hold("pr-train", &bundle.join("pr-train.toml")),
+            Some(DriftHold::Open)
+        );
+        // A hold that cannot be read is said, not swallowed.
+        boss_testing::write_file(&holds.join("pr-train.toml"), "drift_publish = \"held\"\n");
+        assert!(matches!(
+            read_drift_hold("pr-train", &bundle.join("pr-train.toml")),
+            Some(DriftHold::Unreadable(_))
+        ));
+    }
 
     /// Backlog f2eac973, the CLI neighbour. `GET` and `PUT
     /// /api/workflows/{kind}` answer a BARE `WorkflowSpec` (boss-jobs

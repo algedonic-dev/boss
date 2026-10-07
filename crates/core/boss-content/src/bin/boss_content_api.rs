@@ -90,12 +90,48 @@ async fn main() -> Result<()> {
         )))
     });
 
+    let policy: Arc<dyn boss_policy_client::PolicyClient> = if cfg.files.is_some() {
+        files_policy(cfg.policy_api_url.as_deref())
+    } else {
+        Arc::new(boss_policy_client::PermissivePolicyClient)
+    };
+    let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+        boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+        Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+    ));
+    let mode = Arc::new(boss_policy_client::role_reader::MountedReportMode::mount());
+    let source = Arc::new(boss_policy_client::role_reader::HttpRoleReader::new(
+        std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
+        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
+        boss_policy_client::User::service("content"),
+    )?);
+    let wiring = content_role_wiring(
+        policy,
+        Arc::new(boss_policy_client::ReqwestPolicyClient::new(
+            "content",
+            cfg.policy_api_url.clone().unwrap_or_else(|| {
+                std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy"))
+            }),
+        )),
+        roles.clone(),
+        mode.clone(),
+        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
+            boss_policy_client::role_service::REPORT_CAPACITY,
+        )),
+    );
+    let repo: Arc<dyn ContentRepository> = Arc::new(
+        PgContent::new(pool.clone()).with_audience_observer(Arc::new(
+            boss_content::role_reports::RoleAudienceObserver::new(wiring.guards.clone()),
+        )),
+    );
+    let policy = wiring.policy;
+
     let state = ContentApiState {
         repo: repo.clone(),
         publisher: publisher.clone(),
         clock: clock.clone(),
     };
-    let mut app = content_router(state);
+    let mut app = content_router(state).merge(wiring.inventory);
 
     // File-references surface — mounted only when the config wires
     // a bucket. Keeps the binary boot path simple for deployments
@@ -105,7 +141,7 @@ async fn main() -> Result<()> {
     // message instead of a generic 404 (which reads as broken).
     if let Some(files_cfg) = &cfg.files {
         let files_app = build_files_router(
-            &cfg,
+            policy,
             files_cfg,
             pool.clone(),
             publisher.clone(),
@@ -141,7 +177,16 @@ async fn main() -> Result<()> {
         &["/api/content/health"],
         Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
     );
-    axum::serve(listener, app).await?;
+    boss_policy_client::role_service::serve_with_refresh(
+        listener,
+        app,
+        roles,
+        source,
+        mode,
+        boss_policy_client::role_service::REFRESH_CADENCE,
+        boss_policy_client::role_service::shutdown_signal(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -190,8 +235,55 @@ async fn drain(mut body: axum::body::Body) {
     {}
 }
 
+fn content_role_wiring(
+    files_policy: Arc<dyn boss_policy_client::PolicyClient>,
+    report_authorizer: Arc<dyn boss_policy_client::PolicyClient>,
+    roles: Arc<boss_policy_client::role_reader::SnapshotRoleReader>,
+    mode: Arc<dyn boss_policy_client::role_reporting::ReportModeSource>,
+    tally: Arc<boss_policy_client::role_reporting::ReportTally>,
+) -> boss_policy_client::role_service::RoleReportWiring {
+    let wiring = boss_policy_client::role_service::assemble(
+        "content",
+        "/api/content/actor-role-reports",
+        files_policy,
+        roles.clone(),
+        mode.clone(),
+        tally.clone(),
+    );
+    // The optional file client preserves its existing permissive fallback.
+    // Inventory always asks its own enforcing, undecorated authorizer.
+    boss_policy_client::role_service::RoleReportWiring {
+        inventory: boss_policy_client::role_inventory::router(
+            "content",
+            "/api/content/actor-role-reports",
+            report_authorizer,
+            roles,
+            mode,
+            tally,
+        ),
+        ..wiring
+    }
+}
+
+fn files_policy(url: Option<&str>) -> Arc<dyn boss_policy_client::PolicyClient> {
+    match url {
+        Some(url) => Arc::new(boss_policy_client::ReqwestPolicyClient::new(
+            "content",
+            url.to_owned(),
+        )),
+        None => {
+            tracing::warn!(
+                "no policy_api_url configured — file-references operate without policy enforcement \
+                 (gateway cookie auth only). Set policy_api_url in /etc/boss-content-api.toml \
+                 to gate uploads/downloads by role."
+            );
+            Arc::new(boss_policy_client::PermissivePolicyClient)
+        }
+    }
+}
+
 async fn build_files_router(
-    cfg: &ContentApiConfig,
+    policy: Arc<dyn boss_policy_client::PolicyClient>,
     files_cfg: &boss_content::config::FilesConfig,
     pool: sqlx::PgPool,
     publisher: Option<boss_core::publisher::DomainPublisher>,
@@ -210,21 +302,6 @@ async fn build_files_router(
             .with_context(|| format!("opening file storage root {}", files_cfg.root.display()))?,
     );
 
-    let policy: Arc<dyn boss_policy_client::PolicyClient> = match &cfg.policy_api_url {
-        Some(url) => Arc::new(boss_policy_client::ReqwestPolicyClient::new(
-            "content",
-            url.clone(),
-        )),
-        None => {
-            tracing::warn!(
-                "no policy_api_url configured — file-references operate without policy enforcement \
-                 (gateway cookie auth only). Set policy_api_url in /etc/boss-content-api.toml \
-                 to gate uploads/downloads by role."
-            );
-            Arc::new(boss_policy_client::PermissivePolicyClient)
-        }
-    };
-
     let state = FilesApiState {
         repo,
         storage,
@@ -241,6 +318,103 @@ async fn build_files_router(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn optional_file_policy_cannot_authorize_the_role_inventory() {
+        use boss_policy_client::{Action, FakePolicyClient, Resource, Scope, User};
+        use tower::ServiceExt;
+        let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+            boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+            Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+        ));
+        let tally = Arc::new(boss_policy_client::role_reporting::ReportTally::new(8));
+        let report_authorizer = Arc::new(
+            FakePolicyClient::builder()
+                .allow(
+                    "report-reader",
+                    Action::Read,
+                    Resource::policy_rule(),
+                    Scope::All,
+                )
+                .build(),
+        );
+        let wiring = content_role_wiring(
+            files_policy(None),
+            report_authorizer,
+            roles,
+            Arc::new(boss_policy_client::role_reporting::ReportMode::Report),
+            tally,
+        );
+        assert!(
+            wiring
+                .policy
+                .check(
+                    &User::service("file-reader"),
+                    Action::Read,
+                    Resource::class()
+                )
+                .await
+                .unwrap()
+                .is_allowed()
+        );
+        let denied = wiring
+            .inventory
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/content/actor-role-reports")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let mut user = User::service("report-reader");
+        user.role = "report-reader".into();
+        let allowed = wiring
+            .inventory
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/content/actor-role-reports")
+                    .header("x-boss-user", serde_json::to_string(&user).unwrap())
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn optional_files_policy_preserves_configured_outage_and_unconfigured_allow() {
+        use boss_policy_client::{Action, PolicyClientError, Resource, User};
+        let user = User::service("content-fixture");
+        assert!(
+            files_policy(None)
+                .check(&user, Action::Read, Resource::class())
+                .await
+                .unwrap()
+                .is_allowed()
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/api/policy/check",
+            axum::routing::post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let result = files_policy(Some(&url))
+            .check(&user, Action::Read, Resource::class())
+            .await;
+        assert!(
+            matches!(result, Err(PolicyClientError::Unreachable(_))),
+            "configured policy outage must not become permissive: {result:?}"
+        );
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
 
     /// Backlog 1fe351e8 (found by the builder of cef615f6, 2026-09-23):
     /// the switched-off store answered before reading the upload, so a

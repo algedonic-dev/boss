@@ -44,6 +44,28 @@ async fn main() -> Result<()> {
             boss_policy_client::ReqwestPolicyClient::new("views", cli.policy_url),
         ));
 
+    let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+        boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+        Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+    ));
+    let mode = Arc::new(boss_policy_client::role_reader::MountedReportMode::mount());
+    let source = Arc::new(boss_policy_client::role_reader::HttpRoleReader::new(
+        std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
+        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
+        boss_policy_client::User::service("views"),
+    )?);
+    let wiring = boss_policy_client::role_service::assemble(
+        "views",
+        "/api/views/actor-role-reports",
+        policy,
+        roles.clone(),
+        mode.clone(),
+        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
+            boss_policy_client::role_service::REPORT_CAPACITY,
+        )),
+    );
+    let policy = wiring.policy;
+
     let app = boss_views::http::router(boss_views::http::ViewsApiState {
         repo: Arc::new(boss_views::PgViewsRepo::new(pool.clone())),
         // The OS map reads `event_facts` through the same adapter.
@@ -57,7 +79,8 @@ async fn main() -> Result<()> {
         // Stage durations read audit_log wall time (crate::stages).
         stages: Some(Arc::new(boss_views::PgViewsRepo::new(pool.clone()))),
         resolver: Arc::new(boss_views::PgViewResolver::new(pool.clone(), policy)),
-    });
+    })
+    .merge(wiring.inventory);
     let addr = format!("127.0.0.1:{}", cli.http_port);
     tracing::info!(addr = %addr, "boss-views-api listening");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -67,6 +90,15 @@ async fn main() -> Result<()> {
         &["/api/views/health"],
         Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
     );
-    axum::serve(listener, app).await?;
+    boss_policy_client::role_service::serve_with_refresh(
+        listener,
+        app,
+        roles,
+        source,
+        mode,
+        boss_policy_client::role_service::REFRESH_CADENCE,
+        boss_policy_client::role_service::shutdown_signal(),
+    )
+    .await?;
     Ok(())
 }

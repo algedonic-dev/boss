@@ -17,6 +17,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"] }
 
+boss-policy-client = { path = "../../core/boss-policy-client" }
 boss-core = { path = "../../core/boss-core" }
 # The machine gate states its facts through the outbox (design 21946380).
 boss-events = { path = "../../core/boss-events", default-features = false, features = ["postgres"] }
@@ -27,3 +28,7 @@ boss-ports = { path = "../../core/boss-ports" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tower = { workspace = true }
+serde_json = { workspace = true }

@@ -37,9 +37,18 @@ pub(super) async fn sim_clock_state_from_clock(
 /// covers "logged-in only" without an operator allowlist (roles are
 /// tenant-extensible Classes). `Some(403)` short-circuits the handler;
 /// `None` allows it.
-fn operator_guard(user: &CurrentUser) -> Option<Response> {
-    let role = user.0.role.as_str();
-    if boss_core::roles::is_read_only_floor(role) || role == "guest" {
+fn operator_guard(
+    user: &CurrentUser,
+    report: Option<&boss_policy_client::role_guard::RoleGuardReporter>,
+) -> Option<Response> {
+    let predicate = |caller: &boss_policy_client::User| {
+        !boss_core::roles::is_read_only_floor(&caller.role) && caller.role != "guest"
+    };
+    let allowed = match report {
+        Some(report) => report.evaluate("sim-clock-control", "admission", &user.0, predicate),
+        None => predicate(&user.0),
+    };
+    if !allowed {
         return Some(
             (
                 StatusCode::FORBIDDEN,
@@ -62,7 +71,7 @@ pub(super) async fn sim_clock_pause<R: JobsRepository + 'static, B: EventBus + '
     State(state): State<Arc<JobsApiState<R, B>>>,
     user: CurrentUser,
 ) -> Response {
-    if let Some(resp) = operator_guard(&user) {
+    if let Some(resp) = operator_guard(&user, state.role_guards.as_deref()) {
         return resp;
     }
     set_sim_clock_paused(&state, true).await
@@ -72,7 +81,7 @@ pub(super) async fn sim_clock_resume<R: JobsRepository + 'static, B: EventBus + 
     State(state): State<Arc<JobsApiState<R, B>>>,
     user: CurrentUser,
 ) -> Response {
-    if let Some(resp) = operator_guard(&user) {
+    if let Some(resp) = operator_guard(&user, state.role_guards.as_deref()) {
         return resp;
     }
     set_sim_clock_paused(&state, false).await
@@ -171,7 +180,7 @@ pub(super) async fn sim_clock_restart_epoch<R: JobsRepository + 'static, B: Even
     State(state): State<Arc<JobsApiState<R, B>>>,
     user: CurrentUser,
 ) -> Response {
-    if let Some(resp) = operator_guard(&user) {
+    if let Some(resp) = operator_guard(&user, state.role_guards.as_deref()) {
         return resp;
     }
     if let Err(e) = state.jobs.restart_sim_clock_epoch().await {
@@ -211,20 +220,20 @@ mod tests {
             .into_iter()
             .chain(["guest"])
         {
-            let refused = operator_guard(&as_role(role));
+            let refused = operator_guard(&as_role(role), None);
             assert_eq!(
                 refused.map(|r| r.status()),
                 Some(StatusCode::FORBIDDEN),
                 "{role} must not drive the sim clock"
             );
         }
-        assert!(operator_guard(&as_role(boss_core::roles::VISITOR_ROLE)).is_some());
+        assert!(operator_guard(&as_role(boss_core::roles::VISITOR_ROLE), None).is_some());
     }
 
     #[test]
     fn a_signed_in_operator_passes() {
         for role in ["platform-admin", "service-tech"] {
-            assert!(operator_guard(&as_role(role)).is_none(), "{role}");
+            assert!(operator_guard(&as_role(role), None).is_none(), "{role}");
         }
     }
 }

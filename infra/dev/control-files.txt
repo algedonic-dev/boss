@@ -1,0 +1,18 @@
+# Reviewed source closure for the published dev control artifact.
+infra/dev/dev-build.py
+infra/dev/dev-lifecycle.py
+infra/dev/control-artifact.py
+infra/dev/activate-control.py
+infra/dev/control-tools.py
+infra/dev/control-files.txt
+infra/dev/control-contract.txt
+infra/dev/boss-api
+infra/dev/door-freshness.sh
+infra/dev/sor-url
+infra/dev/sor-read-url
+infra/dev/sor-read-ports.env
+infra/dev/machine-token-dir
+infra/forge/probe-bin/sor-routes.sh
+infra/forge/sor-ports.env
+infra/lib/secret-header.sh
+infra/lib/curl-through-a-roll.sh

@@ -129,7 +129,7 @@ async fn app_with(
     experiments: Vec<Job>,
     registry_rows: Vec<WorkflowSpec>,
 ) -> (axum::Router, Arc<InMemoryJobs>) {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     for row in registry_rows {
         kinds.seed(row).unwrap();
     }

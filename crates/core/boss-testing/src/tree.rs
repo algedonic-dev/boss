@@ -122,8 +122,9 @@ pub fn copy_lint_libs(fixture: &Path) {
 }
 
 /// Copy `infra/gate.sh` into a fixture tree at `<fixture>/infra/`,
-/// together with every file it sources — derived from the gate's own
-/// source lines, transitively, rather than enumerated here.
+/// together with every file it sources or invokes through Python —
+/// derived from the gate's own literal paths, transitively, rather than
+/// enumerated here.
 ///
 /// One definition of "what a copied gate needs beside it", and the
 /// same lesson as [`copy_lint_libs`] one layer up (CLAUDE.md §9a).
@@ -133,7 +134,8 @@ pub fn copy_lint_libs(fixture: &Path) {
 /// them at once — the copied gate ran, failed to source, refused, and
 /// the refusal read as a verdict about the fixture. gate.sh is the
 /// definition, so a helper it sources tomorrow is carried without
-/// this function changing.
+/// this function changing. Literal Python helpers are carried too: an
+/// invoked collector is a dependency just as a sourced shell helper is.
 pub fn copy_gate_sh(fixture: &Path) {
     // gate.sh `cd`s to its own repo root before sourcing anything, so
     // every source line names a repo-relative path and the fixture
@@ -159,7 +161,14 @@ pub fn copy_gate_sh(fixture: &Path) {
             // and a source of a VARIABLE path cannot be resolved from
             // the text — the gate has none, and one added later would
             // announce itself by failing here rather than silently.
-            if let Some(rest) = line.trim_start().strip_prefix(". ") {
+            // The runtime collector is invoked rather than sourced.
+            // Read its literal path from the command itself; a second
+            // roster of helper names would drift from the real gate.
+            let command = line.trim_start();
+            if let Some(rest) = command
+                .strip_prefix(". ")
+                .or_else(|| command.strip_prefix("python3 "))
+            {
                 let sourced = rest.split_whitespace().next().unwrap_or_default();
                 if sourced.starts_with("infra/") {
                     pending.push(sourced.to_string());

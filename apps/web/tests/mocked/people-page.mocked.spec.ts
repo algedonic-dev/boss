@@ -1,3 +1,4 @@
+import { isPageWrite } from './_smokeMocks';
 // /ux/people — "Employees" (people), every control and render state
 // pinned as the page behaves TODAY (page audit 0c0265a3, step `test`).
 //
@@ -123,7 +124,6 @@ async function install(page: Page, roster: unknown): Promise<void> {
 
 /// The shell's own non-GET: App.svelte records every route open
 /// (shell/surface-opens.ts). It is the chrome's write, not this page's.
-const SHELL_WRITES: ReadonlySet<string> = new Set(['/api/surface-opens']);
 
 function watch(page: Page): { reads: string[]; writes: Request[] } {
   const seen = { reads: [] as string[], writes: [] as Request[] };
@@ -131,7 +131,7 @@ function watch(page: Page): { reads: string[]; writes: Request[] } {
     const url = new URL(req.url());
     if (!url.pathname.startsWith('/api/')) return;
     if (req.method() !== 'GET') {
-      if (!SHELL_WRITES.has(url.pathname)) seen.writes.push(req);
+      if (isPageWrite(req.method(), url.pathname)) seen.writes.push(req);
       return;
     }
     if (url.pathname === '/api/people') seen.reads.push(url.pathname);

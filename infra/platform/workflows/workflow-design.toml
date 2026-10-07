@@ -63,7 +63,10 @@ terminal = { outcome = "published" }
 # read, since this kind has no surface of its own and the step page
 # builds its form from the declared fields (backlog a14f04b3;
 # tests/a_step_declares_what_its_kind_requires.rs).
-fields = [{ name = "workflow_spec", field_type = "object", required = true }]
+fields = [
+  { name = "workflow_spec", field_type = "object", required = true },
+  { name = "insert_if_absent", field_type = "boolean", required = false },
+]
 
 [[workflow.step]]
 title = "not-published"

@@ -168,6 +168,101 @@ fn the_reader_sends_the_runners_read_scoped_header_on_a_get() {
     );
 }
 
+/// The reader must use the per-probe socket rather than quietly fall
+/// back to the LAN. The parent owns credential stamping (d26515c5).
+#[test]
+fn a_recorded_reader_uses_its_temporary_door_without_forwarding_identity() {
+    let dir = scratch("temporary-door-path");
+    let socket = dir.join("reader.sock");
+    let socket_text = socket.to_str().unwrap();
+    let (rc, stdout, stderr, argv) = run_reader(
+        "temporary-door",
+        &["/api/yard/status"],
+        &[
+            ("BOSS_JOBS_URL", "http://sor.invalid:7900"),
+            ("BOSS_SOR_DOOR", socket_text),
+            ("BOSS_SOR_USER", "caller-supplied-identity"),
+        ],
+    );
+    assert_eq!(rc, 0, "{stderr}");
+    assert!(stdout.contains("STUB_BODY"));
+    let args: Vec<_> = argv.lines().collect();
+    assert!(
+        args.windows(2).any(|a| a == ["--unix-socket", socket_text]),
+        "the reader bypassed its parent-owned door: {argv}"
+    );
+    assert!(args.contains(&"http://sor.invalid:7900/api/yard/status"));
+    assert!(
+        !argv.contains("x-boss-user"),
+        "identity belongs to the door"
+    );
+    assert!(!argv.contains("x-boss-machine-token"));
+}
+
+/// A DOOR THAT FAILS IS A FAILED READ — never a second try on the LAN.
+/// The door carries the reader's identity; a fallback would send the
+/// same read out with `BOSS_SOR_USER` alone, which a reporting gate
+/// answers and an enforcing one refuses, so the probe would read one
+/// world or another depending on a socket (review 0bd6a9c2). `curl` is
+/// called once, through the socket, and its failure is the reader's.
+#[test]
+fn a_failed_door_read_is_never_retried_without_the_door() {
+    let dir = scratch("temporary-door-fails");
+    let bin = dir.join("bin");
+    boss_testing::create_dir(&bin);
+    let calls = dir.join("curl-calls");
+    boss_testing::write_exec(
+        &bin.join("curl"),
+        &format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> '{}'\n\
+             case \" $* \" in *' --unix-socket '*) exit 7 ;; esac\n\
+             printf 'LAN_BODY\\n'\n",
+            calls.display()
+        ),
+    );
+    let socket = dir.join("reader.sock");
+    let out = Command::new(reader_path())
+        .arg("/api/yard/status")
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("BOSS_JOBS_URL", "http://sor.invalid:7900")
+        .env("BOSS_SOR_DOOR", &socket)
+        .env("BOSS_SOR_USER", "caller-supplied-identity")
+        .current_dir(&dir)
+        .output()
+        .expect("the reader runs");
+    assert_eq!(out.status.code(), Some(7), "{out:?}");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("LAN_BODY"),
+        "the reader answered from the LAN after its door failed"
+    );
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    assert_eq!(calls.lines().count(), 1, "{calls}");
+    assert!(calls.contains("--unix-socket"), "{calls}");
+}
+
+#[test]
+fn the_temporary_door_supplies_identity_and_preserves_service_routing() {
+    let dir = scratch("temporary-door-routed-path");
+    let socket = dir.join("reader.sock");
+    let socket_text = socket.to_str().unwrap();
+    let (rc, stdout, stderr, argv) = run_reader(
+        "temporary-door-routed",
+        &["/api/classes"],
+        &[
+            ("BOSS_JOBS_URL", "http://sor.invalid:7900"),
+            ("BOSS_SOR_DOOR", socket_text),
+            ("BOSS_SOR_USER", ""),
+            ("BOSS_SOR_PORTS", "jobs=7900 classes=7600"),
+        ],
+    );
+    assert_eq!(rc, 0, "{stderr}");
+    assert!(stdout.contains("STUB_BODY"));
+    assert!(argv.contains("--unix-socket"));
+    assert!(argv.contains(socket_text));
+    assert!(argv.contains("http://sor.invalid:7600/api/classes"));
+    assert!(!argv.contains("x-boss-user"));
+}
+
 /// AND IT REFUSES RATHER THAN READING UNIDENTIFIED. With no actor in
 /// the env the reader must stop — never fall back to a bare read, which
 /// is the false-absence shape this whole block is about. `curl` must not

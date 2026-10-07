@@ -62,11 +62,9 @@ describe('moduleOn — a module is on only when the tenant lists it true', () =>
     expect(moduleOn(readyFrom({}), 'shop')).toBe(false);
   });
 
-  test('a manifest that is still loading or unreachable hides nothing', () => {
-    // A deployment fault, not a tenant decision: blanking the shell
-    // would hide the fault rather than show it.
-    expect(moduleOn({ kind: 'loading' }, 'shop')).toBe(true);
-    expect(moduleOn({ kind: 'error' }, 'shop')).toBe(true);
+  test('an unread manifest cannot authorize a gated module', () => {
+    expect(moduleOn({ kind: 'loading' }, 'shop')).toBe(false);
+    expect(moduleOn({ kind: 'error' }, 'shop')).toBe(false);
   });
 });
 

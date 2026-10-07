@@ -613,6 +613,103 @@ fn refuses_an_object_the_tree_declares() {
     );
 }
 
+/// THE OBJECT THE CONVERGE RENDERS PER INSTANCE IS NOT DELETABLE (backlog
+/// cb0c9937). `ConfigMap/<instance ns>/boss-instance-config` is generated
+/// by infra/estate/render-dev-door-config.sh and mounted by the boss pod;
+/// no manifest declares it. From train #916 until this test the derivation
+/// had no entry for it, so `--check` named it UNDECLARED — and this verb,
+/// whose authority is that answer, would have deleted a live mount of the
+/// operating instance on request (ConfigMap is inside its kind floor). The
+/// derivation now derives the exemption from the renderer and the instance
+/// list; this holds the verb to it, with the two controls that keep the
+/// exemption from being wider than the renderer: another name in the same
+/// namespace still deletes, and a renderer whose object cannot be read is
+/// CANNOT ANSWER, never "no exemption".
+#[test]
+fn refuses_the_object_the_converge_renders_per_instance() {
+    const RENDERER_REL: &str = "infra/estate/render-dev-door-config.sh";
+    let renderer = std::fs::read_to_string(repo_root().join(RENDERER_REL)).expect("the renderer");
+    // The name, read off the shipped renderer's own line — not typed here.
+    let name = renderer
+        .lines()
+        .find_map(|l| l.strip_prefix("RENDERS=\"ConfigMap/"))
+        .and_then(|l| l.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("{RENDERER_REL} names no `RENDERS=\"ConfigMap/<name>\"`"))
+        .to_string();
+    let target = format!("ConfigMap/boss/{name}");
+
+    let build = |case: &str, renderer_body: &str| {
+        let c = Case::new(
+            case,
+            &[
+                ("ConfigMap", "boss", &name, ""),
+                ("ConfigMap", "boss", "hand-made", ""),
+            ],
+        );
+        write_file(
+            &c.tree.join("infra/cluster/instances.toml"),
+            "source = \"prod\"\n\n[prod]\nnamespace = \"boss\"\ntenant_dir = \"examples/brewery\"\nsim = false\nhostname = \"h.example\"\nguest = false\n",
+        );
+        std::fs::create_dir_all(c.tree.join("infra/estate")).unwrap();
+        write_file(&c.tree.join(RENDERER_REL), renderer_body);
+        git(&c.tree, &["add", "-A"]);
+        git(
+            &c.tree,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "the renderer",
+            ],
+        );
+        c
+    };
+
+    let c = build("rendered-instance-config", &renderer);
+    for args in [vec![target.as_str()], vec![target.as_str(), "--dry-run"]] {
+        let (rc, out) = c.run(&args);
+        assert_eq!(
+            rc, 2,
+            "the verb did not REFUSE the object the converge renders ({args:?}):\n{out}"
+        );
+        contains_all(&out, &["REFUSED", &target, "EXEMPT"], "the rendered object");
+    }
+    assert_eq!(
+        c.deletions(),
+        "",
+        "the rendered ConfigMap was deleted:\n{}",
+        c.deletions()
+    );
+    // The control: the exemption is one name, not the kind.
+    let (rc, out) = c.run(&["ConfigMap/boss/hand-made"]);
+    assert_eq!(
+        rc, 0,
+        "a hand-made ConfigMap of another name is still an orphan:\n{out}"
+    );
+    assert_eq!(c.deletions().trim(), "ConfigMap\tboss\thand-made", "{out}");
+
+    // A renderer whose line cannot be read: nothing is decided, nothing
+    // deleted — not even the genuine orphan beside it.
+    let c = build(
+        "rendered-instance-config-unreadable",
+        &renderer.replace("\nRENDERS=", "\nOBJECT="),
+    );
+    for t in [target.as_str(), "ConfigMap/boss/hand-made"] {
+        let (rc, out) = c.run(&[t]);
+        assert_eq!(
+            rc, 1,
+            "the verb answered {t} from an exemption set it could not derive:\n{out}"
+        );
+        contains_all(
+            &out,
+            &["CANNOT ANSWER", RENDERER_REL],
+            "the unreadable case",
+        );
+    }
+    assert_eq!(c.deletions(), "", "something was deleted");
+}
+
 /// An object that is not there. "Not found" is not "orphaned", and the
 /// refusal says so rather than exiting 0 on a no-op.
 #[test]

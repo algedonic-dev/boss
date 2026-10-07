@@ -18,7 +18,7 @@
   import { onMount } from 'svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
-  import { moduleEnabled } from '@boss/web-kit/session/manifest.svelte';
+  import { manifest, moduleEnabled } from '@boss/web-kit/session/manifest.svelte';
   import { departmentRoster } from '@boss/web-kit/session/departments.svelte';
   import { href } from '../../router';
   import type { Remote } from '../../data/remote';
@@ -106,7 +106,7 @@
   /** "module off on this instance" is the manifest's word, not the row's
    *  (backlog 92ea2e00): the row says which module, the tenant manifest
    *  says whether this instance runs it. */
-  const moduleOff = (m: string): boolean => !moduleEnabled(m);
+  const moduleOff = (m: string): boolean => manifest.value.kind === 'ready' && !moduleEnabled(m);
 
   function fmtVal(v: unknown): string {
     if (v === null || v === undefined) return '';

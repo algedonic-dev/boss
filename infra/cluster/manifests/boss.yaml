@@ -243,7 +243,8 @@ spec:
 # REFUSED in this mode. `enforce` is row C of decision b08725c2, its
 # own car, after a 72-hour clean window, on a Pacific-hours train;
 # crates/core/boss-testing/tests/the_machine_gate_reports_and_refuses_nothing.rs
-# refuses `enforce` anywhere under this directory until then.
+# refuses `enforce` for THIS key anywhere under this directory until
+# then — the policy check's flip below did not carry it.
 #
 # Rendered per instance, so the playground reports too. It holds no
 # token (the broker writes only boss and boss-dev), so every request it
@@ -252,26 +253,54 @@ spec:
 # THE POLICY CHECK'S MODE, the second key (F7 of backlog b8e75382, row
 # D of design b08725c2; boss_policy::check_mode). The same reader, the
 # same five-second re-read, at /etc/boss/machine-gate/policy-check.
-# `report`: every POST /api/policy/check is ANSWERED as before; one that
-# arrives unsigned, or signed by a service whose Read on policy-rule has
-# lapsed, is tallied and warned, and served at
-# /api/policy/check/refusals (recording_since, clean_since, and each
-# row's last_seen) to a holder of Read on policy-rule. The hourly
-# policy-check-refusals-are-read-hourly rule reads that tally and files
-# an alarm for a lapsed service grant. NOTHING IS REFUSED in this mode.
-# `enforce` is row D's own car, after G1 (47aed706 car 3) and C, on a
-# clean window read from clean_since; the pin named above refuses
-# `enforce` for this key too until then.
 #
-# THE ROLLBACK ROAD, for the car that flips it (it passes neither the
-# jobs API nor the forge nor the conductor, because a misfire of D
-# refuses every signed-in write): set the word back to `report` over the
-# LAN kube road, with David's admin kubeconfig —
+# `enforce`, since row D's car. A POST /api/policy/check that arrives
+# with no x-boss-user, or signed by a service's automation: id whose
+# Read on policy-rule has lapsed, is REFUSED 403, naming this mode and
+# the file that turns it back, and is still tallied at
+# /api/policy/check/refusals. Everything else is answered as before: a
+# session about itself, a holder of Read on policy-rule about anyone, a
+# service holding its grant, an unsigned check about the identity-less
+# caller itself. The hourly policy-check-refusals-are-read-hourly rule
+# still reads the tally: a row there is now a refusal, not a would-be.
+#
+# WHAT IT DOES NOT BOUND, until row C (the machine gate's `mode` above)
+# enforces: the service arm takes the caller's WORD for its id. A caller
+# on the LAN door that sends x-boss-user {"id":"automation:anything",
+# "role":"platform-admin"} is answered about anyone, exactly as before
+# this flip. This key closes the caller with NO identity; the machine
+# token is what proves a claimed one.
+#
+# WHAT A MISFIRE COSTS. A refused check is read by the asking service
+# as policy-unreachable, so every door of THAT service that asks policy
+# answers 503 — reads and writes, the operator's included — until the
+# check is answered again. It takes one service at a time, and only by a
+# policy write: a scope-none override on that service's automation: id
+# for Read on policy-rule (the lockout guard, G1, passes it; it refuses
+# the estate-wide edit, retiring platform-admin:policy-rule:read). The
+# policy service's own doors ask its own engine, never this check, so
+# the override is retired through /api/policy/user-overrides while the
+# service is dark; passkey sign-in needs the people service, break-glass
+# sign-in does not.
+#
+# THE ROLLBACK ROAD (it passes neither the jobs API nor the forge nor
+# the conductor, nor any policy check): set the word back to `report`
+# over the LAN kube road, with David's admin kubeconfig —
 #   kubectl -n boss patch configmap boss-machine-gate --type merge -p '{"data":{"policy-check":"report"}}'
-# The policy service reads it within kubelet's ConfigMap refresh plus
-# five seconds, with no pod roll, and logs "LEFT enforce" at WARN. The
-# next converge re-applies this file, so a misfire that outlives an hour
-# is a revert car too. On a playground namespace, the same with its -n.
+# The policy service reads it within kubelet's ConfigMap refresh
+# (typically about a minute; not measured on this cluster) plus five
+# seconds, with NO pod roll, and logs "LEFT enforce" at WARN. Any word
+# but `enforce` stops the refusals: an unknown one reads as `report`
+# with an ERROR, an empty or absent key as `off`. THE NEXT CONVERGE RE-APPLIES THIS FILE and sets the word back
+# to `enforce`, so the patch holds only until the next train: hold the
+# converge or land the revert car (this line back to `report`) behind
+# it. On a playground namespace, the same patch with its -n: this file
+# is rendered once per instance, so the word below is every instance's.
+#
+# BEFORE THIS LINE DEPARTS, AND AFTER IT LANDS, the window is read by a
+# machine, not an eye (design 21946380, decision 4):
+#   boss-api GET '/api/events/gate-window?gate=policy-check&hours=72' > window.json
+#   bash infra/ops/gate-window-is-clean.sh policy-check 72 < window.json
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -279,7 +308,7 @@ metadata:
   namespace: boss
 data:
   mode: report
-  policy-check: report
+  policy-check: enforce
   # abf9eeae precursor, classes only. No enforcement or 72h readiness.
   actor-role: report
 ---
@@ -444,6 +473,12 @@ spec:
         - name: step-plugins
           configMap:
             name: step-plugins
+        # Nonsecret deployment declarations, separate from generic SPA
+        # defaults. A missing declared file is a failed read in the UI.
+        - name: boss-instance-config
+          configMap:
+            name: boss-instance-config
+            optional: true
         # THE DELIVERED TENANT (backlog f4f5c387): a `tenant_repo`
         # instance's tenant directory, checked out by the converge and
         # delivered exactly as step-plugins is — one ConfigMap generated
@@ -866,6 +901,7 @@ spec:
             # points at the session.key file inside it.
             - {name: boss-session-key, mountPath: /etc/boss/session-key, readOnly: true}
             - {name: step-plugins, mountPath: /var/lib/boss/step-plugins, readOnly: true}
+            - {name: boss-instance-config, mountPath: /opt/boss/spa/instance-config, readOnly: true}
             # The delivered tenant (the boss-tenant volume above): the
             # seeds of a repo-sourced instance, under the directory
             # BOSS_TENANT_DIR names for one. Empty on an image-sourced

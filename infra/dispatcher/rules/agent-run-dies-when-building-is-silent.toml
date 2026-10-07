@@ -47,12 +47,23 @@
 # safe at all is an EDGE, not a bound: `boss dispatch` now writes
 # `agent_run = <run id>` onto the step it claims (dd6d44b7), so the
 # reclaim asks whether THAT run died rather than inferring abandonment
-# from the step's stillness. This rule is unchanged and stays the way
-# it is — nothing about it is weakened by having a reader.
+# from the step's stillness. This rule keeps the same silence bound
+# and death vocabulary; its reader does not change either.
 #
 # HOURLY, NOT DAILY. The bound is four hours; a daily sweep would let a
 # dead run sit for up to a day past it, which is the same silence one
 # level up.
+#
+# A LINKED GATE IS WORK IN FLIGHT (d4a3e74f, 2026-10-04). A builder's
+# last completed step can predate a live native gate by hours. The
+# generic progress condition below checks the exact run link and the
+# newest server-stamped launch, its open verdict or completed green,
+# and well-formed native launch metadata. Green awaiting settlement
+# is success, not death; a newer failed launch supersedes an older
+# open one. Report prose alone never protects. The branch and SHA are
+# the gate's launch record, not a comparison to the author's tree.
+# An unreadable or partial listing refuses the judgement, so no-data
+# cannot become a death. No bound, privilege or heartbeat is changed.
 [[rule]]
 name = "agent-run-dies-when-building-is-silent"
 why = """
@@ -66,8 +77,8 @@ existed in a transcript and nowhere a rule could read its age. It adds
 no routing: one firing completes `building` with `result = died` on
 every silent run and the run's own terminal closes it.
 """
-version = 1
+version = 2
 schedule = { cadence = "hourly", anchor_date = "2026-09-18" }
 [[rule.do]]
 handler = "jobs.age_out_step"
-args = { kind = "\"agent-run\"", step = "\"building\"", hours = "\"4\"", done_metadata = '"{\"result\": \"died\"}"' }
+args = { kind = "\"agent-run\"", step = "\"building\"", hours = "\"4\"", done_metadata = '"{\"result\": \"died\"}"', unless_linked_job_proves_progress = '"{\"kind\":\"gate-run\",\"link\":\"agent_run\",\"started_step\":\"launched\",\"live_step\":\"record-verdict\",\"success_step\":\"green\",\"metadata_formats\":{\"branch\":\"nonblank\",\"sha\":\"git-sha\",\"launched_at\":\"timestamp\"}}"' }

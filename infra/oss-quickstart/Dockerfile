@@ -68,6 +68,11 @@ FROM rust-base AS rust-build
 # so only source goes into the build context.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+# The isolated consist worker derives its image from the gate's one
+# definition at compile time, so rustc needs it in this stage (2710c8fc).
+COPY infra/gate-runner/gate-runner.yaml ./infra/gate-runner/gate-runner.yaml
+# The generator and lifecycle reader share this owning Job spec.
+COPY infra/consist-worker/job.json ./infra/consist-worker/job.json
 COPY examples ./examples
 # EVERY PATH THE CRATES READ AT BUILD TIME MUST BE HERE — through a
 # build.rs, which RUNS in this stage, or an `include_str!`, which is
@@ -104,6 +109,8 @@ COPY infra/platform/tiers.toml ./infra/platform/tiers.toml
 # the host runner enforces (one per verb, 5086842d), listed by boss-cli's
 # build.rs; the terminal applies the same rules first.
 COPY infra/ops/verbs ./infra/ops/verbs
+# The CLI and dev activation door read ONE compatibility contract.
+COPY infra/dev/control-contract.txt ./infra/dev/control-contract.txt
 # `boss tenant check` compiles the platform workflow roster in — the
 # DIRECTORY of kind files, listed by the same build.rs — because it
 # judges a tenant's sensor references offline, with no registry to ask
@@ -439,6 +446,7 @@ COPY infra/cluster/break-glass-deposit.sh /usr/local/bin/boss-break-glass-deposi
 # pins this pairing to the path the manifest runs.
 COPY infra/lint/conservation-invariants.sh /opt/boss/infra/lint/conservation-invariants.sh
 COPY infra/lint/lib/conservation.sh /opt/boss/infra/lint/lib/conservation.sh
+COPY infra/lib/secret-header.sh /opt/boss/infra/lib/secret-header.sh
 COPY infra/oss-quickstart/generate-configs.sh /usr/local/bin/boss-generate-configs
 RUN chmod +x /opt/boss/infra/oss-quickstart/database-from-url.sh /usr/local/bin/boss-init /usr/local/bin/boss-launch \
     /usr/local/bin/boss-generate-configs \
@@ -468,3 +476,22 @@ WORKDIR /home/boss
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/usr/local/bin/boss-launch"]
+
+# Control tooling is taken from the SAME reviewed image as its CLI.
+# Only the data manifest's explicit source closure enters the artifact;
+# no build target, dependency cache or runtime credential is packed.
+FROM runtime AS dev-control-artifact
+USER root
+COPY infra /tmp/dev-control-source/infra
+RUN mkdir /tmp/dev-control-artifacts && \
+    if [ -n "$BOSS_BUILD_COMMIT" ] && [ "$BOSS_BUILD_COMMIT" != unknown ]; then \
+      /usr/bin/python3 -I /tmp/dev-control-source/infra/dev/control-artifact.py \
+        pack /tmp/dev-control-source /usr/local/bin /tmp/dev-control-artifacts/dev-control.tar "$BOSS_BUILD_COMMIT" && \
+      cp /tmp/dev-control-source/infra/dev/control-artifact.py /tmp/dev-control-artifacts/dev-control && \
+      chmod 0755 /tmp/dev-control-artifacts/dev-control; \
+    else \
+      echo 'NOT BUILT: dev control artifact requires a published full commit; quickstart services remain available'; \
+    fi
+
+FROM runtime AS final
+COPY --from=dev-control-artifact /tmp/dev-control-artifacts/ /opt/boss/

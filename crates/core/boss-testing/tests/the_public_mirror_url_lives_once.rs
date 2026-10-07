@@ -44,14 +44,16 @@ const SOURCE: &str = "infra/estate/estate.toml";
 const RENDER: &str = "infra/estate/render-sor-env.sh";
 const CLAIMS: &str = "apps/web/src/marketing/claims.ts";
 const LANDING: &str = "apps/web/src/landing/LandingPage.svelte";
+const BROWSER_SOURCE: &str = "apps/web/src/public-source.ts";
+const STEP_PLUGINS: &str = "apps/web/src/it/step-plugins/StepPluginsPage.svelte";
 
 /// A file that still spells the mirror on a machine-read line, and WHY
 /// it cannot read the rendered file. A named set: an entry whose file no
 /// longer carries the literal is stale and fails this test — remove it.
 const ALLOWANCE: &[(&str, &str)] = &[
     (
-        "apps/web/src/landing/LandingPage.svelte",
-        "the page's own href — a visitor's browser reads no env file; it is the CLAIM, held equal to the source by the_landing_pages_link_is_the_declared_mirror below",
+        BROWSER_SOURCE,
+        "the single browser mirror definition — a browser reads no host env file; both page consumers and the declared estate mirror are held equal below",
     ),
     (
         "infra/ops/verbs/read-publish-checks.json",
@@ -362,13 +364,37 @@ fn the_landing_pages_link_is_the_declared_mirror() {
         "the `source.repo` claim must name {SOURCE} / mirror_url — the same value the publish path reads:\n{claims}"
     );
     let url = source_key("mirror_url");
+    let browser = read(BROWSER_SOURCE);
+    assert!(
+        browser.contains(&format!("export const PUBLIC_MIRROR_URL = '{url}';")),
+        "{BROWSER_SOURCE} must hold the declared mirror ({url}): {browser}"
+    );
     let landing = read(LANDING);
+    assert!(
+        landing.contains("import { PUBLIC_MIRROR_URL } from '../public-source';"),
+        "{LANDING} must import its mirror from the single browser definition"
+    );
     let href = landing
         .lines()
         .find(|l| l.contains("data-claim=\"source.repo\""))
         .unwrap_or_else(|| panic!("{LANDING} does not mark the GitHub link as `source.repo`"));
     assert!(
-        href.contains(&format!("href=\"{url}\"")),
+        href.contains("href={safeLinkHref(PUBLIC_MIRROR_URL)}"),
         "the page links somewhere other than the declared mirror ({url}): {href}"
+    );
+}
+
+#[test]
+fn the_step_plugin_reference_is_derived_from_the_same_browser_mirror() {
+    let browser = read(BROWSER_SOURCE);
+    assert!(
+        browser.contains("export const STEP_PLUGIN_README_URL = `${PUBLIC_MIRROR_URL}/blob/main/infra/step-plugins/README.md`;"),
+        "{BROWSER_SOURCE} must derive the README path from its single mirror definition"
+    );
+    let plugins = read(STEP_PLUGINS);
+    assert!(
+        plugins.contains("import { STEP_PLUGIN_README_URL } from '../../public-source';")
+            && plugins.contains("href={safeLinkHref(STEP_PLUGIN_README_URL)}"),
+        "{STEP_PLUGINS} must use the declared README reference"
     );
 }

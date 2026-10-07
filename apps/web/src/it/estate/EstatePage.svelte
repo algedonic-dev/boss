@@ -15,7 +15,6 @@
     CLUSTER_SCOPE,
     comparisonVerdict,
     capacityIntentLine,
-    DEV_DOOR_HOST,
     HOST_SCOPE,
     MACHINE_FIELDS,
     machineDrift,
@@ -24,6 +23,7 @@
     seenCell,
     UNITS_SCOPE,
     devDoorSteps,
+    fetchDevDoor,
     fetchEstate,
     freshnessText,
     hostCoverText,
@@ -43,16 +43,21 @@
     zoneAlarms,
     zoneVerdict,
     type EstateState,
+    type DevDoorDeclaration,
   } from './estate';
+  import type { Remote } from '../../data/remote';
 
   let estate = $state<EstateState | null>(null);
+  let door = $state<Remote<DevDoorDeclaration>>({ kind: 'loading' });
   // One clock for every relative stamp on the page, taken when the
   // data arrived — formatRelative takes `now` explicitly, no hidden
   // wallclock.
   let loadedAt = $state<Date>(new Date());
 
   async function refresh(): Promise<void> {
-    estate = await fetchEstate();
+    const [nextEstate, nextDoor] = await Promise.all([fetchEstate(), fetchDevDoor()]);
+    estate = nextEstate;
+    door = nextDoor;
     loadedAt = new Date();
   }
 
@@ -79,7 +84,7 @@
   );
   // The one-time terminal setup, spelled by the module that holds the
   // hostname — no second address typed into this file.
-  const doorSteps = devDoorSteps();
+  const doorSteps = $derived(door.kind === 'ready' ? devDoorSteps(door.data.host, door.data.steps) : []);
 </script>
 
 <!-- The open alarms on one verdict line's series (48ef9961), each a link
@@ -508,8 +513,15 @@
 
     <div class="estate-section">04 — THE DEV WORKSPACE</div>
     <div class="estate-door">
+      {#if door.kind === 'loading'}
+        <p class="estate-quiet">Reading the dev door declaration…</p>
+      {:else if door.kind === 'failed'}
+        <p class="estate-fail">The dev door declaration could not be read: {door.error}</p>
+      {:else if door.data.host === null}
+        <p class="estate-quiet">This install declares no dev door.</p>
+      {:else}
       <p class="estate-hint">
-        The workspace answers on <code>{DEV_DOOR_HOST}</code>, from anywhere, behind Cloudflare
+        The workspace answers on <code>{door.data.host}</code>, from anywhere, behind Cloudflare
         Access. There is no VPN to join and no key to install: the edge asks who you are and issues
         a certificate that lasts the session. Three lines, the first two once per machine.
       </p>
@@ -523,6 +535,7 @@
         instead, run <code>claude remote-control</code> inside the session and drive it from
         claude.ai.
       </p>
+      {/if}
     </div>
   {/if}
 </div>

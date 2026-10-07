@@ -512,11 +512,21 @@ fn validate_email(email: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-fn people_error_response(e: PeopleError) -> Response {
+pub(crate) fn people_error_response(e: PeopleError) -> Response {
     match e {
         PeopleError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
         PeopleError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
         PeopleError::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+        // The coverage guard could not judge the write. Logged with its
+        // reason, because the caller may be a proxy that shows the user
+        // less than this (review c3b96c09 F2, 2026-10-06: the guard
+        // logged nothing, so a 503 could not be read where it landed).
+        // The reason is the guard's own fixed text — which source, which
+        // status — never a URL, a token or an upstream body.
+        PeopleError::Unavailable(msg) => {
+            tracing::warn!(reason = %msg, "coverage guard could not judge a People write; answering 503");
+            (StatusCode::SERVICE_UNAVAILABLE, msg).into_response()
+        }
     }
 }
 

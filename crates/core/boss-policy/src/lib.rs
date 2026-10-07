@@ -16,7 +16,9 @@ pub mod authority;
 pub mod bootstrap;
 pub mod check_mode;
 pub mod coverage;
+pub mod guard;
 pub mod http;
+pub mod role_reports;
 
 // Re-export everything from boss-policy-client so the historical
 // `use boss_policy::{Action, Decision, ...}` paths keep compiling.

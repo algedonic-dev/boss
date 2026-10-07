@@ -126,9 +126,14 @@
 #   6  REFUSED: the live row carries what the tree never said
 #   7  the publish ran and was NOT confirmed by the read-back
 #   8  the kind has no live active row (the seed admits new kinds)
+#   9  REFUSED: the kind is HELD out of every unattended publish
+#      (infra/platform/workflow-holds/, or a row that declares a writer
+#      or an executor) — in real mode and --force-tree before anything
+#      is read; under --check, where `--check ok` would have been
 #  75  cannot answer: the registry could not be read
 #  78  configuration: no BOSS_JOBS_URL, no `boss`, a `boss` older than
-#      the bundle loader (or of unknown provenance), no python3/tomllib
+#      the bundle loader (or of unknown provenance), no python3/tomllib,
+#      or holds that cannot be read (REFUSED in every mode)
 #
 # Runs as root under the ops-runner with NO HOME; every git read drops
 # to the checkout's owner (root cannot even READ a checkout it does not
@@ -216,9 +221,75 @@ export BOSS_ACTOR="${BOSS_ACTOR:-automation:ops-runner}"
 TMP=$(mktemp -d) || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
+# THE MACHINE TOKEN IS PRESENTED ON THE LIVE READ, NEVER REQUIRED
+# (design 6805c764; backlog 2710c8fc). read_live's GET carries no
+# identity — /api/workflows is a public registry surface — but the jobs
+# port's machine gate records every request without the token, and this
+# one arrived from boss-gcp once per kind on every publish-drift tick
+# (38 would-refuse facts in the 72 hours read on 2026-10-06). Made once,
+# here: after the trap above, which the reader's cleanup chains in front
+# of, and in this script's own shell. No reader beside the checkout, no
+# slot, a slot the reader refuses, a host off the estate's list or a
+# header file that cannot be made: the read goes out as before.
+PW_MT_HDR=""
+# shellcheck source=infra/lib/secret-header.sh
+if [ -r "$SELF_DIR/../lib/secret-header.sh" ]; then . "$SELF_DIR/../lib/secret-header.sh"; fi
+if declare -F machine_token_header >/dev/null; then
+    machine_token_header PW_MT_HDR "$BOSS_JOBS_URL" || PW_MT_HDR=""
+fi
+
 # --- 1. the tree authors the kind -----------------------------------------
 if [ ! -f "$KIND_FILE" ]; then
     refuse 3 "the tree has no $KIND_FILE_REL (checkout $REPO), so there is nothing to publish for '$KIND'. A NEW kind is admitted by the seed (insert-if-missing) once its file lands; this verb republishes kinds the tree already authors."
+fi
+
+# --- 1a. a HELD kind is not published by any machine road -------------------
+# Backlog 083d240e; review R1 of the signer car (run 7cee49b9,
+# 2026-10-06). A row that turns on a REFUSAL goes live at a deliberate
+# registry publish (design b08725c2). Two machine roads publish a tree
+# row with no approval, and BOTH pass through this script: publish-drift
+# calls it per kind, and the `publish-workflow` verb is it — a verb that
+# declares no approval, so any actor who may file an ops-request could
+# have published a held row as automation:ops-runner, and published it
+# again after a rollback (a rolled-back live row is "a row the tree once
+# said"). So the hold sits HERE, where both roads pass.
+#
+# infra/gcp/workflow-holds.py is the one reader (its header is the
+# contract: infra/platform/workflow-holds/<kind>.toml, and by default
+# every row that declares a field writer or a step executor). This
+# script derives nothing of its own.
+#   - holds that cannot be read: REFUSED, exit 78, in EVERY mode — an
+#     unreadable hold is not an absent one;
+#   - a held kind, real mode or --force-tree: REFUSED, exit 9, before
+#     the registry is read — --force-tree forces the tree over a live
+#     edit, never over a hold;
+#   - a held kind, --check: says HELD here, goes on to say what the
+#     registry holds, and where it would have answered `--check ok` it
+#     answers `--check HELD`, exit 9.
+# The one door left is the deliberate one: `boss workflow publish <kind>
+# <file>`, run by a person from a checkout. It is not bound by a hold
+# (it is also the rollback), and it does not lift one.
+HOLDS_PY="$SELF_DIR/workflow-holds.py"
+HOLDS_REL="infra/platform/workflow-holds"
+HELD_SOURCE=""; HELD_WHY=""; HELD_LIFTS=""
+if [ ! -f "$HOLDS_PY" ]; then
+    refuse 78 "the hold reader $HOLDS_PY is missing, so whether '$KIND' is held out of every unattended publish cannot be read, and a hold that cannot be read is not a hold that is absent — nothing compared, nothing published"
+fi
+if ! python3 "$HOLDS_PY" "$REPO" > "$TMP/holds.tsv" 2>"$TMP/holds.err"; then
+    say "the tree's holds cannot be read ($HOLDS_REL, and each row's writers and executors):"
+    awk -F'\t' '$1 == "problem" { print "  " $2 }' "$TMP/holds.tsv"
+    sed 's/^/  /' "$TMP/holds.err"
+    refuse 78 "whether '$KIND' is held out of every unattended publish cannot be read, and a hold that cannot be read is not a hold that is absent — nothing compared, nothing published, in any mode. Fix the file named above in a car."
+fi
+HELD_SOURCE="$(awk -F'\t' -v k="$KIND" '$1 == "held" && $2 == k { print $3; exit }' "$TMP/holds.tsv")"
+if [ -n "$HELD_SOURCE" ]; then
+    HELD_WHY="$(awk -F'\t' -v k="$KIND" '$1 == "held" && $2 == k { print $4; exit }' "$TMP/holds.tsv")"
+    HELD_LIFTS="$(awk -F'\t' -v k="$KIND" '$1 == "held" && $2 == k { print $5; exit }' "$TMP/holds.tsv")"
+    HELD_SAYS="'$KIND' is HELD out of every unattended publish ($HELD_SOURCE): $HELD_WHY — lifts: $HELD_LIFTS. The deliberate door is \`boss workflow publish $KIND $KIND_FILE_REL\`, run by a person from a checkout; it is not bound by the hold and does not lift it"
+    if [ "$MODE" != "--check" ]; then
+        refuse 9 "$HELD_SAYS. This verb does not publish a held kind${MODE:+, and $MODE forces the tree over a live edit, never over a hold} — nothing compared, nothing published (packet ${OPS_REQUEST_ID:-none})."
+    fi
+    say "HELD: $HELD_SAYS. --check goes on to say what the registry holds; a publish through this verb would be REFUSED (exit 9)."
 fi
 
 # --- git, as the checkout's owner -------------------------------------------
@@ -373,7 +444,7 @@ PY
 # registry surface and answered 86 rows to a bare GET on 2026-09-15.
 read_live() { # <out file>; exit 0 with the active row written, 75 otherwise
     local body="$TMP/live.raw" code
-    code=$(curl -sS -m 20 -o "$body" -w '%{http_code}' "$BOSS_JOBS_URL/api/workflows/$KIND" 2>"$TMP/curl.err")
+    code=$(curl -sS -m 20 -o "$body" -w '%{http_code}' ${PW_MT_HDR:+-H "$PW_MT_HDR"} "$BOSS_JOBS_URL/api/workflows/$KIND" 2>"$TMP/curl.err")
     if [ "$code" != "200" ]; then
         printf '%s: could not read %s/api/workflows/%s — HTTP %s. %s\n' "$NAME" "$BOSS_JOBS_URL" "$KIND" "${code:-000}" "$(tr '\n' ' ' <"$TMP/curl.err")" >&2
         say "cannot answer: nothing compared, nothing published (a verdict from an unread registry would be the confident wrong answer)"
@@ -470,6 +541,12 @@ fi
 say "$(grep -m1 'lints clean' "$TMP/lint.out" || tail -n1 "$TMP/lint.out")"
 
 # --- 5. --check stops here ------------------------------------------------------------
+if [ "$MODE" = "--check" ] && [ -n "$HELD_SOURCE" ]; then
+    # Not `--check ok`: the verb file's effect pattern, and every reader
+    # of this line, must not take a held kind for one this verb would
+    # publish. The version phrase is the one publish-drift.sh reads.
+    refuse 9 "--check HELD: would NOT publish $KIND_FILE_REL over live v$LIVE_VERSION at $BOSS_JOBS_URL — the tree is ahead of live and the kind is held ($HELD_SOURCE); nothing written; packet ${OPS_REQUEST_ID:-none}"
+fi
 if [ "$MODE" = "--check" ]; then
     say "--check ok: would publish $KIND_FILE_REL over live v$LIVE_VERSION at $BOSS_JOBS_URL (nothing written; packet ${OPS_REQUEST_ID:-none})"
     exit 0

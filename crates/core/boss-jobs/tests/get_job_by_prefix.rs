@@ -84,7 +84,7 @@ fn job_at(id: &str, title: &str) -> Job {
 }
 
 async fn seed() -> axum::Router {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     for spec in seedable_platform_workflows() {
         let _ = kinds.seed(spec);
     }

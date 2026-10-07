@@ -41,7 +41,13 @@
 //! below holds the set, naming the door that makes each one so. When a
 //! pair is asked by several doors, the strictest decides: `create` on
 //! `schedule` is `all` because the materialiser is, though a person's
-//! own availability takes `self`.
+//! own availability takes `self`. There is no exception to that rule,
+//! and three pairs read as one until the release review of car 2
+//! (005eb5b4, LOW-2) named them: `read` on `step` and on `policy-rule`
+//! are `all` although the file and audit doors (boss-content) admit any
+//! scope, because the in-flight count and the rule-table reads admit
+//! only `all`; and `read` on `job` is `all` although every listing
+//! filters by scope, because the moves record serves only `all`.
 
 use crate::types::{Action, Resource};
 
@@ -150,7 +156,11 @@ controls! {
     /// scoped read would answer an empty estate (train #805).
     READ_ESTATE: Read "estate", all;
 
-    READ_JOB: Read "job";
+    /// Every packet listing filters by the reader's scope, but the moves
+    /// record (boss-jobs `moves.rs` `refused`) names every packet that
+    /// moved and serves only a reader at scope `all` — so, the strictest
+    /// deciding, this is `all` (review 005eb5b4 of car 2, LOW-2).
+    READ_JOB: Read "job", all;
     /// The ALL-KINDS grant opening a packet takes first; `job:<kind>`
     /// is the per-kind grant beside it (design 222fc982), so a holder of
     /// this holds every kind.
@@ -239,8 +249,9 @@ mod tests {
     /// a control read as held.
     #[test]
     fn the_scope_all_doors_are_declared_scope_all() {
-        let doors: [(Pair, &str); 33] = [
+        let doors: [(Pair, &str); 34] = [
             (READ_ESTATE, "boss-jobs estate_read_refusal"),
+            (READ_JOB, "boss-jobs the moves record (moves.rs refused)"),
             (READ_POLICY_RULE, "boss-policy authority::may"),
             (CREATE_POLICY_RULE, "boss-policy authority::may"),
             (UPDATE_POLICY_RULE, "boss-policy authority::may"),

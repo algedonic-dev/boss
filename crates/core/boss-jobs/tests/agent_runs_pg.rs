@@ -1011,6 +1011,15 @@ async fn the_rate_card_is_each_published_page_as_read() {
             Some(100_000),
             Some(2_500_000),
         ),
+        // GPT-6 Sol's own Standard short-context page, fetched 2026-10-04.
+        // API USD proxy per MTok, not actual Codex credit spend.
+        (
+            "gpt-6-sol",
+            2_000_000,
+            10_000_000,
+            Some(200_000),
+            Some(2_500_000),
+        ),
         // Paid tier, prompts <= 200k. The page publishes no cache-write
         // price; a token that misses the implicit cache is input, so the
         // write rate is the input rate (the migration says why).
@@ -1033,9 +1042,22 @@ async fn the_rate_card_is_each_published_page_as_read() {
     assert_eq!(got, read, "the card, row by row, against the page");
     for (model, .., note) in &card {
         let read_on = match model.as_str() {
+            "gpt-6-sol" => "fetched 2026-10-04",
             "gpt-6.1-sol" | "gemini-2.5-pro" => "read 2026-10-01",
             _ => "read 2026-09-25",
         };
+        if model == "gpt-6-sol" {
+            for evidence in [
+                "developers.openai.com/api/docs/models/gpt-6-sol",
+                "USD proxy per MTok",
+                "not actual Codex credit spend or an invoice",
+            ] {
+                assert!(
+                    note.contains(evidence),
+                    "{model}'s note omits {evidence}: {note}"
+                );
+            }
+        }
         assert!(
             note.contains(read_on),
             "{model}'s note does not name its page's read date ({read_on}): {note}"

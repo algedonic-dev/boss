@@ -50,6 +50,69 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
 
+pub(crate) const DEV_CONTROL_CONTRACT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../infra/dev/control-contract.txt"
+));
+
+/// Only the published dev control container carries this marker. Other
+/// hosts retain their existing execution door; workers have neither
+/// the marker nor the credential-bearing controller filesystem.
+fn forward_dev_child(cmd: &mut Command, launcher: &Path) {
+    let program = cmd.get_program().to_os_string();
+    let args: Vec<_> = cmd.get_args().map(std::ffi::OsStr::to_os_string).collect();
+    let cwd = cmd.get_current_dir().map(Path::to_path_buf);
+    let mut forwarded = Command::new(launcher);
+    // A published interpreter is still vulnerable to inherited loader
+    // and startup hooks. Only the controller's authentication context
+    // crosses this boundary; candidate command environment is not the
+    // environment in which the controller itself starts.
+    forwarded.env_clear();
+    forwarded.env("HOME", "/work/home");
+    forwarded.env("PATH", "/usr/bin:/bin");
+    for key in [
+        "KUBERNETES_SERVICE_HOST",
+        "KUBERNETES_SERVICE_PORT",
+        "KUBERNETES_SERVICE_PORT_HTTPS",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            forwarded.env(key, value);
+        }
+    }
+    forwarded.arg("exec-auto");
+    for key in [
+        "BOSS_JOBS_URL",
+        "BOSS_SOR_PORTS",
+        "BOSS_CAR_CONVERGED_AT",
+        "BOSS_CAR_MERGE_REF",
+    ] {
+        let value = match cmd.get_envs().find(|(name, _)| *name == key) {
+            Some((_, value)) => value.map(std::ffi::OsStr::to_os_string),
+            None => std::env::var_os(key),
+        };
+        if let Some(value) = value {
+            let mut assignment = std::ffi::OsString::from(key);
+            assignment.push("=");
+            assignment.push(value);
+            forwarded.arg("--worker-env").arg(assignment);
+        }
+    }
+    if let Some((_, Some(channel))) = cmd
+        .get_envs()
+        .find(|(name, _)| *name == "BOSS_PROBE_NOTFOUND")
+    {
+        forwarded.arg("--notfound-channel").arg(channel);
+    }
+    forwarded.arg("--").arg(program).args(args);
+    if let Some(cwd) = cwd {
+        forwarded.current_dir(cwd);
+    }
+    // Call sites set stdio after this boundary. The new program is a
+    // fixed published controller; an unavailable worker is a refusal,
+    // never permission to run the original program here.
+    *cmd = forwarded;
+}
+
 /// An empty token directory, alive as long as this value, and the
 /// environment that names it to a child.
 pub(crate) struct NoTokenInReach {
@@ -98,7 +161,11 @@ impl NoTokenInReach {
         for name in Self::TOKEN_REMOVED {
             cmd.env_remove(name);
         }
-        cmd.env(boss_core::machine_token::TOKEN_DIR_ENV, self.dir())
+        cmd.env(boss_core::machine_token::TOKEN_DIR_ENV, self.dir());
+        if std::fs::symlink_metadata("/etc/boss-dev-control/enabled").is_ok() {
+            forward_dev_child(cmd, Path::new("/opt/boss-dev-control/dev-build"));
+        }
+        cmd
     }
 
     /// No token, no address, no rendered sor.env — for code asking a
@@ -244,5 +311,96 @@ mod tests {
             line.contains("TOKEN=absent HOSTS=false OLD=false URL=[http://192.0.2.34:7900]"),
             "{line}"
         );
+    }
+
+    #[test]
+    fn a_dev_control_child_is_forwarded_as_data_and_never_runs_locally() {
+        let root = boss_testing::scratch_dir("dev-control-child-forwarding");
+        let marker = root.join("local-candidate-ran");
+        let candidate = root.join("candidate");
+        boss_testing::write_exec(
+            &candidate,
+            &format!("#!/bin/sh\nprintf read > '{}'\n", marker.display()),
+        );
+        let launcher = root.join("published-launcher");
+        boss_testing::write_exec(&launcher, "#!/bin/sh\nprintf '%s\\n' \"$@\"\nexit 75\n");
+        let mut command = Command::new(&candidate);
+        command.arg("literal; touch /control");
+        command.env("BOSS_CAR_MERGE_REF", "refs/heads/train/example");
+        command.env("BOSS_JOBS_URL", "http://example.invalid:7900");
+        super::forward_dev_child(&mut command, &launcher);
+        let result = command.output().expect("published launcher starts");
+        assert_eq!(result.status.code(), Some(75));
+        assert!(
+            !marker.exists(),
+            "failed transport must never fall back locally"
+        );
+        let output = String::from_utf8_lossy(&result.stdout);
+        assert!(output.starts_with("exec-auto\n"), "{output}");
+        assert!(
+            output.contains("BOSS_CAR_MERGE_REF=refs/heads/train/example"),
+            "public probe input was lost: {output}"
+        );
+        assert!(
+            output.contains("BOSS_JOBS_URL=http://example.invalid:7900"),
+            "resolved probe target was lost: {output}"
+        );
+        assert!(
+            !command.get_envs().any(|(key, _)| key == "BOSS_JOBS_URL"),
+            "probe data must not select controller startup state"
+        );
+        assert!(
+            output.contains("literal; touch /control"),
+            "argv remains data: {output}"
+        );
+    }
+
+    #[test]
+    fn a_dev_control_launcher_never_loads_candidate_startup_environment() {
+        let root = boss_testing::scratch_dir("dev-control-startup-env");
+        let marker = root.join("candidate-startup-ran");
+        let startup = root.join("startup.sh");
+        boss_testing::write_file(&startup, &format!("printf read > '{}'\n", marker.display()));
+        let launcher = root.join("published-launcher");
+        boss_testing::write_exec(&launcher, "#!/bin/bash\nexit 75\n");
+        let mut command = Command::new("candidate");
+        command.env("BASH_ENV", &startup).env("PYTHONPATH", &root);
+        for key in [
+            "ENV",
+            "CDPATH",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_COUNT",
+            "BUN_CONFIG",
+            "npm_config_userconfig",
+            "NODE_OPTIONS",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+        ] {
+            command.env(key, &startup);
+        }
+        command.env("PATH", &root).env("HOME", &root);
+        super::forward_dev_child(&mut command, &launcher);
+        let result = command.output().expect("published launcher starts");
+        assert_eq!(result.status.code(), Some(75));
+        assert!(
+            !marker.exists(),
+            "published launcher loaded candidate startup code"
+        );
+        assert!(
+            !command
+                .get_envs()
+                .any(|(key, value)| key == "PYTHONPATH" && value.is_some())
+        );
+        assert!(command.get_envs().all(|(key, _)| matches!(
+            key.to_str(),
+            Some(
+                "HOME"
+                    | "PATH"
+                    | "KUBERNETES_SERVICE_HOST"
+                    | "KUBERNETES_SERVICE_PORT"
+                    | "KUBERNETES_SERVICE_PORT_HTTPS"
+            )
+        )));
     }
 }

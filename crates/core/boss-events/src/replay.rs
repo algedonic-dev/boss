@@ -87,9 +87,35 @@ pub async fn replay_projection<F>(
     lock_key: i64,
     wipe: &[&str],
     kind_filter: &str,
+    apply: F,
+) -> Result<ReplayStats, String>
+where
+    F: AsyncFnMut(&mut PgConnection, ReplayEvent) -> Result<Applied, String>,
+{
+    replay_projection_checked(
+        pool,
+        lock_key,
+        wipe,
+        kind_filter,
+        async |_, _| Ok(()),
+        apply,
+    )
+    .await
+}
+
+/// Validate the complete selected log under the same locks BEFORE a wipe.
+/// A refusal rolls back the transaction without clearing any projection.
+/// Existing callers use [`replay_projection`] and retain their apply behavior.
+pub async fn replay_projection_checked<P, F>(
+    pool: &PgPool,
+    lock_key: i64,
+    wipe: &[&str],
+    kind_filter: &str,
+    mut validate: P,
     mut apply: F,
 ) -> Result<ReplayStats, String>
 where
+    P: AsyncFnMut(&mut PgConnection, &[ReplayEvent]) -> Result<(), String>,
     F: AsyncFnMut(&mut PgConnection, ReplayEvent) -> Result<Applied, String>,
 {
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
@@ -113,13 +139,6 @@ where
         crate::outbox::lock_and_assert_log_complete(&mut tx, &tables).await?;
     }
 
-    for stmt in wipe {
-        sqlx::query(stmt)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-
     let rows: Vec<(i64, uuid::Uuid, String, DateTime<Utc>, serde_json::Value)> =
         sqlx::query_as(&format!(
             "SELECT id, event_id, kind, timestamp, payload FROM audit_log \
@@ -129,16 +148,26 @@ where
         .await
         .map_err(|e| e.to_string())?;
 
-    let mut stats = ReplayStats::default();
-    for (audit_id, event_id, kind, ts, payload) in rows {
-        stats.processed += 1;
-        let event = ReplayEvent {
+    let events: Vec<_> = rows
+        .into_iter()
+        .map(|(audit_id, event_id, kind, ts, payload)| ReplayEvent {
             audit_id,
             event_id,
             kind,
             ts,
             payload,
-        };
+        })
+        .collect();
+    validate(&mut tx, &events).await?;
+    for stmt in wipe {
+        sqlx::query(stmt)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let mut stats = ReplayStats::default();
+    for event in events {
+        stats.processed += 1;
         match apply(&mut *tx, event).await? {
             Applied::Yes => {}
             Applied::Skipped => stats.skipped += 1,

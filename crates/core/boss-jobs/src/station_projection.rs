@@ -669,6 +669,7 @@ mod tests {
     fn an_agent_block_projects_one_station_per_role_and_model() {
         use crate::agent_spec::{AgentSpec, Effort};
         let block = |model: &str| AgentSpec {
+            executor_provenance: Default::default(),
             profile: "builder".into(),
             model: model.into(),
             budget_usd: 5.0,

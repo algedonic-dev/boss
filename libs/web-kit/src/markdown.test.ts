@@ -6,6 +6,13 @@ import { describe, expect, test } from 'bun:test';
 import { renderMarkdown } from './markdown';
 
 describe('renderMarkdown', () => {
+  test('authored underscore emphasis renders without changing identifiers or code', () => {
+    expect(renderMarkdown('_TBD, owner: HR._')).toBe('<p><em>TBD, owner: HR.</em></p>');
+    expect(renderMarkdown('**bold** and __strong__ with _emphasis_')).toContain('<strong>strong</strong>');
+    expect(renderMarkdown('some_identifier and `literal_underscore`')).toBe('<p>some_identifier and <code>literal_underscore</code></p>');
+    expect(renderMarkdown('[file](/some_path_with_underscores)')).toBe('<p><a href="/some_path_with_underscores">file</a></p>');
+    expect(renderMarkdown('```\n_TBD_\n```')).toBe('<pre><code>_TBD_</code></pre>');
+  });
   test('the shapes a design doc uses', () => {
     const html = renderMarkdown(
       '# Title\n\nA **bold** claim with `code` and a [link](https://example.com).\n\n' +

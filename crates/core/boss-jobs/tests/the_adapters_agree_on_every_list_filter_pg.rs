@@ -54,6 +54,8 @@ boss_testing::adapters_agree! {
         kind_prefix,
         kind_prefix_is_literal_text,
         kinds,
+        excluded_kinds,
+        oldest_first,
         department,
         status,
         closed_since,
@@ -78,6 +80,8 @@ const _: fn(JobFilter) = |filter| {
         kind: _,              // case `kind`
         kind_prefix: _,       // cases `kind_prefix`, `kind_prefix_is_literal_text`
         kinds: _,             // case `kinds`
+        excluded_kinds: _,    // case `excluded_kinds`
+        oldest_first: _,      // case `oldest_first`
         department: _,        // case `department`
         status: _,            // case `status`
         closed_since: _,      // case `closed_since`
@@ -294,6 +298,87 @@ async fn kinds<R: JobsRepository>(repo: &R, adapter: &str) {
         ..Default::default()
     };
     narrows(repo, adapter, filter, &[]).await;
+}
+
+async fn excluded_kinds<R: JobsRepository>(repo: &R, adapter: &str) {
+    seed_world(repo).await;
+    narrows(
+        repo,
+        adapter,
+        JobFilter {
+            excluded_kinds: Some(vec![
+                "backlog-item".into(),
+                "pr-train".into(),
+                "field-trip".into(),
+            ]),
+            ..Default::default()
+        },
+        &["field-a", "field-b"],
+    )
+    .await;
+    narrows(
+        repo,
+        adapter,
+        JobFilter {
+            kinds: Some(vec!["field-service".into(), "pr-train".into()]),
+            excluded_kinds: Some(vec!["pr-train".into()]),
+            owner_id: Some("emp-b".into()),
+            scope: JobScope::OwnerIs("emp-b".into()),
+            ..Default::default()
+        },
+        &["field-a"],
+    )
+    .await;
+    let (rows, total) = repo
+        .list_jobs(
+            &JobFilter {
+                excluded_kinds: Some(vec![]),
+                ..Default::default()
+            },
+            1,
+            0,
+        )
+        .await
+        .expect("empty complement");
+    assert_eq!(rows.len(), 1, "{adapter}");
+    assert_eq!(total as usize, world().len(), "{adapter}");
+}
+
+async fn oldest_first<R: JobsRepository>(repo: &R, adapter: &str) {
+    let mut first = packet("first");
+    first.opened_at = Some(instant(1));
+    let mut second = packet("second");
+    second.opened_at = Some(instant(2));
+    let legacy = packet("legacy");
+    // Different insertion times exercise recorded admission over created_at,
+    // with an honest created_at fallback for the legacy row.
+    repo.create_job_at(&second, instant(10), &[])
+        .await
+        .expect("second");
+    repo.create_job_at(&first, instant(20), &[])
+        .await
+        .expect("first");
+    repo.create_job_at(&legacy, instant(3), &[])
+        .await
+        .expect("legacy");
+    let filter = JobFilter {
+        oldest_first: true,
+        ..Default::default()
+    };
+    for (offset, expected) in [(0, "first"), (1, "second"), (2, "legacy")] {
+        let (rows, total) = repo
+            .list_jobs(&filter, 1, offset)
+            .await
+            .expect("oldest page");
+        assert_eq!(
+            rows.iter()
+                .map(|job| job.title.as_str())
+                .collect::<Vec<_>>(),
+            [expected],
+            "{adapter}"
+        );
+        assert_eq!(total, 3, "{adapter}");
+    }
 }
 
 async fn department<R: JobsRepository>(repo: &R, adapter: &str) {

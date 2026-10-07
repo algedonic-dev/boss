@@ -52,9 +52,45 @@ fn empty() -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn a_complete_authenticated_fetch_is_reused_for_many_request_time_lookups() {
+    let (base, seen) = registry(
+        serde_json::json!({"data":[{"id":"agent-example","aliases":["alias"],"role":"tenant-role"}],"total":1}),
+        empty(),
+        serde_json::json!([]),
+    )
+    .await;
+    let reader = HttpRoleReader::with_source(
+        base.clone(),
+        base,
+        User::service("people"),
+        Duration::from_secs(2),
+        Arc::new(Source::fixed(None)),
+    )
+    .unwrap();
+    let roles = reader.fetch_snapshot().await.unwrap();
+    for _ in 0..8 {
+        assert_eq!(
+            roles.role_for("alias").await.unwrap().unwrap().actor_id,
+            "agent-example"
+        );
+        assert_eq!(roles.role_for("missing").await.unwrap(), None);
+    }
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.len(),
+        3,
+        "lookups must not issue any additional registry reads"
+    );
+    for (_, header) in seen.iter() {
+        let user: User = serde_json::from_str(header.as_deref().unwrap()).unwrap();
+        assert_eq!(user.id, "automation:people");
+    }
+}
+
+#[tokio::test]
 async fn unavailable_malformed_oversized_and_timed_out_reads_are_unknown_not_absence() {
     use axum::response::IntoResponse;
-    for failure in ["status", "json", "oversized", "timeout"] {
+    for failure in ["status", "json", "oversized", "timeout", "redirect"] {
         let app = Router::new()
             .route(
                 "/api/agents",
@@ -63,6 +99,9 @@ async fn unavailable_malformed_oversized_and_timed_out_reads_are_unknown_not_abs
                         "status" => axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
                         "json" => "not JSON".into_response(),
                         "oversized" => "x".repeat(4 * 1024 * 1024 + 1).into_response(),
+                        "redirect" => {
+                            axum::response::Redirect::temporary("/pretend").into_response()
+                        }
                         _ => {
                             tokio::time::sleep(Duration::from_millis(250)).await;
                             Json(empty()).into_response()
@@ -70,6 +109,7 @@ async fn unavailable_malformed_oversized_and_timed_out_reads_are_unknown_not_abs
                     }
                 }),
             )
+            .route("/pretend", get(|| async { Json(empty()) }))
             .route("/api/agents/automations", get(|| async { Json(empty()) }))
             .route("/api/people", get(|| async { Json(serde_json::json!([])) }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

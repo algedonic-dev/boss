@@ -18,9 +18,11 @@ const CREDENTIAL: &str = "ops-runner-credential-forge";
 const HOST: &str = "forge";
 const JOB: &str = "1e50e66b-b501-4d45-8da7-c162a0f41d54";
 const OTHER_JOB: &str = "6c9183de-0000-4000-8000-000000000001";
+const THIRD_JOB: &str = "6c9183de-0000-4000-8000-000000000002";
 
 // Fake values, shaped like the broker's (43 characters, base64url).
 const OLD: &str = "oldOLDoldOLDoldOLDoldOLDoldOLDoldOLDold0001";
+const LEFT: &str = "leftLEFTleftLEFTleftLEFTleftLEFTleftLEFT003";
 const GCP: &str = "gcpGCPgcpGCPgcpGCPgcpGCPgcpGCPgcpGCPgcp0002";
 
 // ----- the Secret, projected into a directory as kubelet does -----
@@ -30,6 +32,8 @@ struct MountedSecret {
     dir: PathBuf,
     lag: Mutex<bool>,
     writes: Mutex<usize>,
+    revision: Mutex<u64>,
+    lost_write_ack: Mutex<bool>,
 }
 
 impl MountedSecret {
@@ -40,9 +44,12 @@ impl MountedSecret {
             dir,
             lag: Mutex::new(false),
             writes: Mutex::new(0),
+            revision: Mutex::new(1),
+            lost_write_ack: Mutex::new(false),
         })
     }
     fn seed(&self, key: &str, value: &str) {
+        *self.revision.lock().unwrap() += 1;
         self.map
             .lock()
             .unwrap()
@@ -81,6 +88,50 @@ impl MountedSecret {
 
 #[async_trait]
 impl SecretStore for MountedSecret {
+    async fn read_secret(&self, ns: &str, name: &str) -> Result<Option<SecretData>, String> {
+        assert_eq!((ns, name), (NS, SECRET));
+        let revision = self.revision.lock().unwrap();
+        Ok(Some(SecretData {
+            uid: "runner-fixture-uid".into(),
+            version: revision.to_string(),
+            data: self
+                .map
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        }))
+    }
+    async fn write_keys_if(
+        &self,
+        ns: &str,
+        name: &str,
+        entries: &[(&str, &str)],
+        observed: &SecretData,
+    ) -> Result<WriteAt, String> {
+        assert_eq!((ns, name), (NS, SECRET));
+        {
+            let mut revision = self.revision.lock().unwrap();
+            if observed.uid != "runner-fixture-uid" || observed.version != revision.to_string() {
+                return Ok(WriteAt::Moved);
+            }
+            let mut map = self.map.lock().unwrap();
+            for (key, value) in entries {
+                assert!(key.starts_with("forge."));
+                map.insert((*key).into(), (*value).into());
+            }
+            *revision += 1;
+            *self.writes.lock().unwrap() += 1;
+        }
+        if !*self.lag.lock().unwrap() {
+            self.project();
+        }
+        if std::mem::take(&mut *self.lost_write_ack.lock().unwrap()) {
+            return Err("fixture lost Secret acknowledgment after commit".into());
+        }
+        Ok(WriteAt::Written)
+    }
     async fn read_key(&self, ns: &str, name: &str, key: &str) -> Result<Option<String>, String> {
         assert_eq!((ns, name), (NS, SECRET), "the declared Secret, and only it");
         Ok(self.map.lock().unwrap().get(key).cloned())
@@ -96,6 +147,7 @@ impl SecretStore for MountedSecret {
     ) -> Result<(), String> {
         assert_eq!((ns, name), (NS, SECRET), "the declared Secret, and only it");
         *self.writes.lock().unwrap() += 1;
+        *self.revision.lock().unwrap() += 1;
         {
             let mut m = self.map.lock().unwrap();
             for (k, v) in entries {
@@ -125,6 +177,14 @@ struct Jobs {
     /// Who the packet's `delivered` step names as its completer — the
     /// deposit's actor unless a case says otherwise (review 3930a3eb, N2).
     delivered_by: Arc<Mutex<Option<String>>>,
+    phase_fault: Arc<Mutex<Option<String>>>,
+    attempts: Captured,
+    missing_receipt: Arc<Mutex<bool>>,
+    registry_response: Arc<Mutex<Option<JsonValue>>>,
+    canonical_registry_row: JsonValue,
+    /// What each phase post presented in the broker-stage header, in
+    /// order (design 6e28ed42) — `None` when the header was absent.
+    stage_tokens: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 impl Jobs {
@@ -183,6 +243,39 @@ async fn jobs(dir: PathBuf, step_statuses: &[(&str, &str)]) -> Jobs {
     let (st_get, st_put) = (steps.clone(), steps.clone());
     let (w_put, w_merge) = (writes.clone(), writes.clone());
     let rot = rotations.clone();
+    let phase_fault = Arc::new(Mutex::new(None::<String>));
+    let fault = phase_fault.clone();
+    let attempts: Captured = Default::default();
+    let phase_attempts = attempts.clone();
+    let missing_receipt = Arc::new(Mutex::new(false));
+    let omit = missing_receipt.clone();
+    let stage_tokens = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+    let presented_tokens = stage_tokens.clone();
+    let registry = Arc::new(boss_jobs::credentials::InMemoryCredentials::new(vec![
+        boss_jobs::credentials::CredentialRow {
+            id: CREDENTIAL.into(),
+            kind: "ops-runner-credential".into(),
+            issuer: "credential-broker".into(),
+            principal: "runner:ops".into(),
+            scopes: json!([]),
+            storage_location: "test Secret".into(),
+            consumers: json!([]),
+            rotation_policy: "on-demand".into(),
+            rotated_at: None,
+            notes: String::new(),
+        },
+    ]));
+    let delivery_registry = registry.clone();
+    let get_registry = registry.clone();
+    let canonical_registry_row = serde_json::to_value(
+        boss_jobs::credentials::CredentialsRegistry::get(registry.as_ref(), CREDENTIAL)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let registry_response = Arc::new(Mutex::new(None::<JsonValue>));
+    let response_override = registry_response.clone();
     let delivered_by = Arc::new(Mutex::new(Some(DEPOSIT_ACTOR.to_string())));
     let by_get = delivered_by.clone();
     let app = Router::new()
@@ -244,26 +337,78 @@ async fn jobs(dir: PathBuf, step_statuses: &[(&str, &str)]) -> Jobs {
         .route(
             "/api/credentials/{id}/rotation/{phase}",
             post(
-                move |Path((id, phase)): Path<(String, String)>, Json(body): Json<JsonValue>| {
+                move |Path((id, phase)): Path<(String, String)>, headers:axum::http::HeaderMap, Json(body): Json<JsonValue>| {
                     let rot = rot.clone();
+                    let fault = fault.clone();
+                    let attempts = phase_attempts.clone();
+                    let registry=registry.clone();
+                    let omit=omit.clone();
+                    let presented_tokens = presented_tokens.clone();
                     async move {
-                        rot.lock().unwrap().push((format!("{id}/{phase}"), body));
-                        Json(json!({"recorded": true}))
+                        attempts.lock().unwrap().push((format!("{id}/{phase}"), body.clone()));
+                        let stage_token = headers
+                            .get(boss_jobs::credentials::broker_stage::HEADER)
+                            .map(|v| v.to_str().unwrap().to_owned());
+                        presented_tokens.lock().unwrap().push(stage_token.clone());
+                        let before = fault.lock().unwrap().as_deref() == Some(&format!("before:{phase}"));
+                        if before {
+                            *fault.lock().unwrap() = None;
+                            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                        use boss_jobs::credentials::CredentialsRegistry;
+                        let user: boss_policy_client::User = serde_json::from_str(headers.get("x-boss-user").unwrap().to_str().unwrap()).unwrap();
+                        // As the real door: a presented (there, verified) stage
+                        // token is recorded as the workload, not the typed label.
+                        let actor = match stage_token {
+                            Some(_) => boss_core::actor::ActorId::Automation(
+                                boss_jobs::credentials::broker_stage::ACTOR
+                                    .trim_start_matches("automation:")
+                                    .into(),
+                            ),
+                            None => user.ambient_actor().unwrap(),
+                        };
+                        let stamp=boss_core::publisher::EventStamp::new("jobs",actor);
+                        let mut evidence=body.clone();
+                        evidence["credential_id"]=json!(id);
+                        let result=registry.record_rotation(&id,RotationPhase::parse(&phase).unwrap(),evidence,&stamp).await;
+                        let outcome=match result {
+                            Ok(outcome)=>outcome,
+                            Err(error)=>return (axum::http::StatusCode::CONFLICT,error.to_string()).into_response(),
+                        };
+                        if !matches!(outcome,boss_jobs::credentials::receipt::RotationOutcome::Replayed { .. }) {
+                            rot.lock().unwrap().push((format!("{id}/{phase}"),body));
+                        }
+                        if *omit.lock().unwrap() { return Json(json!({"recorded":true})).into_response(); }
+                        if fault.lock().unwrap().as_deref()==Some(&format!("after:{phase}")) {
+                            *fault.lock().unwrap()=None;
+                            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                        Json(json!({"recorded":true,"observation":outcome})).into_response()
                     }
                 },
             ),
         )
         .route(
             "/api/credentials/{id}",
-            get(move |Path(id): Path<String>| async move {
-                if id == CREDENTIAL {
-                    Json(json!({"id": id, "kind": "ops-runner-credential"})).into_response()
-                } else {
-                    axum::http::StatusCode::NOT_FOUND.into_response()
+            get(move |Path(id): Path<String>| {
+                let registry = get_registry.clone();
+                let response_override = response_override.clone();
+                async move {
+                    if let Some(body) = response_override.lock().unwrap().clone() {
+                        return Json(body).into_response();
+                    }
+                    use boss_jobs::credentials::CredentialsRegistry;
+                    match registry.get(&id).await.unwrap() {
+                        Some(row) => Json(row).into_response(),
+                        None => axum::http::StatusCode::NOT_FOUND.into_response(),
+                    }
                 }
             }),
         );
     // THE REAL DOOR, over the directory the Secret projects into.
+    let app = app.merge(boss_jobs::credentials::http::delivery_router(
+        boss_jobs::credentials::http::CredentialsApiState::new(delivery_registry),
+    ));
     let app = boss_jobs::runner_credential::mount(app, dir);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -274,7 +419,64 @@ async fn jobs(dir: PathBuf, step_statuses: &[(&str, &str)]) -> Jobs {
         writes,
         rotations,
         delivered_by,
+        phase_fault,
+        attempts,
+        missing_receipt,
+        registry_response,
+        canonical_registry_row,
+        stage_tokens,
     }
+}
+
+#[tokio::test]
+async fn a_foreign_or_incomplete_registry_row_cannot_mint_a_runner_credential() {
+    let mut observations = Vec::new();
+    for variant in [
+        "kind",
+        "principal",
+        "id",
+        "missing-id",
+        "malformed",
+        "canonical",
+    ] {
+        let secrets = MountedSecret::new(&format!("registry-{variant}"));
+        secrets.seed("forge.current", OLD);
+        let jobs = jobs(secrets.dir.clone(), FRESH).await;
+        let mut row = jobs.canonical_registry_row.clone();
+        match variant {
+            "kind" => row["kind"] = json!("forgejo-access-token"),
+            "principal" => row["principal"] = json!("runner:other"),
+            "id" => row["id"] = json!("another-credential"),
+            "missing-id" => {
+                row.as_object_mut().unwrap().remove("id");
+            }
+            "malformed" => row = json!(["not a registry row"]),
+            "canonical" => {}
+            _ => unreachable!(),
+        }
+        *jobs.registry_response.lock().unwrap() = Some(row);
+        let original = secrets.map.lock().unwrap().clone();
+        let result = handler(&jobs, &secrets).invoke(&args(), &scope()).await;
+        observations.push((
+            variant,
+            result.is_err(),
+            secrets.writes(),
+            *secrets.map.lock().unwrap() == original,
+            jobs.phases().is_empty(),
+        ));
+    }
+    assert!(
+        observations
+            .iter()
+            .all(|(variant, refused, writes, conserved, no_phase)| {
+                if *variant == "canonical" {
+                    !*refused && *writes == 1 && !*conserved && !*no_phase
+                } else {
+                    *refused && *writes == 0 && *conserved && *no_phase
+                }
+            }),
+        "registry identity must refuse before mint or Secret effects: {observations:?}"
+    );
 }
 
 const FRESH: &[(&str, &str)] = &[
@@ -360,13 +562,10 @@ fn resolved(host: &str, slot: &'static str) -> boss_jobs::runner_credential::Res
 
 /// A rotation of the forge's credential, staged: the scope firing ran and
 /// the door sees the staged value. `boss-gcp` holds a value of its own.
-async fn staged(name: &str) -> (Jobs, Arc<MountedSecret>, String) {
+async fn staged_unacknowledged(name: &str) -> (Jobs, Arc<MountedSecret>, String) {
     let secrets = MountedSecret::new(name);
     secrets.seed("forge.current", OLD);
-    secrets.seed(
-        "forge.previous",
-        "leftLEFTleftLEFTleftLEFTleftLEFTleftLEFT003",
-    );
+    secrets.seed("forge.previous", LEFT);
     secrets.seed("boss-gcp.current", GCP);
     let jobs = jobs(secrets.dir.clone(), FRESH).await;
     handler(&jobs, &secrets)
@@ -374,6 +573,58 @@ async fn staged(name: &str) -> (Jobs, Arc<MountedSecret>, String) {
         .await
         .expect("the scope firing stages and verifies");
     let value = secrets.get("forge.next").expect("a value staged");
+    (jobs, secrets, value)
+}
+
+/// This fixture calls the actual mounted-generation resolver and credential
+/// owner command. Its fake Jobs row is not proof of the production Jobs CAS.
+async fn acknowledge(jobs: &Jobs, secrets: &MountedSecret, job: &str, value: &str) {
+    let local = secrets.dir.join("fixture-local-installed");
+    boss_testing::write_file(&local, value);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), value);
+    let client = boss_core::machine_token::Client::unstamped(reqwest::Client::builder())
+        .expect("fake loopback fixture uses no estate credential");
+    let response = client
+        .get(format!("{}{WHOAMI_PATH}", jobs.url))
+        .header("x-boss-user", dispatcher_reader_header())
+        .header(HEADER, value)
+        .send()
+        .await
+        .unwrap();
+    let identity: JsonValue = response.json().await.unwrap();
+    let context = &identity["delivery"];
+    assert_eq!(context["job_id"], job);
+    let response = client
+        .post(format!(
+            "{}/api/credentials/{CREDENTIAL}/delivery",
+            jobs.url
+        ))
+        .header("x-boss-user", dispatcher_reader_header())
+        .header(HEADER, value)
+        .json(&json!({"job_id":job,"attempt":context["attempt"],
+            "secret_uid":context["secret_uid"]}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: JsonValue = response.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::ACCEPTED, "{body}");
+    *jobs.delivered_by.lock().unwrap() = Some(boss_jobs::runner_credential::ACTOR.into());
+    for (slug, status) in jobs.steps.lock().unwrap().iter_mut() {
+        if slug == "delivered" {
+            *status = "completed".into();
+        }
+    }
+}
+
+async fn staged(name: &str) -> (Jobs, Arc<MountedSecret>, String) {
+    let (jobs, secrets, value) = staged_unacknowledged(name).await;
+    acknowledge(&jobs, &secrets, JOB, &value).await;
     (jobs, secrets, value)
 }
 
@@ -447,7 +698,7 @@ fn the_scope_may_name_the_old_value_only_by_currents_last_eight() {
 
 #[tokio::test]
 async fn the_scope_firing_stages_a_value_the_door_resolves_and_leaves_current_valid() {
-    let (jobs, secrets, value) = staged("stage").await;
+    let (jobs, secrets, value) = staged_unacknowledged("stage").await;
 
     assert_eq!(value.len(), 43);
     assert_eq!(secrets.get("forge.next.minted-for").as_deref(), Some(JOB));
@@ -623,6 +874,30 @@ async fn a_declaration_the_door_could_not_read_or_a_subject_it_does_not_name_is_
 // ----- the delivery firing -----
 
 #[tokio::test]
+async fn a_forged_deposit_label_without_an_authenticated_owner_receipt_promotes_nothing() {
+    let mut accepted = Vec::new();
+    for actor in [DEPOSIT_ACTOR, boss_jobs::runner_credential::ACTOR] {
+        let (jobs, secrets, value) = staged_unacknowledged("forged-label-no-owner").await;
+        *jobs.delivered_by.lock().unwrap() = Some(actor.into());
+        let before = secrets.writes();
+        let result = handler(&jobs, &secrets)
+            .invoke(&args(), &delivered(last_eight(&value)))
+            .await;
+        if result.is_ok() {
+            accepted.push(actor);
+        } else {
+            assert_eq!(secrets.writes(), before);
+            assert_eq!(secrets.get("forge.current").as_deref(), Some(OLD));
+            assert_ne!(jobs.status("revoke"), "completed");
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "typed completer labels are not host installation: {accepted:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_recorded_delivery_promotes_the_value_and_the_old_one_resolves_nothing() {
     let (jobs, secrets, value) = staged("promote").await;
     handler(&jobs, &secrets)
@@ -715,6 +990,7 @@ async fn a_promotion_the_mount_has_not_refreshed_is_not_yet_and_its_redelivery_f
     let writes = secrets.writes();
 
     secrets.propagate();
+    acknowledge(&jobs, &secrets, JOB, &value).await;
     h.invoke(&args(), &delivered(last_eight(&value)))
         .await
         .expect("the redelivery confirms");
@@ -741,6 +1017,7 @@ async fn the_first_rotation_of_a_host_promotes_over_nothing() {
     let h = handler(&jobs, &secrets);
     h.invoke(&args(), &scope()).await.expect("staged");
     let value = secrets.get("forge.next").unwrap();
+    acknowledge(&jobs, &secrets, JOB, &value).await;
     h.invoke(&args(), &delivered(last_eight(&value)))
         .await
         .expect("promoted");
@@ -767,6 +1044,7 @@ async fn a_delivery_whose_verify_never_landed_verifies_before_it_promotes() {
     // The scope firing's redeliveries ran out; the host's deposit proved
     // the value through the door later and recorded delivery.
     secrets.propagate();
+    acknowledge(&jobs, &secrets, JOB, &value).await;
     h.invoke(&args(), &delivered(last_eight(&value)))
         .await
         .expect("verified, then promoted");
@@ -813,6 +1091,7 @@ async fn review_a_second_stage_keeps_the_value_the_host_already_installed() {
     assert_eq!(door(&secrets, OLD), resolved("forge", "current"));
     assert_eq!(secrets.writes(), 2, "one merge-patch per stage");
 
+    acknowledge(&p2, &secrets, OTHER_JOB, &v2).await;
     // P2 completes: every value but v2 dies, the carried one included.
     handler(&p2, &secrets)
         .invoke(
@@ -845,6 +1124,402 @@ async fn review_a_second_stage_keeps_the_value_the_host_already_installed() {
     );
 }
 
+/// R1: a third stage can retire the value still installed on a host.
+/// The installed event must name that retirement without storing a secret.
+#[tokio::test]
+async fn a_third_stage_records_the_previous_value_it_drops() {
+    let (_p1, secrets, v1) = staged("third-stage-drop").await;
+    let p2 = jobs(secrets.dir.clone(), FRESH).await;
+    handler(&p2, &secrets)
+        .invoke(
+            &args(),
+            &ctx_for(OTHER_JOB, "credential-rotation", json!({})),
+        )
+        .await
+        .expect("second stage");
+    let v2 = secrets.get("forge.next").expect("second staged value");
+    let p3 = jobs(secrets.dir.clone(), FRESH).await;
+    handler(&p3, &secrets)
+        .invoke(
+            &args(),
+            &ctx_for(THIRD_JOB, "credential-rotation", json!({})),
+        )
+        .await
+        .expect("third stage");
+    assert_eq!(secrets.get("forge.previous"), Some(v2.clone()));
+    assert_eq!(
+        door(&secrets, &v1),
+        boss_jobs::runner_credential::Resolution::Unmatched
+    );
+    let rotations = p3.rotations.lock().unwrap();
+    let installed = rotations
+        .iter()
+        .find(|(phase, _)| phase == &format!("{CREDENTIAL}/installed"))
+        .expect("installed event");
+    assert_eq!(installed.1["dropped_previous"], last_eight(&v1));
+    assert_eq!(installed.1["carried_to_previous"], last_eight(&v2));
+    assert!(!serde_json::to_string(&installed.1).unwrap().contains(&v1));
+    assert!(!serde_json::to_string(&installed.1).unwrap().contains(&v2));
+}
+
+#[tokio::test]
+async fn a_lost_installed_post_replays_the_original_dropped_previous_observation() {
+    let (_p1, secrets, v1) = staged("lost-installed-original").await;
+    let p2 = jobs(secrets.dir.clone(), FRESH).await;
+    handler(&p2, &secrets)
+        .invoke(
+            &args(),
+            &ctx_for(OTHER_JOB, "credential-rotation", json!({})),
+        )
+        .await
+        .unwrap();
+    let v2 = secrets.get("forge.next").unwrap();
+    let p3 = jobs(secrets.dir.clone(), FRESH).await;
+    *p3.phase_fault.lock().unwrap() = Some("before:installed".into());
+    assert!(
+        handler(&p3, &secrets)
+            .invoke(
+                &args(),
+                &ctx_for(THIRD_JOB, "credential-rotation", json!({}))
+            )
+            .await
+            .is_err()
+    );
+    let v3 = secrets.get("forge.next").unwrap();
+    let writes = secrets.writes();
+    handler(&p3, &secrets)
+        .invoke(
+            &args(),
+            &ctx_for(THIRD_JOB, "credential-rotation", json!({})),
+        )
+        .await
+        .unwrap();
+    let attempts = p3.attempts.lock().unwrap();
+    let installed: Vec<_> = attempts
+        .iter()
+        .filter(|(phase, _)| phase.ends_with("/installed"))
+        .collect();
+    assert_eq!(
+        installed.len(),
+        2,
+        "Secret commit does not prove the refused phase POST committed"
+    );
+    assert_eq!(
+        installed[0].1, installed[1].1,
+        "replay the complete original command"
+    );
+    assert_eq!(installed[1].1["dropped_previous"], last_eight(&v1));
+    assert_eq!(installed[1].1["carried_to_previous"], last_eight(&v2));
+    assert_eq!(secrets.get("forge.next"), Some(v3));
+    assert_eq!(
+        secrets.writes(),
+        writes,
+        "redelivery never remints or rewrites slots"
+    );
+    assert_eq!(p3.status("install"), "completed");
+}
+
+#[tokio::test]
+async fn promotion_done_replays_original_old_and_carried_history_after_restart() {
+    let (jobs, secrets, value) = staged("promotion-original-history").await;
+    *jobs.phase_fault.lock().unwrap() = Some("before:revoked".into());
+    assert!(
+        handler(&jobs, &secrets)
+            .invoke(&args(), &delivered(last_eight(&value)))
+            .await
+            .is_err()
+    );
+    let writes = secrets.writes();
+    handler(&jobs, &secrets)
+        .invoke(&args(), &delivered(last_eight(&value)))
+        .await
+        .unwrap();
+    let attempts = jobs.attempts.lock().unwrap();
+    let revoked: Vec<_> = attempts
+        .iter()
+        .filter(|(phase, _)| phase.ends_with("/revoked"))
+        .collect();
+    assert_eq!(revoked.len(), 2);
+    assert_eq!(
+        revoked[0].1, revoked[1].1,
+        "Promotion::Done must preserve the original full command"
+    );
+    assert_eq!(revoked[1].1["old_last_eight"], last_eight(OLD));
+    assert_eq!(secrets.writes(), writes, "restart does not promote twice");
+    assert_eq!(jobs.status("revoke"), "completed");
+}
+
+#[tokio::test]
+async fn a_success_status_without_the_original_owner_receipt_never_completes_issue() {
+    let secrets = MountedSecret::new("missing-owner-receipt");
+    let jobs = jobs(secrets.dir.clone(), FRESH).await;
+    *jobs.missing_receipt.lock().unwrap() = true;
+    assert!(
+        handler(&jobs, &secrets)
+            .invoke(&args(), &scope())
+            .await
+            .is_err(),
+        "silence is not an owner receipt"
+    );
+    assert_ne!(jobs.status("issue"), "completed");
+}
+
+#[tokio::test]
+async fn a_superseded_unacknowledged_candidate_is_refused_instead_of_reminted() {
+    let secrets = MountedSecret::new("superseded-unacknowledged");
+    let p1 = jobs(secrets.dir.clone(), FRESH).await;
+    *p1.phase_fault.lock().unwrap() = Some("before:installed".into());
+    assert!(
+        handler(&p1, &secrets)
+            .invoke(&args(), &scope())
+            .await
+            .is_err()
+    );
+    let p2 = jobs(secrets.dir.clone(), FRESH).await;
+    handler(&p2, &secrets)
+        .invoke(
+            &args(),
+            &ctx_for(OTHER_JOB, "credential-rotation", json!({})),
+        )
+        .await
+        .unwrap();
+    let next = secrets.get("forge.next");
+    let writes = secrets.writes();
+    assert!(
+        handler(&p1, &secrets)
+            .invoke(&args(), &scope())
+            .await
+            .is_err(),
+        "unknown original effect must remain pending"
+    );
+    assert_eq!(
+        secrets.writes(),
+        writes,
+        "redelivery cannot silently start a new attempt"
+    );
+    assert_eq!(secrets.get("forge.next"), next);
+    assert_ne!(p1.status("install"), "completed");
+}
+
+#[tokio::test]
+async fn lost_secret_ack_and_committed_phase_ack_are_read_back_without_duplicate_effects() {
+    let secrets = MountedSecret::new("lost-secret-and-phase-acks");
+    let jobs = jobs(secrets.dir.clone(), FRESH).await;
+    *secrets.lost_write_ack.lock().unwrap() = true;
+    assert!(
+        handler(&jobs, &secrets)
+            .invoke(&args(), &scope())
+            .await
+            .is_err()
+    );
+    let candidate = secrets.get("forge.next").unwrap();
+    assert!(
+        jobs.phases().is_empty(),
+        "a lost Secret acknowledgment is not a claimed completed mint"
+    );
+    *jobs.phase_fault.lock().unwrap() = Some("after:installed".into());
+    assert!(
+        handler(&jobs, &secrets)
+            .invoke(&args(), &scope())
+            .await
+            .is_err()
+    );
+    assert_ne!(jobs.status("install"), "completed");
+    handler(&jobs, &secrets)
+        .invoke(&args(), &scope())
+        .await
+        .unwrap();
+    assert_eq!(secrets.get("forge.next"), Some(candidate.clone()));
+    assert_eq!(
+        secrets.writes(),
+        1,
+        "readback and receipt replay never mint or install twice"
+    );
+    assert_eq!(
+        jobs.phases(),
+        [
+            format!("{CREDENTIAL}/minted"),
+            format!("{CREDENTIAL}/installed"),
+            format!("{CREDENTIAL}/verified")
+        ]
+    );
+    acknowledge(&jobs, &secrets, JOB, &candidate).await;
+    *secrets.lost_write_ack.lock().unwrap() = true;
+    assert!(
+        handler(&jobs, &secrets)
+            .invoke(&args(), &delivered(last_eight(&candidate)))
+            .await
+            .is_err()
+    );
+    *jobs.phase_fault.lock().unwrap() = Some("after:revoked".into());
+    assert!(
+        handler(&jobs, &secrets)
+            .invoke(&args(), &delivered(last_eight(&candidate)))
+            .await
+            .is_err()
+    );
+    handler(&jobs, &secrets)
+        .invoke(&args(), &delivered(last_eight(&candidate)))
+        .await
+        .unwrap();
+    assert_eq!(
+        secrets.writes(),
+        2,
+        "promotion with lost acknowledgment is not repeated"
+    );
+    assert_eq!(
+        jobs.phases()
+            .iter()
+            .filter(|phase| phase.ends_with("/revoked"))
+            .count(),
+        1
+    );
+    assert_eq!(jobs.status("revoke"), "completed");
+    for value in [OLD, candidate.as_str()] {
+        assert!(!jobs.everything_written().contains(value));
+    }
+}
+
+#[tokio::test]
+async fn malformed_foreign_missing_and_changed_uid_witnesses_never_promote() {
+    for (field, value) in [
+        ("job_id", json!(OTHER_JOB)),
+        ("uid", json!("replacement-uid")),
+        ("credential_id", json!("foreign")),
+        ("commands", json!({})),
+        ("version", json!(2)),
+    ] {
+        let (jobs, secrets, candidate) = staged(&format!("refused-witness-{field}")).await;
+        let key = witness_key(HOST, JOB);
+        let mut witness: JsonValue = serde_json::from_str(&secrets.get(&key).unwrap()).unwrap();
+        witness[field] = value;
+        secrets.seed(&key, &serde_json::to_string(&witness).unwrap());
+        let before = secrets.writes();
+        assert!(
+            handler(&jobs, &secrets)
+                .invoke(&args(), &delivered(last_eight(&candidate)))
+                .await
+                .is_err()
+        );
+        assert_eq!(secrets.writes(), before);
+        assert_eq!(door(&secrets, OLD), resolved(HOST, "current"));
+        assert_ne!(jobs.status("revoke"), "completed");
+    }
+    for damaged in ["", "not-json"] {
+        let (jobs, secrets, candidate) = staged("missing-malformed-witness").await;
+        secrets.seed(&witness_key(HOST, JOB), damaged);
+        let before = secrets.writes();
+        assert!(
+            handler(&jobs, &secrets)
+                .invoke(&args(), &delivered(last_eight(&candidate)))
+                .await
+                .is_err()
+        );
+        assert_eq!(secrets.writes(), before);
+    }
+}
+
+#[tokio::test]
+async fn malformed_original_phase_commands_refuse_before_the_first_owner_post() {
+    let secrets = MountedSecret::new("malformed-original-command");
+    let jobs = jobs(secrets.dir.clone(), FRESH).await;
+    *secrets.lost_write_ack.lock().unwrap() = true;
+    assert!(
+        handler(&jobs, &secrets)
+            .invoke(&args(), &scope())
+            .await
+            .is_err()
+    );
+    let key = witness_key(HOST, JOB);
+    let mut witness: JsonValue = serde_json::from_str(&secrets.get(&key).unwrap()).unwrap();
+    witness["commands"]["installed"]["secret_uid"] = JsonValue::Null;
+    secrets.seed(&key, &serde_json::to_string(&witness).unwrap());
+    assert!(
+        handler(&jobs, &secrets)
+            .invoke(&args(), &scope())
+            .await
+            .is_err(),
+        "malformed command cannot become an original owner fact"
+    );
+    assert!(jobs.phases().is_empty());
+    assert_ne!(jobs.status("install"), "completed");
+}
+
+#[tokio::test]
+async fn distinct_registered_stage_and_delivery_actors_converge_without_impersonating_each_other() {
+    let rule_name = |path: &str| {
+        let raw = std::fs::read_to_string(boss_testing::repo_root().join(path)).unwrap();
+        let rule: toml::Value = toml::from_str(&raw).unwrap();
+        rule["rule"][0]["name"].as_str().unwrap().to_string()
+    };
+    let stage_rule =
+        rule_name("infra/dispatcher/rules/broker-rotates-the-forge-ops-runner-credential.toml");
+    let delivery_rule = rule_name(
+        "infra/dispatcher/rules/broker-promotes-the-forge-ops-runner-credential-on-delivery.toml",
+    );
+    assert_ne!(
+        stage_rule, delivery_rule,
+        "actual registry actors are distinct"
+    );
+    let secrets = MountedSecret::new("actual-distinct-registry-actors");
+    secrets.seed("forge.current", OLD);
+    secrets.lag(true);
+    let jobs = jobs(secrets.dir.clone(), FRESH).await;
+    let mut stage = scope();
+    stage.rule_name = stage_rule;
+    assert!(
+        handler(&jobs, &secrets)
+            .invoke(&args(), &stage)
+            .await
+            .is_err()
+    );
+    assert_eq!(jobs.status("install"), "completed");
+    assert_ne!(jobs.status("verify"), "completed");
+    let candidate = secrets.get("forge.next").unwrap();
+    secrets.propagate();
+    acknowledge(&jobs, &secrets, JOB, &candidate).await;
+    let mut delivery = delivered(last_eight(&candidate));
+    delivery.rule_name = delivery_rule;
+    handler(&jobs, &secrets)
+        .invoke(&args(), &delivery)
+        .await
+        .expect("delivery's real actor converges its own observations");
+    assert_eq!(jobs.status("revoke"), "completed");
+}
+
+#[tokio::test]
+async fn promotion_records_an_existing_previous_value_even_when_stage_had_no_next() {
+    let secrets = MountedSecret::new("previous-without-next");
+    secrets.seed("forge.current", OLD);
+    secrets.seed("forge.previous", LEFT);
+    let jobs = jobs(secrets.dir.clone(), FRESH).await;
+    handler(&jobs, &secrets)
+        .invoke(&args(), &scope())
+        .await
+        .unwrap();
+    let candidate = secrets.get("forge.next").unwrap();
+    acknowledge(&jobs, &secrets, JOB, &candidate).await;
+    handler(&jobs, &secrets)
+        .invoke(&args(), &delivered(last_eight(&candidate)))
+        .await
+        .unwrap();
+    let phases = jobs.rotations.lock().unwrap();
+    let revoked = &phases
+        .iter()
+        .find(|(phase, _)| phase.ends_with("/revoked"))
+        .unwrap()
+        .1;
+    assert_eq!(
+        revoked["carried_last_eight"],
+        last_eight(LEFT),
+        "all retired original candidates remain in the record"
+    );
+    assert_eq!(
+        door(&secrets, LEFT),
+        boss_jobs::runner_credential::Resolution::Unmatched
+    );
+}
+
 /// N2. The promotion kills the old value, so it believes a delivery only
 /// from the deposit that proved the new one on the host: a `delivered`
 /// step completed by hand — its last eight is printed on the install
@@ -867,10 +1542,27 @@ async fn a_delivery_completed_by_anyone_but_the_deposit_promotes_nothing() {
     assert_ne!(jobs.status("revoke"), "completed");
 }
 
-/// The actor the promotion believes is the one the deposit signs as — one
-/// fact in the handler and the host script (CLAUDE.md §9a).
+/// R4: the checkout-token deposit is a different executor. Sharing its
+/// actor lets its completion pass the runner-delivery attribution check.
+#[tokio::test]
+async fn the_checkout_token_deposit_cannot_attest_runner_delivery() {
+    let (jobs, secrets, value) = staged("checkout-actor").await;
+    *jobs.delivered_by.lock().unwrap() = Some("automation:credential-deposit".into());
+    let before = secrets.writes();
+    let err = handler(&jobs, &secrets)
+        .invoke(&args(), &delivered(last_eight(&value)))
+        .await
+        .expect_err("checkout-token deposit is not the runner deposit");
+    assert!(err.is_permanent(), "{err}");
+    assert_eq!(secrets.writes(), before);
+    assert_eq!(door(&secrets, OLD), resolved("forge", "current"));
+    assert_ne!(jobs.status("revoke"), "completed");
+}
+
+/// The registered client attribution remains conserved. The resolver and
+/// original owner receipt independently establish promotion authority.
 #[test]
-fn the_deposit_signs_as_the_actor_the_promotion_believes() {
+fn the_deposit_preserves_its_registered_client_attribution() {
     let script = std::fs::read_to_string(
         boss_testing::repo_root().join("infra/forge/runner-credential-deposit.sh"),
     )
@@ -879,4 +1571,150 @@ fn the_deposit_signs_as_the_actor_the_promotion_believes() {
         script.contains(&format!("\\\"id\\\":\\\"{DEPOSIT_ACTOR}\\\"")),
         "runner-credential-deposit.sh must sign its x-boss-user as {DEPOSIT_ACTOR}"
     );
+}
+
+#[test]
+fn the_registered_runner_deposit_matches_its_client_attribution() {
+    let text = std::fs::read_to_string(
+        boss_testing::repo_root().join("infra/platform/automations/runner-credential-deposit.toml"),
+    )
+    .expect("the runner deposit registration");
+    let document: toml::Value = toml::from_str(&text).expect("valid automation TOML");
+    let rows = document["automation"].as_array().expect("automation rows");
+    assert_eq!(rows.len(), 1, "exactly one runner deposit registration");
+    assert_eq!(
+        rows[0]["id"].as_str(),
+        Some(DEPOSIT_ACTOR),
+        "registered runner deposit must match client attribution"
+    );
+}
+
+// ----- the broker-stage token (design 6e28ed42) -----
+
+const STAGE_TOKEN: &str = "fake.projected-stage-token.not-a-real-signature";
+
+fn presenting(
+    jobs: &Jobs,
+    secrets: &Arc<MountedSecret>,
+    token_file: &std::path::Path,
+) -> Arc<CredentialRotateOpsRunner> {
+    CredentialRotateOpsRunner::with_stage_token(
+        jobs.url.clone(),
+        secrets.clone(),
+        NO_WAIT,
+        Some(token_file.to_path_buf()),
+    )
+}
+
+/// The inactive behaviour this car must not change: with no token file
+/// named — every deployment today — no phase post carries the header and
+/// the phases are recorded under the rule's label, as before.
+#[tokio::test]
+async fn without_a_token_file_no_phase_presents_a_stage_token() {
+    let (jobs, _secrets, _value) = staged_unacknowledged("stage-token-off").await;
+    let presented = jobs.stage_tokens.lock().unwrap().clone();
+    assert_eq!(presented, vec![None, None, None]);
+}
+
+#[tokio::test]
+async fn a_named_token_file_is_presented_on_every_phase_and_read_again_each_time() {
+    let secrets = MountedSecret::new("stage-token-on");
+    secrets.seed("forge.current", OLD);
+    let token_file = boss_testing::scratch_dir("broker-stage-token-file").join("token");
+    boss_testing::write_file(&token_file, &format!("{STAGE_TOKEN}\n"));
+    let jobs = jobs(secrets.dir.clone(), FRESH).await;
+    presenting(&jobs, &secrets, &token_file)
+        .invoke(&args(), &scope())
+        .await
+        .expect("staged: the owner's receipts name the workload actor");
+    for slug in ["issue", "install", "verify"] {
+        assert_eq!(jobs.status(slug), "completed", "{slug}");
+    }
+    assert_eq!(
+        *jobs.stage_tokens.lock().unwrap(),
+        vec![Some(STAGE_TOKEN.to_owned()); 3],
+        "minted, installed and verified each present the projected token"
+    );
+
+    // Kubelet rotates the projected file; the promotion reads it afresh.
+    let value = secrets.get("forge.next").expect("a value staged");
+    acknowledge(&jobs, &secrets, JOB, &value).await;
+    let rotated = format!("{STAGE_TOKEN}.rotated");
+    boss_testing::write_file(&token_file, &rotated);
+    presenting(&jobs, &secrets, &token_file)
+        .invoke(&args(), &delivered(last_eight(&value)))
+        .await
+        .expect("promoted");
+    assert_eq!(jobs.status("revoke"), "completed");
+    assert_eq!(
+        jobs.stage_tokens.lock().unwrap().last().cloned().flatten(),
+        Some(rotated)
+    );
+    let written = jobs.everything_written();
+    assert!(
+        !written.contains(STAGE_TOKEN),
+        "the token reached the record"
+    );
+}
+
+/// Fail closed BEFORE anything is minted: a stage that was told to
+/// present a token and cannot read one never falls back to the label.
+#[tokio::test]
+async fn a_named_token_file_that_cannot_be_presented_mints_nothing() {
+    for (name, content) in [
+        ("absent", None),
+        ("empty", Some(String::new())),
+        ("blank", Some("  \n".to_owned())),
+        ("oversized", Some("a".repeat(9000))),
+        ("two-lines", Some(format!("{STAGE_TOKEN}\nsecond-line"))),
+    ] {
+        let secrets = MountedSecret::new(&format!("stage-token-{name}"));
+        secrets.seed("forge.current", OLD);
+        let token_file = boss_testing::scratch_dir("broker-stage-token-file").join("token");
+        if let Some(content) = &content {
+            boss_testing::write_file(&token_file, content);
+        }
+        let jobs = jobs(secrets.dir.clone(), FRESH).await;
+        let error = presenting(&jobs, &secrets, &token_file)
+            .invoke(&args(), &scope())
+            .await
+            .expect_err(name);
+        let said = format!("{error:?}");
+        assert!(said.contains("broker-stage token"), "{name}: {said}");
+        assert!(
+            !said.contains(STAGE_TOKEN),
+            "{name}: the error carries the token"
+        );
+        assert_eq!(
+            secrets.get("forge.next"),
+            None,
+            "{name}: a value was minted"
+        );
+        assert!(jobs.phases().is_empty(), "{name}");
+        assert!(jobs.stage_tokens.lock().unwrap().is_empty(), "{name}");
+    }
+}
+
+/// The workload token travels no further than the estate token does: a
+/// jobs URL that is not one of the estate's own hosts gets neither.
+#[test]
+fn the_stage_token_is_withheld_from_a_host_that_is_not_the_estates() {
+    let token_file = boss_testing::scratch_dir("broker-stage-token-host").join("token");
+    boss_testing::write_file(&token_file, STAGE_TOKEN);
+    let secrets = MountedSecret::new("stage-token-host");
+    let to = |url: &str| {
+        CredentialRotateOpsRunner::with_stage_token(
+            url.to_owned(),
+            secrets.clone(),
+            NO_WAIT,
+            Some(token_file.clone()),
+        )
+        .stage_token()
+    };
+    assert!(matches!(to("http://127.0.0.1:7900"), Ok(Some(header)) if header.is_sensitive()));
+    for url in ["http://jobs.not-the-estate.example:7900", "not a url"] {
+        let said = format!("{:?}", to(url).expect_err(url));
+        assert!(said.contains("not one of the estate's own hosts"), "{said}");
+        assert!(!said.contains(STAGE_TOKEN), "{said}");
+    }
 }

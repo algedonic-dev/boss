@@ -197,7 +197,30 @@ async fn main() -> Result<()> {
         info!("sim_clock DB refresher running (2s cadence)");
     }
 
-    let app = router(state);
+    let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+        boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+        Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+    ));
+    let mode = Arc::new(boss_policy_client::role_reader::MountedReportMode::mount());
+    let source = Arc::new(boss_policy_client::role_reader::HttpRoleReader::new(
+        std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
+        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
+        boss_policy_client::User::service("clock"),
+    )?);
+    let wiring = boss_policy_client::role_service::assemble(
+        "clock",
+        "/api/clock/actor-role-reports",
+        Arc::new(boss_policy_client::ReqwestPolicyClient::new(
+            "clock",
+            std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
+        )),
+        roles.clone(),
+        mode.clone(),
+        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
+            boss_policy_client::role_service::REPORT_CAPACITY,
+        )),
+    );
+    let app = clock_http_router(router(state), wiring.inventory);
 
     let bind: SocketAddr = cli
         .http_bind
@@ -208,7 +231,16 @@ async fn main() -> Result<()> {
         .with_context(|| format!("binding HTTP listener on {bind}"))?;
     info!(addr = %bind, "boss-clock-api listening");
     let app = boss_core::machine_gate::mount(app, "clock", &["/api/clock/health"], recorder);
-    axum::serve(listener, app).await?;
+    boss_policy_client::role_service::serve_with_refresh(
+        listener,
+        app,
+        roles,
+        source,
+        mode,
+        boss_policy_client::role_service::REFRESH_CADENCE,
+        boss_policy_client::role_service::shutdown_signal(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -240,5 +272,120 @@ mod tests {
         let cli = Cli::try_parse_from(["boss-clock-api", "--http-bind", "127.0.0.1:1"]).unwrap();
         unsafe { std::env::remove_var("BOSS_CLOCK_HTTP_BIND") };
         assert_eq!(cli.http_bind, "127.0.0.1:1");
+    }
+}
+
+fn clock_http_router(domain: axum::Router, inventory: axum::Router) -> axum::Router {
+    domain.merge(inventory)
+}
+
+#[cfg(test)]
+mod role_inventory_tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use boss_policy_client::{Action, FakePolicyClient, Resource, Scope, User};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn clock_mount_preserves_domain_and_protects_inventory() {
+        let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+            boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+            Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+        ));
+        let tally = Arc::new(boss_policy_client::role_reporting::ReportTally::new(8));
+        let policy = Arc::new(
+            FakePolicyClient::builder()
+                .allow(
+                    "report-reader",
+                    Action::Read,
+                    Resource::policy_rule(),
+                    Scope::All,
+                )
+                .build(),
+        );
+        let wiring = boss_policy_client::role_service::assemble(
+            "clock",
+            "/api/clock/actor-role-reports",
+            policy,
+            roles,
+            Arc::new(boss_policy_client::role_reporting::ReportMode::Report),
+            tally.clone(),
+        );
+        let app = clock_http_router(
+            router(ClockApiState {
+                mode: ClockMode::Wall,
+                params: Arc::new(RwLock::new(None)),
+                pool: None,
+            }),
+            wiring.inventory,
+        );
+        let domain = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/clock/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(domain.status(), StatusCode::OK);
+        let health: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(domain.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(health["status"], "ok");
+        assert_eq!(health["mode"], "wall");
+        let pause = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/clock/pause")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pause.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/clock/actor-role-reports")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let mut user = User::service("reader");
+        user.role = "report-reader".into();
+        let allowed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/clock/actor-role-reports")
+                    .header("x-boss-user", serde_json::to_string(&user).unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(allowed.into_body(), 16384)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["service"], "clock");
+        assert_eq!(body["snapshot"]["state"], "never-loaded");
+        assert_eq!(body["report"]["durable_window"], false);
+        assert!(tally.snapshot().rows.is_empty());
     }
 }

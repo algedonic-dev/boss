@@ -73,19 +73,19 @@
 [[road]]
 id = "dev-door-anywhere"
 title = "The dev workspace, from anywhere — try this door first"
-needs = { host = { file = "apps/web/src/it/estate/dev-door.json", key = "host" } }
+needs = { host = { file = "infra/estate/dev-door.json", key = "host" } }
 
 [[road.line]]
 prose = "Needs a laptop with a browser and ssh. Nothing long-lived is stored on the laptop: the edge issues a certificate for the session."
 
 [[road.line]]
 label = "Workspace host"
-file = "apps/web/src/it/estate/dev-door.json"
+file = "infra/estate/dev-door.json"
 key = "host"
 
 [[road.line]]
 label = "Client setup, in order (the first two once per machine)"
-file = "apps/web/src/it/estate/dev-door.json"
+file = "infra/estate/dev-door.json"
 key = "steps"
 fields = ["what", "command", "why"]
 

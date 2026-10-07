@@ -716,15 +716,35 @@ fn a_run_holds_its_liveness_lock_and_empties_its_workspace_at_exit() {
     // pre-seed manifest /gate-target is the shared PVC whose `cargo/`
     // crate cache the skew guard deliberately keeps, and an unkeyed EXIT
     // trap emptying /gate-target would delete it on every run.
+    let exit_traps: Vec<_> = sh
+        .lines()
+        .filter(|line| line.trim_start().starts_with("trap ") && line.ends_with(" EXIT"))
+        .collect();
     assert_eq!(
-        sh.matches("trap 'empty_workspace' EXIT").count(),
+        exit_traps.len(),
         1,
         "the workspace is emptied at exit, from one place"
     );
+    let exit_trap = exit_traps[0].trim();
+    assert_eq!(
+        exit_trap, "trap 'retain_runtime_raw; empty_workspace' EXIT",
+        "the single EXIT trap retains the raw journal before emptying the workspace"
+    );
+    let execution = std::process::Command::new("bash")
+        .args([
+            "-c",
+            &format!(
+                "retain_runtime_raw() {{ printf 'retain\\n'; }}\nempty_workspace() {{ printf 'cleanup\\n'; }}\n{exit_trap}\n"
+            ),
+        ])
+        .output()
+        .unwrap();
+    assert!(execution.status.success());
+    assert_eq!(execution.stdout, b"retain\ncleanup\n");
     let key = sh
         .find("if [ \"${GATE_DISK:-}\" = required ]; then")
         .expect("the gate-volume layout is keyed on GATE_DISK=required");
-    let trap = sh.find("trap 'empty_workspace' EXIT").unwrap();
+    let trap = sh.find(exit_trap).unwrap();
     let block_end = sh[key..].find("\nfi").map(|i| i + key).unwrap();
     assert!(
         key < trap && trap < block_end,

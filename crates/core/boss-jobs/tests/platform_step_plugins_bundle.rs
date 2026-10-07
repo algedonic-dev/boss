@@ -21,7 +21,9 @@
 //! (brief, launch, attribution) served only the used-device-shop
 //! tenant's `marketing-motion` and were retired with its launch
 //! calendar on 2026-09-24 (design 2ea444f5, backlog a8991c86), so nine
-//! remain. A plugin added later is a file dropped in, a JS bundle
+//! remained. Three unused declarations were withdrawn under946ebca5;
+//! their historical JS stays readable, and the used incident-review remains.
+//! A plugin added later is a file dropped in, a JS bundle
 //! beside the others, and a line here.
 
 use boss_jobs::seed_loader::{bundle_files, load_step_plugins};
@@ -29,8 +31,78 @@ use boss_jobs::step_plugin_seed::{platform_step_plugins_path, step_plugin_js_pat
 use boss_jobs::{StepPluginRegistry, StepPluginSpec};
 use std::path::Path;
 
+#[path = "support/withdrawn_plugins.rs"]
+mod withdrawn_plugins;
+
 fn bundle() -> Vec<StepPluginSpec> {
     load_step_plugins(platform_step_plugins_path()).expect("the platform step-plugin bundle parses")
+}
+
+/// Withdrawing a declaration stops fresh seeds, while retired versions and
+/// their bundles remain readable. It never retires the live registry by itself.
+#[tokio::test]
+async fn unused_plugin_declarations_do_not_seed_new_surfaces_or_erase_history() {
+    use boss_core::actor::ActorId;
+    use boss_jobs::registry::WorkflowStatus;
+    use boss_jobs::step_plugin_seed::seed_step_plugins;
+
+    let actor = ActorId::Automation("platform-workflow-seed".into());
+    let now = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
+    let fresh = boss_jobs::InMemoryStepPlugins::new();
+    seed_step_plugins(&fresh, &bundle(), &actor, now, false)
+        .await
+        .unwrap();
+    let existing = boss_jobs::InMemoryStepPlugins::new();
+    for historical in withdrawn_plugins::declarations() {
+        let kind = historical.kind.clone();
+        assert!(
+            fresh.get_active(&kind).await.is_err(),
+            "{kind} must not reappear on a fresh seed"
+        );
+        let historical = existing
+            .publish_declared(historical, &actor, now)
+            .await
+            .unwrap();
+        seed_step_plugins(&existing, &bundle(), &actor, now, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            existing.get_active(&kind).await.unwrap(),
+            historical,
+            "seed withdrawal is not authorization to retire a live row"
+        );
+        let events = existing.recorded_events().len();
+        existing.retire(&kind, &actor, now).await.unwrap();
+        assert_eq!(existing.recorded_events().len(), events + 1);
+        let retired = existing
+            .get_version(&kind, historical.version)
+            .await
+            .unwrap();
+        assert_eq!(retired.frontend_url, historical.frontend_url);
+        assert_eq!(retired.status, WorkflowStatus::Retired);
+        assert!(
+            !std::fs::read(step_plugin_js_path(&retired.frontend_url))
+                .unwrap()
+                .is_empty(),
+            "a pinned historical version must retain its readable bundle"
+        );
+        existing.retire(&kind, &actor, now).await.unwrap();
+        assert_eq!(existing.recorded_events().len(), events + 1);
+    }
+    let incident = fresh.get_active("incident-review").await.unwrap();
+    let workflows = boss_jobs::seed_loader::load_workflows(
+        Path::new(platform_step_plugins_path())
+            .parent()
+            .unwrap()
+            .join("workflows/incident.toml"),
+    )
+    .unwrap();
+    assert!(
+        workflows
+            .iter()
+            .any(|w| w.steps.iter().any(|s| s.kind == incident.kind)),
+        "the now-used incident surface must remain declared"
+    );
 }
 
 /// One plugin per file, and the file is named for its kind, so `ls`
@@ -56,20 +128,11 @@ fn the_bundle_is_one_file_per_kind() {
     }
     let mut kinds: Vec<String> = bundle().into_iter().map(|s| s.kind).collect();
     kinds.sort();
+    kinds.dedup();
     assert_eq!(
-        kinds,
-        [
-            "answer-question",
-            "checklist",
-            "correction-verdict",
-            "diagnostic-call",
-            "incident-review",
-            "review-design",
-            "scope-declaration",
-            "sign-off",
-            "sr-triage",
-        ],
-        "the nine platform step plugins the migrations leave active, and no other"
+        kinds.len(),
+        files.len(),
+        "the directory is the declared roster"
     );
 }
 

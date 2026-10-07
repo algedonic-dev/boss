@@ -134,8 +134,9 @@
   // with the catalog: /ux/support was gated on 'shipping' (backlog
   // f9b43965). A surface without a `module` in the catalog is
   // always-on, as it always was.
+  let requiredModule = $derived(moduleForRoute(route));
   let blockedModule = $derived.by(() => {
-    const req = moduleForRoute(route);
+    const req = requiredModule;
     if (req && !moduleEnabled(req.id)) return req;
     return null;
   });
@@ -273,7 +274,14 @@
 {:else}
   <PerspectiveTabs active={perspective} {apps} searchAppKinds={appKinds} />
 <AppShell {activeSection} {perspective}>
-  {#if blockedModule}
+  {#if requiredModule && manifest.value.kind === 'loading'}
+    <p role="status">Loading tenant manifest…</p>
+  {:else if requiredModule && manifest.value.kind === 'error'}
+    <section aria-label="Tenant manifest unavailable">
+      <p role="alert">Couldn't load tenant manifest. Module availability is unknown.</p>
+      <button onclick={() => loadManifest()}>Retry tenant manifest</button>
+    </section>
+  {:else if blockedModule}
     <ModuleDisabled module={blockedModule.id} label={blockedModule.label} />
   {:else if route.kind === 'home'}
       <LandingPage />
@@ -324,6 +332,9 @@
         <JobsListPage
           initialKind={route.workflow ?? ''}
           initialKindPrefix={route.workflowPrefix ?? ''}
+          initialKindGroup={route.jobKindGroup ?? ''}
+          initialOrder={route.jobOrder ?? 'newest'}
+          initialDepartmentFilter={route.jobDepartment ?? ''}
           initialStatus={route.jobStatus ?? JOBS_DEFAULT_STATUS}
           initialOwnerId={route.jobOwnerId ?? ''}
           initialSubjectId={route.jobSubjectId ?? ''}

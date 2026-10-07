@@ -76,6 +76,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # reqwest's `From<http::Response>` (backlog f13c719e). Already in the
 # tree as reqwest's own dependency; this names it.
 http = "1"
+# The per-probe Unix reader door uses the same HTTP parser as services.
+axum = { workspace = true }
 # `boss attach` states the file store's body limit from the constant the
 # content-api's route applies (UPLOAD_BODY_LIMIT_BYTES), not a copy of
 # it; its tests serve that REAL router over in-memory adapters.
@@ -123,7 +125,6 @@ boss-jobs = { path = "../../core/boss-jobs", features = ["postgres"] }
 # TestDb and point the loop's I/O at it — the same wire, handler and
 # adapter production runs, not a lookalike. axum is test-only: the
 # shipped binary is an HTTP client of that surface, never a server.
-axum = { workspace = true }
 # The fresh-instance seed proof (backlog 0d2d7daa) serves the REAL
 # people and policy routers over one empty TestDb and runs the shipped
 # `boss tenant publish` and the operator-baseline seed against them.

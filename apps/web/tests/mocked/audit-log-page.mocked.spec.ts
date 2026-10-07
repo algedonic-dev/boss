@@ -1,3 +1,4 @@
+import { isPageWrite, pageWrites } from './_smokeMocks';
 // /it/operate/audit — the Audit Log (catalogued as "Monitoring"), pinned
 // control by control. Page audit 65a273d5, step `test`.
 //
@@ -90,7 +91,7 @@ function watch(page: Page): Seen {
     else if (FILES.test(url)) seen.files.push(url);
     // The chrome records every route open with a fire-and-forget POST;
     // that is the shell's write, not this page's.
-    if (r.method() !== 'GET' && url.includes('/api/') && !url.includes('/api/surface-opens')) {
+    if (isPageWrite(r.method(), new URL(url).pathname)) {
       seen.writes.push(`${r.method()} ${url}`);
     }
   });
@@ -833,7 +834,7 @@ test.describe('/it/operate/audit — writes', () => {
     // write any of them opened is in it already. It slept 500 ms and read
     // Playwright's request events until backlog 840c5a76. The chrome's
     // route-open POST is the shell's write, not this page's.
-    const writes = (await openedRequests(page)).filter((e) => e.method !== 'GET' && e.path !== '/api/surface-opens');
+    const writes = pageWrites(await openedRequests(page));
     expect(writes.map((e) => `${e.method} ${e.url}`)).toEqual([]);
   });
 });

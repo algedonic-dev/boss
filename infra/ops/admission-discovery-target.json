@@ -1,0 +1,12 @@
+{
+  "policy": "break-glass-operator-image-only",
+  "binding": "break-glass-operator-image-only",
+  "namespace": "boss",
+  "user": "system:serviceaccount:boss:break-glass-operator",
+  "groups": ["system:serviceaccounts", "system:serviceaccounts:boss", "system:authenticated"],
+  "requests": [
+    {"group": "apps", "resource": "deployments", "verb": "patch"},
+    {"group": "apps", "resource": "statefulsets", "verb": "patch"}
+  ],
+  "stages": ["ResponseComplete"]
+}

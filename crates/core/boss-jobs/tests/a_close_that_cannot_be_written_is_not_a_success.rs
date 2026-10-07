@@ -78,7 +78,7 @@ fn admin_header() -> String {
 }
 
 fn app() -> (axum::Router, Arc<InMemoryJobs>) {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds
         .seed(one_step_spec("closes-by-catch-all", None))
         .expect("seed the catch-all kind");

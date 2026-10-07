@@ -1155,6 +1155,7 @@ pub(super) async fn get_tax_filing(
 struct TaxLiabilityRow {
     account_code: String,
     account_name: String,
+    account_description: Option<String>,
     balance_cents: i64,
 }
 
@@ -1170,8 +1171,8 @@ struct TaxLiabilitySummaryResponse {
 pub(super) async fn tax_liability_summary(State(state): State<Arc<LedgerApiState>>) -> Response {
     let as_of = boss_clock_client::now_from(&state.clock).await.date_naive();
 
-    let rows_result: Result<Vec<(String, String, i64, i64)>, _> = sqlx::query_as(
-        "SELECT a.code, a.name, \
+    let rows_result: Result<Vec<(String, String, Option<String>, i64, i64)>, _> = sqlx::query_as(
+        "SELECT a.code, a.name, a.description, \
                 COALESCE(SUM(l.debit_cents), 0)::bigint, \
                 COALESCE(SUM(l.credit_cents), 0)::bigint \
          FROM gl_accounts a \
@@ -1179,7 +1180,7 @@ pub(super) async fn tax_liability_summary(State(state): State<Arc<LedgerApiState
          LEFT JOIN gl_journal_entries e ON e.id = l.journal_entry_id \
          WHERE a.code IN ('2150', '2300', '2310') \
            AND (e.posted_on IS NULL OR e.posted_on <= $1) \
-         GROUP BY a.code, a.name \
+         GROUP BY a.code, a.name, a.description \
          ORDER BY a.code",
     )
     .bind(as_of)
@@ -1192,9 +1193,10 @@ pub(super) async fn tax_liability_summary(State(state): State<Arc<LedgerApiState
     };
     let liabilities: Vec<TaxLiabilityRow> = liability_rows
         .into_iter()
-        .map(|(code, name, debit, credit)| TaxLiabilityRow {
+        .map(|(code, name, description, debit, credit)| TaxLiabilityRow {
             account_code: code,
             account_name: name,
+            account_description: description,
             balance_cents: credit - debit,
         })
         .collect();

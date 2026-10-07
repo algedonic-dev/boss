@@ -88,6 +88,7 @@ mod boarding;
 mod cars;
 mod conductor;
 mod consist;
+mod consist_job;
 pub(crate) mod dock_regate;
 mod entry;
 mod forge;

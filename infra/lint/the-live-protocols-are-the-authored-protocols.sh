@@ -515,6 +515,10 @@ def agent_facet(block):
         k: (float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v)
         for k, v in block.items()
     }
+    # AgentSpec's legacy default, pinned to the Rust comparator over the
+    # real bundle. Explicit verified/null/unknown values and other keys
+    # remain findings; this does not supply an executor attestation.
+    canon.setdefault("executor_provenance", "advisory")
     return json.dumps(canon, sort_keys=True, ensure_ascii=False)
 
 def facets_to_compare(tree_facets, live_facets, tree_titles, live_titles):
@@ -972,7 +976,7 @@ FX
     [ "$rc" -eq 0 ] || { echo "self-test FAILED: a live row lacking an agent block exited $rc: $out" >&2; rm -rf "$t"; return 1; }
     grep -qF "DRIFT	beta	steps.proven.agent	v3" <<< "$out" \
         || { echo "self-test FAILED: a live step lacking the agent block its file declares was not named by its step: $out" >&2; rm -rf "$t"; return 1; }
-    grep -qF '"profile": "builder"' <<< "$out" \
+    grep -qF '"budget_usd": 5.0, "effort": "high", "executor_provenance": "advisory"' <<< "$out" \
         || { echo "self-test FAILED: the agent finding carries no excerpt of the block the file declares: $out" >&2; rm -rf "$t"; return 1; }
     grep -qF "drifted=1" <<< "$out" \
         || { echo "self-test FAILED: one agent block adrift was not counted as one: $out" >&2; rm -rf "$t"; return 1; }

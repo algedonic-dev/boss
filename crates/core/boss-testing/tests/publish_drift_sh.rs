@@ -40,6 +40,8 @@ fn has(tool: &str) -> bool {
 const SCRIPT: &str = "infra/gcp/publish-drift.sh";
 const SUB_VERB: &str = "infra/gcp/publish-workflow.sh";
 const VERB_FILE: &str = "infra/ops/verbs/publish-drift.json";
+const HOLDS_REL: &str = "infra/platform/workflow-holds";
+const HOLDS_READER: &str = "infra/gcp/workflow-holds.py";
 
 /// A pr-train listing as `GET /api/jobs?kind=pr-train` answers it: the
 /// newest closed train's `merged` step carries `merge_ref`.
@@ -130,6 +132,8 @@ if [ "$mode" = "--check" ]; then
        echo "  [\"step run: ready_when references no step\"]"
        echo "publish-workflow: REFUSED — the tree's $file does not lint clean"; exit 4 ;;
     8) echo "publish-workflow: REFUSED — '$kind' has no live active row at $BOSS_JOBS_URL — the seed admits a new kind"; exit 8 ;;
+    9) echo "publish-workflow: HELD: '$kind' is HELD out of every unattended publish (declared in infra/platform/workflow-holds/$kind.toml)"
+       echo "publish-workflow: REFUSED — --check HELD: would NOT publish $file over live v$ver at $BOSS_JOBS_URL — the tree is ahead of live and the kind is held"; exit 9 ;;
     75) echo "publish-workflow: could not read $BOSS_JOBS_URL/api/workflows/$kind — HTTP 000"
         echo "publish-workflow: cannot answer: nothing compared, nothing published"; exit 75 ;;
     *) echo "stub: unexpected rc $rc"; exit 99 ;;
@@ -139,6 +143,12 @@ if [ -n "$mode" ]; then echo "stub: unexpected mode $mode"; exit 2; fi
 case " ${STUB_PUBLISH_FAIL:-} " in
   *" $kind "*) echo "publish-workflow: NOT CONFIRMED — the active row is still v$ver after a publish over v$ver"; exit 7 ;;
 esac
+case " ${STUB_PUBLISH_HELD:-} " in
+  *" $kind "*) echo "publish-workflow: REFUSED — '$kind' is HELD out of every unattended publish (declared in infra/platform/workflow-holds/$kind.toml): a hold that landed late"; exit 9 ;;
+esac
+# What a case does to the checkout WHILE a publish runs (a hold landing,
+# the checkout moving): the verb must look again before the next kind.
+[ -z "${STUB_PUBLISH_HOOK:-}" ] || bash -c "$STUB_PUBLISH_HOOK"
 next=$((ver + 1))
 echo "publish-workflow: publishing $file as ${BOSS_ACTOR:-unset} for packet ${OPS_REQUEST_ID:-none}"
 echo "publish-workflow: $kind v$ver -> v$next live at $BOSS_JOBS_URL — confirmed by reading the active row back and comparing it to $file (equal); packet ${OPS_REQUEST_ID:-none}"
@@ -188,6 +198,32 @@ cat "$STUB_TRAINS"
             .map(|(k, rc, v)| format!("{k} {rc} {v}\n"))
             .collect();
         write_file(&self.verdicts, &body);
+    }
+
+    /// Replace one kind's row file with a real row (the planted bundle
+    /// is a stub per kind) — what the default hold is derived from.
+    fn row_file(&self, kind: &str, body: &str) {
+        write_file(
+            &self
+                .repo
+                .join(format!("infra/platform/workflows/{kind}.toml")),
+            body,
+        );
+    }
+
+    /// Declare something under infra/platform/workflow-holds/.
+    fn hold_file(&self, name: &str, body: &str) {
+        let dir = self.repo.join(HOLDS_REL);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_file(&dir.join(name), body);
+    }
+
+    fn clear_holds(&self) {
+        let _ = std::fs::remove_dir_all(self.repo.join(HOLDS_REL));
+    }
+
+    fn clear_calls(&self) {
+        let _ = std::fs::remove_file(&self.pw_log);
     }
 
     fn run(&self, args: &[&str]) -> (i32, String) {
@@ -259,7 +295,15 @@ fn row<'a>(text: &'a str, kind: &str) -> &'a str {
 }
 
 fn ready() -> bool {
-    for (ok, why) in [(has("git"), "git"), (has("jq"), "jq")] {
+    let tomllib = Command::new("python3")
+        .args(["-c", "import tomllib"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    for (ok, why) in [
+        (has("git"), "git"),
+        (has("jq"), "jq"),
+        (tomllib, "python3 with tomllib (the hold reader)"),
+    ] {
         if !ok {
             eprintln!("skipping: publish-drift.sh needs {why}, and this box has none");
             return false;
@@ -486,7 +530,7 @@ fn an_unconfirmed_publish_is_reported_and_exits_nonzero() {
     );
     contains_all(
         &out,
-        &["publish-drift: published 2, skipped 0 equal, refused 0, not confirmed 1"],
+        &["publish-drift: published 2, skipped 0 equal, refused 0, held 0, not confirmed 1"],
         "the verdict counts the failure by name",
     );
 }
@@ -614,6 +658,516 @@ fn no_sor_a_foreign_mode_or_a_missing_sub_verb_is_refused_first() {
 }
 
 // ---------------------------------------------------------------------------
+// HOLDS: a kind the tree holds out of the unattended publish (backlog
+// 083d240e). A workflow row that turns on a REFUSAL goes live at a
+// deliberate registry publish (design b08725c2; design 09618594 question
+// `signer`), and until this door the tree published it by itself on the
+// next clean check — and published it AGAIN after a rollback, because
+// the tree was ahead of live once more.
+// ---------------------------------------------------------------------------
+
+const HOLD: &str = "drift_publish = \"held\"\nwhy = '''This row turns on a refusal on the approve path; it goes live at a deliberate publish with its positive control.'''\nlifts = 'backlog 6c9183de: removed by the car that follows the deliberate publish'\n";
+
+/// A row that declares a field `writer` — a refusal row by construction.
+fn writer_row(kind: &str) -> String {
+    format!(
+        "[[workflow]]\nkind = \"{kind}\"\nlabel = \"{kind}\"\ncategory = \"platform\"\nsubject_kinds = [\"custom\"]\n\n[[workflow.step]]\ntitle = \"approve\"\nkind = \"sign-off\"\nready_when = \"true\"\nfields = [{{ name = \"decision\", field_type = \"string\", writer = \"signer\" }}]\n"
+    )
+}
+
+/// A row whose step declares an `executor` — the other refusal shape.
+fn executor_row(kind: &str) -> String {
+    format!(
+        "[[workflow]]\nkind = \"{kind}\"\nlabel = \"{kind}\"\ncategory = \"platform\"\nsubject_kinds = [\"custom\"]\n\n[[workflow.step]]\ntitle = \"execute\"\nkind = \"task\"\nready_when = \"true\"\nexecutor = \"runner:ops\"\n"
+    )
+}
+
+fn verdict_line(out: &str) -> &str {
+    out.lines()
+        .find(|l| {
+            l.starts_with("publish-drift: would publish ")
+                || l.starts_with("publish-drift: published ")
+        })
+        .unwrap_or_else(|| panic!("no verdict line in:\n{out}"))
+}
+
+/// The check NAMES a held kind, with its why and what lifts it, and
+/// counts it as `held` — never in `would publish` (it will not be) and
+/// never in `refused` (one refusal holds the whole for-real, and a hold
+/// must not stop the other kinds).
+#[test]
+fn check_names_a_held_kind_and_counts_it_in_neither_would_publish_nor_refused() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("hold-check");
+    c.verdicts(&[
+        ("maintenance-alpha", 0, 3),
+        ("maintenance-beta", 0, 9),
+        ("maintenance-gamma", 5, 2),
+    ]);
+    c.hold_file("maintenance-beta.toml", HOLD);
+    let (rc, out) = c.run(&["--check"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(
+        verdict_line(&out)
+            .starts_with("publish-drift: would publish 1, skipped 1 equal, refused 0, held 1"),
+        "{out}"
+    );
+    contains_all(
+        row(&out, "maintenance-beta"),
+        &["v9", "HELD", "turns on a refusal", "6c9183de"],
+        "the held row carries its why and what lifts it",
+    );
+    assert!(
+        !row(&out, "maintenance-beta").contains("\twould publish"),
+        "a held kind is not listed as a publish: {out}"
+    );
+    // One greppable line per held kind, outside the table.
+    contains_all(
+        &out,
+        &[
+            "publish-drift: held maintenance-beta (declared in infra/platform/workflow-holds/maintenance-beta.toml)",
+        ],
+        "the held line",
+    );
+    assert!(c.publishes().is_empty(), "{:?}", c.calls());
+
+    // No hold declared: the count is still stated, as zero.
+    c.clear_holds();
+    let (rc, out) = c.run(&["--check"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(
+        verdict_line(&out)
+            .starts_with("publish-drift: would publish 2, skipped 1 equal, refused 0, held 0"),
+        "{out}"
+    );
+}
+
+/// The publish itself: the others land, the held kind does not — and it
+/// still does not on the NEXT run, which is the rollback case (the old
+/// row republished by hand leaves the tree ahead of live again).
+#[test]
+fn for_real_publishes_the_others_and_never_a_held_kind_run_after_run() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("hold-for-real");
+    c.verdicts(&[
+        ("maintenance-alpha", 0, 3),
+        ("maintenance-beta", 0, 9),
+        ("maintenance-gamma", 0, 1),
+    ]);
+    c.hold_file("maintenance-beta.toml", HOLD);
+    for pass in ["first", "after a rollback"] {
+        c.clear_calls();
+        let (rc, out) = c.run(&["--for-real"]);
+        assert_eq!(rc, 0, "{pass}: {out}");
+        assert_eq!(
+            c.publishes(),
+            vec![
+                "maintenance-alpha".to_string(),
+                "maintenance-gamma".to_string()
+            ],
+            "{pass}: the held kind is not published and the others are: {:?}",
+            c.calls()
+        );
+        assert!(
+            verdict_line(&out)
+                .starts_with("publish-drift: published 2, skipped 0 equal, refused 0, held 1"),
+            "{pass}: {out}"
+        );
+        contains_all(
+            &out,
+            &["publish-drift: held maintenance-beta (declared in "],
+            pass,
+        );
+    }
+}
+
+/// A rollback made with a row the tree never said (the sub-verb's 6) on
+/// a held kind is still `held`, not `refused`: the kind is out of this
+/// verb's hands in every state, and the others publish.
+#[test]
+fn a_held_kind_is_held_in_every_state_the_sub_verb_reports() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("hold-states");
+    c.verdicts(&[
+        ("maintenance-alpha", 0, 3),
+        ("maintenance-beta", 6, 9),
+        ("maintenance-delta", 5, 4),
+        ("maintenance-gamma", 4, 1),
+    ]);
+    for k in ["maintenance-beta", "maintenance-delta", "maintenance-gamma"] {
+        c.hold_file(&format!("{k}.toml"), HOLD);
+    }
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(c.publishes(), vec!["maintenance-alpha".to_string()]);
+    assert!(
+        verdict_line(&out)
+            .starts_with("publish-drift: published 1, skipped 0 equal, refused 0, held 3"),
+        "{out}"
+    );
+    contains_all(
+        row(&out, "maintenance-beta"),
+        &["HELD", "never said"],
+        "the state rides the held row",
+    );
+    contains_all(
+        row(&out, "maintenance-delta"),
+        &["HELD", "equal"],
+        "an equal held kind is still named",
+    );
+}
+
+/// TWO LAYERS, ONE READER (review R1 of the signer car, run 7cee49b9).
+/// The sub-verb holds too — it answers 9 where a held kind would have
+/// been `--check ok`, and refuses 9 to publish one — because the
+/// `publish-workflow` verb is a second machine road. This verb reads
+/// that 9 as held (with the version, from the sub-verb's own phrase),
+/// reports the kind ONCE, and still publishes the others. A 9 at the
+/// publish itself (a hold that landed after this run's last look) is a
+/// held row, not a failed publish. And a 9 the reader, asked again,
+/// does not bear out is a tree moving under the run: not an answer.
+#[test]
+fn the_sub_verbs_own_hold_is_read_as_held_once_and_never_as_a_failure() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("hold-layers");
+    c.verdicts(&[
+        ("maintenance-alpha", 0, 3),
+        ("maintenance-beta", 9, 7),
+        ("maintenance-gamma", 0, 1),
+    ]);
+    c.hold_file("maintenance-beta.toml", HOLD);
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(
+        c.publishes(),
+        vec![
+            "maintenance-alpha".to_string(),
+            "maintenance-gamma".to_string()
+        ],
+        "{out}"
+    );
+    contains_all(
+        row(&out, "maintenance-beta"),
+        &["v7", "HELD", "ahead of live v7"],
+        "the sub-verb's 9",
+    );
+    assert_eq!(
+        out.matches("publish-drift: held maintenance-beta ").count(),
+        1,
+        "one held line per kind, whichever layer said it: {out}"
+    );
+    assert!(
+        verdict_line(&out)
+            .starts_with("publish-drift: published 2, skipped 0 equal, refused 0, held 1"),
+        "{out}"
+    );
+
+    // A hold that lands between this verb's look and the sub-verb's
+    // publish: refused there, held here, exit 0, the other kind lands.
+    let c = Case::new("hold-at-publish");
+    c.verdicts(&[("maintenance-alpha", 0, 3), ("maintenance-beta", 0, 9)]);
+    let (rc, out) = c.run_env(
+        &["--for-real"],
+        &[("STUB_PUBLISH_HELD", "maintenance-beta".into())],
+    );
+    assert_eq!(rc, 0, "{out}");
+    contains_all(
+        row(&out, "maintenance-beta"),
+        &["HELD", "refused by the sub-verb"],
+        "held at the publish",
+    );
+    contains_all(
+        row(&out, "maintenance-alpha"),
+        &["published"],
+        "the other kind",
+    );
+    let v = verdict_line(&out);
+    assert!(
+        v.starts_with("publish-drift: published 1, skipped 0 equal, refused 0, held 1")
+            && !v.contains("not confirmed"),
+        "{out}"
+    );
+
+    // The sub-verb says held and the reader, asked again, does not.
+    let c = Case::new("hold-disagree");
+    c.verdicts(&[("maintenance-alpha", 0, 3), ("maintenance-beta", 9, 7)]);
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 75, "{out}");
+    contains_all(
+        &out,
+        &["cannot answer", "maintenance-beta"],
+        "the layers disagree",
+    );
+    assert!(c.publishes().is_empty(), "{:?}", c.calls());
+}
+
+/// A registry that cannot be read for a HELD kind still stops the run:
+/// the hold changes what is published, never what counts as an answer.
+#[test]
+fn an_unreadable_held_kind_still_stops_the_run() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("hold-75");
+    c.verdicts(&[("maintenance-alpha", 0, 3), ("maintenance-beta", 75, 0)]);
+    c.hold_file("maintenance-beta.toml", HOLD);
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 75, "{out}");
+    assert!(c.publishes().is_empty(), "{:?}", c.calls());
+}
+
+/// FAIL CLOSED. A hold that cannot be read is not an absent hold: the
+/// run refuses in BOTH modes, names the file, asks the sub-verb nothing,
+/// publishes nothing, and prints no verdict line a rule could read as
+/// clean.
+#[test]
+fn a_hold_that_cannot_be_read_refuses_both_modes_and_publishes_nothing() {
+    if !ready() {
+        return;
+    }
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            "unparsable",
+            "maintenance-beta.toml",
+            "drift_publish = \"held\nwhy = ",
+            "maintenance-beta.toml",
+        ),
+        (
+            "unknown-kind",
+            "maintenance-betta.toml",
+            HOLD,
+            "no infra/platform/workflows/maintenance-betta.toml",
+        ),
+        (
+            "no-why",
+            "maintenance-beta.toml",
+            "drift_publish = \"held\"\nlifts = 'backlog 6c9183de'\n",
+            "`why`",
+        ),
+        (
+            "empty-why",
+            "maintenance-beta.toml",
+            "drift_publish = \"held\"\nwhy = '  '\nlifts = 'backlog 6c9183de'\n",
+            "`why`",
+        ),
+        (
+            "no-lifts",
+            "maintenance-beta.toml",
+            "drift_publish = \"held\"\nwhy = 'This row turns on a refusal and goes live deliberately.'\n",
+            "`lifts`",
+        ),
+        (
+            "no-state",
+            "maintenance-beta.toml",
+            "why = 'This row turns on a refusal and goes live deliberately.'\nlifts = 'backlog 6c9183de'\n",
+            "`drift_publish`",
+        ),
+        (
+            "foreign-state",
+            "maintenance-beta.toml",
+            "drift_publish = \"hold\"\nwhy = 'This row turns on a refusal and goes live deliberately.'\nlifts = 'backlog 6c9183de'\n",
+            "`drift_publish`",
+        ),
+        (
+            "unknown-key",
+            "maintenance-beta.toml",
+            "drift_publish = \"held\"\nwhy = 'This row turns on a refusal and goes live deliberately.'\nlifts = 'backlog 6c9183de'\nuntil = 'tomorrow'\n",
+            "`until`",
+        ),
+        (
+            "stray-file",
+            "maintenance-beta.tml",
+            HOLD,
+            "maintenance-beta.tml",
+        ),
+        (
+            "release-of-nothing",
+            "maintenance-beta.toml",
+            "drift_publish = \"released\"\nwhy = 'This row was published by hand and its control passed.'\n",
+            "releases nothing",
+        ),
+    ];
+    for (name, file, body, needle) in cases {
+        let c = Case::new(&format!("hold-bad-{name}"));
+        c.verdicts(&[("maintenance-alpha", 0, 3), ("maintenance-beta", 0, 9)]);
+        c.hold_file(file, body);
+        for mode in ["--check", "--for-real"] {
+            let (rc, out) = c.run(&[mode]);
+            assert_eq!(rc, 78, "{name} {mode}: {out}");
+            contains_all(
+                &out,
+                &[needle, "REFUSED", "nothing published"],
+                &format!("{name} {mode}"),
+            );
+            assert!(
+                !out.contains("would publish ") && !out.contains("publish-drift: published "),
+                "{name} {mode}: a refused run prints no verdict a rule could read: {out}"
+            );
+            assert!(
+                c.calls().is_empty(),
+                "{name} {mode} asked or published: {:?}",
+                c.calls()
+            );
+        }
+    }
+}
+
+/// THE DEFAULT (backlog 083d240e, part 5). A row that declares a field
+/// `writer` or a step `executor` is a refusal row by construction, so it
+/// is held with NO file — forgetting the file cannot publish a refusal
+/// unattended. The file is the override in both directions: `held` adds
+/// the why and the lift, `released` hands the row back to this verb.
+#[test]
+fn a_row_declaring_a_writer_or_an_executor_is_held_by_default_and_a_release_file_frees_it() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("hold-default");
+    c.verdicts(&[
+        ("maintenance-alpha", 0, 3),
+        ("maintenance-beta", 0, 9),
+        ("maintenance-gamma", 0, 1),
+    ]);
+    c.row_file("maintenance-beta", &writer_row("maintenance-beta"));
+    c.row_file("maintenance-gamma", &executor_row("maintenance-gamma"));
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(c.publishes(), vec!["maintenance-alpha".to_string()]);
+    assert!(
+        verdict_line(&out)
+            .starts_with("publish-drift: published 1, skipped 0 equal, refused 0, held 2"),
+        "{out}"
+    );
+    contains_all(
+        &out,
+        &[
+            "publish-drift: held maintenance-beta (by default: step approve field decision declares writer signer)",
+            "publish-drift: held maintenance-gamma (by default: step execute declares executor runner:ops)",
+        ],
+        "the default names what it read",
+    );
+
+    // Released on the record: the row is this verb's again, and named.
+    c.clear_calls();
+    c.hold_file(
+        "maintenance-beta.toml",
+        "drift_publish = \"released\"\nwhy = 'Published by hand on 2026-10-07 and the positive control passed; later edits may ride the drift publish.'\n",
+    );
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(
+        c.publishes(),
+        vec![
+            "maintenance-alpha".to_string(),
+            "maintenance-beta".to_string()
+        ]
+    );
+    contains_all(
+        &out,
+        &[
+            "publish-drift: released maintenance-beta (declared in infra/platform/workflow-holds/maintenance-beta.toml)",
+        ],
+        "a release is named every time too",
+    );
+    assert!(
+        verdict_line(&out)
+            .starts_with("publish-drift: published 2, skipped 0 equal, refused 0, held 1"),
+        "{out}"
+    );
+}
+
+/// The check that filed a `--for-real` may predate the hold, and a
+/// checkout can move while the publishes run. The verb looks again
+/// before EVERY publish: a hold that appeared is honoured, and a
+/// checkout that moved stops the rest (they were judged against another
+/// tree) with a non-zero exit.
+#[test]
+fn for_real_looks_again_before_every_publish() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("hold-late");
+    c.verdicts(&[("maintenance-alpha", 0, 3), ("maintenance-beta", 0, 9)]);
+    let holds = c.repo.join(HOLDS_REL);
+    let late = c.root.join("late-hold.toml");
+    write_file(&late, HOLD);
+    let hook = format!(
+        "mkdir -p '{}' && cp '{}' '{}/maintenance-beta.toml'",
+        holds.display(),
+        late.display(),
+        holds.display()
+    );
+    let (rc, out) = c.run_env(&["--for-real"], &[("STUB_PUBLISH_HOOK", hook)]);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(
+        c.publishes(),
+        vec!["maintenance-alpha".to_string()],
+        "a hold that landed mid-run is honoured: {out}"
+    );
+    contains_all(
+        row(&out, "maintenance-beta"),
+        &["HELD"],
+        "the late hold's row",
+    );
+    assert!(
+        verdict_line(&out)
+            .starts_with("publish-drift: published 1, skipped 0 equal, refused 0, held 1"),
+        "{out}"
+    );
+
+    let c = Case::new("hold-moved");
+    c.verdicts(&[("maintenance-alpha", 0, 3), ("maintenance-beta", 0, 9)]);
+    let hook = format!(
+        "git -C '{}' -c user.name=fixture -c user.email=f@example.invalid commit -q --allow-empty -m 'the checkout moved'",
+        c.repo.display()
+    );
+    let (rc, out) = c.run_env(&["--for-real"], &[("STUB_PUBLISH_HOOK", hook)]);
+    assert_eq!(rc, 1, "{out}");
+    assert_eq!(c.publishes(), vec!["maintenance-alpha".to_string()]);
+    contains_all(
+        row(&out, "maintenance-beta"),
+        &["NOT PUBLISHED", "moved"],
+        "the kind judged against another tree",
+    );
+}
+
+/// The shipped tree's own holds are readable: a hold that would make
+/// the live verb refuse is refused HERE, on the car that wrote it.
+#[test]
+fn the_shipped_holds_are_readable() {
+    if !has("python3") {
+        eprintln!("skipping: the hold reader needs python3");
+        return;
+    }
+    let out = Command::new("python3")
+        .arg(repo_root().join(HOLDS_READER))
+        .arg(repo_root())
+        .output()
+        .expect("the reader runs");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "{HOLDS_REL} does not read clean in this tree — publish-drift would refuse every run:\n{text}"
+    );
+    assert!(
+        repo_root().join(HOLDS_REL).join("README.md").is_file(),
+        "{HOLDS_REL}/README.md is what keeps the directory, and says the shape"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // One definition: the sub-verb's exit codes and phrases are what this
 // verb reads. Pinned rather than collapsed — the phrases live in the
 // sub-verb's say/refuse calls and the classification in its EXIT block.
@@ -631,6 +1185,7 @@ fn the_phrases_the_table_reads_are_the_sub_verbs_own() {
         "already says what",
         "carries what the tree never said",
         "-> v",
+        "--check HELD: would NOT publish",
     ] {
         assert!(sub.contains(phrase), "{SUB_VERB} no longer says `{phrase}`");
         assert!(drift.contains(phrase), "{SCRIPT} does not read `{phrase}`");
@@ -638,7 +1193,7 @@ fn the_phrases_the_table_reads_are_the_sub_verbs_own() {
     // The exit codes are the sub-verb's documented contract, read by
     // number in the classifier: each number the EXIT block documents
     // for a refusal appears as a case there.
-    for code in ["5)", "6)", "4)", "8)", "7)"] {
+    for code in ["5)", "6)", "4)", "8)", "7)", "9)"] {
         assert!(
             drift.contains(code),
             "{SCRIPT} has no case for sub-verb exit {code}"

@@ -256,6 +256,7 @@ mod tests {
                 ready_when: "true".into(),
                 authority_role: Some("platform-admin".into()),
                 agent: Some(AgentSpec {
+                    executor_provenance: Default::default(),
                     profile: "builder".into(),
                     model: "opus-5[1m]".into(),
                     budget_usd: 5.0,

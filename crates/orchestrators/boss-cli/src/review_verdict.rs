@@ -112,7 +112,13 @@ pub(crate) fn builder_run(car: &Value) -> Option<&str> {
 /// only when every fact holds: the run is an agent-run that is not the
 /// car's builder, it records a review OF THIS CAR, the verdict is
 /// RELEASE, and it read exactly `head`. Each refusal names the fact.
+#[cfg(test)]
 pub(crate) fn vouches(run: &Value, car: &Value, head: &str) -> Result<(), String> {
+    executor_review_eligibility(car)?;
+    vouches_inner(run, car, head)
+}
+
+fn vouches_inner(run: &Value, car: &Value, head: &str) -> Result<(), String> {
     let run_id = str_at(run, "/id");
     let car_id = str_at(car, "/id");
     if run_id.is_empty() {
@@ -195,6 +201,394 @@ pub(crate) fn vouches(run: &Value, car: &Value, head: &str) -> Result<(), String
         ));
     }
     Ok(())
+}
+
+#[async_trait::async_trait]
+pub(crate) trait ExecutorRecordReader: Sync {
+    async fn executor_read(&self, path: &str) -> Result<Option<Value>>;
+    async fn executor_original(
+        &self,
+        job: uuid::Uuid,
+        step: uuid::Uuid,
+        key: &str,
+    ) -> Result<Option<boss_jobs::first_record::FirstRecord>>;
+}
+
+#[async_trait::async_trait]
+impl ExecutorRecordReader for Wire {
+    async fn executor_read(&self, path: &str) -> Result<Option<Value>> {
+        self.call(reqwest::Method::GET, path, None).await
+    }
+    async fn executor_original(
+        &self,
+        job: uuid::Uuid,
+        step: uuid::Uuid,
+        key: &str,
+    ) -> Result<Option<boss_jobs::first_record::FirstRecord>> {
+        self.immutable_record(job, step, key).await
+    }
+}
+
+pub(crate) fn immutable_record_resource(
+    record: &boss_jobs::first_record::FirstRecord,
+    job: uuid::Uuid,
+    step: uuid::Uuid,
+    key: &str,
+) -> Result<()> {
+    if record.job_id.inner().as_uuid() != &job
+        || record.step_id.inner().as_uuid() != &step
+        || record.key != key
+    {
+        bail!("the immutable record response belongs to another resource");
+    }
+    Ok(())
+}
+
+/// Resolve the admitted protocol, never the mutable convenience projection.
+pub(crate) async fn pinned_executor_requirement(
+    reader: &impl ExecutorRecordReader,
+    car: &Value,
+) -> Result<boss_jobs::executor_attestation::ExecutorProvenanceRequirement> {
+    use boss_jobs::executor_attestation::ExecutorProvenanceRequirement;
+    let kind = car
+        .get("kind")
+        .and_then(Value::as_str)
+        .context("the source packet has no protocol kind")?;
+    let version = car
+        .get("workflow_version")
+        .and_then(Value::as_i64)
+        .filter(|v| *v > 0)
+        .context("the source packet has no pinned protocol version")?;
+    let row = reader
+        .executor_read(&format!("/api/workflows/{kind}/versions/{version}"))
+        .await?
+        .context("the pinned source protocol is unavailable")?;
+    if row["kind"] != kind
+        || row["version"] != version
+        || !matches!(row["status"].as_str(), Some("active" | "retired"))
+    {
+        bail!("the source protocol read does not match its immutable pin");
+    }
+    let step = row
+        .get("steps")
+        .and_then(Value::as_array)
+        .and_then(|steps| {
+            steps
+                .iter()
+                .find(|step| step["title"] == boss_jobs::car::REVIEW_SLUG)
+        })
+        .context("the pinned protocol has no review step")?;
+    match step.get("agent") {
+        None | Some(Value::Null) => Ok(ExecutorProvenanceRequirement::Advisory),
+        Some(value) => {
+            let agent: boss_jobs::agent_spec::AgentSpec = serde_json::from_value(value.clone())
+                .context("the pinned executor declaration is unreadable")?;
+            Ok(agent.executor_provenance)
+        }
+    }
+}
+
+/// Authority read during this operation. Neither callers nor metadata can
+/// construct it. A verified result retains the original receipt's identity.
+#[derive(Debug)]
+pub(crate) struct ExecutorReviewEligibility {
+    car: String,
+    head: String,
+    verified: Option<boss_jobs::executor_attestation::VerifiedExecutor>,
+    original_verdict: Option<boss_jobs::first_record::FirstRecord>,
+    original_receipt: Option<boss_jobs::first_record::FirstRecord>,
+}
+
+const ORIGINAL_VERDICT_KEY: &str = "review.verdict";
+
+fn judgment_time(
+    value: &Value,
+    receipt: &boss_jobs::first_record::FirstRecord,
+) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    let at = value
+        .get("at")
+        .and_then(Value::as_str)
+        .and_then(|at| at.parse::<chrono::DateTime<chrono::Utc>>().ok())
+        .ok_or("the original verdict judgment time is unreadable")?;
+    if receipt.recorded_at > at {
+        return Err(
+            "an executor receipt recorded after judgment cannot be bound to that verdict".into(),
+        );
+    }
+    Ok(at)
+}
+
+fn select_original_verdict(original: Option<&Value>, candidate: &Value) -> Result<Value, String> {
+    let Some(original) = original else {
+        return Ok(candidate.clone());
+    };
+    let mut original_judgment = original.clone();
+    let mut candidate_judgment = candidate.clone();
+    original_judgment
+        .as_object_mut()
+        .ok_or("original verdict is not an object")?
+        .remove("at");
+    candidate_judgment
+        .as_object_mut()
+        .ok_or("candidate verdict is not an object")?
+        .remove("at");
+    if original_judgment != candidate_judgment {
+        return Err(
+            "the original immutable verdict cannot be replaced; use a distinct review run".into(),
+        );
+    }
+    Ok(original.clone())
+}
+
+async fn persist_original_verdict(
+    wire: &Wire,
+    native: uuid::Uuid,
+    building: uuid::Uuid,
+    value: &Value,
+) -> Result<boss_jobs::first_record::FirstRecord> {
+    use boss_jobs::first_record::FirstRecordResult;
+    let response = wire
+        .call(
+            reqwest::Method::POST,
+            &format!("/api/jobs/{native}/steps/{building}/metadata/records"),
+            Some(json!({"key":ORIGINAL_VERDICT_KEY,"value":value,"expected_absence":true})),
+        )
+        .await?
+        .context("the immutable verdict write returned no record")?;
+    let original = match serde_json::from_value::<FirstRecordResult>(response)
+        .context("the immutable verdict write returned an unreadable record")?
+    {
+        FirstRecordResult::Recorded(record) | FirstRecordResult::Replayed(record) => record,
+        _ => bail!("the immutable verdict write refused; no mutable verdict was projected"),
+    };
+    immutable_record_resource(&original, native, building, ORIGINAL_VERDICT_KEY)?;
+    use sha2::{Digest, Sha256};
+    let scalar: Value = serde_json::from_str(&original.value_json)
+        .context("the immutable verdict scalar is unreadable")?;
+    if !original.matches(value)
+        || original.value != scalar
+        || boss_core::job::canonical_json_bytes(&scalar) != original.canonical
+        || hex::encode(Sha256::digest(&original.canonical)) != original.digest
+    {
+        bail!("the immutable verdict write returned a different judgment");
+    }
+    Ok(original)
+}
+
+fn original_verdict_matches(
+    original: &boss_jobs::first_record::FirstRecord,
+    run: &Value,
+    building: uuid::Uuid,
+    receipt: &boss_jobs::first_record::FirstRecord,
+) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let scalar: Value = serde_json::from_str(&original.value_json)
+        .map_err(|_| "the original verdict scalar is unreadable")?;
+    let canonical = boss_core::job::canonical_json_bytes(&scalar);
+    let judged_at = judgment_time(&scalar, receipt)?;
+    if original.job_id.to_string() != str_at(run, "/id")
+        || original.step_id.to_string() != building.to_string()
+        || original.key != ORIGINAL_VERDICT_KEY
+        || scalar != original.value
+        || canonical != original.canonical
+        || hex::encode(Sha256::digest(&canonical)) != original.digest
+        || run.pointer(&format!("/metadata/{REVIEW_KEY}")) != Some(&original.value)
+        || receipt.job_id != original.job_id
+        || receipt.step_id != original.step_id
+        || receipt.key != boss_jobs::executor_attestation::EXECUTOR_BINDING_KEY
+        || receipt.value.get("actor").and_then(Value::as_str)
+            != Some(original.actor.to_string().as_str())
+        || receipt.recorded_at > original.recorded_at
+        || judged_at > original.recorded_at
+        || original.value.get("executor_binding")
+            != Some(&json!({"digest":receipt.digest,"event_id":receipt.event_id}))
+    {
+        return Err(
+            "the verdict does not conserve its original receipt, actor, bytes and order".into(),
+        );
+    }
+    Ok(())
+}
+
+impl ExecutorReviewEligibility {
+    pub(crate) fn record_binding(&self) -> Option<Value> {
+        self.verified
+            .as_ref()
+            .map(|executor| json!({"digest":executor.digest(),"event_id":executor.event_id()}))
+    }
+}
+
+pub(crate) fn vouches_with_executor(
+    run: &Value,
+    car: &Value,
+    head: &str,
+    eligibility: &ExecutorReviewEligibility,
+) -> Result<(), String> {
+    if eligibility.car != str_at(car, "/id") || eligibility.head != head {
+        return Err("executor eligibility belongs to another source claim/head".into());
+    }
+    let binding = eligibility.record_binding();
+    if run.pointer(&format!("/metadata/{REVIEW_KEY}/executor_binding")) != binding.as_ref() {
+        return Err("the verdict does not retain the original verified executor receipt".into());
+    }
+    if eligibility.verified.is_some() {
+        let original = eligibility
+            .original_verdict
+            .as_ref()
+            .ok_or("verified review has no original immutable verdict")?;
+        let receipt = eligibility
+            .original_receipt
+            .as_ref()
+            .ok_or("verified review has no original immutable receipt")?;
+        let building = crate::envelope::steps(run)
+            .into_iter()
+            .find(|step| step["spec_slug"] == crate::dispatch::BUILDING_SLUG)
+            .and_then(|step| step["id"].as_str())
+            .and_then(|id| id.parse().ok())
+            .ok_or("verified review has no valid Building identity")?;
+        original_verdict_matches(original, run, building, receipt)?;
+    }
+    vouches_inner(run, car, head)
+}
+
+/// Original immutable records are read from storage. The current production
+/// verifier refuses because no authenticated host/tool issuer is installed.
+pub(crate) async fn read_executor_eligibility(
+    reader: &impl ExecutorRecordReader,
+    run: &Value,
+    car: &Value,
+    head: &str,
+) -> Result<ExecutorReviewEligibility> {
+    use boss_jobs::executor_attestation::{
+        EXECUTOR_BINDING_KEY, ExecutorExpectation, ExecutorProvenanceRequirement, SOURCE_CLAIM_KEY,
+        UnavailableLaunchReceiptVerifier, executor_eligibility,
+    };
+    let requirement = pinned_executor_requirement(reader, car).await?;
+    let advisory = || ExecutorReviewEligibility {
+        car: str_at(car, "/id").into(),
+        head: head.into(),
+        verified: None,
+        original_verdict: None,
+        original_receipt: None,
+    };
+    let native = str_at(run, "/id");
+    let building = crate::envelope::steps(run)
+        .into_iter()
+        .find(|step| step["spec_slug"] == crate::dispatch::BUILDING_SLUG);
+    let Some(building) = building else {
+        if requirement == ExecutorProvenanceRequirement::Advisory {
+            return Ok(advisory());
+        }
+        bail!("the native run has no Building claim");
+    };
+    let building_id = building
+        .get("id")
+        .and_then(Value::as_str)
+        .context("the Building claim has no id")?;
+    let native_id: uuid::Uuid = native.parse().context("the native run id is invalid")?;
+    let building_uuid: uuid::Uuid = building_id
+        .parse()
+        .context("the Building claim id is invalid")?;
+    let source = reader
+        .executor_original(native_id, building_uuid, SOURCE_CLAIM_KEY)
+        .await?;
+    let Some(source) = source else {
+        if requirement == ExecutorProvenanceRequirement::Advisory {
+            return Ok(advisory());
+        }
+        bail!("verified executor requires the original immutable source claim");
+    };
+    let claim = boss_jobs::executor_attestation::read_source_claim(&source)?;
+    let source_step = crate::envelope::steps(car)
+        .into_iter()
+        .find(|step| step["spec_slug"] == boss_jobs::car::REVIEW_SLUG)
+        .context("the source packet has no review step")?;
+    let reference = format!("refs/heads/{}", branch_of(car)?);
+    if claim.native_run.to_string() != native
+        || claim.source_job.to_string() != str_at(car, "/id")
+        || claim.source_step.to_string() != str_at(source_step, "/id")
+        || claim.source_slug != boss_jobs::car::REVIEW_SLUG
+        || Some(i64::from(claim.protocol_version)) != car["workflow_version"].as_i64()
+        || claim.executor_provenance != requirement
+        || claim
+            .source_ref
+            .as_deref()
+            .is_some_and(|value| value != reference)
+        || claim
+            .source_head
+            .as_deref()
+            .is_some_and(|value| value != head)
+    {
+        bail!(
+            "the original source claim cannot be downgraded or reused after its protocol/head changes"
+        );
+    }
+    if requirement == ExecutorProvenanceRequirement::Advisory {
+        return Ok(advisory());
+    }
+    let record = reader
+        .executor_original(native_id, building_uuid, EXECUTOR_BINDING_KEY)
+        .await?
+        .context("verified executor requires an immutable launch receipt")?;
+    let mut expectation: ExecutorExpectation = serde_json::from_value(record.value.clone())
+        .context("the executor binding is unreadable")?;
+    if expectation.native_run.to_string() != native
+        || expectation.source_job.to_string() != str_at(car, "/id")
+        || expectation.source_step.to_string() != str_at(source_step, "/id")
+        || expectation.source_slug != boss_jobs::car::REVIEW_SLUG
+        || Some(i64::from(expectation.protocol_version)) != car["workflow_version"].as_i64()
+        || expectation.source_ref.as_deref() != Some(reference.as_str())
+        || expectation.source_head.as_deref() != Some(head)
+        || record.step_id.to_string() != building_id
+        || building
+            .get("assignee_id")
+            .and_then(Value::as_str)
+            .is_some_and(|actor| actor != expectation.actor)
+        || source_step
+            .get("assignee_id")
+            .and_then(Value::as_str)
+            .is_some_and(|actor| actor != expectation.actor)
+    {
+        bail!("the immutable executor binding does not match the exact current source claim/head");
+    }
+    expectation.source_claim = Some(source);
+    let verified = executor_eligibility(
+        requirement,
+        Some(&record),
+        Some(&expectation),
+        &UnavailableLaunchReceiptVerifier,
+    )?;
+    let original_verdict = reader
+        .executor_original(native_id, building_uuid, ORIGINAL_VERDICT_KEY)
+        .await?;
+    Ok(ExecutorReviewEligibility {
+        car: str_at(car, "/id").into(),
+        head: head.into(),
+        verified,
+        original_verdict,
+        original_receipt: Some(record),
+    })
+}
+
+pub(crate) fn executor_review_eligibility(car: &Value) -> Result<(), String> {
+    use boss_jobs::executor_attestation::{
+        ExecutorProvenanceRequirement, UnavailableLaunchReceiptVerifier, executor_eligibility,
+    };
+    let declaration = crate::envelope::steps(car)
+        .into_iter()
+        .find(|step| step["spec_slug"] == boss_jobs::car::REVIEW_SLUG)
+        .and_then(|step| step["metadata"].get(boss_jobs::agent_spec::EXECUTOR_PROVENANCE_KEY));
+    let requirement = match declaration {
+        None => ExecutorProvenanceRequirement::Advisory,
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|_| "the pinned executor provenance declaration is unreadable".to_string())?,
+    };
+    // There is no authenticated host/tool receipt adapter in this deployment.
+    // An actor header, model metadata or self-attestation must not stand in
+    // for that authority. The same domain predicate keeps every door closed.
+    executor_eligibility(requirement, None, None, &UnavailableLaunchReceiptVerifier)
+        .map(|_| ())
+        .map_err(|why| format!("the pinned FORMAL executor requirement is unmet: {why}; no authenticated host/tool receipt adapter is available"))
 }
 
 /// The review-step key a BARE release records itself under: `{hold, by,
@@ -287,6 +681,11 @@ pub(crate) fn bare_release_record(hold: &str, by: &str, at: &str, releaser: &Rel
 /// — because a refusal that leaves its reader to find the way round is
 /// a dead end at the wrong moment.
 pub(crate) fn may_release(car: &Value, releaser: Option<&str>) -> Result<(), String> {
+    executor_review_eligibility(car)?;
+    may_release_identity(car, releaser)
+}
+
+fn may_release_identity(car: &Value, releaser: Option<&str>) -> Result<(), String> {
     let env = crate::gate::AGENT_RUN_ENV;
     let id = str_at(car, "/id");
     let branch = str_at(car, "/metadata/branch");
@@ -479,8 +878,44 @@ pub(crate) async fn record(
     }
     let branch = branch_of(&packet)?;
     let head = forge(&format!("refs/heads/{branch}"))?;
+    let executor = read_executor_eligibility(wire, &run_packet, &packet, &head).await.context("boss review: FORMAL executor eligibility refused; advisory findings remain reportable on the run")?;
     let at = crate::gate::stamp(boss_clock_client::wall_now());
-    let rec = review_record(&packet, &head, verdict, findings.trim(), &at);
+    let mut rec = review_record(&packet, &head, verdict, findings.trim(), &at);
+    if let Some(binding) = executor.record_binding() {
+        rec["executor_binding"] = binding;
+    }
+    if executor.verified.is_some() {
+        rec = select_original_verdict(
+            executor
+                .original_verdict
+                .as_ref()
+                .map(|record| &record.value),
+            &rec,
+        )
+        .map_err(|why| anyhow!(why))?;
+        let receipt = executor
+            .original_receipt
+            .as_ref()
+            .context("verified review has no original receipt")?;
+        judgment_time(&rec, receipt).map_err(|why| anyhow!(why))?;
+        let original = persist_original_verdict(
+            wire,
+            receipt.job_id.to_string().parse()?,
+            receipt.step_id.to_string().parse()?,
+            &rec,
+        )
+        .await?;
+        let mut projected_run = run_packet.clone();
+        projected_run["metadata"][REVIEW_KEY] = original.value.clone();
+        original_verdict_matches(
+            &original,
+            &projected_run,
+            receipt.step_id.to_string().parse()?,
+            receipt,
+        )
+        .map_err(|why| anyhow!(why))?;
+        rec = original.value;
+    }
     wire.patch_job_metadata(run_id, json!({ REVIEW_KEY: rec.clone() }))
         .await
         .context("writing the review onto the reviewer's run")?;
@@ -522,12 +957,16 @@ pub(crate) async fn release(
     }
     let packet = wire.car(car).await?;
     let step = crate::steps::holdable(&packet).map_err(|e| anyhow!("{e}"))?;
-    may_release(&packet, releaser.run()).map_err(|why| anyhow!("{why}"))?;
+    may_release_identity(&packet, releaser.run()).map_err(|why| anyhow!("{why}"))?;
     let branch = branch_of(&packet)?;
     let head = forge(&format!("refs/heads/{branch}"))?;
     let main = forge("refs/heads/main")?;
     let run = wire.packet(review).await?;
-    vouches(&run, &packet, &head).map_err(|why| anyhow!("boss release: REFUSED — {why}"))?;
+    let executor = read_executor_eligibility(wire, &run, &packet, &head)
+        .await
+        .context("boss release: pinned executor eligibility refused")?;
+    vouches_with_executor(&run, &packet, &head, &executor)
+        .map_err(|why| anyhow!("boss release: REFUSED — {why}"))?;
     let by = wire
         .caller_id()
         .context("an unnamed release is refused before it is sent")?;
@@ -536,6 +975,9 @@ pub(crate) async fn release(
     // signs as agent-claude, so the actor alone cannot say (car 3,
     // review 5aa91689 B1).
     let mut rec = release_record(&head, review, by, &at, &main);
+    if let Some(binding) = executor.record_binding() {
+        rec["executor_binding"] = binding;
+    }
     if let (Some(fields), Value::Object(shell)) = (rec.as_object_mut(), releaser.provenance()) {
         fields.extend(shell);
     }
@@ -592,6 +1034,344 @@ mod tests {
 
     fn release_at(sha: &str) -> Value {
         review_record(&car(), sha, RELEASE, "no findings", "2026-09-28T20:00:00Z")
+    }
+
+    #[test]
+    fn an_original_verdict_cannot_acquire_a_later_receipt_or_changed_projection() {
+        use boss_core::{
+            actor::ActorId,
+            job::{JobId, StepId},
+            publisher::EventStamp,
+        };
+        use boss_jobs::first_record::FirstRecord;
+        let building = uuid::Uuid::from_u128(44);
+        let stamp = |at: &str| {
+            let mut s = EventStamp::new("test", ActorId::automation("launch"));
+            s.timestamp = at.parse().unwrap();
+            s
+        };
+        let receipt = FirstRecord::new(
+            JobId::from_uuid(REVIEWER.parse().unwrap()),
+            StepId::from_uuid(building),
+            "executor.binding",
+            &json!({"actor":"automation:launch"}),
+            &stamp("2026-09-28T19:59:59Z"),
+            uuid::Uuid::from_u128(45),
+        );
+        let binding = json!({"digest":receipt.digest,"event_id":receipt.event_id});
+        let mut value = release_at(H1);
+        value["executor_binding"] = binding;
+        let native = run(REVIEWER, value.clone());
+        let original = FirstRecord::new(
+            JobId::from_uuid(REVIEWER.parse().unwrap()),
+            StepId::from_uuid(building),
+            "review.verdict",
+            &value,
+            &stamp("2026-09-28T20:00:00Z"),
+            uuid::Uuid::from_u128(46),
+        );
+        assert!(original_verdict_matches(&original, &native, building, &receipt).is_ok());
+        let mut late = receipt.clone();
+        late.recorded_at = "2026-09-28T20:00:01Z".parse().unwrap();
+        assert!(
+            original_verdict_matches(&original, &native, building, &late).is_err(),
+            "later evidence cannot retrofit an old verdict"
+        );
+        let mut later_original = original.clone();
+        later_original.recorded_at = "2026-09-28T20:01:00Z".parse().unwrap();
+        assert!(
+            original_verdict_matches(&later_original, &native, building, &late).is_err(),
+            "a late immutable write cannot retrofit a receipt after the original judgment time"
+        );
+        let mut changed = native.clone();
+        changed["metadata"][REVIEW_KEY]["findings"] = json!("replacement");
+        assert!(
+            original_verdict_matches(&original, &changed, building, &receipt).is_err(),
+            "mutable review replacement must not inherit an original judgment"
+        );
+        let mut damaged = original.clone();
+        damaged.digest = "0".repeat(64);
+        assert!(original_verdict_matches(&damaged, &native, building, &receipt).is_err());
+    }
+
+    fn fixture_stamp_at(
+        actor: boss_core::actor::ActorId,
+        at: &str,
+    ) -> boss_core::publisher::EventStamp {
+        let mut stamp = boss_core::publisher::EventStamp::new("fixture", actor);
+        stamp.timestamp = at.parse().unwrap();
+        stamp
+    }
+
+    #[test]
+    fn the_issuer_actor_is_not_the_executor_who_records_the_verdict() {
+        use boss_core::{
+            actor::ActorId,
+            job::{JobId, StepId},
+        };
+        use boss_jobs::first_record::FirstRecord;
+        let job = JobId::from_uuid(REVIEWER.parse().unwrap());
+        let step = StepId::from_uuid(uuid::Uuid::from_u128(44));
+        let issuer = fixture_stamp_at(
+            ActorId::automation("trusted-launch"),
+            "2026-09-28T19:59:59Z",
+        );
+        let receipt = FirstRecord::new(
+            job,
+            step,
+            "executor.binding",
+            &json!({"actor":"agent-codex"}),
+            &issuer,
+            uuid::Uuid::from_u128(45),
+        );
+        let judgment = fixture_stamp_at(
+            ActorId::RegisteredAgent("agent-codex".into()),
+            "2026-09-28T20:00:00Z",
+        );
+        let mut value = release_at(H1);
+        value["executor_binding"] = json!({"digest":receipt.digest,"event_id":receipt.event_id});
+        let original = FirstRecord::new(
+            job,
+            step,
+            ORIGINAL_VERDICT_KEY,
+            &value,
+            &judgment,
+            uuid::Uuid::from_u128(46),
+        );
+        let native = run(REVIEWER, value);
+        assert!(
+            original_verdict_matches(&original, &native, uuid::Uuid::from_u128(44), &receipt)
+                .is_ok()
+        );
+        let mut other = original;
+        other.actor = ActorId::RegisteredAgent("agent-other".into());
+        assert!(
+            original_verdict_matches(&other, &native, uuid::Uuid::from_u128(44), &receipt).is_err()
+        );
+    }
+
+    #[test]
+    fn an_immutable_verdict_retry_keeps_first_time_and_refuses_replacement() {
+        let original = release_at(H1);
+        let mut retry = original.clone();
+        retry["at"] = json!("2026-09-28T20:01:00Z");
+        assert_eq!(
+            select_original_verdict(Some(&original), &retry).unwrap(),
+            original
+        );
+        retry["findings"] = json!("changed judgment");
+        assert!(select_original_verdict(Some(&original), &retry).is_err());
+        retry = original.clone();
+        retry["executor_binding"] = json!({"digest":"new receipt"});
+        assert!(select_original_verdict(Some(&original), &retry).is_err());
+        assert_eq!(select_original_verdict(None, &original).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn immutable_verdict_write_refuses_an_internally_damaged_receipt() {
+        use axum::{Router, extract::Json};
+        use boss_core::{
+            actor::ActorId,
+            job::{JobId, StepId},
+            publisher::EventStamp,
+        };
+        use boss_jobs::first_record::{FirstRecord, FirstRecordResult};
+        let native = REVIEWER.parse().unwrap();
+        let building = uuid::Uuid::from_u128(44);
+        let value = release_at(H1);
+        let mut record = FirstRecord::new(
+            JobId::from_uuid(native),
+            StepId::from_uuid(building),
+            ORIGINAL_VERDICT_KEY,
+            &value,
+            &EventStamp::new("jobs", ActorId::automation("launch")),
+            uuid::Uuid::from_u128(48),
+        );
+        record.value["findings"] = json!("damaged projection");
+        let app = Router::new().fallback(move || {
+            let record = record.clone();
+            async move { Json(FirstRecordResult::Recorded(record)) }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let wire = Wire::at(
+            base,
+            crate::identity::resolve_from(Some("agent-codex".into()), None),
+        )
+        .unwrap();
+        assert!(
+            persist_original_verdict(&wire, native, building, &value)
+                .await
+                .is_err()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn immutable_verdict_write_keeps_the_server_record_and_refuses_a_changed_response() {
+        use axum::{Router, extract::Json};
+        use boss_core::{
+            actor::ActorId,
+            job::{JobId, StepId},
+            publisher::EventStamp,
+        };
+        use boss_jobs::first_record::{FirstRecord, FirstRecordResult};
+        let native = REVIEWER.parse().unwrap();
+        let building = uuid::Uuid::from_u128(44);
+        let value = release_at(H1);
+        let mut stamp = EventStamp::new("jobs", ActorId::automation("launch"));
+        stamp.timestamp = "2026-09-28T20:00:01Z".parse().unwrap();
+        let original = FirstRecord::new(
+            JobId::from_uuid(native),
+            StepId::from_uuid(building),
+            ORIGINAL_VERDICT_KEY,
+            &value,
+            &stamp,
+            uuid::Uuid::from_u128(47),
+        );
+        let served = original.clone();
+        let app = Router::new().fallback(move |Json(body): Json<Value>| {
+            let mut record = served.clone();
+            async move {
+                assert_eq!(body["key"], ORIGINAL_VERDICT_KEY);
+                assert_eq!(body["expected_absence"], true);
+                if body["value"]["findings"] != record.value["findings"] {
+                    record.value["findings"] = json!("server replacement");
+                }
+                Json(FirstRecordResult::Replayed(record))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let wire = Wire::at(
+            base,
+            crate::identity::resolve_from(Some("agent-codex".into()), None),
+        )
+        .unwrap();
+        assert_eq!(
+            persist_original_verdict(&wire, native, building, &value)
+                .await
+                .unwrap(),
+            original
+        );
+        let mut changed = value.clone();
+        changed["findings"] = json!("changed judgment");
+        assert!(
+            persist_original_verdict(&wire, native, building, &changed)
+                .await
+                .is_err()
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn an_advisory_result_cannot_supply_or_retarget_a_verified_receipt_reference() {
+        let eligibility = ExecutorReviewEligibility {
+            car: CAR.into(),
+            head: H1.into(),
+            verified: None,
+            original_verdict: None,
+            original_receipt: None,
+        };
+        let mut reviewer = run(REVIEWER, release_at(H1));
+        assert!(vouches_with_executor(&reviewer, &car(), H1, &eligibility).is_ok());
+        assert!(vouches_with_executor(&reviewer, &car(), H2, &eligibility).is_err());
+        reviewer["metadata"][REVIEW_KEY]["executor_binding"] =
+            json!({"digest":"self-declared","event_id":REVIEWER});
+        assert!(vouches_with_executor(&reviewer, &car(), H1, &eligibility).is_err());
+        let mut another_car = car();
+        another_car["id"] = json!("another-car");
+        assert!(vouches_with_executor(&reviewer, &another_car, H1, &eligibility).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_formal_verdict_reads_original_records_and_never_mutable_receipt_metadata() {
+        use axum::{Router, body::Body, extract::Request, http::StatusCode, response::Response};
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = calls.clone();
+        let mut packet = car();
+        packet["status"] = json!("open");
+        packet["workflow_version"] = json!(7);
+        packet["steps"] = json!([{"id":"00000000-0000-0000-0000-000000000003", "spec_slug":"review","metadata":{"agent_executor_provenance":"verified"}}]);
+        let native = json!({"id":REVIEWER,"kind":"agent-run","metadata":{"executor.binding":{"assurance":"verified"}},"steps":[{"id":"00000000-0000-0000-0000-000000000004","spec_slug":"building","status":"active"}]});
+        let app = Router::new().fallback(move |request: Request| {
+            let calls = observed.clone(); let packet = packet.clone(); let native = native.clone();
+            async move {
+                let path = request.uri().path().to_string();
+                calls.lock().unwrap().push(format!("{} {path}", request.method()));
+                let answer = if request.method() != reqwest::Method::GET { None }
+                    else if path == "/api/jobs" { Some(json!({"data":[packet],"total":1})) }
+                    else if path == format!("/api/jobs/{CAR}") { Some(packet) }
+                    else if path == format!("/api/jobs/{REVIEWER}") { Some(native) }
+                    else if path == "/api/workflows/ship-a-change/versions/7" { Some(json!({"kind":"ship-a-change","version":7,"status":"active","steps":[{"title":"review","agent":{"profile":"reviewer","model":"gpt-6.1-sol","budget_usd":1,"effort":"low","executor_provenance":"verified"}}]})) }
+                    else { None };
+                match answer {
+                    Some(value) => Response::builder().status(StatusCode::OK).header("content-type","application/json").body(Body::from(value.to_string())).unwrap(),
+                    None => Response::builder().status(StatusCode::NOT_FOUND).body(Body::from("no original record")).unwrap(),
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let wire = Wire::at(
+            base,
+            crate::identity::resolve_from(Some("agent-codex".into()), None),
+        )
+        .unwrap();
+        assert!(
+            record(&wire, CAR, RELEASE, "review", Some(REVIEWER), |_| Ok(
+                H1.into()
+            ))
+            .await
+            .is_err()
+        );
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|path| path.ends_with("/records/executor.source_claim")),
+            "FORMAL must read the original immutable record: {calls:?}"
+        );
+        assert!(
+            calls.iter().all(|path| path.starts_with("GET ")),
+            "missing authority refuses all writes"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn verified_formal_review_requires_authenticated_execution_not_matching_model_metadata() {
+        let mut car = car();
+        car["steps"] =
+            json!([{"spec_slug":"review","metadata":{"agent_executor_provenance":"verified"}}]);
+        let mut run = run(REVIEWER, release_at(H1));
+        run["metadata"]["model"] = json!("gpt-6.1-sol");
+        run["metadata"]["observed_model"] = json!("gpt-6.1-sol");
+        assert!(
+            vouches(&run, &car, H1).is_err(),
+            "matching caller metadata is no authenticated launch receipt"
+        );
+    }
+
+    #[test]
+    fn a_bare_release_cannot_bypass_verified_executor_provenance() {
+        let mut car = car();
+        car["steps"] =
+            json!([{"spec_slug":"review","metadata":{"agent_executor_provenance":"verified"}}]);
+        assert!(
+            may_release(&car, None).is_err(),
+            "a human shell cannot erase the pinned executor requirement"
+        );
     }
 
     #[test]

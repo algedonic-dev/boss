@@ -186,6 +186,34 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
         "kind LIKE 'jobs.job.%' OR kind LIKE 'jobs.step.%'",
         async |conn, ev| {
             match ev.kind.as_str() {
+                crate::events::STEP_FIRST_RECORDED => {
+                    let mut step: Step = serde_json::from_value(ev.payload.get("step").cloned().ok_or("first record lacks step state")?)
+                        .map_err(|_| "first record step state is invalid".to_string())?;
+                    let record: crate::first_record::FirstRecord = serde_json::from_value(ev.payload.get("record").cloned().ok_or("first record lacks receipt")?)
+                        .map_err(|_| "first record receipt is invalid".to_string())?;
+                    let value: serde_json::Value = serde_json::from_str(&record.value_json).map_err(|_| "first record authoritative value is invalid".to_string())?;
+                    use sha2::{Digest, Sha256};
+                    if record.step_id != step.id || record.job_id != step.job_id || record.event_id != ev.event_id
+                        || record.recorded_at.timestamp_micros() != ev.ts.timestamp_micros()
+                        || serde_json::to_value(&record.actor).map_err(|e| e.to_string())? != *ev.payload.get("_actor").ok_or("first record lacks server actor")?
+                        || !crate::first_record::valid_key(&record.key)
+                        || !record.matches(&value) || !record.matches(&record.value)
+                        || record.digest != hex::encode(Sha256::digest(&record.canonical))
+                        || !step.metadata.get(&record.key).is_some_and(|v| record.matches(v)) {
+                        return Err("first record receipt disagrees with immutable event or full step state".into());
+                    }
+                    keep_the_voids(&mut *conn, &mut step).await.map_err(|e| e.to_string())?;
+                    let inserted = upsert_step(&mut *conn, &step, ev.ts).await.map_err(|e| e.to_string())?;
+                    let receipt = serde_json::to_string(&record).map_err(|e| e.to_string())?;
+                    let stored: Option<String> = sqlx::query_scalar("SELECT receipt FROM step_first_records WHERE step_id=$1 AND key=$2")
+                        .bind(*step.id.inner().as_uuid()).bind(&record.key).fetch_optional(&mut *conn).await.map_err(|e| e.to_string())?;
+                    if stored.as_ref().is_some_and(|stored| stored != &receipt) { return Err("audit replay attempts to replace an immutable first receipt".into()); }
+                    sqlx::query("INSERT INTO step_first_records (step_id,key,receipt) VALUES ($1,$2,$3) ON CONFLICT (step_id,key) DO NOTHING")
+                        .bind(*step.id.inner().as_uuid()).bind(&record.key).bind(receipt)
+                        .execute(&mut *conn).await.map_err(|e| e.to_string())?;
+                    if inserted { report.steps_inserted += 1; } else { report.steps_updated += 1; }
+                    Ok(Applied::Yes)
+                }
                 "jobs.job.created" | "jobs.job.updated" => {
                     let job: Job = match serde_json::from_value(ev.payload.clone()) {
                         Ok(j) => j,
@@ -535,6 +563,9 @@ async fn upsert_step(
     step: &Step,
     ts: DateTime<Utc>,
 ) -> Result<bool, RebuildError> {
+    crate::postgres::preserve_first_records(&mut *conn, &step.id, &step.metadata)
+        .await
+        .map_err(|e| RebuildError::Storage(e.to_string()))?;
     let result = sqlx::query(
         r#"
         INSERT INTO steps (id, job_id, kind, title, spec_slug, assignee_id, status, sort_order,

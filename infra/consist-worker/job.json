@@ -1,0 +1,193 @@
+{
+  "apiVersion": "batch/v1",
+  "kind": "Job",
+  "metadata": {
+    "name": "$NAME",
+    "namespace": "boss-dev",
+    "labels": {
+      "app": "consist-worker"
+    }
+  },
+  "spec": {
+    "backoffLimit": 0,
+    "activeDeadlineSeconds": "$DEADLINE",
+    "ttlSecondsAfterFinished": 86400,
+    "template": {
+      "metadata": {
+        "labels": {
+          "app": "consist-worker"
+        }
+      },
+      "spec": {
+        "restartPolicy": "Never",
+        "automountServiceAccountToken": false,
+        "shareProcessNamespace": false,
+        "hostPID": false,
+        "hostIPC": false,
+        "hostNetwork": false,
+        "imagePullSecrets": [
+          {
+            "name": "forgejo-registry"
+          }
+        ],
+        "affinity": {
+          "nodeAffinity": {
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+              "nodeSelectorTerms": [
+                {
+                  "matchExpressions": [
+                    {
+                      "key": "node-role.kubernetes.io/control-plane",
+                      "operator": "DoesNotExist"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "securityContext": {
+          "fsGroup": 1500,
+          "runAsNonRoot": true,
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          }
+        },
+        "initContainers": [
+          {
+            "name": "clone",
+            "image": "$IMAGE",
+            "imagePullPolicy": "Always",
+            "securityContext": {
+              "allowPrivilegeEscalation": false,
+              "readOnlyRootFilesystem": true,
+              "runAsUser": 65534,
+              "runAsGroup": 1500,
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ]
+              }
+            },
+            "resources": {
+              "requests": {
+                "cpu": "100m",
+                "memory": "256Mi",
+                "ephemeral-storage": "1Gi"
+              },
+              "limits": {
+                "cpu": "1",
+                "memory": "1Gi",
+                "ephemeral-storage": "2Gi"
+              }
+            },
+            "command": [
+              "bash",
+              "-c",
+              "$CLONE",
+              "consist-clone",
+              "$URL",
+              "$REFERENCE",
+              "$HEAD",
+              "refs/heads/main",
+              "$BASELINE"
+            ],
+            "volumeMounts": [
+              {
+                "name": "checkout",
+                "mountPath": "/work"
+              },
+              {
+                "name": "forge-read",
+                "mountPath": "/etc/forge",
+                "readOnly": true
+              },
+              {
+                "name": "clone-tmp",
+                "mountPath": "/tmp"
+              }
+            ]
+          }
+        ],
+        "containers": [
+          {
+            "name": "consist",
+            "image": "$IMAGE",
+            "imagePullPolicy": "Always",
+            "securityContext": {
+              "allowPrivilegeEscalation": false,
+              "readOnlyRootFilesystem": true,
+              "runAsUser": 65534,
+              "runAsGroup": 1500,
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ]
+              }
+            },
+            "resources": {
+              "requests": {
+                "cpu": "100m",
+                "memory": "256Mi",
+                "ephemeral-storage": "1Gi"
+              },
+              "limits": {
+                "cpu": "1",
+                "memory": "1Gi",
+                "ephemeral-storage": "2Gi"
+              }
+            },
+            "command": [
+              "python3",
+              "-c",
+              "$WORKER",
+              "$HEAD",
+              "$BASELINE",
+              "$BUDGET",
+              "$NAME",
+              "/work/repo"
+            ],
+            "volumeMounts": [
+              {
+                "name": "checkout",
+                "mountPath": "/work",
+                "readOnly": true
+              },
+              {
+                "name": "worker-tmp",
+                "mountPath": "/tmp"
+              }
+            ]
+          }
+        ],
+        "volumes": [
+          {
+            "name": "checkout",
+            "emptyDir": {
+              "sizeLimit": "1Gi"
+            }
+          },
+          {
+            "name": "forge-read",
+            "secret": {
+              "secretName": "forge-read",
+              "defaultMode": 256
+            }
+          },
+          {
+            "name": "clone-tmp",
+            "emptyDir": {
+              "sizeLimit": "256Mi"
+            }
+          },
+          {
+            "name": "worker-tmp",
+            "emptyDir": {
+              "sizeLimit": "256Mi"
+            }
+          }
+        ]
+      }
+    }
+  }
+}

@@ -56,6 +56,7 @@ boss-policy = { path = "../../core/boss-policy" }
 boss-policy-client = { path = "../../core/boss-policy-client" }
 
 [dev-dependencies]
+syn = { version = "2", features = ["full"] }
 tokio = { workspace = true }
 tower = { workspace = true }
 http-body-util = "0.1"

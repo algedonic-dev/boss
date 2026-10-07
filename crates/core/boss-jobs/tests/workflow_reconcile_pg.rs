@@ -61,7 +61,7 @@ async fn created_by(db: &TestDb, kind: &str) -> Option<String> {
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_inserts_missing_kinds_as_bootstrap_owned() {
     let db = TestDb::new().await;
-    let registry = PgWorkflows::new(db.pool.clone());
+    let registry = PgWorkflows::for_fixture(db.pool.clone());
 
     let stats = registry
         .bootstrap_reconcile(
@@ -100,7 +100,7 @@ async fn pg_inserts_missing_kinds_as_bootstrap_owned() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_republishes_drifted_bootstrap_rows_as_a_new_version() {
     let db = TestDb::new().await;
-    let registry = PgWorkflows::new(db.pool.clone());
+    let registry = PgWorkflows::for_fixture(db.pool.clone());
 
     registry
         .bootstrap_reconcile(
@@ -160,7 +160,7 @@ async fn pg_republishes_drifted_bootstrap_rows_as_a_new_version() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_preserves_operator_edits() {
     let db = TestDb::new().await;
-    let registry = PgWorkflows::new(db.pool.clone());
+    let registry = PgWorkflows::for_fixture(db.pool.clone());
 
     // Seed an operator-owned row directly (created_by != 'bootstrap').
     sqlx::query(
@@ -226,7 +226,7 @@ async fn pg_preserves_operator_edits() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_preserves_a_workflow_published_through_the_api() {
     let db = TestDb::new().await;
-    let registry = PgWorkflows::new(db.pool.clone());
+    let registry = PgWorkflows::for_fixture(db.pool.clone());
     let editor = boss_core::actor::ActorId::Human("emp-david".into());
     let now = chrono::Utc::now();
 
@@ -275,7 +275,7 @@ async fn pg_preserves_a_workflow_published_through_the_api() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_no_op_when_already_matching() {
     let db = TestDb::new().await;
-    let registry = PgWorkflows::new(db.pool.clone());
+    let registry = PgWorkflows::for_fixture(db.pool.clone());
 
     let body = spec("workflow-design", "Design a Workflow");
     registry
@@ -300,7 +300,7 @@ async fn pg_no_op_when_already_matching() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_publish_authored_supersedes_active_and_stamps_provenance() {
     let db = TestDb::new().await;
-    let registry = PgWorkflows::new(db.pool.clone());
+    let registry = PgWorkflows::for_fixture(db.pool.clone());
 
     // Seed a bootstrap row first, so the publish path actually
     // exercises the supersede branch (not just an insert).

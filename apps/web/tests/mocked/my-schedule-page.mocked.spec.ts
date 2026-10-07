@@ -1,3 +1,4 @@
+import { isPageWrite } from './_smokeMocks';
 // /ux/calendar/me — "My schedule", every control and render state
 // pinned as the page behaves TODAY (page audit 0e4fef17, step `test`).
 //
@@ -17,7 +18,7 @@
 //             calendar row, which carries the module, onto its own
 //             always-on `schedule` row in Home.
 //   State B — the module on: MyCalendarPage, three buttons, one read,
-//             no writes, no links.
+//             no writes; native job-step references resolve to scoped links.
 //
 // Lines that pin a FILED gap's current behaviour name the gap. They are
 // meant to be edited by the car that fixes it, so the fix shows up here
@@ -43,6 +44,9 @@ const json = (r: Route, body: unknown, status = 200): Promise<void> =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
 
 const RESERVATIONS = /\/api\/calendar\/reservations\?/;
+const STEP_ID = 'a6c40001-0000-0000-0000-000000000001';
+const JOB_ID = 'a6c40002-0000-0000-0000-000000000001';
+const STEP_LOOKUP = `/api/jobs/steps/${STEP_ID}`;
 
 /// 2026-09-23 is a Wednesday; its week is Mon 21 – Sun 27 September.
 const NOW = new Date('2026-09-23T15:00:00Z');
@@ -77,7 +81,6 @@ async function installEmployeeSession(page: Page): Promise<void> {
 /// The shell's own non-GET: App.svelte records every route open
 /// (shell/surface-opens.ts, 628f182b). It is the chrome's write, not
 /// this page's, so the page's write count excludes it by path.
-const SHELL_WRITES: ReadonlySet<string> = new Set(['/api/surface-opens']);
 
 /// Record every reservations read and every non-GET the page sends.
 function watch(page: Page): { reads: URL[]; writes: Request[] } {
@@ -86,7 +89,7 @@ function watch(page: Page): { reads: URL[]; writes: Request[] } {
     const url = new URL(req.url());
     if (!url.pathname.startsWith('/api/')) return;
     if (req.method() !== 'GET') {
-      if (!SHELL_WRITES.has(url.pathname)) seen.writes.push(req);
+      if (isPageWrite(req.method(), url.pathname)) seen.writes.push(req);
       return;
     }
     if (url.pathname === '/api/calendar/reservations') seen.reads.push(url);
@@ -105,6 +108,97 @@ function readWindow(url: URL | undefined): Record<string, string | null> {
 
 const body = (page: Page) => page.locator('.catalog');
 const button = (page: Page, name: string) => page.getByRole('button', { name, exact: true });
+
+test.describe('/ux/calendar/me — reservation step navigation', () => {
+  test('one slow step lookup does not hold a resolved destination', async ({ page }) => {
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    await installEmployeeSession(page);
+    await page.route(RESERVATIONS, (r) => json(r, [
+      reservation('first', '2026-09-23T12:00:00Z', '2026-09-23T13:00:00Z', 'job-step', STEP_ID),
+      reservation('second', '2026-09-23T13:00:00Z', '2026-09-23T14:00:00Z', 'job-step', JOB_ID),
+    ]));
+    await page.route(STEP_LOOKUP, (r) => json(r, { step_id: STEP_ID, job_id: JOB_ID }));
+    await page.route(`/api/jobs/steps/${JOB_ID}`, async (r) => { await held; await json(r, {}, 404); });
+    await mountPage(page, PATH, { titleMatch: /week of Mon, Sep 21$/ });
+    await expect(page.locator('.week-cell-ref a')).toHaveText(STEP_ID);
+    await expect(page.getByRole('status')).toHaveText('Loading step…');
+    release();
+    await expect(page.getByRole('status')).toHaveText('Step unavailable');
+  });
+  test('malformed step references and other reasons never enter the jobs lookup', async ({ page }) => {
+    const lookups: string[] = [];
+    await installEmployeeSession(page);
+    await page.route(/\/api\/jobs\/steps\//, (r) => { lookups.push(r.request().url()); return json(r, {}); });
+    await page.route(RESERVATIONS, (r) => json(r, [
+      reservation('bad', '2026-09-23T12:00:00Z', '2026-09-23T13:00:00Z', 'job-step', '../bad'),
+      reservation('meeting', '2026-09-23T13:00:00Z', '2026-09-23T14:00:00Z', 'meeting', STEP_ID),
+    ]));
+    await mountPage(page, PATH, { titleMatch: /week of Mon, Sep 21$/ });
+    await expect(page.getByRole('status')).toHaveText('Step unavailable');
+    await expect(page.locator('.week-cell-ref a')).toHaveCount(0);
+    expect(lookups).toEqual([]);
+  });
+  test('a native step reference links to the actual packet and keeps its return lens', async ({ page }) => {
+    const seen = watch(page);
+    await installEmployeeSession(page);
+    await page.route(RESERVATIONS, (r) => json(r, [reservation('step', '2026-09-23T12:00:00Z', '2026-09-23T13:00:00Z', 'job-step', STEP_ID)]));
+    await page.route(STEP_LOOKUP, (r) => json(r, { step_id: STEP_ID, job_id: JOB_ID }));
+    await mountPage(page, PATH, { titleMatch: /week of Mon, Sep 21$/ });
+    const link = page.locator('.week-cell-ref a');
+    await expect(link).toHaveText(STEP_ID);
+    await expect(link).toHaveAttribute('href', `/jobs/${JOB_ID}/steps/${STEP_ID}?from=%2Fux%2Fcalendar%2Fme&from_label=My+schedule`);
+    await link.click();
+    await expect(page).toHaveURL(new RegExp(`/jobs/${JOB_ID}/steps/${STEP_ID}\\?`));
+    expect(seen.writes).toEqual([]);
+  });
+
+  for (const status of [403, 404, 500]) {
+    test(`lookup HTTP ${status} preserves the reservation without inventing a link`, async ({ page }) => {
+      await installEmployeeSession(page);
+      await page.route(RESERVATIONS, (r) => json(r, [reservation('step', '2026-09-23T12:00:00Z', '2026-09-23T13:00:00Z', 'job-step', STEP_ID)]));
+      await page.route(STEP_LOOKUP, (r) => json(r, {}, status));
+      await mountPage(page, PATH, { titleMatch: /week of Mon, Sep 21$/ });
+      await expect(page.locator('.week-cell')).toHaveCount(1);
+      await expect(page.locator('.week-cell-ref')).toContainText(STEP_ID);
+      await expect(page.locator('.week-cell-ref a')).toHaveCount(0);
+      await expect(page.getByRole('status')).toHaveText('Step unavailable');
+    });
+  }
+
+  for (const [name, response] of [
+    ['different step', { step_id: JOB_ID, job_id: JOB_ID }],
+    ['malformed packet', { step_id: STEP_ID, job_id: '../other' }],
+    ['empty response', {}],
+  ] as const) {
+    test(`a ${name} lookup response never creates a guessed destination`, async ({ page }) => {
+      await installEmployeeSession(page);
+      await page.route(RESERVATIONS, (r) => json(r, [reservation('step', '2026-09-23T12:00:00Z', '2026-09-23T13:00:00Z', 'job-step', STEP_ID)]));
+      await page.route(STEP_LOOKUP, (r) => json(r, response));
+      await mountPage(page, PATH, { titleMatch: /week of Mon, Sep 21$/ });
+      await expect(page.getByRole('status')).toHaveText('Step unavailable');
+      await expect(page.locator('.week-cell-ref a')).toHaveCount(0);
+    });
+  }
+
+  test('an old lookup cannot repopulate a new empty week', async ({ page }) => {
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    await installEmployeeSession(page);
+    await page.route(RESERVATIONS, (r) => json(r, new URL(r.request().url()).searchParams.get('start') === WEEK.start
+      ? [reservation('step', '2026-09-23T12:00:00Z', '2026-09-23T13:00:00Z', 'job-step', STEP_ID)] : []));
+    await page.route(STEP_LOOKUP, async (r) => { await held; await json(r, { step_id: STEP_ID, job_id: JOB_ID }); });
+    await mountPage(page, PATH, { titleMatch: /week of Mon, Sep 21$/ });
+    await expect(page.locator('.week-cell')).toHaveCount(1);
+    await button(page, 'Next week →').click();
+    await expect(page.locator('.week-col-empty')).toHaveCount(7);
+    const oldResponse = page.waitForResponse((response) => new URL(response.url()).pathname === STEP_LOOKUP);
+    release();
+    await (await oldResponse).finished();
+    await expect(page.locator('.week-cell')).toHaveCount(0);
+    await expect(page.locator('.week-cell-ref a')).toHaveCount(0);
+  });
+});
 
 test.describe('/ux/calendar/me — State A, the calendar module off (the live instance)', () => {
   // Gap 1 (eff0c5e5, fixed 2026-09-24): this spec pinned ModuleDisabled
@@ -165,9 +259,10 @@ test.describe('/ux/calendar/me — State B, the module on: identity', () => {
     expect(reads.map((e) => e.url)).toEqual([]);
   });
 
-  // Gap 4 (cfe3f465): while the session is still loading, the page tells
-  // a signed-in user to sign in.
-  test('a session still loading paints "Sign in to see your week." until it resolves', async ({ page }) => {
+  // Gap 4 (cfe3f465): session loading is unknown identity, not signed out.
+  test('a session still loading waits for its employee before reading the calendar', async ({ page }) => {
+    await recordPageRequests(page);
+    const seen = watch(page);
     let release: () => void = () => {};
     const held = new Promise<void>((resolve) => { release = resolve; });
     await installEmployeeSession(page);
@@ -178,28 +273,53 @@ test.describe('/ux/calendar/me — State B, the module on: identity', () => {
     await page.route(RESERVATIONS, (r) => json(r, []));
     await page.goto(PATH);
 
-    await expect(body(page).locator('p.empty')).toHaveText('Sign in to see your week.');
+    await expect(body(page).locator('p.empty')).toHaveText('Loading session…');
+    await expect(page.getByText('Sign in to see your week.')).toHaveCount(0);
+    await expect(page.locator('.week-grid')).toHaveCount(0);
+    for (const name of ['← Prev week', 'This week', 'Next week →']) {
+      await expect(button(page, name)).toBeDisabled();
+    }
+    expect((await openedRequests(page)).filter((e) => e.path === '/api/calendar/reservations')).toEqual([]);
     await expect(page.locator('h1').first()).toHaveText('My Week');
     release();
     await expect(page.locator('h1').first()).toHaveText(`${EMP_ID} — week of Mon, Sep 21`);
     await expect(page.getByText('Sign in to see your week.')).toHaveCount(0);
+    expect(await settledReads(page, () => seen.reads.length, 1)).toBe(1);
+    expect(readWindow(seen.reads[0])).toEqual({ resource_kind: 'employee', resource_id: EMP_ID, ...WEEK });
+    expect(seen.writes).toEqual([]);
   });
 
-  // Gap 4 (cfe3f465), second half: a guest is `ready` with an id that is
-  // its username, so the read fires for an id nothing reserves against
-  // and the week paints empty with nothing saying why.
-  test('a guest session reads reservations for the guest username and paints an empty week', async ({ page }) => {
+  // A guest is a renderable identity, not an employee reservation resource.
+  for (const role of ['audit-readonly', 'visitor']) {
+    test(`a ${role} guest session explains its missing employee calendar without reading a username`, async ({ page }) => {
+      await recordPageRequests(page);
+      const seen = watch(page);
+      await installEmployeeSession(page);
+      await page.route(/\/api\/session$/, (r) => json(r, { username: 'guest', role }));
+      await page.route(RESERVATIONS, (r) => json(r, []));
+      await mountPage(page, PATH, { titleMatch: /^My Week$/ });
+
+      await expect(body(page).locator('p.empty')).toHaveText('This session is not linked to an employee calendar.');
+      await expect(page.locator('.week-grid')).toHaveCount(0);
+      expect((await openedRequests(page)).filter((e) => e.path === '/api/calendar/reservations')).toEqual([]);
+      expect(seen.reads).toEqual([]);
+      expect(seen.writes).toEqual([]);
+      for (const name of ['← Prev week', 'This week', 'Next week →']) {
+        await expect(button(page, name)).toBeDisabled();
+      }
+    });
+  }
+
+  test('an employee with a guest-floor role still reads their actual employee calendar', async ({ page }) => {
     const seen = watch(page);
     await installEmployeeSession(page);
-    await page.route(/\/api\/session$/, (r) => json(r, { username: 'guest', role: 'audit-readonly' }));
+    await page.route(/\/api\/session$/, (r) => json(r, { employee_id: EMP_ID, username: 'ceo', role: 'audit-readonly' }));
     await page.route(RESERVATIONS, (r) => json(r, []));
-    await mountPage(page, PATH, { titleMatch: /week of Mon, Sep 21/ });
-
+    await mountPage(page, PATH, { titleMatch: new RegExp(`^${EMP_ID} — week of Mon, Sep 21$`) });
     await expect(page.locator('.week-col-empty')).toHaveCount(7);
     expect(await settledReads(page, () => seen.reads.length, 1)).toBe(1);
-    // guestEmployee(username) takes the username as its id.
-    expect(readWindow(seen.reads[0])).toEqual({ resource_kind: 'employee', resource_id: 'guest', ...WEEK });
-    await expect(page.locator('h1').first()).toHaveText('guest — week of Mon, Sep 21');
+    expect(readWindow(seen.reads[0])).toEqual({ resource_kind: 'employee', resource_id: EMP_ID, ...WEEK });
+    expect(seen.writes).toEqual([]);
   });
 });
 
@@ -271,11 +391,12 @@ test.describe('/ux/calendar/me — State B, the module on: the read and the week
 
   test('reservations land on their days in start order, with the reason label, the raw ref and the notes', async ({ page }) => {
     await installEmployeeSession(page);
+    await page.route(STEP_LOOKUP, (r) => json(r, { step_id: STEP_ID, job_id: JOB_ID }));
     await page.route(RESERVATIONS, (r) =>
       json(r, [
         // Deliberately out of order: Wednesday's later block first.
         reservation('r-meet', '2026-09-23T14:00:00Z', '2026-09-23T15:00:00Z', 'meeting', 'mtg-7', 'Brew plan'),
-        reservation('r-step', '2026-09-23T09:00:00Z', '2026-09-23T11:30:00Z', 'job-step', '3f0c1a2b-step-uuid'),
+        reservation('r-step', '2026-09-23T09:00:00Z', '2026-09-23T11:30:00Z', 'job-step', STEP_ID),
         reservation('r-pm', '2026-09-21T08:00:00Z', '2026-09-21T09:00:00Z', 'preventive-maintenance-visit', 'pm-1'),
         reservation('r-train', '2026-09-22T10:00:00Z', '2026-09-22T12:00:00Z', 'training', 'trn-1'),
         // Spans Thursday into Friday, so it shows on both.
@@ -297,8 +418,8 @@ test.describe('/ux/calendar/me — State B, the module on: the read and the week
     // Wednesday: sorted by start, not by arrival.
     await expect(col(2).locator('.week-cell-time')).toHaveText(['9:00 AM–11:30 AM', '2:00 PM–3:00 PM']);
     await expect(col(2).locator('[class*="chip-reason-"]')).toHaveText(['Job step', 'Meeting']);
-    // Gap 5 (b6c4d9a1): a job-step's ref is a bare step id, as text, not a link.
-    await expect(col(2).locator('.week-cell-ref')).toHaveText(['3f0c1a2b-step-uuid', 'mtg-7']);
+    // Gap 5 (b6c4d9a1): only an actual scoped step identity becomes a link.
+    await expect(col(2).locator('.week-cell-ref')).toHaveText([STEP_ID, 'mtg-7']);
     await expect(col(2).locator('.week-cell-notes')).toHaveText(['Brew plan']);
 
     await expect(col(3).locator('[class*="chip-reason-"]')).toHaveText(['PTO']);
@@ -309,14 +430,13 @@ test.describe('/ux/calendar/me — State B, the module on: the read and the week
 
     await expect(page.locator('.week-col-empty')).toHaveCount(0);
     await expect(page.locator('.week-cell')).toHaveCount(8);
-    // Gap 5 (b6c4d9a1): no cell can be followed anywhere.
-    await expect(body(page).locator('a')).toHaveCount(0);
+    await expect(body(page).locator('a')).toHaveCount(1);
   });
 });
 
 test.describe('/ux/calendar/me — State B: a failed read is said, never drawn as an empty week', () => {
-  // Gap 8(a) (7c196817): the 502/503 words name `calendar_api_url`,
-  // which is not the knob behind the gateway's calendar route.
+  // Gap 8(a) (7c196817): an unavailable service needs retry advice,
+  // not an assumed configuration cause or an internal configuration key.
   for (const status of [503, 502]) {
     test(`HTTP ${status} says the calendar service is unavailable`, async ({ page }) => {
       await installEmployeeSession(page);
@@ -324,7 +444,7 @@ test.describe('/ux/calendar/me — State B: a failed read is said, never drawn a
       await mountPage(page, PATH, { titleMatch: /week of Mon, Sep 21$/ });
 
       await expect(body(page).locator('p.empty')).toHaveText(
-        "Couldn't load calendar: calendar service unavailable — wire calendar_api_url",
+        "Couldn't load calendar: calendar service unavailable — please try again later",
       );
       await expect(page.locator('.week-grid')).toHaveCount(0);
       await expect(page.locator('.week-col-empty')).toHaveCount(0);

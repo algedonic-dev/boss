@@ -41,6 +41,7 @@ fn migration_sql() -> String {
 fn build_app(pool: PgPool) -> Router {
     let publisher = DomainPublisher::new(RecordingEventBus::new(), "scheduling");
     scheduling_router(SchedulingApiState {
+        role_guards: None,
         repo: Arc::new(PgScheduling::new(pool)),
         publisher: Some(publisher),
         clock: Arc::new(boss_clock_client::WallClockClient),

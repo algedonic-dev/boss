@@ -13,6 +13,7 @@ pub mod events;
 pub mod files;
 pub mod in_memory;
 pub mod port;
+pub mod role_reports;
 pub mod seed;
 pub mod types;
 
@@ -20,6 +21,8 @@ pub mod types;
 pub mod config;
 #[cfg(feature = "postgres")]
 pub mod http;
+#[cfg(feature = "postgres")]
+mod manual_rebuild;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "postgres")]

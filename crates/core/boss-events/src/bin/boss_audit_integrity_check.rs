@@ -76,6 +76,10 @@ struct Cli {
     /// The systemd journal-friendly default is one summary line.
     #[arg(long)]
     json: bool,
+
+    /// Record independent chain/drift observations through the native run-summary door.
+    #[arg(long)]
+    summary_file: Option<PathBuf>,
 }
 
 #[derive(serde::Deserialize)]
@@ -175,7 +179,10 @@ async fn main() -> Result<()> {
     // The event-kind drift guard (registry 108; warn-not-abort per
     // the review): an emitted kind nothing declares is a vocabulary
     // hole — loud in the journal, never a failed run.
-    match boss_events::integrity::unregistered_kinds(&pool).await {
+    let drift = boss_events::integrity::unregistered_kinds(&pool)
+        .await
+        .map_err(|error| error.to_string());
+    match &drift {
         Ok(missing) if !missing.is_empty() => tracing::warn!(
             count = missing.len(),
             kinds = %missing.join(", "),
@@ -186,6 +193,14 @@ async fn main() -> Result<()> {
         Err(e) => {
             tracing::warn!(error = %e, "event-kind drift check failed (registry table missing?)")
         }
+    }
+
+    let observation = structured_observation(&report, drift, Utc::now());
+    if let Some(path) = &cli.summary_file {
+        let bytes = serde_json::to_vec(&serde_json::json!({"audit_integrity": observation}))?;
+        tokio::fs::write(path, bytes)
+            .await
+            .with_context(|| format!("writing audit integrity summary to {}", path.display()))?;
     }
 
     // Layer 3: the daily checkpoint — log the current chain head so
@@ -225,6 +240,7 @@ async fn main() -> Result<()> {
             "missing_ids": report.missing_ids(),
             "gap_reading": report.gap_reading().as_str(),
             "chain_intact": report.chain_intact(),
+            "audit_integrity": observation,
             "exit_code": if report.has_errors() { 2 } else { 0 },
             "regression_count": report.regressions.len(),
             "chain_break_count": report.chain_breaks.len(),
@@ -328,4 +344,125 @@ async fn main() -> Result<()> {
         );
     }
     std::process::exit(2);
+}
+
+fn structured_observation(
+    report: &IntegrityReport,
+    drift: Result<Vec<String>, String>,
+    checked_at: DateTime<Utc>,
+) -> serde_json::Value {
+    let drift = match drift {
+        Ok(kinds) => serde_json::json!({
+            "state": if kinds.is_empty() { "covered" } else { "undeclared" },
+            "kinds": kinds,
+        }),
+        Err(error) => serde_json::json!({"state": "unavailable", "error": error}),
+    };
+    serde_json::json!({
+        "version": 1,
+        "checked_at": checked_at,
+        "chain": {
+            "state": if report.chain_intact() { "intact" } else { "broken" },
+            "total_rows": report.total_rows,
+            "chain_break_count": report.chain_breaks.len(),
+            "regression_count": report.regressions.len(),
+            "dangling_ref_count": report.dangling_refs.len(),
+            "gap_count": report.gaps.len(),
+            "missing_ids": report.missing_ids(),
+            "gap_reading": report.gap_reading().as_str(),
+        },
+        "drift": drift,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, structured_observation};
+    use boss_events::IntegrityReport;
+    use chrono::{TimeZone, Utc};
+    use clap::Parser;
+
+    #[test]
+    fn the_native_report_has_an_explicit_file_door() {
+        let parsed = Cli::try_parse_from([
+            "boss-audit-integrity-check",
+            "--summary-file",
+            "run-summary.json",
+        ]);
+        assert!(
+            parsed.is_ok(),
+            "structured report door was refused: {parsed:?}"
+        );
+    }
+
+    #[test]
+    fn drift_failure_is_not_empty_coverage_even_when_the_chain_is_intact() {
+        let report = IntegrityReport {
+            total_rows: 3,
+            gaps: vec![],
+            regressions: vec![],
+            chain_breaks: vec![],
+            dangling_refs: vec![],
+            sanctioned_trim_gap: None,
+        };
+        let checked = Utc.with_ymd_and_hms(2026, 10, 3, 3, 30, 0).unwrap();
+        let observed = structured_observation(&report, Err("registry unavailable".into()), checked);
+        assert_eq!(observed["chain"]["state"], "intact");
+        assert_eq!(observed["drift"]["state"], "unavailable");
+        assert_eq!(observed["drift"]["error"], "registry unavailable");
+        assert!(observed["drift"].get("kinds").is_none());
+        assert_eq!(observed["version"], 1);
+    }
+
+    #[test]
+    fn an_undeclared_kind_is_recorded_independently_of_a_clean_chain() {
+        let report = IntegrityReport {
+            total_rows: 3,
+            gaps: vec![],
+            regressions: vec![],
+            chain_breaks: vec![],
+            dangling_refs: vec![],
+            sanctioned_trim_gap: None,
+        };
+        let checked = Utc.with_ymd_and_hms(2026, 10, 3, 3, 30, 0).unwrap();
+        for kinds in [vec![], vec!["jobs.new.fact".into()]] {
+            let observed = structured_observation(&report, Ok(kinds.clone()), checked);
+            assert_eq!(observed["chain"]["state"], "intact");
+            assert_eq!(observed["drift"]["kinds"], serde_json::json!(kinds));
+            assert_eq!(
+                observed["drift"]["state"],
+                if kinds.is_empty() {
+                    "covered"
+                } else {
+                    "undeclared"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn broken_chain_facts_are_preserved_with_their_native_counts() {
+        let report = IntegrityReport {
+            total_rows: 3,
+            gaps: vec![],
+            regressions: vec![],
+            chain_breaks: vec![boss_events::integrity::ChainBreak {
+                id: 3,
+                stored_hash: vec![1],
+                computed_hash: vec![2],
+            }],
+            dangling_refs: vec![],
+            sanctioned_trim_gap: None,
+        };
+        let checked = Utc.with_ymd_and_hms(2026, 10, 3, 3, 30, 0).unwrap();
+        let observed = structured_observation(&report, Ok(vec![]), checked);
+        assert!(
+            report.has_errors(),
+            "the existing failure exit remains earned"
+        );
+        assert_eq!(observed["chain"]["state"], "broken");
+        assert_eq!(observed["chain"]["chain_break_count"], 1);
+        assert_eq!(observed["chain"]["total_rows"], 3);
+        assert_eq!(observed["drift"]["state"], "covered");
+    }
 }

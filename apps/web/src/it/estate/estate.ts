@@ -574,24 +574,54 @@ export type EstateState = Readonly<{
 // (infra/cluster/manifests/boss-dev.yaml, Service boss-dev-ssh).
 //
 // ONE COPY, TWO READERS (design 125d405d, backlog fd6d6c08). The
-// hostname and the three client steps live in ./dev-door.json, which
-// this page imports and the printed recovery sheet reads
+// hostname and client steps live in infra/estate/dev-door.json. Converge
+// delivers those bytes through the nonsecret static declaration; the
+// printed recovery sheet reads the same source
 // (infra/recovery/re-entry.toml, `boss recovery sheet`). Until
 // 2026-09-29 they were literals here and the paper would have been a
-// second spelling; one file cannot drift from itself (CLAUDE.md §9a).
+// second spelling. A generic image instead ships an explicit empty
+// declaration; its reader does not import this estate's hostname.
 // The hostname is still DECLARED twice more — the tunnel route in
 // infra/cluster/tunnel-origins.toml and the application in
 // infra/cluster/dns/access.toml — and the Rust test
 // the_dev_door_is_an_access_ssh_application.rs holds the data file to
 // the route the connector serves, so a drift is a red test rather than
 // a terminal block that opens nothing.
-import devDoor from './dev-door.json';
-
-export const DEV_DOOR_HOST: string = devDoor.host;
+export const DEV_DOOR_READ = '/instance-config/dev-door.json';
 
 /** One line of the terminal setup, with the reason it is there: a
  *  command an operator pastes blind is a command they cannot judge. */
 export type DoorStep = Readonly<{ what: string; command: string; why: string }>;
+export type DevDoorDeclaration = Readonly<{ host: string | null; steps: readonly DoorStep[] }>;
+
+/** D4, approved c6f08b60: an explicit empty declaration is the generic
+ * default. An unread or malformed declaration is a failure, not none. */
+export function parseDevDoor(raw: unknown): DevDoorDeclaration {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('dev door declaration must be an object');
+  const o = raw as Record<string, unknown>;
+  const host = o.host ?? null;
+  if (host !== null && (typeof host !== 'string' || !validDoorHost(host))) throw new Error('dev door host must be a DNS hostname');
+  if (o.steps === undefined && host === null) return { host: null, steps: [] };
+  if (!Array.isArray(o.steps) || (host !== null && o.steps.length === 0) || o.steps.length > 32) throw new Error('dev door declaration requires its setup steps');
+  const steps = o.steps.map((value: unknown): DoorStep => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('dev door step must be an object');
+    const s = value as Record<string, unknown>;
+    const text = (key: string): string => {
+      const v = s[key];
+      if (typeof v !== 'string' || v.trim().length === 0 || v.length > 8192) throw new Error('dev door step is incomplete');
+      return v;
+    };
+    return { what: text('what'), command: text('command'), why: text('why') };
+  });
+  return host === null ? { host: null, steps: [] } : { host, steps };
+}
+
+const validDoorHost = (host: string): boolean => host.length <= 253 && host.split('.').every(
+  (label) => /^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$/.test(label),
+);
+
+export const fetchDevDoor = (): Promise<Exclude<Remote<DevDoorDeclaration>, { kind: 'loading' }>> =>
+  fetchRemote(DEV_DOOR_READ, parseDevDoor);
 
 /** The one-time terminal setup for the dev door, in order. Steps 1 and
  *  2 are done once per machine; step 3 is every session — and after
@@ -599,9 +629,11 @@ export type DoorStep = Readonly<{ what: string; command: string; why: string }>;
  *  because the stanza teaches ssh itself how to reach it. `{host}` in
  *  the data file is the host this is given — the sheet's renderer
  *  fills it with the file's own `host`. */
-export function devDoorSteps(host: string = DEV_DOOR_HOST): readonly DoorStep[] {
+export function devDoorSteps(host: string | null, steps: readonly DoorStep[] = []): readonly DoorStep[] {
+  if (host === null) return [];
+  if (!validDoorHost(host)) throw new Error('dev door host must be a DNS hostname');
   const fill = (s: string) => s.replaceAll('{host}', host);
-  return devDoor.steps.map((s) => ({ what: fill(s.what), command: fill(s.command), why: fill(s.why) }));
+  return steps.map((s) => ({ what: fill(s.what), command: fill(s.command), why: fill(s.why) }));
 }
 
 function asArray(raw: unknown): readonly unknown[] {

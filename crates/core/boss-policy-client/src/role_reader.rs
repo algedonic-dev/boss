@@ -3,8 +3,8 @@
 //! agents with aliases, automation rows, and the active people roster.
 //! A complete answer is required; errors differ from an unregistered id.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use boss_core::machine_gate::{Mode, ModeSwitch};
@@ -57,6 +57,314 @@ pub struct HttpRoleReader {
     http: machine_token::Client,
 }
 
+/// An owned, complete registry projection. Lookup performs no I/O, so
+/// registry services can compare their own callers without reading themselves.
+/// Freshness and atomic publication belong to the injected snapshot adapter.
+pub struct RegistryRoles {
+    rows: Vec<(Value, bool, bool)>,
+}
+
+impl RegistryRoles {
+    pub fn from_sources(
+        agents: Value,
+        automations: Value,
+        people: Value,
+    ) -> Result<Self, RoleLookupError> {
+        let mut rows = Vec::new();
+        for (body, path, aliases, people) in [
+            (agents, "/api/agents", true, false),
+            (automations, "/api/agents/automations", false, false),
+            (people, "/api/people", false, true),
+        ] {
+            for row in complete_rows(body, path, people)? {
+                // Validate every row before publication, including rows that
+                // happen not to match the first caller using this projection.
+                matches_actor(&row, "", aliases, people)?;
+                record(&row)?;
+                rows.push((row, aliases, people));
+            }
+        }
+        Ok(Self { rows })
+    }
+}
+
+impl RegistryRoles {
+    pub fn lookup(&self, actor: &str) -> Result<Option<RoleRecord>, RoleLookupError> {
+        let mut found = Vec::new();
+        for (row, aliases, people) in &self.rows {
+            if matches_actor(row, actor, *aliases, *people)? {
+                found.push(record(row)?);
+            }
+        }
+        if found.len() > 1 {
+            return Err(RoleLookupError::Ambiguous(format!(
+                "{} registry rows match {actor}",
+                found.len()
+            )));
+        }
+        Ok(found.pop())
+    }
+}
+
+#[async_trait]
+impl RoleOfRecord for RegistryRoles {
+    async fn role_for(&self, actor: &str) -> Result<Option<RoleRecord>, RoleLookupError> {
+        self.lookup(actor)
+    }
+}
+
+/// Monotonic freshness is an explicit dependency; tests never sleep to age data.
+pub trait RoleSnapshotClock: Send + Sync {
+    fn now(&self) -> Instant;
+}
+
+#[async_trait]
+pub trait RoleSnapshotSource: Send + Sync {
+    async fn fetch_snapshot(&self) -> Result<RegistryRoles, RoleLookupError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleRefreshOutcome {
+    Published,
+    Unavailable,
+    Superseded,
+}
+
+pub struct MonotonicRoleSnapshotClock;
+
+impl RoleSnapshotClock for MonotonicRoleSnapshotClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+struct RefreshMarker {
+    started_at: Instant,
+}
+
+/// An opaque refresh identity, bound to the reader that admitted it.
+/// Pointer identity avoids a wrapping generation counter or caller-supplied ids.
+pub struct RoleRefreshTicket {
+    marker: Arc<RefreshMarker>,
+}
+
+#[derive(Clone)]
+enum PublishedRoles {
+    NeverLoaded,
+    Unavailable(RoleLookupError),
+    Ready {
+        roles: Arc<RegistryRoles>,
+        captured_at: Instant,
+    },
+}
+
+struct SnapshotState {
+    refresh: Option<Arc<RefreshMarker>>,
+    published: PublishedRoles,
+}
+
+/// Service-owned snapshot publication adapter. Request-time lookup never
+/// fetches a registry. A failed refresh replaces previous success with unknown;
+/// older refresh completions cannot replace the newest admitted refresh.
+pub struct SnapshotRoleReader {
+    max_age: Duration,
+    clock: Arc<dyn RoleSnapshotClock>,
+    state: Mutex<SnapshotState>,
+}
+
+/// Inventory of the currently usable generation. Ages use the injected
+/// monotonic clock; they are not audit timestamps or a durable clean window.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum RoleSnapshotStatus {
+    NeverLoaded,
+    Unavailable {
+        reason: String,
+    },
+    Ready {
+        age_seconds: u64,
+        max_age_seconds: u64,
+    },
+    Expired {
+        age_seconds: Option<u64>,
+        max_age_seconds: u64,
+    },
+}
+
+impl SnapshotRoleReader {
+    pub fn snapshot_status(&self) -> RoleSnapshotStatus {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match &state.published {
+            PublishedRoles::NeverLoaded => RoleSnapshotStatus::NeverLoaded,
+            PublishedRoles::Unavailable(error) => RoleSnapshotStatus::Unavailable {
+                reason: error.to_string(),
+            },
+            PublishedRoles::Ready { captured_at, .. } => {
+                let age = self.clock.now().checked_duration_since(*captured_at);
+                let max_age_seconds = self.max_age.as_secs();
+                match age {
+                    Some(age) if age < self.max_age => RoleSnapshotStatus::Ready {
+                        age_seconds: age.as_secs(),
+                        max_age_seconds,
+                    },
+                    _ => RoleSnapshotStatus::Expired {
+                        age_seconds: age.map(|age| age.as_secs()),
+                        max_age_seconds,
+                    },
+                }
+            }
+        }
+    }
+
+    pub fn new(max_age: Duration, clock: Arc<dyn RoleSnapshotClock>) -> Self {
+        Self {
+            max_age,
+            clock,
+            state: Mutex::new(SnapshotState {
+                refresh: None,
+                published: PublishedRoles::NeverLoaded,
+            }),
+        }
+    }
+
+    pub fn begin_refresh(&self) -> RoleRefreshTicket {
+        let marker = Arc::new(RefreshMarker {
+            started_at: self.clock.now(),
+        });
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.refresh = Some(marker.clone());
+        RoleRefreshTicket { marker }
+    }
+
+    pub fn finish_refresh(
+        &self,
+        ticket: RoleRefreshTicket,
+        result: Result<RegistryRoles, RoleLookupError>,
+    ) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if !state
+            .refresh
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &ticket.marker))
+        {
+            return false;
+        }
+        state.published = match result {
+            Ok(roles) => PublishedRoles::Ready {
+                roles: Arc::new(roles),
+                captured_at: ticket.marker.started_at,
+            },
+            Err(error) => PublishedRoles::Unavailable(error),
+        };
+        state.refresh = None;
+        true
+    }
+
+    /// Fetch outside the publication lock. A refused publication means a
+    /// newer refresh owns the slot, not that the old fetch became current.
+    pub async fn refresh_from(&self, source: &dyn RoleSnapshotSource) -> RoleRefreshOutcome {
+        let ticket = self.begin_refresh();
+        let result = source.fetch_snapshot().await;
+        let outcome = match &result {
+            Ok(_) => RoleRefreshOutcome::Published,
+            Err(error) => {
+                tracing::warn!(%error, "complete actor-role snapshot refresh unavailable");
+                RoleRefreshOutcome::Unavailable
+            }
+        };
+        if self.finish_refresh(ticket, result) {
+            outcome
+        } else {
+            RoleRefreshOutcome::Superseded
+        }
+    }
+
+    fn refresh_owner_stopped(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.refresh = None;
+        state.published = PublishedRoles::Unavailable(RoleLookupError::Unavailable(
+            "actor-role snapshot refresh owner has stopped".into(),
+        ));
+    }
+
+    /// Run under the service's owned task and shutdown receiver. Off does no
+    /// registry work; shutdown cancels even a source that has not answered.
+    pub async fn run_refresh_loop(
+        self: Arc<Self>,
+        source: Arc<dyn RoleSnapshotSource>,
+        mode: Arc<dyn ReportModeSource>,
+        cadence: Duration,
+        mut stop: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), RoleLookupError> {
+        if cadence.is_zero() {
+            return Err(RoleLookupError::Unavailable(
+                "actor-role refresh cadence must be nonzero".into(),
+            ));
+        }
+        let mut ticks = tokio::time::interval(cadence);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let tick_ready = tokio::select! {
+                biased;
+                _ = stop.wait_for(|stopped| *stopped) => false,
+                _ = ticks.tick() => true,
+            };
+            if !tick_ready {
+                self.refresh_owner_stopped();
+                return Ok(());
+            }
+            if mode.mode() == ReportMode::Off {
+                continue;
+            }
+            tokio::select! {
+                biased;
+                _ = stop.wait_for(|stopped| *stopped) => {
+                    self.refresh_owner_stopped();
+                    return Ok(());
+                },
+                _ = self.refresh_from(source.as_ref()) => {}
+            }
+        }
+    }
+}
+
+impl SnapshotRoleReader {
+    /// Read one fresh complete generation without request-time I/O.
+    pub fn lookup(&self, actor: &str) -> Result<Option<RoleRecord>, RoleLookupError> {
+        let published = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .published
+            .clone();
+        match published {
+            PublishedRoles::NeverLoaded => Err(RoleLookupError::Unavailable(
+                "complete role snapshot has never loaded".into(),
+            )),
+            PublishedRoles::Unavailable(error) => Err(error),
+            PublishedRoles::Ready { roles, captured_at } => {
+                let fresh = self
+                    .clock
+                    .now()
+                    .checked_duration_since(captured_at)
+                    .is_some_and(|age| age < self.max_age);
+                if !fresh {
+                    return Err(RoleLookupError::Unavailable(
+                        "complete role snapshot is expired or has an invalid capture time".into(),
+                    ));
+                }
+                roles.lookup(actor)
+            }
+        }
+    }
+}
+#[async_trait]
+impl RoleOfRecord for SnapshotRoleReader {
+    async fn role_for(&self, actor: &str) -> Result<Option<RoleRecord>, RoleLookupError> {
+        self.lookup(actor)
+    }
+}
+
 impl HttpRoleReader {
     pub fn new(jobs: String, people: String, reader: User) -> Result<Self, RoleLookupError> {
         Self::with_source(
@@ -93,6 +401,17 @@ impl HttpRoleReader {
             people: people.trim_end_matches('/').into(),
             http,
         })
+    }
+
+    /// Load one complete generation through the existing authenticated doors.
+    /// Snapshot publication happens only after all three responses validate.
+    pub async fn fetch_snapshot(&self) -> Result<RegistryRoles, RoleLookupError> {
+        let (agents, automations, people) = tokio::try_join!(
+            self.get(&self.jobs, "/api/agents"),
+            self.get(&self.jobs, "/api/agents/automations"),
+            self.get(&self.people, "/api/people?status=active"),
+        )?;
+        RegistryRoles::from_sources(agents, automations, people)
     }
 
     async fn get(&self, base: &str, path: &str) -> Result<Value, RoleLookupError> {
@@ -154,7 +473,7 @@ fn matches_actor(
     let id = row
         .get("id")
         .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
+        .filter(|id| !id.trim().is_empty())
         .ok_or_else(|| RoleLookupError::Unavailable("registry row has no id".into()))?;
     if people {
         let status = row
@@ -177,14 +496,24 @@ fn matches_actor(
             let alias = alias.as_str().ok_or_else(|| {
                 RoleLookupError::Unavailable("agent alias is not a string".into())
             })?;
+            if alias.trim().is_empty() {
+                return Err(RoleLookupError::Unavailable("agent alias is blank".into()));
+            }
             matches |= alias == actor;
         }
     }
     if people {
-        matches |= row
-            .get("email")
-            .and_then(Value::as_str)
-            .is_some_and(|email| email.eq_ignore_ascii_case(actor));
+        match row.get("email") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(email)) if !email.trim().is_empty() => {
+                matches |= email.eq_ignore_ascii_case(actor);
+            }
+            _ => {
+                return Err(RoleLookupError::Unavailable(
+                    "active people row has a malformed email".into(),
+                ));
+            }
+        }
     }
     Ok(matches)
 }
@@ -212,29 +541,13 @@ impl RoleOfRecord for HttpRoleReader {
     async fn role_for(&self, actor: &str) -> Result<Option<RoleRecord>, RoleLookupError> {
         // Finite independent GETs. This reader never calls policy itself;
         // registry doors authorize its named service using their own ports.
-        let (agents, automations, people) = tokio::try_join!(
-            self.get(&self.jobs, "/api/agents"),
-            self.get(&self.jobs, "/api/agents/automations"),
-            self.get(&self.people, "/api/people?status=active"),
-        )?;
-        let mut found = Vec::new();
-        for (body, path, aliases, people) in [
-            (agents, "/api/agents", true, false),
-            (automations, "/api/agents/automations", false, false),
-            (people, "/api/people", false, true),
-        ] {
-            for row in complete_rows(body, path, people)? {
-                if matches_actor(&row, actor, aliases, people)? {
-                    found.push(record(&row)?);
-                }
-            }
-        }
-        if found.len() > 1 {
-            return Err(RoleLookupError::Ambiguous(format!(
-                "{} registry rows match {actor}",
-                found.len()
-            )));
-        }
-        Ok(found.pop())
+        self.fetch_snapshot().await?.role_for(actor).await
+    }
+}
+
+#[async_trait]
+impl RoleSnapshotSource for HttpRoleReader {
+    async fn fetch_snapshot(&self) -> Result<RegistryRoles, RoleLookupError> {
+        HttpRoleReader::fetch_snapshot(self).await
     }
 }

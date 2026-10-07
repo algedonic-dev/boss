@@ -24,6 +24,7 @@ use sqlx::PgPool;
 #[derive(Clone)]
 pub struct ScopeState {
     pub pool: Arc<PgPool>,
+    pub role_guards: Option<Arc<boss_policy_client::role_guard::RoleGuardReporter>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,8 +42,16 @@ pub struct EmployeeScope {
 }
 
 pub fn scope_router(pool: PgPool) -> Router {
+    scope_router_with_reports(pool, None)
+}
+
+pub fn scope_router_with_reports(
+    pool: PgPool,
+    role_guards: Option<Arc<boss_policy_client::role_guard::RoleGuardReporter>>,
+) -> Router {
     let state = ScopeState {
         pool: Arc::new(pool),
+        role_guards,
     };
     Router::new()
         .route("/api/people/{id}/scope", get(get_scope))
@@ -65,7 +74,23 @@ async fn get_scope(
     let tier_ok = matches!(user.access_tier, boss_policy::AccessTier::Operator);
     let role_ok = boss_core::roles::has_global_read(&user.role);
     let self_lookup = user.id == id;
-    if !(tier_ok || role_ok || self_lookup) {
+    let original = tier_ok || role_ok || self_lookup;
+    let allowed = state.role_guards.as_ref().map_or(original, |reporter| {
+        reporter.observe_captured(
+            "people-scope-enumeration",
+            "admission",
+            &user,
+            original,
+            |candidate| {
+                Some(
+                    matches!(candidate.access_tier, boss_policy::AccessTier::Operator)
+                        || boss_core::roles::has_global_read(&candidate.role)
+                        || candidate.id == id,
+                )
+            },
+        )
+    });
+    if !allowed {
         return (
             StatusCode::FORBIDDEN,
             "operator tier, admin-ish role, or self-lookup required",
@@ -137,7 +162,22 @@ async fn bootstrap_by_email(
 ) -> Response {
     let tier_ok = matches!(user.access_tier, boss_policy::AccessTier::Operator);
     let role_ok = boss_core::roles::has_global_read(&user.role);
-    if !(tier_ok || role_ok) {
+    let original = tier_ok || role_ok;
+    let allowed = state.role_guards.as_ref().map_or(original, |reporter| {
+        reporter.observe_captured(
+            "people-bootstrap-enumeration",
+            "admission",
+            &user,
+            original,
+            |candidate| {
+                Some(
+                    matches!(candidate.access_tier, boss_policy::AccessTier::Operator)
+                        || boss_core::roles::has_global_read(&candidate.role),
+                )
+            },
+        )
+    });
+    if !allowed {
         return (
             StatusCode::FORBIDDEN,
             "operator tier or admin-ish role required",

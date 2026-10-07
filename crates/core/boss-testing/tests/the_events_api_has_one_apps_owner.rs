@@ -65,8 +65,8 @@ fn the_events_api_has_one_apps_package_and_the_same_runtime_contract() {
     for unchanged in [
         "boss_events::events_api_config::EventsApiConfig",
         "/etc/boss-events-api.toml",
-        "audit_tail_router(pool.clone())",
-        ".merge(outbox_router(pool.clone()))",
+        "audit_tail_router_with_reports(pool.clone(), Some(wiring.guards.clone()))",
+        ".merge(outbox_router_with_reports(",
         "boss_core::machine_gate::mount(",
         "\"events\",",
         "\"/api/events/health\"",

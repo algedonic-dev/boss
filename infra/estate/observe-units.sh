@@ -419,8 +419,21 @@ echo "observing $HOST_ID units: $# watched (roles: ${BOSS_NODE_ROLES:-none}, $ro
 # No temp file, body and status in one capture — the same lesson
 # observe-host.sh carries (its first scheduled firing turned a curl -o
 # write error into an UNREACHABLE lie).
+#
+# The machine token is presented, never required (design 6805c764;
+# backlog 2710c8fc): the one shell reader, sourced only when it is
+# beside this script (`.` on a missing file ends a dash script), called
+# here in the script's own shell before the `$(…)`. Anything short of a
+# header — no lib, no slot, a refused slot, a host off the estate's
+# list, a file that cannot be made — posts unstamped, as before.
+MT_HDR=""
+if [ -r "$(dirname "$0")/../lib/secret-header.sh" ]; then . "$(dirname "$0")/../lib/secret-header.sh"; fi
+if command -v machine_token_header >/dev/null 2>&1; then
+    machine_token_header MT_HDR "$JOBS_API" || MT_HDR=""
+fi
 resp=$(printf '%s' "$observation" | curl -s -w '\n%{http_code}' \
     -X POST -H 'content-type: application/json' \
+    ${MT_HDR:+-H "$MT_HDR"} \
     -H 'x-boss-user: {"id":"automation:estate-observer-units","role":"platform-admin","access_tier":"operator"}' \
     --data-binary @- \
     "$JOBS_API/api/estate/observation") ||

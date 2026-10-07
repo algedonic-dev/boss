@@ -33,6 +33,55 @@ impl crate::car_retire::Door for Conductor {
     }
 }
 
+#[async_trait]
+impl crate::review_verdict::ExecutorRecordReader for Conductor {
+    async fn executor_read(&self, path: &str) -> Result<Option<Value>> {
+        self.api(Method::GET, path, None).await
+    }
+    async fn executor_original(
+        &self,
+        job: uuid::Uuid,
+        step: uuid::Uuid,
+        key: &str,
+    ) -> Result<Option<boss_jobs::first_record::FirstRecord>> {
+        if job.is_nil()
+            || step.is_nil()
+            || key.is_empty()
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            bail!("invalid immutable record resource");
+        }
+        let path = format!("/api/jobs/{job}/steps/{step}/records/{key}");
+        let raw = retrying(
+            &JOBS_API_RETRY,
+            &Method::GET,
+            &path,
+            self.policy.blip_cause_budget,
+            &|message| log(message),
+            || async {
+                match self.api_once(Method::GET, &path, None).await {
+                    Err(failure) if failure.kind == Failure::Http(404) => Ok(None),
+                    Ok(None) => Err(ApiFailure {
+                        kind: Failure::Malformed,
+                        cause: anyhow!("the immutable record response is empty"),
+                    }),
+                    other => other,
+                }
+            },
+        )
+        .await?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let record =
+            serde_json::from_value(raw).context("the immutable record response is malformed")?;
+        crate::review_verdict::immutable_record_resource(&record, job, step, key)?;
+        Ok(Some(record))
+    }
+}
+
 /// What one walk of the dock found (`Conductor::candidates`).
 pub(super) struct DockPass {
     /// Cars that may board now, with their branch.
@@ -4152,12 +4201,40 @@ impl Conductor {
         use crate::mutating_verb::Dock;
         let head = head.unwrap_or_default();
         let clone = Path::new(&self.cfg.clone);
-        let dock = crate::mutating_verb::dock(
-            car,
-            head,
-            || crate::mutating_verb::judge_on_main(clone, "origin/main", head),
-            |from, to| crate::mutating_verb::same_change(clone, "origin/main", from, to),
-        );
+        let executor_guard: Result<()> = async {
+            let requirement = crate::review_verdict::pinned_executor_requirement(self, car).await?;
+            if requirement
+                == boss_jobs::executor_attestation::ExecutorProvenanceRequirement::Verified
+            {
+                let release = crate::review_verdict::release_on(car)
+                    .context("the pinned FORMAL requirement has no reviewer release")?;
+                let run = self
+                    .api(Method::GET, &format!("/api/jobs/{}", release.review), None)
+                    .await?
+                    .context("the reviewer run is unavailable")?;
+                let executor =
+                    crate::review_verdict::read_executor_eligibility(self, &run, car, head).await?;
+                crate::review_verdict::vouches_with_executor(&run, car, head, &executor)
+                    .map_err(|why| anyhow!("{why}"))?;
+                if release.record.get("executor_binding") != executor.record_binding().as_ref() {
+                    bail!("the release does not retain the original executor receipt");
+                }
+            }
+            Ok(())
+        }
+        .await;
+        let dock = match executor_guard {
+            Err(reason) => Dock::Hold {
+                reason: format!("pinned executor eligibility refused: {reason:#}"),
+                bind: true,
+            },
+            Ok(()) => crate::mutating_verb::dock(
+                car,
+                head,
+                || crate::mutating_verb::judge_on_main(clone, "origin/main", head),
+                |from, to| crate::mutating_verb::same_change(clone, "origin/main", from, to),
+            ),
+        };
         let (reason, bind) = match dock {
             Dock::Board => return None,
             Dock::Hold { reason, bind } => (reason, bind),
@@ -4178,7 +4255,16 @@ impl Conductor {
                     .api(Method::GET, &format!("/api/jobs/{review}"), None)
                     .await
                 {
-                    Ok(Some(run)) => match crate::review_verdict::vouches(&run, car, &reviewed) {
+                    Ok(Some(run)) => match crate::review_verdict::read_executor_eligibility(
+                        self, &run, car, &reviewed,
+                    )
+                    .await
+                    .map_err(|why| format!("{why:#}"))
+                    .and_then(|executor| {
+                        crate::review_verdict::vouches_with_executor(
+                            &run, car, &reviewed, &executor,
+                        )
+                    }) {
                         Ok(()) => {
                             if let Some(patch_id) = carry {
                                 self.carry_release(car, jid, head, &patch_id).await;
@@ -5390,7 +5476,9 @@ impl Conductor {
         // refuses it (2026-09-06). Best-effort: a failed fetch logs
         // and the lints use the ref as it stands, exactly as before.
         freshen_trunk(clone);
-        let verdict = consist_check(Path::new(clone), &self.policy);
+        let verdict =
+            super::consist_job::isolated_consist_check(clone, &self.cfg.fork_url, &self.policy)
+                .await;
         for w in verdict.warnings() {
             log(format!(
                 "consist check: {w} — skipping it, a broken check must not hold a train"
@@ -9182,6 +9270,7 @@ mod tests {
     /// read back off it.
     #[derive(Clone, Default)]
     struct Sor {
+        review_protocol: std::sync::Arc<std::sync::Mutex<Option<Value>>>,
         jobs: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Value>>>,
         posts: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
     }
@@ -9235,7 +9324,9 @@ mod tests {
             let (list, create, one, merge) =
                 (self.clone(), self.clone(), self.clone(), self.clone());
             let (step_merge, step_put) = (self.clone(), self.clone());
+            let protocol = self.review_protocol.clone();
             let app = Router::new()
+                .route("/api/workflows/ship-a-change/versions/7", get(move || { let protocol = protocol.clone(); async move { Json(protocol.lock().unwrap().clone().unwrap_or_else(|| json!({"kind":"ship-a-change","version":7,"status":"active","steps":[{"title":"review"}]}))) } }))
                 .route(
                     "/api/jobs",
                     get(move |Query(q): Query<HashMap<String, String>>| {
@@ -9354,9 +9445,53 @@ mod tests {
         for (k, v) in md.as_object().cloned().unwrap_or_default() {
             metadata[k] = v;
         }
-        json!({"id": id, "kind": "ship-a-change", "status": "open", "metadata": metadata,
+        json!({"id": id, "kind": "ship-a-change", "workflow_version":7, "status": "open", "metadata": metadata,
                "steps": [{"id": format!("{id}-rev"), "spec_slug": "review",
                           "title": "Open for review", "status": "ready", "metadata": {}}]})
+    }
+
+    #[tokio::test]
+    async fn boarding_cannot_downgrade_the_pinned_protocol_through_projection() {
+        let (_guard, clone) = clone_fixture("dock-immutable-executor-pin");
+        let head = park_car(&clone, "feat/immutable-pin", "docs/immutable-pin.md");
+        let mut car = parked_at_review("car-immutable-pin", "feat/immutable-pin", json!({}));
+        car["steps"][0]["metadata"]["agent_executor_provenance"] = json!("advisory");
+        let sor = Sor::default();
+        *sor.review_protocol.lock().unwrap() = Some(
+            json!({"kind":"ship-a-change","version":7,"status":"active","steps":[{"title":"review","agent":{"profile":"reviewer","model":"gpt-6.1-sol","budget_usd":1,"effort":"low","executor_provenance":"verified"}}]}),
+        );
+        let mut conductor = dock_conductor(&clone);
+        conductor.cfg.jobs = sor.serve().await;
+        conductor.cfg.dry = true;
+        assert!(
+            conductor
+                .review_hold(&car, "car-immutable-pin", Some(&head))
+                .await
+                .is_some(),
+            "Dock::Board cannot use an editable advisory projection"
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_executor_provenance_is_required_even_when_the_diff_needs_no_ops_review() {
+        let (_guard, clone) = clone_fixture("dock-verified-executor");
+        let head = park_car(&clone, "feat/verified-docs", "docs/verified-notes.md");
+        let mut car = parked_at_review("car-verified-docs", "feat/verified-docs", json!({}));
+        car["steps"][0]["metadata"]["agent_executor_provenance"] = json!("verified");
+        let sor = Sor::default();
+        *sor.review_protocol.lock().unwrap() = Some(
+            json!({"kind":"ship-a-change","version":7,"status":"active","steps":[{"title":"review","agent":{"profile":"reviewer","model":"gpt-6.1-sol","budget_usd":1,"effort":"low","executor_provenance":"verified"}}]}),
+        );
+        let mut conductor = dock_conductor(&clone);
+        conductor.cfg.jobs = sor.serve().await;
+        conductor.cfg.dry = true;
+        assert!(
+            conductor
+                .review_hold(&car, "car-verified-docs", Some(&head))
+                .await
+                .is_some(),
+            "Dock::Board cannot bypass a pinned verified executor requirement"
+        );
     }
 
     /// THE STREAK IS THE DOCK'S OWN (MEDIUM 3 of the adversarial review

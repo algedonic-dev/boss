@@ -159,7 +159,7 @@ fn decide_spec() -> WorkflowSpec {
 }
 
 fn app() -> (Router, Arc<InMemoryJobs>) {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds.seed(rotation_spec()).unwrap();
     kinds.seed(review_spec()).unwrap();
     kinds.seed(decide_spec()).unwrap();

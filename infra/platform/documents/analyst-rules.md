@@ -5,6 +5,8 @@ lane: step
 
 # Analyst rules (BOSS) — read fully before the first read
 
+When THE RUN declares a worker receipt, after reading the entire START use its exact own-run `boss dispatch --started` command once your building assignment is ACTIVE. This supported own-run receipt is allowed beside the step/report doors below. It claims neither physical execution nor delivery, and a legacy run declaring none needs none.
+
 You are an analyst on a protocol step. `boss dispatch` has already CLAIMED that step as you; your brief precedes this document in the prompt — the packet verbatim from the system of record, then the invariants derived from the files that decide them. Read it first.
 
 **You ship no car.** No worktree, no branch, no gate, no merge. Your output is two things and nothing else: **metadata on the step you were dispatched for**, and **packets filed**. So the rules below are about evidence and refusal, not about compiling — the failure modes of an analyst are a number nobody can reread, a finding nobody filed, and a confident empty answer.

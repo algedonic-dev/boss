@@ -5,6 +5,9 @@
 //! service tickets name the assignee, sales opportunities have an owner.
 
 pub mod assets_client;
+pub mod coverage_guard;
+#[cfg(feature = "postgres")]
+pub mod coverage_guard_pg;
 pub mod departments;
 #[cfg(feature = "postgres")]
 pub mod employee_changes;

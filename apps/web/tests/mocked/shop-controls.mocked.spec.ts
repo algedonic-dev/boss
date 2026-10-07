@@ -1,3 +1,4 @@
+import { isShellWrite } from './_smokeMocks';
 // Whole root-page controls for page-audit a98b6d6a. Checkout is a
 // separate route and obligation; these navigation checks never order.
 import { expect, test, type Page } from './_test';
@@ -32,7 +33,7 @@ async function noWrites(page: Page): Promise<void> {
   const writes = (await openedRequests(page)).filter((r) => r.method !== 'GET');
   // App's shared route-open telemetry is a real write, separate from
   // Shop's zero business writes. Refuse every other path and method.
-  expect(writes.every((r) => r.path === '/api/surface-opens' && r.method === 'POST')).toBe(true);
+  expect(writes.every((r) => isShellWrite(r.method, r.path))).toBe(true);
 }
 
 test.describe('/ux/shop — whole root controls', () => {

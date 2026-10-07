@@ -35,7 +35,7 @@ async fn seed(registry: &PgWorkflows) -> SeedReport {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_seed_inserts_the_bundle_then_stops() {
     let db = TestDb::new().await;
-    let registry = PgWorkflows::new(db.pool.clone());
+    let registry = PgWorkflows::for_fixture(db.pool.clone());
     let bundled = load_workflows(platform_bundle_path()).expect("bundle parses");
     assert!(!bundled.is_empty(), "an empty bundle would prove nothing");
 
@@ -79,7 +79,7 @@ async fn the_seed_inserts_the_bundle_then_stops() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_seed_leaves_an_operator_edit_alone() {
     let db = TestDb::new().await;
-    let registry = PgWorkflows::new(db.pool.clone());
+    let registry = PgWorkflows::for_fixture(db.pool.clone());
     let bundled = load_workflows(platform_bundle_path()).expect("bundle parses");
     let target = bundled.first().expect("bundle has a row").clone();
 

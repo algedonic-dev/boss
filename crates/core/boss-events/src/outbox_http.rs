@@ -60,12 +60,28 @@ use crate::outbox::{
     resolve_dead_letter, undrained,
 };
 
+#[derive(Clone)]
+struct OutboxHttpState {
+    pool: Arc<PgPool>,
+    role_guards: Option<Arc<boss_policy_client::role_guard::RoleGuardReporter>>,
+}
+
 pub fn outbox_router(pool: PgPool) -> Router {
+    outbox_router_with_reports(pool, None)
+}
+
+pub fn outbox_router_with_reports(
+    pool: PgPool,
+    role_guards: Option<Arc<boss_policy_client::role_guard::RoleGuardReporter>>,
+) -> Router {
     Router::new()
         .route("/api/events/outbox/{id}/redeliver", post(redeliver))
         .route("/api/events/outbox/{id}/resolve", post(resolve))
         .route("/api/events/outbox/stats", get(stats))
-        .with_state(Arc::new(pool))
+        .with_state(OutboxHttpState {
+            pool: Arc::new(pool),
+            role_guards,
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,31 +141,33 @@ async fn answer(pool: &PgPool, letter: DeadLetter, act_kind: &str) -> Response {
 }
 
 async fn redeliver(
-    State(pool): State<Arc<PgPool>>,
+    State(state): State<OutboxHttpState>,
     CurrentUser(user): CurrentUser,
     Path(id): Path<i64>,
 ) -> Response {
+    let pool = &state.pool;
     let Some(actor) = operator(&user) else {
         return forbidden(&user);
     };
-    match redeliver_dead_letter(&pool, id, actor).await {
-        Ok(letter) => answer(&pool, letter, REDELIVERED_KIND).await,
+    match redeliver_dead_letter(pool, id, actor).await {
+        Ok(letter) => answer(pool, letter, REDELIVERED_KIND).await,
         Err(e) => refusal(e),
     }
 }
 
 async fn resolve(
-    State(pool): State<Arc<PgPool>>,
+    State(state): State<OutboxHttpState>,
     CurrentUser(user): CurrentUser,
     Path(id): Path<i64>,
     Json(body): Json<ResolveBody>,
 ) -> Response {
+    let pool = &state.pool;
     let Some(actor) = operator(&user) else {
         return forbidden(&user);
     };
     let reason = body.reason.unwrap_or_default();
-    match resolve_dead_letter(&pool, id, &reason, actor).await {
-        Ok(letter) => answer(&pool, letter, RESOLVED_KIND).await,
+    match resolve_dead_letter(pool, id, &reason, actor).await {
+        Ok(letter) => answer(pool, letter, RESOLVED_KIND).await,
         Err(e) => refusal(e),
     }
 }
@@ -179,12 +197,16 @@ pub struct OutboxStats {
 }
 
 async fn stats(
-    State(pool): State<Arc<PgPool>>,
+    State(state): State<OutboxHttpState>,
     CurrentUser(user): CurrentUser,
     Query(q): Query<StatsQuery>,
 ) -> Response {
-    let tier_ok = matches!(user.access_tier, AccessTier::Operator | AccessTier::Auditor);
-    if !(tier_ok || boss_core::roles::has_global_read(&user.role)) {
+    let pool = &state.pool;
+    if !crate::tail_http::observed_audit_read(
+        &user,
+        state.role_guards.as_deref(),
+        "outbox-stats-read",
+    ) {
         return (
             StatusCode::FORBIDDEN,
             "operator tier or executive role required",
@@ -205,10 +227,10 @@ async fn stats(
     }
     let read = async {
         Ok::<_, String>(OutboxStats {
-            undrained: undrained(&*pool).await?,
-            pending: pending_count(&pool).await?,
-            dead_lettered_open: dead_lettered_count(&pool).await?,
-            lag: relay_lag(&pool, window_hours).await?,
+            undrained: undrained(pool.as_ref()).await?,
+            pending: pending_count(pool).await?,
+            dead_lettered_open: dead_lettered_count(pool).await?,
+            lag: relay_lag(pool, window_hours).await?,
         })
     };
     match read.await {

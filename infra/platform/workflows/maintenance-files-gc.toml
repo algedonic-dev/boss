@@ -6,7 +6,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "The 04:16 file_refs GC sweep (boss-files-gc)."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
 
 [[workflow.step]]
 title = "scheduled"

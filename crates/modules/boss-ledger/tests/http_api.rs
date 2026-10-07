@@ -1751,6 +1751,12 @@ async fn tax_liability_summary_includes_accrued_and_next_due() {
     let db = TestDb::new().await;
     db.declare_revenue_categories_of("brewery").await;
     seed_sales_tax_accrual(&db, "inv-sum-1", 3_000).await;
+    sqlx::query(
+        "UPDATE gl_accounts SET description = 'Tenant sales obligation' WHERE code = '2300'",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
 
     let r = router(LedgerApiState {
         pool: db.pool.clone(),
@@ -1792,6 +1798,12 @@ async fn tax_liability_summary_includes_accrued_and_next_due() {
         .find(|l| l["account_code"] == "2300")
         .expect("2300 row");
     assert_eq!(sales["balance_cents"], 3_000);
+    assert_eq!(sales["account_description"], "Tenant sales obligation");
+    assert!(
+        libs.iter()
+            .filter(|l| l["account_code"] != "2300")
+            .all(|l| l["account_description"].is_null())
+    );
     // Accrued filings list carries the row we just created; next_due is it.
     let accrued = body["accrued_filings"].as_array().unwrap();
     assert_eq!(accrued.len(), 1);
@@ -2698,7 +2710,7 @@ async fn chart_batch_inserts_if_absent_keeps_a_starter_code_and_names_the_differ
     let rows = json!([
         {"code": "1000", "name": "Bank", "kind": "asset", "normal_balance": "debit"},
         {"code": "1010", "name": "Cash in Transit", "kind": "asset", "normal_balance": "debit"},
-        {"code": "4300", "name": "Hosting revenue", "kind": "revenue", "normal_balance": "credit"},
+        {"code": "4300", "name": "Hosting revenue", "description": "Authored revenue description", "kind": "revenue", "normal_balance": "credit"},
         {"code": "4310", "name": "Hosting revenue — managed", "kind": "revenue", "normal_balance": "credit", "parent": "4300"},
     ]);
     let (status, body) = post_as_operator(
@@ -2764,6 +2776,11 @@ async fn chart_batch_inserts_if_absent_keeps_a_starter_code_and_names_the_differ
     };
     assert_eq!(by_code("4310")["parent"], "4300");
     assert_eq!(by_code("4300")["parent"], Value::Null);
+    assert_eq!(
+        by_code("4300")["description"],
+        "Authored revenue description"
+    );
+    assert_eq!(by_code("4310")["description"], Value::Null);
 
     // One fact per inserted row, staged on the outbox with the row and
     // declared_by = the actor the request signed with.
@@ -2778,6 +2795,7 @@ async fn chart_batch_inserts_if_absent_keeps_a_starter_code_and_names_the_differ
     assert!(staged.iter().all(|(s, _)| s == "ledger"), "{staged:?}");
     assert_eq!(staged[0].1["code"], "4300");
     assert_eq!(staged[0].1["name"], "Hosting revenue");
+    assert_eq!(staged[0].1["description"], "Authored revenue description");
     assert_eq!(staged[0].1["normal_balance"], "credit");
     assert_eq!(staged[0].1["declared_by"], "automation:tenant-seed");
     assert_eq!(staged[1].1["code"], "4310");

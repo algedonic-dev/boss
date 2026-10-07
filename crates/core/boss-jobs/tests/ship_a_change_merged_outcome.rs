@@ -70,7 +70,7 @@ fn admin_header() -> String {
 }
 
 fn app() -> axum::Router {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     // The real platform registry — a fixture copy would keep passing
     // while the shipped ship-a-change kind stayed broken.
     for spec in seedable_platform_workflows() {

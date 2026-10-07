@@ -10,12 +10,14 @@
 # approved snapshot as the GitHub App, reads main and the PR back, and
 # completes the step itself. Its last line is the answer:
 #
-#   publish-github-pr: merged https://github.com/algedonic-dev/boss/pull/250 — main reads <40-hex sha>
+#   publish-github-pr: merged https://github.com/algedonic-dev/boss/pull/250 — main carries <original 40-hex sha>
+# Version2 also reads historical "main reads" answers. Existing packets
+# stay pinned: neither their approval nor their workflow is repinned.
 #
 # This rule is the reader. The request carries `for_publish`, so
 # `jobs.complete_linked_step` follows that edge:
 #
-# - exit 0 and a `merged <url> — main reads <sha>` line: complete
+# - exit 0 and a `merged <url> — main carries <sha>` line: complete
 #   `merge` with `merged_sha` COPIED from the verb's own line. The verb
 #   prints that line only AFTER it has completed the step itself, so this
 #   leg finds the step done and writes nothing: it is a second writer of
@@ -56,9 +58,9 @@ step's own required field, copied from the verb's line; on failure the
 step is ANNOTATED, never completed, and the alert is a backlog-item at
 the platform owner's queue. Self-filters to this one verb.
 """
-version = 1
+version = 2
 on_event = "jobs.job.closed"
 when = 'kind = "ops-request" AND outcome = "answered"'
 [[rule.do]]
 handler = "jobs.complete_linked_step"
-args = { verb = '"merge-publish-pr"', verdict_pattern = '"^publish-github-pr: merged (?P<pr_url>https://github[.]com/[^ ]+) . main reads (?P<merged_sha>[0-9a-f]+)$"', link = '"for_publish"', steps = '"merge"', done_metadata = '"{\"merged_sha\": \"{merged_sha}\", \"pr_url\": \"{pr_url}\"}"', evidence_key = '"merged_by"', on_failure = '"annotate-and-alert"' }
+args = { verb = '"merge-publish-pr"', verdict_pattern = '"^publish-github-pr: merged (?P<pr_url>https://github[.]com/[^ ]+) . main (?:reads|carries) (?P<merged_sha>[0-9a-f]+)$"', link = '"for_publish"', steps = '"merge"', done_metadata = '"{\"merged_sha\": \"{merged_sha}\", \"pr_url\": \"{pr_url}\"}"', evidence_key = '"merged_by"', on_failure = '"annotate-and-alert"' }

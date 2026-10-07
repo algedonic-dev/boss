@@ -1,3 +1,4 @@
+import { isPageWrite } from './_smokeMocks';
 // /it — the IT world, every control the default page renders, pinned
 // (page audit e18f7540, step `test`).
 //
@@ -551,13 +552,12 @@ test.describe('CURRENT gap 8', () => {
 
 /// The one non-GET every route sends: the shell's route-open record
 /// (shell/surface-opens.ts). It is the chrome's write, not this page's.
-const SHELL_WRITES: ReadonlySet<string> = new Set(['/api/surface-opens']);
 
 test('the page writes nothing: every control on it is a read or a view change', async ({ page }) => {
   const writes: string[] = [];
   page.on('request', (req: Request) => {
     const path = new URL(req.url()).pathname;
-    if (req.method() !== 'GET' && path.startsWith('/api/') && !SHELL_WRITES.has(path)) {
+    if (req.method() !== 'GET' && path.startsWith('/api/') && isPageWrite(req.method(), path)) {
       writes.push(`${req.method()} ${path}`);
     }
   });

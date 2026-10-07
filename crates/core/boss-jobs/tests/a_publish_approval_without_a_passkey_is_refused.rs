@@ -75,7 +75,7 @@ fn header(id: &str) -> String {
 }
 
 fn app() -> axum::Router {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     for spec in seedable_platform_workflows() {
         kinds.seed(spec).expect("seed platform kind");
     }

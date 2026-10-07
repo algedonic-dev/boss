@@ -120,6 +120,28 @@ async fn main() -> Result<()> {
         ),
     ));
 
+    let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+        boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+        Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+    ));
+    let mode = Arc::new(boss_policy_client::role_reader::MountedReportMode::mount());
+    let source = Arc::new(boss_policy_client::role_reader::HttpRoleReader::new(
+        std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
+        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
+        boss_policy_client::User::service("commerce"),
+    )?);
+    let wiring = boss_policy_client::role_service::assemble(
+        "commerce",
+        "/api/commerce/actor-role-reports",
+        policy,
+        roles.clone(),
+        mode.clone(),
+        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
+            boss_policy_client::role_service::REPORT_CAPACITY,
+        )),
+    );
+    let policy = wiring.policy;
+
     let state = CommerceApiState {
         commerce,
         publisher,
@@ -136,7 +158,7 @@ async fn main() -> Result<()> {
         policy,
     );
 
-    let app = router(state).merge(agreements_app);
+    let app = router(state).merge(agreements_app).merge(wiring.inventory);
     // Sim-origin middleware: extract x-sim-origin header and set the
     // per-request task-local so the publisher inherits the sim
     // marker. Closes the gap where a sim chain could trigger a
@@ -160,6 +182,15 @@ async fn main() -> Result<()> {
         &["/api/commerce/health"],
         Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
     );
-    axum::serve(listener, app).await?;
+    boss_policy_client::role_service::serve_with_refresh(
+        listener,
+        app,
+        roles,
+        source,
+        mode,
+        boss_policy_client::role_service::REFRESH_CADENCE,
+        boss_policy_client::role_service::shutdown_signal(),
+    )
+    .await?;
     Ok(())
 }

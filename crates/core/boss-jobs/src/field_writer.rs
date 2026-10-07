@@ -22,17 +22,19 @@
 //! token and can type `automation:ops-runner`. A rule keyed on that id
 //! is design option D, rejected because a guard that LOOKS like
 //! protection against the adversary the review named, and is not, is a
-//! mostly-sure guard. So a declared writer is satisfied ONLY by a
-//! [`CredentialedCaller`] request extension, which a client cannot set:
-//! only a server-side door that resolved a presented credential inserts
-//! one. That door is [`crate::runner_credential`] (the resolve step of
+//! mostly-sure guard. The shared writer check accepts only a server-judged
+//! [`CredentialedCaller`]. A runner judgment comes from its request
+//! extension, which a client cannot set; a signer judgment comes from the
+//! verified session and scoped required-role check described below.
+//! The runner door is [`crate::runner_credential`] (the resolve step of
 //! design f623e425 option A); until the broker's Secret it reads is
 //! mounted and filled (the credential kind and its broker handler, the
 //! next car), no caller satisfies a declared writer, which is why no
-//! live protocol declares one yet — the declaration lands on the
+//! live protocol declares a runner writer yet — the declaration lands on the
 //! ops-request row with the credential delivery, never before it. The
-//! viability lint holds that: a `writer` not in
-//! [`RESOLVABLE_PRINCIPALS`] is refused at publish.
+//! viability lint holds that: runner writers not in
+//! [`RESOLVABLE_PRINCIPALS`] are refused at publish. A signer declaration
+//! independently requires the step's sign-off roles.
 //!
 //! THE HOST BINDING. A credential bound to a host writes only packets
 //! whose `host` (job metadata) is that host — "a runner for host h
@@ -47,13 +49,20 @@
 //! ([`repin_refusals`], S1); the merge door drops an unchanged re-send
 //! of a reserved key rather than apply it to a row the writer may have
 //! moved since the read ([`strip_unchanged_reserved`], S3).
+//!
+//! A `signer` writer is a separate approved authority: the metadata doors
+//! verify the gateway session with the shared verifier, then require an
+//! actual required sign-off role within the packet's scope. The owning
+//! adapter retains session expiry, packet and step identity at its write.
+//! No asserted role/id or host credential supplies that signer authority.
 
 use boss_core::job::StepField;
 use serde::Serialize;
 use serde_json::Value;
 
 /// The caller as a server-side credential door resolved it. Inserted
-/// into the request's extensions by that door and by nothing else; a
+/// into request extensions by that door. The signer guard supplies the
+/// same internal judgment input after verified session and scoped sign-off authority; a
 /// client has no way to set a request extension, which is the whole
 /// point — this is the only identity a declared writer believes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,8 +84,8 @@ pub struct ReservedKey {
 }
 
 /// Every writer principal a server-side credential door resolves into a
-/// [`CredentialedCaller`] — the only names a Workflow row may declare as
-/// a field's `writer` (the viability lint refuses any other, backlog
+/// [`CredentialedCaller`] — the enrolled runner names a Workflow row may
+/// declare as a field's `writer` (the viability lint refuses any other runner, backlog
 /// 6c9183de review S4). EMPTY until the first door is mounted: no door
 /// resolves any principal today, so a declared writer would lock its key
 /// against every caller. The car that mounts a door adds its principal
@@ -92,6 +101,9 @@ pub struct ReservedKey {
 /// delivers a credential the runner can present; the door's test pins
 /// every entry to a principal it resolves.
 pub const RESOLVABLE_PRINCIPALS: &[&str] = &[];
+
+/// Gateway session authority is distinct from enrolled host credentials.
+pub const SIGNER_WRITER: &str = "signer";
 
 /// The job-metadata key a host-bound credential is judged against.
 pub const HOST_KEY: &str = "host";
@@ -163,9 +175,10 @@ pub fn strip_unchanged_reserved(
 /// Whether any of a packet's steps declares a field writer — the packets
 /// whose job-metadata [`HOST_KEY`] is fixed at admission (review S2).
 pub fn declares_a_writer<'a>(steps: impl IntoIterator<Item = &'a boss_core::job::Step>) -> bool {
-    steps
-        .into_iter()
-        .any(|s| s.fields.iter().any(|f| f.writer.is_some()))
+    steps.into_iter().any(|s| {
+        s.fields.iter().any(|f| f.writer.is_some())
+            || s.metadata.get(crate::credential_executor::KEY).is_some()
+    })
 }
 
 /// Whether a job-metadata write moves [`HOST_KEY`]: `old` is the stored
@@ -211,6 +224,8 @@ pub fn repin_refusals(
     now_metadata: &Value,
     next_metadata: &Value,
 ) -> Vec<String> {
+    let executor_changed = now_metadata.get(crate::credential_executor::KEY)
+        != next_metadata.get(crate::credential_executor::KEY);
     let writer_of = |fields: &[StepField], name: &str| {
         fields
             .iter()
@@ -254,6 +269,12 @@ pub fn repin_refusals(
             r.key, r.writer
         )
     }));
+    if executor_changed {
+        out.push(
+            "a live step's credential executor cannot be added, removed or changed by a re-pin"
+                .into(),
+        );
+    }
     out
 }
 

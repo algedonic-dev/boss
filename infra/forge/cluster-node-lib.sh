@@ -46,6 +46,10 @@
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/sor.sh"
 # shellcheck source=infra/estate/ops-credentials.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/estate/ops-credentials.sh"
+# The machine token's one shell reader — sourced when it is there, and
+# only defines functions; node_read_registry says what it is for.
+# shellcheck source=infra/lib/secret-header.sh
+if [ -r "$(dirname "${BASH_SOURCE[0]}")/../lib/secret-header.sh" ]; then . "$(dirname "${BASH_SOURCE[0]}")/../lib/secret-header.sh"; fi
 
 # A Kubernetes node name, which is also its estate id here: a DNS label.
 # No leading dash, no dot, no upper case, one word.
@@ -68,9 +72,21 @@ node_read_registry() {
         sor_require BOSS_JOBS_URL
         url="$BOSS_JOBS_URL/api/estate/nodes"
     fi
+    # The machine token is presented, never required (design 6805c764;
+    # backlog 2710c8fc): made here, in the verb's own shell — every verb
+    # sets its `trap … EXIT` before this call — and before the `$(…)`.
+    # No lib, no slot, a refused slot, a host off the estate's list or a
+    # header file that cannot be made all send the read as before.
+    local NODE_MT_HDR=""
+    if declare -F machine_token_header >/dev/null; then
+        case "$url" in
+            http://* | https://*) machine_token_header NODE_MT_HDR "$url" || NODE_MT_HDR="" ;;
+        esac
+    fi
     # The status is KEPT (node-roles.sh's lesson): a 403 read as "no such
     # node" would be a confident wrong answer. `000` is a file:// fixture.
     if ! out="$(curl -sS --max-time 15 \
+            ${NODE_MT_HDR:+-H "$NODE_MT_HDR"} \
             -H "x-boss-user: $(sor_reader_header "automation:$ME")" \
             -w '\n%{http_code}' "$url" 2> "$WORK/registry.err")"; then
         node_fail "the estate registry at $url did not answer ($(tr '\n' ' ' < "$WORK/registry.err")) — a registry that cannot be read says nothing about which nodes are workers, so nothing was done"

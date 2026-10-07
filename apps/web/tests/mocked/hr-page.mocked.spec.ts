@@ -1,3 +1,4 @@
+import { pageWrites } from './_smokeMocks';
 // /hr, page audit b959394e (2026-09-27). One spec for the page's own
 // decisions, each pinned where it renders:
 //
@@ -309,7 +310,7 @@ test.describe('/hr — page audit b959394e', () => {
     await page.locator('tr').filter({ hasText: 'Issue a laptop' }).getByRole('link', { name: 'Open job' }).click();
     await expect(page).toHaveURL(/\/jobs\/job-hire$/);
     await expect(page.getByRole('heading', { name: 'onboarding emp-david', exact: true })).toBeVisible();
-    expect((await openedRequests(page)).filter((r) => r.method !== 'GET' && r.path !== '/api/surface-opens'))
+    expect(pageWrites(await openedRequests(page)))
       .toEqual([]);
     await page.goBack();
     await expect(page).toHaveURL(/\/hr$/);

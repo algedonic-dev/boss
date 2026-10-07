@@ -170,7 +170,7 @@ async fn update_status(
         .update_employee_at(&id, &emp, stamp.timestamp, &stamp)
         .await
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        return crate::http::people_error_response(e);
     }
 
     let change_kind = derive_change_kind(from_status.as_deref().unwrap_or(""), &body.status);
@@ -332,7 +332,7 @@ async fn update_employee_status(
         .update_employee_at(employee_id, &emp, stamp.timestamp, &stamp)
         .await
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        return crate::http::people_error_response(e);
     }
 
     if let Err(resp) = record_change_inner(

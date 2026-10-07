@@ -96,3 +96,102 @@ async fn the_catch_up_waits_on_the_event_facts_lock() {
     assert_eq!(report.rows_projected, 1);
     assert_released(&db.pool).await;
 }
+
+/// A client can finish closing before PostgreSQL receives Terminate.
+/// Hold that real protocol message to make the gate's release race
+/// deterministic, without delaying the queries or their responses.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finished_catch_up_releases_its_lock_before_session_termination() {
+    use sqlx::postgres::{PgPoolOptions, PgSslMode};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
+
+    let db = TestDb::new().await;
+    write_event(&db.pool).await;
+    let original = db.pool.connect_options();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream_address = (original.get_host().to_string(), original.get_port());
+    let (release, delayed) = oneshot::channel::<()>();
+    let (observed, terminated) = oneshot::channel::<()>();
+    let proxy = tokio::spawn(async move {
+        let (client, _) = listener.accept().await.unwrap();
+        let server = TcpStream::connect(upstream_address).await.unwrap();
+        let (mut client_read, mut client_write) = client.into_split();
+        let (mut server_read, mut server_write) = server.into_split();
+        let upload = async move {
+            // PostgreSQL startup has no tag; subsequent messages do.
+            let length = client_read.read_u32().await.unwrap();
+            assert!((8..=1_048_576).contains(&length));
+            let mut startup = vec![0; (length - 4) as usize];
+            client_read.read_exact(&mut startup).await.unwrap();
+            server_write.write_u32(length).await.unwrap();
+            server_write.write_all(&startup).await.unwrap();
+            loop {
+                let tag = client_read.read_u8().await.unwrap();
+                let length = client_read.read_u32().await.unwrap();
+                assert!((4..=1_048_576).contains(&length));
+                let mut body = vec![0; (length - 4) as usize];
+                client_read.read_exact(&mut body).await.unwrap();
+                if tag == b'X' {
+                    assert_eq!(length, 4);
+                    observed.send(()).unwrap();
+                    delayed.await.unwrap();
+                    server_write.write_u8(tag).await.unwrap();
+                    server_write.write_u32(length).await.unwrap();
+                    server_write.shutdown().await.unwrap();
+                    break;
+                }
+                server_write.write_u8(tag).await.unwrap();
+                server_write.write_u32(length).await.unwrap();
+                server_write.write_all(&body).await.unwrap();
+            }
+        };
+        let download = async move {
+            tokio::io::copy(&mut server_read, &mut client_write)
+                .await
+                .unwrap();
+        };
+        tokio::join!(upload, download);
+    });
+    let options = original
+        .as_ref()
+        .clone()
+        .host("127.0.0.1")
+        .port(address.port())
+        .ssl_mode(PgSslMode::Disable);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let report = tokio::time::timeout(
+        Duration::from_secs(30),
+        boss_views::catch_up_event_facts(&pool),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(report.rows_projected, 1);
+    tokio::time::timeout(Duration::from_secs(5), terminated)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut check = db.pool.begin().await.unwrap();
+    let released: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(KEY)
+        .fetch_one(&mut *check)
+        .await
+        .unwrap();
+    check.rollback().await.unwrap();
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), proxy)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        released,
+        "finished catch-up still holds the lock until Terminate reaches PostgreSQL"
+    );
+}

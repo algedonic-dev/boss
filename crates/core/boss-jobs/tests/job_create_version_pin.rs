@@ -54,7 +54,7 @@ fn versioned_spec(version: i32, status: WorkflowStatus) -> WorkflowSpec {
 #[tokio::test]
 async fn new_job_pins_to_active_version_not_default_one() {
     // A kind whose ACTIVE version is 3 (v1, v2 retired by prior publishes).
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds
         .seed(versioned_spec(1, WorkflowStatus::Retired))
         .unwrap();
@@ -201,7 +201,7 @@ async fn a_republish_does_not_strand_a_job_opened_under_the_old_version() {
         s
     }
 
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds
         .bootstrap_reconcile(&[v1()], &reconciler(), chrono::Utc::now())
         .await

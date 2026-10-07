@@ -1,3 +1,4 @@
+import { pageWrites } from './_smokeMocks';
 // /ux/support — the page's controls and its module gate, pinned
 // (backlog 5b2f3240, gap 10 of the /ux/support page audit 9876ef0d).
 //
@@ -584,7 +585,6 @@ test.describe('/ux/support — the escalation line', () => {
 test.describe('/ux/support — reads once, writes nothing', () => {
   // The shell's own non-GET: App.svelte records every route open
   // (shell/surface-opens.ts). It is the chrome's write, not this page's.
-  const SHELL_WRITE = /^\/api\/surface-opens$/;
 
   test('every tab and every header, clicked, sends no write and re-reads nothing', async ({ page }) => {
     await recordPageRequests(page);
@@ -602,7 +602,7 @@ test.describe('/ux/support — reads once, writes nothing', () => {
     await readsSettled(page);
 
     const opened = await openedRequests(page);
-    const writes = opened.filter((o) => o.method !== 'GET' && !SHELL_WRITE.test(o.path));
+    const writes = pageWrites(opened);
     expect(writes.map((w) => `${w.method} ${w.path}`)).toEqual([]);
     for (const read of [CASES, ACCOUNTS, ASSETS]) {
       expect(opened.filter((o) => o.method === 'GET' && read.test(o.url)), `${read} read once`).toHaveLength(1);

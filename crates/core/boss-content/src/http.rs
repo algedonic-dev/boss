@@ -228,7 +228,15 @@ async fn section_create(
         Ok(u) => u,
         Err(e) => return e.into_response(),
     };
-    match state.repo.create_section(draft, &user.id).await {
+    let actor = match user.id.parse() {
+        Ok(actor) => actor,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid editor: {e}")).into_response(),
+    };
+    let stamp = match &state.publisher {
+        Some(publisher) => publisher.stamp_with_actor(actor).await,
+        None => boss_core::publisher::EventStamp::new("content", actor),
+    };
+    match state.repo.create_section_at(draft, &stamp).await {
         Ok(s) => (StatusCode::CREATED, Json(s)).into_response(),
         Err(e) => err(e),
     }
@@ -244,7 +252,15 @@ async fn section_update(
         Ok(u) => u,
         Err(e) => return e.into_response(),
     };
-    match state.repo.update_section(&slug, patch, &user.id).await {
+    let actor = match user.id.parse() {
+        Ok(actor) => actor,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid editor: {e}")).into_response(),
+    };
+    let stamp = match &state.publisher {
+        Some(publisher) => publisher.stamp_with_actor(actor).await,
+        None => boss_core::publisher::EventStamp::new("content", actor),
+    };
+    match state.repo.update_section_at(&slug, patch, &stamp).await {
         Ok(s) => Json(s).into_response(),
         Err(e) => err(e),
     }

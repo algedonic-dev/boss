@@ -71,15 +71,10 @@ EARLY_RETURN='if[[:space:]]*\([[:space:]]*![[:space:]]*[A-Za-z_$][A-Za-z0-9_$.]*
 PATTERN="(${TERNARY})|(${EARLY_RETURN})"
 
 # file => exact number of matches it may carry.
-#   PartsList.svelte — the PO read degrades the "on order" counts
-#     deliberately (filed as 61c16b17, where the decision belongs). Its
-#     models, inventory and catalog-parts reads left the ternary in
-#     0ef5e008: each is refused by name and shape-checked (readRows).
 #   classes.svelte.ts / departments.svelte.ts — the `null` is not
 #     painted: the next line refuses anything but an array (or a
 #     department list) and sets the registry's `error` arm.
 declare -A ALLOW=(
-    ["apps/web/src/parts/PartsList.svelte"]=1
     ["libs/web-kit/src/session/classes.svelte.ts"]=1
     ["libs/web-kit/src/session/departments.svelte.ts"]=1
 )

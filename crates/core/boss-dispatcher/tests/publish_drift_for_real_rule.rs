@@ -148,6 +148,75 @@ fn the_rule_hands_ops_judge_a_declaration_it_can_run() {
     );
 }
 
+/// An answer that carries HELD kinds (backlog 083d240e) is still read:
+/// the verb appends `, held H` after `refused K`, so the three groups
+/// keep their places, and a held kind is in neither `n` nor `k` — the
+/// others publish (`n >= 1`), and a check whose ONLY drift is held files
+/// nothing (`n = 0`). The line is the script's own, read out of
+/// infra/gcp/publish-drift.sh rather than retyped, so a rewording of
+/// the verdict names this rule.
+#[test]
+fn an_answer_with_held_kinds_keeps_its_groups_and_holds_nothing_else_back() {
+    let reg = shipped_rules();
+    let a = judge_args(&reg, "answered").remove(0);
+    let re = regex::Regex::new(arg(&a, "verdict_pattern").expect("verdict_pattern")).unwrap();
+    let script =
+        std::fs::read_to_string(boss_testing::repo_root().join("infra/gcp/publish-drift.sh"))
+            .expect("infra/gcp/publish-drift.sh");
+    let shape =
+        "$NAME: would publish $n_ahead, skipped $n_equal equal, refused $n_refused, held $n_held";
+    assert!(
+        script.contains(shape),
+        "publish-drift.sh no longer builds its --check verdict as `{shape}` — the pattern and this test read that line"
+    );
+    let line = |n: u32, m: u32, k: u32, h: u32| {
+        shape
+            .replace("$NAME", "publish-drift")
+            .replace("$n_ahead", &n.to_string())
+            .replace("$n_equal", &m.to_string())
+            .replace("$n_refused", &k.to_string())
+            .replace("$n_held", &h.to_string())
+            + " (checkout cb053ed6, 23 kind(s), packet 11111111)"
+    };
+    let when = boss_dispatcher::rules::expr::parse(arg(&a, "when").expect("when")).unwrap();
+    let files = |text: &str| {
+        let caps = re
+            .captures(text)
+            .unwrap_or_else(|| panic!("no match: {text}"));
+        let groups = json!({
+            "n": caps["n"].parse::<u64>().unwrap(),
+            "m": caps["m"].parse::<u64>().unwrap(),
+            "k": caps["k"].parse::<u64>().unwrap(),
+        });
+        boss_dispatcher::rules::expr::eval(
+            &when,
+            &boss_dispatcher::rules::expr::Context {
+                payload: &groups,
+                helpers: &NoHelpers,
+            },
+        )
+        .unwrap()
+    };
+    let held_beside_others = line(2, 20, 0, 1);
+    let caps = re.captures(&held_beside_others).expect("matches");
+    assert_eq!((&caps["n"], &caps["m"], &caps["k"]), ("2", "20", "0"));
+    assert_eq!(
+        files(&held_beside_others),
+        Value::Bool(true),
+        "a held kind does not stop the others"
+    );
+    assert_eq!(
+        files(&line(0, 22, 0, 1)),
+        Value::Bool(false),
+        "a check whose only drift is held files no --for-real"
+    );
+    assert_eq!(
+        files(&line(1, 20, 1, 1)),
+        Value::Bool(false),
+        "a refusal still holds the whole set"
+    );
+}
+
 /// THE PIN (CLAUDE.md §9a): the words the rule files as `then_args` are
 /// words the verb file admits — `infra/ops/verbs/publish-drift.json`
 /// declares `mode` with `one_of`, and the ops-runner refuses anything

@@ -44,6 +44,7 @@
 //! is asserted never to be printed.
 
 use boss_testing::{feed_stdin, repo_root};
+use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1854,6 +1855,15 @@ for a in "$@"; do
     case "$a" in
         # The rules on a branch and a commit's check-runs (backlog
         # 602fe95f): the fixture's answer, or the 404 curl -f exits 22 on.
+        */actions/runs/*/attempts/*/jobs*)
+            if [ -f '{pulls}/_workflow_jobs.json' ]; then cat '{pulls}/_workflow_jobs.json'; exit 0; fi
+            exit 22 ;;
+        */actions/runs\?*)
+            if [ -f '{pulls}/_workflow_runs.json' ]; then cat '{pulls}/_workflow_runs.json'; exit 0; fi
+            exit 22 ;;
+        */actions/runs/*)
+            if [ -f '{pulls}/_workflow_run.json' ]; then cat '{pulls}/_workflow_run.json'; exit 0; fi
+            exit 22 ;;
         */rules/branches/*)
             if [ -f '{pulls}/_rules.json' ]; then cat '{pulls}/_rules.json'; exit 0; fi
             echo 'curl: (22) The requested URL returned error: 404' >&2
@@ -3780,6 +3790,397 @@ const ACTIONS_APP: u64 = 15368;
 const APP_BOT: &str = "boss-publisher[bot]";
 const APP_BOT_ID: &str = "9001";
 
+#[test]
+fn the_original_snapshot_answer_is_read_without_repinning_legacy_requests() {
+    let verb: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_root().join("infra/ops/verbs/merge-publish-pr.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    let effect = regex::Regex::new(verb["effect"].as_str().unwrap()).unwrap();
+    let rule: toml::Value = toml::from_str(
+        &std::fs::read_to_string(repo_root().join(
+            "infra/dispatcher/rules/complete-publish-merge-step-on-merge-publish-pr-answered.toml",
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let src = rule["rule"][0]["do"][0]["args"]["verdict_pattern"]
+        .as_str()
+        .unwrap();
+    let pattern =
+        regex::Regex::new(src.strip_prefix('"').unwrap().strip_suffix('"').unwrap()).unwrap();
+    let original = "0123456789abcdef0123456789abcdef01234567";
+    for verb in ["reads", "carries"] {
+        let line = format!(
+            "publish-github-pr: merged {} — main {verb} {original}",
+            merge_pr_url()
+        );
+        assert!(effect.is_match(&line));
+        let captured = pattern.captures(&line).unwrap();
+        assert_eq!(&captured["merged_sha"], original);
+        assert_eq!(&captured["pr_url"], merge_pr_url());
+    }
+    for line in [
+        "publish-github-pr: REFUSED — main carries a snapshot",
+        "publish-github-pr: merged wrong-subject — main carries 0123",
+    ] {
+        assert!(!effect.is_match(line));
+        assert!(!pattern.is_match(line));
+    }
+}
+
+/// Review077 measured that an unavailable or undercounted page was
+/// accepted beside a valid Gate. An unread newer check cannot be green.
+#[test]
+fn a_merge_refuses_an_incomplete_or_malformed_check_page_count() {
+    assert!(have_real_jq());
+    let counts = [
+        None,
+        Some(json!(null)),
+        Some(json!(-1)),
+        Some(json!(0.5)),
+        Some(json!(0)),
+        Some(json!("1")),
+        Some(json!(true)),
+        Some(json!(2)),
+    ];
+    for (index, count) in counts.into_iter().enumerate() {
+        let m = Merge::new(&format!("check-page-count-{index}"));
+        let path = m.run.gh_api.join("_check_runs.json");
+        let mut checks: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        match count {
+            Some(count) => checks["total_count"] = count,
+            None => {
+                checks.as_object_mut().unwrap().remove("total_count");
+            }
+        }
+        boss_testing::write_file(&path, &checks.to_string());
+        let (ok, out) = m.go(&[]);
+        assert!(!ok, "malformed check page {index} was accepted: {out}");
+        m.assert_nothing_merged(&out);
+    }
+}
+
+/// A second unread required rule cannot disappear behind a successful
+/// known Gate; inspect its native container and each requirement first.
+#[test]
+fn a_merge_refuses_a_malformed_required_check_rule() {
+    assert!(have_real_jq());
+    let parameters = [
+        json!({}),
+        json!(null),
+        json!("unread"),
+        json!({"required_status_checks": null}),
+        json!({"required_status_checks": {"cached": {
+            "context": GATE_CHECK, "integration_id": ACTIONS_APP
+        }}}),
+        json!({"required_status_checks": [null]}),
+        json!({"required_status_checks": [{"context": null, "integration_id": ACTIONS_APP}]}),
+        json!({"required_status_checks": [{"context": "", "integration_id": ACTIONS_APP}]}),
+        json!({"required_status_checks": [{"context": 1, "integration_id": ACTIONS_APP}]}),
+        json!({"required_status_checks": [{"context": "Other", "integration_id": null}]}),
+        json!({"required_status_checks": [{"context": "Other", "integration_id": 0.5}]}),
+    ];
+    for (index, parameters) in parameters.into_iter().enumerate() {
+        let m = Merge::new(&format!("required-rule-shape-{index}"));
+        let path = m.run.gh_api.join("_rules.json");
+        let mut rules: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        rules.as_array_mut().unwrap().push(json!({
+            "type": "required_status_checks", "parameters": parameters
+        }));
+        boss_testing::write_file(&path, &rules.to_string());
+        let (ok, out) = m.go(&[]);
+        assert!(!ok, "malformed required rule {index} was accepted: {out}");
+        m.assert_nothing_merged(&out);
+    }
+}
+
+#[test]
+fn reviewer_a_malformed_pr_association_container_is_not_workflow_evidence() {
+    assert!(have_real_jq());
+    let m = Merge::new("reviewer-malformed-pr-association");
+    let path = m.run.gh_api.join("_workflow_runs.json");
+    let mut runs: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    runs["workflow_runs"][0]["pull_requests"] =
+        serde_json::json!({"cached":runs["workflow_runs"][0]["pull_requests"][0].clone()});
+    boss_testing::write_file(&path, &runs.to_string());
+    boss_testing::write_file(
+        &m.run.gh_api.join("_workflow_run.json"),
+        &runs["workflow_runs"][0].to_string(),
+    );
+    let (ok, out) = m.go(&[]);
+    assert!(
+        !ok,
+        "malformed PR association was accepted and merged: {out}"
+    );
+    m.assert_nothing_merged(&out);
+}
+
+#[test]
+fn reviewer_the_success_record_conserves_the_workflow_attempt_evidence() {
+    assert!(have_real_jq());
+    let m = Merge::new("reviewer-recorded-workflow-evidence");
+    let (ok, out) = m.go(&[]);
+    assert!(ok, "positive workflow fixture was refused: {out}");
+    let writes = m.run.puts();
+    let completed = writes
+        .iter()
+        .find(|write| write["status"] == "completed")
+        .unwrap();
+    let recorded = completed["metadata"].to_string();
+    assert!(
+        recorded.contains(".github/workflows/ci.yml") && recorded.contains("run_attempt"),
+        "merge completed but workflow/current-attempt evidence is absent from its record: {recorded}"
+    );
+    let evidence = &completed["metadata"]["required_checks_evidence"];
+    for (key, fixture) in [
+        ("workflow_runs", "_workflow_runs.json"),
+        ("final_workflow_run", "_workflow_run.json"),
+    ] {
+        let original: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(m.run.gh_api.join(fixture)).unwrap())
+                .unwrap();
+        assert_eq!(
+            evidence[key], original,
+            "original {key} observation changed"
+        );
+    }
+}
+
+/// A matching name and Actions App are not evidence of the workflow
+/// that produced a check (16a9c5ae). No Actions run/job answer exists
+/// in this fixture; the old merge still accepts its successful check.
+#[test]
+fn a_merge_refuses_a_green_check_without_workflow_run_provenance() {
+    assert!(have_real_jq(), "this causal merge test requires real jq");
+    let m = Merge::new("merge-missing-workflow-provenance");
+    std::fs::remove_file(m.run.gh_api.join("_workflow_runs.json")).unwrap();
+    let (ok, out) = m.go(&[]);
+    assert!(
+        !ok,
+        "a check with no workflow/run/job evidence was accepted: {out}"
+    );
+    m.assert_nothing_merged(&out);
+}
+
+#[test]
+fn a_merge_accepts_the_current_successful_required_gate_control() {
+    assert!(have_real_jq(), "this merge control requires real jq");
+    let m = Merge::new("merge-current-gate-positive-control");
+    let (ok, out) = m.go(&[]);
+    assert!(ok, "valid current merge fixture was refused: {out}");
+    assert_eq!(
+        m.main(),
+        m.snapshot,
+        "successful merge did not advance main"
+    );
+}
+
+#[test]
+fn a_merge_refuses_the_same_actions_app_from_another_workflow() {
+    assert!(have_real_jq(), "this causal merge test requires real jq");
+    let m = Merge::new("merge-wrong-workflow-provenance");
+    let path = m.run.gh_api.join("_workflow_runs.json");
+    let mut runs: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    runs["workflow_runs"][0]["path"] = serde_json::json!(".github/workflows/impostor.yml");
+    boss_testing::write_file(&path, &runs.to_string());
+    let (ok, out) = m.go(&[]);
+    assert!(
+        !ok,
+        "a successful same-App check from another workflow was accepted: {out}"
+    );
+    m.assert_nothing_merged(&out);
+}
+
+#[test]
+fn a_merge_refuses_mismatched_or_incomplete_workflow_evidence() {
+    assert!(have_real_jq(), "these provenance controls require real jq");
+    for case in [
+        "wrong-pr",
+        "wrong-head",
+        "wrong-repo",
+        "wrong-event",
+        "partial-runs",
+        "partial-jobs",
+        "wrong-check",
+        "wrong-attempt",
+        "missing-jobs",
+        "wrong-job-sha",
+        "wrong-run-id",
+        "wrong-suite",
+        "fractional-run",
+        "fractional-attempt",
+        "missing-job-id",
+        "wrong-pr-head-repo",
+        "wrong-pr-base-repo",
+    ] {
+        let m = Merge::new(&format!("merge-provenance-{case}"));
+        let runs_path = m.run.gh_api.join("_workflow_runs.json");
+        let jobs_path = m.run.gh_api.join("_workflow_jobs.json");
+        let mut runs: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&runs_path).unwrap()).unwrap();
+        let mut jobs: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&jobs_path).unwrap()).unwrap();
+        match case {
+            "wrong-pr" => {
+                runs["workflow_runs"][0]["pull_requests"][0]["number"] = serde_json::json!(2)
+            }
+            "wrong-head" => {
+                runs["workflow_runs"][0]["pull_requests"][0]["head"]["sha"] =
+                    serde_json::json!("b".repeat(40))
+            }
+            "wrong-repo" => {
+                runs["workflow_runs"][0]["repository"]["full_name"] =
+                    serde_json::json!("other/repository")
+            }
+            "wrong-event" => {
+                runs["workflow_runs"][0]["event"] = serde_json::json!("workflow_dispatch")
+            }
+            "partial-runs" => runs["total_count"] = serde_json::json!(2),
+            "partial-jobs" => jobs["total_count"] = serde_json::json!(2),
+            "wrong-check" => {
+                jobs["jobs"][0]["check_run_url"] = serde_json::json!(format!(
+                    "https://api.github.com/repos/{MIRROR_SLUG}/check-runs/2"
+                ))
+            }
+            "wrong-attempt" => runs["workflow_runs"][0]["run_attempt"] = serde_json::json!(2),
+            "wrong-job-sha" => jobs["jobs"][0]["head_sha"] = serde_json::json!("b".repeat(40)),
+            "wrong-run-id" => jobs["jobs"][0]["run_id"] = serde_json::json!(701),
+            "wrong-suite" => runs["workflow_runs"][0]["check_suite_id"] = serde_json::json!(702),
+            "fractional-run" => runs["workflow_runs"][0]["id"] = serde_json::json!(700.5),
+            "fractional-attempt" => {
+                runs["workflow_runs"][0]["run_attempt"] = serde_json::json!(1.5)
+            }
+            "missing-job-id" => jobs["jobs"][0]["id"] = serde_json::Value::Null,
+            "wrong-pr-head-repo" => {
+                runs["workflow_runs"][0]["pull_requests"][0]["head"]["repo"]["url"] =
+                    serde_json::json!("https://api.github.com/repos/other/repo")
+            }
+            "wrong-pr-base-repo" => {
+                runs["workflow_runs"][0]["pull_requests"][0]["base"]["repo"]["url"] =
+                    serde_json::json!("https://api.github.com/repos/other/repo")
+            }
+            "missing-jobs" => {}
+            _ => unreachable!(),
+        }
+        boss_testing::write_file(&runs_path, &runs.to_string());
+        boss_testing::write_file(&jobs_path, &jobs.to_string());
+        if case == "missing-jobs" {
+            std::fs::remove_file(&jobs_path).unwrap();
+        }
+        let (ok, out) = m.go(&[]);
+        assert!(!ok, "{case} provenance was accepted: {out}");
+        m.assert_nothing_merged(&out);
+    }
+}
+
+#[test]
+fn a_merge_refuses_rules_that_omit_the_full_gate() {
+    assert!(have_real_jq(), "this merge control requires real jq");
+    let m = Merge::new("merge-no-required-full-gate");
+    m.rules(&["Renamed check"], Some(ACTIONS_APP));
+    m.check_runs(&[("Renamed check", "completed", "success")]);
+    let (ok, out) = m.go(&[]);
+    assert!(!ok, "rules without the full Gate were accepted: {out}");
+    m.assert_nothing_merged(&out);
+}
+
+#[test]
+fn a_merge_accepts_a_workflow_ref_suffix_and_irrelevant_run_updates() {
+    assert!(have_real_jq(), "this merge control requires real jq");
+    let m = Merge::new("merge-workflow-path-ref");
+    let path = m.run.gh_api.join("_workflow_runs.json");
+    let mut runs: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    runs["workflow_runs"][0]["path"] = serde_json::json!(".github/workflows/ci.yml@main");
+    boss_testing::write_file(&path, &runs.to_string());
+    let mut after = runs["workflow_runs"][0].clone();
+    after["updated_at"] = serde_json::json!("2026-10-04T16:00:00Z");
+    boss_testing::write_file(&m.run.gh_api.join("_workflow_run.json"), &after.to_string());
+    let (ok, out) = m.go(&[]);
+    assert!(
+        ok,
+        "valid workflow reference or irrelevant update refused: {out}"
+    );
+    assert_eq!(m.main(), m.snapshot);
+}
+
+#[test]
+fn the_publish_required_gate_context_matches_the_workflow_job() {
+    let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap();
+    let mut lines = workflow.lines().skip_while(|line| *line != "  gate:");
+    assert_eq!(
+        lines.next(),
+        Some("  gate:"),
+        "CI must declare the gate job"
+    );
+    let name = lines
+        .next()
+        .and_then(|line| line.strip_prefix("    name: "));
+    assert_eq!(
+        name,
+        Some(GATE_CHECK),
+        "required publish context drifted from CI gate job"
+    );
+    let publish = std::fs::read_to_string(script()).unwrap();
+    assert!(
+        publish.contains(&format!("publish_gate_context='{GATE_CHECK}'")),
+        "publish context drifted from workflow: {GATE_CHECK}"
+    );
+}
+
+#[test]
+fn a_merge_preserves_an_additional_required_external_app_check() {
+    assert!(have_real_jq(), "this merge control requires real jq");
+    let m = Merge::new("merge-external-app-control");
+    m.rules(&[GATE_CHECK, "External audit"], Some(ACTIONS_APP));
+    let rules_path = m.run.gh_api.join("_rules.json");
+    let mut rules: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&rules_path).unwrap()).unwrap();
+    rules[1]["parameters"]["required_status_checks"][1]["integration_id"] =
+        serde_json::json!(57789);
+    boss_testing::write_file(&rules_path, &rules.to_string());
+    m.check_runs(&[
+        (GATE_CHECK, "completed", "success"),
+        ("External audit", "completed", "success"),
+    ]);
+    let checks_path = m.run.gh_api.join("_check_runs.json");
+    let mut checks: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&checks_path).unwrap()).unwrap();
+    checks["check_runs"][1]["app"]["id"] = serde_json::json!(57789);
+    boss_testing::write_file(&checks_path, &checks.to_string());
+    let (ok, out) = m.go(&[]);
+    assert!(ok, "valid external-App check refused: {out}");
+    assert_eq!(m.main(), m.snapshot);
+}
+
+#[test]
+fn a_merge_accepts_the_observed_actions_pr_repository_shape() {
+    assert!(have_real_jq(), "this merge control requires real jq");
+    let m = Merge::new("merge-observed-actions-pr-repo");
+    let path = m.run.gh_api.join("_workflow_runs.json");
+    let mut runs: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for side in ["head", "base"] {
+        runs["workflow_runs"][0]["pull_requests"][0][side]["repo"] = serde_json::json!({
+            "id": 123, "name": "mirror", "url": format!("https://api.github.com/repos/{MIRROR_SLUG}")
+        });
+    }
+    boss_testing::write_file(&path, &runs.to_string());
+    boss_testing::write_file(
+        &m.run.gh_api.join("_workflow_run.json"),
+        &runs["workflow_runs"][0].to_string(),
+    );
+    let (ok, out) = m.go(&[]);
+    assert!(ok, "observed Actions PR repository shape refused: {out}");
+    assert_eq!(m.main(), m.snapshot);
+}
+
 fn merge_pr_url() -> String {
     format!("https://github.com/{MIRROR_SLUG}/pull/1")
 }
@@ -3819,6 +4220,7 @@ impl Merge {
         m.put_pull(&m.pull());
         m.rules(&[GATE_CHECK], Some(ACTIONS_APP));
         m.check_runs(&[(GATE_CHECK, "completed", "success")]);
+        m.workflow_provenance();
         boss_testing::write_file(&m.run.gh_api.join("_ff_marks_merged"), "");
         m.run.echoing_curl();
         m
@@ -3863,6 +4265,7 @@ impl Merge {
             "head": format!("{}:{}", mirror_owner(), self.branch),
             "source_sha": packet.source,
             "opened_by": APP_BOT, "opened_by_id": APP_BOT_ID,
+            "approved_by": "emp-david", "approved_at": "2026-01-02T00:00:00.000000Z",
         });
         change(&mut md);
         open_pr["metadata"] = md;
@@ -3931,6 +4334,7 @@ impl Merge {
                     "started_at": format!("2026-01-02T00:1{i}:00Z"),
                     "html_url": format!("https://github.com/{MIRROR_SLUG}/runs/{}", i + 1),
                     "app": {"id": 15368},
+                    "check_suite": {"id": 701},
                 })
             })
             .collect();
@@ -3944,6 +4348,39 @@ impl Merge {
         let mut env = vec![("BOSS_PUBLISH_READBACK_SLEEP", "0".to_string())];
         env.extend(extra.iter().cloned());
         self.run.go_argv("--merge", &env)
+    }
+
+    fn workflow_provenance(&self) {
+        // PR workflows can execute a synthetic merge SHA. The explicit
+        // PR association identifies the approved branch head separately.
+        let execution_sha = "a".repeat(40);
+        let run = serde_json::json!({
+            "id": 700, "check_suite_id": 701, "run_attempt": 1,
+            "path": ".github/workflows/ci.yml", "event": "pull_request",
+            "status": "completed", "conclusion": "success", "head_sha": execution_sha,
+            "repository": {"full_name": MIRROR_SLUG},
+            "head_repository": {"full_name": MIRROR_SLUG},
+            "pull_requests": [{"number": 1,
+                "head": {"sha": self.snapshot, "repo": {"id": 123, "name": "mirror", "url": format!("https://api.github.com/repos/{MIRROR_SLUG}")}},
+                "base": {"ref": "main", "repo": {"id": 123, "name": "mirror", "url": format!("https://api.github.com/repos/{MIRROR_SLUG}")}}}]
+        });
+        for (name, value) in [
+            ("_workflow_run.json", run.clone()),
+            (
+                "_workflow_runs.json",
+                serde_json::json!({"total_count": 1, "workflow_runs": [run]}),
+            ),
+            (
+                "_workflow_jobs.json",
+                serde_json::json!({"total_count": 1, "jobs": [{
+                    "id": 800, "run_id": 700, "head_sha": execution_sha,
+                    "name": GATE_CHECK, "status": "completed", "conclusion": "success",
+                    "check_run_url": format!("https://api.github.com/repos/{MIRROR_SLUG}/check-runs/1")
+                }]}),
+            ),
+        ] {
+            boss_testing::write_file(&self.run.gh_api.join(name), &value.to_string());
+        }
     }
 
     fn main(&self) -> String {
@@ -4433,7 +4870,7 @@ fn a_merge_github_does_not_record_or_refuses_fails_loudly() {
     assert_eq!(code, 3, "past the push a failure exits 3: {out}");
     assert!(
         out.contains("FAILED")
-            && out.contains("main IS the approved commit")
+            && out.contains("the original snapshot is on main")
             && out.contains(&format!("for_publish={OPEN_PACKET}")),
         "{out}"
     );
@@ -4612,6 +5049,273 @@ fn a_main_that_advanced_past_the_snapshot_is_never_read_as_not_merged() {
         assert_eq!(m.main(), child, "nothing was pushed: {out}");
         assert!(out.contains("contains"), "{out}");
     }
+}
+
+/// Settlement proves the original publication, not approval of descendants.
+#[test]
+fn an_original_merged_receipt_settles_after_main_advances_without_pushing() {
+    assert!(have_real_jq());
+    let m = Merge::new("settle-original-after-main-advances");
+    let tree = git_in(
+        &m.run.mirror,
+        &["rev-parse", &format!("{}^{{tree}}", m.main_before)],
+    );
+    assert_ne!(
+        tree,
+        git_in(
+            &m.run.mirror,
+            &["rev-parse", &format!("{}^{{tree}}", m.snapshot)]
+        ),
+        "the descendant must carry a different tree, receiving no transferred approval"
+    );
+    let child = git_in(
+        &m.run.mirror,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &m.snapshot,
+            "-m",
+            "later publication",
+        ],
+    );
+    git_in(&m.run.mirror, &["update-ref", "refs/heads/main", &child]);
+    git_in(
+        &m.run.mirror,
+        &["update-ref", "-d", &format!("refs/heads/{}", m.branch)],
+    );
+    let mut receipt = m.pull();
+    receipt["state"] = json!("closed");
+    receipt["merged"] = json!(true);
+    receipt["merge_commit_sha"] = json!(m.snapshot);
+    receipt["merged_at"] = json!("2026-01-02T01:00:00Z");
+    m.put_pull(&receipt);
+    let mut authenticated = receipt.clone();
+    authenticated["updated_at"] = json!("2026-01-03T00:00:00Z");
+    authenticated["mergeable_state"] = json!("unknown");
+    m.run.gh_repo(
+        &format!("{MIRROR_SLUG}/pulls/1"),
+        &authenticated.to_string(),
+    );
+    let (code, out) = m.go_code(&[]);
+    assert_eq!(code, 0, "matching original receipt was not settled: {out}");
+    assert_eq!(m.main(), child, "settlement must never push: {out}");
+    let writes = m.run.puts();
+    assert_eq!(writes.len(), 1, "one original merge completion: {writes:?}");
+    assert_eq!(writes[0]["metadata"]["merged_sha"], m.snapshot);
+    assert_eq!(writes[0]["metadata"]["observed_main"], child);
+    assert_eq!(writes[0]["metadata"]["pushed"], false);
+    assert_eq!(writes[0]["metadata"]["original_merge_receipt"], receipt);
+    assert_eq!(
+        writes[0]["metadata"]["authenticated_merge_receipt"],
+        authenticated
+    );
+    assert!(
+        out.contains(&format!(
+            "merged {} — main carries {}",
+            merge_pr_url(),
+            m.snapshot
+        )),
+        "answer must name original snapshot truthfully: {out}"
+    );
+}
+
+#[test]
+fn advanced_main_alone_or_a_foreign_receipt_never_settles_the_original() {
+    assert!(have_real_jq());
+    for case in [
+        "missing-commit",
+        "other-commit",
+        "unmerged",
+        "open",
+        "missing-time",
+        "bad-time",
+        "other-number",
+        "other-repo",
+        "other-head",
+        "other-opener",
+        "other-source",
+        "other-tree",
+        "changed-authenticated-receipt",
+    ] {
+        let mut m = Merge::new(&format!("original-settlement-refuses-{case}"));
+        if case == "other-tree" {
+            let wrong_tree = git_in(
+                &m.run.mirror,
+                &["rev-parse", &format!("{}^{{tree}}", m.main_before)],
+            );
+            m.snapshot = git_in(
+                &m.run.mirror,
+                &[
+                    "commit-tree",
+                    &wrong_tree,
+                    "-p",
+                    &m.main_before,
+                    "-m",
+                    "unapproved tree",
+                ],
+            );
+            m.serve(&Packet::signed(&m.run.forge_main()), |_| {});
+        }
+        let tree = git_in(
+            &m.run.mirror,
+            &["rev-parse", &format!("{}^{{tree}}", m.snapshot)],
+        );
+        let child = git_in(
+            &m.run.mirror,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &m.snapshot,
+                "-m",
+                "later publication",
+            ],
+        );
+        git_in(&m.run.mirror, &["update-ref", "refs/heads/main", &child]);
+        let mut receipt = m.pull();
+        receipt["state"] = json!("closed");
+        receipt["merged"] = json!(true);
+        receipt["merge_commit_sha"] = json!(m.snapshot);
+        receipt["merged_at"] = json!("2026-01-02T01:00:00Z");
+        match case {
+            "missing-commit" => {
+                receipt.as_object_mut().unwrap().remove("merge_commit_sha");
+            }
+            "other-commit" => receipt["merge_commit_sha"] = json!(child),
+            "unmerged" => receipt["merged"] = json!(false),
+            "open" => receipt["state"] = json!("open"),
+            "missing-time" => receipt["merged_at"] = json!(null),
+            "bad-time" => receipt["merged_at"] = json!("2026-99-99T00:00:00Z"),
+            "other-number" => receipt["number"] = json!(2),
+            "other-repo" => receipt["base"]["repo"]["full_name"] = json!("foreign/repo"),
+            "other-head" => receipt["head"]["sha"] = json!(child),
+            "other-opener" => receipt["user"]["id"] = json!(9002),
+            "other-source" => m.serve(&Packet::signed(&m.run.forge_main()), |md| {
+                md["source_sha"] = json!("a".repeat(40));
+            }),
+            "changed-authenticated-receipt" | "other-tree" => {}
+            _ => unreachable!(),
+        }
+        m.put_pull(&receipt);
+        if case == "changed-authenticated-receipt" {
+            let mut changed = receipt.clone();
+            changed["merge_commit_sha"] = json!(child);
+            m.run
+                .gh_repo(&format!("{MIRROR_SLUG}/pulls/1"), &changed.to_string());
+        }
+        let (code, out) = m.go_code(&[]);
+        assert_eq!(
+            code, 3,
+            "contained original must stay open on {case}: {out}"
+        );
+        assert_eq!(m.main(), child, "refusal must never push: {out}");
+        assert!(
+            m.run.puts().is_empty(),
+            "{case} completed a foreign receipt: {:?}",
+            m.run.puts()
+        );
+        if case != "changed-authenticated-receipt" {
+            assert!(
+                !m.run.render_log().contains("--request"),
+                "{case} took a token before joining original evidence"
+            );
+        }
+    }
+}
+
+#[test]
+fn original_settlement_requires_the_original_approval_before_the_effect() {
+    assert!(have_real_jq());
+    let mut failures = Vec::new();
+    for case in [
+        "missing-original-time",
+        "malformed-original-time",
+        "different-original-time",
+        "different-original-signer",
+        "after-merge",
+        "after-merge-fraction",
+        "missing-live-time",
+        "malformed-live-time",
+        "wrong-request",
+    ] {
+        let m = Merge::new(&format!("settlement-approval-binding-{case}"));
+        let tree = git_in(
+            &m.run.mirror,
+            &["rev-parse", &format!("{}^{{tree}}", m.snapshot)],
+        );
+        let child = git_in(
+            &m.run.mirror,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &m.snapshot,
+                "-m",
+                "later publication",
+            ],
+        );
+        git_in(&m.run.mirror, &["update-ref", "refs/heads/main", &child]);
+        let mut receipt = m.pull();
+        receipt["state"] = json!("closed");
+        receipt["merged"] = json!(true);
+        receipt["merge_commit_sha"] = json!(m.snapshot);
+        receipt["merged_at"] = json!("2026-01-02T01:00:00Z");
+        m.put_pull(&receipt);
+        let path = m.run.root.join("jobs.json");
+        let mut jobs: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let steps = jobs["data"][0]["steps"].as_array_mut().unwrap();
+        let open = steps
+            .iter_mut()
+            .find(|s| s["spec_slug"] == "open-pr")
+            .unwrap();
+        let time = match case {
+            "after-merge" => Some("2026-01-03T00:00:00.000000Z"),
+            "after-merge-fraction" => Some("2026-01-02T01:00:00.000001Z"),
+            "missing-live-time" => Some(""),
+            "malformed-live-time" => Some("not a timestamp"),
+            _ => None,
+        };
+        match case {
+            "missing-original-time" => {
+                open["metadata"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("approved_at");
+            }
+            "malformed-original-time" => open["metadata"]["approved_at"] = json!("not a timestamp"),
+            "different-original-time" => {
+                open["metadata"]["approved_at"] = json!("2026-01-01T00:00:00.000000Z")
+            }
+            "different-original-signer" => open["metadata"]["approved_by"] = json!("emp-other"),
+            "wrong-request" => m.request(Some(OLDER_PACKET)),
+            _ => open["metadata"]["approved_at"] = json!(time.unwrap()),
+        }
+        if let Some(time) = time {
+            let approve = steps
+                .iter_mut()
+                .find(|s| s["spec_slug"] == "approve")
+                .unwrap();
+            approve["sign_offs"][0]["stamped_at"] = json!(time);
+        }
+        boss_testing::write_file(&path, &jobs.to_string());
+        let (code, out) = m.go_code(&[]);
+        let expected = if case == "wrong-request" { 4 } else { 3 };
+        if code != expected
+            || m.main() != child
+            || !m.run.puts().is_empty()
+            || m.run.render_log().contains("--request")
+        {
+            failures.push(format!(
+                "{case}: expected refusal{expected} without effect; got{code}: {out}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "original approval binding failures: {failures:?}"
+    );
 }
 
 /// Review 20beab5a C3: the containment answer is only as good as the

@@ -52,7 +52,16 @@ const NEXT_ACTION_MODEL_IDS: &[&str] = &[
     "mdl-next-action-preventive-maintenance-due-v1",
 ];
 
-/// True iff `user` may see next-best-actions for `account_id`.
+struct VisibilityContext {
+    allowed: bool,
+    relationship: Option<bool>,
+}
+
+fn comparison_with_relationship(broad: bool, relationship: Option<bool>) -> Option<bool> {
+    if broad { Some(true) } else { relationship }
+}
+
+/// Original visibility and the relationship answer that path actually read.
 ///
 /// Three paths to access:
 ///   1. Role is broadly scoped (C-suite / VP / manager).
@@ -65,9 +74,12 @@ async fn user_can_see_account_nba(
     user_id: &str,
     role: &str,
     account_id: &str,
-) -> Result<bool, String> {
+) -> Result<VisibilityContext, String> {
     if boss_core::roles::has_broad_account_access(role) {
-        return Ok(true);
+        return Ok(VisibilityContext {
+            allowed: true,
+            relationship: None,
+        });
     }
     let (can_see,): (bool,) = sqlx::query_as(
         "SELECT EXISTS (
@@ -81,7 +93,10 @@ async fn user_can_see_account_nba(
     .fetch_one(pool)
     .await
     .map_err(|e| e.to_string())?;
-    Ok(can_see)
+    Ok(VisibilityContext {
+        allowed: can_see,
+        relationship: Some(can_see),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -124,15 +139,25 @@ pub struct Action {
 #[derive(Clone)]
 pub struct NextActionsState {
     pub pool: Arc<PgPool>,
+    pub role_guards: Option<Arc<boss_policy_client::role_guard::RoleGuardReporter>>,
     /// Source `today` for the prediction-freshness cutoff from this
     /// clock so sim-mode reads sim-today.
     pub clock: Arc<dyn boss_clock_client::ClockClient>,
 }
 
 pub fn next_actions_router(pool: PgPool, clock: Arc<dyn boss_clock_client::ClockClient>) -> Router {
+    next_actions_router_with_reports(pool, clock, None)
+}
+
+pub fn next_actions_router_with_reports(
+    pool: PgPool,
+    clock: Arc<dyn boss_clock_client::ClockClient>,
+    role_guards: Option<Arc<boss_policy_client::role_guard::RoleGuardReporter>>,
+) -> Router {
     let state = NextActionsState {
         pool: Arc::new(pool),
         clock,
+        role_guards,
     };
     Router::new()
         .route(
@@ -152,10 +177,32 @@ async fn list_next_actions(
     // relationship to the account get an empty list, not a 403 — the
     // rest of the account page is
     // still viewable, just the action panel is gated.
-    match user_can_see_account_nba(&state.pool, &user.id, &user.role, &account_id).await {
-        Ok(true) => {}
-        Ok(false) => return Json(Vec::<Action>::new()).into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    let context =
+        match user_can_see_account_nba(&state.pool, &user.id, &user.role, &account_id).await {
+            Ok(context) => context,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        };
+    // A broad original role skipped relationship SQL. A narrow candidate
+    // cannot invent its answer; the report names missing context instead.
+    let allowed = state
+        .role_guards
+        .as_ref()
+        .map_or(context.allowed, |reporter| {
+            reporter.observe_captured(
+                "account-next-actions",
+                "admission",
+                &user,
+                context.allowed,
+                |candidate| {
+                    comparison_with_relationship(
+                        boss_core::roles::has_broad_account_access(&candidate.role),
+                        context.relationship,
+                    )
+                },
+            )
+        });
+    if !allowed {
+        return Json(Vec::<Action>::new()).into_response();
     }
 
     // Source `today` from ClockClient so the "yesterday's stale
@@ -395,5 +442,15 @@ mod tests {
         assert!(json.contains("\"deep_link\":\"/sales/agreements/SA-123\""));
         assert!(json.contains("\"severity\":\"warning\""));
         assert!(json.contains("\"due_on\":\"2026-05-10\""));
+    }
+    #[test]
+    fn comparison_does_not_invent_a_relationship_the_original_broad_path_skipped() {
+        assert_eq!(comparison_with_relationship(false, None), None);
+        assert_eq!(comparison_with_relationship(true, None), Some(true));
+        assert_eq!(comparison_with_relationship(false, Some(true)), Some(true));
+        assert_eq!(
+            comparison_with_relationship(false, Some(false)),
+            Some(false)
+        );
     }
 }

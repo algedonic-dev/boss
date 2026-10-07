@@ -281,6 +281,12 @@ impl SchedulingRepository for TwoSchedules {
 /// service manager reads the schedules of their team — the shape a
 /// tenant seed writes for its managers.
 fn app() -> Router {
+    app_with_reporter(None)
+}
+
+fn app_with_reporter(
+    reporter: Option<Arc<boss_policy_client::role_guard::RoleGuardReporter>>,
+) -> Router {
     let policy = boss_policy_client::defaults::default_rules()
         .into_iter()
         .fold(FakePolicyClient::builder(), |b, r| {
@@ -294,11 +300,89 @@ fn app() -> Router {
         )
         .build();
     router(SchedulingApiState {
+        role_guards: reporter,
         repo: Arc::new(TwoSchedules),
         publisher: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
         policy: Arc::new(policy),
     })
+}
+
+#[tokio::test]
+async fn schedule_self_visibility_reports_the_recorded_floor_without_changing_the_answer() {
+    exercise_schedule_report(true, boss_policy_client::role_reporting::ReportMode::Report).await;
+}
+
+#[tokio::test]
+async fn schedule_reporting_off_preserves_visibility_without_a_report() {
+    exercise_schedule_report(true, boss_policy_client::role_reporting::ReportMode::Off).await;
+}
+
+#[tokio::test]
+async fn an_unread_schedule_role_is_unknown_not_an_unchanged_scope() {
+    exercise_schedule_report(
+        false,
+        boss_policy_client::role_reporting::ReportMode::Report,
+    )
+    .await;
+}
+
+async fn exercise_schedule_report(
+    registered: bool,
+    mode: boss_policy_client::role_reporting::ReportMode,
+) {
+    use boss_policy_client::role_guard::RoleGuardReporter;
+    use boss_policy_client::role_reader::{RegistryRoles, RoleSnapshotClock, SnapshotRoleReader};
+    use boss_policy_client::role_reporting::{ReportMode, ReportTally};
+    use std::time::{Duration, Instant};
+    struct Clock;
+    impl RoleSnapshotClock for Clock {
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+    }
+    let roles = Arc::new(SnapshotRoleReader::new(
+        Duration::from_secs(30),
+        Arc::new(Clock),
+    ));
+    if registered {
+        let ticket = roles.begin_refresh();
+        assert!(
+            roles.finish_refresh(
+                ticket,
+                Ok(RegistryRoles::from_sources(
+                    json!({"data":[], "total":0}),
+                    json!({"data":[{"id":MINE,"role":"visitor"}], "total":1}),
+                    json!([]),
+                )
+                .unwrap())
+            )
+        );
+    }
+    let tally = Arc::new(ReportTally::new(10));
+    let application = app_with_reporter(Some(Arc::new(RoleGuardReporter::new(
+        roles,
+        tally.clone(),
+        Arc::new(mode),
+    ))));
+    let header = user_header(Caller::Employee(MINE)).unwrap();
+    let response = TestRequest::get("/api/scheduling/availability")
+        .header("x-boss-user", header.to_string())
+        .send(&application)
+        .await;
+    assert_eq!(response.status, StatusCode::OK);
+    let reports = tally.snapshot();
+    if mode == ReportMode::Off {
+        assert!(reports.rows.is_empty());
+        return;
+    }
+    assert_eq!(reports.rows.len(), 1);
+    assert_eq!(reports.rows[0].observation.action, "selection");
+    assert_eq!(
+        reports.rows[0].observation.would_change_scope,
+        registered.then_some(true)
+    );
+    assert_eq!(reports.rows[0].observation.would_deny, None);
 }
 
 /// Who is asking — as the gateway's `build_user_json` spells it.

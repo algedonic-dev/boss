@@ -67,6 +67,10 @@ pub enum JobsError {
         "step {id} changed since this write read it — the row is no longer the version the write was computed from"
     )]
     StepChanged { id: StepId },
+    #[error("signer metadata authority no longer holds: {reason}")]
+    SignerWriteRefused { reason: String },
+    #[error("step {id} first record {key} is immutable")]
+    FirstRecordImmutable { id: StepId, key: String },
     /// A sign-off stamp attests a shape the row no longer has: the
     /// sign-off door built it over the step it READ, and a write moved
     /// the row before the append took the lock (backlog 4174c4a9, the
@@ -154,6 +158,11 @@ impl StepVersion {
     pub(crate) fn new(raw: i64) -> Self {
         Self(raw)
     }
+
+    /// A comparison token scoped to its row; callers carry it unchanged.
+    pub fn scoped_token(self, job: &JobId, step: &StepId) -> String {
+        format!("{job}/{step}/{:x}", self.0)
+    }
 }
 
 /// PURE: whether writing `write` over the TERMINAL row `row` would move
@@ -223,6 +232,11 @@ pub struct JobFilter {
     /// measured on prod, `?department=sales` answered 1944, the
     /// unfiltered total, because nothing read the parameter at all.
     pub kinds: Option<Vec<String>>,
+    /// Complement of a declared kind set. Unknown historical kinds remain visible.
+    /// ANDed with inclusion, policy and every other predicate before count/paging.
+    pub excluded_kinds: Option<Vec<String>>,
+    /// Opt-in admission-time ascending order; existing callers stay newest first.
+    pub oldest_first: bool,
     /// Keep only the packets IN one department — the `?department=`
     /// listing's filter. See [`DepartmentFilter`] for which packets
     /// that is; `None` is no filter.
@@ -1365,6 +1379,17 @@ pub trait JobsRepository: Send + Sync {
         limit: i64,
     ) -> Result<Vec<boss_core::event::Event>, JobsError>;
 
+    /// Exact immutable receipt read; a bounded recent page cannot prove
+    /// an old completion's provenance. Adapters without a log refuse.
+    async fn recorded_event(
+        &self,
+        _id: uuid::Uuid,
+    ) -> Result<Option<boss_core::event::Event>, JobsError> {
+        Err(JobsError::Storage(
+            "recorded event lookup unavailable".into(),
+        ))
+    }
+
     /// Re-pin a packet to a different protocol version.
     ///
     /// A DELIBERATELY SEPARATE VERB, not a field on `update_job`.
@@ -1551,6 +1576,86 @@ pub trait JobsRepository: Send + Sync {
         patch: &serde_json::Map<String, serde_json::Value>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Step, JobsError>;
+
+    /// A signer guard is checked under the actual row/event writers, and again
+    /// before Pg COMMIT dispatch. An adapter with no such owner refuses it.
+    async fn merge_step_metadata_guarded_at(
+        &self,
+        id: &StepId,
+        patch: &serde_json::Map<String, serde_json::Value>,
+        stamp: &boss_core::publisher::EventStamp,
+        guard: Option<&crate::signer_write::SignerWriteGuard>,
+    ) -> Result<Step, JobsError> {
+        if guard.is_some() {
+            return Err(JobsError::Storage(
+                "adapter has no owning signer metadata guard".into(),
+            ));
+        }
+        self.merge_step_metadata_at(id, patch, stamp).await
+    }
+
+    /// Read the original receipt without a caller value or replay write.
+    /// Storage unavailability is an error, never evidence that no record exists.
+    async fn first_step_record(
+        &self,
+        id: &StepId,
+        key: &str,
+    ) -> Result<Option<crate::first_record::FirstRecord>, JobsError> {
+        let _ = (id, key);
+        Err(JobsError::Storage(
+            "adapter does not support original first-record reads".into(),
+        ))
+    }
+
+    /// Insert an immutable first record under the same lock as completion.
+    /// No overwrite, and an equal replay returns the original receipt without an event.
+    /// A terminal row permits only that replay; absence is not retroactive evidence.
+    async fn record_step_metadata_at(
+        &self,
+        id: &StepId,
+        key: &str,
+        value: &serde_json::Value,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<crate::first_record::FirstRecordResult, JobsError> {
+        self.record_step_metadata_if_unchanged_at(id, key, value, None, stamp)
+            .await
+    }
+
+    /// The HTTP door supplies its judged row version; trusted internal callers
+    /// still use the unchecked overload, as the existing whole-row port does.
+    /// A supplied version is checked before returning existing evidence too:
+    /// stale authorization cannot obtain a replay receipt after declarations move.
+    async fn record_step_metadata_if_unchanged_at(
+        &self,
+        id: &StepId,
+        key: &str,
+        value: &serde_json::Value,
+        read: Option<StepVersion>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<crate::first_record::FirstRecordResult, JobsError> {
+        let _ = (id, key, value, read, stamp);
+        Err(JobsError::Storage(
+            "adapter does not support atomic first records".into(),
+        ))
+    }
+
+    async fn record_step_metadata_guarded_at(
+        &self,
+        id: &StepId,
+        key: &str,
+        value: &serde_json::Value,
+        read: Option<StepVersion>,
+        stamp: &boss_core::publisher::EventStamp,
+        guard: Option<&crate::signer_write::SignerWriteGuard>,
+    ) -> Result<crate::first_record::FirstRecordResult, JobsError> {
+        if guard.is_some() {
+            return Err(JobsError::Storage(
+                "adapter has no owning signer first-record guard".into(),
+            ));
+        }
+        self.record_step_metadata_if_unchanged_at(id, key, value, read, stamp)
+            .await
+    }
 
     /// Claim a ready step for an actor — the Ready→Active
     /// compare-and-set (queue-visibility Q2). Succeeds only while

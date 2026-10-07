@@ -1,3 +1,4 @@
+import { isPageWrite } from './_smokeMocks';
 // /ux/sales — "Sales pipeline" (department sales), every control and
 // render state pinned as the page behaves TODAY (page audit 1e9283fc,
 // step `test`).
@@ -15,12 +16,13 @@
 //              "Create Ad Hoc Job" (only when the registry carries
 //              `ad-hoc`), three status buttons (Open / Closed / All), and
 //              in the form "Create Job" / "Creating…" and "Cancel";
-//   controls — the Kind, Status and Subject id filters; in the form the
+//   controls — Kind group, Kind, Status, Subject id and Order; in the form the
 //              Kind, Subject kind, Subject id, Owner and Title fields;
 //   form     — 1, the new-Job form, which POSTs the envelope;
-//   links    — 2 per row (the short id to the Job, the Subject cell to
-//              the Subject) and the row itself (rowLink, to the Job);
-//   reads    — 4 paths: GET /api/jobs?{filters}, GET /api/workflows, the
+//   links    — 3 per declared row (the short id to the Job, Department
+//              to its Jobs view, Subject to the Subject), plus rowLink;
+//   reads    — 5 paths: GET /api/jobs?{filters}, GET /api/workflows,
+//              GET /api/departments, the
 //              subject autocomplete (one URL per subject kind) and
 //              GET /api/people (the owner picker);
 //   writes   — 1, POST /api/jobs.
@@ -119,7 +121,8 @@ const job = (
 
 const INQUIRY = job(
   'aaaaaaaa-0000-4000-8000-00000000a001', 'receive-an-inquiry', 'Inquiry from Anchor Pub',
-  { subject_kind: 'account', id: 'acct-anchor' }, 'open', 'high', '2026-09-20',
+  // Native priority vocabulary: the old "high" fixture was invalid.
+  { subject_kind: 'account', id: 'acct-anchor' }, 'open', 'urgent', '2026-09-20',
 );
 /// The one sponsorship the live instance has ever closed (needs_md).
 const SPONSORED = job(
@@ -151,15 +154,24 @@ function answerList(params: URLSearchParams): { data: unknown[]; total: number }
   return { data: rows, total: rows.length };
 }
 
-const HEADINGS = ['ID', 'Kind', 'Title', 'Subject', 'Status', 'Priority', 'Opened'];
+const HEADINGS = ['ID', 'Kind', 'Department', 'Title', 'Subject', 'Status', 'Priority', 'Opened',
+  'Current steps and holders', 'Open age', 'Closed'];
+const FIXTURE_AGES: Readonly<Record<string, string>> = {
+  [INQUIRY.id]: '13 days (date only)',
+  [SPONSOR_OPEN.id]: '11 days (date only)',
+  [AUDIT.id]: '14 days (date only)',
+};
 const cells = (j: (typeof JOBS)[number]): string[] => [
-  j.id.replace(/-/g, '').slice(-8), j.kind, j.title, j.subject.id!, j.status, j.priority, j.opened_on,
+  j.id.replace(/-/g, '').slice(-8), j.kind, SALES_KINDS.has(j.kind) ? 'Sales' : '', j.title, j.subject.id!, j.status, j.priority, j.opened_on,
+  'None', j.status === 'closed' ? '—' : FIXTURE_AGES[j.id] ?? 'Unknown fixture age',
+  j.closed_on ?? '—',
 ];
 
 /// The shell (installSmokeMocks), the registry above, the list answered
 /// by answerList, the account autocomplete and each Job's detail read.
 /// A spec re-routes any one after this to change it.
 async function installSales(page: Page): Promise<void> {
+  await page.clock.setFixedTime(new Date('2026-10-03T12:00:00Z'));
   await installSmokeMocks(page);
   await page.route(REGISTRY, (r) => json(r, WORKFLOWS));
   await page.route(LIST, (r) => json(r, answerList(new URL(r.request().url()).searchParams)));
@@ -174,7 +186,6 @@ async function installSales(page: Page): Promise<void> {
 }
 
 /// The shell's own non-GET: App.svelte records every route open.
-const SHELL_WRITES: ReadonlySet<string> = new Set(['/api/surface-opens']);
 
 type Seen = { lists: URLSearchParams[]; registry: number; accounts: number; writes: Request[] };
 function watch(page: Page): Seen {
@@ -183,7 +194,7 @@ function watch(page: Page): Seen {
     const url = new URL(req.url());
     if (!url.pathname.startsWith('/api/')) return;
     if (req.method() !== 'GET') {
-      if (!SHELL_WRITES.has(url.pathname)) seen.writes.push(req);
+      if (isPageWrite(req.method(), url.pathname)) seen.writes.push(req);
       return;
     }
     if (url.pathname === '/api/jobs' && url.search) seen.lists.push(url.searchParams);
@@ -200,13 +211,16 @@ const root = (page: Page) => page.locator('div.catalog.theme-exec');
 const header = (page: Page) => root(page).locator('header.exec-header');
 const subtitle = (page: Page) => header(page).locator('p');
 const filters = (page: Page) => root(page).locator('.job-filters');
-const kindFilter = (page: Page) => filters(page).locator('label').first().locator('select');
+const kindFilter = (page: Page) => filters(page).locator('label.job-filter:has(> span:text-is("Kind"))').locator('select');
 const statusFilter = (page: Page) => filters(page).getByRole('combobox', { name: /^Status/ });
 const subjectFilter = (page: Page) => filters(page).getByRole('textbox', { name: 'Subject id' });
 const clear = (page: Page) => filters(page).getByRole('button', { name: /Clear/ });
 const statusButtons = (page: Page) => root(page).locator('aside.catalog-filters button');
 const rows = (page: Page) => root(page).locator('table.data-table tbody tr');
-const titles = (page: Page) => rows(page).locator('td:nth-child(3)');
+// Names come from the full header contract above, not the column's old
+// position: gate 2f5f caught Department being mistaken for Title.
+const column = (page: Page, name: string) => rows(page).locator(`td:nth-child(${HEADINGS.indexOf(name) + 1})`);
+const titles = (page: Page) => column(page, 'Title');
 const form = (page: Page) => root(page).locator('form.new-job-form');
 /// The form's first label wraps its Kind select, as the filter bar's does
 /// (kindFilter above). A label wrapping a select takes the options into
@@ -245,7 +259,7 @@ test.describe('/ux/sales — mount', () => {
     await expect(header(page).locator('h1.exec-title')).toHaveText('Sales pipeline — filtered');
     await expect(subtitle(page)).toHaveText('2 open');
 
-    await expect(filters(page).locator('label > span')).toHaveText(['Kind', 'Status', 'Subject id']);
+    await expect(filters(page).locator('label > span')).toHaveText(['Kind group', 'Kind', 'Status', 'Subject id', 'Order']);
     // GAP 3 (887c6b42): the Kind filter offers the whole registry, in
     // kind order — page-audit included, a kind Sales does not run.
     await expect(kindFilter(page).locator('option')).toHaveText([
@@ -255,6 +269,10 @@ test.describe('/ux/sales — mount', () => {
     await expect(statusFilter(page).locator('option')).toHaveText(['Open', 'Closed', 'All']);
     await expect(statusFilter(page)).toHaveValue('open');
     await expect(subjectFilter(page)).toHaveValue('');
+    await expect(filters(page).locator('label:has(> span:text-is("Kind group")) select option'))
+      .toHaveText(['All activity', 'Other activity']);
+    await expect(filters(page).locator('label:has(> span:text-is("Order")) select option'))
+      .toHaveText(['Newest first', 'Oldest first']);
     // d0b93b80: it named a brewery account id.
     await expect(subjectFilter(page)).toHaveAttribute('placeholder', 'An exact subject id');
     await expect(clear(page)).toBeVisible();
@@ -277,13 +295,16 @@ test.describe('/ux/sales — mount', () => {
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
 
     // The inventory at mount: 7 buttons (2 actions + 3 status + the
-    // removable Open chip and Clear), 2 selects, 1 input, 0 forms, 2 links per row, each row
+    // removable Open chip and Clear), 4 selects (Kind group, Kind,
+    // Status, Order), 1 input, 0 forms, 3 links per row, each row
     // itself a link.
     await expect(root(page).locator('button')).toHaveCount(7);
-    await expect(root(page).locator('select')).toHaveCount(2);
+    await expect(root(page).locator('select')).toHaveCount(4);
     await expect(root(page).locator('input')).toHaveCount(1);
     await expect(root(page).locator('form')).toHaveCount(0);
-    await expect(root(page).locator('a')).toHaveCount(4);
+    await expect(root(page).locator('a')).toHaveCount(6);
+    await expect(column(page, 'Department').getByRole('link')).toHaveText(['Sales', 'Sales']);
+    await expect(column(page, 'Department').getByRole('link').first()).toHaveAttribute('href', '/sales/jobs');
     await expect(rows(page).nth(0)).toHaveAttribute('role', 'link');
     await expect(rows(page).nth(0)).toHaveAttribute('aria-label', INQUIRY.title);
   });
@@ -341,12 +362,12 @@ test.describe('/ux/sales — links, and back', () => {
     await installSales(page);
     await mountSales(page);
 
-    const account = rows(page).nth(0).locator('td').nth(3).locator('a');
+    const account = column(page, 'Subject').nth(0).getByRole('link');
     await expect(account).toHaveText('acct-anchor');
     await expect(account).toHaveAttribute('href', `${ROUTE_CATALOG.accounts.path}/acct-anchor`);
     expect(parseRoute(`${ROUTE_CATALOG.accounts.path}/acct-anchor`)).toMatchObject({ kind: 'account', accountId: 'acct-anchor' });
 
-    const custom = rows(page).nth(1).locator('td').nth(3).locator('a');
+    const custom = column(page, 'Subject').nth(1).getByRole('link');
     await expect(custom).toHaveText('sponsor-zed');
     await expect(custom).toHaveAttribute('href', `${ROUTE_CATALOG.jobs.path}?subject_id=sponsor-zed`);
     expect(parseRoute(ROUTE_CATALOG.jobs.path, '?subject_id=sponsor-zed')).toMatchObject({ kind: 'jobs', jobSubjectId: 'sponsor-zed' });
@@ -360,6 +381,24 @@ test.describe('/ux/sales — links, and back', () => {
     await expect.poll(() => new URL(page.url()).pathname).toBe(PATH);
     await expect(page.locator('h1.exec-title')).toHaveText('Sales pipeline — filtered');
     await expect(titles(page)).toHaveText([INQUIRY.title, SPONSOR_OPEN.title]);
+  });
+
+  test('the Department link opens the actual Sales Jobs view and Back restores the locked pipeline', async ({ page }) => {
+    const seen = watch(page);
+    await installSales(page);
+    await mountSales(page);
+    await column(page, 'Department').first().getByRole('link', { name: 'Sales', exact: true }).click();
+    await expect.poll(() => new URL(page.url()).pathname).toBe('/sales/jobs');
+    await expect(page.locator('h1.exec-title')).toHaveText('Jobs');
+    await expect(page.locator('.exec-eyebrow')).toHaveText('Sales');
+    await expect(page.getByText(INQUIRY.title, { exact: true })).toBeVisible();
+    await page.goBack();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(PATH);
+    await expect(page.locator('h1.exec-title')).toHaveText('Sales pipeline — filtered');
+    await expect(titles(page)).toHaveText([INQUIRY.title, SPONSOR_OPEN.title]);
+    await expect(filters(page).locator('label > span')).toHaveText(['Kind group', 'Kind', 'Status', 'Subject id', 'Order']);
+    expect(params(seen.lists.at(-1))).toEqual({ department: DEPARTMENT, status: 'open', limit: '200' });
+    expect(seen.writes).toHaveLength(0);
   });
 });
 

@@ -57,6 +57,12 @@
 
 set -u
 
+# Keep the runner-supplied journal in this shell, including across startup
+# probes. Every collector receives its path explicitly; child commands and
+# nested fixture gates must create their own journals. The runner parent
+# retains its own environment for the final merge after this gate returns.
+export -n BOSS_GATE_RUNTIME_EVIDENCE
+
 # THE TREE CHECKED IS THE TREE THIS SCRIPT LIVES IN, so a caller standing
 # in a different git tree is refused rather than told its tree is clean
 # (backlog 67adb415). Measured 2026-09-22: `bash /work/boss/infra/gate.sh
@@ -1386,9 +1392,11 @@ scope_self_test() {
         "boss-jobs" "infra/forge/host-absent-tools.txt"
     # A build script's read is a compile input too: boss-dispatcher-
     # handlers' build.rs `.expect`s infra/estate/observe-lib.sh to exist
-    # and compiles its text in.
+    # and compiles its text in. boss-testing owes it as well since
+    # 2026-10-06: host_senders_present_the_machine_token.rs copies that
+    # file by path and runs its post (backlog 2710c8fc).
     _case "a build script's input implies its crate" \
-        "boss-dispatcher-handlers" "infra/estate/observe-lib.sh"
+        "boss-dispatcher-handlers boss-testing" "infra/estate/observe-lib.sh"
     # Two crates read this manifest — boss-cli defaults to it and asserts
     # against the real file, boss-testing's gate_runner_manifests.rs pins
     # it — and the map owes both, not whichever was noticed first.
@@ -2039,8 +2047,24 @@ web_timings_json() {
 }
 # --- web timings (end) ---
 
+runtime_evidence_sample() {
+    python3 infra/gate-runner/runtime-evidence.py sample "$BOSS_GATE_RUNTIME_EVIDENCE" "$1" \
+        || { printf 'gate-runtime-evidence: collector failed at %s\n' "$1" >&2; printf '%s\n' "$1" >> "${BOSS_GATE_RUNTIME_EVIDENCE}.failed"; }
+}
+runtime_evidence_report() {
+    python3 infra/gate-runner/runtime-evidence.py report "$BOSS_GATE_RUNTIME_EVIDENCE" \
+        || printf '%s' '{"state":"unavailable","collection_errors":["collector report failed"]}'
+}
+# The runner supplies its retained workspace path. Local preflights must not
+# create an untracked file in the very tree whose cleanliness they judge.
+BOSS_GATE_RUNTIME_EVIDENCE="${BOSS_GATE_RUNTIME_EVIDENCE:-$(mktemp -d)/runtime-evidence.jsonl}"
+export BOSS_GATE_SOURCE_HEAD="$(git rev-parse HEAD 2>/dev/null || true)"
+EVIDENCE+=("runtime observations"$'\t'"$BOSS_GATE_RUNTIME_EVIDENCE")
+runtime_evidence_sample gate-start
+
 write_receipt() {
     local verdict="$1" mode checks="" first=1 entry name result secs
+    runtime_evidence_sample "receipt:${verdict}"
     # The public half of the same verdict, on Actions only (backlog
     # 29c36336): why the gate declined, and every failure not yet named.
     if [ -n "${GATE_REFUSAL:-}" ]; then gh_annotate_refusal "$GATE_REFUSAL"; fi
@@ -2118,6 +2142,7 @@ write_receipt() {
   "ci": ${in_ci},
   "free_gb": $(gate_avail_gb),
   "web_timings": $(web_timings_json),
+  "runtime_evidence": $(runtime_evidence_report),
   "unverifiable": [${unver}],
   "schema_change": {"paths": [${schema_json}], "readers": "${GATE_SCHEMA_READERS}"},
   "evidence": $(evidence_json),
@@ -2153,6 +2178,7 @@ RECEIPT
 # on input cannot run unattended. `check_stdin_self_test` pins this.
 check() {
     local name="$1"; shift
+    runtime_evidence_sample "check-start:${name}"
     # The poll. Growth during the run is what wedges the box, so the
     # reading taken before this phase is the one that counts.
     require_headroom "to continue before '${name}'"
@@ -2199,6 +2225,7 @@ check() {
             gh_annotate_fail "$name" "${why} (exit ${CHECK_STATUS}, after ${took}s)"
         fi
     fi
+    runtime_evidence_sample "check-finish:${name}"
     [ -z "$cap" ] || rm -rf "$cap"
 }
 CHECK_STATUS=0
@@ -3153,6 +3180,11 @@ if [ "$AUTO" -eq 0 ] || [ "$(web_touched)" = "yes" ]; then
     # so the suite cannot trust node_modules to be complete and does its
     # own. Cached after the warm-up, so this is seconds, not minutes.
     check "web install" bash -c 'cd apps/web && PUPPETEER_SKIP_DOWNLOAD=1 bun install --frozen-lockfile'
+    # Resolve controls in the same toolchain/environment; runtime output remains
+    # a separate observation rather than a configured worker count posing as one.
+    (cd apps/web && bun -e 'import config from "./playwright.mocked.config.ts"; console.log(JSON.stringify({workers:config.workers,retries:config.retries}));') \
+        > "${BOSS_GATE_RUNTIME_EVIDENCE}.browser-config" 2> "${BOSS_GATE_RUNTIME_EVIDENCE}.browser-config-error" \
+        || printf '%s\n' browser-config >> "${BOSS_GATE_RUNTIME_EVIDENCE}.failed"
     # web-kit FIRST: its 7 test files existed for weeks and ran in no
     # job at all - not here, not in ci.yml. One of them could not even
     # load, because it imported a module whose top-level `$state` made
@@ -3177,6 +3209,9 @@ if [ "$AUTO" -eq 0 ] || [ "$(web_touched)" = "yes" ]; then
     # only what Playwright writes after this is this check's evidence.
     web_since="$(mktemp)" || web_since=""
     check "web-suite (unit+build+mocked)" output_to "$web_out" bash -c 'cd apps/web && bun run test:unit && bun run build && bun run test:mocked'
+    if [ -n "$web_out" ]; then cp "$web_out" "${BOSS_GATE_RUNTIME_EVIDENCE}.browser-output"; fi
+    python3 infra/gate-runner/runtime-evidence.py browser "${BOSS_GATE_RUNTIME_EVIDENCE}.browser-output" > "${BOSS_GATE_RUNTIME_EVIDENCE}.browser" \
+        || printf '%s\n' browser >> "${BOSS_GATE_RUNTIME_EVIDENCE}.failed"
     if [ "$CHECK_STATUS" -ne 0 ] && [ -n "$web_since" ]; then keep_error_context "web-suite (unit+build+mocked)" "$web_since" "$web_out"; fi
     [ -z "$web_since" ] || rm -f "$web_since"
     [ -z "$web_out" ] || rm -f "$web_out"

@@ -1,3 +1,4 @@
+import { isPageWrite } from './_smokeMocks';
 // /ux/jobs — "All jobs" (department it, catalogued under app home),
 // every control and render state pinned as the page behaves TODAY
 // (page audit 473f4f92, step `test`).
@@ -37,9 +38,9 @@
 // answer shows up here as a changed expectation rather than a silently
 // passing one:
 //   gap 6  6c9672c2  answered: active filters are visible and removable
-//   gap 10 8708447c  no column for the step a packet waits at, its
-//                    holder, or its closed date
-//   gap 11 75d1b902  no department filter, column or link
+//   gap 10 8708447c  phase1 answers lifecycle and registry group controls;
+//                    bb282d4c retains two ledger group declarations
+//   gap 11 75d1b902  answered: registry picker and packet/workflow department links
 // Answered on main before this spec, each pinned by its own spec named
 // above: gap 2 4af37dd8, gap 4 e98cabd0, gap 7 03e198e5, gap 8 45ca0f89,
 // gap 5 ce8f634a now retains a failed Owner read and offers retry;
@@ -106,13 +107,14 @@ const job = (
   priority: string, opened_on: string, extra: Record<string, unknown> = {},
 ) => ({
   id, kind, subject, title, owner_id: 'emp-001', status: 'open', priority, opened_on,
-  due_on: null, closed_on: null, metadata: {}, tags: [], ...extra,
+  due_on: null, closed_on: null, metadata: {}, tags: [], steps: [], ...extra,
 });
 
 /// Three open packets, one per Subject shape the page links differently:
 /// a custom Subject (every live packet's), an account, and an asset. The
-/// first carries an ACTIVE step with a holder, which the list fetches
-/// and never shows (gap 10).
+/// first carries an ACTIVE step with a holder, now shown for gap 10.
+/// Native listed rows always carry steps; a genuine empty array says
+/// there are none without hiding an omitted read.
 const ROWS = [
   job(J1, 'page-audit', { subject_kind: 'custom', id: '/ux/jobs' }, 'Page audit: /ux/jobs', 'standard', '2026-09-19', {
     steps: [{ id: 's1', job_id: J1, kind: 'task', title: 'test', status: 'active', assignee_id: 'agent-claude', sort_order: 3, blocked_by: [], completed_on: null, metadata: {} }],
@@ -146,7 +148,6 @@ type Seen = { list: URLSearchParams[]; registry: number; people: number; account
 
 /// The shell's own non-GET: App.svelte records every route open. It is
 /// the chrome's write, not this page's.
-const SHELL_WRITES: ReadonlySet<string> = new Set(['/api/surface-opens']);
 
 const SIGNED_IN = { username: 'ceo@demo', employee_id: 'emp-001', role: 'ceo' };
 
@@ -159,7 +160,7 @@ async function install(page: Page, b: Backend = {}): Promise<Seen> {
   page.on('request', (req) => {
     const url = new URL(req.url());
     if (!url.pathname.startsWith('/api/')) return;
-    if (req.method() !== 'GET' && !SHELL_WRITES.has(url.pathname)) seen.writes.push(req);
+    if (req.method() !== 'GET' && isPageWrite(req.method(), url.pathname)) seen.writes.push(req);
   });
   await installSmokeMocks(page);
   await page.route(/\/api\/people$/, (r) => {
@@ -179,7 +180,7 @@ async function install(page: Page, b: Backend = {}): Promise<Seen> {
     const id = decodeURIComponent(new URL(r.request().url()).pathname.split('/').pop() ?? '');
     const row = ROWS.find((j) => j.id === id)
       ?? (id === CREATED ? job(CREATED, 'page-audit', { subject_kind: 'custom', id: '/ux/vendors' }, 'Page audit — /ux/vendors', 'standard', '2026-09-25') : null);
-    return row ? json(r, { steps: [], ...row }) : json(r, 'not found', 404);
+    return row ? json(r, row) : json(r, 'not found', 404);
   });
   await page.route(/\/api\/jobs(\?|$)/, (r) => {
     if (r.request().method() === 'POST') {
@@ -241,6 +242,7 @@ async function openList(page: Page, b: Backend = {}, path = PATH): Promise<Seen>
 
 test.describe('/ux/jobs — the list', () => {
   test('renders every column and word of three open packets, from one list read and no writes', async ({ page }) => {
+    await page.clock.setFixedTime(new Date('2026-10-03T12:00:00Z'));
     const seen = await openList(page);
     await expect(bodyRows(page)).toHaveCount(3);
 
@@ -260,23 +262,25 @@ test.describe('/ux/jobs — the list', () => {
     await expect(button(page, 'Previous')).toBeDisabled();
     await expect(button(page, 'Next')).toBeEnabled();
 
-    await expect(filterBar(page).locator('label.job-filter > span')).toHaveText(['Kind', 'Status', 'Subject id']);
+    await expect(filterBar(page).locator('label.job-filter > span')).toHaveText(['Department', 'Kind group', 'Kind', 'Status', 'Subject id', 'Order']);
     // d0b93b80: it named a brewery account id.
     await expect(subjectFilter(page)).toHaveAttribute('placeholder', 'An exact subject id');
     await expect(page.locator('.catalog-filters .filter-label')).toHaveText('Status');
 
-    // Gap 10 (8708447c): seven columns. J1's active step `test` and its
-    // holder `agent-claude` arrive on the row and are shown nowhere.
-    // Gap 11 (75d1b902): no department in the columns or the filters.
+    // Gap10 lifecycle now shows the fetched live step/holder, calendar
+    // age with explicit legacy precision, and actual recorded closed date.
+    // Gap11 now exposes the department while genuinely undeclared
+    // fixture rows remain blank, after both registry reads answer.
     await expect(page.locator('table.data-table thead th')).toHaveText([
-      'ID', 'Kind', 'Title', 'Subject', 'Status', 'Priority', 'Opened',
+      'ID', 'Kind', 'Department', 'Title', 'Subject', 'Status', 'Priority', 'Opened',
+      'Current steps and holders', 'Open age', 'Closed',
     ]);
     expect(await table(page)).toEqual([
-      ['0000aa01', 'page-audit', 'Page audit: /ux/jobs', '/ux/jobs', 'open', 'standard', '2026-09-19'],
-      ['0000bb02', 'ad-hoc', 'Call the taproom', 'acc-1', 'open', 'urgent', '2026-09-23'],
-      ['0000cc03', 'backlog-item', 'Replace the chiller', 'ast-9', 'open', 'standard', '2026-09-24'],
+      ['0000aa01', 'page-audit', '', 'Page audit: /ux/jobs', '/ux/jobs', 'open', 'standard', '2026-09-19', 'test · active · agent-claude', '14 days (date only)', '—'],
+      ['0000bb02', 'ad-hoc', '', 'Call the taproom', 'acc-1', 'open', 'urgent', '2026-09-23', 'None', '10 days (date only)', '—'],
+      ['0000cc03', 'backlog-item', '', 'Replace the chiller', 'ast-9', 'open', 'standard', '2026-09-24', 'None', '9 days (date only)', '—'],
     ]);
-    await expect(list(page)).not.toContainText('agent-claude');
+    await expect(list(page)).toContainText('agent-claude');
 
     // Mounting and reading write nothing, and read the registry once
     // (for the Kind filter and the Ad Hoc button). The roster is the
@@ -410,8 +414,8 @@ test.describe('/ux/jobs — the filters', () => {
     await expect.poll(() => lastRead(seen)).toEqual({ status: 'closed', limit: '200' });
     await expect(page.locator('.filter-button-active')).toHaveText('Closed');
     await expect(statusButton(page, 'Closed')).toHaveAttribute('aria-pressed', 'true');
-    // Gap 10 (8708447c): Closed shows no closed date; the columns do not change.
-    await expect(page.locator('table.data-table thead th')).toHaveCount(7);
+    // Closed uses the same complete lifecycle columns as Open/All.
+    await expect(page.locator('table.data-table thead th')).toHaveCount(11);
     await expectHeader(page, 'Filtered jobs', `${LIVE_TOTAL} closed`);
     await expect(button(page, 'Clear ✕')).toBeVisible();
 
@@ -464,15 +468,13 @@ test.describe('/ux/jobs — the filters', () => {
     expect(seen.writes).toHaveLength(0);
   });
 
-  test('the page offers no department control (gap 11)', async ({ page }) => {
-    // Gap 11 (75d1b902): the server's `department=` join exists and the
-    // page mounts with one on /ux/service and /ux/sales — but /ux/jobs
-    // has no way to set it, and a `department` query is not read.
+  test('department is a visible general-list filter (gap 11 answered)', async ({ page }) => {
     const seen = await openList(page, {}, `${PATH}?department=finance`);
     await expect(bodyRows(page)).toHaveCount(3);
-    expect(lastRead(seen)).toEqual({ status: 'open', limit: '200' });
+    expect(lastRead(seen)).toEqual({ department: 'finance', status: 'open', limit: '200' });
     await expect(page.getByRole('link', { name: /department/i })).toHaveCount(0);
-    await expect(page.locator('.catalog').getByText(/department/i)).toHaveCount(0);
+    await expect(filter(page, 'Department').locator('select')).toHaveValue('finance');
+    await expect(page.getByRole('button', { name: 'Remove department filter', exact: true })).toBeVisible();
   });
 
   for (const [path, department] of [[ROUTE_CATALOG.service.path, 'service'], [ROUTE_CATALOG.sales.path, 'sales']] as const) {

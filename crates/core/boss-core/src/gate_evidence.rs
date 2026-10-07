@@ -80,6 +80,33 @@ use crate::machine_gate::Mode;
 use crate::port::EventRecorder;
 use crate::publisher::EventStamp;
 
+/// The policy tally producer and its health reader derive the same
+/// reasons from the same bounded input; strings are never an excuse list.
+pub const POLICY_TALLY_KEYS: usize = 1024;
+
+pub fn policy_tally_reasons(
+    mode: Mode,
+    rows: usize,
+    checks: u64,
+    overflow: u64,
+    evidence: &EvidenceHealth,
+) -> Vec<String> {
+    let mut why = Vec::new();
+    if mode == Mode::Off {
+        why.push("mode `off` records nothing, so its silence is no evidence of anything".into());
+    }
+    if rows != 0 {
+        why.push(format!(
+            "{rows} caller shape(s), {checks} check(s), that `enforce` refuses"
+        ));
+    }
+    if overflow != 0 {
+        why.push(format!("overflow {overflow}: checks past the tally's {POLICY_TALLY_KEYS} keys, which name no caller and may include any — a full tally is never clean"));
+    }
+    why.extend(evidence.not_clean());
+    why
+}
+
 /// Which refusing gate a fact is about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -723,15 +750,42 @@ async fn terminated() {
 /// The port the log half reads: the facts one gate stated.
 #[async_trait]
 pub trait GateEvidenceLog: Send + Sync {
-    /// Every fact of `gate` recorded at or after `from`, AND each
-    /// service's newest `recording_began` recorded before `from` — the
-    /// mode a service was in when the window opened. Oldest first, by
-    /// the recorded instant, then by event id (byte order), so a tie
-    /// has one answer on every adapter. A process that ended before
-    /// `from` is not read past its newest start, so when the next one
-    /// began after `from` its end is not seen and the watch starts with
-    /// the next process — shorter by one restart, never cleaner.
+    /// Every fact at or after `from`, plus each service's latest start
+    /// before `from` and the facts of that opening epoch. An old first
+    /// sighting may have an unknown final usage time inside the window;
+    /// retaining the epoch prevents a restart from erasing it. Sorted by
+    /// timestamp then immutable id. A count or byte bound refuses the
+    /// complete read rather than returning a prefix as clean evidence.
     async fn facts(&self, gate: Gate, from: DateTime<Utc>) -> Result<Vec<Event>, String>;
+}
+
+/// A read either conserves the whole bounded population or refuses.
+/// A limit is never permission to call a truncated clean subset complete.
+pub const MAX_WINDOW_FACTS: usize = 65_536;
+pub const MAX_WINDOW_FACT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Incremental complete-read accounting, shared by the log adapters.
+/// Crossing either bound refuses the entire answer, never its tail.
+#[derive(Default)]
+pub struct FactReadBound {
+    count: usize,
+    bytes: usize,
+}
+
+impl FactReadBound {
+    pub fn observe(&mut self, event: &Event) -> Result<(), String> {
+        self.count += 1;
+        let bytes = serde_json::to_vec(event)
+            .map_err(|e| format!("gate fact cannot be encoded: {e}"))?
+            .len();
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.count > MAX_WINDOW_FACTS || self.bytes > MAX_WINDOW_FACT_BYTES {
+            return Err(format!(
+                "gate evidence exceeds complete-read bounds ({MAX_WINDOW_FACTS} facts, {MAX_WINDOW_FACT_BYTES} bytes)"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The log as a list of events — the double every reader's test asks.
@@ -772,8 +826,27 @@ impl GateEvidenceLog for InMemoryGateEvidence {
                 *slot = e;
             }
         }
+        // The opening epoch's first sightings may precede the read, while
+        // their unrecorded final use overlaps it. Preserve that uncertainty.
+        out.extend(
+            self.events
+                .iter()
+                .filter(|event| {
+                    event.timestamp < from
+                        && event.kind != began
+                        && gate.fact_of(&event.kind).is_some()
+                        && before
+                            .get(&service_of(event))
+                            .is_some_and(|start| event.timestamp >= start.timestamp)
+                })
+                .cloned(),
+        );
         out.extend(before.into_values().cloned());
         out.sort_by(order);
+        let mut bound = FactReadBound::default();
+        for event in &out {
+            bound.observe(event)?;
+        }
         Ok(out)
     }
 }
@@ -957,9 +1030,65 @@ pub fn window(
     now: DateTime<Utc>,
     facts: &[Event],
 ) -> Window {
+    window_selected(gate, services, from, now, facts, |e| {
+        gate.fact_of(&e.kind).is_some_and(Fact::dirties)
+    })
+}
+
+/// The previous-slot drain shares recording coverage with enforcement,
+/// but an unrelated token miss cannot say that the previous value is used.
+pub fn previous_window(
+    services: &[&str],
+    from: DateTime<Utc>,
+    now: DateTime<Utc>,
+    facts: &[Event],
+) -> Window {
+    let gate = Gate::MachineGate;
+    window_selected(gate, services, from, now, facts, |e| {
+        match gate.fact_of(&e.kind) {
+            Some(Fact::PreviousPresented | Fact::FactsLost) => true,
+            Some(Fact::TallyOverflowed) => {
+                // A named source's known unrelated presentation cannot hide
+                // previous; malformed and global overflow remain unknown.
+                e.payload.get("scope").and_then(Value::as_str) != Some("source")
+                    || e.payload
+                        .get("source")
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+                    || serde_json::from_value::<crate::machine_gate::Presented>(
+                        e.payload.get("presented").cloned().unwrap_or(Value::Null),
+                    )
+                    .map_or(true, |p| p == crate::machine_gate::Presented::Previous)
+            }
+            _ => false,
+        }
+    })
+}
+
+/// Findings are the policy alarm's output, while lost facts still
+/// prevent it from establishing a complete watch for recovery.
+pub fn policy_watch_window(
+    services: &[&str],
+    from: DateTime<Utc>,
+    now: DateTime<Utc>,
+    facts: &[Event],
+) -> Window {
+    window_selected(Gate::PolicyCheck, services, from, now, facts, |event| {
+        Gate::PolicyCheck.fact_of(&event.kind) == Some(Fact::FactsLost)
+    })
+}
+
+fn window_selected(
+    gate: Gate,
+    services: &[&str],
+    from: DateTime<Utc>,
+    now: DateTime<Utc>,
+    facts: &[Event],
+    selected: impl Fn(&Event) -> bool,
+) -> Window {
     let dirty: Vec<Dirty> = facts
         .iter()
-        .filter(|e| e.timestamp >= from && gate.fact_of(&e.kind).is_some_and(Fact::dirties))
+        .filter(|e| e.timestamp >= from && selected(e))
         .map(|e| Dirty {
             at: e.timestamp,
             kind: e.kind.clone(),
@@ -1008,6 +1137,36 @@ mod tests {
 
     fn at(h: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 10, 1, h, 0, 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_over_bound_fact_population_is_unavailable_not_a_clean_subset() {
+        let records = (0..65_537)
+            .map(|_| Event::new("policy", "policy.check.recording_began", json!({}), at(1)))
+            .collect();
+        let read = InMemoryGateEvidence::new(records)
+            .facts(Gate::PolicyCheck, at(0))
+            .await;
+        assert!(
+            read.is_err(),
+            "an incomplete bounded population must never answer as complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_over_byte_bound_population_is_unavailable_even_with_one_record() {
+        let records = vec![Event::new(
+            "policy",
+            "policy.check.would_refuse",
+            json!({"oversized": "x".repeat(8 * 1024 * 1024)}),
+            at(1),
+        )];
+        assert!(
+            InMemoryGateEvidence::new(records)
+                .facts(Gate::PolicyCheck, at(0))
+                .await
+                .is_err()
+        );
     }
 
     fn fact(gate: Gate, fact: Fact, service: &str, when: DateTime<Utc>, fields: Value) -> Event {

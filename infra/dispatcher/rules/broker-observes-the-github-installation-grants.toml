@@ -1,0 +1,15 @@
+# Source preparation only. Publication and human scope remain separate acts.
+[[rule]]
+name = "broker-observes-the-github-installation-grants"
+why = """
+EXTERNAL GLUE: urgent99a2649d cannot identify the missing GitHub installation
+permission from a token exchange422 alone. A human-scoped native request
+authorizes a broker-owned public GET using its existing App root. This
+executor records complete public evidence and no credential lifecycle act;
+any permission change or publication retry remains separately authorized.
+"""
+on_event = "step.done.task"
+when = 'metadata.installation_diagnostic = "scope" AND subject_id = "github-app-algedonic-dev"'
+[[rule.do]]
+handler = "credential.observe.github-installation"
+args = { credential_id = "\"github-app-algedonic-dev\"", permissions = "\"contents:write,metadata:read,pull_requests:write,workflows:write\"" }

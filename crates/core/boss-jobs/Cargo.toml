@@ -61,6 +61,12 @@ async-stream = "0.3"
 # backlog 4aaff4dc); both crates are already boss-core's.
 sha2 = "0.11"
 hex = "0.4"
+# The broker-stage door (credentials/broker_stage.rs, design 6e28ed42)
+# verifies an RS256 ServiceAccount token. `rsa` is already in the lock
+# (the dispatcher handlers' App issuer); its re-exported `sha2` is the
+# digest its PKCS#1 v1.5 verifier is built against, not the 0.11 above.
+rsa = { version = "0.9", features = ["sha2"] }
+base64 = "0.22"
 anyhow = { workspace = true }
 clap = { workspace = true }
 toml = { workspace = true }
@@ -82,9 +88,16 @@ http-body-util = "0.1"
 sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"] }
 proptest = "1"
 tempfile = "3"
+# A test signing key is GENERATED per test binary, never checked in.
+rsa = { version = "0.9", features = ["sha2", "getrandom"] }
+hmac = "0.13"
 
 [lints]
 workspace = true
+
+[[test]]
+name = "a_signed_session_writes_the_signers_keys"
+required-features = ["postgres"]
 
 [[test]]
 name = "a_packet_is_created_whole_or_not_at_all_pg"
@@ -484,4 +497,20 @@ required-features = ["postgres"]
 
 [[test]]
 name = "a_workflow_version_number_is_never_reused_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "conditional_workflow_publication_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "conditional_completion_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "first_step_record"
+required-features = ["postgres"]
+
+[[test]]
+name = "workflow_publish_coverage"
 required-features = ["postgres"]

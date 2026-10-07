@@ -41,6 +41,7 @@ export const manifest = $state<{ value: ManifestState }>({
 });
 
 export async function loadManifest(): Promise<void> {
+  if (manifest.value.kind === 'error') manifest.value = { kind: 'loading' };
   try {
     const r = await fetch('/api/tenant/manifest');
     if (!r.ok) {
@@ -55,7 +56,7 @@ export async function loadManifest(): Promise<void> {
 }
 
 /// True if the tenant manifest lists `module_id = true`. The rule, and
-/// its one exception (a manifest not yet loaded), are `moduleOn`'s.
+/// its unread-state refusal, are `moduleOn`'s.
 export function moduleEnabled(module_id: string): boolean {
   return moduleOn(manifest.value, module_id);
 }

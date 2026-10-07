@@ -117,7 +117,7 @@ printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":20,"cached_inp
         jobs.add_step(&source).await.unwrap();
         jobs.create_job(&run).await.unwrap();
         jobs.add_step(&building).await.unwrap();
-        let kinds = Arc::new(InMemoryWorkflows::new());
+        let kinds = Arc::new(InMemoryWorkflows::for_fixture());
         let spec = boss_jobs::seed_loader::load_workflows(
             boss_testing::repo_root().join("infra/platform/workflows"),
         )
@@ -266,19 +266,37 @@ printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":20,"cached_inp
         }
     }
     async fn launch(&self) -> std::process::Output {
+        self.launch_with("codex").await
+    }
+    fn write_gemini(&self, script: &str) {
+        let capture = self.root.path().to_string_lossy().replace('\'', "'\\''");
+        let script = script.replace("$FIXTURE_CAPTURE", "$capture").replacen(
+            "#!/bin/sh\n",
+            &format!("#!/bin/sh\ncapture='{capture}'\n"),
+            1,
+        );
+        boss_testing::write_exec(&self.root.path().join("bin/gemini"), &script);
+    }
+    async fn launch_with(&self, harness: &str) -> std::process::Output {
         tokio::process::Command::new(env!("CARGO_BIN_EXE_boss"))
             .current_dir(self.root.path())
             .args([
                 "launch",
                 &self.run.to_string(),
                 "--harness",
-                "codex",
+                harness,
                 "--scratch",
             ])
             .arg(self.root.path().join("attempt"))
             .env("BOSS_JOBS_URL", &self.base)
             .env("BOSS_ACTOR", ACTOR)
             .env("FIXTURE_CAPTURE", self.root.path())
+            .env("GEMINI_API_KEY", "private-fixture-auth-only")
+            .env("NODE_OPTIONS", "--require=/unsupported-ambient-hook")
+            .env(
+                "GEMINI_CLI_IDE_SERVER_STDIO_COMMAND",
+                "unsupported-ambient-command",
+            )
             .env(
                 "PATH",
                 std::env::join_paths(
@@ -295,6 +313,289 @@ printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":20,"cached_inp
             .output()
             .await
             .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn gemini_without_environment_auth_does_not_open_ambient_credentials() {
+    let world = World::new().await;
+    let mut run = world.jobs.get_job(&world.run).await.unwrap().unwrap();
+    run.metadata["model"] = json!("gemini-2.5-pro");
+    world.jobs.update_job(&run).await.unwrap();
+    world.write_gemini(&format!(
+        r#"#!/bin/sh
+set -eu
+if [ "${{1:-}}" = '--version' ]; then printf '%s\n' '0.62.0'; exit 0; fi
+printf '%s\n' 'model started' > "$FIXTURE_CAPTURE/calls"
+cat > "$FIXTURE_CAPTURE/prompt"
+printf '%s\n' '{{"type":"init","session_id":"{THREAD}","model":"gemini-2.5-pro"}}'
+printf '%s\n' '{{"type":"result","status":"success","stats":{{}}}}'
+"#
+    ));
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_boss"))
+        .current_dir(world.root.path())
+        .args([
+            "launch",
+            &world.run.to_string(),
+            "--harness",
+            "gemini",
+            "--scratch",
+        ])
+        .arg(world.root.path().join("attempt"))
+        .env("BOSS_JOBS_URL", &world.base)
+        .env("BOSS_ACTOR", ACTOR)
+        .env("FIXTURE_CAPTURE", world.root.path())
+        .env_remove("GEMINI_API_KEY")
+        .env("PATH", world.root.path().join("bin"))
+        .env(
+            "BOSS_MACHINE_TOKEN_DIR",
+            world.root.path().join("empty-token"),
+        )
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "missing environment auth must not fall back to credential files"
+    );
+    assert!(!world.root.path().join("calls").exists());
+}
+
+#[tokio::test]
+async fn gemini_records_native_session_and_configured_model_without_inventing_billing() {
+    let world = World::new().await;
+    let mut run = world.jobs.get_job(&world.run).await.unwrap().unwrap();
+    run.metadata["model"] = json!("gemini-2.5-pro");
+    world.jobs.update_job(&run).await.unwrap();
+    world.write_gemini(
+        &format!(
+            r#"#!/bin/sh
+set -eu
+if [ "${{1:-}}" = '--version' ]; then printf '%s\n' '0.62.0'; exit 0; fi
+printf '%s\n' "$@" > "$FIXTURE_CAPTURE/argv"
+printf '%s\n' "$GEMINI_CLI_HOME/.gemini/settings.json" > "$FIXTURE_CAPTURE/settings-path"
+printf '%s\n' "$BOSS_ACTOR" "$BOSS_AGENT_RUN" "${{HOME:-}}" "${{NODE_OPTIONS:-}}" "${{GEMINI_CLI_IDE_SERVER_STDIO_COMMAND:-}}" > "$FIXTURE_CAPTURE/env"
+cat > "$FIXTURE_CAPTURE/prompt"
+printf '%s\n' '{{"type":"init","session_id":"{THREAD}","model":"gemini-2.5-pro"}}'
+printf '%s\n' '{{"type":"result","status":"success","stats":{{"duration_ms":5,"tool_calls":0,"total_tokens":12,"input_tokens":10,"output_tokens":2,"cached":0,"input":10,"models":{{"gemini-2.5-pro":{{"input_tokens":10,"output_tokens":2,"cached":0,"input":10,"total_tokens":12}}}}}}}}'
+"#
+        ),
+    );
+    let out = world.launch_with("gemini").await;
+    assert!(out.status.success(), "{out:?}");
+    let receipt: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(receipt["source"], "gemini.stream-json");
+    assert_eq!(receipt["runtime_id"], THREAD);
+    assert_eq!(receipt["configured_model"], "gemini-2.5-pro");
+    assert!(
+        receipt["observed_model"].is_null(),
+        "init reports configuration, not inference provenance"
+    );
+    assert_eq!(
+        receipt["native_events"][1]["stats"]["models"]["gemini-2.5-pro"]["input_tokens"],
+        10
+    );
+    assert!(receipt.get("spend_usd").is_none());
+    assert!(receipt.get("heartbeat_at").is_none());
+    let argv = std::fs::read_to_string(world.root.path().join("argv")).unwrap();
+    assert!(argv.contains("--output-format\nstream-json\n"));
+    assert!(argv.contains("--admin-policy\n"));
+    assert!(argv.contains("--extensions\nnone\n"));
+    let settings_path = std::fs::read_to_string(world.root.path().join("settings-path")).unwrap();
+    let settings: Value =
+        serde_json::from_slice(&std::fs::read(settings_path.trim()).unwrap()).unwrap();
+    assert_eq!(settings["hooksConfig"]["enabled"], false);
+    assert_eq!(settings["mcpServers"], json!({}));
+    assert_eq!(settings["skills"]["enabled"], false);
+    assert_eq!(
+        settings["security"]["auth"]["selectedType"],
+        "gemini-api-key"
+    );
+    let environment = std::fs::read_to_string(world.root.path().join("env")).unwrap();
+    let fields = environment.lines().collect::<Vec<_>>();
+    assert_eq!(fields[0], ACTOR);
+    assert_eq!(fields[1], world.run.to_string());
+    assert_eq!(fields[2], std::env::var("HOME").unwrap());
+    assert_eq!(fields[3], "", "ambient Node hooks are not inherited");
+    assert_eq!(fields[4], "", "ambient IDE executors are not inherited");
+    assert!(
+        !world.launch_with("gemini").await.status.success(),
+        "the same run is never charged twice"
+    );
+}
+
+#[tokio::test]
+async fn gemini_rechecks_registered_ownership_before_model_process_start() {
+    for mode in [
+        "drift-claim",
+        "drift-link",
+        "drift-model",
+        "drift-brief",
+        "drift-run",
+        "drift-building",
+    ] {
+        let world = World::with_admission(mode).await;
+        let mut run = world.jobs.get_job(&world.run).await.unwrap().unwrap();
+        run.metadata["model"] = json!("gemini-2.5-pro");
+        world.jobs.update_job(&run).await.unwrap();
+        world.write_gemini("#!/bin/sh\nset -eu\nif [ \"${1:-}\" = '--version' ]; then printf '%s\\n' '0.62.0'; exit 0; fi\nprintf '%s\\n' 'unexpected model start' > \"$FIXTURE_CAPTURE/calls\"\n");
+        let out = world.launch_with("gemini").await;
+        assert!(!out.status.success(), "{mode}: {out:?}");
+        assert!(
+            !world.root.path().join("calls").exists(),
+            "{mode}: no model process"
+        );
+        let receipt: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(receipt["runtime_id"].is_null());
+        assert!(
+            receipt["launcher_error"]
+                .as_str()
+                .unwrap()
+                .contains("before process start")
+        );
+    }
+}
+
+#[tokio::test]
+async fn gemini_refuses_an_unverified_cli_policy_contract_before_model_execution() {
+    let world = World::new().await;
+    let mut run = world.jobs.get_job(&world.run).await.unwrap().unwrap();
+    run.metadata["model"] = json!("gemini-2.5-pro");
+    world.jobs.update_job(&run).await.unwrap();
+    world.write_gemini(&format!(
+        r#"#!/bin/sh
+set -eu
+if [ "${{1:-}}" = '--version' ]; then printf '%s\n' '0.63.0'; exit 0; fi
+printf '%s\n' 'model started' > "$FIXTURE_CAPTURE/calls"
+cat > "$FIXTURE_CAPTURE/prompt"
+printf '%s\n' '{{"type":"init","session_id":"{THREAD}","model":"gemini-2.5-pro"}}'
+printf '%s\n' '{{"type":"result","status":"success","stats":{{}}}}'
+"#
+    ));
+    let out = world.launch_with("gemini").await;
+    assert!(
+        !out.status.success(),
+        "an unverified native policy version must refuse"
+    );
+    assert!(!world.root.path().join("calls").exists());
+    let receipt: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(receipt["runtime_id"].is_null());
+    assert!(
+        receipt["launcher_error"]
+            .as_str()
+            .unwrap()
+            .contains("version")
+    );
+}
+
+#[tokio::test]
+async fn gemini_native_warnings_and_errors_preserve_the_final_outcome() {
+    for (severity, status, expected) in [
+        ("warning", "success", "completed"),
+        ("error", "error", "failed"),
+    ] {
+        let world = World::new().await;
+        let mut run = world.jobs.get_job(&world.run).await.unwrap().unwrap();
+        run.metadata["model"] = json!("gemini-2.5-pro");
+        world.jobs.update_job(&run).await.unwrap();
+        let lines = [
+            json!({"type":"init","session_id":THREAD,"model":"gemini-2.5-pro"}),
+            json!({"type":"error","severity":severity,"message":"retained native diagnosis"}),
+            json!({"type":"result","status":status,"stats":{"duration_ms":5,"tool_calls":0,"total_tokens":0,"input_tokens":0,"output_tokens":0,"cached":0,"input":0,"models":{}}}),
+        ];
+        let output = lines
+            .iter()
+            .map(|line| {
+                format!(
+                    "printf '%s\\n' '{}'\n",
+                    line.to_string().replace('\'', "'\\''")
+                )
+            })
+            .collect::<String>();
+        world.write_gemini(&format!("#!/bin/sh\nset -eu\nif [ \"${{1:-}}\" = '--version' ]; then printf '%s\\n' '0.62.0'; exit 0; fi\ncat > \"$FIXTURE_CAPTURE/prompt\"\n{output}"));
+        let out = world.launch_with("gemini").await;
+        let receipt: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(receipt["status"], expected, "{severity}: {out:?}");
+        assert_eq!(out.status.success(), expected == "completed");
+        assert_eq!(
+            receipt["native_events"][1]["message"],
+            "retained native diagnosis"
+        );
+    }
+}
+
+#[tokio::test]
+async fn incomplete_or_contradictory_gemini_controls_cannot_attest_success() {
+    let init = json!({"type":"init","session_id":THREAD,"model":"gemini-2.5-pro"}).to_string();
+    let result = json!({"type":"result","status":"success","stats":{"duration_ms":1,"tool_calls":0,"total_tokens":0,"input_tokens":0,"output_tokens":0,"cached":0,"input":0,"models":{}}}).to_string();
+    for (name, lines) in [
+        (
+            "absent native statistics",
+            vec![
+                init.clone(),
+                json!({"type":"result","status":"success","stats":{}}).to_string(),
+            ],
+        ),
+        ("result before init", vec![result.clone(), init.clone()]),
+        (
+            "duplicate init",
+            vec![init.clone(), init.clone(), result.clone()],
+        ),
+        (
+            "duplicate result",
+            vec![init.clone(), result.clone(), result.clone()],
+        ),
+        (
+            "untyped error",
+            vec![
+                init.clone(),
+                json!({"type":"error","message":"unknown severity"}).to_string(),
+                result.clone(),
+            ],
+        ),
+        (
+            "error then success",
+            vec![
+                init.clone(),
+                json!({"type":"error","severity":"error","message":"failed native inference"})
+                    .to_string(),
+                result.clone(),
+            ],
+        ),
+        (
+            "invalid identity",
+            vec![
+                json!({"type":"init","session_id":"not-a-uuid","model":"gemini-2.5-pro"})
+                    .to_string(),
+                result.clone(),
+            ],
+        ),
+        (
+            "missing model",
+            vec![
+                json!({"type":"init","session_id":THREAD}).to_string(),
+                result.clone(),
+            ],
+        ),
+        ("malformed stream", vec!["not JSON".into()]),
+        ("silent stream", vec![]),
+    ] {
+        let world = World::new().await;
+        let mut run = world.jobs.get_job(&world.run).await.unwrap().unwrap();
+        run.metadata["model"] = json!("gemini-2.5-pro");
+        world.jobs.update_job(&run).await.unwrap();
+        let output = lines
+            .iter()
+            .map(|line| format!("printf '%s\\n' '{}'\n", line.replace('\'', "'\\''")))
+            .collect::<String>();
+        world.write_gemini(&format!("#!/bin/sh\nset -eu\nif [ \"${{1:-}}\" = '--version' ]; then printf '%s\\n' '0.62.0'; exit 0; fi\ncat > \"$FIXTURE_CAPTURE/prompt\"\n{output}"));
+        let out = world.launch_with("gemini").await;
+        assert!(!out.status.success(), "{name}: {out:?}");
+        let receipt: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_ne!(receipt["status"], "completed", "{name}");
+        assert!(receipt["observed_model"].is_null());
+        assert!(world.root.path().join("attempt/native.jsonl").is_file());
     }
 }
 

@@ -215,11 +215,20 @@ mod tests {
 #[derive(Clone)]
 pub struct RiskScoresState {
     pub pool: Arc<PgPool>,
+    pub role_guards: Option<Arc<boss_policy_client::role_guard::RoleGuardReporter>>,
 }
 
 pub fn risk_scores_router(pool: PgPool) -> Router {
+    risk_scores_router_with_reports(pool, None)
+}
+
+pub fn risk_scores_router_with_reports(
+    pool: PgPool,
+    role_guards: Option<Arc<boss_policy_client::role_guard::RoleGuardReporter>>,
+) -> Router {
     let state = RiskScoresState {
         pool: Arc::new(pool),
+        role_guards,
     };
     Router::new()
         .route("/api/people/accounts/risk-scores", get(list_risk_scores))
@@ -310,7 +319,17 @@ async fn list_risk_scores(
     // match those filters." — a denial read as nothing at risk, the
     // false-empty class (backlog 3f0cdca8; page audit 08b0c4f8 GAP 5,
     // 2026-09-23). A refusal the page can name is the clean degrade.
-    if !is_trusted_or_broad(&user) {
+    let original = is_trusted_or_broad(&user);
+    let allowed = state.role_guards.as_ref().map_or(original, |reporter| {
+        reporter.observe_captured(
+            "account-risk-scores",
+            "admission",
+            &user,
+            original,
+            |candidate| Some(is_trusted_or_broad(candidate)),
+        )
+    });
+    if !allowed {
         return (
             StatusCode::FORBIDDEN,
             "account risk scores are shown only to roles with broad account access",

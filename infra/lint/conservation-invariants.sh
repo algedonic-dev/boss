@@ -205,11 +205,22 @@ LEDGER_BASE="${LEDGER_BASE:-http://127.0.0.1:7080}"
 # a real invariant into a permanently-erroring check — a sweep that
 # always errors is a sweep nobody reads.
 LEDGER_READER='{"id":"automation:conservation-sweep","role":"audit-readonly","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
-bs_response=$(curl -sS --fail -H "x-boss-user: $LEDGER_READER" "$LEDGER_BASE/api/ledger/balance-sheet" 2>&1) || {
-    echo "[ERROR] S. Balance-sheet endpoint — fetch failed:"
-    echo "$bs_response" | sed 's/^/    /'
+# The mounted token is read for this request, scoped to the ledger host
+# and handed to curl in a private file (2710c8fc). The first helper call
+# belongs in this shell so its EXIT cleanup survives command substitution.
+# shellcheck source=infra/lib/secret-header.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../lib/secret-header.sh" || exit 3
+bs_response=''
+if machine_token_header LEDGER_MACHINE_HEADER "$LEDGER_BASE"; then
+    bs_response=$(curl -sS --fail ${LEDGER_MACHINE_HEADER:+-H "$LEDGER_MACHINE_HEADER"} -H "x-boss-user: $LEDGER_READER" "$LEDGER_BASE/api/ledger/balance-sheet" 2>&1) || {
+        echo "[ERROR] S. Balance-sheet endpoint — fetch failed:"
+        echo "$bs_response" | sed 's/^/    /'
+        violations=$((violations + 1))
+    }
+else
+    echo "[ERROR] S. Balance-sheet endpoint — machine header preparation failed; nothing sent"
     violations=$((violations + 1))
-}
+fi
 if [[ -n "$bs_response" ]]; then
     imbalance=$(echo "$bs_response" | jq -r '
         (.total_assets_cents // 0)

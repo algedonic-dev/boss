@@ -1,3 +1,4 @@
+import { isPageWrite, pageWrites } from './_smokeMocks';
 // Page audit 7cdb095b, whole-control completion after eac5d4c8's
 // honest-read car. The three existing marketing specs retain the
 // classes/people/history/truncation refusal pins; this one adds the
@@ -53,7 +54,7 @@ async function install(page: Page): Promise<Seen> {
   const seen: Seen = { reads: [], writes: [] };
   page.on('request', (r) => {
     const path = new URL(r.url()).pathname;
-    if (path.startsWith('/api/') && r.method() !== 'GET' && path !== '/api/surface-opens') {
+    if (isPageWrite(r.method(), path)) {
       seen.writes.push(`${r.method()} ${path}`);
     }
   });
@@ -302,7 +303,7 @@ test('the detail inventory names every link, follows its catalogued destination,
     subject: { subject_kind: 'campaign', id: 'campaign-a' },
     title: 'Prepare linked campaign artwork', owner_id: 'emp-a',
     status: 'open', priority: 'standard', opened_on: '2026-09-02',
-    due_on: null, closed_on: null, metadata: {}, tags: [],
+    due_on: null, closed_on: null, metadata: {}, tags: [], steps: [],
   };
   const campaignQueries: URLSearchParams[] = [];
   await page.route(/\/api\/jobs\?/, (r) => {
@@ -405,7 +406,7 @@ test('the detail inventory names every link, follows its catalogued destination,
         .toEqual([{ status: 'open', subject_id: campaignJob.subject.id, limit: '200' }]);
       const campaignRow = root(page).locator('tbody tr').filter({ hasText: campaignJob.title });
       await expect(campaignRow).toHaveCount(1);
-      await expect(campaignRow.locator('td').nth(2)).toHaveText(campaignJob.title);
+      await expect(campaignRow.getByRole('cell', { name: campaignJob.title, exact: true })).toHaveText(campaignJob.title);
       await expect(campaignRow.locator('td').first().getByRole('link'))
         .toHaveAttribute('href', `${ROUTE_CATALOG.jobs.path}/${campaignJob.id}`);
     }
@@ -421,8 +422,7 @@ test('the detail inventory names every link, follows its catalogued destination,
   await page.goBack();
   await expect(detail(page).locator('h1')).toHaveText(current.title);
   expect(seen.writes).toEqual([]);
-  expect((await openedRequests(page)).filter((r) => r.method !== 'GET' &&
-    !(r.method === 'POST' && r.path === '/api/surface-opens'))).toEqual([]);
+  expect(pageWrites(await openedRequests(page))).toEqual([]);
 });
 
 test('an original asset states genuine empty profile fields, unsafe file text and no curation controls', async ({ page }) => {

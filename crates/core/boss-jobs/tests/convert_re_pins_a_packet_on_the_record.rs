@@ -117,7 +117,7 @@ struct App {
 }
 
 fn app() -> App {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     for spec in seedable_platform_workflows() {
         kinds.seed(spec).expect("seed platform kind");
     }
@@ -852,20 +852,39 @@ async fn a_packet_that_closed_after_the_move_was_judged_is_not_written() {
     assert!(repinned_events(&app.jobs).is_empty());
 }
 
-/// THE CONTROL: triage routed `build`, so `build` is READY under v2's
-/// predicate. The predicate that opened it is the old one, and nothing
-/// proves v14's agrees — the refusal the packet asked to keep. Nothing
-/// is written.
+/// THE CONTROL: an additional AND requirement tightens a READY step.
+/// Nothing is written merely because another edit was a safe OR widening.
 #[tokio::test]
 async fn a_backlog_item_whose_build_is_ready_is_still_refused() {
     let app = app();
     let id = backlog_item_routed(&app, "build").await;
+    app.kinds
+        .retire(BACKLOG, &admin_actor(), chrono::Utc::now())
+        .await
+        .expect("retire v14");
+    let mut stricter = backlog_v14();
+    stricter.version = 15;
+    stricter
+        .steps
+        .iter_mut()
+        .find(|s| s.title == "build")
+        .expect("build")
+        .ready_when = format!(
+        "({}) AND steps.measure.done",
+        backlog_v2()
+            .steps
+            .iter()
+            .find(|s| s.title == "build")
+            .expect("old build")
+            .ready_when
+    );
+    app.kinds.seed(stricter).expect("seed tightening");
     assert_eq!(
         status_of(&get_job(&app.router, &id).await, "build"),
         "ready"
     );
 
-    let (status, body) = convert(&app.router, &id, 14).await;
+    let (status, body) = convert(&app.router, &id, 15).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     let obstacles = body["obstacles"].as_array().expect("obstacles");
     assert!(
@@ -883,4 +902,86 @@ async fn a_backlog_item_whose_build_is_ready_is_still_refused() {
     assert_eq!(after["workflow_version"], 2, "the pin stays");
     assert!(after["metadata"].get("repins").is_none(), "{after}");
     assert!(repinned_events(&app.jobs).is_empty());
+}
+
+#[tokio::test]
+async fn an_active_design_branch_converts_when_its_exact_predicate_is_preserved() {
+    let app = app();
+    let id = backlog_item_routed(&app, "design").await;
+    let ready = get_job(&app.router, &id).await;
+    assert_eq!(status_of(&ready, "draft-design"), "ready");
+    let step_id = step_named(&ready, "draft-design")["id"]
+        .as_str()
+        .expect("step id");
+    let (status, body) = send(
+        &app.router,
+        req(
+            "POST",
+            &format!("/api/jobs/{id}/steps/{step_id}/claim"),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "claim design: {status}: {body}");
+    let before = get_job(&app.router, &id).await;
+    assert_eq!(status_of(&before, "draft-design"), "active");
+
+    let (status, preview) = send(
+        &app.router,
+        req(
+            "GET",
+            &format!("/api/jobs/{id}/convert?to=14"),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert_eq!(
+        preview["convertible"], true,
+        "exact old design branch remains: {preview}"
+    );
+    assert_eq!(
+        get_job(&app.router, &id).await,
+        before,
+        "preview writes nothing"
+    );
+    assert!(repinned_events(&app.jobs).is_empty());
+
+    let (status, body) = convert_as(&app.router, ENGINEER, &id, 14).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        get_job(&app.router, &id).await,
+        before,
+        "job-update authority is insufficient"
+    );
+    assert!(repinned_events(&app.jobs).is_empty());
+
+    let (status, body) = convert(&app.router, &id, 14).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let after = get_job(&app.router, &id).await;
+    assert_eq!(after["workflow_version"], 14);
+    let draft_before = step_named(&before, "draft-design");
+    let draft_after = step_named(&after, "draft-design");
+    for key in ["id", "status", "assignee_id", "metadata"] {
+        assert_eq!(
+            draft_after[key], draft_before[key],
+            "active design {key} preserved"
+        );
+    }
+    assert_eq!(
+        step_named(&after, "triage"),
+        step_named(&before, "triage"),
+        "completed evidence preserved"
+    );
+    assert_eq!(
+        after["metadata"]["repins"]
+            .as_array()
+            .expect("repin record")
+            .len(),
+        1
+    );
+    let events = repinned_events(&app.jobs);
+    assert_eq!(events.len(), 1, "exactly one native repin event");
+    assert_eq!(events[0]["from"], 2);
+    assert_eq!(events[0]["to"], 14);
 }

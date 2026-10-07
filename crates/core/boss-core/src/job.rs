@@ -556,6 +556,19 @@ pub fn apply_voids(stamps: &mut [SignOffStamp], from: &[SignOffStamp]) {
 /// does, on an approve step, but its approvals expire in ten minutes.
 pub fn step_shape_hash(title: &str, metadata: &serde_json::Value) -> String {
     use sha2::{Digest, Sha256};
+    let mut buf = Vec::new();
+    buf.extend_from_slice(title.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(&canonical_json_bytes(metadata));
+    let mut h = Sha256::new();
+    h.update(&buf);
+    hex::encode(h.finalize())
+}
+
+/// The existing step-shape encoding, shared with immutable record equality.
+/// This is an unambiguous encoding rather than a JSON document: delimiters
+/// deliberately retain their historical form so existing shape hashes stay fixed.
+pub fn canonical_json_bytes(value: &serde_json::Value) -> Vec<u8> {
     fn canonical(v: &serde_json::Value, out: &mut Vec<u8>) {
         match v {
             serde_json::Value::Object(m) => {
@@ -583,12 +596,8 @@ pub fn step_shape_hash(title: &str, metadata: &serde_json::Value) -> String {
         }
     }
     let mut buf = Vec::new();
-    buf.extend_from_slice(title.as_bytes());
-    buf.push(0);
-    canonical(metadata, &mut buf);
-    let mut h = Sha256::new();
-    h.update(&buf);
-    hex::encode(h.finalize())
+    canonical(value, &mut buf);
+    buf
 }
 
 /// The key a SLIM listed step carries (`"slim": true`), and the reason

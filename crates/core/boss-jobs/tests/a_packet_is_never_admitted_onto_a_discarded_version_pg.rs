@@ -22,9 +22,10 @@
 //! discard's verdict when it is let through.
 //!
 //! Both interleavings run the REAL adapter code on both sides. Each
-//! writer is held at a point of the test's choosing by a third
-//! transaction that owns a row the writer must insert — an uncommitted
-//! insert of the same key makes the writer wait on it — and the second
+//! writer is held after its workflow row lock: the discard's committed
+//! insert trigger waits on an advisory lock, and the admission waits
+//! on an uncommitted subject insert. The discard's pause must own no
+//! data-table lock that blocks its preceding publication fence. The second
 //! writer is observed WAITING on the first before the hold is released,
 //! so the interleaving is the one the review walked, every run. The
 //! in-memory adapter's sequential answer is the adapters-agree case
@@ -122,6 +123,37 @@ async fn packets_on(pool: &sqlx::PgPool, version: i32) -> i64 {
         .expect("count pinned packets")
 }
 
+/// Observe the specific blocked backend and its blocker, not an anonymous
+/// count that could describe a different phase of the transaction.
+async fn until_blocked_by<T>(
+    pool: &sqlx::PgPool,
+    blocker: i32,
+    query_fragment: &str,
+    racer: &tokio::task::JoinHandle<T>,
+) -> i32 {
+    for _ in 0..500 {
+        let pid: Option<i32> = sqlx::query_scalar(
+            "SELECT pid FROM pg_stat_activity WHERE datname = current_database()
+             AND $1 = ANY(pg_blocking_pids(pid)) AND position($2 in query) > 0",
+        )
+        .bind(blocker)
+        .bind(query_fragment)
+        .fetch_optional(pool)
+        .await
+        .expect("read exact blocking edge");
+        if let Some(pid) = pid {
+            println!("backend {pid} executing {query_fragment:?} blocked by {blocker}");
+            return pid;
+        }
+        assert!(
+            !racer.is_finished(),
+            "racer finished before its required blocking edge"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("no backend executing {query_fragment:?} blocked by {blocker}");
+}
+
 /// THE DISCARD FIRST. It has locked the draft, counted no packet,
 /// deleted the row, and is held before its commit (on the spent-number
 /// insert). An admission onto that version starts now: it must wait for
@@ -131,35 +163,62 @@ async fn packets_on(pool: &sqlx::PgPool, version: i32) -> i64 {
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_an_admission_behind_a_discard_is_refused_and_writes_nothing() {
     let db = TestDb::new().await;
-    let registry = PgWorkflows::new(db.pool.clone());
+    let registry = PgWorkflows::for_fixture(db.pool.clone());
     let now = chrono::Utc::now();
     let d = registry
         .create_draft(spec(), &author(), now)
         .await
         .expect("draft");
 
-    // Hold the discard before its commit: an uncommitted row with the
-    // key its spent-number insert writes makes that insert wait.
-    let mut hold = db.pool.begin().await.expect("hold tx");
-    sqlx::query(
-        "INSERT INTO workflow_discarded_versions (kind, version, discarded_at, discarded_by)
-         VALUES ($1, $2, $3, 'test-hold')",
+    // A committed BEFORE INSERT trigger pauses the real discard AFTER
+    // its table fence, draft row lock, pin count and DELETE. The holder
+    // owns only an advisory lock: a pre-held spent-table INSERT would
+    // block the new table fence before the discard acquires its row.
+    sqlx::raw_sql(
+        "CREATE FUNCTION pause_discard_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN PERFORM pg_advisory_xact_lock(7391, 1); RETURN NEW; END $$;
+         CREATE TRIGGER pause_discard_insert BEFORE INSERT ON workflow_discarded_versions
+         FOR EACH ROW EXECUTE FUNCTION pause_discard_insert();",
     )
-    .bind(KIND)
-    .bind(d.version)
-    .bind(now)
-    .execute(&mut *hold)
+    .execute(&db.pool)
     .await
-    .expect("hold the spent number");
+    .expect("commit the post-row discard pause");
+    let mut hold = db.pool.begin().await.expect("hold tx");
+    let holder: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *hold)
+        .await
+        .expect("holder backend");
+    sqlx::query("SELECT pg_advisory_xact_lock(7391, 1)")
+        .execute(&mut *hold)
+        .await
+        .expect("hold the advisory pause");
 
-    let discarding = PgWorkflows::new(db.pool.clone());
+    let discarding = PgWorkflows::for_fixture(db.pool.clone());
     let version = d.version;
     let discard = tokio::spawn(async move {
         discarding
             .discard_draft(KIND, version, &author(), now)
             .await
     });
-    until_waiting(&db.pool, 1, &discard).await;
+    let discard_pid = until_blocked_by(
+        &db.pool,
+        holder,
+        "INSERT INTO workflow_discarded_versions",
+        &discard,
+    )
+    .await;
+    let advisory_wait: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory'
+         AND classid=7391 AND objid=1 AND objsubid=2 AND NOT granted)",
+    )
+    .bind(discard_pid)
+    .fetch_one(&db.pool)
+    .await
+    .expect("exact advisory lock tag");
+    assert!(
+        advisory_wait,
+        "discard is paused at the committed insert trigger"
+    );
     assert!(
         !discard.is_finished(),
         "case error: the discard must be held before its commit"
@@ -170,7 +229,7 @@ async fn pg_an_admission_behind_a_discard_is_refused_and_writes_nothing() {
     let job = packet(d.version, "race-behind-a-discard");
     let admitted = job.clone();
     let admission = tokio::spawn(async move { admitting.create_job(&admitted).await });
-    until_waiting(&db.pool, 2, &admission).await;
+    until_blocked_by(&db.pool, discard_pid, "FOR KEY SHARE", &admission).await;
 
     hold.rollback().await.expect("release the discard");
     discard
@@ -197,6 +256,15 @@ async fn pg_an_admission_behind_a_discard_is_refused_and_writes_nothing() {
         .await
         .expect("count subjects");
     assert_eq!(minted, 0, "a refused admission mints no subject either");
+    let created: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM event_outbox WHERE kind = 'jobs.job.created'")
+            .fetch_one(&db.pool)
+            .await
+            .expect("count admitted job facts");
+    assert_eq!(
+        created, 0,
+        "a refused admission records no job-created fact"
+    );
 }
 
 /// THE ADMISSION FIRST. It has locked the row it pins to and is held
@@ -208,7 +276,7 @@ async fn pg_an_admission_behind_a_discard_is_refused_and_writes_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_a_discard_behind_an_admission_counts_it_and_refuses() {
     let db = TestDb::new().await;
-    let registry = PgWorkflows::new(db.pool.clone());
+    let registry = PgWorkflows::for_fixture(db.pool.clone());
     let now = chrono::Utc::now();
     let d = registry
         .create_draft(spec(), &author(), now)
@@ -236,7 +304,7 @@ async fn pg_a_discard_behind_an_admission_counts_it_and_refuses() {
     );
 
     // The discard races it.
-    let discarding = PgWorkflows::new(db.pool.clone());
+    let discarding = PgWorkflows::for_fixture(db.pool.clone());
     let version = d.version;
     let discard = tokio::spawn(async move {
         discarding
@@ -274,7 +342,7 @@ async fn pg_a_discard_behind_an_admission_counts_it_and_refuses() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_only_a_discarded_number_refuses_admission() {
     let db = TestDb::new().await;
-    let registry = PgWorkflows::new(db.pool.clone());
+    let registry = PgWorkflows::for_fixture(db.pool.clone());
     let repo = PgJobs::new(db.pool.clone());
     let now = chrono::Utc::now();
 

@@ -1,0 +1,20 @@
+# A printed prompt is not a worker receipt (da708aaf). The expectation
+# and its bound ride the run's admitted building-step metadata, so legacy
+# runs and engines with no declaration are never retroactively judged.
+# Records an overdue receipt; never kills, marks died or reassigns work.
+[[rule]]
+name = "a-declared-worker-receipt-is-observed-every-five-minutes"
+why = """
+A TIMER over an absence: no event says that a worker receipt never arrived.
+Four unpicked prompts on a live host waited 204 minutes before discovery.
+Observe only the explicit obligation in the admitted protocol, file one
+native alarm per run, and retain recovery when the receipt later arrives.
+A healthy tick files nothing; an already recorded alarm prevents a second filing.
+The alarm is keyed by rule and run, so counting a periodic backlog-item kind
+cannot measure this observer cadence. The firing record retains its execution.
+The existing four-hour running-work silence bound is unchanged.
+"""
+schedule = { cadence = "every-5-minutes", anchor_date = "2026-10-03" }
+[[rule.do]]
+handler = "jobs.receipt_overdue"
+args = { kind = '"agent-run"', step = '"building"', dispatched_step = '"briefed"', expectation_key = '"worker_start_expectation"', receipt_key = '"worker_started"' }

@@ -224,9 +224,10 @@ fn uuid_segment(value: &str, what: &str) -> Result<Uuid, ErrResp> {
 
 /// `DELETE /api/auth/passkey/credentials/{credential_id}` — remove one
 /// of the session's own passkeys. The rule lives in boss-people (the
-/// last one stays, 409 in the user's terms); this proxies for the
-/// session's employee and passes that refusal through verbatim, so the
-/// panel can show the reason rather than "failed".
+/// last one stays, 409 in the user's terms; a removal its coverage guard
+/// cannot judge, 503 with the reason); this proxies for the session's
+/// employee and passes those refusals through verbatim, so the panel
+/// can show the reason rather than "failed".
 pub async fn credentials_remove(
     State(state): State<Arc<PasskeyState>>,
     headers: HeaderMap,
@@ -263,7 +264,13 @@ pub async fn credentials_remove(
     let reason = format!("credential removal: {}", resp.status());
     match status {
         StatusCode::NO_CONTENT => StatusCode::NO_CONTENT.into_response(),
-        StatusCode::CONFLICT | StatusCode::NOT_FOUND => {
+        // 503 is People's coverage guard saying it could not judge the
+        // removal (G2 of design b08725c2): its text is the guard's own
+        // fixed reason — which source, which status — and passes through
+        // like the 409, so the person removing a key reads why instead of
+        // "failed" (review c3b96c09 F2, 2026-10-06). Every other status
+        // keeps the fixed text below, never an upstream body.
+        StatusCode::CONFLICT | StatusCode::NOT_FOUND | StatusCode::SERVICE_UNAVAILABLE => {
             refused(&reason, (status, resp.text().await.unwrap_or_default()))
         }
         _ => refused(

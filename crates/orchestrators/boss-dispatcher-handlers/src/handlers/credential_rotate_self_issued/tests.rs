@@ -34,9 +34,30 @@ struct FakeSecrets {
     /// The next write to this namespace's Secret fails once: a firing
     /// that stops part way through staging (review fd151a97, D4).
     fail_once_in: Mutex<Option<String>>,
+    /// (reads of the PRIMARY still to serve, what then lands): once that
+    /// many have been served, the next store call of any kind is preceded
+    /// by it — a write placed exactly between two of a firing's own reads
+    /// and writes (review 34313729, P6).
+    after_primary_reads: Mutex<Option<(usize, OnMisses)>>,
 }
 
 impl FakeSecrets {
+    fn store_call(&self, reading: Option<&str>) {
+        let lands = {
+            let mut armed = self.after_primary_reads.lock().unwrap();
+            match armed.as_mut() {
+                Some((0, _)) => armed.take().map(|(_, lands)| lands),
+                Some((left, _)) if reading == Some(PRIMARY) => {
+                    *left -= 1;
+                    None
+                }
+                _ => None,
+            }
+        };
+        if let Some(lands) = lands {
+            lands();
+        }
+    }
     fn bump(&self, ns: &str, name: &str) {
         *self
             .versions
@@ -109,6 +130,7 @@ impl SecretStore for FakeSecrets {
         Ok(())
     }
     async fn read_secret(&self, ns: &str, name: &str) -> Result<Option<SecretData>, String> {
+        self.store_call(Some(ns));
         let prefix = format!("{ns}/{name}/");
         let data = self
             .map
@@ -118,6 +140,7 @@ impl SecretStore for FakeSecrets {
             .filter_map(|(k, v)| Some((k.strip_prefix(&prefix)?.to_string(), v.clone())))
             .collect();
         Ok(Some(SecretData {
+            uid: "self-issued-fixture".into(),
             version: self.version(ns, name),
             data,
         }))
@@ -129,6 +152,7 @@ impl SecretStore for FakeSecrets {
         entries: &[(&str, &str)],
         version: &str,
     ) -> Result<WriteAt, String> {
+        self.store_call(None);
         if let Some(theirs) = self.races_with.lock().unwrap().take() {
             // The other firing's own conditional write lands first.
             for n in [PRIMARY, MIRROR] {
@@ -159,6 +183,8 @@ struct FakeGate {
     slots: [Option<String>; 3],
     extra_rows: Vec<MissRow>,
     overflow: u64,
+    facts: Vec<boss_core::event::Event>,
+    rx: tokio::sync::mpsc::Receiver<boss_core::event::Event>,
 }
 
 impl FakeGate {
@@ -166,6 +192,36 @@ impl FakeGate {
         let [c, n, p] = self.slots.clone();
         self.real
             .observe(Reading::new(self.mode, Slots::new(c, n, p)));
+    }
+
+    fn collect(&mut self) {
+        while let Ok(event) = self.rx.try_recv() {
+            self.facts.push(event);
+        }
+    }
+
+    fn restart(&mut self, since: DateTime<Utc>, clean_end: bool) {
+        use boss_core::gate_evidence::{Evidence, Fact, Gate};
+        self.collect();
+        let old = self.real.misses();
+        if clean_end {
+            self.facts.push(boss_core::event::Event::new(old.service.clone(), Gate::MachineGate.kind(Fact::RecordingEnded), json!({"service":old.service,"instance":old.evidence.instance,"clean":true,"lost":0,"unstated":0}), since - chrono::Duration::minutes(1)));
+        }
+        let (evidence, mut rx) = Evidence::channel(Gate::MachineGate, &old.service);
+        let [current, next, previous] = self.slots.clone();
+        self.real = Arc::new(
+            MachineGate::starting_at(
+                &old.service,
+                &[],
+                Reading::new(self.mode, Slots::new(current, next, previous)),
+                since,
+            )
+            .with_evidence(evidence),
+        );
+        let mut began = rx.try_recv().unwrap();
+        began.timestamp = since; // Explicit synthetic historical process start.
+        self.facts.push(began);
+        self.rx = rx;
     }
 }
 
@@ -176,6 +232,8 @@ type OnMisses = Box<dyn FnOnce() + Send>;
 struct FakeGates {
     gates: Mutex<BTreeMap<String, FakeGate>>,
     on_misses: Mutex<Option<OnMisses>>,
+    on_accepts: Mutex<Option<OnMisses>>,
+    window_change: Mutex<Option<fn(&mut boss_core::gate_window::JoinedWindow)>>,
 }
 
 impl FakeGates {
@@ -186,18 +244,27 @@ impl FakeGates {
 
     fn in_mode(mode: Mode, served: &[&str], not_served: &[&str]) -> Arc<Self> {
         let since = Utc::now() - chrono::Duration::days(3);
-        let gate = |name: &str, served: bool| FakeGate {
-            real: Arc::new(MachineGate::starting_at(
+        let gate = |name: &str, served: bool| {
+            let (evidence, mut rx) = boss_core::gate_evidence::Evidence::channel(
+                boss_core::gate_evidence::Gate::MachineGate,
                 name,
-                &[],
-                Reading::new(mode, Slots::default()),
-                since,
-            )),
-            served,
-            mode,
-            slots: [None, None, None],
-            extra_rows: Vec::new(),
-            overflow: 0,
+            );
+            let real = Arc::new(
+                MachineGate::starting_at(name, &[], Reading::new(mode, Slots::default()), since)
+                    .with_evidence(evidence),
+            );
+            let mut began = rx.try_recv().unwrap();
+            began.timestamp = since; // The fixture declares a historical first statement.
+            FakeGate {
+                real,
+                served,
+                mode,
+                slots: [None, None, None],
+                extra_rows: Vec::new(),
+                overflow: 0,
+                facts: vec![began],
+                rx,
+            }
         };
         Arc::new(Self {
             gates: Mutex::new(
@@ -208,6 +275,8 @@ impl FakeGates {
                     .collect(),
             ),
             on_misses: Mutex::new(None),
+            on_accepts: Mutex::new(None),
+            window_change: Mutex::new(None),
         })
     }
 
@@ -235,14 +304,66 @@ impl FakeGates {
         f(gate);
         gate.reread();
     }
+
+    async fn window_snapshot(
+        &self,
+        presented: &str,
+        minutes: chrono::Duration,
+    ) -> boss_core::gate_window::JoinedWindow {
+        let roster = self.roster();
+        let mut reads = Vec::new();
+        for service in &roster {
+            let answer = match self.misses(service, presented).await {
+                GateRead::Answered(misses) => Ok(serde_json::to_value(misses).unwrap()),
+                GateRead::NotServed => Err("connection refused".into()),
+                GateRead::Failed(error) | GateRead::Unasked(error) => Err(error),
+            };
+            reads.push(boss_core::gate_window::LiveRead {
+                service: service.clone(),
+                answer,
+            });
+        }
+        let mut facts = Vec::new();
+        for gate in self.gates.lock().unwrap().values_mut() {
+            gate.collect();
+            facts.extend(gate.facts.iter().cloned());
+        }
+        facts.sort_by_key(|event| (event.timestamp, event.id));
+        let now = Utc::now();
+        boss_core::gate_window::join_window(
+            boss_core::gate_evidence::Gate::MachineGate,
+            &roster,
+            now - minutes,
+            now,
+            Ok(facts),
+            reads,
+        )
+    }
 }
 
 #[async_trait]
 impl GateReader for FakeGates {
+    async fn window(
+        &self,
+        presented: &str,
+        hours: i64,
+    ) -> Result<boss_core::gate_window::JoinedWindow, String> {
+        let mut snapshot = self
+            .window_snapshot(presented, chrono::Duration::hours(hours))
+            .await;
+        if let Some(change) = self.window_change.lock().unwrap().take() {
+            change(&mut snapshot);
+        }
+        Ok(snapshot)
+    }
     fn roster(&self) -> Vec<String> {
         self.gates.lock().unwrap().keys().cloned().collect()
     }
     async fn accepts(&self, service: &str, presented: &str) -> GateRead<Accepts> {
+        let hook = self.on_accepts.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
         let gates = self.gates.lock().unwrap();
         let gate = &gates[service];
         if !gate.served {
@@ -610,6 +731,324 @@ fn handler(j: &Jobs, s: &Arc<FakeSecrets>, g: &Arc<FakeGates>) -> Arc<Credential
 
 async fn fire(h: &CredentialRotateSelfIssued, ctx: &InvocationContext, a: &[(String, Value)]) {
     h.invoke(a, ctx).await.expect("the firing succeeds");
+}
+
+// ----- the promotion: every copy judged before any is written -----
+
+const COMPETING: &str = "competing-next-value-from-another-packet";
+const RESTAGED: &str = "a-value-the-gates-were-never-asked-about";
+/// The sentence `defer` ends every note with. A stop no later firing can
+/// get past must not carry it (review 34313729, F1).
+const RESUMES: &str = "no hand is needed";
+
+type Rotation = (
+    Jobs,
+    Arc<FakeSecrets>,
+    Arc<FakeGates>,
+    Arc<CredentialRotateSelfIssued>,
+);
+type Snapshot = (BTreeMap<String, String>, BTreeMap<String, u64>);
+
+/// This packet's value staged in `next` of both copies by its scope
+/// firing, and read by every gate.
+async fn staged() -> Rotation {
+    let j = jobs(&[(JOB, packet("2026-09-30T01:00:00Z"))]).await;
+    let s = Arc::new(FakeSecrets::default());
+    let g = FakeGates::new(&ROSTER, &[]);
+    let h = handler(&j, &s, &g);
+    fire(&h, &scope_ctx(JOB), &args(&[])).await;
+    g.refresh(&s);
+    (j, s, g, h)
+}
+
+fn snapshot(s: &FakeSecrets) -> Snapshot {
+    (
+        s.map.lock().unwrap().clone(),
+        s.versions.lock().unwrap().clone(),
+    )
+}
+
+/// Another writer replaces `next` in `copies` WHILE the gates are being
+/// asked: its value when `value` is given, its origin always, and each
+/// Secret's version bumped as a real write bumps it. The promotion's
+/// conditional write therefore sees a fresh version and passes; only
+/// judging the reread `next` can stop it (backlog 3f44a70e). Returns what
+/// that writer left, to hold every slot and every version to.
+fn replace_next_while_the_gates_are_read(
+    g: &FakeGates,
+    s: &Arc<FakeSecrets>,
+    copies: &'static [&'static str],
+    value: Option<&'static str>,
+    origin: &'static str,
+) -> Arc<Mutex<Option<Snapshot>>> {
+    let left = Arc::new(Mutex::new(None));
+    let (observed, shared) = (left.clone(), s.clone());
+    *g.on_accepts.lock().unwrap() = Some(Box::new(move || {
+        for copy in copies {
+            if let Some(value) = value {
+                shared.seed(copy, "next", value);
+            }
+            shared.seed(copy, "next.minted-for", origin);
+            shared.bump(copy, SECRET);
+        }
+        *observed.lock().unwrap() = Some(snapshot(&shared));
+    }));
+    left
+}
+
+async fn tick(h: &CredentialRotateSelfIssued) -> Result<(), HandlerError> {
+    h.invoke(&args(&[("phase", ADVANCE_PHASE)]), &tick_ctx())
+        .await
+}
+
+/// No copy was written since `left` was taken, nothing was promoted, the
+/// verify step is not done and no Verified fact was published.
+fn assert_nothing_was_promoted(j: &Jobs, s: &FakeSecrets, left: &Snapshot) {
+    assert_eq!(snapshot(s), *left, "a copy was written");
+    for copy in [PRIMARY, MIRROR] {
+        assert!(s.get(copy, "current").is_none(), "{copy} was promoted");
+    }
+    assert_ne!(j.status(JOB, "verify"), "completed");
+    assert!(!j.phases().iter().any(|phase| phase.ends_with("/verified")));
+}
+
+/// The firing FAILED, and the verify step says why in `verify_refused`:
+/// each of `copies` by path, whom its next names, that a hand is needed
+/// and that nothing resumes. No note left on the step still promises a
+/// resumption, and neither value is in anything recorded or returned.
+fn assert_refused(
+    j: &Jobs,
+    result: &Result<(), HandlerError>,
+    copies: &[&str],
+    names: &str,
+    mine: &str,
+) {
+    let error = result
+        .as_ref()
+        .expect_err("the firing must fail")
+        .to_string();
+    let refused = j
+        .meta(JOB, "verify", "verify_refused")
+        .expect("verify_refused is recorded");
+    for copy in copies {
+        let path = format!("{copy}/{SECRET}");
+        assert!(refused.contains(&path), "{refused}");
+        assert!(error.contains(&path), "{error}");
+    }
+    assert!(refused.contains(names), "{refused}");
+    assert!(refused.contains("a hand is needed"), "{refused}");
+    assert!(refused.contains("abandoned terminal"), "{refused}");
+    assert!(!refused.contains(RESUMES), "{refused}");
+    assert!(!refused.contains(ADVANCE_RULE), "{refused}");
+    if let Some(deferred) = j.meta(JOB, "verify", "verify_deferred") {
+        assert!(!deferred.contains(RESUMES), "{deferred}");
+    }
+    let record = format!("{}\n{error}", j.everything_written());
+    for value in [mine, COMPETING, RESTAGED] {
+        assert!(!record.contains(value), "the record carries a value");
+    }
+}
+
+/// The packet's headline: both copies' next replaced by another packet
+/// after the gates accepted this one's. Nothing is written, and the stop
+/// is a REFUSAL — every later firing is the same refusal, so a note that
+/// said the clock resumes it would be false (review 34313729, F1).
+#[tokio::test]
+async fn promotion_conserves_a_superseding_next_after_acceptance() {
+    let (j, s, g, h) = staged().await;
+    let mine = s.get(PRIMARY, "next").unwrap();
+    let left =
+        replace_next_while_the_gates_are_read(&g, &s, &[PRIMARY, MIRROR], Some(COMPETING), OTHER);
+    let first = tick(&h).await;
+    let left = left.lock().unwrap().clone().expect("the gates were asked");
+    for copy in [PRIMARY, MIRROR] {
+        assert_eq!(s.get(copy, "next").as_deref(), Some(COMPETING));
+        assert_eq!(s.get(copy, "next.minted-for").as_deref(), Some(OTHER));
+    }
+    assert_nothing_was_promoted(&j, &s, &left);
+    assert_refused(&j, &first, &[PRIMARY, MIRROR], OTHER, &mine);
+    for _ in 0..2 {
+        g.refresh(&s);
+        let later = tick(&h).await;
+        assert_nothing_was_promoted(&j, &s, &left);
+        assert_refused(&j, &later, &[PRIMARY], OTHER, &mine);
+    }
+}
+
+/// EVERY unpromoted copy is judged, not the primary alone: the mirror's
+/// next replaced, the primary's still this packet's. Neither is promoted,
+/// and it stays a recorded refusal on every later firing rather than a
+/// note that never changes (review 34313729, F1 second shape, and M3).
+#[tokio::test]
+async fn promotion_refuses_when_only_the_mirror_was_superseded() {
+    let (j, s, g, h) = staged().await;
+    let mine = s.get(PRIMARY, "next").unwrap();
+    let left = replace_next_while_the_gates_are_read(&g, &s, &[MIRROR], Some(COMPETING), OTHER);
+    let first = tick(&h).await;
+    let left = left.lock().unwrap().clone().expect("the gates were asked");
+    assert_eq!(s.get(MIRROR, "next").as_deref(), Some(COMPETING));
+    assert_eq!(s.get(PRIMARY, "next").as_deref(), Some(mine.as_str()));
+    assert_nothing_was_promoted(&j, &s, &left);
+    assert_refused(&j, &first, &[MIRROR], OTHER, &mine);
+    g.refresh(&s);
+    let later = tick(&h).await;
+    assert_nothing_was_promoted(&j, &s, &left);
+    assert_refused(&j, &later, &[MIRROR], OTHER, &mine);
+    // The refusal is not sticky. A hand puts the mirror's next back, the
+    // next firing promotes, and the step stops asking for a hand.
+    s.seed(MIRROR, "next", &mine);
+    s.seed(MIRROR, "next.minted-for", JOB);
+    s.bump(MIRROR, SECRET);
+    tick(&h).await.expect("promoted, and waiting on the gates");
+    for copy in [PRIMARY, MIRROR] {
+        assert_eq!(s.get(copy, "current").as_deref(), Some(mine.as_str()));
+    }
+    let refused = j.meta(JOB, "verify", "verify_refused").unwrap();
+    assert!(refused.starts_with("cleared:"), "{refused}");
+}
+
+/// The candidate is a value AND its origin: the same bytes under another
+/// packet's `next.minted-for` are not this packet's to promote (M1).
+#[tokio::test]
+async fn promotion_refuses_a_next_that_names_another_packet_over_the_same_value() {
+    let (j, s, g, h) = staged().await;
+    let mine = s.get(PRIMARY, "next").unwrap();
+    let left = replace_next_while_the_gates_are_read(&g, &s, &[PRIMARY, MIRROR], None, OTHER);
+    let first = tick(&h).await;
+    let left = left.lock().unwrap().clone().expect("the gates were asked");
+    assert_eq!(s.get(PRIMARY, "next").as_deref(), Some(mine.as_str()));
+    assert_nothing_was_promoted(&j, &s, &left);
+    assert_refused(&j, &first, &[PRIMARY, MIRROR], OTHER, &mine);
+}
+
+/// A next still naming THIS packet but holding a value the gates were
+/// never asked about is not promoted either, and that one is a defer
+/// that does resume: the next firing asks the gates about the value next
+/// holds now and promotes it.
+#[tokio::test]
+async fn promotion_defers_to_a_value_this_packet_restaged_and_then_promotes_it() {
+    let (j, s, g, h) = staged().await;
+    let left =
+        replace_next_while_the_gates_are_read(&g, &s, &[PRIMARY, MIRROR], Some(RESTAGED), JOB);
+    tick(&h).await.expect("a defer acknowledges");
+    let left = left.lock().unwrap().clone().expect("the gates were asked");
+    assert_nothing_was_promoted(&j, &s, &left);
+    let deferred = j.meta(JOB, "verify", "verify_deferred").unwrap();
+    assert!(
+        deferred.contains(&format!("{PRIMARY}/{SECRET}")),
+        "{deferred}"
+    );
+    assert!(
+        deferred.contains("the next firing asks the gates about the value next holds now"),
+        "{deferred}"
+    );
+    assert!(deferred.contains(RESUMES), "{deferred}");
+    assert!(!deferred.contains(RESTAGED), "the note carries a value");
+    assert!(j.meta(JOB, "verify", "verify_refused").is_none());
+    g.refresh(&s);
+    let _ = tick(&h).await;
+    for copy in [PRIMARY, MIRROR] {
+        assert_eq!(s.get(copy, "current").as_deref(), Some(RESTAGED));
+        assert_eq!(s.get(copy, "current.minted-for").as_deref(), Some(JOB));
+    }
+}
+
+/// One copy differing stops BOTH — the mirror, written first, used to be
+/// promoted before the primary was reread. Here only the primary took
+/// this packet's other value: the first firing defers to it, and the
+/// second, finding the mirror still on the old one, refuses, because no
+/// firing brings two disagreeing copies of next together.
+#[tokio::test]
+async fn promotion_of_every_copy_stops_when_one_copy_holds_another_value() {
+    let (j, s, g, h) = staged().await;
+    let mine = s.get(PRIMARY, "next").unwrap();
+    let left = replace_next_while_the_gates_are_read(&g, &s, &[PRIMARY], Some(RESTAGED), JOB);
+    tick(&h).await.expect("a defer acknowledges");
+    let left = left.lock().unwrap().clone().expect("the gates were asked");
+    assert_eq!(s.get(PRIMARY, "next").as_deref(), Some(RESTAGED));
+    assert_nothing_was_promoted(&j, &s, &left);
+    assert!(
+        j.meta(JOB, "verify", "verify_deferred")
+            .unwrap()
+            .contains("the next firing asks the gates about the value next holds now")
+    );
+    g.refresh(&s);
+    let second = tick(&h).await;
+    assert_nothing_was_promoted(&j, &s, &left);
+    assert_refused(
+        &j,
+        &second,
+        &[MIRROR],
+        "another value than the primary's",
+        &mine,
+    );
+}
+
+/// The write is conditional on the version that was JUDGED, not on one
+/// read again just before writing: the primary's next is replaced right
+/// after the judge pass read it, and the primary's write is refused as
+/// moved with the superseding next intact (review 34313729, P6 and M4).
+/// The mirror, written first, IS promoted here — the half-applied
+/// promotion main already had, and not this car's to redesign (F4).
+#[tokio::test]
+async fn promotion_writes_at_the_version_it_judged() {
+    let (_j, s, _g, h) = staged().await;
+    let shared = s.clone();
+    *s.after_primary_reads.lock().unwrap() = Some((
+        2,
+        Box::new(move || {
+            shared.seed(PRIMARY, "next", COMPETING);
+            shared.seed(PRIMARY, "next.minted-for", OTHER);
+            shared.bump(PRIMARY, SECRET);
+        }),
+    ));
+    let first = tick(&h).await;
+    assert!(
+        s.after_primary_reads.lock().unwrap().is_none(),
+        "the primary never moved"
+    );
+    assert!(first.unwrap_err().to_string().contains("moved"));
+    assert_eq!(s.get(PRIMARY, "next").as_deref(), Some(COMPETING));
+    assert_eq!(s.get(PRIMARY, "next.minted-for").as_deref(), Some(OTHER));
+    assert!(s.get(PRIMARY, "current").is_none());
+}
+
+/// `previous` still holding a value in ONE copy refuses before ANY copy
+/// is written: the mirror used to be promoted and the primary then
+/// refused (review 34313729, F5).
+#[tokio::test]
+async fn promotion_refuses_over_an_undrained_previous_before_any_copy_is_written() {
+    let (j, s, _g, h) = staged().await;
+    s.seed(PRIMARY, "previous", "an-old-value-not-yet-drained");
+    s.bump(PRIMARY, SECRET);
+    let left = snapshot(&s);
+    let first = tick(&h).await;
+    assert!(first.unwrap_err().to_string().contains("previous holds"));
+    assert_nothing_was_promoted(&j, &s, &left);
+}
+
+/// The same refusal when the replacement landed BETWEEN firings: verify
+/// finds this packet's value in neither slot at its first read. The note
+/// an earlier firing left, saying the clock resumes it, is cleared.
+#[tokio::test]
+async fn a_next_superseded_between_firings_is_a_recorded_refusal() {
+    let (j, s, _g, h) = staged().await;
+    let mine = s.get(PRIMARY, "next").unwrap();
+    assert!(
+        j.meta(JOB, "verify", "verify_deferred")
+            .unwrap()
+            .contains(RESUMES),
+        "the scope firing left a defer for this control to clear"
+    );
+    for copy in [PRIMARY, MIRROR] {
+        s.seed(copy, "next", COMPETING);
+        s.seed(copy, "next.minted-for", OTHER);
+        s.bump(copy, SECRET);
+    }
+    let left = snapshot(&s);
+    let first = tick(&h).await;
+    assert_nothing_was_promoted(&j, &s, &left);
+    assert_refused(&j, &first, &[PRIMARY], OTHER, &mine);
 }
 
 // ----- pure: the value, the judgements -----
@@ -1155,6 +1594,83 @@ async fn a_gate_in_mode_off_holds_the_revoke_because_its_silence_is_not_evidence
     assert!(s.get(PRIMARY, "previous").is_some());
 }
 
+#[tokio::test]
+async fn a_clean_durable_restart_can_finish_the_original_one_day_drain() {
+    let j = jobs(&[(JOB, packet("2026-09-30T01:00:00Z"))]).await;
+    let s = Arc::new(FakeSecrets::default());
+    s.seed(
+        PRIMARY,
+        "current",
+        "the-current-value-this-packet-promoted-xxxx",
+    );
+    s.seed(PRIMARY, "current.minted-for", JOB);
+    s.seed(
+        PRIMARY,
+        "previous",
+        "the-old-value-still-in-the-previous-slot-xx",
+    );
+    s.seed(
+        MIRROR,
+        "current",
+        "the-current-value-this-packet-promoted-xxxx",
+    );
+    s.seed(MIRROR, "current.minted-for", JOB);
+    s.seed(
+        MIRROR,
+        "previous",
+        "the-old-value-still-in-the-previous-slot-xx",
+    );
+    s.seed(
+        PRIMARY,
+        PROMOTED_AT,
+        &(Utc::now() - chrono::Duration::days(2)).to_rfc3339(),
+    );
+    let g = FakeGates::new(&ROSTER, &[]);
+    g.refresh(&s);
+    g.with("jobs", |gate| {
+        gate.restart(Utc::now() - chrono::Duration::minutes(10), true)
+    });
+    let snapshot = g
+        .window_snapshot(
+            "the-current-value-this-packet-promoted-xxxx",
+            chrono::Duration::days(1),
+        )
+        .await;
+    let observation = snapshot.observation.unwrap();
+    let proof = boss_core::gate_window::join_previous_window(
+        &observation.required_services,
+        observation.from,
+        observation.now,
+        observation.facts,
+        observation.reads,
+    );
+    assert!(
+        proof.covers_requested_window,
+        "the fixture has a complete clean durable day: {proof:?}"
+    );
+    {
+        let mut packets = j.packets.lock().unwrap();
+        let steps = &mut packets.get_mut(JOB).unwrap().steps;
+        for slug in ["issue", "install", "verify"] {
+            steps.get_mut(slug).unwrap().status = "completed".into();
+        }
+        steps.get_mut("revoke").unwrap().status = "ready".into();
+    }
+    fire(
+        &handler(&j, &s, &g),
+        &tick_ctx(),
+        &args(&[("phase", ADVANCE_PHASE)]),
+    )
+    .await;
+    assert_eq!(
+        j.status(JOB, "revoke"),
+        "completed",
+        "the young live process must not erase a proven durable day: {:?}",
+        j.meta(JOB, "revoke", "revoke_deferred")
+    );
+    assert_eq!(s.get(PRIMARY, "previous"), None);
+}
+
 /// G3 (review 1718e070): a promotion that lands while the drain reads the
 /// gates moves `current`; the drain judged the old one, so it blanks
 /// nothing and defers, rather than blank a `previous` the newer promotion
@@ -1340,7 +1856,11 @@ fn the_production_roster_is_every_gated_boss_ports_row_with_the_control_among_th
     assert!(!roster.iter().any(|s| s == "gateway"), "{roster:?}");
     assert!(roster.iter().any(|s| s == CONTROL_SERVICE));
     assert_eq!(
-        roster.len() + boss_core::machine_gate::UNGATED.len(),
+        roster.len()
+            + boss_core::machine_gate::UNGATED
+                .iter()
+                .filter(|u| u.service.is_some())
+                .count(),
         boss_ports::all().count()
     );
 }
@@ -2129,7 +2649,7 @@ async fn the_kube_store_reads_a_secret_whole_and_writes_only_at_its_version() {
     use crate::handlers::credential_issuer::KubeSecretStore;
     use base64::Engine as _;
     let enc = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
-    let body = json!({"metadata": {"resourceVersion": "41"},
+    let body = json!({"metadata": {"resourceVersion": "41","uid":"fixture-secret-uid"},
         "data": {"current": enc("cur"), "current.minted-for": enc(JOB)}});
     let patches: Captured = Default::default();
     let seen = patches.clone();
@@ -2143,7 +2663,10 @@ async fn the_kube_store_reads_a_secret_whole_and_writes_only_at_its_version() {
             let seen = seen.clone();
             async move {
                 seen.lock().unwrap().push(("patch".into(), p.clone()));
-                if p.pointer("/metadata/resourceVersion") == Some(&json!("41")) {
+                if p.pointer("/metadata/resourceVersion") == Some(&json!("41"))
+                    && p.pointer("/metadata/uid")
+                        .is_none_or(|uid| uid == &json!("fixture-secret-uid"))
+                {
                     axum::http::StatusCode::OK
                 } else {
                     axum::http::StatusCode::CONFLICT
@@ -2157,6 +2680,7 @@ async fn the_kube_store_reads_a_secret_whole_and_writes_only_at_its_version() {
     let kube = KubeSecretStore::new(format!("http://{addr}"), "sa-token", None).unwrap();
     let got = kube.read_secret("boss", SECRET).await.unwrap().unwrap();
     assert_eq!(got.version, "41");
+    assert_eq!(got.uid, "fixture-secret-uid");
     assert_eq!(got.data["current"], "cur");
     assert_eq!(got.data["current.minted-for"], JOB);
     assert!(
@@ -2173,6 +2697,250 @@ async fn the_kube_store_reads_a_secret_whole_and_writes_only_at_its_version() {
             .await,
         Ok(WriteAt::Moved)
     );
+    assert_eq!(
+        kube.write_keys_if(
+            "boss",
+            SECRET,
+            &[
+                ("next", "candidate"),
+                ("recovery.witness", "value-free-witness")
+            ],
+            &got
+        )
+        .await,
+        Ok(WriteAt::Written)
+    );
+    let mut replaced = got.clone();
+    replaced.uid = "replacement-object".into();
+    assert_eq!(
+        kube.write_keys_if("boss", SECRET, &[("next", "refused")], &replaced)
+            .await,
+        Ok(WriteAt::Moved)
+    );
+    let mut unknown = got.clone();
+    unknown.uid.clear();
+    assert!(
+        kube.write_keys_if("boss", SECRET, &[("next", "refused")], &unknown)
+            .await
+            .is_err()
+    );
     let p = patches.lock().unwrap();
     assert_eq!(p[0].1["data"]["next"], enc("n"));
+    assert_eq!(p.len(), 4, "missing identity refuses before any request");
+    assert_eq!(
+        p[2].1["metadata"],
+        json!({"uid":"fixture-secret-uid","resourceVersion":"41"}),
+        "bind both actual object and observed version"
+    );
+    assert_eq!(p[2].1["data"]["next"], enc("candidate"));
+    assert_eq!(
+        p[2].1["data"]["recovery.witness"],
+        enc("value-free-witness"),
+        "candidate and witness share one preconditioned request"
+    );
+}
+
+#[tokio::test]
+async fn the_actual_drain_uses_exact_declared_minutes_inside_the_hour_reader() {
+    for minutes in [59, 61, 119, 1440, 10081] {
+        let j = jobs(&[(JOB, packet("2026-09-30T01:00:00Z"))]).await;
+        let s = Arc::new(FakeSecrets::default());
+        for ns in [PRIMARY, MIRROR] {
+            s.seed(ns, "current", "the-current-value-this-packet-promoted-xxxx");
+            s.seed(ns, "current.minted-for", JOB);
+            s.seed(
+                ns,
+                "previous",
+                "the-old-value-still-in-the-previous-slot-xx",
+            );
+        }
+        s.seed(
+            PRIMARY,
+            PROMOTED_AT,
+            &(Utc::now() - chrono::Duration::days(10)).to_rfc3339(),
+        );
+        let g = FakeGates::new(&ROSTER, &[]);
+        g.refresh(&s);
+        // A known previous use 90 minutes ago is outside a 61-minute
+        // drain, inside 119 minutes, and must not be clipped by rounding.
+        g.with("jobs", |gate| {
+            gate.extra_rows
+                .push(previous_row(Utc::now() - chrono::Duration::minutes(90)))
+        });
+        {
+            let mut packets = j.packets.lock().unwrap();
+            let steps = &mut packets.get_mut(JOB).unwrap().steps;
+            for slug in ["issue", "install", "verify"] {
+                steps.get_mut(slug).unwrap().status = "completed".into();
+            }
+            steps.get_mut("revoke").unwrap().status = "ready".into();
+        }
+        let arguments = args(&[("phase", ADVANCE_PHASE)])
+            .into_iter()
+            .map(|(key, value)| {
+                if key == "drain_minutes" {
+                    (key, Value::String(minutes.to_string()))
+                } else {
+                    (key, value)
+                }
+            })
+            .collect::<Vec<_>>();
+        if minutes == 59 {
+            assert!(matches!(
+                Declaration::parse(&arguments),
+                Err(HandlerError::Permanent(_))
+            ));
+            continue;
+        }
+        fire(&handler(&j, &s, &g), &tick_ctx(), &arguments).await;
+        assert_eq!(
+            j.status(JOB, "revoke") == "completed",
+            minutes == 61,
+            "exact declared interval {minutes}: {:?}",
+            j.meta(JOB, "revoke", "revoke_deferred")
+        );
+        assert_eq!(s.get(PRIMARY, "previous").is_none(), minutes == 61);
+    }
+}
+
+#[tokio::test]
+async fn the_actual_drain_refuses_insufficient_misaligned_and_overlong_reader_intervals() {
+    fn shorter(snapshot: &mut boss_core::gate_window::JoinedWindow) {
+        snapshot.from += chrono::Duration::minutes(1);
+        snapshot.observation.as_mut().unwrap().from = snapshot.from;
+    }
+    fn longer(snapshot: &mut boss_core::gate_window::JoinedWindow) {
+        snapshot.from -= chrono::Duration::hours(1);
+        snapshot.observation.as_mut().unwrap().from = snapshot.from;
+    }
+    fn shifted(snapshot: &mut boss_core::gate_window::JoinedWindow) {
+        snapshot.now += chrono::Duration::minutes(1);
+        snapshot.from += chrono::Duration::minutes(1);
+        let obs = snapshot.observation.as_mut().unwrap();
+        obs.now = snapshot.now;
+        obs.from = snapshot.from;
+    }
+    for change in [
+        shorter as fn(&mut boss_core::gate_window::JoinedWindow),
+        longer,
+        shifted,
+    ] {
+        let j = jobs(&[(JOB, packet("2026-09-30T01:00:00Z"))]).await;
+        let s = Arc::new(FakeSecrets::default());
+        for ns in [PRIMARY, MIRROR] {
+            s.seed(ns, "current", "the-current-value-this-packet-promoted-xxxx");
+            s.seed(ns, "current.minted-for", JOB);
+            s.seed(
+                ns,
+                "previous",
+                "the-old-value-still-in-the-previous-slot-xx",
+            );
+        }
+        s.seed(
+            PRIMARY,
+            PROMOTED_AT,
+            &(Utc::now() - chrono::Duration::days(2)).to_rfc3339(),
+        );
+        let g = FakeGates::new(&ROSTER, &[]);
+        g.refresh(&s);
+        *g.window_change.lock().unwrap() = Some(change);
+        {
+            let mut packets = j.packets.lock().unwrap();
+            let steps = &mut packets.get_mut(JOB).unwrap().steps;
+            for slug in ["issue", "install", "verify"] {
+                steps.get_mut(slug).unwrap().status = "completed".into();
+            }
+            steps.get_mut("revoke").unwrap().status = "ready".into();
+        }
+        fire(
+            &handler(&j, &s, &g),
+            &tick_ctx(),
+            &args(&[("phase", ADVANCE_PHASE)]),
+        )
+        .await;
+        assert_ne!(j.status(JOB, "revoke"), "completed");
+        assert!(s.get(PRIMARY, "previous").is_some() && s.get(MIRROR, "previous").is_some());
+        assert!(
+            j.meta(JOB, "revoke", "revoke_deferred")
+                .unwrap()
+                .contains("interval")
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_epoch_seen_between_polls_permanently_removes_the_down_at_verify_excuse() {
+    durable_down_exception_case(false).await;
+}
+
+#[tokio::test]
+async fn a_raced_durable_exception_write_does_not_claim_the_exemption_was_narrowed() {
+    durable_down_exception_case(true).await;
+}
+
+async fn durable_down_exception_case(raced: bool) {
+    let j = jobs(&[(JOB, packet("2026-09-30T01:00:00Z"))]).await;
+    let s = Arc::new(FakeSecrets::default());
+    for ns in [PRIMARY, MIRROR] {
+        s.seed(ns, "current", "the-current-value-this-packet-promoted-xxxx");
+        s.seed(ns, "current.minted-for", JOB);
+        s.seed(
+            ns,
+            "previous",
+            "the-old-value-still-in-the-previous-slot-xx",
+        );
+    }
+    s.seed(
+        PRIMARY,
+        PROMOTED_AT,
+        &(Utc::now() - chrono::Duration::days(2)).to_rfc3339(),
+    );
+    s.seed(PRIMARY, NOT_SERVED_AT_VERIFY, "sim-control");
+    let g = FakeGates::new(&["jobs", "policy"], &["sim-control"]);
+    g.refresh(&s);
+    g.with("sim-control", |gate| {
+        gate.restart(Utc::now() - chrono::Duration::minutes(10), true)
+    });
+    {
+        let mut packets = j.packets.lock().unwrap();
+        let steps = &mut packets.get_mut(JOB).unwrap().steps;
+        for slug in ["issue", "install", "verify"] {
+            steps.get_mut(slug).unwrap().status = "completed".into();
+        }
+        steps.get_mut("revoke").unwrap().status = "ready".into();
+    }
+    let h = handler(&j, &s, &g);
+    let tick = args(&[("phase", ADVANCE_PHASE)]);
+    if raced {
+        *s.races_with.lock().unwrap() = Some("the-other-firings-value-xxxxxxxxxxxxxxxxxxx".into());
+    }
+    fire(&h, &tick_ctx(), &tick).await;
+    if raced {
+        assert_eq!(
+            s.get(PRIMARY, NOT_SERVED_AT_VERIFY),
+            Some("sim-control".into())
+        );
+        assert!(s.get(PRIMARY, "previous").is_some() && s.get(MIRROR, "previous").is_some());
+        assert!(
+            j.meta(JOB, "revoke", "revoke_deferred")
+                .unwrap()
+                .contains("moved"),
+            "a lost CAS cannot claim the exemption was narrowed"
+        );
+        return;
+    }
+    assert_eq!(
+        s.get(PRIMARY, NOT_SERVED_AT_VERIFY),
+        None,
+        "a durable sourced start between polls removes the recorded exemption"
+    );
+    assert!(s.get(PRIMARY, "previous").is_some());
+    fire(&h, &tick_ctx(), &tick).await;
+    assert_ne!(j.status(JOB, "revoke"), "completed");
+    assert!(s.get(PRIMARY, "previous").is_some() && s.get(MIRROR, "previous").is_some());
+    assert!(
+        j.meta(JOB, "revoke", "revoke_deferred")
+            .unwrap()
+            .contains("sim-control")
+    );
 }

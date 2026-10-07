@@ -24,6 +24,9 @@
 //! - `design` — the design id every filed item carries as
 //!   `metadata.design`, so the queue reads the items as one thread.
 //! - `area` — `metadata.area` on each item, the queue's grouping key.
+//! - `no_red_failure_route` — optional bounded route key for ONE item
+//!   when a failed close has no shaped RED line. Undeclared rules keep
+//!   the original no-item behavior (backlog e4a9a9b3).
 //!
 //! Which chore kind and which outcome ride the rule's `when`; this
 //! handler reads whatever closed and finds RED lines or does not.
@@ -426,6 +429,68 @@ impl ChoreFileReds {
         )
         .await
     }
+
+    /// A declared failed check still reaches its owner when it crashed
+    /// before printing a RED line. Keep the captured evidence distinct
+    /// from a diagnostic: no route, error kind or exit status is guessed.
+    async fn file_unshaped_failure(
+        &self,
+        route: &str,
+        chore: &serde_json::Value,
+        step: &str,
+        design: &str,
+        area: &str,
+        ctx: &InvocationContext,
+    ) -> Result<(), HandlerError> {
+        let rule = &ctx.rule_name;
+        let chore_id = str_field(chore, "id");
+        let open = open_jobs_of_kind(&self.client, self.base(), "backlog-item", rule).await?;
+        let already = open_routes(&open).iter().any(|r| r == route);
+        let mut filed = Vec::new();
+        if !already {
+            let owner = owner_for_filing(self.owner.as_ref(), rule).await;
+            let metadata = step_by_slug(chore, step).and_then(|s| s.get("metadata"));
+            let output_value = metadata.and_then(|m| m.get("output"));
+            let output = output_value.and_then(|v| v.as_str());
+            let excerpt: Option<String> = output.map(|s| s.chars().take(4096).collect());
+            let exit_value = metadata.and_then(|m| m.get("exit_status"));
+            let exit = exit_value
+                .and_then(|v| v.as_str())
+                .filter(|s| s.len() <= 32 && s.parse::<i32>().is_ok());
+            let body = json!({
+                "kind": "backlog-item",
+                "title": format!("{} failed without a RED finding", str_field(chore, "title")),
+                "subject": {"subject_kind": "custom", "id": "bosspipeline"},
+                "owner_id": owner, "priority": "standard", "status": "open", "tags": [],
+                "metadata": {
+                    "input_channel": super::common::lane_label(InputChannel::PipelineFailure),
+                    "area": area, "design": design, RED_ROUTE: route,
+                    "source": source_of_chore(chore_id), "reporter": rule,
+                    "triggered_by_event_id": ctx.triggering_event_id,
+                    "failure_step": step,
+                    "failure_output": excerpt,
+                    "failure_output_state": if output_value.is_none() {"missing"} else if output.is_some() {"recorded"} else {"not a string"},
+                    "failure_output_truncated": output.is_some_and(|s| s.chars().count() > 4096),
+                    "failure_exit_status": exit,
+                    "failure_exit_status_state": if exit_value.is_none() {"missing"} else if exit.is_some() {"recorded"} else {"not an integer string"},
+                    "detail": format!("The {} packet {chore_id} closed failed without a shaped RED finding on step {step}. The recorded output excerpt is bounded to 4096 characters; the source packet holds the recorded capture. No diagnostic cause is inferred. One item for the declared route {route} while it is open.", str_field(chore, "kind")),
+                },
+            });
+            filed.push(
+                super::common::post_json_minted_id(
+                    &self.client,
+                    &format!("{}/api/jobs", self.base()),
+                    &body,
+                    rule,
+                )
+                .await?,
+            );
+        }
+        self.annotate(chore_id, json!({
+            JUDGED: format!("{rule}: failed without a shaped RED finding; filed {} backlog-item(s) for {route}; already open: {already}", filed.len()),
+            RED_VERDICT: "failed without a shaped RED finding", "filed": filed,
+        }), rule).await
+    }
 }
 
 fn str_field<'a>(job: &'a serde_json::Value, key: &str) -> &'a str {
@@ -446,6 +511,15 @@ impl Handler for ChoreFileReds {
         let step = arg_string(args, "step")?;
         let design = arg_string(args, "design")?;
         let area = arg_string(args, "area")?;
+        let fallback = if args.iter().any(|(k, _)| k == "no_red_failure_route") {
+            let route = arg_string(args, "no_red_failure_route")?;
+            if route.is_empty() || route.len() > 128 || route.contains(char::is_whitespace) {
+                return Err(HandlerError::Permanent("no_red_failure_route must be a nonempty route key of at most 128 bytes without whitespace".into()));
+            }
+            Some(route)
+        } else {
+            None
+        };
         let rule = ctx.rule_name.as_str();
 
         // The close marker names the packet. A malformed marker is not
@@ -476,6 +550,13 @@ impl Handler for ChoreFileReds {
             .unwrap_or("");
         let reds = red_routes(output);
         if reds.is_empty() {
+            if let Some(route) = fallback.filter(|_| {
+                ctx.event_payload.get("outcome").and_then(|v| v.as_str()) == Some("failed")
+            }) {
+                return self
+                    .file_unshaped_failure(route, &chore, step, design, area, ctx)
+                    .await;
+            }
             self.annotate(
                 chore_id,
                 json!({
@@ -774,6 +855,235 @@ mod tests {
     }
 
     // -- the pure parser -------------------------------------------------
+
+    fn fallback_args() -> Vec<(String, Value)> {
+        let mut a = args();
+        a.push((
+            "no_red_failure_route".into(),
+            Value::String("check-failure".into()),
+        ));
+        a
+    }
+
+    #[test]
+    fn only_the_break_glass_rule_declares_the_no_red_failure_route() {
+        let root = boss_testing::repo_root();
+        let rules = root.join("infra/dispatcher/rules");
+        let mut declarations = Vec::new();
+        for entry in std::fs::read_dir(rules).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|x| x.to_str()) != Some("toml") {
+                continue;
+            }
+            let parsed: toml::Value =
+                toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            for rule in parsed["rule"].as_array().unwrap() {
+                for action in rule["do"].as_array().unwrap() {
+                    if action
+                        .get("args")
+                        .and_then(|x| x.get("no_red_failure_route"))
+                        .is_some()
+                    {
+                        declarations.push(rule["name"].as_str().unwrap().to_string());
+                        assert_eq!(
+                            action["args"]["no_red_failure_route"].as_str(),
+                            Some("\"break-glass-deposit\"")
+                        );
+                        assert_eq!(
+                            rule["when"].as_str(),
+                            Some(
+                                "kind = \"maintenance-break-glass-deposit\" AND outcome = \"failed\""
+                            )
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            declarations,
+            ["file-backlog-items-on-break-glass-deposit-red"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declared_failed_check_without_red_files_one_owned_item() {
+        let (base, writes) = mock_jobs(vec![crawl(NO_RED_OUTPUT)]).await;
+        let h = handler(base);
+        h.invoke(&fallback_args(), &ctx()).await.unwrap();
+        h.invoke(&fallback_args(), &ctx()).await.unwrap();
+        let w = writes.lock().unwrap().clone();
+        let filed = posts(&w);
+        assert_eq!(filed.len(), 1, "{w:?}");
+        assert_eq!(filed[0]["owner_id"], "emp-owner");
+        assert_eq!(
+            filed[0]["metadata"]["input_channel"],
+            super::super::common::lane_label(InputChannel::PipelineFailure)
+        );
+        assert_eq!(filed[0]["metadata"][RED_ROUTE], "check-failure");
+        assert_eq!(filed[0]["metadata"]["source"], source_of_chore(CRAWL));
+        assert_eq!(filed[0]["metadata"]["failure_output"], NO_RED_OUTPUT);
+        assert_eq!(filed[0]["metadata"]["failure_exit_status"], "1");
+        assert_eq!(w.len(), 2, "redelivery writes nothing");
+    }
+
+    #[tokio::test]
+    async fn the_authored_break_glass_rule_dispatches_and_dedups_two_crashed_days() {
+        use boss_dispatcher::rules::{
+            expr::NoHelpers,
+            handler::{HandlerRegistry, dispatch},
+            registry::{Registry, match_event},
+        };
+        let rule = std::fs::read_to_string(
+            boss_testing::repo_root()
+                .join("infra/dispatcher/rules/file-backlog-items-on-break-glass-deposit-red.toml"),
+        )
+        .unwrap();
+        let registry = Registry::from_toml(&rule).unwrap();
+        const DAY2: &str = "33333333-3333-3333-3333-333333333332";
+        let mut first = crawl(NO_RED_OUTPUT);
+        first["kind"] = json!("maintenance-break-glass-deposit");
+        let mut second = first.clone();
+        second["id"] = json!(DAY2);
+        let (base, writes) = mock_jobs(vec![first, second]).await;
+        let mut handlers = HandlerRegistry::new();
+        handlers.register(handler(base));
+        for id in [CRAWL, CRAWL, DAY2] {
+            let payload =
+                json!({"id": id, "kind": "maintenance-break-glass-deposit", "outcome": "failed"});
+            let matched = match_event(&registry, "jobs.job.closed", &payload, &NoHelpers).matched;
+            assert_eq!(matched.len(), 1);
+            let result = dispatch(
+                &matched,
+                &handlers,
+                "event-crash",
+                "jobs.job.closed",
+                &payload,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(result[0].outcome.is_ok(), "{result:?}");
+        }
+        let w = writes.lock().unwrap().clone();
+        let filed = posts(&w);
+        assert_eq!(
+            filed.len(),
+            1,
+            "two failed days and redelivery are one open item: {w:?}"
+        );
+        assert_eq!(filed[0]["metadata"][RED_ROUTE], "break-glass-deposit");
+        assert_eq!(filed[0]["metadata"]["design"], "835c0c9c");
+        assert_eq!(filed[0]["metadata"]["area"], "credentials");
+        assert_eq!(
+            filed[0]["metadata"]["reporter"],
+            "file-backlog-items-on-break-glass-deposit-red"
+        );
+        assert_eq!(filed[0]["owner_id"], "emp-owner");
+        assert_eq!(w.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn missing_step_and_malformed_exit_remain_unknown_and_bad_declarations_refuse() {
+        let mut missing = crawl("");
+        missing["steps"] = json!([]);
+        let (base, writes) = mock_jobs(vec![missing]).await;
+        handler(base)
+            .invoke(&fallback_args(), &ctx())
+            .await
+            .unwrap();
+        let w = writes.lock().unwrap().clone();
+        let f = posts(&w);
+        assert_eq!(f[0]["metadata"]["failure_output_state"], "missing");
+        assert_eq!(f[0]["metadata"]["failure_exit_status_state"], "missing");
+        assert!(f[0]["metadata"]["failure_exit_status"].is_null());
+        let mut bad = crawl("RED malformed\n");
+        bad["steps"][1]["metadata"]["exit_status"] = json!({"wrong": 1});
+        let (base, writes) = mock_jobs(vec![bad]).await;
+        let h = handler(base);
+        h.invoke(&fallback_args(), &ctx()).await.unwrap();
+        let w = writes.lock().unwrap().clone();
+        let f = posts(&w);
+        assert_eq!(f[0]["metadata"]["failure_output"], "RED malformed\n");
+        assert_eq!(
+            f[0]["metadata"]["failure_exit_status_state"],
+            "not an integer string"
+        );
+        assert!(f[0]["metadata"]["failure_exit_status"].is_null());
+        for route in ["", "two words", &"x".repeat(129)] {
+            let mut a = args();
+            a.push(("no_red_failure_route".into(), Value::String(route.into())));
+            assert!(h.invoke(&a, &ctx()).await.unwrap_err().is_permanent());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_declared_failure_dedups_an_open_item_without_a_judged_note() {
+        let (base, writes) = mock_jobs(vec![
+            crawl(NO_RED_OUTPUT),
+            open_item("old", "check-failure"),
+        ])
+        .await;
+        handler(base)
+            .invoke(&fallback_args(), &ctx())
+            .await
+            .unwrap();
+        let w = writes.lock().unwrap().clone();
+        assert!(posts(&w).is_empty());
+        assert!(w[0].2[JUDGED].as_str().unwrap().contains("already open"));
+    }
+
+    #[tokio::test]
+    async fn declared_fallback_keeps_positive_red_and_nonfailed_controls() {
+        let (base, writes) = mock_jobs(vec![crawl(RED_OUTPUT)]).await;
+        handler(base)
+            .invoke(&fallback_args(), &ctx())
+            .await
+            .unwrap();
+        assert_eq!(posts(&writes.lock().unwrap()).len(), 2);
+        let (base, writes) = mock_jobs(vec![crawl(NO_RED_OUTPUT)]).await;
+        let mut c = ctx();
+        c.event_payload["outcome"] = json!("ok");
+        handler(base).invoke(&fallback_args(), &c).await.unwrap();
+        assert!(posts(&writes.lock().unwrap()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn absent_or_malformed_failure_output_is_named_not_invented_and_capture_is_bounded() {
+        for output in [None, Some(json!(7)), Some(json!("x".repeat(6000)))] {
+            let mut job = crawl("");
+            job["steps"][1]["metadata"]
+                .as_object_mut()
+                .unwrap()
+                .remove("output");
+            if let Some(v) = output.clone() {
+                job["steps"][1]["metadata"]["output"] = v;
+            }
+            let (base, writes) = mock_jobs(vec![job]).await;
+            handler(base)
+                .invoke(&fallback_args(), &ctx())
+                .await
+                .unwrap();
+            let w = writes.lock().unwrap().clone();
+            let f = posts(&w);
+            assert_eq!(f.len(), 1);
+            assert_eq!(
+                f[0]["metadata"]["failure_output_state"],
+                match output.as_ref() {
+                    None => "missing",
+                    Some(value) if value.is_string() => "recorded",
+                    Some(_) => "not a string",
+                }
+            );
+            assert!(f[0]["metadata"].get("red_error").is_none());
+            if output.as_ref().is_some_and(|x| x.is_string()) {
+                assert_eq!(
+                    f[0]["metadata"]["failure_output"].as_str().unwrap().len(),
+                    4096
+                );
+                assert_eq!(f[0]["metadata"]["failure_output_truncated"], true);
+            }
+        }
+    }
 
     /// Three RED lines, two routes: the route that threw twice is ONE
     /// finding with both errors, in the order printed.
@@ -1231,5 +1541,18 @@ RED /c pageerror: HTTP 502 from /api/c\n";
             .await
             .unwrap_err();
         assert!(err.is_permanent(), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_overlong_integer_string_does_not_escape_the_failure_evidence_bound() {
+        let mut job = crawl(NO_RED_OUTPUT);
+        job["steps"][1]["metadata"]["exit_status"] = json!("0".repeat(6000));
+        let (base, writes) = mock_jobs(vec![job]).await;
+        handler(base)
+            .invoke(&fallback_args(), &ctx())
+            .await
+            .unwrap();
+        let w = writes.lock().unwrap().clone();
+        assert!(posts(&w)[0]["metadata"]["failure_exit_status"].is_null());
     }
 }

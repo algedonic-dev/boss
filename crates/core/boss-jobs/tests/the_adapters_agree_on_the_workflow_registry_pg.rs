@@ -82,12 +82,12 @@ boss_testing::adapters_agree! {
     adapters {
         in_memory => {
             let jobs = Arc::new(InMemoryJobs::new());
-            let registry = InMemoryWorkflows::new().with_packets(jobs.clone());
+            let registry = InMemoryWorkflows::for_fixture().with_packets(jobs.clone());
             (World { registry, jobs }, ())
         },
         postgres => {
             let db = boss_testing::TestDb::new().await;
-            let registry = boss_jobs::registry::PgWorkflows::new(db.pool.clone());
+            let registry = boss_jobs::registry::PgWorkflows::for_fixture(db.pool.clone());
             let jobs = Arc::new(boss_jobs::PgJobs::new(db.pool.clone()));
             (World { registry, jobs }, db)
         },
@@ -104,6 +104,8 @@ boss_testing::adapters_agree! {
         a_packet_is_never_admitted_onto_a_discarded_version,
         a_spent_version_number_is_never_handed_out_again,
         publish_authored_retires_the_active_and_names_its_job,
+        conditional_publication_keeps_equal_and_refuses_every_history_boundary,
+        concurrent_conditional_publications_insert_one_complete_definition,
         list_active_narrows_by_category_in_byte_order,
         the_reconcile_inserts_republishes_preserves_and_refuses,
     }
@@ -152,6 +154,126 @@ fn spec(kind: &str, label: &str, category: &str) -> WorkflowSpec {
 
 fn viable(kind: &str) -> WorkflowSpec {
     spec(kind, "Suite", "suite")
+}
+
+async fn conditional_publication_keeps_equal_and_refuses_every_history_boundary<
+    R: WorkflowRegistry,
+    J: JobsRepository,
+>(
+    w: &World<R, J>,
+    adapter: &str,
+) {
+    let authored = viable("suite-conditional");
+    let first_job = JobId::new();
+    let first = w
+        .registry
+        .publish_authored_if_absent(authored.clone(), first_job, &author(), instant(1))
+        .await
+        .unwrap();
+    assert_eq!(first.version, 1, "{adapter}");
+    assert_eq!(
+        first.authoring_job_id,
+        Some(*first_job.inner().as_uuid()),
+        "{adapter}"
+    );
+    let equal = w
+        .registry
+        .publish_authored_if_absent(authored.clone(), JobId::new(), &author(), instant(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        equal, first,
+        "{adapter}: equal returns original complete row"
+    );
+    let mut changed = authored.clone();
+    changed.description = Some("A different full authored field".into());
+    assert!(
+        matches!(
+            w.registry
+                .publish_authored_if_absent(changed, JobId::new(), &author(), instant(3))
+                .await,
+            Err(WorkflowError::Conflict(_))
+        ),
+        "{adapter}"
+    );
+    assert_eq!(
+        w.registry.get_active(&authored.kind).await.unwrap(),
+        first,
+        "{adapter}"
+    );
+    w.registry
+        .retire(&authored.kind, &author(), instant(4))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            w.registry
+                .publish_authored_if_absent(authored, JobId::new(), &author(), instant(5))
+                .await,
+            Err(WorkflowError::Conflict(_))
+        ),
+        "{adapter}: retired history refuses"
+    );
+    let draft = viable("suite-conditional-draft");
+    let row = w
+        .registry
+        .create_draft(draft.clone(), &author(), instant(6))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            w.registry
+                .publish_authored_if_absent(draft.clone(), JobId::new(), &author(), instant(7))
+                .await,
+            Err(WorkflowError::Conflict(_))
+        ),
+        "{adapter}: draft refuses"
+    );
+    w.registry
+        .discard_draft(&draft.kind, row.version, &author(), instant(8))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            w.registry
+                .publish_authored_if_absent(draft, JobId::new(), &author(), instant(9))
+                .await,
+            Err(WorkflowError::Conflict(_))
+        ),
+        "{adapter}: discarded identity refuses"
+    );
+}
+
+async fn concurrent_conditional_publications_insert_one_complete_definition<
+    R: WorkflowRegistry,
+    J: JobsRepository,
+>(
+    w: &World<R, J>,
+    adapter: &str,
+) {
+    let first = viable("suite-conditional-race");
+    let mut second = first.clone();
+    second.label = "Different racing definition".into();
+    let first_job = JobId::new();
+    let second_job = JobId::new();
+    let actor = author();
+    let (a, b) = tokio::join!(
+        w.registry
+            .publish_authored_if_absent(first, first_job, &actor, instant(1)),
+        w.registry
+            .publish_authored_if_absent(second, second_job, &actor, instant(2)),
+    );
+    assert_eq!(
+        usize::from(a.is_ok()) + usize::from(b.is_ok()),
+        1,
+        "{adapter}: {a:?} / {b:?}"
+    );
+    let held = a.or(b).unwrap();
+    assert_eq!(
+        w.registry.list_versions(&held.kind).await.unwrap(),
+        vec![held],
+        "{adapter}: never supersede a racing insertion"
+    );
 }
 
 /// No terminal: the viability gate refuses it.

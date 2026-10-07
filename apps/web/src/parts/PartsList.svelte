@@ -16,12 +16,14 @@
     type CatalogPart,
     type DeviceModel,
     type InventoryItem,
-    type PurchaseOrder,
     type StockStatus,
   } from './types';
   import { partsHeader, unstockedSkus } from './stock-counts';
-  import { countLabel, emptyState, readStateOfLoad } from '../data/readState';
+  import {
+    countLabel, emptyState, readStateOfLoad, loadingRead, okRead, failedRead, type ReadState,
+  } from '../data/readState';
   import { readRows } from '../data/shape';
+  import { orderQuantities } from './order-quantities';
   import ListEmpty from '../data/ListEmpty.svelte';
   import { rowLink } from '@boss/web-kit/ui/RowLink';
   import { href, navigate } from '../router';
@@ -49,7 +51,8 @@
 
   let models = $state<DeviceModel[]>([]);
   let inventory = $state<InventoryItem[]>([]);
-  let pos = $state<PurchaseOrder[]>([]);
+  let poRead = $state<ReadState>(loadingRead);
+  let onOrder = $state<ReadonlyMap<string, number>>(new Map());
   // The brewery seeds parts directly into the `parts` table —
   // no system_models.spare_parts/consumables linkage. Pull the
   // canonical /api/catalog/parts list and fall back to the
@@ -85,12 +88,25 @@
   $effect(() => {
     let cancelled = false;
     loading = true;
+    poRead = loadingRead;
     (async () => {
       try {
-        const [mResp, iResp, pResp, cpResp] = await Promise.all([
+        const response = await fetchNamed(ORDERS_URL);
+        if (!response.ok) throw new Error(`${ORDERS_URL}: HTTP ${response.status}`);
+        const quantities = orderQuantities(ORDERS_URL, await response.json().catch(namedAs(ORDERS_URL)));
+        if (!cancelled) {
+          onOrder = quantities;
+          poRead = okRead;
+        }
+      } catch (error) {
+        if (!cancelled) poRead = failedRead(error instanceof Error ? error.message : String(error));
+      }
+    })();
+    (async () => {
+      try {
+        const [mResp, iResp, cpResp] = await Promise.all([
           fetchNamed(MODELS_URL),
           fetchNamed(ITEMS_URL),
-          fetch(ORDERS_URL),
           fetchNamed(CATALOG_PARTS_URL),
         ]);
         // The row sources (models, inventory, catalog parts) are the
@@ -98,7 +114,7 @@
         // the line names WHICH (backlog 0ef5e008: it said "HTTP 503" with
         // three reads behind it). A 200 that is not a list shape fails it
         // too: each was coerced to no rows, which read as no parts.
-        // The PO list only feeds "on order" counts and degrades.
+        // The independent PO read controls only "on order" knowledge.
         const primary = [
           [MODELS_URL, mResp],
           [ITEMS_URL, iResp],
@@ -109,16 +125,9 @@
         const [mRows, iRows, cpRows] = await Promise.all(
           primary.map(async ([url, r]) => readRows(url, await r.json().catch(namedAs(url)))),
         );
-        const pBody = pResp.ok ? await pResp.json() : [];
-        // A refused PO read degrades to no "on order" counts (gap 4,
-        // 61c16b17); a 200 that is not a list shape is a contract break,
-        // not an outage, and fails the page by name like the three above
-        // (backlog b6b74115). `[]` from the refused arm reads as itself.
-        const pRows = readRows(ORDERS_URL, pBody);
         if (!cancelled) {
           models = mRows as DeviceModel[];
           inventory = iRows as InventoryItem[];
-          pos = pRows as PurchaseOrder[];
           catalogParts = cpRows as CatalogPart[];
           loadFailed = null;
           loading = false;
@@ -141,17 +150,6 @@
     new Map(catalogParts.map((p) => [p.part_sku, p])),
   );
 
-  let onOrder = $derived.by(() => {
-    const m = new Map<string, number>();
-    for (const po of pos) {
-      if (po.status === 'received' || po.status === 'closed') continue;
-      for (const line of po.lines) {
-        m.set(line.part_sku, (m.get(line.part_sku) ?? 0) + line.qty);
-      }
-    }
-    return m;
-  });
-
   type Row = {
     sku: string;
     /// Null for a catalogued part that was never stocked (4cb8c06a).
@@ -159,7 +157,8 @@
     name: string;
     description: string;
     kind: RowKind;
-    used_by: number;
+    // No satellite linkage means model usage is untracked, not zero (e709ee79).
+    used_by: number | null;
     status: RowStatus;
     on_order: number;
   };
@@ -190,7 +189,7 @@
         name: meta?.part.name ?? flat?.name ?? sku,
         description: meta?.part.description ?? flat?.description ?? '',
         kind: meta?.kind ?? kindFromSku(sku),
-        used_by: meta?.used_by.length ?? 0,
+        used_by: meta?.used_by.length ?? null,
         status: item ? stockStatus(item) : 'never-stocked',
         on_order: onOrder.get(sku) ?? 0,
       };
@@ -333,6 +332,9 @@
     </aside>
 
     <section class="list-section">
+      {#if poRead.kind === 'failed'}
+        <p class="load-failed" role="alert">Couldn't load purchase orders — {poRead.error}</p>
+      {/if}
       {#if listState.kind !== 'rows'}
         <ListEmpty view={listState} words={{ what: 'parts', noun: 'parts' }} />
       {:else}
@@ -371,7 +373,7 @@
                 <td class="num">{r.item ? r.item.on_hand : '—'}</td>
                 <td class="num">{r.item ? r.item.allocated : '—'}</td>
                 <td class="num">{r.item ? r.item.reorder_point : '—'}</td>
-                <td class="num">{r.on_order > 0 ? r.on_order : '—'}</td>
+                <td class="num">{poRead.kind === 'loading' ? 'Loading…' : poRead.kind === 'failed' ? 'Unknown' : r.on_order > 0 ? r.on_order : '—'}</td>
                 <td>
                   <StatusChip
                     value={r.status}
@@ -379,7 +381,7 @@
                   />
                 </td>
                 <td class="num">
-                  {catalogSkuSet.has(r.sku) ? '—' : r.used_by}
+                  {catalogSkuSet.has(r.sku) ? '—' : r.used_by === null ? 'Not tracked' : r.used_by}
                 </td>
                 <td class="mono">{r.item ? r.item.bin : '—'}</td>
               </tr>

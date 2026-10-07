@@ -36,12 +36,13 @@
 //!   completes when every port answers `matched: current`.
 //! - **revoke** — blank `previous`, but only once the gates have shown
 //!   for a whole drain window that nothing presents it: every served
-//!   port's tally (`GET /api/machine-gate/misses`) in `report` or
-//!   `enforce`, no overflow that could hide a `previous` (one noisy
+//!   port's durable recording history plus healthy live tally in
+//!   `report` or `enforce`, no overflow that could hide a `previous` (one noisy
 //!   source past its own share is named, not held on — backlog
 //!   93bcf490; a `previous` is always keyed, so it ages out like any
-//!   row — review ebc7b1cc), begun before the window opened, with no
-//!   `previous` match inside it. A caller still sending the old value —
+//!   row — review ebc7b1cc), covering the entire exact-minute interval,
+//!   with no `previous` match inside it. A retired epoch's unknown final
+//!   usage remains unresolved until its explicit retirement ages out. A caller still sending the old value —
 //!   an off-cluster host whose pull has not run — holds the step open and
 //!   is named on it. The window is the rule's `drain_minutes`, never
 //!   below [`DRAIN_FLOOR_MINUTES`], and pinned to outlast the longest
@@ -141,6 +142,14 @@ pub const HANDLER: &str = "credential.rotate.self-issued";
 /// The one value of the `phase` arg: the clock rule's pass over every
 /// open rotation packet about the credential.
 pub const ADVANCE_PHASE: &str = "advance";
+
+/// What a verify refusal says when no later firing gets past it. The
+/// packet stays open with install done and revoke not, and `ahead_of`
+/// holds every other rotation of the credential behind that — so the note
+/// names the hand act, and never the clock (review 34313729, F1).
+const STUCK_NEEDS_A_HAND: &str = "No later firing gets past this, so a hand is needed: close this \
+     packet on its abandoned terminal, the exit for a rotation that is stuck. Until then every \
+     other rotation of this credential is held behind it";
 
 /// The clock rule, named on every deferred step so its reader knows what
 /// acts next, and when.
@@ -293,6 +302,12 @@ pub trait GateReader: Send + Sync {
     async fn accepts(&self, service: &str, presented: &str) -> GateRead<Accepts>;
     /// `GET /api/machine-gate/misses`, presenting `presented`.
     async fn misses(&self, service: &str, presented: &str) -> GateRead<Misses>;
+    /// Complete durable evidence and live observations for the requested hours.
+    async fn window(
+        &self,
+        presented: &str,
+        hours: i64,
+    ) -> Result<boss_core::gate_window::JoinedWindow, String>;
 }
 
 /// The gates of the pod this process runs in: every `boss_ports` row at
@@ -392,6 +407,35 @@ fn connection_refused(e: &reqwest::Error) -> bool {
 impl GateReader for LocalGates {
     fn roster(&self) -> Vec<String> {
         self.services.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    async fn window(
+        &self,
+        presented: &str,
+        hours: i64,
+    ) -> Result<boss_core::gate_window::JoinedWindow, String> {
+        if !(1..=168).contains(&hours) {
+            return Err("gate window hours outside protected reader bound".into());
+        }
+        let base = self
+            .services
+            .iter()
+            .find(|(name, _)| name == "events")
+            .map(|(_, base)| base)
+            .ok_or("events reader is not declared in the service roster")?;
+        let client = boss_core::machine_token::Client::build_with_source(
+            reqwest::Client::builder().connect_timeout(self.timeout),
+            Arc::new(boss_core::machine_token::Source::fixed(Some(
+                presented.to_string(),
+            ))),
+        )
+        .map_err(|error| format!("window client: {error}"))?;
+        let url = format!(
+            "{}{}?gate=machine-gate&hours={hours}",
+            base.trim_end_matches('/'),
+            boss_core::gate_window::PATH
+        );
+        super::gate_window_read::read(&client, &url, &dispatcher_reader_header()).await
     }
 
     async fn accepts(&self, service: &str, presented: &str) -> GateRead<Accepts> {
@@ -1037,16 +1081,56 @@ impl CredentialRotateSelfIssued {
             "{why}. The clock rule {ADVANCE_RULE} resumes this every fifteen minutes; no hand is needed."
         );
         tracing::info!(job_id, slug, %note, "machine token rotation deferred");
-        self.put_step(
-            rule,
-            job_id,
-            steps,
-            slug,
-            vec![(format!("{slug}_deferred"), note)],
-            false,
-        )
-        .await?;
+        let mut evidence = vec![(format!("{slug}_deferred"), note)];
+        // A refusal an earlier firing recorded no longer holds once a
+        // firing gets as far as deferring, and the step must not go on
+        // asking for a hand (the rule put_step applies at completion).
+        let refused = format!("{slug}_refused");
+        if steps
+            .get(slug)
+            .is_some_and(|s| s.metadata.contains_key(&refused))
+        {
+            evidence.push((refused, "cleared: a later firing deferred".into()));
+        }
+        self.put_step(rule, job_id, steps, slug, evidence, false)
+            .await?;
         Ok(Pass::Deferred)
+    }
+
+    /// Record on its own step why a phase cannot go on WITHOUT A HAND,
+    /// and hand back the failure. A defer says the clock resumes it; this
+    /// is for the stop no later firing gets past, so it says what the hand
+    /// does and clears a `<step>_deferred` an earlier firing left, which
+    /// would otherwise go on saying no hand is needed beside it (review
+    /// 34313729, F1). It is not sticky: every firing judges the state
+    /// again, and a later defer or completion clears it.
+    async fn refuse(
+        &self,
+        rule: &str,
+        job_id: &str,
+        steps: &HashMap<String, StepView>,
+        slug: &str,
+        why: String,
+    ) -> HandlerError {
+        tracing::warn!(job_id, slug, %why, "machine token rotation refused");
+        let mut evidence = vec![(format!("{slug}_refused"), why.clone())];
+        let deferred = format!("{slug}_deferred");
+        if steps
+            .get(slug)
+            .is_some_and(|s| s.metadata.contains_key(&deferred))
+        {
+            evidence.push((
+                deferred,
+                format!("cleared: the phase refused; see {slug}_refused"),
+            ));
+        }
+        match self
+            .put_step(rule, job_id, steps, slug, evidence, false)
+            .await
+        {
+            Ok(()) => HandlerError::Permanent(why),
+            Err(e) => e,
+        }
     }
 
     /// `Some(why)` when another rotation of this credential must go
@@ -1170,10 +1254,116 @@ impl CredentialRotateSelfIssued {
                 ends.to_rfc3339()
             )]));
         }
-        let clean = match judge_drain(&reads, now, d.drain, &excused) {
-            Ok(clean) => clean,
-            Err(held) => return Ok(Err(held)),
+        let hours = (d.drain.num_minutes() + 59) / 60;
+        if !(1..=168).contains(&hours) {
+            return Ok(Err(vec![
+                "drain exceeds the protected durable reader interval bound".into(),
+            ]));
+        }
+        let before = boss_clock_client::wall_now();
+        let snapshot = match self.gates.window(current, hours).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return Ok(Err(vec![format!(
+                    "durable previous drain is unreadable: {error}"
+                )]));
+            }
         };
+        let after = boss_clock_client::wall_now();
+        let roster = self.gates.roster();
+        let observation = match super::gate_window_read::observation(
+            &snapshot,
+            boss_core::gate_evidence::Gate::MachineGate,
+            &roster,
+            chrono::Duration::hours(hours),
+            before,
+            after,
+        ) {
+            Ok(observation) => observation,
+            Err(error) => return Ok(Err(vec![error])),
+        };
+        let target_from = observation.now - d.drain;
+        if observation.from > target_from || observation.now < ends {
+            return Ok(Err(vec![
+                "durable reader does not enclose the complete declared drain after promotion"
+                    .into(),
+            ]));
+        }
+        // An epoch observed after promotion permanently removes a down-at-
+        // verify excuse, even if that port is down again at this read.
+        let facts = observation
+            .facts
+            .as_ref()
+            .map_err(|error| HandlerError::Downstream(error.clone()))?;
+        let durable_excused = excused
+            .iter()
+            .filter(|service| {
+                !facts.iter().any(|event| {
+                    event.source == **service
+                        && event.kind
+                            == boss_core::gate_evidence::Gate::MachineGate
+                                .kind(boss_core::gate_evidence::Fact::RecordingBegan)
+                        && event.timestamp >= promoted
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if durable_excused != excused {
+            let wrote = self
+                .secrets
+                .write_keys_at(
+                    d.secret_namespace,
+                    d.secret_name,
+                    &[(NOT_SERVED_AT_VERIFY, durable_excused.join(",").as_str())],
+                    &primary.version,
+                )
+                .await
+                .map_err(HandlerError::Downstream)?;
+            return Ok(Err(vec![
+                if wrote == super::credential_issuer::WriteAt::Moved {
+                    "Secret moved before durable process history could narrow verify excuses; the next pass rereads the version".into()
+                } else {
+                    "durable process history narrowed verify excuses; the next pass rereads the Secret version".into()
+                },
+            ]));
+        }
+        let required = roster
+            .into_iter()
+            .filter(|service| !excused.contains(service))
+            .collect::<Vec<_>>();
+        let joined = boss_core::gate_window::join_previous_window(
+            &required,
+            target_from,
+            observation.now,
+            observation.facts.clone(),
+            observation
+                .reads
+                .iter()
+                .filter(|read| required.contains(&read.service))
+                .cloned()
+                .collect(),
+        );
+        if !joined.covers_requested_window {
+            let mut held = joined.not_clean;
+            // Preserve existing caller/mode/port diagnostics; the durable
+            // projection alone decides whether the drain is proven.
+            if let Err(reasons) = judge_drain(&reads, observation.now, d.drain, &excused) {
+                held.extend(reasons);
+            }
+            if held.is_empty() {
+                held.push(format!(
+                    "durable recording coverage does not enclose the declared {} minute drain",
+                    d.drain.num_minutes()
+                ));
+            }
+            return Ok(Err(held));
+        }
+        let clean = format!(
+            "complete durable previous-specific drain of {} minutes through {}; permanently not served at verify: {}",
+            d.drain.num_minutes(),
+            observation.now.to_rfc3339(),
+            excused.join(", ")
+        );
         // The primary first: its gates stop accepting the old value, and
         // a mirror's copy is read by callers only, never by a gate. Each
         // copy is blanked only while its current is still the one this
@@ -1808,14 +1998,27 @@ impl CredentialRotateSelfIssued {
         } else if primary.next.is_for(job_id) {
             (primary.next.value.clone().unwrap_or_default(), false)
         } else {
-            return Err(HandlerError::Permanent(format!(
-                "this packet's value is in neither next nor current of {}/{} (next.minted-for \
-                 names {}, current.minted-for names {}); nothing is promoted",
-                d.secret_namespace,
-                d.secret_name,
-                primary.next.minted_for.as_deref().unwrap_or("nothing"),
-                primary.current.minted_for.as_deref().unwrap_or("nothing"),
-            )));
+            // Recorded on the step, not only returned: this is what every
+            // firing after a superseded promotion answers, and the step
+            // otherwise keeps whatever an earlier firing deferred with
+            // (review 34313729, F1).
+            return Err(self
+                .refuse(
+                    rule,
+                    job_id,
+                    steps,
+                    "verify",
+                    format!(
+                        "this packet's value is in neither next nor current of {}/{} \
+                         (next.minted-for names {}, current.minted-for names {}); nothing is \
+                         promoted. {STUCK_NEEDS_A_HAND}",
+                        d.secret_namespace,
+                        d.secret_name,
+                        primary.next.minted_for.as_deref().unwrap_or("nothing"),
+                        primary.current.minted_for.as_deref().unwrap_or("nothing"),
+                    ),
+                )
+                .await);
         };
         if !promoted {
             let staged = self.poll_accepts(&value, SLOTS[1]).await;
@@ -1843,17 +2046,104 @@ impl CredentialRotateSelfIssued {
             let excused = staged.not_served.join(",");
             let mut order = d.targets();
             order.rotate_left(1);
+            // Every copy is read and judged BEFORE any is written, and the
+            // write is conditional on the version judged. The gates' answer
+            // above took time, and another packet may have replaced `next`
+            // and `next.minted-for` in it: the reread used to take only the
+            // fresh version, so the conditional write passed, put the value
+            // read BEFORE the poll into current and blanked the superseding
+            // next (backlog 3f44a70e). A copy whose next is no longer this
+            // packet's candidate, by value AND by origin, stops the
+            // promotion of every copy with nothing written.
+            let mut unpromoted = Vec::new();
             for (ns, name) in order {
                 let s = self.read_slots(ns, name).await?;
-                if s.current.is_for(job_id) {
-                    continue;
+                if !s.current.is_for(job_id) {
+                    unpromoted.push((ns, name, s));
                 }
-                if s.previous.value.is_some() {
-                    return Err(HandlerError::Permanent(format!(
-                        "Secret {ns}/{name}: previous holds a value, and promoting would drop it \
-                         without its drain; nothing more is promoted"
-                    )));
-                }
+            }
+            // What the stop is depends on what a LATER firing will find
+            // (review 34313729, F1), so it is decided over all the copies:
+            // - a next that no longer names this packet is never this
+            //   packet's again, and neither is a mirror naming it over
+            //   another value than the primary's, which no firing brings
+            //   together: REFUSED, for a hand;
+            // - the primary alone naming this packet over another value is
+            //   what the next firing reads as its candidate and asks the
+            //   gates about: deferred, and the clock does resume it.
+            let is_primary = |ns: &str| ns == d.secret_namespace;
+            let lost: Vec<String> = unpromoted
+                .iter()
+                .filter_map(|(ns, name, s)| {
+                    if !s.next.is_for(job_id) {
+                        Some(format!(
+                            "{ns}/{name} (next.minted-for names {})",
+                            s.next.minted_for.as_deref().unwrap_or("nothing")
+                        ))
+                    } else if !is_primary(ns) && s.next.value.as_deref() != Some(value.as_str()) {
+                        Some(format!(
+                            "{ns}/{name} (next names this packet over another value than the \
+                             primary's)"
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let restaged = unpromoted.iter().any(|(ns, _, s)| {
+                is_primary(ns) && s.next.value.as_deref() != Some(value.as_str())
+            });
+            // The restaged primary comes first: its mirrors may differ from
+            // the value the gates were asked about only because they
+            // already hold the primary's new one.
+            let renamed = unpromoted.iter().any(|(_, _, s)| !s.next.is_for(job_id));
+            if restaged && !renamed {
+                return self
+                    .defer(
+                        rule,
+                        job_id,
+                        steps,
+                        "verify",
+                        format!(
+                            "next of {}/{} still names this packet but no longer holds the value \
+                             the gates were asked about; nothing is promoted and every copy is \
+                             left as it was read, and the next firing asks the gates about the \
+                             value next holds now",
+                            d.secret_namespace, d.secret_name
+                        ),
+                    )
+                    .await;
+            }
+            if !lost.is_empty() {
+                return Err(self
+                    .refuse(
+                        rule,
+                        job_id,
+                        steps,
+                        "verify",
+                        format!(
+                            "next is no longer the value this packet staged and the gates \
+                             accepted, in {}; it was replaced while the gates were read, so \
+                             nothing is promoted and every copy is left as it was read. \
+                             {STUCK_NEEDS_A_HAND}",
+                            lost.join("; ")
+                        ),
+                    )
+                    .await);
+            }
+            // Judged with the rest, so it too refuses before ANY copy is
+            // written: checked per copy at its write, a mirror was promoted
+            // and the primary then refused (review 34313729, F5).
+            if let Some((ns, name, _)) = unpromoted
+                .iter()
+                .find(|(_, _, s)| s.previous.value.is_some())
+            {
+                return Err(HandlerError::Permanent(format!(
+                    "Secret {ns}/{name}: previous holds a value, and promoting would drop it \
+                     without its drain; nothing is promoted"
+                )));
+            }
+            for (ns, name, s) in unpromoted {
                 let (cur_for, prev_for) = (minted_for_key(SLOTS[0]), minted_for_key(SLOTS[2]));
                 let next_for = minted_for_key(SLOTS[1]);
                 self.write_at(

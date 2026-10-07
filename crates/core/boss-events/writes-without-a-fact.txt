@@ -49,6 +49,7 @@ not-a-fact file crates/core/boss-classes/src/rebuild.rs -- projection rebuilder:
 not-a-fact file crates/core/boss-content/src/files/rebuild.rs -- projection rebuilder: replays content.file.* events from audit_log into file_refs
 not-a-fact file crates/core/boss-content/src/rebuild.rs -- projection rebuilder: replays content.bulletin.* events from audit_log into bulletins and dismissals
 not-a-fact file crates/core/boss-jobs/src/agent_runs/rebuild.rs -- projection rebuilder: replays agents.run.recorded from audit_log into agent_runs
+not-a-fact fn crates/core/boss-jobs/src/credentials/rebuild.rs::rebuild_credentials -- projection rebuilder: restores credential declarations, original phase receipts and Installed timestamps from complete audit_log history; emitting a new fact would duplicate the original event
 not-a-fact file crates/core/boss-jobs/src/rebuild.rs -- projection rebuilder: replays jobs.* events from audit_log into jobs and steps
 not-a-fact file crates/core/boss-jobs/src/scheduling/rebuild.rs -- projection rebuilder: replays scheduling events from audit_log into the scheduling tables
 not-a-fact file crates/core/boss-search/src/rebuild.rs -- projection rebuilder: search_index is rebuilt from the identity projections, themselves rebuilt from audit_log
@@ -150,12 +151,10 @@ gap fn crates/core/boss-jobs/src/delivery/postgres.rs::PgDeliveryPolicy::publish
 gap fn crates/core/boss-jobs/src/sensors/postgres.rs::PgSensors::publish -- a sensor registry row is published with no event
 # The privilege model: policy_rule_audit is a sibling table, not the log.
 gap fn crates/core/boss-policy/src/postgres.rs::PgPolicy::upsert_rule_judged -- a policy rule is created or changed with no event (only a policy_rule_audit row)
-gap fn crates/core/boss-policy/src/postgres.rs::PgPolicy::deactivate_rule -- a policy rule is deactivated with no event (only a policy_rule_audit row)
+gap fn crates/core/boss-policy/src/postgres.rs::PgPolicy::deactivate_rule_judged -- a policy rule is deactivated with no event (only a policy_rule_audit row); judged since car 3 of design 1c4e42e1, the same write under its new name
 gap fn crates/core/boss-policy/src/postgres.rs::PgPolicy::upsert_user_override_judged -- a user policy override is created or changed with no event (only a policy_rule_audit row)
 gap fn crates/core/boss-policy/src/postgres.rs::PgPolicy::deactivate_user_override_judged -- a user policy override is deactivated with no event (only a policy_rule_audit row)
 # Domain writes with no fact:
-gap fn crates/core/boss-content/src/postgres.rs::PgContent::create_section -- a manual section is created with no event (SECTION_CREATED is reserved in events.rs and never emitted)
-gap fn crates/core/boss-content/src/postgres.rs::PgContent::update_section -- a manual section is edited with no event (SECTION_UPDATED is reserved and never emitted)
 gap fn crates/core/boss-jobs/src/scheduling/postgres.rs::PgScheduling::materialize_shift_patterns -- availability materialized from shift patterns stages no event, so a rebuild from the log cannot reproduce it
 gap fn crates/core/boss-views/src/postgres.rs::PgViewsRepo::create -- an operator's saved View is created with no event
 gap fn crates/core/boss-views/src/postgres.rs::PgViewsRepo::replace -- an operator's saved View is replaced with no event

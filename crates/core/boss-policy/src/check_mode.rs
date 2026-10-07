@@ -35,13 +35,18 @@
 //!   the last mode move) and judges itself once (`clean_since`, `None`
 //!   while any row or any overflow stands) — enforce checklist F1 and F2
 //!   of review 1c2860f4. Mounted at `report` by
-//!   `infra/cluster/manifests/boss.yaml` since the report-prep car of
-//!   backlog b8e75382 (checklist F4), and read hourly by the
-//!   lapsed-grant alarm (`policy.check.refusals.alarm`, R3).
+//!   `infra/cluster/manifests/boss.yaml` from the report-prep car of
+//!   backlog b8e75382 (checklist F4) until row D's car, and read hourly
+//!   by the lapsed-grant alarm (`policy.check.refusals.alarm`, R3).
 //! * `enforce` — both arms are refused 403, naming the mode and the file
-//!   that is the way back. Still tallied, so a refusal is countable. Not
-//!   mounted anywhere: it waits on G1 (47aed706 car 3, checklist F3) and
-//!   row C, and a pin refuses the word in any manifest until then.
+//!   that is the way back. Still tallied, so a refusal is countable.
+//!   Mounted by `infra/cluster/manifests/boss.yaml` since row D's car,
+//!   after G1 (47aed706 car 3, checklist F3); the pin
+//!   `the_machine_gate_reports_and_refuses_nothing.rs` holds the word to
+//!   that one line. It bounds the caller with NO identity. It does not
+//!   prove a claimed one: [`Arm::Service`] trusts an asserted
+//!   `automation:` id until the machine gate enforces (row C), so a LAN
+//!   caller that asserts one at platform-admin is still answered.
 //!
 //! An unreadable file, or a word that is not a mode, is `report` said at
 //! ERROR — never `off`, and never `enforce`.
@@ -94,7 +99,7 @@ pub const REFUSALS_PATH: &str = "/api/policy/check/refusals";
 /// How many distinct keys one process holds; past it a new key is
 /// counted in `overflow`, so a caller spraying identities cannot grow the
 /// service's memory without bound.
-pub const MAX_TALLY_KEYS: usize = 1024;
+pub const MAX_TALLY_KEYS: usize = boss_core::gate_evidence::POLICY_TALLY_KEYS;
 /// Longest caller id or role kept in a key: both are caller text.
 const MAX_ID_CHARS: usize = 96;
 /// How often a mounted switch's tally is looked at with no check
@@ -186,27 +191,13 @@ pub struct Refusals {
 
 impl Refusals {
     fn judge(&mut self) {
-        let mut why = Vec::new();
-        if self.mode == Mode::Off {
-            why.push(
-                "mode `off` records nothing, so its silence is no evidence of anything".to_string(),
-            );
-        }
-        if !self.rows.is_empty() {
-            let checks: u64 = self.rows.iter().map(|r| r.count).sum();
-            why.push(format!(
-                "{} caller shape(s), {checks} check(s), that `enforce` refuses",
-                self.rows.len()
-            ));
-        }
-        if self.overflow > 0 {
-            why.push(format!(
-                "overflow {}: checks past the tally's {MAX_TALLY_KEYS} keys, which name no caller \
-                 and may include any — a full tally is never clean",
-                self.overflow
-            ));
-        }
-        why.extend(self.evidence.not_clean());
+        let why = boss_core::gate_evidence::policy_tally_reasons(
+            self.mode,
+            self.rows.len(),
+            self.rows.iter().map(|row| row.count).sum(),
+            self.overflow,
+            &self.evidence,
+        );
         self.clean_since = why.is_empty().then_some(self.recording_since);
         self.not_clean = why;
     }

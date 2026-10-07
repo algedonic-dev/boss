@@ -11,6 +11,7 @@ use boss_core::primitives::ClassRef;
 use boss_locations_client::LocationsClient;
 use sqlx::PgPool;
 
+use crate::coverage_guard::Change;
 use crate::departments::{DepartmentRoster, PgDepartmentRoster, validate_department};
 use crate::port::{PeopleError, PeopleRepository, refuse_another_id, refuse_malformed};
 use crate::types::*;
@@ -35,6 +36,7 @@ pub struct PgPeople {
     /// `employee` department Classes it was checked against until
     /// backlog c87e3d6d (see `crate::departments`).
     departments: Option<Arc<dyn DepartmentRoster>>,
+    coverage: Option<Arc<dyn crate::coverage_guard::CoverageRead>>,
 }
 
 impl PgPeople {
@@ -47,6 +49,7 @@ impl PgPeople {
             classes: None,
             locations: None,
             departments: None,
+            coverage: None,
         }
     }
 
@@ -68,7 +71,67 @@ impl PgPeople {
             classes: Some(classes),
             locations: Some(locations),
             departments: Some(departments),
+            coverage: None,
         }
+    }
+
+    pub fn with_coverage(mut self, source: Arc<dyn crate::coverage_guard::CoverageRead>) -> Self {
+        self.coverage = Some(source);
+        self
+    }
+
+    /// The coverage basis for one employee write, read before its
+    /// transaction — or `None` when the guard is not mounted, when the
+    /// write's own existence check will answer, or when the local roster
+    /// and keys show it cannot take a holder away
+    /// (`coverage_guard::can_orphan`). Only the last arm of that used to
+    /// exist: every write read the basis first, one request per employee
+    /// (review c3b96c09 F1).
+    async fn standing(
+        &self,
+        id: &str,
+        change: crate::coverage_guard::Change<'_>,
+    ) -> Result<Option<crate::coverage_guard::Standing>, PeopleError> {
+        let Some(source) = &self.coverage else {
+            return Ok(None);
+        };
+        let local = crate::coverage_guard_pg::read_unlocked(&self.pool).await?;
+        let Some(after) = crate::coverage_guard::roster_after(&local.roster, id, &change) else {
+            return Ok(None);
+        };
+        crate::coverage_guard::standing_for(
+            source.as_ref(),
+            &local.roster,
+            &local.keys,
+            &after,
+            &local.keys,
+        )
+        .await
+    }
+
+    /// The judgement inside the write's transaction, on the roster and
+    /// keys read under the guard's lock.
+    async fn judge_employee(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        standing: Option<&crate::coverage_guard::Standing>,
+        id: &str,
+        change: crate::coverage_guard::Change<'_>,
+    ) -> Result<(), PeopleError> {
+        if self.coverage.is_none() {
+            return Ok(());
+        }
+        let local = crate::coverage_guard_pg::read_locked(tx).await?;
+        let Some(after) = crate::coverage_guard::roster_after(&local.roster, id, &change) else {
+            return Ok(());
+        };
+        crate::coverage_guard::judge_at_commit(
+            standing,
+            &local.roster,
+            &local.keys,
+            &after,
+            &local.keys,
+        )
     }
 
     /// Reject writes whose `role` doesn't resolve to an active Class.
@@ -201,6 +264,7 @@ impl PeopleRepository for PgPeople {
         now: chrono::DateTime<chrono::Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<String, PeopleError> {
+        let standing = self.standing(&emp.id, Change::Create(emp)).await?;
         // Registry validation runs before the transaction so a
         // mis-typed code doesn't waste a Postgres connection.
         // Identity-first: validate only the descriptive fields that are
@@ -233,6 +297,8 @@ impl PeopleRepository for PgPeople {
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(|e| PeopleError::Storage(e.to_string()))?;
+        self.judge_employee(&mut tx, standing.as_ref(), &emp.id, Change::Create(emp))
+            .await?;
         // Identity write-through (subject-model R1, Q1): same tx as
         // the domain row.
         boss_subject_kinds::subjects::record_subject_in_tx(
@@ -274,6 +340,7 @@ impl PeopleRepository for PgPeople {
         now: chrono::DateTime<chrono::Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), PeopleError> {
+        let standing = self.standing(id, Change::Update(emp)).await?;
         // Identity-first: validate only the descriptive fields that are
         // present. An id-only employee record carries none of these yet;
         // each is validated against its Class registry once assigned.
@@ -308,6 +375,8 @@ impl PeopleRepository for PgPeople {
             return Err(PeopleError::NotFound(id.to_string()));
         }
         refuse_another_id(id, emp)?;
+        self.judge_employee(&mut tx, standing.as_ref(), id, Change::Update(emp))
+            .await?;
         refuse_unholdable(&mut tx, emp).await?;
         // UPSERT preserves `created_at` (load-bearing for rebuild
         // equality). Satellites still get full replacement since
@@ -346,11 +415,14 @@ impl PeopleRepository for PgPeople {
         now: chrono::DateTime<chrono::Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), PeopleError> {
+        let standing = self.standing(id, Change::Delete).await?;
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| PeopleError::Storage(e.to_string()))?;
+        self.judge_employee(&mut tx, standing.as_ref(), id, Change::Delete)
+            .await?;
         // A manager with a report is refused by name, as the double
         // refuses it — the foreign key answered a `Storage` error, a
         // 500, until backlog be459ab9.

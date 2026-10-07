@@ -1,0 +1,11 @@
+{
+  "about": "READ-ONLY fixed sanitized retained admission source-access probe, approved design f927de0c Q1, partial build90218205. No parameters. Reconciles the complete registered control-plane roster and generated audit configuration and capture-policy before deriving the configured audit file host mapping. Only that file and supported bounded rotation siblings are read through existing operator Talos credentials. Raw paths, names, records and diagnostics remain transient in bounded private pipes; no raw file is written or exported. Full inventories and complete bytes are read twice and configuration, policy and roster rechecked. Reports per-node access, opaque sink/content/inventory identities, counts and retained timestamps. Refuses denied, missing, malformed, truncated, unsupported, oversized, duplicate or unstable inputs. Drop/error coverage and historical continuity remain explicitly unavailable: access-positive never means history clean or complete. No new credential/grant, capture/export/retention change, policy flip or G1 release. Requires independent held full method/sanitizer review before live use. Exit4 is unavailable. Later bounded history adapter and live controls remain separate obligations.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/probe-admission-source-access.sh"
+  ],
+  "params": [],
+  "timeout": 900
+}

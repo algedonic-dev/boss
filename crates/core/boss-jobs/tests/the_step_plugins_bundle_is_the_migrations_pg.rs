@@ -1,6 +1,7 @@
 //! The platform step-plugin bundle (`infra/platform/step-plugins/`)
-//! declares exactly the ACTIVE rows the migrations produce — every
-//! column — and can be the registry's only home.
+//! preserves every column of migration history. Current declarations plus
+//! withdrawn historical fixtures describe those rows; only current declarations
+//! seed an empty registry. Withdrawal never retires an existing row.
 //!
 //! MEASURED 2026-09-18 on origin/main 6286857f (backlog 393d3234,
 //! consolidation H4, car 2 of 4). Seven migrations were the only place a
@@ -16,14 +17,14 @@
 //!
 //! TWO PINS, in the order the move needs them:
 //!
-//!   1. The bundle is COMPLETE before it becomes the home: the active
+//!   1. Current and withdrawn source declarations preserve the active
 //!      rows a TestDb holds after the migrations equal the rows the
-//!      bundle declares, kind for kind and column for column
+//!      migration rows, kind for kind and column for column
 //!      (`created_at` excepted — it is when the deployment was built,
 //!      not part of the declaration).
-//!   2. The bundle can be the ONLY home: with the `step_plugins` table
-//!      emptied, the seed's publish function recreates the migration
-//!      rows exactly — same versions, same columns, active.
+//!   2. With the `step_plugins` table emptied, the seed publishes only
+//!      current declarations. The independently checked historical fixtures
+//!      are test data, outside every production seed directory.
 //!
 //! And the refusal that makes editing safe: a bundle row that differs
 //! from the live active row of the same (kind, version) is refused by
@@ -39,6 +40,9 @@ use boss_jobs::step_plugin_seed::{
 use boss_jobs::{PgStepPlugins, StepPluginRegistry, StepPluginSpec};
 use boss_testing::TestDb;
 use std::collections::BTreeMap;
+
+#[path = "support/withdrawn_plugins.rs"]
+mod withdrawn_plugins;
 
 fn actor() -> ActorId {
     ActorId::Automation("platform-workflow-seed".into())
@@ -61,8 +65,22 @@ fn bundle() -> Vec<StepPluginSpec> {
     load_step_plugins(platform_step_plugins_path()).expect("the platform step-plugin bundle parses")
 }
 
-/// PIN 1 — every active row the migrations produce is declared in the
-/// bundle, column for column, and the bundle declares nothing else.
+fn historical_declarations() -> BTreeMap<String, serde_json::Value> {
+    let current = bundle();
+    let withdrawn = withdrawn_plugins::declarations();
+    let expected_count = current.len() + withdrawn.len();
+    let all: Vec<_> = current.into_iter().chain(withdrawn).collect();
+    let expected = declarations(&all);
+    assert_eq!(
+        expected.len(),
+        expected_count,
+        "current and historical kinds are disjoint"
+    );
+    expected
+}
+
+/// PIN 1 — every migrated row matches its current or withdrawn immutable
+/// source declaration, column for column, with no missing or extra history.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_bundle_declares_every_active_row_the_migrations_produce() {
     let db = TestDb::new().await;
@@ -71,34 +89,37 @@ async fn the_bundle_declares_every_active_row_the_migrations_produce() {
     assert!(!live.is_empty(), "the migrations seed at least one plugin");
 
     let from_migrations = declarations(&live);
-    let from_bundle = declarations(&bundle());
+    let from_bundle = historical_declarations();
 
     let migration_kinds: Vec<&String> = from_migrations.keys().collect();
     let bundle_kinds: Vec<&String> = from_bundle.keys().collect();
     assert_eq!(
         migration_kinds, bundle_kinds,
-        "the bundle's kinds must be exactly the migrations' active kinds \
-         (a plugin the migrations seed and the bundle does not declare has no home \
-         once migrations declare schema only)"
+        "the migration history equals current declarations plus independently retained withdrawn declarations"
     );
     for (kind, migrated) in &from_migrations {
         let declared = &from_bundle[kind];
         assert_eq!(
             declared, migrated,
-            "infra/platform/step-plugins/{kind}.toml must equal the active row the \
+            "the current or withdrawn source declaration for {kind} must equal the active row the \
              migrations produce, every column (left = bundle, right = migrations)"
         );
     }
 }
 
-/// PIN 2 — with the table emptied, the seed alone rebuilds exactly the
-/// migration rows: same versions, same columns, all active.
+/// PIN 2 — with the table emptied, the seed publishes current declarations
+/// only, conserving their versions and columns without resurrecting withdrawals.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_emptied_registry_is_rebuilt_from_the_bundle_alone() {
     let db = TestDb::new().await;
     let registry = PgStepPlugins::new(db.pool.clone());
     let before = registry.list_active(None).await.expect("list_active");
-    let expected = declarations(&before);
+    assert_eq!(
+        declarations(&before),
+        historical_declarations(),
+        "all migrated historical columns retain their original source provenance"
+    );
+    let expected = declarations(&bundle());
 
     sqlx::query("DELETE FROM step_plugins")
         .execute(&db.pool)
@@ -126,7 +147,7 @@ async fn an_emptied_registry_is_rebuilt_from_the_bundle_alone() {
     assert_eq!(
         declarations(&after),
         expected,
-        "the seed must recreate the migration rows exactly — the bundle can be the only home"
+        "an empty registry gets only current declarations, not withdrawn history"
     );
     for row in &after {
         assert_eq!(row.status, WorkflowStatus::Active, "{} is active", row.kind);
@@ -160,13 +181,18 @@ async fn a_present_registry_is_left_untouched() {
     let db = TestDb::new().await;
     let registry = PgStepPlugins::new(db.pool.clone());
     let before = declarations(&registry.list_active(None).await.expect("list_active"));
+    assert_eq!(
+        before,
+        historical_declarations(),
+        "the independent historical source oracle holds before seeding"
+    );
 
     let report = seed_step_plugins(&registry, &bundle(), &actor(), chrono::Utc::now(), false)
         .await
         .expect("a present registry is not a failure");
     assert_eq!(
         report.count(|o| matches!(o, SeedOutcome::Present)),
-        before.len(),
+        bundle().len(),
         "every bundle row is already present: {report}"
     );
     assert_eq!(report.count(|o| matches!(o, SeedOutcome::Inserted)), 0);

@@ -152,7 +152,7 @@ fn app() -> (axum::Router, Arc<InMemoryJobs>) {
 /// `protocols: false` plumbs no Workflow registry: every kind is
 /// admitted, steps are added by hand, and nothing re-evaluates them.
 fn app_with(protocols: bool) -> (axum::Router, Arc<InMemoryJobs>) {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds.seed(spec()).expect("seed the kind");
     let jobs = Arc::new(InMemoryJobs::new());
     let policy: Arc<dyn PolicyClient> = Arc::new(

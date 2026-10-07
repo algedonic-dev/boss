@@ -83,7 +83,30 @@ async fn main() -> Result<()> {
     }
 
     let state = MlApiState { repo, dispatcher };
-    let app = router(state);
+    let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+        boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+        Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+    ));
+    let mode = Arc::new(boss_policy_client::role_reader::MountedReportMode::mount());
+    let source = Arc::new(boss_policy_client::role_reader::HttpRoleReader::new(
+        std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
+        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
+        boss_policy_client::User::service("ml"),
+    )?);
+    let wiring = boss_policy_client::role_service::assemble(
+        "ml",
+        "/api/ml/actor-role-reports",
+        Arc::new(boss_policy_client::ReqwestPolicyClient::new(
+            "ml",
+            std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
+        )),
+        roles.clone(),
+        mode.clone(),
+        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
+            boss_policy_client::role_service::REPORT_CAPACITY,
+        )),
+    );
+    let app = ml_http_router(router(state), wiring.inventory);
 
     let http_addr: SocketAddr = cfg
         .http_bind
@@ -99,6 +122,139 @@ async fn main() -> Result<()> {
         &["/api/ml/health"],
         Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
     );
-    axum::serve(listener, app).await?;
+    boss_policy_client::role_service::serve_with_refresh(
+        listener,
+        app,
+        roles,
+        source,
+        mode,
+        boss_policy_client::role_service::REFRESH_CADENCE,
+        boss_policy_client::role_service::shutdown_signal(),
+    )
+    .await?;
     Ok(())
+}
+
+fn ml_http_router(domain: axum::Router, inventory: axum::Router) -> axum::Router {
+    domain.merge(inventory)
+}
+
+#[cfg(test)]
+mod role_inventory_tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use boss_policy_client::{Action, FakePolicyClient, Resource, Scope, User};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn ml_mount_preserves_domain_and_protects_inventory() {
+        let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+            boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+            Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+        ));
+        let tally = Arc::new(boss_policy_client::role_reporting::ReportTally::new(8));
+        let policy = Arc::new(
+            FakePolicyClient::builder()
+                .allow(
+                    "report-reader",
+                    Action::Read,
+                    Resource::policy_rule(),
+                    Scope::All,
+                )
+                .build(),
+        );
+        let wiring = boss_policy_client::role_service::assemble(
+            "ml",
+            "/api/ml/actor-role-reports",
+            policy,
+            roles,
+            Arc::new(boss_policy_client::role_reporting::ReportMode::Report),
+            tally.clone(),
+        );
+        let app = ml_http_router(
+            router(MlApiState {
+                repo: Arc::new(boss_ml::InMemoryMlRepo::new()),
+                dispatcher: None,
+            }),
+            wiring.inventory,
+        );
+        let domain = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ml/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(domain.status(), StatusCode::OK);
+        let health: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(domain.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(health["status"], "ok");
+        for path in [
+            "/api/ml/models/mdl-test/infer/entity-test",
+            "/api/ml/models/mdl-test/infer-batch",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap(),
+                "inference dispatcher not wired"
+            );
+        }
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ml/actor-role-reports")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let mut user = User::service("reader");
+        user.role = "report-reader".into();
+        let allowed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ml/actor-role-reports")
+                    .header("x-boss-user", serde_json::to_string(&user).unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(allowed.into_body(), 16384)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["service"], "ml");
+        assert_eq!(body["snapshot"]["state"], "never-loaded");
+        assert_eq!(body["report"]["durable_window"], false);
+        assert!(tally.snapshot().rows.is_empty());
+    }
 }

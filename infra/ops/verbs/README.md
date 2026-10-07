@@ -59,7 +59,37 @@ can leave a completely captured partial answer with a failed exit.
 
 The explicit volume-plan reader opts in so its plan bytes remain apart
 from live-space diagnostics and its printed hash (backlog f3a09e07,
-parent 53c8cb72). Dynamic discovery/request chaining remains separate.
+parent 53c8cb72).
+
+## Discovered remedies
+
+An approval verb may declare `discovery_remedies` with `finding_class`,
+`scope`, `discovery_verb` and ordered `arg_fields`. The fields name direct
+strings on that scope's finding; joined with `/` they must conserve its
+identity. The discovery verb must be a same-host READ-ONLY registry row
+with separate-stream capture and exactly those initial mutation params.
+It proposes the remaining explicit arguments; it never receives the
+signed hash or permission to mutate.
+
+The estate reactor first applies the final remedy's whole-board,
+recent-request and declined-episode guards, then files one native
+discovery request for that final successor. On completion the second
+reactor fetches the authoritative request and execute step, verifies
+successful complete stdout bytes against their receipt, and accepts one
+JSON object containing exactly `verb`, `args`, `plan`, `plan_sha256`.
+The verb is the declared plan verb; arguments satisfy the mutation's
+existing schema and preserve the discovery target; the plan's exact
+bytes must hash to the recorded hash. It rechecks final guards and
+episode identity before filing, retaining the proposal and source
+request/step/stream on the approval request. Partial output, failed
+reads and ambiguous proposals file no approval request.
+
+Largest-fit volume discovery uses this boundary. No whole-GiB growth
+that fits remains a native explicit refusal, with full stdout/stderr
+and exit retained; no replica is guessed or moved. A filed expansion
+request still waits for the named approver's passkey on the ordinary
+runner's freshly rendered explicit plan. Report-only PVC intent and
+live capacity observations grant no storage authority.
 
 ## Authorization
 

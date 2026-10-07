@@ -122,7 +122,17 @@ pub fn wall_now() -> chrono::DateTime<Utc> {
 pub fn subscribe_ticks(base_url: impl Into<String>) -> impl Stream<Item = ClockNow> + Send {
     let url = format!("{}/api/clock/ticks", base_url.into().trim_end_matches('/'));
     async_stream::stream! {
-        let client = reqwest::Client::new();
+        // Keep SSE untimed; the shared transport stamps each reconnect
+        // from the watched mount and refuses redirects (2710, 45bb3797).
+        let client = loop {
+            match boss_core::machine_token::Client::build(reqwest::Client::builder()) {
+                Ok(client) => break client,
+                Err(error) => {
+                    tracing::warn!(%error, "clock /ticks client unavailable; retrying");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        };
         loop {
             match client.get(&url).send().await {
                 Ok(resp) if resp.status().is_success() => {
@@ -216,7 +226,7 @@ impl boss_core::publisher::SimulatedProbe for ClockSimProbe {
 /// network hop is amortized.
 pub struct ReqwestClockClient {
     url: String,
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     cache_ttl: Duration,
     cache: RwLock<Option<(Instant, ClockNow)>>,
 }
@@ -225,10 +235,10 @@ impl ReqwestClockClient {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(2))
-                .build()
-                .expect("default reqwest client always builds"),
+            client: boss_core::machine_token::Client::build(
+                reqwest::Client::builder().timeout(Duration::from_secs(2)),
+            )
+            .expect("default reqwest client always builds"),
             cache_ttl: Duration::from_millis(100),
             cache: RwLock::new(None),
         }

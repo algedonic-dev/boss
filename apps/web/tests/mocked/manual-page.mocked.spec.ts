@@ -1,3 +1,4 @@
+import { isPageWrite } from './_smokeMocks';
 // /manual — every control the page renders, pinned against a NON-EMPTY
 // tree (page audit 5ab2662c, step `test`).
 //
@@ -13,7 +14,7 @@
 // The measure step's inventory (controls_md on the packet), which this
 // spec covers item by item:
 //   links    2 kinds  — tree section link; entity link in a section body
-//   buttons  1 kind   — tree toggle (Expand / Collapse; a no-op on a leaf)
+//   buttons  1 kind   — tree toggle (Expand / Collapse, parents only)
 //   forms    0
 //   reads    3        — the tree, the active section, and one
 //                        /api/people/{id} per employee shortcode in
@@ -157,12 +158,11 @@ test.describe('/manual — the page chrome and its two spellings', () => {
     await expect(page.locator('.manual-tree-label')).toHaveCount(SECTIONS.length);
   });
 
-  // CURRENT, gap 1 (ee688ba9): the catalog row exists, but nothing in
-  // the app links to it — the URL has to be typed. The smoke persona's
+  // The Home entrance uses the existing catalog row (ee688ba9). The smoke persona's
   // session carries no role, and a role-less sidebar renders no rows at
   // all, so this leg signs in a role that sees every surface; the
   // control is the Home sidebar's My Day row, on the same page.
-  test('CURRENT, gap 1: no link anywhere in the app shell leads to the manual', async ({ page }) => {
+  test('the Home sidebar opens the manual through its catalog entrance', async ({ page }) => {
     await installManualReads(page);
     await page.route(/\/api\/session$/, (r) =>
       json(r, { username: 'david', employee_id: 'emp-001', role: 'platform-admin' }));
@@ -173,7 +173,12 @@ test.describe('/manual — the page chrome and its two spellings', () => {
     await mountPage(page, '/ux/manual', { titleMatch: /Company manual/ });
 
     await expect(page.locator('.shell-nav').getByRole('link', { name: 'My Day', exact: true }).first()).toBeVisible();
-    await expect(page.locator('a[href="/manual"], a[href="/ux/manual"]')).toHaveCount(0);
+    const manual = page.locator('.shell-nav').getByRole('link', { name: 'Manual', exact: true });
+    await expect(manual).toBeVisible();
+    await expect(manual).toHaveAttribute('href', '/manual');
+    await manual.click();
+    await expect(page).toHaveURL(/\/manual$/);
+    await expect(page.locator('.manual-tree-label')).toHaveCount(SECTIONS.length);
   });
 });
 
@@ -328,30 +333,24 @@ test.describe('/manual — tree toggles', () => {
     await expect.poll(() => storedCollapsed(page)).toBe('["policies"]');
   });
 
-  // CURRENT, gap 8 (e703e1af): every leaf renders a toggle button with
-  // no text and no accessible name, and clicking it does nothing. With
-  // no glyph it collapses to zero height, so a pointer cannot reach it
-  // (Playwright calls it not visible) — but it is still a button, and
-  // still a keyboard tab stop with nothing to announce. The click is
-  // dispatched for that reason.
-  test('CURRENT, gap 8: a leaf renders an unlabelled toggle that does nothing', async ({ page }) => {
+  // Gap 8 (e703e1af): leaves have a section link, never a no-op tab stop.
+  test('leaf links remain navigable without empty toggle buttons', async ({ page }) => {
     await installManualReads(page);
     await mountPage(page, '/ux/manual', { titleMatch: /Company manual/ });
 
-    await expect(page.locator('button.manual-tree-toggle')).toHaveCount(SECTIONS.length);
+    await expect(page.locator('button.manual-tree-toggle')).toHaveCount(PARENTS.length);
     for (const s of PARENTS) {
       const title = SECTIONS.find((x) => x.slug === s)!.title;
       await expect(node(page, title).locator('button.manual-tree-toggle')).toHaveAttribute('aria-label', 'Collapse');
     }
     for (const s of LEAVES) {
       const title = SECTIONS.find((x) => x.slug === s)!.title;
-      const toggle = node(page, title).locator('button.manual-tree-toggle');
-      await expect(toggle).toHaveText('');
-      expect(await toggle.getAttribute('aria-label')).toBeNull();
-      await toggle.focus();
-      await expect(toggle).toBeFocused();
-      await toggle.dispatchEvent('click');
-      await expect(page).toHaveURL(/\/ux\/manual$/);
+      await expect(node(page, title).locator('button')).toHaveCount(0);
+      const link = node(page, title).locator('a.manual-tree-label');
+      await link.focus();
+      await expect(link).toBeFocused();
+      await page.keyboard.press('Enter');
+      await expect(page).toHaveURL(new RegExp(`/ux/manual/${s}$`));
     }
     expect(await storedCollapsed(page)).toBeNull();
     await expect.poll(() => treeTitles(page)).toEqual(TREE_ORDER.map(([t]) => t));
@@ -376,14 +375,13 @@ test.describe('/manual — the section body', () => {
     await expect(page.locator('article.manual-article h2')).toHaveText('Welcome');
   });
 
-  // CURRENT, gap 4 (d1b6cfef): the seed says bodies are markdown; the
-  // page renders them as plain text, so emphasis shows as underscores.
-  test('CURRENT, gap 4: a markdown body renders as plain text, underscores and all', async ({ page }) => {
+  // Authored seed markdown is rendered, not shown as literal delimiters (d1b6cfef).
+  test('a markdown body renders the seed owner annotation as emphasis', async ({ page }) => {
     await installManualReads(page);
     await mountPage(page, '/ux/manual/policies/security', { titleMatch: /Company manual/ });
 
-    await expect(page.locator('.manual-article-body')).toHaveText('_TBD, owner: Operations lead._');
-    await expect(page.locator('.manual-article-body em')).toHaveCount(0);
+    await expect(page.locator('.manual-article-body')).toHaveText('TBD, owner: Operations lead.');
+    await expect(page.locator('.manual-article-body em')).toHaveText('TBD, owner: Operations lead.');
   });
 });
 
@@ -417,21 +415,21 @@ test.describe('/manual — empty and failed reads are never the same paint', () 
     await expect(page.getByText('No sections yet.')).toHaveCount(0);
   });
 
-  // CURRENT, gap 2 (e8394d44), first half: a non-404 failure of the
-  // section read paints a line with no status and no failure marker.
-  test('CURRENT, gap 2: a failed section read on first load says "Unable to load section." and nothing more', async ({ page }) => {
+  // Gap 2 (e8394d44): a section failure must name the failed read,
+  // rather than look empty or retain another section under its URL.
+  test('a failed section read on first load names its status', async ({ page }) => {
     await installManualReads(page);
     await page.route(SECTION, (r) => json(r, { error: 'content down' }, 500));
     await mountPage(page, '/ux/manual/welcome', { titleMatch: /Company manual/ });
 
-    await expect(page.locator('.manual-content')).toHaveText('Unable to load section.');
-    await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
+    const failed = page.locator(`.manual-content ${FAILURE_MARKER}`);
+    await expect(failed).toHaveText("Couldn't load section — HTTP 500");
+    await expect(failed).toHaveAttribute('role', 'alert');
+    await expect(page.locator('article.manual-article')).toHaveCount(0);
+    await expect(page.getByText('Unable to load section.')).toHaveCount(0);
   });
 
-  // CURRENT, gap 2 (e8394d44), second half: after the reader moves from
-  // one section to another whose read fails, the FIRST section's article
-  // stays on screen under the second's URL — false content.
-  test('CURRENT, gap 2: a failed section read after navigating keeps the previous section on screen', async ({ page }) => {
+  test('a failed section read after navigating clears the previous section', async ({ page }) => {
     await installManualReads(page);
     await page.route(/\/api\/content\/manual\/policies\/security$/, (r) => json(r, { error: 'content down' }, 500));
     await mountPage(page, '/ux/manual/welcome', { titleMatch: /Company manual/ });
@@ -440,9 +438,83 @@ test.describe('/manual — empty and failed reads are never the same paint', () 
     await page.getByRole('link', { name: 'Security', exact: true }).click();
     await expect(page).toHaveURL(/\/ux\/manual\/policies\/security$/);
     await expect(node(page, 'Security')).toHaveClass(/manual-tree-active/);
+    await expect(page.locator(`.manual-content ${FAILURE_MARKER}`)).toHaveText("Couldn't load section — HTTP 500");
+    await expect(page.locator('article.manual-article')).toHaveCount(0);
+    await page.getByRole('link', { name: 'Welcome', exact: true }).click();
     await expect(page.locator('article.manual-article h2')).toHaveText('Welcome');
-    await expect(page.locator('.manual-article-eyebrow')).toHaveText('welcome');
-    await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
+    await expect(page.locator(`.manual-content ${FAILURE_MARKER}`)).toHaveCount(0);
+  });
+
+  for (const navigating of [false, true]) {
+    test(`a section read that throws ${navigating ? 'after navigating' : 'on first load'} says so without an old article`, async ({ page }) => {
+      await installManualReads(page);
+      await page.route(/\/api\/content\/manual\/policies\/security$/, (r) => r.abort('connectionrefused'));
+      await mountPage(page, navigating ? '/ux/manual/welcome' : '/ux/manual/policies/security', { titleMatch: /Company manual/ });
+      if (navigating) {
+        await expect(page.locator('article.manual-article h2')).toHaveText('Welcome');
+        await page.getByRole('link', { name: 'Security', exact: true }).click();
+      }
+      const failed = page.locator(`.manual-content ${FAILURE_MARKER}`);
+      await expect(failed).toContainText("Couldn't load section — ");
+      await expect(failed).toHaveAttribute('role', 'alert');
+      await expect(page.locator('article.manual-article')).toHaveCount(0);
+    });
+  }
+
+  // An error's diagnostic may be empty; failure presence must still
+  // produce the accessible failure state (formal review debe9c03).
+  for (const failureAt of ['fetch', 'JSON'] as const) {
+    for (const navigating of [false, true]) {
+      test(`an empty-message ${failureAt} error ${navigating ? 'after navigating' : 'on first load'} remains an accessible section failure`, async ({ page }) => {
+        await installManualReads(page);
+        await page.addInitScript((at) => {
+          const original = window.fetch.bind(window);
+          const read = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+            const path = new URL(input instanceof Request ? input.url : String(input), location.origin).pathname;
+            const selected = path === '/api/content/manual/policies/security';
+            if (selected && at === 'fetch') throw new Error('');
+            const response = await original(input, init);
+            if (selected && at === 'JSON') {
+              Object.defineProperty(response, 'json', { value: async () => { throw new Error(''); } });
+            }
+            return response;
+          };
+          Object.defineProperty(window, 'fetch', { value: read });
+        }, failureAt);
+        await mountPage(page, navigating ? '/ux/manual/welcome' : '/ux/manual/policies/security', { titleMatch: /Company manual/ });
+        if (navigating) {
+          await expect(page.locator('article.manual-article h2')).toHaveText('Welcome');
+          await page.getByRole('link', { name: 'Security', exact: true }).click();
+        }
+        const failed = page.locator(`.manual-content ${FAILURE_MARKER}`);
+        await expect(failed).toHaveAttribute('role', 'alert');
+        await expect(failed).toContainText("Couldn't load section");
+        await expect(page.locator('article.manual-article')).toHaveCount(0);
+        await expect(page.getByText('Unable to load section.')).toHaveCount(0);
+        await page.getByRole('link', { name: 'Welcome', exact: true }).click();
+        await expect(page.locator('article.manual-article h2')).toHaveText('Welcome');
+        await expect(failed).toHaveCount(0);
+      });
+    }
+  }
+
+  test('an earlier section read that finishes late cannot replace the selected failure', async ({ page }) => {
+    await installManualReads(page);
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    await page.route(/\/api\/content\/manual\/welcome$/, async (r) => { await held; await json(r, SECTIONS[1]); });
+    await page.route(/\/api\/content\/manual\/policies\/security$/, (r) => json(r, { error: 'content down' }, 500));
+    await mountPage(page, '/ux/manual/welcome', { titleMatch: /Company manual/ });
+    await expect(page.locator('.manual-content')).toHaveText('Loading…');
+    await page.getByRole('link', { name: 'Security', exact: true }).click();
+    const failed = page.locator(`.manual-content ${FAILURE_MARKER}`);
+    await expect(failed).toHaveText("Couldn't load section — HTTP 500");
+    const response = page.waitForResponse(/\/api\/content\/manual\/welcome$/);
+    release();
+    await (await response).finished();
+    await expect(page).toHaveURL(/\/ux\/manual\/policies\/security$/);
+    await expect(failed).toHaveText("Couldn't load section — HTTP 500");
+    await expect(page.locator('article.manual-article')).toHaveCount(0);
   });
 
   // Gap 3 (5013bef4), FIXED by backlog 1e73bd93: this test was
@@ -492,12 +564,12 @@ test.describe('/manual — writes', () => {
   // refused-write leg has nothing to refuse. What IS pinned is the zero
   // — a write added to this page without a refusal leg fails here
   // first. /api/surface-opens is the shell's open telemetry, silent by
-  // design (interaction-crawl's SILENT_WRITES), and not the page's.
+  // design (the shared shell-write declaration), and not the page's.
   test('the page issues no write while it is read, navigated and toggled', async ({ page }) => {
     const writes: string[] = [];
     page.on('request', (req) => {
       const url = new URL(req.url());
-      if (req.method() !== 'GET' && url.pathname.startsWith('/api/') && url.pathname !== '/api/surface-opens') {
+      if (isPageWrite(req.method(), url.pathname)) {
         writes.push(`${req.method()} ${url.pathname}`);
       }
     });
@@ -507,7 +579,7 @@ test.describe('/manual — writes', () => {
     await page.getByRole('link', { name: 'Welcome', exact: true }).click();
     await expect(page.locator('article.manual-article h2')).toHaveText('Welcome');
     await node(page, 'Policies').locator('button.manual-tree-toggle').click();
-    await node(page, 'Welcome').locator('button.manual-tree-toggle').dispatchEvent('click');
+    await expect(node(page, 'Welcome').locator('button.manual-tree-toggle')).toHaveCount(0);
     await page.getByRole('link', { name: 'Benefits', exact: true }).click();
     await expect(page.locator('article.manual-article h2')).toHaveText('Benefits');
 

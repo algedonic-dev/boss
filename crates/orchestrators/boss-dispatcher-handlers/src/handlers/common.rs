@@ -1420,9 +1420,11 @@ mod lane_pin {
         // a reading of the registry against the tree; nineteen since
         // `policy.check.refusals.alarm` (backlog b8e75382 R3), a lapsed
         // service grant read off the policy check's tally, stamped
-        // `Telemetry` like the coverage backstop beside it.
+        // `Telemetry` like the coverage backstop beside it; twenty since
+        // the registry-declared failed chore without RED lines (e4a9a9b3)
+        // reaches its owner, stamped `PipelineFailure` by the fallback.
         assert_eq!(
-            filings, 19,
+            filings, 20,
             "the number of machine filing sites changed. That is fine — but check the new \
              one stamps a lane, then update this count, which exists so a filing that \
              DISAPPEARS from the scan (a renamed key, a reshaped body) cannot read as \

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { safeLinkHref } from '@boss/web-kit/links';
   // Public unauth landing surface at `/`. A marketing hero over the
   // live System-Model view — Jobs in flight right now plus the
   // per-Workflow step-graph each Job is walking. The live view itself
@@ -17,6 +18,7 @@
   // The live view below is exempt by construction: it is read from the
   // live registry, so it cannot drift from it.
   import SystemModelLiveView from './SystemModelLiveView.svelte';
+  import { PUBLIC_MIRROR_URL } from '../public-source';
 </script>
 
 <div class="landing">
@@ -44,7 +46,7 @@
   <footer class="cta">
     <a class="cta-link" data-claim="cta.signin" href="/login">Sign in to operate the brewery →</a>
     <span class="docs">
-      <a data-claim="source.repo" href="https://github.com/algedonic-dev/boss" target="_blank" rel="noopener">Source on GitHub</a>
+      <a data-claim="source.repo" href={safeLinkHref(PUBLIC_MIRROR_URL)} target="_blank" rel="noopener">Source on GitHub</a>
     </span>
   </footer>
 </div>

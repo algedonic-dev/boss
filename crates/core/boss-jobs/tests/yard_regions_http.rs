@@ -125,7 +125,7 @@ fn task_station_row() -> boss_jobs::StationSpec {
 /// inbound kinds can be named — and the task station beside the dock.
 fn app_with_intake() -> (axum::Router, Arc<InMemoryJobs>) {
     let jobs = Arc::new(InMemoryJobs::new());
-    let kinds = Arc::new(boss_jobs::InMemoryWorkflows::new());
+    let kinds = Arc::new(boss_jobs::InMemoryWorkflows::for_fixture());
     for spec in boss_jobs::registry::seedable_platform_workflows() {
         kinds.seed(spec).expect("seed platform kind");
     }

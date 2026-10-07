@@ -1,9 +1,7 @@
 <script lang="ts">
-  // Render a plain-text body with entity-ID shortcodes promoted to
-  // EntityLinks. Svelte port of apps/web/src/content/RichBody.tsx.
-
-  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
-  import { tokenize } from './richBody';
+  import { navigate } from '@boss/web-kit/nav';
+  import { safeLinkHref } from '@boss/web-kit/links';
+  import { renderRichMarkdown } from './richMarkdown';
 
   type Props = {
     body: string;
@@ -12,17 +10,22 @@
   };
   let { body, employeeNames, className = '' }: Props = $props();
 
-  let tokens = $derived(tokenize(body));
+  let rendered = $derived(renderRichMarkdown(body, employeeNames));
+
+  function followInternalLinks(node: HTMLElement) {
+    const click = (event: MouseEvent) => {
+      const target = event.target instanceof Element ? event.target.closest('a') : null;
+      if (!target || !node.contains(target)) return;
+      event.stopPropagation();
+      if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) return;
+      const path = target.getAttribute('href');
+      if (!path?.startsWith('/') || safeLinkHref(path) === null) return;
+      event.preventDefault();
+      navigate(path);
+    };
+    node.addEventListener('click', click);
+    return { destroy: () => node.removeEventListener('click', click) };
+  }
 </script>
 
-<span class={className} style="white-space:pre-wrap">
-  {#each tokens as t, i (i)}
-    {#if t.kind === 'text'}
-      {t.text}
-    {:else}
-      {@const label =
-        t.entityKind === 'employee' ? employeeNames?.get(t.id) : undefined}
-      <EntityLink kind={t.entityKind} id={t.id} label={label ?? undefined} />
-    {/if}
-  {/each}
-</span>
+<div class={className} use:followInternalLinks>{@html rendered}</div>

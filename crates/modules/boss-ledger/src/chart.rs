@@ -58,6 +58,9 @@ pub const NORMAL_BALANCES: [&str; 2] = ["debit", "credit"];
 pub struct AccountInput {
     pub code: String,
     pub name: String,
+    /// Tenant-authored explanatory text, absent on historical charts (c8b71886).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub kind: String,
     #[serde(alias = "normal_side")]
     pub normal_balance: String,
@@ -74,6 +77,7 @@ pub struct AccountInput {
 pub struct RegisteredAccount {
     pub code: String,
     pub name: String,
+    pub description: Option<String>,
     pub kind: String,
     pub normal_balance: String,
     pub parent: Option<String>,
@@ -86,6 +90,9 @@ impl RegisteredAccount {
         let mut out = Vec::new();
         if self.name != declared.name {
             out.push("name".to_string());
+        }
+        if self.description != declared.description {
+            out.push("description".to_string());
         }
         if self.kind != declared.kind {
             out.push("kind".to_string());
@@ -164,6 +171,12 @@ pub fn validate(rows: &[AccountInput]) -> Result<(), String> {
         }
         if r.name.trim().is_empty() {
             return Err(format!("{at}: name is empty"));
+        }
+        if r.description
+            .as_deref()
+            .is_some_and(|text| text.trim().is_empty())
+        {
+            return Err(format!("{at}: description is empty — omit it when unknown"));
         }
         if !ACCOUNT_KINDS.contains(&r.kind.as_str()) {
             return Err(format!(
@@ -274,19 +287,21 @@ mod pg {
         for r in rows {
             // The registered row for this code, joined to its parent's
             // code so `differs_from` compares in the declaration's terms.
-            let existing: Option<(String, String, String, Option<String>)> = sqlx::query_as(
-                "SELECT a.name, a.kind, a.normal_side, p.code \
+            let existing: Option<(String, Option<String>, String, String, Option<String>)> =
+                sqlx::query_as(
+                    "SELECT a.name, a.description, a.kind, a.normal_side, p.code \
                  FROM gl_accounts a LEFT JOIN gl_accounts p ON p.id = a.parent_id \
                  WHERE a.code = $1",
-            )
-            .bind(&r.code)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| LedgerError::Storage(e.to_string()))?;
-            if let Some((name, kind, normal_balance, parent)) = existing {
+                )
+                .bind(&r.code)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| LedgerError::Storage(e.to_string()))?;
+            if let Some((name, description, kind, normal_balance, parent)) = existing {
                 let have = RegisteredAccount {
                     code: r.code.clone(),
                     name,
+                    description,
                     kind,
                     normal_balance,
                     parent,
@@ -320,8 +335,8 @@ mod pg {
             };
             let id = Uuid::new_v4();
             let result = sqlx::query(
-                "INSERT INTO gl_accounts (id, code, name, kind, normal_side, parent_id) \
-                 VALUES ($1, $2, $3, $4, $5, $6) \
+                "INSERT INTO gl_accounts (id, code, name, kind, normal_side, parent_id, description) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
                  ON CONFLICT (code) DO NOTHING",
             )
             .bind(id)
@@ -330,6 +345,7 @@ mod pg {
             .bind(&r.kind)
             .bind(&r.normal_balance)
             .bind(parent_id)
+            .bind(&r.description)
             .execute(&mut *tx)
             .await
             .map_err(|e| LedgerError::Storage(e.to_string()))?;
@@ -359,6 +375,7 @@ mod tests {
         AccountInput {
             code: code.into(),
             name: name.into(),
+            description: None,
             kind: kind.into(),
             normal_balance: nb.into(),
             parent: parent.map(str::to_string),
@@ -393,6 +410,43 @@ normal_balance = "credit"
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[1].parent.as_deref(), Some("1000"));
         assert_eq!(rows[2].kind, "revenue");
+    }
+
+    #[test]
+    fn a_description_is_optional_but_an_authored_blank_is_refused() {
+        let legacy = row("2450", "Tenant obligation", "liability", "credit", None);
+        let mut json = serde_json::to_value(&legacy).unwrap();
+        assert!(json.get("description").is_none());
+        json["description"] = serde_json::Value::Null;
+        let nullable: AccountInput = serde_json::from_value(json).unwrap();
+        assert_eq!(nullable.description, None);
+        assert!(validate(&[nullable]).is_ok());
+        for blank in ["", " \t\n"] {
+            let mut authored = legacy.clone();
+            authored.description = Some(blank.into());
+            let error = validate(&[authored]).unwrap_err();
+            assert!(error.contains("description"), "{error}");
+        }
+    }
+
+    #[test]
+    fn an_optional_chart_description_is_authored_and_preserved() {
+        let rows = parse_chart_toml(
+            "[[account]]\ncode = \"2450\"\nname = \"Tenant tax obligation\"\nkind = \"liability\"\nnormal_balance = \"credit\"\ndescription = \"Declared by this tenant, without a simulator schedule\"\n",
+        )
+        .unwrap();
+        let value = serde_json::to_value(&rows[0]).unwrap();
+        assert_eq!(
+            value["description"],
+            "Declared by this tenant, without a simulator schedule"
+        );
+        let original = parse_chart_toml(FILE).unwrap();
+        assert!(
+            serde_json::to_value(&original[0])
+                .unwrap()
+                .get("description")
+                .is_none()
+        );
     }
 
     #[test]
@@ -473,6 +527,7 @@ normal_balance = "credit"
         let starter = RegisteredAccount {
             code: "1000".into(),
             name: "Cash".into(),
+            description: None,
             kind: "asset".into(),
             normal_balance: "debit".into(),
             parent: None,

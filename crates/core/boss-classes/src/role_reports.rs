@@ -16,6 +16,35 @@ use boss_policy_client::{CurrentUser, Decision, PolicyClient, Scope, controls};
 
 use crate::http::{ClassesApiState, router};
 
+/// The complete, expiring registry projection used by estate-wide reporting.
+/// The inventory names unloaded snapshots and uses the original authorizer.
+pub fn mount_snapshot(
+    state: ClassesApiState,
+    roles: Arc<boss_policy_client::role_reader::SnapshotRoleReader>,
+    mode: Arc<dyn ReportModeSource>,
+    tally: Arc<ReportTally>,
+) -> Router {
+    let inventory = boss_policy_client::role_inventory::router(
+        "classes",
+        "/api/classes/actor-role-reports",
+        state.policy.clone(),
+        roles.clone(),
+        mode.clone(),
+        tally.clone(),
+    );
+    let policy = Arc::new(ReportingPolicyClient::with_mode_source(
+        state.policy,
+        roles,
+        tally,
+        mode,
+    ));
+    router(ClassesApiState {
+        classes: state.classes,
+        policy,
+    })
+    .merge(inventory)
+}
+
 #[derive(Clone)]
 struct ReportReader {
     policy: Arc<dyn PolicyClient>,

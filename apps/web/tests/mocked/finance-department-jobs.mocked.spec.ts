@@ -219,3 +219,42 @@ test('a failed department read is said, and the statements still render', async 
   await expect(panel(page).locator(FAILURE_MARKER)).toContainText('HTTP 503');
   await expect(page.getByRole('tab', { name: 'Overview', exact: true })).toBeVisible();
 });
+
+test('closed ledger runs display their recorded outcome; absence never means success', async ({ page }) => {
+  const closed = (id: string, title: string, outcome?: unknown) => ({
+    ...job(id, 'maintenance-ledger-replay', title, 'closed', [], '2026-09-23'),
+    metadata: outcome === undefined ? {} : { outcome },
+  });
+  const runs = [
+    closed('44444444-0000-0000-0000-000000000004', 'Replay agreed', 'completed'),
+    closed('55555555-0000-0000-0000-000000000005', 'Replay differed', 'failed'),
+    closed('66666666-0000-0000-0000-000000000006', 'Old run without outcome'),
+    closed('77777777-0000-0000-0000-000000000007', 'Malformed outcome', 7),
+    closed('88888888-0000-0000-0000-000000000008', 'Empty outcome', ''),
+    closed('99999999-0000-0000-0000-000000000009', 'Tenant terminal', 'needs-reconciliation'),
+    closed('aaaaaaaa-0000-0000-0000-000000000010', 'Whitespace outcome', '  '),
+    { ...closed('bbbbbbbb-0000-0000-0000-000000000011', 'Cancelled with outcome', 'aborted'), status: 'cancelled' },
+    { ...closed('cccccccc-0000-0000-0000-000000000012', 'Cancelled without outcome'), status: 'cancelled' },
+  ];
+  await install(page, (r) => {
+    const live = new URL(r.request().url()).searchParams.get('terminal') === 'false';
+    return json(r, { data: live ? [{ ...PAYOUT, metadata: { outcome: 'completed' } }] : runs, total: live ? 1 : runs.length });
+  });
+  await mountPage(page, PATH);
+  await expect(panel(page).getByRole('columnheader', { name: 'Outcome', exact: true })).toHaveCount(2);
+  const departures = panel(page).locator('section.list-section').nth(2);
+  for (const [name, outcome] of [
+    ['Replay agreed', 'completed'],
+    ['Replay differed', 'failed'],
+    ['Old run without outcome', 'unknown'],
+    ['Malformed outcome', 'unknown'],
+    ['Empty outcome', 'unknown'],
+    ['Tenant terminal', 'needs-reconciliation'],
+    ['Whitespace outcome', 'unknown'],
+    ['Cancelled with outcome', 'aborted'],
+    ['Cancelled without outcome', 'unknown'],
+  ] as const) {
+    await expect(departures.locator('tbody tr').filter({ hasText: name }).locator('td.outcome')).toHaveText(outcome);
+  }
+  await expect(panel(page).locator('section.list-section').nth(1).locator('td.outcome')).toHaveText('—');
+});

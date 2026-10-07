@@ -32,9 +32,11 @@
 //! The design said "readable by anyone"; the review narrowed it, and
 //! the gap list stays visible to every signed-in person.
 //!
-//! IT REFUSES NOTHING ELSE. Nothing here blocks a write; the guards that
-//! will ask this function before a policy, people or publish write wait
-//! for DR readiness (62dac114).
+//! IT REFUSES NOTHING ELSE. Nothing here blocks a write. The policy-write
+//! guard (`crate::guard`, car 3) reads the same three [`CoverageSources`]
+//! before every rule or override write and refuses one that orphans a
+//! control; the people and publish guards (cars 4 and 5) are still to
+//! come, released in the order of design b08725c2.
 
 use std::sync::Arc;
 
@@ -95,6 +97,7 @@ pub struct CoverageApiState<R: PolicyRepository> {
 pub fn router<R: PolicyRepository + 'static>(state: CoverageApiState<R>) -> Router {
     Router::new()
         .route(COVERAGE_PATH, get(read_coverage::<R>))
+        .route(coverage::SNAPSHOT_PATH, get(read_snapshot::<R>))
         .with_state(Arc::new(state))
 }
 
@@ -109,6 +112,52 @@ fn dark(source: &str, why: impl std::fmt::Display) -> Response {
         })),
     )
         .into_response()
+}
+
+async fn read_snapshot<R: PolicyRepository + 'static>(
+    State(state): State<Arc<CoverageApiState<R>>>,
+    CurrentUser(user): CurrentUser,
+) -> Response {
+    if user.is_anonymous() || boss_core::roles::ANONYMOUS_VISITOR_IDS.contains(&user.id.as_str()) {
+        return (
+            StatusCode::FORBIDDEN,
+            "coverage snapshot requires policy-table read authority",
+        )
+            .into_response();
+    }
+    let engine = PolicyEngine::new(state.repo.clone());
+    if let Err(response) = crate::http::may_read_rule_table(&engine, &user).await {
+        return response;
+    }
+    let roster = match state.sources.roster().await {
+        Ok(roster) => roster.into_iter().filter(|p| p.active).collect::<Vec<_>>(),
+        Err(error) => return dark("the people roster", error),
+    };
+    if roster.is_empty() {
+        return dark("the people roster", "answered no active employee");
+    }
+    let keys = match state.sources.keys().await {
+        Ok(keys) => keys,
+        Err(error) => return dark("the passkey tier counts", error),
+    };
+    let mut overrides = Vec::new();
+    for person in &roster {
+        match state.repo.list_user_overrides(&person.id).await {
+            Ok(rows) => overrides.extend(rows),
+            Err(error) => return dark("policy overrides", error),
+        }
+    }
+    let rules = match state.repo.list_rules().await {
+        Ok(rules) => rules,
+        Err(error) => return dark("policy rules", error),
+    };
+    Json(coverage::CoverageSnapshot {
+        rules,
+        overrides,
+        roster,
+        keys,
+    })
+    .into_response()
 }
 
 async fn read_coverage<R: PolicyRepository + 'static>(
@@ -205,6 +254,14 @@ async fn read_coverage<R: PolicyRepository + 'static>(
 /// the roster read with. It is NOT the gateway: the credential listing
 /// answers only the gateway's id (e199c02d), and this read never needs
 /// key material, only counts.
+///
+/// The lockout guard reads as this identity too (`crate::guard`), so an
+/// override on [`COVERAGE_READER_ID`] could blind it; the override door
+/// refuses one (adversarial review 782257de of car 3, B1).
+pub const COVERAGE_READER_ID: &str = "automation:policy-coverage";
+
+/// The header the reads are signed with; its id is [`COVERAGE_READER_ID`]
+/// (held equal by `guard::tests::the_guards_own_reader_is_named`).
 pub const COVERAGE_READER: &str = r#"{"id":"automation:policy-coverage","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}"#;
 
 pub struct HttpCoverageSources {
@@ -247,10 +304,19 @@ impl HttpCoverageSources {
 fn rows(body: Value, what: &str) -> Result<Vec<Value>, String> {
     match body {
         Value::Array(rows) => Ok(rows),
-        Value::Object(mut m) => match m.remove("data") {
-            Some(Value::Array(rows)) => Ok(rows),
-            _ => Err(format!("{what} answered no array of rows")),
-        },
+        Value::Object(mut m) => {
+            let total = m
+                .remove("total")
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| format!("{what} answered no whole listing total"))?;
+            match m.remove("data") {
+                Some(Value::Array(rows)) if u64::try_from(rows.len()).ok() == Some(total) => {
+                    Ok(rows)
+                }
+                Some(Value::Array(_)) => Err(format!("{what} answered a partial listing")),
+                _ => Err(format!("{what} answered no array of rows")),
+            }
+        }
         _ => Err(format!("{what} answered no array of rows")),
     }
 }
@@ -258,12 +324,18 @@ fn rows(body: Value, what: &str) -> Result<Vec<Value>, String> {
 /// One `/api/people` row as a roster entry.
 pub fn person_from_row(row: &Value) -> Option<Person> {
     let id = row.get("id")?.as_str()?.to_string();
-    let role = row.get("role").and_then(Value::as_str).map(str::to_string);
-    let active = row.get("status").and_then(Value::as_str) == Some("active");
-    let hire_date = row
-        .get("hire_date")
-        .and_then(Value::as_str)
-        .and_then(|d| d.parse().ok());
+    if id.is_empty() {
+        return None;
+    }
+    let role = match row.get("role") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_str()?.to_string()),
+    };
+    let active = row.get("status")?.as_str()? == "active";
+    let hire_date = match row.get("hire_date") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_str()?.parse().ok()?),
+    };
     Some(Person {
         id,
         role,
@@ -302,10 +374,13 @@ impl CoverageSources for HttpCoverageSources {
     async fn roster(&self) -> Result<Vec<Person>, String> {
         let url = format!("{}/api/people?status=active", self.people_base);
         let body = self.get(&url).await?;
-        Ok(rows(body, "GET /api/people")?
+        rows(body, "GET /api/people")?
             .iter()
-            .filter_map(person_from_row)
-            .collect())
+            .map(|row| {
+                person_from_row(row)
+                    .ok_or_else(|| "GET /api/people answered an invalid employee row".to_string())
+            })
+            .collect()
     }
 
     async fn keys(&self) -> Result<Vec<Key>, String> {
@@ -393,11 +468,20 @@ mod tests {
     }
 
     async fn read(sources: Fixed, repo: Arc<InMemoryPolicy>, who: Option<&str>) -> (u16, Value) {
+        read_path(sources, repo, who, COVERAGE_PATH).await
+    }
+
+    async fn read_path(
+        sources: Fixed,
+        repo: Arc<InMemoryPolicy>,
+        who: Option<&str>,
+        path: &str,
+    ) -> (u16, Value) {
         let app = router(CoverageApiState {
             repo,
             sources: Arc::new(sources),
         });
-        let mut req = axum::http::Request::get(COVERAGE_PATH);
+        let mut req = axum::http::Request::get(path);
         if let Some(who) = who {
             req = req.header("x-boss-user", who);
         }
@@ -418,6 +502,71 @@ mod tests {
     }
 
     const SIGNED: &str = r#"{"id":"automation:rule:x","role":"platform-admin"}"#;
+
+    #[test]
+    fn holder_sources_refuse_a_partial_listing_or_unknown_roster_identity() {
+        assert!(rows(json!({"data":[{"id":"emp-one"}],"total":2}), "roster").is_err());
+        assert!(rows(json!({"data":[],"total":"0"}), "roster").is_err());
+        assert!(person_from_row(&json!({"id":"emp-one","role":"platform-admin"})).is_none());
+        assert!(
+            person_from_row(&json!({"id":"emp-one","status":"active","hire_date":"invalid"}))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_reuses_rule_table_authority_and_never_calls_back_into_jobs() {
+        let identity = serde_json::to_string(&boss_policy_client::User::service("jobs")).unwrap();
+        let mut sources = instance();
+        sources.workflows = Err("jobs callback is forbidden".into());
+        let (status, body) = read_path(
+            sources,
+            repo_with_defaults().await,
+            Some(&identity),
+            coverage::SNAPSHOT_PATH,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let snapshot: coverage::CoverageSnapshot = serde_json::from_value(body).unwrap();
+        snapshot.validate().unwrap();
+        assert!(!snapshot.rules.is_empty());
+        for identity in [
+            None,
+            Some(r#"{"id":"anonymous","role":"platform-admin"}"#),
+            Some(r#"{"id":"emp-no-authority","role":"no-authority"}"#),
+        ] {
+            let (status, _) = read_path(
+                instance(),
+                repo_with_defaults().await,
+                identity,
+                coverage::SNAPSHOT_PATH,
+            )
+            .await;
+            assert_eq!(status, 403);
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_refuses_unknown_keys_and_dark_roster_instead_of_returning_empty_facts() {
+        let identity = serde_json::to_string(&boss_policy_client::User::service("jobs")).unwrap();
+        for source in 0..2 {
+            let mut sources = instance();
+            if source == 0 {
+                sources.keys = Err("unknown key counts".into());
+            } else {
+                sources.roster = Ok(vec![]);
+            }
+            let (status, body) = read_path(
+                sources,
+                repo_with_defaults().await,
+                Some(&identity),
+                coverage::SNAPSHOT_PATH,
+            )
+            .await;
+            assert_eq!(status, 502, "{body}");
+            assert!(body.get("rules").is_none());
+        }
+    }
 
     fn orphan_ids(body: &Value) -> Vec<String> {
         body["orphans"]
@@ -610,6 +759,11 @@ mod tests {
         );
         assert!(keys_from_row(&json!({"employee_id": "emp-a", "user": 1})).is_err());
         assert!(rows(json!({"error": "x"}), "GET x").is_err());
-        assert_eq!(rows(json!({"data": [1]}), "GET x").unwrap().len(), 1);
+        assert_eq!(
+            rows(json!({"data": [1], "total": 1}), "GET x")
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

@@ -140,8 +140,9 @@ const KILL_AFTER_SECS: u64 = 5;
 
 /// WHERE, AS WHOM AND UNDER WHAT A PROBE'S SHELL RUNS. The hand door
 /// ([`Shell::here`]) is the operator's own shell: this user, this
-/// directory (or the recorded one under `--recheck`), no timeout, the
-/// environment as it is. The unattended door ([`Shell::unattended`]) is
+/// directory (or the recorded one under `--recheck`), the environment
+/// as it is, and no timeout of its own — a probe is bounded there only
+/// while a reader door stands open for it ([`Shell::bound`]). The unattended door ([`Shell::unattended`]) is
 /// what the forge's shell twin did and what the ops-request now asks
 /// `boss prove --unattended` to do: drop from root to the probe user,
 /// run in the converged checkout, under a timeout, with exactly the
@@ -160,6 +161,7 @@ pub(crate) struct Shell {
     /// probe user.
     pub user: Option<String>,
     /// Seconds before the probe is killed; `None` at the hand door.
+    /// What the shell ASKS for: [`Shell::bound`] is what a run gets.
     pub timeout_secs: Option<u64>,
     /// Set on the probe's environment, after `strip`.
     pub env: Vec<(String, String)>,
@@ -167,6 +169,11 @@ pub(crate) struct Shell {
     pub strip: Vec<String>,
     /// Prepended to the probe's PATH, colon-separated.
     pub path_prefix: Option<std::path::PathBuf>,
+    /// Where a reader door for this probe would be opened FROM. Naming
+    /// it opens nothing: `execute_with` asks `probe_reader::open`, and a
+    /// host that holds no reader credential gets no door and reads as
+    /// it did before the door existed (review 0bd6a9c2, B1).
+    pub reader: Option<crate::probe_reader::Config>,
 }
 
 /// THE CAR'S OWN CONVERGENCE INSTANT, read off the car: the `merge_ref`
@@ -259,21 +266,24 @@ impl Shell {
             env: Vec::new(),
             strip: Vec::new(),
             path_prefix: None,
+            reader: None,
         }
     }
 
     /// The argv the shell runs — `timeout`, `runuser` and `bash -c` in
     /// the forge runner's order — with the prelude ahead of the probe's
-    /// text. Pure, so the test pins the words rather than a run.
-    pub(crate) fn command_line(&self, probe: &str, as_root: bool) -> Vec<String> {
-        let mut argv = self.command_prefix(as_root);
+    /// text, under the bound this run actually has: [`Self::bound`],
+    /// once it is known whether a door opened. Pure, so the test pins
+    /// the words rather than a run.
+    fn command_line_under(&self, probe: &str, as_root: bool, bound: Option<u64>) -> Vec<String> {
+        let mut argv = self.command_prefix(as_root, bound);
         argv.extend(["bash", "-c", &format!("{PRELUDE}\n{probe}")].map(str::to_string));
         argv
     }
 
-    fn command_prefix(&self, as_root: bool) -> Vec<String> {
+    fn command_prefix(&self, as_root: bool, bound: Option<u64>) -> Vec<String> {
         let mut argv = Vec::new();
-        if let Some(t) = self.timeout_secs {
+        if let Some(t) = bound {
             argv.extend(
                 [
                     "timeout",
@@ -288,6 +298,45 @@ impl Shell {
             argv.extend(["runuser", "-u", u, "--"].map(str::to_string));
         }
         argv
+    }
+
+    /// The seconds this run is given. A door that is OPEN holds a
+    /// credential for one recorded command and lives 60 s, so the probe
+    /// behind it lives no longer; with no door the shell's own answer
+    /// stands, which at the hand door is no timeout at all.
+    ///
+    /// The first cut clamped every shell that NAMED a reader, and every
+    /// shell names one, so the hand door lost its "no timeout" without a
+    /// word while its doc comment still promised it (review 0bd6a9c2,
+    /// F2). The cap now follows the door, and [`Self::clamp_notice`]
+    /// says so when it changes what was asked.
+    fn bound(&self, door_open: bool) -> Option<u64> {
+        if door_open {
+            Some(
+                self.timeout_secs
+                    .unwrap_or(crate::probe_reader::MAX_LIFETIME_SECS)
+                    .clamp(1, crate::probe_reader::MAX_LIFETIME_SECS),
+            )
+        } else {
+            self.timeout_secs
+        }
+    }
+
+    /// The sentence owed when an open door shortens what the shell
+    /// asked for; `None` when it changes nothing.
+    fn clamp_notice(&self, door_open: bool) -> Option<String> {
+        let bound = self.bound(door_open)?;
+        if !door_open || self.timeout_secs == Some(bound) {
+            return None;
+        }
+        let asked = self
+            .timeout_secs
+            .map_or("no timeout".to_string(), |t| format!("{t}s"));
+        Some(format!(
+            "a reader door is open for this probe, so it is bounded at {bound}s where this \
+             door asked for {asked}: the door holds a reader credential for one recorded \
+             command and lives no longer (design b35c22b4)"
+        ))
     }
 
     /// Shared by execution and its provenance reads: the same directory,
@@ -317,7 +366,9 @@ impl Shell {
         args: &[&str],
         no_token: &crate::door_env::NoTokenInReach,
     ) -> Result<std::process::Output, String> {
-        let mut argv = self.command_prefix(self.user.is_some() && running_as_root());
+        // A provenance read opens no door, so it is bounded as asked.
+        let mut argv =
+            self.command_prefix(self.user.is_some() && running_as_root(), self.timeout_secs);
         argv.push(program.into());
         argv.extend(args.iter().map(|arg| (*arg).to_string()));
         let mut cmd = self.command(&argv);
@@ -385,7 +436,7 @@ impl std::fmt::Display for EnvironmentRefusal {
             f,
             "ENVIRONMENT REFUSAL — the probe did not run and nothing about the claim was \
              judged: {}. This host could not give the probe the environment it is promised; \
-             free the temp filesystem and run it again.",
+             repair the named cause and run it again.",
             self.0
         )
     }
@@ -445,8 +496,8 @@ pub(crate) fn on_environment_refusal(door: Door) -> OnRefusal {
 pub(crate) fn environment_why(host: &str, cause: &str) -> String {
     format!(
         "NOT YET: the probe did not run — {host} refused its environment ({cause}). \
-         ENVIRONMENT REFUSAL, not a verdict against the change; free the host's temp \
-         filesystem, and recheck-failing-probes-hourly runs it again."
+         ENVIRONMENT REFUSAL, not a verdict against the change; repair the named cause, \
+         and recheck-failing-probes-hourly runs it again."
     )
 }
 
@@ -569,6 +620,28 @@ fn execute_given(
     let no_token =
         no_token.map_err(|e| anyhow::Error::new(EnvironmentRefusal(format!("{e:#}"))))?;
     let as_root = shell.user.is_some() && running_as_root();
+    // THE READER DOOR, IF THIS HOST HOLDS A READER CREDENTIAL (design
+    // b35c22b4; review 0bd6a9c2, B1). `None` is a host with no
+    // credential file: no door, and everything below is the read path
+    // as it was — `BOSS_SOR_USER` on the LAN, which an enforcing gate
+    // refuses 401 by itself and `curl -f` makes loud. An ERROR is a
+    // credential that is there and cannot be used or is not accepted as
+    // a reader: the probe does not run, and that is said as the host's
+    // refusal. Never the quiet fallback — a probe that silently read
+    // without the door it was meant to have is how an absence assertion
+    // passes against a narrower world (61085a9e).
+    let reader = match &shell.reader {
+        Some(config) => {
+            crate::probe_reader::open(config, shell.user.as_deref().filter(|_| as_root))
+                .map_err(|error| anyhow::Error::new(EnvironmentRefusal(format!("{error:#}"))))?
+        }
+        None => None,
+    };
+    let bound = shell.bound(reader.is_some());
+    let clamped = shell.clamp_notice(reader.is_some());
+    if let Some(notice) = &clamped {
+        eprintln!("boss prove: {notice}.");
+    }
     // The channel: a file of this process's own, named so two operators
     // (or two rechecks) on one box never share it — the uid and pid by
     // `own_temp_path` (307df975), the clock within one process. It is
@@ -595,8 +668,13 @@ fn execute_given(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(c, std::fs::Permissions::from_mode(0o666));
     }
-    let argv = shell.command_line(probe, as_root);
+    let argv = shell.command_line_under(probe, as_root, bound);
     let mut cmd = shell.command(&argv);
+    cmd.env_remove(crate::probe_reader::CREDENTIAL_ENV)
+        .env_remove(crate::probe_reader::DOOR_ENV);
+    if let Some(reader) = &reader {
+        cmd.env(crate::probe_reader::DOOR_ENV, reader.socket());
+    }
     if let Some(c) = &channel {
         cmd.env("BOSS_PROBE_NOTFOUND", c);
     }
@@ -622,8 +700,13 @@ fn execute_given(
     let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     // `timeout` exits 124 for a probe it had to stop; the record says
     // so where the probe's own last words are, as the forge's did.
-    if let (Some(t), TIMEOUT_EXIT) = (shell.timeout_secs, exit) {
+    if let (Some(t), TIMEOUT_EXIT) = (bound, exit) {
         stderr.push_str(&format!("\n[boss prove: killed at {t}s timeout]\n"));
+        // The record says whose bound it was when it was not the one
+        // this door asked for.
+        if let Some(notice) = &clamped {
+            stderr.push_str(&format!("[boss prove: {notice}]\n"));
+        }
     }
     Ok(Outcome {
         exit,
@@ -2461,6 +2544,7 @@ impl Shell {
         };
         Ok(Self {
             path_prefix: None,
+            reader: None,
             cwd: Some(dir.clone()),
             user: Some(user),
             timeout_secs: Some(timeout),
@@ -2511,8 +2595,10 @@ impl Shell {
     /// which is the honest did-not-run.
     ///
     /// What this does NOT make the same is the rest of the hand door:
-    /// the probe still runs HERE, as the operator, with no timeout and
-    /// with their own `BOSS_ACTOR` — `admit` already says so, and a
+    /// the probe still runs HERE, as the operator, with their own
+    /// `BOSS_ACTOR` and no timeout — unless this host holds a reader
+    /// credential, in which case the door that opens bounds the probe
+    /// at its own 60 s and says so (`Shell::bound`, review 0bd6a9c2 F2) — `admit` already says so, and a
     /// pod-local proof is the established shape for a claim only the
     /// cluster can show.
     pub(crate) fn with_probe_reader(mut self, tree: Option<&Path>, base: &str) -> Self {
@@ -2524,6 +2610,13 @@ impl Shell {
             .and_then(|t| std::fs::read_to_string(t.join(SOR_PORTS_ENV)).ok())
             .map(|t| sor_ports_table(&t))
             .unwrap_or_default();
+        self.reader = Some(crate::probe_reader::Config {
+            credential: std::env::var_os(crate::probe_reader::CREDENTIAL_ENV)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(crate::probe_reader::DEFAULT_CREDENTIAL)),
+            base: base.to_string(),
+            ports: ports.clone(),
+        });
         self.path_prefix = tree.map(|t| t.join(PROBE_BIN));
         self.env.push(("BOSS_JOBS_URL".into(), base.to_string()));
         self.env
@@ -3333,6 +3426,20 @@ pub(crate) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl Shell {
+        /// The line a shell with no door open runs — what the shell
+        /// itself asked for. A run takes `command_line_under` with the
+        /// bound an open door decides, so only these tests ask for this
+        /// one, and it lives here rather than behind an attribute in
+        /// the source above: this module's source pins read everything
+        /// before the first test attribute as the production text, and
+        /// one placed up there cut that text off at line 279 and failed
+        /// five of them (gate-run 5fc19018, 2026-10-06).
+        fn command_line(&self, probe: &str, as_root: bool) -> Vec<String> {
+            self.command_line_under(probe, as_root, self.timeout_secs)
+        }
+    }
     use crate::identity::READER_ROLE;
 
     /// Run `probe` through this host's shell and capture everything it
@@ -5469,6 +5576,7 @@ ugrep: warning: complete\": No such file or directory\n";
             env: Vec::new(),
             strip: Vec::new(),
             path_prefix: None,
+            reader: None,
         };
         let as_root = shell.command_line("echo x", true);
         assert_eq!(
@@ -5528,6 +5636,7 @@ ugrep: warning: complete\": No such file or directory\n";
             ],
             strip: vec!["BOSS_PROVE_TEST_LEAK".into()],
             path_prefix: Some(bin),
+            reader: None,
         };
         let o = execute_with(
             "tool-on-prefix; printf '[%s][%s][%s][%s]\\n' \"$BOSS_JOBS_URL\" \"$BOSS_SOR_PORTS\" \
@@ -5630,6 +5739,230 @@ ugrep: warning: complete\": No such file or directory\n";
         let user: Value = serde_json::from_str(&user).unwrap();
         assert_eq!(user["id"], READER_ACTOR);
         assert_ne!(user["id"], crate::identity::UNIDENTIFIED);
+    }
+
+    /// THE FOUR DOORS A CAR'S PROBE RUNS AT, each built the way its own
+    /// call site builds it, with the reader credential at `credential`
+    /// and the system of record at `base`. The unattended door runs here
+    /// as itself in a scratch directory — its user and checkout are the
+    /// forge's — as `no_machine_token_reaches_a_probe_at_either_door`
+    /// does. `every_door_names_the_reader_door_it_may_open` holds this
+    /// list to the source.
+    fn the_four_doors(base: &str, credential: &Path) -> Vec<(&'static str, Shell)> {
+        let scratch = boss_testing::scratch::scratch_dir("prove-reader-door");
+        let unattended = Shell {
+            user: None,
+            cwd: Some(scratch.clone()),
+            ..Shell::unattended(base).unwrap()
+        };
+        let mut doors = vec![
+            ("unattended", unattended),
+            (
+                "recheck",
+                Shell::here(Some(&scratch)).with_probe_reader(None, base),
+            ),
+            ("hand", Shell::here(None).with_probe_reader(None, base)),
+            ("disproved", Shell::here(None).with_probe_reader(None, base)),
+        ];
+        for (_, shell) in &mut doors {
+            shell.reader.as_mut().unwrap().credential = credential.to_path_buf();
+        }
+        doors
+    }
+
+    /// Each of those four sites names the door in non-test source: the
+    /// three `Shell::here(..).with_probe_reader(..)` and the unattended
+    /// constructor, which calls it itself.
+    #[test]
+    fn every_door_names_the_reader_door_it_may_open() {
+        let prod = |src: &'static str| src.split("#[cfg(test)]").next().unwrap_or("");
+        let prove = prod(include_str!("prove.rs"));
+        let disprove = prod(include_str!("disprove.rs"));
+        let named = |src: &str| src.matches(".with_probe_reader(").count();
+        // recheck, hand, and inside `Shell::unattended`.
+        assert_eq!(
+            named(prove),
+            3,
+            "a door in prove.rs gained or lost its reader"
+        );
+        assert_eq!(named(disprove), 1);
+        assert_eq!(
+            prove.matches("crate::probe_reader::open(").count(),
+            1,
+            "every door opens its reader in one place, execute_given"
+        );
+        assert!(!prove.contains("probe_reader::Guard::start"));
+    }
+
+    /// What a probe can see of the door it was or was not given: the
+    /// socket's name (or `none`), who it reads as on the LAN path, and
+    /// the program that started its shell — `timeout` when it is
+    /// bounded.
+    const DOOR_REPORT: &str = "printf 'DOOR=%s USER=%s PARENT=%s\\n' \"${BOSS_SOR_DOOR:-none}\" \
+         \"${BOSS_SOR_USER:+named}\" \"$(cat /proc/$PPID/comm)\"; \
+         test -z \"${BOSS_PROBE_READER_CREDENTIAL:-}\" || exit 42";
+
+    /// B1 (review 0bd6a9c2), MEASURED AT ALL FOUR DOORS. A host with no
+    /// reader credential — every host in the estate, until the delivery
+    /// chain exists — gets no door and the probe RUNS, reading as it
+    /// did before the door existed: the read-scoped identity in
+    /// `BOSS_SOR_USER`, no socket, and no bound the door did not ask
+    /// for. The first cut refused here, at every door, which would have
+    /// stopped every proof in the estate the hour it landed.
+    #[test]
+    fn with_no_reader_credential_every_door_runs_the_probe_as_it_did_before() {
+        let held = tempfile::tempdir().unwrap();
+        let absent = held.path().join("never-deposited.credential");
+        for (door, shell) in the_four_doors("http://sor.invalid:7900", &absent) {
+            let o = execute_with(DOOR_REPORT, &shell)
+                .unwrap_or_else(|e| panic!("{door}: refused with no credential: {e:#}"));
+            assert_eq!(o.exit, 0, "{door}: {o:?}");
+            assert!(o.stdout.contains("DOOR=none USER=named"), "{door}: {o:?}");
+            // Only the unattended door asked for a timeout.
+            assert_eq!(
+                o.stdout.contains("PARENT=timeout"),
+                door == "unattended",
+                "{door}: {o:?}"
+            );
+        }
+    }
+
+    /// B1's other half, and B3, at all four doors: a credential that is
+    /// PRESENT and cannot be used — not private, empty, or one the gate
+    /// does not name a reader — is the host's refusal. The probe does
+    /// not run (its marker is never written), nothing is judged, and it
+    /// is never the quiet no-door of an absent file.
+    #[test]
+    fn a_present_but_unusable_credential_refuses_at_every_door_and_runs_nothing() {
+        use crate::probe_reader::fixture;
+        let upstream = fixture::gated_with_reader(Some(fixture::VALUE));
+        let scratch = boss_testing::scratch::scratch_dir("prove-reader-door-refused");
+        let marker = scratch.join("the-probe-ran");
+        let probe = format!("touch '{}'", marker.display());
+        for (what, text, mode, says) in [
+            ("not private", fixture::VALUE, 0o644, "not private"),
+            ("empty", "", 0o600, "is empty"),
+            (
+                "not a reader's",
+                "fixture-value-no-slot-holds",
+                0o600,
+                "not a reader slot",
+            ),
+        ] {
+            let held = tempfile::tempdir().unwrap();
+            let credential = fixture::credential(held.path(), text, mode);
+            for (door, shell) in the_four_doors(&upstream.base, &credential) {
+                let _ = std::fs::remove_file(&marker);
+                let refused = match execute_with(&probe, &shell) {
+                    Ok(o) => panic!("{door}, {what}: the probe ran: {o:?}"),
+                    Err(e) => e,
+                };
+                let said = refused
+                    .downcast_ref::<EnvironmentRefusal>()
+                    .unwrap_or_else(|| panic!("{door}, {what}: not a refusal: {refused:#}"))
+                    .to_string();
+                assert!(said.contains("the probe did not run"), "{door}: {said}");
+                assert!(said.contains(says), "{door}, {what}: {said}");
+                assert!(!said.contains(text) || text.is_empty(), "{door}: {said}");
+                assert!(!marker.exists(), "{door}, {what}: the probe ran anyway");
+            }
+        }
+        assert!(
+            upstream.seen.lock().unwrap().is_empty(),
+            "a refused door served a read"
+        );
+    }
+
+    /// AND WITH A CREDENTIAL THE GATE NAMES A READER, the door stands
+    /// for exactly the probe's life: a private socket in its
+    /// environment, the shipped `boss-sor-read` reading through it and
+    /// answered as the probe reader by the real gate, the credential's
+    /// own path nowhere in reach, the probe bounded — and nothing left
+    /// when it returns.
+    #[test]
+    fn a_probe_has_a_private_reader_socket_only_for_its_own_lifetime() {
+        use crate::probe_reader::fixture;
+        let upstream = fixture::gated_with_reader(Some(fixture::VALUE));
+        let held = tempfile::tempdir().unwrap();
+        let credential = fixture::credential(held.path(), fixture::VALUE, 0o600);
+        let root = boss_testing::repo_root();
+        let mut shell = Shell::here(None).with_probe_reader(Some(&root), &upstream.base);
+        shell.reader.as_mut().unwrap().credential = credential.clone();
+        // The tree's port table names the estate's ports; this fixture
+        // has one, so every path is read on the base.
+        shell.reader.as_mut().unwrap().ports = String::new();
+        shell.env.retain(|(k, _)| k != "BOSS_SOR_PORTS");
+        // Even an ambient child env entry is scrubbed after applying
+        // Shell.env; the private config never lends its path to it.
+        shell.env.push((
+            crate::probe_reader::CREDENTIAL_ENV.into(),
+            credential.display().to_string(),
+        ));
+        let out = execute_with(
+            &format!(
+                "test -S \"${{BOSS_SOR_DOOR:-}}\" || exit 41; {DOOR_REPORT}; \
+                 boss-sor-read '/api/yard/status' || exit 43; echo; \
+                 printf '%s\\n' \"$BOSS_SOR_DOOR\""
+            ),
+            &shell,
+        )
+        .unwrap();
+        assert_eq!(out.exit, 0, "{out:?}");
+        assert!(out.stdout.contains("PARENT=timeout"), "{out:?}");
+        assert!(out.stdout.contains(fixture::BODY), "{out:?}");
+        {
+            let seen = upstream.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "one read, through the door");
+            assert_eq!(seen[0].1, "/api/yard/status");
+            let user: Value = serde_json::from_slice(seen[0].2["x-boss-user"].as_bytes()).unwrap();
+            assert_eq!(user["id"], boss_core::roles::PROBE_READER_ACTOR);
+        }
+        let socket = std::path::Path::new(out.stdout.lines().last().unwrap());
+        assert!(
+            socket.is_absolute(),
+            "the probe observed a real socket path"
+        );
+        assert!(!socket.exists(), "the reader door outlived its probe");
+        assert!(
+            !socket.parent().unwrap().exists(),
+            "private directory leaked"
+        );
+    }
+
+    /// F2 (review 0bd6a9c2). The 60 s cap belongs to an OPEN door. With
+    /// none, each door keeps what it asked for — the hand door no
+    /// timeout at all, as its help says — and when a door does shorten
+    /// what was asked, the shell says so rather than killing a rehearsed
+    /// probe at a bound nobody named.
+    #[test]
+    fn only_an_open_reader_door_bounds_a_probe_and_it_says_when_it_does() {
+        for (asked, open, bound, told) in [
+            (None, false, None, false),
+            (Some(120), false, Some(120), false),
+            (Some(2), false, Some(2), false),
+            (None, true, Some(60), true),
+            (Some(120), true, Some(60), true),
+            (Some(60), true, Some(60), false),
+            (Some(2), true, Some(2), false),
+        ] {
+            let mut shell = Shell::here(None).with_probe_reader(None, "http://sor.invalid:7900");
+            shell.timeout_secs = asked;
+            assert_eq!(shell.bound(open), bound, "{asked:?} open={open}");
+            let notice = shell.clamp_notice(open);
+            assert_eq!(notice.is_some(), told, "{asked:?} open={open}: {notice:?}");
+            let argv = shell.command_line_under("true", false, shell.bound(open));
+            match bound {
+                Some(t) => assert_eq!(&argv[..4], &["timeout", "-k", "5", &t.to_string()]),
+                None => assert_eq!(argv[0], "bash"),
+            }
+        }
+        let hand = Shell::here(None).with_probe_reader(None, "http://sor.invalid:7900");
+        let notice = hand.clamp_notice(true).unwrap();
+        assert!(notice.contains("bounded at 60s"), "{notice}");
+        assert!(notice.contains("asked for no timeout"), "{notice}");
+        // Naming a reader bounds nothing by itself.
+        assert_eq!(hand.command_line("true", false)[0], "bash");
+        assert_eq!(crate::probe_reader::MAX_LIFETIME_SECS, 60);
     }
 
     /// THE CAR'S OWN CONVERGED INSTANT IS PART OF THAT PROMISE
@@ -6208,6 +6541,19 @@ ugrep: warning: complete\": No such file or directory\n";
         )
         .expect("bash runs");
         assert_eq!(o.exit, 0, "{o:?}");
+    }
+
+    #[test]
+    fn reader_credential_refusal_preserves_the_cause_without_a_disk_only_remedy() {
+        let cause = "reader credential is unavailable";
+        for message in [
+            EnvironmentRefusal(cause.into()).to_string(),
+            environment_why("forge", cause),
+        ] {
+            assert!(message.contains(cause), "{message}");
+            assert!(message.contains("repair the named cause"), "{message}");
+            assert!(!message.contains("free the"), "{message}");
+        }
     }
 
     /// Every site in non-test source where a door runs a car's probe —

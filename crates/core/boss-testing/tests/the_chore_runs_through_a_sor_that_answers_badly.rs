@@ -917,6 +917,18 @@ fn posts_seen(sor: &Sor) -> usize {
     sor.seen().iter().filter(|s| s.method == "POST").count()
 }
 
+/// Own the lock process and release it when this scope ends, including panic.
+struct HeldLedgerLock(std::process::Child);
+
+impl Drop for HeldLedgerLock {
+    fn drop(&mut self) {
+        // EOF releases the owned reader even during assertion unwinding.
+        // No sleeping descendant survives to hold the lock after this test.
+        self.0.stdin.take();
+        let _ = self.0.wait();
+    }
+}
+
 /// Finding 3: a stray row was written in place under its final `.stray-`
 /// name, so a sweep could read it half-written. It is written as
 /// `.writing-*`, which no sweep reads, and only then renamed.
@@ -932,11 +944,17 @@ fn a_stray_is_written_aside_and_only_then_named_for_the_sweep() {
 
     // Another run holds the lock, so this run's miss becomes a stray.
     let ready = home.join("lock-held");
-    let mut holder = Command::new("flock")
-        .arg(format!("{}.lock", path.display()))
-        .args(["-c", &format!("touch '{}'; sleep 8", ready.display())])
-        .spawn()
-        .unwrap();
+    // f08bcb9f: a fixed eight-second sleep released this lock while the
+    // wrap was still doing HTTP work. Hold it until the actual wrap exits.
+    let mut holder = HeldLedgerLock(
+        Command::new("flock")
+            .arg(format!("{}.lock", path.display()))
+            .args(["bash", "-c", "touch \"$1\"; read -r release", "lock-holder"])
+            .arg(&ready)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !ready.exists() {
         assert!(
@@ -968,15 +986,23 @@ fn a_stray_is_written_aside_and_only_then_named_for_the_sweep() {
         shim.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let down = Sor::always(503, "{}");
+    let down = Sor::start(Box::new(|_, _| {
+        // The original eight-second holder expires during this bounded
+        // request. The fixture's ownership must survive until wrap exit.
+        std::thread::sleep(std::time::Duration::from_secs(9));
+        (503, "{}".to_string())
+    }));
     let out = wrap_with(
         Some(&down.url),
         &home,
         kind,
         &[("BOSS_WRAP_LOCK_WAIT", "1"), ("PATH", &path_env)],
     );
-    let _ = holder.kill();
-    let _ = holder.wait();
+    assert!(
+        holder.0.try_wait().unwrap().is_none(),
+        "the fixture lock owner must still be alive when the wrap exits"
+    );
+    drop(holder);
     assert_eq!(out.rc, 0, "{}", out.text);
     let asked = std::fs::read_to_string(&log).unwrap_or_default();
     assert!(

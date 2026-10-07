@@ -1,0 +1,35 @@
+# Backlog 85889a52: periodic and ad hoc reaping. The ad hoc verb already
+# landed; this row supplies the daily REQUEST, never unattended deletion.
+# The existing ops-request approval renders plan-a-pod-reap, requires a
+# per-request passkey, and binds the signed plan to the reap verb's argv.
+# No plan, signature or approved hash comes from the clock.
+#
+# Daily clock rules fire at 00:00Z. One open request for pod-reap holds
+# the next day's twin. This exact literal identity and dedup guard are
+# read by cadence_roster, so the existing cadence-silence-sweep-daily
+# names that holding packet as SUPPRESSED and alarms past its declared
+# suppression window. A pending human approval cannot retire the cadence
+# silently. No rule cancels it, expires unsigned intent or approves it;
+# those changes belong to the separate unresolved security design d8f0b44e.
+#
+# Once a request closes, the next day can open another. Ad hoc callers
+# keep using the same registered plan/reap verbs and approval protocol.
+# Job-owned pods remain Kubernetes' TTL controller's, and target scope,
+# capture-before-delete and UID preconditions remain the existing verb's.
+[[rule]]
+name = "request-a-pod-reap-daily"
+why = """
+A TIMER: the original 85889a52 request asks for a period as well as ad
+hoc execution. No packet causes a day to pass. The signed plan/reap
+verbs and per-request human approval already landed, but no registry
+cadence filed their request. Opening an ops-request is mechanical;
+approval and deletion remain their existing protocol's separate acts.
+One open request suppresses a twin, and the derived silence roster
+names and ages that hold instead of letting dedup retire the cadence.
+"""
+version = 2
+when = 'NOT open_job_exists("ops-request", "pod-reap")'
+schedule = { cadence = "daily", anchor_date = "2026-10-03" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = '"ops-request"', subject_kind = '"custom"', subject = '"pod-reap"', title = '"Pod reap — review and sign the daily rendered plan"', "metadata.host" = '"forge"', "metadata.verb" = '"reap-terminated-pods"', "metadata.args" = '[]', "metadata.requires_approval" = 'true', "metadata.trigger" = '"daily"', "metadata.area" = '"platform"' }

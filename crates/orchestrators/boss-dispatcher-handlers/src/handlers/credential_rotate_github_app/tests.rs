@@ -213,7 +213,7 @@ async fn jobs(step_statuses: &[(&str, &str)]) -> Jobs {
             "/api/credentials/{id}",
             get(move |Path(id): Path<String>| async move {
                 if id == CREDENTIAL {
-                    Json(json!({"id": id, "kind": "github-app-installation-token"})).into_response()
+                    Json(json!({"id": id, "kind": REGISTRY_KIND})).into_response()
                 } else {
                     axum::http::StatusCode::NOT_FOUND.into_response()
                 }

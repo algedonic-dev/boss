@@ -461,3 +461,40 @@ async fn the_holder_still_completes_its_step() {
     assert_eq!(after.status, StepStatus::Completed);
     assert_eq!(after.assignee_id.as_deref(), Some(CLAIMANT));
 }
+
+/// Intent is testimony about a request, not a claim that it succeeded.
+#[tokio::test]
+async fn a_recorded_nomination_request_does_not_displace_a_claim_on_retry() {
+    let (app, jobs) = seed(StepStatus::Ready, None).await;
+    let request = serde_json::json!({"nomination_requested": {
+        "assignee_id": DISPATCHER_PICK, "why": "supported executor lane",
+        "by": "emp-op", "at": "2026-10-05T18:05:26Z"
+    }});
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        &format!("/api/jobs/{JOB}/steps/{STEP}/metadata"),
+        "emp-op",
+        &request.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    claim(&app, CLAIMANT).await;
+    for _ in 0..2 {
+        let (status, body) = put_step(
+            &app,
+            "emp-op",
+            &serde_json::json!({"assignee_id": DISPATCHER_PICK}).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let after = stored(&jobs).await;
+        assert_eq!(after.status, StepStatus::Active);
+        assert_eq!(after.assignee_id.as_deref(), Some(CLAIMANT));
+        assert_eq!(
+            after.metadata["nomination_requested"],
+            request["nomination_requested"]
+        );
+        assert!(after.metadata.get("nominated").is_none());
+    }
+}

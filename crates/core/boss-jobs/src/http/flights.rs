@@ -79,8 +79,34 @@ pub(super) async fn flights_mine<R: JobsRepository + 'static, B: EventBus + 'sta
             judged.push((decl, flights::state_of(&steps, spec)));
         }
     }
-    Json(serde_json::json!({
-        "flights": flights::codes_on_for(&judged, &user.id, &user.role),
-    }))
-    .into_response()
+    let codes = flights::codes_on_for(&judged, &user.id, &user.role);
+    if let Some(report) = &state.role_guards {
+        // Keep every declaration of a code together: ambiguity is off for
+        // both viewers, exactly as in the original codes-only response.
+        // These are already-read declarations and pinned step judgements;
+        // comparing a role performs no additional registry or packet IO.
+        let mut by_code: BTreeMap<&str, Vec<(Declaration, FlightState)>> = BTreeMap::new();
+        for (declaration, flight_state) in &judged {
+            by_code
+                .entry(&declaration.code)
+                .or_default()
+                .push((declaration.clone(), *flight_state));
+        }
+        for (code, declarations) in by_code {
+            report.observe_captured(
+                "flight-code-visibility",
+                "visibility",
+                &user,
+                codes.iter().any(|visible| visible == code),
+                |candidate| {
+                    Some(
+                        flights::codes_on_for(&declarations, &candidate.id, &candidate.role)
+                            .iter()
+                            .any(|visible| visible == code),
+                    )
+                },
+            );
+        }
+    }
+    Json(serde_json::json!({ "flights": codes })).into_response()
 }

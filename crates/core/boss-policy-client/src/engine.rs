@@ -9,6 +9,23 @@ use crate::types::{Action, Decision, Predicate, Resource, Scope, User};
 
 pub struct PolicyEngine<R: PolicyRepository> {
     repo: Arc<R>,
+    observer: Option<Arc<dyn PolicyDecisionObserver>>,
+}
+
+/// Observation of an actual admission, after its original answer is
+/// known. Implementations cannot replace the answer or its expiry.
+/// Candidate comparisons must use this same instant and must not
+/// recursively invoke an observed engine.
+#[async_trait::async_trait]
+pub trait PolicyDecisionObserver: Send + Sync {
+    async fn observe(
+        &self,
+        user: &User,
+        action: Action,
+        resource: Resource,
+        at: chrono::DateTime<chrono::Utc>,
+        result: &Result<(Decision, Option<chrono::DateTime<chrono::Utc>>), PolicyError>,
+    );
 }
 
 /// The instant an override's expiry is judged at. Expiry is local
@@ -23,7 +40,17 @@ pub fn expiry_now() -> chrono::DateTime<chrono::Utc> {
 
 impl<R: PolicyRepository> PolicyEngine<R> {
     pub fn new(repo: Arc<R>) -> Self {
-        Self { repo }
+        Self {
+            repo,
+            observer: None,
+        }
+    }
+
+    pub fn with_observer(repo: Arc<R>, observer: Arc<dyn PolicyDecisionObserver>) -> Self {
+        Self {
+            repo,
+            observer: Some(observer),
+        }
     }
 
     /// Resolve (user, action, resource) into a Decision.
@@ -66,7 +93,24 @@ impl<R: PolicyRepository> PolicyEngine<R> {
         resource: Resource,
     ) -> Result<(Decision, Option<chrono::DateTime<chrono::Utc>>), PolicyError> {
         let now = expiry_now();
+        let result = self.check_at(user, action, resource.clone(), now).await;
+        if let Some(observer) = &self.observer {
+            observer.observe(user, action, resource, now, &result).await;
+        }
+        result
+    }
 
+    /// Raw evaluation for a report-only comparison at the admission's
+    /// captured instant. This does not invoke the observer. Repository
+    /// reads are not an atomic policy snapshot; callers must not claim
+    /// equivalent policy revisions merely because the instant matches.
+    pub(crate) async fn check_at(
+        &self,
+        user: &User,
+        action: Action,
+        resource: Resource,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(Decision, Option<chrono::DateTime<chrono::Utc>>), PolicyError> {
         // 1. User overrides first.
         let overrides = self.repo.list_user_overrides(&user.id).await?;
         for ov in &overrides {

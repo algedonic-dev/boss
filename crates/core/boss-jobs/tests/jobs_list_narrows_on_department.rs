@@ -67,7 +67,7 @@ fn spec(kind: &str, metadata: serde_json::Value) -> WorkflowSpec {
 /// declare `sales`, one `marketing`, one `finance`, and the platform
 /// bundle declares nothing.
 fn registry() -> Arc<InMemoryWorkflows> {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     for s in [
         spec(
             "receive-an-inquiry",

@@ -45,6 +45,17 @@ fn step<'a>(spec: &'a WorkflowSpec, title: &str) -> &'a StepSpec {
         .unwrap_or_else(|| panic!("agent-run has a `{title}` step"))
 }
 
+#[test]
+fn newly_admitted_runs_declare_a_worker_receipt_without_changing_the_step_graph() {
+    let run = bundled("agent-run");
+    assert_eq!(
+        step(&run, "building").metadata_defaults["worker_start_expectation"],
+        json!({"schema":1,"minutes":15})
+    );
+    assert_eq!(step(&run, "building").ready_when, "steps.briefed.done");
+    assert_eq!(step(&run, "building").duration_hours, Some(2.0));
+}
+
 /// Evaluate a bundled step's `ready_when` against a synthetic packet
 /// where `building` has completed carrying `building_md` and `reported`
 /// is done or not — the same context shape `registry::build_context`

@@ -87,6 +87,10 @@ name = "rebuild_log_complete_pg"
 required-features = ["postgres"]
 
 [[test]]
+name = "replay_validation_before_wipe_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "subject_edges_pg"
 required-features = ["postgres"]
 

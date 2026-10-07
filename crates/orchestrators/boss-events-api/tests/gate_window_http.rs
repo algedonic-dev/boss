@@ -710,3 +710,179 @@ async fn a_malformed_postgres_start_expires_only_after_a_complete_later_watch() 
         }
     }
 }
+
+/// Backlog 93e0814a (2026-10-06). The reader requires what the launcher
+/// recorded it started, and the record can only excuse a port that
+/// shows no process: a record that names a running service as skipped,
+/// a record that is missing or cut short, and a reader given no record
+/// path at all each leave the window not clean, saying why.
+#[tokio::test]
+async fn the_required_services_are_what_the_launcher_started_and_no_record_hides_a_running_one() {
+    use boss_core::gate_evidence::InMemoryGateEvidence;
+    use boss_events_api::gate_window_http::LocalTallies;
+    let now = Utc::now();
+    let since = now - Duration::hours(74);
+    let machine = |service: &str| {
+        json!({"service":service,"mode":"report","recording_since":since,
+        "rows":[],"overflow":0,"source_overflow":[],"not_clean":[],
+        "evidence":{"recorder":true,"instance":format!("{service}-process"),"lost":0,"unstated":0,"retrying":false,"last_error":null}})
+    };
+    let events: Vec<_> = ["jobs", "people"]
+        .into_iter()
+        .map(|service| Event {
+            id: Uuid::new_v4(),
+            timestamp: since,
+            source: service.into(),
+            kind: "machine_gate.recording_began".into(),
+            payload: json!({"service":service,"mode":"report","since":since,"instance":format!("{service}-process")}),
+        })
+        .collect();
+    let upstream = |body: String, status: StatusCode| Upstream {
+        body,
+        status,
+        redirect: None,
+        delay: std::time::Duration::ZERO,
+        reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    };
+    let jobs = serve(upstream(machine("jobs").to_string(), StatusCode::OK)).await;
+    let people = serve(upstream(machine("people").to_string(), StatusCode::OK)).await;
+    // A port nothing listens on: bound once so the number is real, then
+    // released.
+    let closed = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    // A process the record does not account for. It refuses the tally
+    // read, as a service that is up and unhealthy would; the port
+    // answering is what gives it away.
+    let stray = serve(upstream(
+        "not ready".into(),
+        StatusCode::SERVICE_UNAVAILABLE,
+    ))
+    .await;
+    let dir = boss_testing::scratch_dir("gate-window-launch-record");
+    let skip = "skip boss-assets-api module equipment is not on in the tenant manifest";
+    let whole = format!(
+        "boss-launch-record v1\nstart boss-jobs-api\nstart boss-people-api\n{skip}\nend 3\n"
+    );
+    let write = |name: &str, body: &str| {
+        let path = dir.join(name);
+        boss_testing::write_file(&path, body);
+        path
+    };
+    let record = write("whole", &whole);
+    let cut = write("cut", &whole.replace("end 3\n", ""));
+    let all_started = write("all-started", &whole.replace(skip, "start boss-assets-api"));
+    struct Case {
+        name: &'static str,
+        assets: String,
+        record: Result<std::path::PathBuf, String>,
+        clean: bool,
+        required: serde_json::Value,
+    }
+    let two = json!(["jobs", "people"]);
+    let three = json!(["assets", "jobs", "people"]);
+    let cases = [
+        Case {
+            name: "skipped and silent",
+            assets: closed.clone(),
+            record: Ok(record.clone()),
+            clean: true,
+            required: two.clone(),
+        },
+        Case {
+            name: "recorded as skipped while a process answers on its port",
+            assets: stray.base.clone(),
+            record: Ok(record.clone()),
+            clean: false,
+            required: two.clone(),
+        },
+        Case {
+            name: "started and down",
+            assets: closed.clone(),
+            record: Ok(all_started),
+            clean: false,
+            required: three.clone(),
+        },
+        Case {
+            name: "the record is missing",
+            assets: closed.clone(),
+            record: Ok(dir.join("absent")),
+            clean: false,
+            required: three.clone(),
+        },
+        Case {
+            name: "the record is cut short",
+            assets: closed.clone(),
+            record: Ok(cut),
+            clean: false,
+            required: three.clone(),
+        },
+        Case {
+            name: "no record path was handed to this process",
+            assets: closed.clone(),
+            record: Err("BOSS_LAUNCH_RECORD is unset".into()),
+            clean: false,
+            required: three.clone(),
+        },
+    ];
+    for case in cases {
+        let live = LocalTallies::new(
+            fixture_client(std::time::Duration::from_secs(1)),
+            vec![
+                ("jobs".into(), jobs.base.clone()),
+                ("people".into(), people.base.clone()),
+                ("assets".into(), case.assets.clone()),
+            ],
+        )
+        .with_launch_record(case.record.clone());
+        let app = gate_window_router(
+            Arc::new(InMemoryGateEvidence::new(events.clone())),
+            Arc::new(live),
+            Arc::new(FixedClock::new(now)),
+        );
+        let response = ask(
+            app,
+            "/api/events/gate-window?gate=machine-gate&hours=72",
+            Some(&user("auditor", "service-tech")),
+            "GET",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let result: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let name = case.name;
+        assert_eq!(
+            result["required_services"], case.required,
+            "{name}: {result}"
+        );
+        assert_eq!(
+            result["covers_requested_window"], case.clean,
+            "{name}: {result}"
+        );
+        let why = result["not_clean"].to_string();
+        match name {
+            "skipped and silent" => {
+                assert_eq!(result["not_launched"][0]["service"], "assets");
+                assert_eq!(result["not_launched"][0]["listening"], false);
+                // The excused port's read stays in the observation.
+                assert_eq!(result["observation"]["reads"].as_array().unwrap().len(), 3);
+                assert_eq!(result["observation"]["not_launched"], json!(["assets"]));
+            }
+            "recorded as skipped while a process answers on its port" => {
+                assert!(
+                    why.contains("assets: recorded as not launched")
+                        && why.contains("its port accepts a connection"),
+                    "{why}"
+                );
+            }
+            "started and down" => assert!(why.contains("assets: GET"), "{why}"),
+            _ => {
+                assert!(why.contains("launch record: "), "{name}: {why}");
+                assert_eq!(result["roster_errors"].as_array().unwrap().len(), 1);
+                assert!(result["not_launched"].as_array().unwrap().is_empty());
+            }
+        }
+    }
+}

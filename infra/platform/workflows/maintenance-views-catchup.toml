@@ -6,7 +6,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "Projects audit_log rows past the event_facts watermark. Before this timer existed the projection only moved on a full boss-rebuild-all and sat tens of thousands of events behind on a live box."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
 
 [[workflow.step]]
 title = "scheduled"

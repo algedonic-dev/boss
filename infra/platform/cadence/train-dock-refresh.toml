@@ -26,7 +26,7 @@
 # which once held it, left the row in its v10 (backlog d1d4275d). A car
 # whose re-gate is still running rides the next train instead.
 #
-# WHY TWO MINUTES. The train-reconcile wall rule is ten, which is most of
+# WHY TWO MINUTES. At this rule's introduction train-reconcile was ten, most of
 # a gate (median 13.9 min for a dock re-gate that day) spent waiting to
 # launch. Two re-asks well inside a gate slot's turnover without contending
 # for the conductor's lock more than the 60-second board already does; a

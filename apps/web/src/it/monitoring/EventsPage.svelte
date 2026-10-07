@@ -24,6 +24,9 @@
   import { formatDate } from '@boss/web-kit/ui/date';
   import { actorOf, knownActors as actorsIn } from './auditActor';
   import { readExport } from './auditExport';
+  import { ageText, readIntegrity, type IntegrityState } from './auditIntegrity';
+  import { href } from '../../router';
+  import { safeLinkHref } from '@boss/web-kit/links';
 
   type AuditEntry = {
     event_id: string;
@@ -82,6 +85,24 @@
     | { kind: 'error'; message: string };
   const STATS_RELOAD_MS = 60_000;
   let statsState = $state<StatsState>({ kind: 'loading' });
+  let integrityState = $state<IntegrityState>({ kind: 'loading' });
+  let integrityNow = $state(Date.now());
+  $effect(() => {
+    let cancelled = false;
+    let refreshGeneration = 0;
+    async function refreshIntegrity(): Promise<void> {
+      const generation = ++refreshGeneration;
+      const value = await readIntegrity((url) => fetch(url, { headers: { Accept: 'application/json' } }));
+      // A slow prior read must not hide a newer failure or unfinished run.
+      if (!cancelled && generation === refreshGeneration) {
+        integrityState = value;
+        integrityNow = Date.now();
+      }
+    }
+    void refreshIntegrity();
+    const timer = setInterval(() => void refreshIntegrity(), STATS_RELOAD_MS);
+    return () => { cancelled = true; clearInterval(timer); };
+  });
 
   async function loadStats(): Promise<void> {
     try {
@@ -434,6 +455,52 @@
     title="Audit Log"
     subtitle="Live tail of every domain event. Operator tier only."
   />
+
+  <div role="region" aria-label="Audit integrity">
+    <Section title="Audit integrity" wide>
+      {#if integrityState.kind === 'loading'}
+        <p role="status">Reading the newest integrity check…</p>
+      {:else if integrityState.kind === 'unavailable'}
+        <p class="load-failed" role="alert">Integrity check unavailable: {integrityState.message}</p>
+      {:else if integrityState.kind === 'empty'}
+        <p>No recorded real integrity checks.</p>
+      {:else}
+        {@const check = integrityState}
+        <p>
+          {check.status === 'open' || check.status === 'draft' ? 'Newest run is in progress'
+            : check.result === 'ok' ? 'Run completed' : check.result === 'failed' ? 'Run failed'
+            : 'Run outcome unknown'}{check.exitStatus ? ` · exit ${check.exitStatus}` : ''}.
+          <a href={safeLinkHref(href(`/jobs/${check.id}`))}>Open integrity check</a>
+        </p>
+        {#if check.observation}
+          {@const report = check.observation}
+          <p>Last checked: <time datetime={report.checkedAt}>{report.checkedAt}</time> · {ageText(report.checkedAt, integrityNow)}.</p>
+          <p>{report.chain === 'intact' ? 'Chain intact' : 'Chain broken'} · {report.totalRows.toLocaleString()} rows.
+            {report.gaps} sequence gaps · {report.missing} missing IDs · {report.gapReading}.
+            {report.regressions} time regressions · {report.dangling} dangling references.</p>
+          {#if report.drift.kind === 'covered'}
+            <p>Every emitted kind declared.</p>
+          {:else if report.drift.kind === 'undeclared'}
+            <p role="status">Undeclared event kinds: {report.drift.kinds.join(', ')}</p>
+          {:else}
+            <p class="load-failed" role="alert">Event-kind coverage unavailable: {report.drift.error}</p>
+          {/if}
+        {:else}
+          <p>Check details unknown: this run has no valid versioned chain and event-kind report.</p>
+          {#if check.finishedAt}
+            <p>Latest run finished: <time datetime={check.finishedAt}>{check.finishedAt}</time> · {ageText(check.finishedAt, integrityNow)}.</p>
+          {:else}
+            <p>Latest run admitted: <time datetime={check.admittedAt}>{check.admittedAt}</time> · {ageText(check.admittedAt, integrityNow)}.</p>
+          {/if}
+        {/if}
+        <details>
+          <summary>Raw evidence</summary>
+          <pre class="events-payload">{check.output ?? 'No raw output recorded.'}</pre>
+          {#if check.rawReport !== null}<pre class="events-payload">{JSON.stringify(check.rawReport, null, 2)}</pre>{/if}
+        </details>
+      {/if}
+    </Section>
+  </div>
 
   <Section title="Size and growth" wide>
     {#if statsState.kind === 'loading'}

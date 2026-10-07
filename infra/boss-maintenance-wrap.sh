@@ -289,8 +289,17 @@ SECRET_LIB="$(dirname "$0")/lib/secret-header.sh"
 machine_token_header MT_HDR "$BOSS_JOBS_URL" \
     || run_unrecorded "the machine token's header file could not be written, so nothing was sent"
 
+# EVERY REQUEST CARRIES IT, THE READ INCLUDED (backlog 37742794). Until
+# 2026-10-06 the header file made above was handed to the POST alone, so
+# every run of every chore — the ten CronJobs that mount the token
+# among them — sent this read bare: 1,327 of the 1,415 would-refuse facts
+# the machine gate held against automation:maintenance-timer in 72 hours,
+# from 259 pod addresses, read at the time as chores missing a mount.
+# Pinned by a_chore_stamps_every_request_it_sends.rs, which drives a
+# whole run and reads each request.
 reply=""; rc=0
 reply=$("$API_CURL" -fsS --max-time "$MAX_TIME" -H "x-boss-user: $BOSS_USER" \
+    ${MT_HDR:+-H "$MT_HDR"} \
     "$BASE/api/jobs?kind=$KIND&status=open&limit=50" 2>"${curl_err:-/dev/stderr}") || rc=$?
 if [ "$rc" -ne 0 ]; then
     run_unrecorded "the jobs API at $BASE did not answer the open-packet read (curl exit $rc)"

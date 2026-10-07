@@ -65,6 +65,26 @@ struct Reader {
 
 const READERS: &[Reader] = &[
     Reader {
+        file: "infra/forge/probe-admission-source-access.sh",
+        door: "its own bounded curl, signed by sor_reader_header as automation:probe-admission-source-access at the existing read role",
+        proof_file: "infra/forge/probe-admission-source-access.sh",
+        proof: "-H \"x-boss-user: $(sor_reader_header 'automation:probe-admission-source-access')\"",
+    },
+    Reader {
+        file: "crates/orchestrators/boss-dispatcher-handlers/src/handlers/ops_discover_remedies.rs",
+        door: "common::get_json, which signs as the rule (dispatcher_actor_header)",
+        proof_file: "crates/orchestrators/boss-dispatcher-handlers/src/handlers/common.rs",
+        proof: ".header(\"x-boss-user\", dispatcher_actor_header(rule_name))",
+    },
+    Reader {
+        file: "infra/forge/discover-admission-source.sh",
+        door: "its own bounded curl, signed by sor_reader_header (infra/lib/sor.sh) \
+               as automation:discover-admission-source at the read role",
+        proof_file: "infra/forge/discover-admission-source.sh",
+        proof: "-H \"x-boss-user: $(sor_reader_header 'automation:discover-admission-source')\" \\\n\
+                -w $'\\n%{http_code}' \"$url\"",
+    },
+    Reader {
         file: "infra/estate/node-roles.sh",
         door: "its own curl, signed by sor_reader_header (infra/lib/sor.sh) as \
                automation:<converge> at the read role — run against a stub curl in \

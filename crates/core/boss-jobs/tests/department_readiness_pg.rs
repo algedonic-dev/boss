@@ -129,7 +129,7 @@ struct Fixture {
 async fn fixture(wired: bool, rules: Option<Arc<dyn DispatcherRules>>) -> Fixture {
     let db = TestDb::new().await;
     let jobs = Arc::new(boss_jobs::PgJobs::new(db.pool.clone()));
-    let kinds = PgWorkflows::new(db.pool.clone());
+    let kinds = PgWorkflows::for_fixture(db.pool.clone());
     let sensors = PgSensors::new(db.pool.clone());
 
     publish(&kinds, declaring("receive-an-inquiry", "sales")).await;

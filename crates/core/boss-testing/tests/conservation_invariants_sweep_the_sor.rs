@@ -130,6 +130,8 @@ fn run_sweep(script: &str, bin: &Path, env: &[(&str, &str)]) -> (i32, String, St
         .env_remove("PGHOST")
         .env_remove("PGUSER")
         .env_remove("PGDATABASE")
+        .env("BOSS_MACHINE_TOKEN_DIR", bin.join("absent-token-mount"))
+        .env("BOSS_MACHINE_TOKEN_HOSTS", "")
         .env("PATH", path)
         .env("STUB_LOG", &log);
     for (k, v) in env {
@@ -139,7 +141,11 @@ fn run_sweep(script: &str, bin: &Path, env: &[(&str, &str)]) -> (i32, String, St
     let argv = std::fs::read_to_string(&log).unwrap_or_default();
     (
         out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
         argv,
     )
 }
@@ -243,6 +249,151 @@ fn the_platform_sweep_reads_database_url_and_falls_back_to_the_pg_spelling() {
             .all(|l| l.starts_with("-h pg.example -U someone -d somedb ")),
         "without DATABASE_URL the PG* triple is what psql gets:\n{argv}"
     );
+}
+
+#[test]
+fn the_ledger_request_reads_the_mounted_token_without_exposing_it_in_argv() {
+    let bin = stubs("conservation-machine-header");
+    let mount = bin.join("mount");
+    std::fs::create_dir(&mount).unwrap();
+    let header_log = bin.join("header.log");
+    write_exec(
+        &bin.join("curl"),
+        r#"#!/usr/bin/env bash
+printf '%s\n' "curl $*" >> "$STUB_LOG"
+for arg in "$@"; do
+    case "$arg" in
+        @*)
+            file=${arg#@}
+            stat -c '%a' "$file" >> "$HEADER_LOG"
+            printf '%s\n' "$file" >> "$HEADER_LOG"
+            cat "$file" >> "$HEADER_LOG"
+            ;;
+    esac
+done
+echo '{"total_assets_cents":100,"total_liabilities_cents":40,"total_equity_cents":60}'
+"#,
+    );
+    let mount_path = mount.to_str().unwrap();
+    let header_path = header_log.to_str().unwrap();
+    for token in ["synthetic-first", "synthetic-rotated"] {
+        std::fs::write(mount.join("current"), token).unwrap();
+        let _ = std::fs::remove_file(&header_log);
+        let (rc, out, argv) = run_sweep(
+            PLATFORM,
+            &bin,
+            &[
+                ("DATABASE_URL", "postgres://fixture/synthetic"),
+                ("LEDGER_BASE", "http://ledger.boss.svc.cluster.local:7080"),
+                ("BOSS_MACHINE_TOKEN_DIR", mount_path),
+                ("BOSS_MACHINE_TOKEN_HOSTS", ".boss.svc.cluster.local"),
+                ("HEADER_LOG", header_path),
+            ],
+        );
+        assert_eq!(rc, 0, "{out}");
+        let recorded = std::fs::read_to_string(&header_log)
+            .expect("the actual ledger curl received a header file");
+        let lines: Vec<_> = recorded.lines().collect();
+        assert_eq!(lines[0], "600", "{recorded}");
+        assert_eq!(lines[2], format!("x-boss-machine-token: {token}"));
+        assert!(
+            !Path::new(lines[1]).exists(),
+            "EXIT removes the header file"
+        );
+        assert!(!argv.contains(token), "the token never reaches curl argv");
+        assert!(!out.contains(token), "the token never reaches the verdict");
+        assert!(argv.contains("automation:conservation-sweep"));
+        assert!(argv.contains("audit-readonly"));
+    }
+}
+
+#[test]
+fn the_ledger_request_withholds_an_absent_bad_or_off_host_token() {
+    let bin = stubs("conservation-machine-withheld");
+    let mount = bin.join("mount");
+    std::fs::create_dir(&mount).unwrap();
+    for (slot, base) in [
+        (None, "http://ledger.boss.svc.cluster.local:7080"),
+        (
+            Some("synthetic\ninjected"),
+            "http://ledger.boss.svc.cluster.local:7080",
+        ),
+        (Some("synthetic-private"), "http://outside.example:7080"),
+    ] {
+        if let Some(value) = slot {
+            std::fs::write(mount.join("current"), value).unwrap();
+        }
+        let (rc, out, argv) = run_sweep(
+            PLATFORM,
+            &bin,
+            &[
+                ("BOSS_MACHINE_TOKEN_DIR", mount.to_str().unwrap()),
+                ("BOSS_MACHINE_TOKEN_HOSTS", ".boss.svc.cluster.local"),
+                ("LEDGER_BASE", base),
+            ],
+        );
+        assert_eq!(
+            rc, 0,
+            "report-mode token omission preserves the sweep: {out}"
+        );
+        assert!(argv.contains("/api/ledger/balance-sheet"));
+        assert!(!argv.contains(" -H @"), "{argv}");
+        assert!(!argv.contains("synthetic"), "{argv}");
+        assert!(!out.contains("synthetic"), "{out}");
+    }
+}
+
+#[test]
+fn a_header_file_failure_is_an_s_error_and_does_not_call_curl() {
+    let bin = stubs("conservation-machine-header-failure");
+    let mount = bin.join("mount");
+    std::fs::create_dir(&mount).unwrap();
+    std::fs::write(mount.join("current"), "synthetic-private").unwrap();
+    write_exec(&bin.join("mktemp"), "#!/usr/bin/env bash\nexit 1\n");
+    let (rc, out, argv) = run_sweep(
+        PLATFORM,
+        &bin,
+        &[
+            ("BOSS_MACHINE_TOKEN_DIR", mount.to_str().unwrap()),
+            ("LEDGER_BASE", "http://127.0.0.1:7080"),
+        ],
+    );
+    assert_eq!(rc, 1, "{out}");
+    assert!(out.contains("[ERROR] S. Balance-sheet endpoint"), "{out}");
+    assert!(out.contains("1 invariant(s) violated"), "{out}");
+    assert!(
+        !argv.contains("curl "),
+        "no unstamped retry after local header failure: {argv}"
+    );
+    assert!(!out.contains("synthetic-private"));
+}
+
+#[test]
+fn the_stamped_ledger_request_still_reports_an_accounting_violation() {
+    let bin = stubs("conservation-machine-imbalance");
+    let mount = bin.join("mount");
+    std::fs::create_dir(&mount).unwrap();
+    std::fs::write(mount.join("current"), "synthetic-private").unwrap();
+    write_exec(
+        &bin.join("curl"),
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"curl $*\" >> \"$STUB_LOG\"\necho '{\"total_assets_cents\":101,\"total_liabilities_cents\":40,\"total_equity_cents\":60}'\n",
+    );
+    let (rc, out, argv) = run_sweep(
+        PLATFORM,
+        &bin,
+        &[
+            ("BOSS_MACHINE_TOKEN_DIR", mount.to_str().unwrap()),
+            ("LEDGER_BASE", "http://127.0.0.1:7080"),
+        ],
+    );
+    assert_eq!(rc, 1, "{out}");
+    assert!(argv.contains(" -H @"), "{argv}");
+    assert!(
+        out.contains("[VIOLATION] S. Balance-sheet endpoint"),
+        "{out}"
+    );
+    assert!(out.contains("imbalance=1 cents"), "{out}");
+    assert!(out.contains("1 invariant(s) violated"), "{out}");
 }
 
 // --- the brewery sweep -----------------------------------------------------
@@ -484,6 +635,11 @@ fn the_image_carries_what_the_chore_runs() {
         "the brewery's own sweep rides in with the examples directory"
     );
     assert!(repo_root().join(LIB).is_file(), "{LIB} exists");
+    assert!(
+        dockerfile
+            .contains("COPY infra/lib/secret-header.sh /opt/boss/infra/lib/secret-header.sh\n"),
+        "the image carries the token helper beside the sweep at its actual relative source path"
+    );
 }
 
 // --- the bare-metal residue ------------------------------------------------

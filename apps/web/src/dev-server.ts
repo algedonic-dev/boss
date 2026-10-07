@@ -32,6 +32,7 @@ import { readyLine } from './dev-ready';
 import { DEFAULT_PORT, TREE_ID, TREE_PATH, treeResponse } from './dev-tree';
 import { MERMAID_ROUTE } from './it/mermaidUrl';
 import { vendoredMermaidFile } from './mermaid-vendor';
+import { serveDevDoorDefault } from './dev-door-static';
 
 const PORT = Number(process.env['PORT'] ?? DEFAULT_PORT);
 
@@ -269,6 +270,7 @@ serve({
     // waiting on the SPA bundle. See src/dev-tree.ts for why a suite
     // that could not ask this went green against another worktree.
     [TREE_PATH]: () => treeResponse(),
+    '/instance-config/dev-door.json': () => serveDevDoorDefault(),
     '/api/tenant/manifest': () => serveTenantManifest(),
     // /api/session — gateway-only route in production; mocked here
     // so the SPA's session probe doesn't 502 in dev. Returns the

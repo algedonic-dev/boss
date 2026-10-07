@@ -217,8 +217,8 @@ fn default_published() -> bool {
     true
 }
 
-/// Patch for a section update. Each `PUT` to a section writes an
-/// append-only history row with the prior state, then applies the patch.
+/// Patch for a section update. Each successful `PUT` records the resulting
+/// state as a new append-only history version.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ManualPatch {
     pub title: Option<String>,

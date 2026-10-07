@@ -122,12 +122,14 @@ esac
 # THE REFUSAL THIS WHOLE FILE EXISTS FOR. Reading on with no identity is
 # exactly the defect: a narrowed answer that looks like a quiet system.
 # So stop, and say which half is missing.
+if [[ -z "${BOSS_SOR_DOOR:-}" ]]; then
 [[ -n "${BOSS_SOR_USER:-}" ]] || refuse \
     "BOSS_SOR_USER is not set, so this read would go out as operator:unidentified — and an
   unidentified reader is answered with a NARROWER WORLD, silently (backlog 61085a9e:
   21 open cars read as 0, a busy yard read as idle). Refusing rather than returning an
   answer that cannot be told apart from 'nothing is there'. The unattended door exports
   this; by hand, export the read-scoped actor yourself."
+fi
 
 base="${BOSS_JOBS_URL%/}"
 
@@ -179,4 +181,9 @@ fi
 # rehearsal). Unbounded, that turns a car's honest not-yet into the
 # runner's 60 s kill — "unreadable" — for every future surface. Ten
 # seconds to connect; the read itself is not cut.
+# The parent owns the credential and identity (design b35c22b4).
+# A failed socket never falls back to an unstamped LAN request.
+if [[ -n "${BOSS_SOR_DOOR:-}" ]]; then
+    exec curl -fsS --connect-timeout 10 --unix-socket "$BOSS_SOR_DOOR" "${base}${path}"
+fi
 exec curl -fsS --connect-timeout 10 -H "x-boss-user: ${BOSS_SOR_USER}" "${base}${path}"

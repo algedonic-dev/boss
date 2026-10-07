@@ -1,3 +1,4 @@
+import { isPageWrite, pageWrites } from './_smokeMocks';
 // /ux/warehouse — "Inventory" (department warehouse), every control and
 // render state pinned as the page behaves TODAY (page audit 7510b0c1,
 // step `test`).
@@ -140,7 +141,6 @@ async function installWarehouse(page: Page): Promise<void> {
 
 /// The shell's own non-GET: App.svelte records every route open
 /// (shell/surface-opens.ts). It is the chrome's write, not this page's.
-const SHELL_WRITES: ReadonlySet<string> = new Set(['/api/surface-opens']);
 
 /// Every read of the page's three paths, and every non-GET it sends.
 function watch(page: Page): { reads: string[]; writes: Request[] } {
@@ -149,7 +149,7 @@ function watch(page: Page): { reads: string[]; writes: Request[] } {
     const url = new URL(req.url());
     if (!url.pathname.startsWith('/api/')) return;
     if (req.method() !== 'GET') {
-      if (!SHELL_WRITES.has(url.pathname)) seen.writes.push(req);
+      if (isPageWrite(req.method(), url.pathname)) seen.writes.push(req);
       return;
     }
     if (READ_PATHS.includes(url.pathname)) seen.reads.push(url.pathname);
@@ -231,19 +231,17 @@ test.describe('/ux/warehouse — State A, the warehouse module off (the live ins
     });
   }
 
-  // Gap 1 (a1fcee7b): with no inlined manifest (the fetch fallback) the
-  // page behind the gate mounts first and makes its three reads before
-  // the notice replaces it. A served page has the manifest inlined, so
-  // this is the fallback's behaviour, not the live instance's.
-  test('without an inlined manifest the page behind the gate reads once before the notice replaces it', async ({ page }) => {
+  // Gap 1 (a1fcee7b): the fallback waits for the manifest before mounting
+  // the gated page, so a known off answer causes no warehouse reads.
+  test('without an inlined manifest the disabled answer prevents page reads', async ({ page }) => {
     const seen = watch(page);
     await installWarehouse(page);
     await installTenantManifest(page, MODULES_LIVE);
     await mountPage(page, PATH);
     await expect(page.locator('.module-disabled h1')).toHaveText('Not enabled for this tenant');
     await expect(page.getByRole('tab', { name: 'Overview' })).toHaveCount(0);
-    expect(await settledReads(page, () => seen.reads.length, 3)).toBe(3);
-    expect([...seen.reads].sort()).toEqual([...READ_PATHS].sort());
+    expect(seen.reads).toEqual([]);
+    expect(seen.writes).toEqual([]);
   });
 });
 
@@ -718,7 +716,7 @@ test.describe('/ux/warehouse — State B: the Create PO form (the one write)', (
     // The page's own record, read once Submit has returned: a write the
     // click opened is in it already. It slept 300 ms and read Playwright's
     // request event until backlog 840c5a76 — a bet on the event's transit.
-    const writes = (await openedRequests(page)).filter((e) => e.method !== 'GET' && !SHELL_WRITES.has(e.path));
+    const writes = pageWrites(await openedRequests(page));
     expect(writes.map((e) => `${e.method} ${e.path}`)).toEqual([]);
     await expect(poStatusLine(page)).toHaveCount(0);
     await expect(button(page, 'Cancel')).toBeVisible();

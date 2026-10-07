@@ -202,7 +202,7 @@ async fn a_rule_narrowing_the_readers_role_leaves_the_coverage_read_whole() {
     );
 
     // The jobs API, deciding by the real engine over those rules.
-    let registry = Arc::new(InMemoryWorkflows::new());
+    let registry = Arc::new(InMemoryWorkflows::for_fixture());
     registry.seed(active_workflow()).unwrap();
     let registry: Arc<dyn WorkflowRegistry> = registry;
     let bus = RecordingEventBus::new();

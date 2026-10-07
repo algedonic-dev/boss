@@ -164,7 +164,7 @@ impl World {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("native.jsonl"), NATIVE).unwrap();
         let jobs = Arc::new(InMemoryJobs::new());
-        let workflows = Arc::new(InMemoryWorkflows::new());
+        let workflows = Arc::new(InMemoryWorkflows::for_fixture());
         let spec = boss_jobs::seed_loader::load_workflows(
             boss_testing::repo_root().join("infra/platform/workflows"),
         )

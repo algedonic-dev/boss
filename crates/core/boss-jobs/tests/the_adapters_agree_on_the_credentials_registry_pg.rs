@@ -76,6 +76,7 @@ impl World for InMemory {
     async fn facts(&self) -> Vec<(String, Value)> {
         self.0
             .recorded_events()
+            .unwrap()
             .into_iter()
             .filter(|e| e.kind.starts_with("credential."))
             .map(|e| (e.kind, e.payload))
@@ -120,7 +121,113 @@ boss_testing::adapters_agree! {
         only_the_install_phase_stamps_rotated_at,
         a_rotation_of_an_unknown_credential_records_nothing,
         a_rotation_policy_the_schema_refuses_lands_nothing,
+        an_original_observation_replays_exactly_and_conflicts_leave_no_new_fact,
     }
+}
+
+async fn an_original_observation_replays_exactly_and_conflicts_leave_no_new_fact<W: World>(
+    w: &W,
+    adapter: &str,
+) {
+    use boss_jobs::credentials::receipt::RotationOutcome;
+    w.repo()
+        .publish("suite", &[declared("suite-replay")], &stamp(0))
+        .await
+        .unwrap();
+    let command = json!({"observation_id":"original-attempt","measured":9.0});
+    let recorded = w
+        .repo()
+        .record_rotation(
+            "suite-replay",
+            RotationPhase::Installed,
+            command.clone(),
+            &stamp(1),
+        )
+        .await
+        .unwrap();
+    let RotationOutcome::Recorded { receipt: original } = recorded else {
+        panic!("{adapter}: fresh observation is recorded");
+    };
+    let facts = w.facts().await;
+    let replay = w
+        .repo()
+        .record_rotation(
+            "suite-replay",
+            RotationPhase::Installed,
+            command.clone(),
+            &stamp(2),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(replay,RotationOutcome::Replayed { receipt } if receipt==original),
+        "{adapter}: original actor/time/event/full bytes retained"
+    );
+    assert_eq!(w.facts().await, facts, "{adapter}: no second event");
+    let changed = json!({"observation_id":"original-attempt","measured":9});
+    assert!(
+        matches!(
+            w.repo()
+                .record_rotation("suite-replay", RotationPhase::Installed, changed, &stamp(3))
+                .await,
+            Err(CredentialsError::ObservationConflict)
+        ),
+        "{adapter}: even changed scalar spelling conflicts"
+    );
+    let foreign = EventStamp::new("jobs", ActorId::automation("foreign")).with_timestamp(at(4));
+    assert!(
+        matches!(
+            w.repo()
+                .record_rotation("suite-replay", RotationPhase::Installed, command, &foreign)
+                .await,
+            Err(CredentialsError::ObservationConflict)
+        ),
+        "{adapter}: actor cannot retrofit provenance"
+    );
+    for invalid in [
+        Value::Null,
+        json!(""),
+        json!("x".repeat(129)),
+        json!(42),
+        json!("a b"),
+    ] {
+        assert!(
+            w.repo()
+                .record_rotation(
+                    "suite-replay",
+                    RotationPhase::Installed,
+                    json!({"observation_id":invalid}),
+                    &stamp(5)
+                )
+                .await
+                .is_err(),
+            "{adapter}: malformed control before mutation"
+        );
+    }
+    assert_eq!(
+        w.repo()
+            .get("suite-replay")
+            .await
+            .unwrap()
+            .unwrap()
+            .rotated_at,
+        Some(at(1))
+    );
+    assert_eq!(w.facts().await, facts);
+    for _ in 0..2 {
+        assert!(matches!(
+            w.repo()
+                .record_rotation("suite-replay", RotationPhase::Minted, json!({}), &stamp(6))
+                .await
+                .unwrap(),
+            RotationOutcome::LegacyRecorded
+        ));
+    }
+    assert_eq!(
+        w.facts().await.len(),
+        facts.len() + 2,
+        "{adapter}: legacy calls deliberately append"
+    );
 }
 
 // ----- fixtures ------------------------------------------------------------

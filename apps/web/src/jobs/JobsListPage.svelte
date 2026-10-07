@@ -12,7 +12,10 @@
   import { rowLink } from '@boss/web-kit/ui/RowLink';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
   import { shortId } from '../data/ids';
-  import { subjectLabel, subjectPath, type Job } from './types';
+  import { subjectLabel, subjectPath } from './types';
+  import { parseListedEnvelope, type LifecycleListedJob } from './listedEnvelope';
+  import { liveSteps, openAge } from './lifecycle';
+  import { listGroups, groupKindQuery } from './listGroups';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { session } from '@boss/web-kit/session/session.svelte';
   import WriteGate from '@boss/web-kit/ui/WriteGate.svelte';
@@ -21,6 +24,11 @@
   import { kindsForDepartment } from './newJobKinds';
   import { ACCOUNTS_LIST_URL } from '../accounts/api';
   import { jobsFilterSearch, searchWithoutNewJob } from './filterQuery';
+  import { parseCompanyDepartments } from '../it/yard/company-map';
+  import { fetchRemote, type Remote } from '../data/remote';
+  import type { Department } from '@boss/web-kit/nav';
+  import { departmentJobsPath } from '../shell/nav-catalog';
+  import { rowDepartment } from './department';
 
   let userId = $derived(
     session.value.kind === 'ready' ? session.value.user.id : '',
@@ -29,7 +37,10 @@
   let {
     initialKind = '',
     initialKindPrefix = '',
+    initialKindGroup = '',
+    initialOrder = 'newest',
     initialDepartment = '',
+    initialDepartmentFilter = '',
     initialStatus = 'open',
     initialOwnerId = '',
     initialSubjectId = '',
@@ -43,6 +54,8 @@
   } = $props<{
     initialKind?: string;
     initialKindPrefix?: string;
+    initialKindGroup?: string;
+    initialOrder?: string;
     /// A departments-registry code. The listing narrows to the packets
     /// whose workflow row declares it — the server's join, not this
     /// page's guess. The Service queue and the Sales pipeline are
@@ -53,6 +66,7 @@
     /// route's own catalog entry (shell/nav-catalog.ts), beside its
     /// path and its app.
     initialDepartment?: string;
+    initialDepartmentFilter?: string;
     initialStatus?: string;
     // #93: list-filter props. owner_id filters by Job.owner_id;
     // subjectId filters by Job.subject_id. A subjectKind prop was
@@ -83,12 +97,23 @@
   // viewer rather than a reactive reset to the incoming deep link.
   let kindPrefix = $state(untrack(() => initialKindPrefix));
   let ownerIdFilter = $state(untrack(() => initialOwnerId));
+  let kindGroup = $state(untrack(() => initialKindGroup));
+  let order = $state(untrack(() => initialOrder));
+  let departmentFilter = $state(untrack(() => initialDepartmentFilter));
+  const effectiveDepartment = $derived(initialDepartment || departmentFilter);
+  let departmentRead = $state<Remote<ReadonlyArray<Department>>>({ kind: 'loading' });
+  const departmentRows = $derived(departmentRead.kind === 'ready' ? departmentRead.data : null);
+  async function readDepartments(): Promise<void> {
+    departmentRead = { kind: 'loading' };
+    departmentRead = await fetchRemote('/api/departments', parseCompanyDepartments);
+  }
+  onMount(() => { void readDepartments(); });
   let status = $state(initialStatus);
   // Operator-typed subject-id override. Falls back to initialSubjectId
   // when the page was opened with a pre-filter (e.g. drilled in from an
   // Account detail page); typing here narrows the result set further.
   let subjectIdFilter = $state(initialSubjectId);
-  let jobs = $state<Job[]>([]);
+  let jobs = $state<LifecycleListedJob[]>([]);
   let loading = $state(true);
   let error = $state<string | null>(null);
   let total = $state(0);
@@ -102,7 +127,7 @@
   $effect(() => {
     if (!writesFiltersToUrl) return;
     const { pathname, search, hash } = window.location;
-    const next = jobsFilterSearch(search, { kind, status, subjectId: subjectIdFilter, ownerId: ownerIdFilter, kindPrefix });
+    const next = jobsFilterSearch(search, { kind, status, subjectId: subjectIdFilter, ownerId: ownerIdFilter, kindPrefix, kindGroup, order, department: initialDepartment ? undefined : departmentFilter });
     if (next !== search) window.history.replaceState(window.history.state, '', pathname + next + hash);
   });
 
@@ -122,7 +147,7 @@
   // of its own to reset it.
   const PAGE_SIZE = 200;
   const filterKey = $derived(
-    JSON.stringify([kind, kindPrefix, initialDepartment, status, ownerIdFilter, subjectIdFilter]),
+    JSON.stringify([kind, kindPrefix, effectiveDepartment, status, ownerIdFilter, subjectIdFilter, kindGroup, order]),
   );
   let turned = $state<{ key: string; offset: number }>({ key: '', offset: 0 });
   const offset = $derived(turned.key === filterKey ? turned.offset : 0);
@@ -130,11 +155,16 @@
   $effect(() => {
     const k = kind;
     const kp = kindPrefix;
-    const dept = initialDepartment;
+    const dept = effectiveDepartment;
     const s = status;
     const o = ownerIdFilter;
     const si = subjectIdFilter;
     const at = offset;
+    const group = kindGroup;
+    const sorting = order;
+    const registryReady = group ? kindsLoaded : false;
+    const registryError = group ? kindsError : null;
+    const registryRows = group ? kinds : [];
     let cancelled = false;
     loading = true;
 
@@ -150,12 +180,21 @@
 
     (async () => {
       try {
+        if (sorting !== 'newest' && sorting !== 'oldest') throw new Error('Invalid job order');
+        if (group && !registryReady) {
+          if (registryError) throw new Error(`Job grouping unavailable: ${registryError}`);
+          return;
+        }
+        const grouped = groupKindQuery(registryRows, group);
+        if (grouped.kinds !== undefined) params.set('kinds', JSON.stringify(grouped.kinds));
+        if (grouped.exclude_kinds !== undefined) params.set('exclude_kinds', JSON.stringify(grouped.exclude_kinds));
+        if (sorting === 'oldest') params.set('order', sorting);
         const resp = await fetch(`/api/jobs?${params}`);
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const body = (await resp.json()) as { data: Job[]; total: number };
+        const body = parseListedEnvelope(await resp.json());
         if (!cancelled) {
-          jobs = body.data ?? [];
-          total = body.total ?? 0;
+          jobs = body.data;
+          total = body.total;
           loading = false;
           error = null;
         }
@@ -183,7 +222,7 @@
 
   // A narrowed read must name its scope (6c9672c2). A department
   // landing keeps its identity; its department is not a removable filter.
-  const filtered = $derived(!!(kind || kindPrefix || ownerIdFilter || subjectIdFilter || status));
+  const filtered = $derived(!!(kind || kindPrefix || ownerIdFilter || subjectIdFilter || status || kindGroup || (!initialDepartment && departmentFilter)));
   const titleFor = $derived(pageTitle
     ? `${pageTitle}${filtered ? ' — filtered' : ''}`
     : filtered ? 'Filtered jobs' : 'All jobs');
@@ -232,6 +271,8 @@
 
   let newJobOpen = $state(false);
   let kinds = $state<WorkflowRow[]>([]);
+  let kindsLoaded = $state(false);
+  const groups = $derived(listGroups(kinds));
   /** The registered ad-hoc Workflow, once the registry has loaded;
    *  null until then and null for a tenant that registers none. */
   const adHoc = $derived(registeredAdHoc(kinds));
@@ -319,7 +360,7 @@
   /// again. The mount effect never passes it.
   async function loadKinds(opts?: { retry?: boolean }) {
     if (opts?.retry) kindsError = null;
-    if (kinds.length > 0 || kindsLoading || kindsError !== null) return;
+    if (kindsLoaded || kindsLoading || kindsError !== null) return;
     kindsLoading = true;
     try {
       const resp = await fetch('/api/workflows');
@@ -327,7 +368,10 @@
       // /api/workflows returns a plain array of WorkflowSpec rows;
       // we keep `description` + `category` so the form can preview
       // what's about to happen.
-      kinds = (await resp.json()) as WorkflowRow[];
+      const rows = (await resp.json()) as WorkflowRow[];
+      listGroups(rows);
+      kinds = rows;
+      kindsLoaded = true;
     } catch (e) {
       kindsError = e instanceof Error ? e.message : String(e);
       formError = kindsError;
@@ -606,6 +650,33 @@
        same state powers the API query so the "All jobs" page can
        drill into any kind / status combination operators care about. -->
   <div class="job-filters">
+    {#if !initialDepartment}
+      <label class="job-filter">
+        <span>Department</span>
+        <select bind:value={departmentFilter} disabled={departmentRead.kind !== 'ready' || departmentRead.data.length === 0}>
+          <option value="">All departments</option>
+          {#each departmentRows ?? [] as department (department.code)}
+            <option value={department.code}>{department.label}</option>
+          {/each}
+          {#if departmentFilter && !departmentRows?.some(row => row.code === departmentFilter)}
+            <option value={departmentFilter}>{departmentRows === null ? 'Department' : 'Unregistered department'}: {departmentFilter}</option>
+          {/if}
+        </select>
+      </label>
+    {/if}
+    <label class="job-filter">
+      <span>Kind group</span>
+      <select bind:value={kindGroup} onfocus={() => void loadKinds({ retry: true })}>
+        <option value="">All activity</option>
+        {#each groups as group (group.value)}
+          <option value={group.value}>{group.label}</option>
+        {/each}
+        <option value="other">Other activity</option>
+        {#if kindGroup && kindGroup !== 'other' && !groups.some(group => group.value === kindGroup)}
+          <option value={kindGroup}>Unknown group: {kindGroup}</option>
+        {/if}
+      </select>
+    </label>
     <label class="job-filter">
       <span>Kind</span>
       <select bind:value={kind} onfocus={() => void loadKinds({ retry: true })}>
@@ -631,8 +702,17 @@
         bind:value={subjectIdFilter}
       />
     </label>
+    <label class="job-filter">
+      <span>Order</span>
+      <select bind:value={order}>
+        <option value="newest">Newest first</option>
+        <option value="oldest">Oldest first</option>
+      </select>
+    </label>
     {#if initialDepartment}
       <span class="job-filter">Department: {initialDepartment}</span>
+    {:else if departmentFilter}
+      <button type="button" aria-label="Remove department filter" onclick={() => { departmentFilter = ''; }}>Department: {departmentRows?.find(row => row.code === departmentFilter)?.label ?? departmentFilter} ✕</button>
     {/if}
     {#if kind}
       <button type="button" aria-label="Remove kind filter" onclick={() => { kind = ''; }}>Kind: {kind} ✕</button>
@@ -649,11 +729,17 @@
     {#if status}
       <button type="button" aria-label="Remove status filter" onclick={() => { status = ''; }}>Status: {status} ✕</button>
     {/if}
-    {#if filtered}
+    {#if kindGroup}
+      <button type="button" aria-label="Remove kind group filter" onclick={() => { kindGroup = ''; }}>Kind group: {kindGroup === 'other' ? 'Other activity' : groups.find(group => group.value === kindGroup)?.label ?? kindGroup} ✕</button>
+    {/if}
+    {#if order !== 'newest'}
+      <button type="button" aria-label="Reset job order" onclick={() => { order = 'newest'; }}>Order: {order} ✕</button>
+    {/if}
+    {#if filtered || order !== 'newest'}
       <button
         type="button"
         class="job-filter-clear"
-        onclick={() => { kind = ''; kindPrefix = ''; ownerIdFilter = ''; status = ''; subjectIdFilter = ''; }}
+        onclick={() => { kind = ''; kindPrefix = ''; ownerIdFilter = ''; status = ''; subjectIdFilter = ''; kindGroup = ''; order = 'newest'; departmentFilter = ''; }}
         title="Clear all filters"
       >
         Clear ✕
@@ -667,6 +753,14 @@
        too, on the shared marker, for as long as the page holds it. -->
   {#if kindsError}
     <p class="load-failed kinds-failed" role="alert">Couldn't load job kinds: {kindsError}</p>
+  {/if}
+  {#if departmentRead.kind === 'failed'}
+    <p class="load-failed" role="alert">Couldn't load departments: {departmentRead.error}</p>
+    <button type="button" onclick={() => void readDepartments()}>Retry department registry</button>
+  {:else if departmentRead.kind === 'loading'}
+    <p role="status">Reading the department registry…</p>
+  {:else if departmentRead.data.length === 0}
+    <p>No departments are registered.</p>
   {/if}
 
   <div class="job-actions">
@@ -840,7 +934,7 @@
             // the cancellation is no back-button entry.
             if (!writesFiltersToUrl) return;
             const { pathname, search, hash } = window.location;
-            const next = searchWithoutNewJob(search, { kind, status, subjectId: subjectIdFilter, ownerId: ownerIdFilter, kindPrefix });
+            const next = searchWithoutNewJob(search, { kind, status, subjectId: subjectIdFilter, ownerId: ownerIdFilter, kindPrefix, kindGroup, order, department: initialDepartment ? undefined : departmentFilter });
             if (next !== search) window.history.replaceState(window.history.state, '', pathname + next + hash);
           }}
           disabled={formSubmitting}
@@ -883,20 +977,36 @@
             <tr>
               <th>ID</th>
               <th>Kind</th>
+              <th>Department</th>
               <th>Title</th>
               <th>Subject</th>
               <th>Status</th>
               <th>Priority</th>
               <th>Opened</th>
+              <th>Current steps and holders</th>
+              <th>Open age</th>
+              <th>Closed</th>
             </tr>
           </thead>
           <tbody>
             {#each jobs as j (j.id)}
+              {@const department = rowDepartment(j, kindsLoaded ? kinds : null, departmentRows)}
               <tr use:rowLink={{ onActivate: () => navigate(entityHref('job', j.id)), label: j.title }}>
                 <td class="mono">
                   <Link to={entityHref('job', j.id)}>{shortId(j.id)}</Link>
                 </td>
                 <td>{j.kind}</td>
+                <td>
+                  {#if department.kind === 'unknown'}
+                    Unknown
+                  {:else if department.kind === 'declared'}
+                    {#if department.registered}
+                      <Link to={href(departmentJobsPath(department.code))}>{department.label}</Link>
+                    {:else}
+                      {department.code} (not registered)
+                    {/if}
+                  {/if}
+                </td>
                 <td>{j.title}</td>
                 <td class="mono">
                   <Link to={href(subjectPath(j.subject))}>{subjectLabel(j.subject)}</Link>
@@ -904,6 +1014,15 @@
                 <td>{j.status}</td>
                 <td>{j.priority}</td>
                 <td>{j.opened_on}</td>
+                <td>
+                  {#each liveSteps(j) as step (step.id)}
+                    <div>{step.title} · {step.status} · {step.assignee_id ?? 'Unassigned'}</div>
+                  {:else}
+                    None
+                  {/each}
+                </td>
+                <td>{openAge(j, appToday())}</td>
+                <td>{j.closed_on ?? '—'}</td>
               </tr>
             {/each}
           </tbody>
@@ -916,7 +1035,7 @@
           <p>
             Showing {jobs.length > 0
               ? `${(offset + 1).toLocaleString()}–${(offset + jobs.length).toLocaleString()}`
-              : 'none'} of {total.toLocaleString()}, newest first
+              : 'none'} of {total.toLocaleString()}, {order} first
           </p>
           <button
             type="button"

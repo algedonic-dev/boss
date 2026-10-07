@@ -98,6 +98,11 @@ fn no_machine_token() -> PathBuf {
 /// — the shape `--gateway` expects (every /api prefix through one
 /// base).
 async fn serve(pool: PgPool) -> String {
+    // Bound first: the policy router's lockout guard reads the roster and
+    // the passkey tiers back through this same base (car 3 of design
+    // 1c4e42e1), as boss-policy-api reads the people API.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
     let people = Arc::new(boss_people::PgPeople::new(pool.clone()));
     let policy: Arc<dyn PolicyClient> = Arc::new(PermissivePolicyClient);
     let people_router = boss_people::http::router(boss_people::http::PeopleApiState {
@@ -160,6 +165,13 @@ async fn serve(pool: PgPool) -> String {
     // defaults (platform-admin / audit-readonly / smoke-tester / guest)
     // into policy_rules. On a fresh database this is where every
     // platform-admin grant comes from.
+    // The passkey tier counts the guard reads — the real door, so a fresh
+    // instance's roster with no key bound reads as nobody holding
+    // anything, and no seeded rule is refused.
+    let webauthn_router = boss_people::webauthn::webauthn_router(
+        pool.clone(),
+        Arc::new(boss_clock_client::WallClockClient),
+    );
     let repo = Arc::new(boss_policy::PgPolicy::new(pool));
     boss_policy::PolicyRepository::bootstrap_reconcile(&*repo, &boss_policy::default_rules())
         .await
@@ -171,6 +183,10 @@ async fn serve(pool: PgPool) -> String {
         repo,
         engine,
         check_mode,
+        sources: Arc::new(boss_policy::coverage::HttpCoverageSources::new(
+            base.clone(),
+            base.clone(),
+        )),
     });
     let outside_this_proof = Router::new()
         .route(
@@ -216,17 +232,16 @@ async fn serve(pool: PgPool) -> String {
         .merge(calendar_router)
         .merge(agents_router)
         .merge(stamps_router)
+        .merge(webauthn_router)
         .merge(policy_router)
         .merge(outside_this_proof)
         .layer(axum::middleware::from_fn(
             boss_policy_client::request_context_middleware,
         ));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    format!("http://{addr}")
+    base
 }
 
 /// A scratch copy of the fixture, so a case can perturb one field.
@@ -250,12 +265,12 @@ fn copy_tree(from: &Path, to: &Path) {
 }
 
 /// The shipped binary: `boss tenant publish <dir> --gateway <base>`.
-fn boss_tenant_publish(dir: &Path, base: &str) -> (bool, String) {
-    boss_tenant_publish_taking(dir, base, None)
+async fn boss_tenant_publish(dir: &Path, base: &str) -> (bool, String) {
+    boss_tenant_publish_taking(dir, base, None).await
 }
 
 /// The same, with `--take <registries>` when `take` is given.
-fn boss_tenant_publish_taking(dir: &Path, base: &str, take: Option<&str>) -> (bool, String) {
+async fn boss_tenant_publish_taking(dir: &Path, base: &str, take: Option<&str>) -> (bool, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_boss"));
     cmd.args(["tenant", "publish"])
         .arg(dir)
@@ -264,7 +279,11 @@ fn boss_tenant_publish_taking(dir: &Path, base: &str, take: Option<&str>) -> (bo
     if let Some(t) = take {
         cmd.args(["--take", t]);
     }
-    let out = cmd.output().expect("boss runs");
+    // Waiting on the child must leave the runtime serving its loopback door.
+    let out = tokio::task::spawn_blocking(move || cmd.output())
+        .await
+        .expect("child wait task joins")
+        .expect("boss runs");
     (
         out.status.success(),
         format!(
@@ -273,6 +292,49 @@ fn boss_tenant_publish_taking(dir: &Path, base: &str, take: Option<&str>) -> (bo
             String::from_utf8_lossy(&out.stderr)
         ),
     )
+}
+
+// A single async worker must still serve the real child's first request.
+// The later 404 deliberately stops this narrow fixture after that boundary.
+#[tokio::test]
+async fn the_publish_child_leaves_its_loopback_server_runnable() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = calls.clone();
+    let app = Router::new().route(
+        "/api/classes/batch",
+        post(move |Json(rows): Json<Vec<Value>>| {
+            let observed = observed.clone();
+            async move {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Json(json!({"received": rows.len(), "inserted": rows.len()}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let dir = tenant_copy("child-server-progress");
+    let (ok, out) = boss_tenant_publish(&dir, &base).await;
+    assert!(!ok, "the subsequent unstubbed door must refuse: {out}");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the loopback server never handled the child's first request: {out}"
+    );
+    assert!(!out.contains("operation timed out"), "{out}");
+    assert!(out.contains("404 Not Found"), "{out}");
+    let dir_text = dir.display().to_string();
+    let (code, out) = boss_unnamed(
+        None,
+        &["tenant", "publish", &dir_text, "--gateway", &base],
+        None,
+    )
+    .await;
+    server.abort();
+    assert_ne!(code, 0, "the later unstubbed door must refuse: {out}");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "{out}");
+    assert!(!out.contains("operation timed out"), "{out}");
+    assert!(out.contains("404 Not Found"), "{out}");
 }
 
 /// The operator baseline, with BOSS_BOOTSTRAP_ADMIN_EMAIL naming the
@@ -329,7 +391,7 @@ async fn the_real_tenant_verbatim_lands_its_location_before_its_founder() {
             .unwrap();
     assert_eq!(before, None, "the schema does not seed the tenant's site");
 
-    let (ok, out) = boss_tenant_publish(&dir, &base);
+    let (ok, out) = boss_tenant_publish(&dir, &base).await;
     assert!(ok, "the verbatim tenant publishes:\n{out}");
     let line_of = |needle: &str| {
         out.lines()
@@ -421,7 +483,7 @@ async fn the_real_tenant_verbatim_lands_its_location_before_its_founder() {
 
     // `--take agents`: the declaration is applied at the real door,
     // each change named from → to, and the fact rides the batch.
-    let (ok, out) = boss_tenant_publish_taking(&dir, &base, Some("agents"));
+    let (ok, out) = boss_tenant_publish_taking(&dir, &base, Some("agents")).await;
     assert!(ok, "the take:\n{out}");
     let agents_line = out
         .lines()
@@ -447,7 +509,7 @@ async fn the_real_tenant_verbatim_lands_its_location_before_its_founder() {
     );
 
     // A second default publish inserts nothing and changes nothing.
-    let (ok, out) = boss_tenant_publish(&dir, &base);
+    let (ok, out) = boss_tenant_publish(&dir, &base).await;
     assert!(ok, "the second publish:\n{out}");
     let locations_line = out
         .lines()
@@ -484,7 +546,7 @@ async fn a_changed_declaration_is_kept_at_the_real_door_and_taken_only_by_decisi
     let db = TestDb::new().await;
     let base = serve(db.pool.clone()).await;
     let dir = tenant_copy("declaration-wins");
-    let (ok, out) = boss_tenant_publish(&dir, &base);
+    let (ok, out) = boss_tenant_publish(&dir, &base).await;
     assert!(ok, "the first publish:\n{out}");
 
     // A salary set out of band, which the tenant's file does not
@@ -506,7 +568,7 @@ async fn a_changed_declaration_is_kept_at_the_real_door_and_taken_only_by_decisi
 
     // By default the instance's row is kept and the line names the
     // field the file says differently; nothing is PUT.
-    let (ok, out) = boss_tenant_publish(&dir, &base);
+    let (ok, out) = boss_tenant_publish(&dir, &base).await;
     assert!(ok, "the second publish:\n{out}");
     let people_line = out
         .lines()
@@ -536,7 +598,7 @@ async fn a_changed_declaration_is_kept_at_the_real_door_and_taken_only_by_decisi
     assert_eq!(n, 0, "no update fact under the default");
 
     // Under --take employees the declared field is applied.
-    let (ok, out) = boss_tenant_publish_taking(&dir, &base, Some("employees"));
+    let (ok, out) = boss_tenant_publish_taking(&dir, &base, Some("employees")).await;
     assert!(ok, "the take:\n{out}");
     let people_line = out
         .lines()
@@ -577,7 +639,7 @@ async fn a_changed_declaration_is_kept_at_the_real_door_and_taken_only_by_decisi
     assert_ne!(updates[0]["_simulated"], json!(true));
 
     // Idempotent at the real door: the same file again writes nothing.
-    let (ok, out) = boss_tenant_publish(&dir, &base);
+    let (ok, out) = boss_tenant_publish(&dir, &base).await;
     assert!(ok, "the third publish:\n{out}");
     let people_line = out
         .lines()
@@ -605,7 +667,7 @@ async fn tenant_then_baseline_leaves_one_founder_row_and_no_bootstrap_admin() {
     let dir = tenant_copy("one-founder");
 
     // 1. The tenant, verbatim, through the shipped verb.
-    let (ok, out) = boss_tenant_publish(&dir, &base);
+    let (ok, out) = boss_tenant_publish(&dir, &base).await;
     assert!(ok, "boss tenant publish:\n{out}");
     assert!(
         out.contains("1 posted, 0/0 linked"),
@@ -748,7 +810,7 @@ async fn baseline_then_tenant_reads_the_declared_roster_and_leaves_one_founder_r
     );
 
     // 2. The tenant, verbatim, through the shipped verb.
-    let (ok, out) = boss_tenant_publish(&dir, &base);
+    let (ok, out) = boss_tenant_publish(&dir, &base).await;
     assert!(ok, "boss tenant publish:\n{out}");
     assert!(
         out.contains("1 posted, 0/0 linked"),
@@ -821,7 +883,7 @@ async fn the_seed_calendar_lands_through_the_real_door_and_a_take_names_who_took
     let dir = tenant_copy("calendar");
     let declared = ["2026-11-26", "2026-11-27", "2026-12-25", "2027-01-01"];
 
-    let (ok, out) = boss_tenant_publish(&dir, &base);
+    let (ok, out) = boss_tenant_publish(&dir, &base).await;
     assert!(ok, "the verbatim tenant publishes:\n{out}");
     let line = |out: &str| {
         out.lines()
@@ -852,7 +914,7 @@ async fn the_seed_calendar_lands_through_the_real_door_and_a_take_names_who_took
     std::fs::write(&path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
 
     // By default the instance's set is kept, and nothing is recorded.
-    let (ok, out) = boss_tenant_publish(&dir, &base);
+    let (ok, out) = boss_tenant_publish(&dir, &base).await;
     assert!(ok, "the default republish:\n{out}");
     let calendars = line(&out);
     assert!(
@@ -868,7 +930,7 @@ async fn the_seed_calendar_lands_through_the_real_door_and_a_take_names_who_took
 
     // Under --take calendars the declaration replaces the set, and the
     // fact says who did it and what it replaced.
-    let (ok, out) = boss_tenant_publish_taking(&dir, &base, Some("calendars"));
+    let (ok, out) = boss_tenant_publish_taking(&dir, &base, Some("calendars")).await;
     assert!(ok, "the take:\n{out}");
     let calendars = line(&out);
     assert!(
@@ -890,7 +952,7 @@ async fn the_seed_calendar_lands_through_the_real_door_and_a_take_names_who_took
     assert_eq!(updated["_actor"], "automation:tenant-seed");
 
     // The same take again restates the held row: nothing recorded.
-    let (ok, out) = boss_tenant_publish_taking(&dir, &base, Some("calendars"));
+    let (ok, out) = boss_tenant_publish_taking(&dir, &base, Some("calendars")).await;
     assert!(ok, "the second take:\n{out}");
     assert_eq!(
         calendar_facts(&db.pool).await.len(),
@@ -901,14 +963,47 @@ async fn the_seed_calendar_lands_through_the_real_door_and_a_take_names_who_took
 
 /// The shipped binary with the services container's environment:
 /// `BOSS_POSTGRES_URL` naming the database the doors serve from.
-fn boss_with_database(db: &TestDb, args: &[&str], take: Option<&str>) -> (i32, String) {
-    boss_unnamed(Some(db), args, take)
+async fn boss_with_database(db: &TestDb, args: &[&str], take: Option<&str>) -> (i32, String) {
+    boss_unnamed(Some(db), args, take).await
+}
+
+/// Force real SQL diagnostics in the child, independent of pool timing.
+/// Separate pipes are the launcher's contract: warnings must stay visible
+/// without becoming the first word of the command's data (aa666eb9).
+fn published_with_sql_diagnostics(db: &TestDb) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_boss"))
+        .args(["tenant", "published"])
+        .env("BOSS_POSTGRES_URL", db.url())
+        .env("RUST_LOG", "sqlx::query=debug")
+        .env(TOKEN_DIR_ENV, no_machine_token())
+        .output()
+        .expect("the real CLI runs with separate output pipes")
+}
+
+fn traced_published_line(out: &std::process::Output, code: i32) -> String {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(code),
+        "stdout:{stdout}\nstderr:{stderr}"
+    );
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "one data line, diagnostics separate: stdout:{stdout}\nstderr:{stderr}"
+    );
+    assert!(
+        stderr.contains("sqlx::query"),
+        "actual SQL diagnostics remain visible: stdout:{stdout}\nstderr:{stderr}"
+    );
+    stdout.trim_end().to_string()
 }
 
 /// The same, unnamed, with or without the database URL — `None` is the
 /// operator's seat, which publishes through a door and holds no
 /// database (backlog 42da8bd2).
-fn boss_unnamed(db: Option<&TestDb>, args: &[&str], take: Option<&str>) -> (i32, String) {
+async fn boss_unnamed(db: Option<&TestDb>, args: &[&str], take: Option<&str>) -> (i32, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_boss"));
     match db {
         Some(db) => cmd.env("BOSS_POSTGRES_URL", db.url()),
@@ -926,7 +1021,10 @@ fn boss_unnamed(db: Option<&TestDb>, args: &[&str], take: Option<&str>) -> (i32,
     if let Some(t) = take {
         cmd.args(["--take", t]);
     }
-    let out = cmd.output().expect("boss runs");
+    let out = tokio::task::spawn_blocking(move || cmd.output())
+        .await
+        .expect("child wait task joins")
+        .expect("boss runs");
     (
         out.status.code().unwrap_or(-1),
         format!(
@@ -959,17 +1057,26 @@ async fn a_successful_publish_stamps_the_database_once_per_run_and_published_rea
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(
+        out.stdout.is_empty(),
+        "an unavailable database emits no result data"
+    );
+    assert!(
         String::from_utf8_lossy(&out.stderr).contains("BOSS_POSTGRES_URL is unset"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
 
     // A fresh database holds no stamp: exit 1, the line says so.
-    let (code, out) = boss_with_database(&db, &["tenant", "published"], None);
+    let (code, out) = boss_with_database(&db, &["tenant", "published"], None).await;
     assert_eq!(code, 1, "{out}");
     assert!(
         out.contains("no tenant publish stamped in this database"),
         "{out}"
+    );
+    let traced_empty = traced_published_line(&published_with_sql_diagnostics(&db), 1);
+    assert_eq!(
+        traced_empty,
+        "no tenant publish stamped in this database: the launcher publishes on the next boot; boss tenant publish <dir> publishes now"
     );
 
     // A dry run stamps nothing.
@@ -978,9 +1085,10 @@ async fn a_successful_publish_stamps_the_database_once_per_run_and_published_rea
         &db,
         &["tenant", "publish", &dir_s, "--gateway", &base, "--dry-run"],
         None,
-    );
+    )
+    .await;
     assert_eq!(code, 0, "{out}");
-    let (code, _) = boss_with_database(&db, &["tenant", "published"], None);
+    let (code, _) = boss_with_database(&db, &["tenant", "published"], None).await;
     assert_eq!(code, 1, "a dry run leaves no stamp");
 
     // Without the URL — the operator's seat, which publishes through a
@@ -993,7 +1101,8 @@ async fn a_successful_publish_stamps_the_database_once_per_run_and_published_rea
         None,
         &["tenant", "publish", &dir_s, "--gateway", &base],
         None,
-    );
+    )
+    .await;
     assert_eq!(code, 0, "{out}");
     assert!(
         out.contains("stamped: tenant algedonic publish recorded in tenant_publishes at ")
@@ -1003,7 +1112,7 @@ async fn a_successful_publish_stamps_the_database_once_per_run_and_published_rea
 
     // `published` prints the date first (the launcher's contract) and
     // exits 0 — the row the door wrote is the one the guard reads.
-    let (code, out) = boss_with_database(&db, &["tenant", "published"], None);
+    let (code, out) = boss_with_database(&db, &["tenant", "published"], None).await;
     assert_eq!(code, 0, "{out}");
     let line = out.lines().nth(1).unwrap_or_default();
     let date = line.split(' ').next().unwrap_or_default();
@@ -1016,6 +1125,11 @@ async fn a_successful_publish_stamps_the_database_once_per_run_and_published_rea
             && line.ends_with(&format!("; 1 publish, last {date}")),
         "{line}"
     );
+    let traced_stamp = traced_published_line(&published_with_sql_diagnostics(&db), 0);
+    assert_eq!(
+        traced_stamp, line,
+        "diagnostics cannot change the complete stamp data"
+    );
 
     // A republish under --take is recorded as a second row with what
     // it took; the FIRST row stays the stamp.
@@ -1023,7 +1137,8 @@ async fn a_successful_publish_stamps_the_database_once_per_run_and_published_rea
         &db,
         &["tenant", "publish", &dir_s, "--gateway", &base],
         Some("agents"),
-    );
+    )
+    .await;
     assert_eq!(code, 0, "{out}");
     assert!(out.contains("; took agents"), "{out}");
     let rows: Vec<(String, String, Vec<String>)> = sqlx::query_as(
@@ -1047,12 +1162,14 @@ async fn a_successful_publish_stamps_the_database_once_per_run_and_published_rea
             ),
         ]
     );
-    let (code, out) = boss_with_database(&db, &["tenant", "published"], None);
+    let (code, out) = boss_with_database(&db, &["tenant", "published"], None).await;
     assert_eq!(code, 0, "{out}");
     assert!(
         out.contains(&format!("{date} tenant algedonic")) && out.contains("; 2 publishes, last "),
         "the first publish stays the stamp:\n{out}"
     );
+    let traced_republish = traced_published_line(&published_with_sql_diagnostics(&db), 0);
+    assert_eq!(traced_republish, out.lines().nth(1).unwrap_or_default());
 
     // Each row projects a FACT the door staged on the outbox with it
     // (backlog dbdc4d31, 42da8bd2): one tenant.published per publish,

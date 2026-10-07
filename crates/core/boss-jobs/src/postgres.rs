@@ -25,6 +25,27 @@ pub struct PgJobs {
     nats_url: Option<String>,
 }
 
+pub(crate) async fn preserve_first_records(
+    conn: &mut sqlx::PgConnection,
+    id: &StepId,
+    metadata: &serde_json::Value,
+) -> Result<(), JobsError> {
+    let receipts: Vec<String> =
+        sqlx::query_scalar("SELECT receipt FROM step_first_records WHERE step_id = $1")
+            .bind(*id.inner().as_uuid())
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+    let records: Vec<crate::first_record::FirstRecord> = receipts
+        .iter()
+        .map(|receipt| {
+            serde_json::from_str(receipt)
+                .map_err(|_| JobsError::Storage("invalid first record projection".into()))
+        })
+        .collect::<Result<_, _>>()?;
+    crate::first_record::preserve(records.iter(), metadata)
+}
+
 impl PgJobs {
     pub fn new(pool: PgPool) -> Self {
         Self {
@@ -81,6 +102,7 @@ impl PgJobs {
         };
         let row_version = row.row_version;
         let current = row_to_step(row.step)?;
+        preserve_first_records(&mut tx, &step.id, &step.metadata).await?;
         if let Some(read) = read {
             if StepVersion::new(row_version) != read {
                 return Err(JobsError::StepChanged { id: step.id });
@@ -276,6 +298,24 @@ struct JobRow {
     metadata: serde_json::Value,
     tags: Vec<String>,
     partition: String,
+}
+
+const JOB_BY_ID_QUERY: &str = "SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, opened_at, due_on, closed_on, metadata, tags, partition FROM jobs WHERE id = $1";
+
+async fn signer_job_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    guard: &crate::signer_write::SignerWriteGuard,
+    stamp: &boss_core::publisher::EventStamp,
+) -> Result<(), JobsError> {
+    // Job writers precede step writers: hold the actual scope inputs until
+    // COMMIT, not just a handler's earlier read of owner/department/subject.
+    let row = sqlx::query_as::<_, JobRow>(&format!("{JOB_BY_ID_QUERY} FOR SHARE"))
+        .bind(*guard.job().id.inner().as_uuid())
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|error| JobsError::Storage(error.to_string()))?;
+    let job = row.map(row_to_job);
+    guard.check_job(job.as_ref(), stamp)
 }
 
 #[derive(sqlx::FromRow)]
@@ -896,13 +936,11 @@ impl JobsRepository for PgJobs {
     }
 
     async fn get_job(&self, id: &JobId) -> Result<Option<Job>, JobsError> {
-        let row = sqlx::query_as::<_, JobRow>(
-            "SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, opened_at, due_on, closed_on, metadata, tags, partition FROM jobs WHERE id = $1",
-        )
-        .bind(*id.inner().as_uuid())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| JobsError::Storage(e.to_string()))?;
+        let row = sqlx::query_as::<_, JobRow>(JOB_BY_ID_QUERY)
+            .bind(*id.inner().as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
         Ok(row.map(row_to_job))
     }
 
@@ -1492,6 +1530,22 @@ impl JobsRepository for PgJobs {
             .collect())
     }
 
+    async fn recorded_event(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<boss_core::event::Event>, JobsError> {
+        Ok(boss_events::tail_http::recorded_event(&self.pool, id)
+            .await
+            .map_err(JobsError::Storage)?
+            .map(|row| boss_core::event::Event {
+                id: row.event_id,
+                timestamp: row.timestamp,
+                source: row.source,
+                kind: row.kind,
+                payload: row.payload,
+            }))
+    }
+
     async fn repin_workflow_version_at(
         &self,
         id: &JobId,
@@ -1573,6 +1627,18 @@ impl JobsRepository for PgJobs {
             // would revive them. A terminal row keeps its text under the
             // CASEs below, so its shape does not move and nothing dies.
             let shape_before = shape_under_lock(&mut tx, &s.id).await?;
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM steps WHERE id = $1")
+                    .bind(*s.id.inner().as_uuid())
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| JobsError::Storage(e.to_string()))?;
+            if status
+                .as_deref()
+                .is_some_and(|s| s != "completed" && (s != "skipped" || r.unskipped))
+            {
+                preserve_first_records(&mut tx, &s.id, &s.metadata).await?;
+            }
             // A skipped row the plan re-derived as live ($12, backlog
             // 4c6b4b74) is the one terminal row this writes: pending,
             // with the target's text. Every CASE reads the row as it
@@ -1808,6 +1874,7 @@ impl JobsRepository for PgJobs {
               -- window's departures alone (backlog a22311a1).
               AND ($20::bool IS NULL
                    OR (status IN ('closed', 'cancelled')) = $20)
+              AND ($21::text[] IS NULL OR NOT (kind = ANY($21)))
               -- opened_on is a DATE: a busy day is one big tie, and a
               -- LIMIT over an arbitrary order returns an arbitrary
               -- subset (2026-09-07 held 398 closed pr-trains; the
@@ -1815,7 +1882,10 @@ impl JobsRepository for PgJobs {
               -- the evening). Admission instant, then id, makes the
               -- page deterministic. The in-memory adapter sorts the
               -- same way — pinned by tests on both sides.
-            ORDER BY opened_on DESC, created_at DESC, id
+            ORDER BY CASE WHEN $22::bool THEN COALESCE(opened_at, created_at) END ASC,
+                     CASE WHEN NOT $22::bool THEN opened_on END DESC,
+                     CASE WHEN NOT $22::bool THEN created_at END DESC,
+                     id
             LIMIT $5 OFFSET $6
         "#;
 
@@ -1840,6 +1910,8 @@ impl JobsRepository for PgJobs {
             .bind(department_kinds)
             .bind(filter.priority.map(priority_str))
             .bind(filter.terminal)
+            .bind(filter.excluded_kinds.as_deref())
+            .bind(filter.oldest_first)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
@@ -1898,6 +1970,7 @@ impl JobsRepository for PgJobs {
               -- the same reason.
               AND ($18::bool IS NULL
                    OR (status IN ('closed', 'cancelled')) = $18)
+              AND ($19::text[] IS NULL OR NOT (kind = ANY($19)))
             "#,
         )
         .bind(filter.kind.as_deref())
@@ -1918,6 +1991,7 @@ impl JobsRepository for PgJobs {
         .bind(department_kinds)
         .bind(filter.priority.map(priority_str))
         .bind(filter.terminal)
+        .bind(filter.excluded_kinds.as_deref())
         .fetch_one(&self.pool)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
@@ -1992,11 +2066,184 @@ impl JobsRepository for PgJobs {
         self.write_step(step, Some(read), now, events).await
     }
 
+    async fn first_step_record(
+        &self,
+        id: &StepId,
+        key: &str,
+    ) -> Result<Option<crate::first_record::FirstRecord>, JobsError> {
+        let receipt: Option<String> = sqlx::query_scalar(
+            "SELECT receipt FROM step_first_records WHERE step_id = $1 AND key = $2",
+        )
+        .bind(*id.inner().as_uuid())
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+        receipt
+            .map(|raw| {
+                serde_json::from_str(&raw)
+                    .map_err(|_| JobsError::Storage("invalid first record projection".into()))
+            })
+            .transpose()
+    }
+
+    async fn record_step_metadata_if_unchanged_at(
+        &self,
+        id: &StepId,
+        key: &str,
+        value: &serde_json::Value,
+        read: Option<StepVersion>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<crate::first_record::FirstRecordResult, JobsError> {
+        self.record_step_metadata_guarded_at(id, key, value, read, stamp, None)
+            .await
+    }
+    async fn record_step_metadata_guarded_at(
+        &self,
+        id: &StepId,
+        key: &str,
+        value: &serde_json::Value,
+        read: Option<StepVersion>,
+        stamp: &boss_core::publisher::EventStamp,
+        guard: Option<&crate::signer_write::SignerWriteGuard>,
+    ) -> Result<crate::first_record::FirstRecordResult, JobsError> {
+        use crate::first_record::{FirstRecord, FirstRecordResult};
+        if !crate::first_record::valid_key(key) {
+            return Err(JobsError::Storage("invalid first record key".into()));
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        if let Some(guard) = guard {
+            signer_job_in(&mut tx, guard, stamp).await?;
+        }
+        let row = sqlx::query_as::<_, VersionedStepRow>(&format!(
+            "{VERSIONED_STEP_SELECT} WHERE id = $1 FOR UPDATE"
+        ))
+        .bind(*id.inner().as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+        let Some(row) = row else {
+            return Ok(FirstRecordResult::NotFound);
+        };
+        let row_version = StepVersion::new(row.row_version);
+        if let Some(guard) = guard {
+            guard.check_row(row_version, id, stamp)?;
+        }
+        let mut step = row_to_step(row.step)?;
+        // A replay still returns protected evidence: do not reuse a stale
+        // authorization judgment after declarations move under the row lock.
+        if read.is_some_and(|read| read != row_version) {
+            return Err(JobsError::StepChanged { id: *id });
+        }
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT receipt FROM step_first_records WHERE step_id = $1 AND key = $2",
+        )
+        .bind(*id.inner().as_uuid())
+        .bind(key)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+        if let Some(guard) = guard {
+            guard.check_before_dispatch(stamp)?;
+        }
+        if let Some(existing) = existing {
+            let record: FirstRecord = serde_json::from_str(&existing)
+                .map_err(|_| JobsError::Storage("invalid first record projection".into()))?;
+            return Ok(if record.matches(value) {
+                FirstRecordResult::Replayed(record)
+            } else {
+                FirstRecordResult::Conflict {
+                    job_id: step.job_id,
+                    step_id: *id,
+                    key: key.into(),
+                }
+            });
+        }
+        if matches!(step.status, StepStatus::Completed | StepStatus::Skipped) {
+            return Ok(FirstRecordResult::Terminal);
+        }
+        if step.metadata.get(key).is_some() {
+            return Ok(FirstRecordResult::Conflict {
+                job_id: step.job_id,
+                step_id: *id,
+                key: key.into(),
+            });
+        }
+        let before = step.shape_hash();
+        let mut metadata = step.metadata.as_object().cloned().unwrap_or_default();
+        metadata.insert(key.into(), value.clone());
+        step.metadata = serde_json::Value::Object(metadata);
+        let invalidated = crate::events::void_stamps_if_moved(stamp, &before, &mut step);
+        let mut event = stamp.event(crate::events::STEP_FIRST_RECORDED, serde_json::Value::Null);
+        let record = FirstRecord::new(step.job_id, *id, key, value, stamp, event.id);
+        event.payload = stamp
+            .event(
+                crate::events::STEP_FIRST_RECORDED,
+                serde_json::json!({"step":step,"record":record}),
+            )
+            .payload;
+        let state_event = stamp.event(
+            crate::events::STEP_UPDATED,
+            crate::events::step_state_payload(&step),
+        );
+        sqlx::query(
+            "UPDATE steps SET metadata = $2, sign_offs = $3, updated_at = $4 WHERE id = $1",
+        )
+        .bind(*id.inner().as_uuid())
+        .bind(&step.metadata)
+        .bind(serde_json::to_value(&step.sign_offs).map_err(|e| JobsError::Storage(e.to_string()))?)
+        .bind(stamp.timestamp)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+        let serialized =
+            serde_json::to_string(&record).map_err(|e| JobsError::Storage(e.to_string()))?;
+        sqlx::query("INSERT INTO step_first_records (step_id, key, receipt) VALUES ($1,$2,$3)")
+            .bind(*id.inner().as_uuid())
+            .bind(key)
+            .bind(serialized)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(JobsError::Storage)?;
+        boss_events::outbox::record_event_in_tx(&mut tx, &state_event)
+            .await
+            .map_err(JobsError::Storage)?;
+        if let Some(event) = invalidated {
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(JobsError::Storage)?;
+        }
+        if let Some(guard) = guard {
+            guard.check_before_dispatch(stamp)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        Ok(FirstRecordResult::Recorded(record))
+    }
+
     async fn merge_step_metadata_at(
         &self,
         id: &StepId,
         patch: &serde_json::Map<String, serde_json::Value>,
         stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<Step, JobsError> {
+        self.merge_step_metadata_guarded_at(id, patch, stamp, None)
+            .await
+    }
+    async fn merge_step_metadata_guarded_at(
+        &self,
+        id: &StepId,
+        patch: &serde_json::Map<String, serde_json::Value>,
+        stamp: &boss_core::publisher::EventStamp,
+        guard: Option<&crate::signer_write::SignerWriteGuard>,
     ) -> Result<Step, JobsError> {
         // Same split as merge_job_metadata_at: null values are
         // removals, everything else upserts. Top-level only.
@@ -2015,10 +2262,43 @@ impl JobsRepository for PgJobs {
             .begin()
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
+        if let Some(guard) = guard {
+            signer_job_in(&mut tx, guard, stamp).await?;
+        }
         // The shape the stamps were attesting, under the lock the merge
         // below then writes through (design 87329a13). A missing row
         // reads None here and is named by the disambiguation below.
         let shape_before = shape_under_lock(&mut tx, id).await?;
+        if let Some(guard) = guard {
+            let version: Option<i64> =
+                sqlx::query_scalar("SELECT xmin::text::bigint FROM steps WHERE id=$1")
+                    .bind(*id.inner().as_uuid())
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| JobsError::Storage(e.to_string()))?;
+            guard.check_row(
+                StepVersion::new(version.ok_or(JobsError::StepNotFound(*id))?),
+                id,
+                stamp,
+            )?;
+        }
+        let metadata: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT metadata FROM steps WHERE id = $1")
+                .bind(*id.inner().as_uuid())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| JobsError::Storage(e.to_string()))?;
+        if let Some(metadata) = metadata {
+            let mut proposed = metadata.as_object().cloned().unwrap_or_default();
+            for (key, value) in patch {
+                if value.is_null() {
+                    proposed.remove(key);
+                } else {
+                    proposed.insert(key.clone(), value.clone());
+                }
+            }
+            preserve_first_records(&mut tx, id, &serde_json::Value::Object(proposed)).await?;
+        }
         // ONE statement is the atomicity, and the terminal freeze
         // rides its WHERE clause: a step that completed between the
         // caller's read and this write matches no row, instead of
@@ -2089,6 +2369,9 @@ impl JobsRepository for PgJobs {
             boss_events::outbox::record_event_in_tx(&mut tx, event)
                 .await
                 .map_err(JobsError::Storage)?;
+        }
+        if let Some(guard) = guard {
+            guard.check_before_dispatch(stamp)?;
         }
         tx.commit()
             .await
@@ -2209,6 +2492,21 @@ impl JobsRepository for PgJobs {
         // after its STEP_UPDATED (backlog 4174c4a9). A re-claim by the
         // holder moves nothing and voids nothing.
         let mut claimed = row_to_step(row)?;
+        preserve_first_records(&mut tx, step_id, &claimed.metadata).await?;
+        for event in events
+            .iter()
+            .filter(|event| event.kind == crate::events::STEP_UPDATED)
+        {
+            preserve_first_records(
+                &mut tx,
+                step_id,
+                event
+                    .payload
+                    .get("metadata")
+                    .unwrap_or(&serde_json::Value::Null),
+            )
+            .await?;
+        }
         let invalidated = match &shape_before {
             Some(before) => crate::events::void_stamps_if_moved(stamp, before, &mut claimed),
             None => None,

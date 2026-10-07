@@ -1,3 +1,4 @@
+import { isPageWrite } from './_smokeMocks';
 // /ux/assets — "Assets" (department maintenance), every control and
 // render state pinned as the page behaves TODAY (page audit 015c3935,
 // step `test`).
@@ -134,7 +135,6 @@ async function installAssets(page: Page): Promise<void> {
 
 /// The shell's own non-GET: App.svelte records every route open
 /// (shell/surface-opens.ts). It is the chrome's write, not this page's.
-const SHELL_WRITES: ReadonlySet<string> = new Set(['/api/surface-opens']);
 
 /// Every read of the page's two paths (with its query), and every non-GET.
 function watch(page: Page): { reads: string[]; writes: Request[] } {
@@ -143,7 +143,7 @@ function watch(page: Page): { reads: string[]; writes: Request[] } {
     const url = new URL(req.url());
     if (!url.pathname.startsWith('/api/')) return;
     if (req.method() !== 'GET') {
-      if (!SHELL_WRITES.has(url.pathname)) seen.writes.push(req);
+      if (isPageWrite(req.method(), url.pathname)) seen.writes.push(req);
       return;
     }
     if (READ_PATHS.includes(url.pathname)) seen.reads.push(`${url.pathname}${url.search}`);
@@ -236,19 +236,16 @@ test.describe('/ux/assets — State A, the equipment module off (the live instan
     expect(MODULES_LIVE.equipment, `the live manifest recorded ${LIVE_MANIFEST_RECORDED_AT}`).toBe(false);
   });
 
-  // With no inlined manifest (the fetch fallback) the page behind the
-  // gate mounts first and makes its two reads before the notice replaces
-  // it. A served page has the manifest inlined, so this is the
-  // fallback's behaviour, not the live instance's.
-  test('without an inlined manifest the page behind the gate reads once before the notice replaces it', async ({ page }) => {
+  // The fetch fallback waits for the manifest and refuses an off module without reads.
+  test('without an inlined manifest the disabled module performs no page reads', async ({ page }) => {
     const seen = watch(page);
     await installAssets(page);
     await installTenantManifest(page, MODULES_LIVE);
     await mountPage(page, PATH);
     await expect(page.locator('.module-disabled h1')).toHaveText('Not enabled for this tenant');
     await expect(page.locator('.kanban')).toHaveCount(0);
-    expect(await settledReads(page, () => seen.reads.length, 2)).toBe(2);
-    expect([...seen.reads].sort()).toEqual(['/api/assets/summary', '/api/assets?limit=500']);
+    expect(await settledReads(page, () => seen.reads.length, 0)).toBe(0);
+    expect(seen.reads).toEqual([]);
   });
 });
 

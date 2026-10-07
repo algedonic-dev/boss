@@ -33,7 +33,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "The daily 17:20 UTC deposit of the break-glass operator's kubeconfig on boss-gcp, verified by effect in both directions first (boss-break-glass-deposit)."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
 
 [[workflow.step]]
 title = "scheduled"

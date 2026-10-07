@@ -1,3 +1,4 @@
+import { isPageWrite } from './_smokeMocks';
 // /ux/products — "Products" (department production), every control and
 // render state pinned as the page behaves TODAY (page audit 6b4e43a1,
 // step `test`; gap 2 of that audit is this spec).
@@ -99,7 +100,6 @@ async function installProducts(page: Page): Promise<void> {
 
 /// The shell's own non-GET: App.svelte records every route open
 /// (shell/surface-opens.ts). It is the chrome's write, not this page's.
-const SHELL_WRITES: ReadonlySet<string> = new Set(['/api/surface-opens']);
 
 /// Every read of the page's paths (the list and each detail), and every
 /// non-GET it sends.
@@ -109,7 +109,7 @@ function watch(page: Page): { reads: string[]; writes: Request[] } {
     const url = new URL(req.url());
     if (!url.pathname.startsWith('/api/')) return;
     if (req.method() !== 'GET') {
-      if (!SHELL_WRITES.has(url.pathname)) seen.writes.push(req);
+      if (isPageWrite(req.method(), url.pathname)) seen.writes.push(req);
       return;
     }
     if (url.pathname === '/api/products' || url.pathname.startsWith('/api/products/')) {
@@ -201,15 +201,10 @@ test.describe('/ux/products — State A, the parts module off (the live instance
     expect(reads.map((e) => e.path)).toEqual([]);
   });
 
-  // a1fcee7b, measured while writing this spec: with no inlined manifest
-  // (the fetch fallback), the page behind the gate mounts first and
-  // makes its reads before the notice replaces it. The manifest answer
-  // is HELD here until all 1 + N reads have arrived, so the order is
-  // deterministic: nothing about the pending manifest stops the page
-  // reading and painting its rows. On a served page the gateway inlines
-  // the manifest, so this is the fallback's behaviour, not the live
-  // instance's.
-  test('without an inlined manifest the page behind the gate reads and paints before the notice replaces it', async ({ page }) => {
+  // a1fcee7b: hold the fallback answer and prove the module cannot
+  // mount or read before the manifest authorizes it. Known off remains
+  // the disabled notice; an unread answer is a distinct state.
+  test('without an inlined manifest the gated page waits without reads before the disabled answer', async ({ page }) => {
     const seen = watch(page);
     await installProducts(page);
     let release: () => void = () => {};
@@ -220,15 +215,44 @@ test.describe('/ux/products — State A, the parts module off (the live instance
     });
     await mountPage(page, PATH);
 
-    await expect.poll(() => seen.reads.length).toBe(READS_AT_MOUNT);
-    await expect(list(page).locator('tbody tr')).toHaveCount(ROWS.length);
-    await expect(list(page).locator('h1.exec-title')).toHaveText('Products');
+    await expect(page.getByRole('status').filter({ hasText: 'Loading tenant manifest' })).toBeVisible();
+    expect(seen.reads).toEqual([]);
+    await expect(list(page)).toHaveCount(0);
 
     release();
     await expect(page.locator('.module-disabled h1')).toHaveText('Not enabled for this tenant');
     await expect(list(page)).toHaveCount(0);
-    expect(await settledReads(page, () => seen.reads.length, READS_AT_MOUNT)).toBe(READS_AT_MOUNT);
+    expect(seen.reads).toEqual([]);
   });
+
+  test('a failed manifest stays unknown without product reads and retry recovers to the known on module', async ({ page }) => {
+    const seen = watch(page);
+    await installProducts(page);
+    let attempts = 0;
+    let releaseRetry: () => void = () => {};
+    const retryAnswer = new Promise<void>((resolve) => { releaseRetry = resolve; });
+    await page.route(/\/api\/tenant\/manifest$/, async (r) => {
+      attempts += 1;
+      if (attempts > 1) await retryAnswer;
+      await json(r, attempts === 1 ? { error: 'unavailable' } : tenantManifest({ parts: true }), attempts === 1 ? 503 : 200);
+    });
+    await mountPage(page, PATH);
+    await expect(page.getByRole('alert').filter({ hasText: "Couldn't load tenant manifest" })).toBeVisible();
+    await expect(page.locator('.module-disabled')).toHaveCount(0);
+    await expect(list(page)).toHaveCount(0);
+    expect(seen.reads).toEqual([]);
+    expect(seen.writes).toEqual([]);
+    await page.getByRole('button', { name: 'Retry tenant manifest' }).click();
+    await expect(page.getByRole('status').filter({ hasText: 'Loading tenant manifest' })).toBeVisible();
+    expect(seen.reads).toEqual([]);
+    await expect(page.locator('.module-disabled')).toHaveCount(0);
+    releaseRetry();
+    await expect(list(page).locator('tbody tr')).toHaveCount(PRODUCTS.length);
+    expect(await settledReads(page, () => seen.reads.length, READS_AT_MOUNT)).toBe(READS_AT_MOUNT);
+    expect(attempts).toBe(2);
+    expect(seen.writes).toEqual([]);
+  });
+
 });
 
 test.describe('/ux/products — State B, the module on: the list', () => {

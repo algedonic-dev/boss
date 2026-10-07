@@ -158,6 +158,10 @@ pub struct StepSpec {
     /// so every existing spec is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimable: Option<bool>,
+    /// Credential principal permitted to execute this step (design f623e425).
+    /// This does not grant policy authority or activate a live declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
     /// WHO THIS STEP IS FOR, declared once (design f5ebd2e1, backlog
     /// 67a58840). A closed set of shapes — an individual, a role, a
     /// department, a named station — from which today's three placement
@@ -365,157 +369,6 @@ impl WorkflowSpec {
 // empty since 2026-09-11. See docs/architecture-decisions.md
 // §Jobs, Workflows, Steps (Workflows bootstrap through Jobs).
 // ---------------------------------------------------------------------------
-
-/// Build the canonical `workflow-design` WorkflowSpec.
-///
-/// Step graph (tier-major, default edges between adjacent tiers):
-/// 0. `task`              — Author spec
-/// 1. `task`              — Validate (lint via `validate_all`)
-/// 2. `sign-off`          — Approve (authority_role = `workflow-approver`)
-/// 3. `workflow-publish`  — Publish (writes to registry, emits
-///    `jobs.kind.published`)
-///
-/// Subject discriminator is `custom`, with `custom_kind =
-/// "workflow"` per Q3 of the design doc — reuses the existing
-/// CustomSubject support without forcing a new Subject variant
-/// in `boss-core`.
-#[cfg(test)]
-fn workflow_design_spec() -> WorkflowSpec {
-    let steps = vec![
-        StepSpec {
-            title: "author".into(),
-            kind: "task".into(),
-            ready_when: "true".into(),
-            title_template: "Author WorkflowSpec".into(),
-            ..Default::default()
-        },
-        StepSpec {
-            title: "validate".into(),
-            kind: "task".into(),
-            ready_when: "steps.author.done".into(),
-            title_template: "Validate spec".into(),
-            // The next step is a SIGN-OFF, and required metadata is
-            // checked at COMPLETION — so the constraint that guarantees
-            // the approver has something to read belongs HERE, not
-            // there. On the sign-off it would refuse only after the
-            // human had already opened an empty screen. Phase 4 of the
-            // viability lint refuses the alternative.
-            fields: vec![boss_core::job::StepField {
-                required: true,
-                ..boss_core::job::StepField::new("sign_off_context", "string")
-            }],
-            ..Default::default()
-        },
-        StepSpec {
-            title: "approve".into(),
-            kind: "sign-off".into(),
-            ready_when: "steps.validate.done".into(),
-            title_template: "Approve spec".into(),
-            // Approval authority is `workflow-approver` — an operational-
-            // leadership capability granted (via tenant policy) to the
-            // C-suite/COO/dept-heads who own the `workflows` authoring
-            // surface, plus platform-admin (core policy default). NOT
-            // platform-admin alone: authoring a work-type is the
-            // operational leaders' job, not solely the deploy operator's.
-            sign_offs_required: vec!["workflow-approver".into()],
-            assurance_required: None,
-            authority_role: Some("workflow-approver".into()),
-            // `changes_requested_completes` (backlog da322e8f,
-            // 2026-09-23): the sign-off surface completes a Request
-            // changes only where the step declares it, and
-            // `not-published` needs this step done on changes-requested.
-            // Rides through BOTH copies for the reason the note below
-            // gives.
-            metadata_defaults: serde_json::json!({
-                "authority_role": "workflow-approver",
-                "changes_requested_completes": true,
-            }),
-            // 2026-08-31, cdfe2e1a: the decision must LEAVE a record
-            // (workflow_lint Phase 5) — required at completion, on the
-            // step itself, unlike `sign_off_context` above which
-            // guards arrival on the predecessor. This function is the
-            // frozen conversion reference for the bundle-faithfulness
-            // test, so a deliberate post-conversion evolution rides
-            // through BOTH — the double edit is the price of keeping
-            // the transcription guard byte-exact, and it is also load-
-            // bearing: bootstrap republishes bundle drift, so a bundle
-            // left behind would have regressed the live v3 back to
-            // field-less on the next boot.
-            fields: vec![boss_core::job::StepField {
-                required: true,
-                ..boss_core::job::StepField::new(
-                    "decision",
-                    "pending|approved|rejected|changes-requested",
-                )
-            }],
-            ..Default::default()
-        },
-        StepSpec {
-            title: "publish".into(),
-            kind: "workflow-publish".into(),
-            // 8686485c, 2026-09-09: this read `steps.approve.done` and
-            // nothing else, so a REJECTED spec reached the publish step
-            // exactly as an approved one did. `approve` has declared a
-            // required `decision` enum since the note above; nothing
-            // read it. Rides through BOTH copies for the reason that
-            // note gives.
-            ready_when: "steps.approve.done AND steps.approve.metadata.decision = \"approved\""
-                .into(),
-            title_template: "Publish to registry".into(),
-            terminal: Some(Terminal {
-                outcome: "published".into(),
-            }),
-            // Backlog a14f04b3 (2026-09-28): the kind requires the spec
-            // at done, and a step declares every field its kind requires
-            // (tests/a_step_declares_what_its_kind_requires.rs). Rides
-            // through BOTH copies for the reason the `approve` note gives.
-            fields: vec![boss_core::job::StepField {
-                required: true,
-                ..boss_core::job::StepField::new("workflow_spec", "object")
-            }],
-            ..Default::default()
-        },
-        StepSpec {
-            title: "not-published".into(),
-            kind: "outcome".into(),
-            // Where a rejection goes — until now, nowhere: four steps,
-            // one terminal. Stated as the NEGATIVE of `approved` so a
-            // value outside the enum, or an absent one, still reaches a
-            // terminal instead of wedging the packet open. Leads with
-            // `.done` so it is not ready on a freshly created Job.
-            // The bundle row carries the full reasoning.
-            ready_when:
-                "steps.approve.done AND NOT (steps.approve.metadata.decision = \"approved\")".into(),
-            title_template: "Closed without publishing".into(),
-            metadata_defaults: serde_json::json!({ "outcome_kind": "aborted" }),
-            terminal: Some(Terminal {
-                outcome: "not-published".into(),
-            }),
-            ..Default::default()
-        },
-    ];
-
-    let mut spec = WorkflowSpec::platform_seed(
-        "workflow-design",
-        "Design a Workflow",
-        "platform",
-        vec!["custom".into()],
-        steps,
-    );
-    // Q7: the responsible human for platform meta-work. The approve
-    // step's authority (`workflow-approver`) is a policy CAPABILITY,
-    // not an employees.role value, so the step-authority fallback
-    // can't resolve it — name the operator-baseline role explicitly.
-    spec.metadata = serde_json::json!({ "department": "it", "owner_role": "platform-admin" });
-    spec.description = Some(
-        "Meta-kind: every Workflow in the registry is authored by a Job of this kind. \
-         The terminal `workflow-publish` step writes the spec into the registry and \
-         emits `jobs.kind.published` into audit_log. See \
-         docs/architecture-decisions.md (Jobs, Workflows, Steps)."
-            .to_string(),
-    );
-    spec
-}
 
 /// Build the canonical `regenerate-deployment` WorkflowSpec.
 ///
@@ -1839,6 +1692,16 @@ pub(crate) fn merge_metadata(defaults: &serde_json::Value, step: &StepSpec) -> s
         serde_json::Value::Object(_) => defaults.clone(),
         _ => serde_json::Value::Object(serde_json::Map::new()),
     };
+    if let serde_json::Value::Object(m) = &mut merged {
+        // The declaration comes from the schema, never metadata_defaults.
+        m.remove(crate::credential_executor::KEY);
+        if let Some(executor) = &step.executor {
+            m.insert(
+                crate::credential_executor::KEY.into(),
+                serde_json::Value::String(executor.clone()),
+            );
+        }
+    }
     // The placement keys are DERIVED from the step's one audience
     // declaration (`selectors()`; the legacy `authority_role` when it
     // declares none — today's behaviour unchanged). `authority_role`
@@ -1889,6 +1752,8 @@ pub(crate) fn merge_metadata(defaults: &serde_json::Value, step: &StepSpec) -> s
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkflowError {
+    #[error("workflow holder coverage unavailable: {0}")]
+    CoverageUnavailable(String),
     #[error("job kind not found: {0}")]
     NotFound(String),
     #[error("conflict: {0}")]
@@ -2069,6 +1934,22 @@ pub trait WorkflowRegistry: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<WorkflowSpec, WorkflowError>;
 
+    /// Insert version 1 only when this kind has never existed. An equal
+    /// active incumbent is returned unchanged, with its original provenance
+    /// and no event; different, draft, retired or discarded history refuses.
+    /// The absence check and insertion are one atomic adapter operation.
+    async fn publish_authored_if_absent(
+        &self,
+        _spec: WorkflowSpec,
+        _authoring_job_id: JobId,
+        _actor: &boss_core::actor::ActorId,
+        _now: DateTime<Utc>,
+    ) -> Result<WorkflowSpec, WorkflowError> {
+        Err(WorkflowError::Storage(
+            "workflow adapter does not support conditional publication".into(),
+        ))
+    }
+
     /// Reconcile the active rows in the registry against a set of
     /// platform-supplied defaults. For each default:
     ///
@@ -2151,6 +2032,80 @@ fn kind_body_matches(existing: &WorkflowSpec, default: &WorkflowSpec) -> bool {
         && existing.owning_team == default.owning_team
 }
 
+/// Runtime publication has external holder evidence; fixtures explicitly
+/// opt into unjudged setup. No HTTP request can choose this capability.
+#[derive(Clone, Default)]
+enum PublicationCoverage {
+    #[default]
+    Unconfigured,
+    Runtime(Arc<dyn boss_policy_client::coverage::CoverageSnapshotSource>),
+    Fixture,
+    TrustedBootstrap,
+}
+
+impl PublicationCoverage {
+    async fn read(
+        &self,
+    ) -> Result<Option<boss_policy_client::coverage::CoverageSnapshot>, WorkflowError> {
+        match self {
+            Self::Unconfigured => Err(WorkflowError::CoverageUnavailable(
+                "runtime workflow publication has no coverage snapshot source".into(),
+            )),
+            Self::Runtime(source) => {
+                let snapshot = source
+                    .snapshot()
+                    .await
+                    .map_err(WorkflowError::CoverageUnavailable)?;
+                snapshot
+                    .validate()
+                    .map_err(WorkflowError::CoverageUnavailable)?;
+                Ok(Some(snapshot))
+            }
+            Self::Fixture | Self::TrustedBootstrap => Ok(None),
+        }
+    }
+}
+
+fn workflow_facts(spec: &WorkflowSpec) -> boss_policy_client::coverage::WorkflowFacts {
+    boss_policy_client::coverage::WorkflowFacts {
+        kind: spec.kind.clone(),
+        status: Some("active".into()),
+        steps: spec
+            .steps
+            .iter()
+            .map(|s| boss_policy_client::coverage::StepFacts {
+                title: s.title.clone(),
+                authority_role: s.authority_role.clone(),
+                sign_offs_required: s.sign_offs_required.clone(),
+                assurance_required: s.assurance_required.map(|a| match a {
+                    boss_core::job::Assurance::Session => "session".into(),
+                    boss_core::job::Assurance::Presence => "presence".into(),
+                }),
+                audience: s
+                    .audience
+                    .as_ref()
+                    .and_then(|a| serde_json::to_value(a).ok()),
+            })
+            .collect(),
+    }
+}
+
+fn judge_publication(
+    snapshot: Option<&boss_policy_client::coverage::CoverageSnapshot>,
+    active: &[WorkflowSpec],
+    candidate: &WorkflowSpec,
+) -> Result<(), WorkflowError> {
+    if let Some(snapshot) = snapshot {
+        snapshot
+            .judge_workflow(
+                &active.iter().map(workflow_facts).collect::<Vec<_>>(),
+                &workflow_facts(candidate),
+            )
+            .map_err(WorkflowError::Conflict)?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // In-memory adapter
 // ---------------------------------------------------------------------------
@@ -2158,6 +2113,7 @@ fn kind_body_matches(existing: &WorkflowSpec, default: &WorkflowSpec) -> bool {
 /// Mutex-backed in-memory registry. Every async fn resolves immediately;
 /// safe to call from either a tokio or a non-tokio context.
 pub struct InMemoryWorkflows {
+    publication_coverage: PublicationCoverage,
     rows: Arc<Mutex<HashMap<(String, i32), WorkflowSpec>>>,
     /// Tracks which rows came from a bootstrap reconcile. Mirrors
     /// the `created_by = 'bootstrap'` discriminator the postgres
@@ -2189,6 +2145,15 @@ impl Default for InMemoryWorkflows {
 }
 
 impl InMemoryWorkflows {
+    /// Trusted deployment initialization only. Runtime publication uses
+    /// `guarded`; no request can select this bootstrap capability.
+    pub fn for_bootstrap() -> Self {
+        Self {
+            publication_coverage: PublicationCoverage::TrustedBootstrap,
+            ..Self::new()
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             rows: Arc::new(Mutex::new(HashMap::new())),
@@ -2196,6 +2161,22 @@ impl InMemoryWorkflows {
             recorded: Arc::new(Mutex::new(Vec::new())),
             discarded_high_water: Arc::new(Mutex::new(HashMap::new())),
             packets: None,
+            publication_coverage: PublicationCoverage::Unconfigured,
+        }
+    }
+
+    /// Explicit unjudged fixture setup, never an operational API adapter.
+    pub fn for_fixture() -> Self {
+        Self {
+            publication_coverage: PublicationCoverage::Fixture,
+            ..Self::new()
+        }
+    }
+
+    pub fn guarded(source: Arc<dyn boss_policy_client::coverage::CoverageSnapshotSource>) -> Self {
+        Self {
+            publication_coverage: PublicationCoverage::Runtime(source),
+            ..Self::new()
         }
     }
 
@@ -2251,20 +2232,23 @@ impl InMemoryWorkflows {
         let rows = self.rows.lock().unwrap();
         rows.values().cloned().collect()
     }
-
-    /// The highest number this kind has ever spent — live rows AND
-    /// discarded drafts, so an allocation above it never reuses a
-    /// number a packet may be pinned to (backlog ce8b7d66).
-    fn max_version(&self, kind: &str) -> Option<i32> {
-        let rows = self.rows.lock().unwrap();
-        spent_high_water(&rows, &self.discarded_high_water, kind)
-    }
 }
 
 /// The in-memory allocator's one question, asked by every path that
 /// assigns a number: the highest version `kind` has spent, over its
 /// live rows and its discarded drafts. Takes the rows already locked,
 /// because the reconcile holds that lock while it allocates.
+/// Compare every authored field, excluding only adapter-assigned provenance.
+fn authored_body_matches(spec: &WorkflowSpec, row: &WorkflowSpec) -> bool {
+    *row == WorkflowSpec {
+        version: row.version,
+        status: row.status,
+        created_at: row.created_at,
+        authoring_job_id: row.authoring_job_id,
+        ..spec.clone()
+    }
+}
+
 fn spent_high_water(
     rows: &HashMap<(String, i32), WorkflowSpec>,
     discarded: &Mutex<HashMap<String, i32>>,
@@ -2281,6 +2265,75 @@ fn spent_high_water(
 
 #[async_trait]
 impl WorkflowRegistry for InMemoryWorkflows {
+    async fn publish_authored_if_absent(
+        &self,
+        mut spec: WorkflowSpec,
+        authoring_job_id: JobId,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<WorkflowSpec, WorkflowError> {
+        crate::workflow_lint::gate_active(&spec).map_err(WorkflowError::Unviable)?;
+        // An equal durable first record is a read, not a new publication.
+        // Its original provenance survives a dark external holder source.
+        {
+            let rows = self.rows.lock().map_err(|_| {
+                WorkflowError::Storage("conditional workflow row lock is poisoned".into())
+            })?;
+            if let Some(active) = rows.values().find(|row| {
+                row.kind == spec.kind
+                    && row.status == WorkflowStatus::Active
+                    && authored_body_matches(&spec, row)
+            }) {
+                return Ok(active.clone());
+            }
+        }
+        let snapshot = self.publication_coverage.read().await?;
+        let mut rows = self.rows.lock().map_err(|_| {
+            WorkflowError::Storage("conditional workflow row lock is poisoned".into())
+        })?;
+        let existing: Vec<_> = rows.values().filter(|row| row.kind == spec.kind).collect();
+        if let Some(active) = existing
+            .iter()
+            .find(|row| row.status == WorkflowStatus::Active)
+            && authored_body_matches(&spec, active)
+        {
+            return Ok((*active).clone());
+        }
+        let discarded = self.discarded_high_water.lock().map_err(|_| {
+            WorkflowError::Storage("conditional workflow history lock is poisoned".into())
+        })?;
+        if !existing.is_empty() || discarded.contains_key(&spec.kind) {
+            return Err(WorkflowError::Conflict(format!(
+                "conditional publication keeps existing workflow history for {}",
+                spec.kind
+            )));
+        }
+        judge_publication(
+            snapshot.as_ref(),
+            &rows
+                .values()
+                .filter(|s| s.status == WorkflowStatus::Active)
+                .cloned()
+                .collect::<Vec<_>>(),
+            &spec,
+        )?;
+        spec.version = 1;
+        spec.status = WorkflowStatus::Active;
+        spec.created_at = now;
+        spec.authoring_job_id = Some(*authoring_job_id.inner().as_uuid());
+        let event = crate::events::workflow_registry_event_at(
+            crate::events::WORKFLOW_PUBLISHED,
+            actor,
+            &spec,
+            now,
+        );
+        let mut recorded = self.recorded.lock().map_err(|_| {
+            WorkflowError::Storage("conditional workflow event lock is poisoned".into())
+        })?;
+        rows.insert((spec.kind.clone(), 1), spec.clone());
+        recorded.push(event);
+        Ok(spec)
+    }
     async fn get_active(&self, kind: &str) -> Result<WorkflowSpec, WorkflowError> {
         let rows = self.snapshot();
         rows.into_iter()
@@ -2325,11 +2378,11 @@ impl WorkflowRegistry for InMemoryWorkflows {
         actor: &boss_core::actor::ActorId,
         now: DateTime<Utc>,
     ) -> Result<WorkflowSpec, WorkflowError> {
-        let next = self.max_version(&spec.kind).unwrap_or(0) + 1;
+        let mut rows = self.rows.lock().unwrap();
+        let next = spent_high_water(&rows, &self.discarded_high_water, &spec.kind).unwrap_or(0) + 1;
         spec.version = next;
         spec.status = WorkflowStatus::Draft;
         spec.created_at = now;
-        let mut rows = self.rows.lock().unwrap();
         rows.insert((spec.kind.clone(), spec.version), spec.clone());
         drop(rows);
         self.record(crate::events::workflow_registry_event(
@@ -2346,6 +2399,7 @@ impl WorkflowRegistry for InMemoryWorkflows {
         actor: &boss_core::actor::ActorId,
         _now: DateTime<Utc>,
     ) -> Result<WorkflowSpec, WorkflowError> {
+        let snapshot = self.publication_coverage.read().await?;
         let mut rows = self.rows.lock().unwrap();
 
         // Find the latest draft for this kind.
@@ -2360,6 +2414,16 @@ impl WorkflowRegistry for InMemoryWorkflows {
 
         // The publish gate — refuse before any row flips.
         crate::workflow_lint::gate_active(&latest_draft).map_err(WorkflowError::Unviable)?;
+
+        judge_publication(
+            snapshot.as_ref(),
+            &rows
+                .values()
+                .filter(|s| s.status == WorkflowStatus::Active)
+                .cloned()
+                .collect::<Vec<_>>(),
+            &latest_draft,
+        )?;
 
         // Demote any currently-active row for this kind.
         for ((k, _), row) in rows.iter_mut() {
@@ -2441,6 +2505,16 @@ impl WorkflowRegistry for InMemoryWorkflows {
             )));
         }
 
+        // Keep the rows hold until the number is recorded as spent.
+        // Dropping it first exposed an absent row with no history to
+        // conditional publication and ordinary allocation (69c8aee1).
+        // Every allocator takes rows then history; nothing takes the
+        // history hold before rows. Acquire it before spending a pin
+        // pair too, so a poisoned history lock refuses before mutation.
+        let mut high = self.discarded_high_water.lock().map_err(|_| {
+            WorkflowError::Storage("workflow discard history lock is poisoned".into())
+        })?;
+
         // A pinned draft is not pre-history (backlog ce8b7d66): the
         // same count and the same sentence the Pg adapter refuses with
         // inside its discard transaction.
@@ -2454,7 +2528,6 @@ impl WorkflowRegistry for InMemoryWorkflows {
         }
 
         let removed = rows.remove(&key);
-        drop(rows);
         let Some(spec) = removed else {
             // Unreachable under the hold above; refused rather than
             // recorded, as the Pg adapter's `rows_affected() != 1` is.
@@ -2463,10 +2536,10 @@ impl WorkflowRegistry for InMemoryWorkflows {
             )));
         };
         // The number stays spent: the next allocation reads above it.
-        let mut high = self.discarded_high_water.lock().unwrap();
         let entry = high.entry(kind.to_string()).or_insert(version);
         *entry = (*entry).max(version);
         drop(high);
+        drop(rows);
         self.record(crate::events::workflow_registry_event(
             crate::events::WORKFLOW_DRAFT_DISCARDED,
             actor,
@@ -2482,18 +2555,28 @@ impl WorkflowRegistry for InMemoryWorkflows {
         actor: &boss_core::actor::ActorId,
         now: DateTime<Utc>,
     ) -> Result<WorkflowSpec, WorkflowError> {
+        let snapshot = self.publication_coverage.read().await?;
         // Same gate as `publish` — this path writes an active row
         // with no draft ever existing, so it needs its own check.
         crate::workflow_lint::gate_active(&spec).map_err(WorkflowError::Unviable)?;
 
-        let next = self.max_version(&spec.kind).unwrap_or(0) + 1;
+        let mut rows = self.rows.lock().unwrap();
+        judge_publication(
+            snapshot.as_ref(),
+            &rows
+                .values()
+                .filter(|s| s.status == WorkflowStatus::Active)
+                .cloned()
+                .collect::<Vec<_>>(),
+            &spec,
+        )?;
+        let next = spent_high_water(&rows, &self.discarded_high_water, &spec.kind).unwrap_or(0) + 1;
         spec.version = next;
         spec.status = WorkflowStatus::Active;
         spec.created_at = now;
         spec.authoring_job_id = Some(*authoring_job_id.inner().as_uuid());
 
         let key = (spec.kind.clone(), spec.version);
-        let mut rows = self.rows.lock().unwrap();
         // Retire any currently-active row of the same kind.
         for ((k, _), row) in rows.iter_mut() {
             if k == &spec.kind && row.status == WorkflowStatus::Active {
@@ -2653,12 +2736,64 @@ mod pg {
 
     pub struct PgWorkflows {
         pool: PgPool,
+        publication_coverage: PublicationCoverage,
     }
 
     impl PgWorkflows {
         pub fn new(pool: PgPool) -> Self {
-            Self { pool }
+            Self {
+                pool,
+                publication_coverage: PublicationCoverage::Unconfigured,
+            }
         }
+    }
+    impl PgWorkflows {
+        /// Trusted deployment initialization only. The platform seed
+        /// consumes its validated local bundle with existing insert-only
+        /// semantics without depending on policy or people availability.
+        pub fn for_bootstrap(pool: PgPool) -> Self {
+            Self {
+                pool,
+                publication_coverage: PublicationCoverage::TrustedBootstrap,
+            }
+        }
+
+        /// Explicit unjudged fixture setup. Runtime always uses `guarded`.
+        pub fn for_fixture(pool: PgPool) -> Self {
+            Self {
+                pool,
+                publication_coverage: PublicationCoverage::Fixture,
+            }
+        }
+        pub fn guarded(
+            pool: PgPool,
+            source: Arc<dyn boss_policy_client::coverage::CoverageSnapshotSource>,
+        ) -> Self {
+            Self {
+                pool,
+                publication_coverage: PublicationCoverage::Runtime(source),
+            }
+        }
+    }
+
+    async fn publication_fence(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<(), WorkflowError> {
+        sqlx::query(
+            "LOCK TABLE workflows, workflow_discarded_versions IN SHARE ROW EXCLUSIVE MODE",
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn active_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<Vec<WorkflowSpec>, WorkflowError> {
+        let rows: Vec<Row> = sqlx::query_as("SELECT kind, version, status, label, description, category, subject_kinds, steps, metadata_schema, entitlements, metadata, on_complete_create, owning_team, authoring_job_id, created_at FROM workflows WHERE status = 'active' ORDER BY kind COLLATE \"C\"")
+            .fetch_all(&mut **tx).await.map_err(|e| WorkflowError::Storage(e.to_string()))?;
+        rows.into_iter().map(row_to_spec).collect()
     }
 
     /// The next version of `kind`: one above every number it has
@@ -2679,6 +2814,50 @@ mod pg {
         .fetch_one(conn)
         .await
         .map_err(|e| WorkflowError::Storage(e.to_string()))
+    }
+
+    async fn insert_authored(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        spec: &WorkflowSpec,
+        authoring_job_id: JobId,
+        event: &boss_core::event::Event,
+    ) -> Result<(), WorkflowError> {
+        let subject_kinds = serde_json::to_value(&spec.subject_kinds)
+            .map_err(|e| WorkflowError::Invalid(e.to_string()))?;
+        let steps =
+            serde_json::to_value(&spec.steps).map_err(|e| WorkflowError::Invalid(e.to_string()))?;
+        let triggers = serde_json::to_value(&spec.on_complete_create)
+            .map_err(|e| WorkflowError::Invalid(e.to_string()))?;
+        sqlx::query(
+            "INSERT INTO workflows
+                (kind, version, status, label, description, category,
+                 subject_kinds, steps, metadata_schema, entitlements, metadata,
+                 on_complete_create, owning_team, authoring_job_id,
+                 created_by, created_at)
+             VALUES ($1, $2, 'active', $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                     $12, $13, $14, $15)",
+        )
+        .bind(&spec.kind)
+        .bind(spec.version)
+        .bind(&spec.label)
+        .bind(&spec.description)
+        .bind(&spec.category)
+        .bind(subject_kinds)
+        .bind(steps)
+        .bind(&spec.metadata_schema)
+        .bind(&spec.entitlements)
+        .bind(&spec.metadata)
+        .bind(triggers)
+        .bind(&spec.owning_team)
+        .bind(spec.authoring_job_id)
+        .bind(format!("job-{authoring_job_id}"))
+        .bind(spec.created_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+        boss_events::outbox::record_event_in_tx(tx, event)
+            .await
+            .map_err(WorkflowError::Storage)
     }
 
     #[derive(sqlx::FromRow)]
@@ -2732,6 +2911,106 @@ mod pg {
 
     #[async_trait]
     impl WorkflowRegistry for PgWorkflows {
+        async fn publish_authored_if_absent(
+            &self,
+            mut spec: WorkflowSpec,
+            authoring_job_id: JobId,
+            actor: &boss_core::actor::ActorId,
+            now: DateTime<Utc>,
+        ) -> Result<WorkflowSpec, WorkflowError> {
+            crate::workflow_lint::gate_active(&spec).map_err(WorkflowError::Unviable)?;
+            // An equal durable first record is a read, not a new publication.
+            // Its original provenance survives a dark external holder source.
+            let mut replay = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            let active: Option<Row> = sqlx::query_as(
+                "SELECT kind, version, status, label, description, category,
+                    subject_kinds, steps, metadata_schema, entitlements, metadata,
+                    on_complete_create, owning_team, authoring_job_id, created_at
+             FROM workflows WHERE kind = $1 AND status = 'active' FOR SHARE",
+            )
+            .bind(&spec.kind)
+            .fetch_optional(&mut *replay)
+            .await
+            .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            let active = active.map(row_to_spec).transpose()?;
+            let equal = active.filter(|row| authored_body_matches(&spec, row));
+            replay
+                .commit()
+                .await
+                .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            if let Some(active) = equal {
+                return Ok(active);
+            }
+            let snapshot = self.publication_coverage.read().await?;
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            // An absent row cannot be locked. This short control-plane lock
+            // conflicts with every ordinary workflow writer's RowExclusive
+            // lock, including bootstrap and discard, without relying on
+            // their cooperation with a new advisory lock. Discard acquires
+            // this same table fence first to keep table/row lock order equal.
+            sqlx::query(
+                "LOCK TABLE workflows, workflow_discarded_versions IN SHARE ROW EXCLUSIVE MODE",
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            let rows: Vec<Row> = sqlx::query_as(
+                "SELECT kind, version, status, label, description, category,
+                        subject_kinds, steps, metadata_schema, entitlements, metadata,
+                        on_complete_create, owning_team, authoring_job_id, created_at
+                 FROM workflows WHERE kind = $1 ORDER BY version",
+            )
+            .bind(&spec.kind)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            let rows = rows
+                .into_iter()
+                .map(row_to_spec)
+                .collect::<Result<Vec<_>, _>>()?;
+            if let Some(active) = rows.iter().find(|row| row.status == WorkflowStatus::Active)
+                && authored_body_matches(&spec, active)
+            {
+                let active = active.clone();
+                tx.commit()
+                    .await
+                    .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+                return Ok(active);
+            }
+            if !rows.is_empty() || next_version(&mut tx, &spec.kind).await? != 1 {
+                return Err(WorkflowError::Conflict(format!(
+                    "conditional publication keeps existing workflow history for {}",
+                    spec.kind
+                )));
+            }
+            judge_publication(snapshot.as_ref(), &active_in_tx(&mut tx).await?, &spec)?;
+            spec.version = 1;
+            spec.status = WorkflowStatus::Active;
+            // PostgreSQL stores microseconds. The fact payload must carry
+            // the exact durable row; the event time remains the supplied clock.
+            spec.created_at = chrono::SubsecRound::trunc_subsecs(now, 6);
+            spec.authoring_job_id = Some(*authoring_job_id.inner().as_uuid());
+            let event = crate::events::workflow_registry_event_at(
+                crate::events::WORKFLOW_PUBLISHED,
+                actor,
+                &spec,
+                now,
+            );
+            insert_authored(&mut tx, &spec, authoring_job_id, &event).await?;
+            tx.commit()
+                .await
+                .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            Ok(spec)
+        }
+
         async fn get_active(&self, kind: &str) -> Result<WorkflowSpec, WorkflowError> {
             let row: Option<Row> = sqlx::query_as(
                 "SELECT kind, version, status, label, description, category,
@@ -2923,11 +3202,13 @@ mod pg {
             actor: &boss_core::actor::ActorId,
             _now: DateTime<Utc>,
         ) -> Result<WorkflowSpec, WorkflowError> {
+            let snapshot = self.publication_coverage.read().await?;
             let mut tx = self
                 .pool
                 .begin()
                 .await
                 .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            publication_fence(&mut tx).await?;
 
             // Pick the latest draft — the full row, not just the
             // version: the event payload is the promoted spec, and
@@ -2967,6 +3248,8 @@ mod pg {
             // the row we are about to promote — not against whatever
             // a caller happened to hand us.
             crate::workflow_lint::gate_active(&promoted).map_err(WorkflowError::Unviable)?;
+
+            judge_publication(snapshot.as_ref(), &active_in_tx(&mut tx).await?, &promoted)?;
 
             // Retire any currently-active row.
             sqlx::query(
@@ -3090,16 +3373,21 @@ mod pg {
                 .await
                 .map_err(|e| WorkflowError::Storage(e.to_string()))?;
 
+            // Publication takes the broad table fence before its draft row.
+            // Match that order: row-first discard then DELETE's table lock
+            // formed a real cycle with publication (G3 gate 08bd2312).
+            publication_fence(&mut tx).await?;
+
             // Read first: the refusal must say what the row IS (a typo
             // must read as NotFound, history as Conflict — never as a
             // silent no-op), and the discard event's payload is the
             // spec being removed. FOR UPDATE, so the status judged here
             // is the status deleted: a publish that already holds the
             // row makes this read wait and then see it active. The
-            // lock protects the DISCARD only — a publish that reads
-            // after it is protected by its own FOR UPDATE on the same
-            // row, and its one-row check (the review of car 06973644,
-            // finding A: this comment used to claim both).
+            // row lock protects the DISCARD; the preceding common table
+            // fence orders publication before either path takes a row.
+            // Publication still keeps its one-row promotion check as a
+            // backstop (review of car 06973644, finding A).
             let found: Option<Row> = sqlx::query_as(
                 "SELECT kind, version, status, label, description, category,
                         subject_kinds, steps, metadata_schema, entitlements, metadata,
@@ -3206,6 +3494,7 @@ mod pg {
             actor: &boss_core::actor::ActorId,
             now: DateTime<Utc>,
         ) -> Result<WorkflowSpec, WorkflowError> {
+            let snapshot = self.publication_coverage.read().await?;
             // Same gate as `publish` — refuse before opening the
             // transaction, since nothing here can rescue an unviable
             // spec.
@@ -3216,6 +3505,9 @@ mod pg {
                 .begin()
                 .await
                 .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            publication_fence(&mut tx).await?;
+
+            judge_publication(snapshot.as_ref(), &active_in_tx(&mut tx).await?, &spec)?;
 
             // Compute next version inside the transaction so a
             // concurrent publish can't race us into a duplicate.
@@ -3237,54 +3529,12 @@ mod pg {
             .await
             .map_err(|e| WorkflowError::Storage(e.to_string()))?;
 
-            let subject_kinds_json = serde_json::to_value(&spec.subject_kinds)
-                .map_err(|e| WorkflowError::Invalid(e.to_string()))?;
-            let steps_json = serde_json::to_value(&spec.steps)
-                .map_err(|e| WorkflowError::Invalid(e.to_string()))?;
-            let on_complete_create_json = serde_json::to_value(&spec.on_complete_create)
-                .map_err(|e| WorkflowError::Invalid(e.to_string()))?;
-
-            // Stamp created_by = "job-<authoring_job_id>" so the
-            // bootstrap reconciler preserves this row (operator-
-            // owned). Same shape any future reconcile decision uses.
-            let created_by = format!("job-{}", authoring_job_id);
-
-            sqlx::query(
-                "INSERT INTO workflows
-                    (kind, version, status, label, description, category,
-                     subject_kinds, steps, metadata_schema, entitlements, metadata,
-                     on_complete_create, owning_team, authoring_job_id,
-                     created_by, created_at)
-                 VALUES ($1, $2, 'active', $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                         $12, $13, $14, $15)",
-            )
-            .bind(&spec.kind)
-            .bind(spec.version)
-            .bind(&spec.label)
-            .bind(&spec.description)
-            .bind(&spec.category)
-            .bind(&subject_kinds_json)
-            .bind(&steps_json)
-            .bind(&spec.metadata_schema)
-            .bind(&spec.entitlements)
-            .bind(&spec.metadata)
-            .bind(&on_complete_create_json)
-            .bind(&spec.owning_team)
-            .bind(spec.authoring_job_id)
-            .bind(&created_by)
-            .bind(spec.created_at)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| WorkflowError::Storage(e.to_string()))?;
-
             let event = crate::events::workflow_registry_event(
                 crate::events::WORKFLOW_PUBLISHED,
                 actor,
                 &spec,
             );
-            boss_events::outbox::record_event_in_tx(&mut tx, &event)
-                .await
-                .map_err(WorkflowError::Storage)?;
+            insert_authored(&mut tx, &spec, authoring_job_id, &event).await?;
 
             tx.commit()
                 .await
@@ -3653,6 +3903,38 @@ mod tests {
     }
 
     #[test]
+    fn the_authoring_protocol_declares_conditional_publication_without_changing_the_default() {
+        let bundled = crate::seed_loader::load_workflows(super::platform_bundle_path()).unwrap();
+        let authoring = bundled
+            .iter()
+            .find(|spec| spec.kind == "workflow-design")
+            .unwrap();
+        let publish = authoring
+            .steps
+            .iter()
+            .find(|step| step.title == "publish")
+            .unwrap();
+        let mode = publish
+            .fields
+            .iter()
+            .find(|field| field.name == "insert_if_absent")
+            .unwrap();
+        assert_eq!(mode.field_type, "boolean");
+        assert!(!mode.required, "existing authoring packets omit this field");
+        assert!(
+            publish.metadata_defaults.get("insert_if_absent").is_none(),
+            "ordinary publication stays the default"
+        );
+        let spec = publish
+            .fields
+            .iter()
+            .find(|field| field.name == "workflow_spec")
+            .unwrap();
+        assert!(spec.required);
+        assert_eq!(spec.field_type, "object");
+    }
+
+    #[test]
     fn the_platform_bundle_matches_the_specs_it_replaced() {
         let bundle_path = super::platform_bundle_path();
         let bundled =
@@ -3711,11 +3993,11 @@ mod tests {
         // `platform_bundle_maintenance.rs` pins the new shape from the
         // bundle side, for every chore rather than the three that
         // happened to be literals.
-        let expected = [
-            workflow_design_spec(),
-            regenerate_deployment_spec(),
-            design_doc_review_spec(),
-        ];
+        // workflow-design now evolves only in registry data. Its historical
+        // Rust transcription was retired after the conditional field made
+        // that move-fidelity copy a second authoring venue (69c8aee1).
+        // Presence, no-shadow, viability and dispatch contracts remain.
+        let expected = [regenerate_deployment_spec(), design_doc_review_spec()];
         // Every CONVERTED kind must still be here. This is the
         // load-bearing half and it has earned its keep: it went red
         // the first time three kinds were removed from
@@ -4306,7 +4588,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_draft_assigns_next_version() {
-        let reg = InMemoryWorkflows::new();
+        let reg = InMemoryWorkflows::for_fixture();
         let v1 = reg
             .create_draft(seed_spec("repair"), &test_actor(), Utc::now())
             .await
@@ -4324,7 +4606,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_promotes_draft_and_retires_previous_active() {
-        let reg = InMemoryWorkflows::new();
+        let reg = InMemoryWorkflows::for_fixture();
 
         // v1 drafted and published.
         reg.create_draft(seed_spec("repair"), &test_actor(), Utc::now())
@@ -4357,7 +4639,7 @@ mod tests {
 
     #[tokio::test]
     async fn retire_flips_active_to_retired() {
-        let reg = InMemoryWorkflows::new();
+        let reg = InMemoryWorkflows::for_fixture();
         reg.create_draft(seed_spec("repair"), &test_actor(), Utc::now())
             .await
             .unwrap();
@@ -4380,7 +4662,7 @@ mod tests {
     /// removal goes on the record; history refuses; a typo is NotFound.
     #[tokio::test]
     async fn a_draft_can_be_discarded_and_history_cannot() {
-        let reg = InMemoryWorkflows::new();
+        let reg = InMemoryWorkflows::for_fixture();
         let d = reg
             .create_draft(seed_spec("repair"), &test_actor(), Utc::now())
             .await
@@ -4434,7 +4716,7 @@ mod tests {
     /// spent, on every allocation path.
     #[tokio::test]
     async fn a_discarded_version_number_is_never_reused() {
-        let reg = InMemoryWorkflows::new();
+        let reg = InMemoryWorkflows::for_fixture();
         let v1 = reg
             .create_draft(seed_spec("repair"), &test_actor(), Utc::now())
             .await
@@ -4470,7 +4752,7 @@ mod tests {
     /// refuses a draft target — each pinned by its own test.
     #[tokio::test]
     async fn get_version_serves_a_draft() {
-        let reg = InMemoryWorkflows::new();
+        let reg = InMemoryWorkflows::for_fixture();
         let d = reg
             .create_draft(seed_spec("repair"), &test_actor(), Utc::now())
             .await
@@ -4481,7 +4763,7 @@ mod tests {
 
     #[tokio::test]
     async fn retire_is_idempotent() {
-        let reg = InMemoryWorkflows::new();
+        let reg = InMemoryWorkflows::for_fixture();
         // Retiring a kind with no active row is a no-op, not an error.
         reg.retire("never-existed", &test_actor(), Utc::now())
             .await
@@ -4493,7 +4775,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_without_draft_returns_not_found() {
-        let reg = InMemoryWorkflows::new();
+        let reg = InMemoryWorkflows::for_fixture();
         let err = reg
             .publish("repair", &test_actor(), Utc::now())
             .await
@@ -4506,7 +4788,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_active_filters_by_category() {
-        let reg = InMemoryWorkflows::new();
+        let reg = InMemoryWorkflows::for_fixture();
         let mut refurb = seed_spec("refurb");
         refurb.category = "refurb".into();
         reg.seed(WorkflowSpec {
@@ -5024,6 +5306,7 @@ mod tests {
         use crate::agent_spec::{AgentSpec, Effort};
         let mut with_agent = one_step_with("build", crate::audience::Audience::Role("x".into()));
         with_agent.agent = Some(AgentSpec {
+            executor_provenance: Default::default(),
             profile: "builder".into(),
             model: "opus-5[1m]".into(),
             budget_usd: 5.0,
@@ -5098,7 +5381,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_versions_returns_oldest_first() {
-        let reg = InMemoryWorkflows::new();
+        let reg = InMemoryWorkflows::for_fixture();
         reg.create_draft(seed_spec("repair"), &test_actor(), Utc::now())
             .await
             .unwrap();
@@ -5885,7 +6168,7 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_reconcile_inserts_missing_kinds() {
-        let registry = InMemoryWorkflows::new();
+        let registry = InMemoryWorkflows::for_fixture();
         let defaults = vec![reconcile_spec("workflow-design", "Design a Workflow")];
         let stats = registry
             .bootstrap_reconcile(&defaults, &test_actor(), Utc::now())
@@ -5903,7 +6186,7 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_reconcile_republishes_drift_as_a_new_version() {
-        let registry = InMemoryWorkflows::new();
+        let registry = InMemoryWorkflows::for_fixture();
         // Seed a stale bootstrap row.
         let stale = reconcile_spec("workflow-design", "Old Label");
         registry
@@ -5943,7 +6226,7 @@ mod tests {
     /// published, a restart loop would mint versions forever.
     #[tokio::test]
     async fn bootstrap_reconcile_republishes_only_on_a_real_change() {
-        let registry = InMemoryWorkflows::new();
+        let registry = InMemoryWorkflows::for_fixture();
         let spec = reconcile_spec("workflow-design", "Design a Workflow");
         registry
             .bootstrap_reconcile(std::slice::from_ref(&spec), &test_actor(), Utc::now())
@@ -5970,7 +6253,7 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_reconcile_preserves_operator_edits() {
-        let registry = InMemoryWorkflows::new();
+        let registry = InMemoryWorkflows::for_fixture();
         // Operator-owned row: inserted via `seed`, NOT via reconcile,
         // so it lands without bootstrap ownership tracking.
         let mut operator_spec = reconcile_spec("workflow-design", "Operator Label");
@@ -5996,7 +6279,7 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_reconcile_no_op_when_already_matching() {
-        let registry = InMemoryWorkflows::new();
+        let registry = InMemoryWorkflows::for_fixture();
         let spec = reconcile_spec("workflow-design", "Design a Workflow");
         registry
             .bootstrap_reconcile(std::slice::from_ref(&spec), &test_actor(), Utc::now())
@@ -6018,7 +6301,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_authored_creates_v1_when_no_prior_rows() {
-        let registry = InMemoryWorkflows::new();
+        let registry = InMemoryWorkflows::for_fixture();
         let spec = reconcile_spec("morning-brew", "Morning Brew");
         let job_id = JobId::new();
 
@@ -6042,7 +6325,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_authored_supersedes_prior_active_row() {
-        let registry = InMemoryWorkflows::new();
+        let registry = InMemoryWorkflows::for_fixture();
         let job_a = JobId::new();
         let job_b = JobId::new();
 
@@ -6074,6 +6357,199 @@ mod tests {
 
         let v1 = registry.get_version("morning-brew", 1).await.unwrap();
         assert_eq!(v1.status, WorkflowStatus::Retired);
+    }
+
+    /// The signed insertion inventory never authorizes replacement of a
+    /// kind that appeared after planning (69c8aee1).
+    #[tokio::test]
+    async fn an_absent_only_publish_refuses_a_differing_incumbent() {
+        let registry = InMemoryWorkflows::for_fixture();
+        let held = registry
+            .publish_authored(
+                reconcile_spec("bounded-kind", "Live author"),
+                JobId::new(),
+                &test_actor(),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let before = registry.recorded_events();
+        let result = registry
+            .publish_authored_if_absent(
+                reconcile_spec("bounded-kind", "Approved insertion"),
+                JobId::new(),
+                &test_actor(),
+                Utc::now(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(WorkflowError::Conflict(_))),
+            "{result:?}"
+        );
+        assert_eq!(registry.get_active("bounded-kind").await.unwrap(), held);
+        assert_eq!(
+            serde_json::to_value(registry.recorded_events()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conditional_publication_event_uses_the_supplied_clock() {
+        let registry = InMemoryWorkflows::for_fixture();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-20T02:03:04Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let published = registry
+            .publish_authored_if_absent(
+                reconcile_spec("conditional-clock", "Clock provenance"),
+                JobId::new(),
+                &test_actor(),
+                now,
+            )
+            .await
+            .unwrap();
+        let events = registry.recorded_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].timestamp, now);
+        assert_eq!(
+            events[0].payload["created_at"],
+            serde_json::to_value(published.created_at).unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn conditional_and_ordinary_writers_never_reuse_a_version() {
+        for round in 0..16 {
+            let registry = Arc::new(InMemoryWorkflows::for_fixture());
+            let start = Arc::new(tokio::sync::Barrier::new(17));
+            let kind = format!("conditional-mixed-{round}");
+            let mut writers = Vec::new();
+            for writer in 0..16 {
+                let registry = registry.clone();
+                let start = start.clone();
+                let kind = kind.clone();
+                writers.push(tokio::spawn(async move {
+                    start.wait().await;
+                    let spec = reconcile_spec(&kind, &format!("Writer {writer}"));
+                    if writer % 2 == 0 {
+                        registry
+                            .publish_authored(spec, JobId::new(), &test_actor(), Utc::now())
+                            .await
+                            .unwrap()
+                    } else {
+                        registry
+                            .create_draft(spec, &test_actor(), Utc::now())
+                            .await
+                            .unwrap()
+                    }
+                }));
+            }
+            start.wait().await;
+            let conditional = registry
+                .publish_authored_if_absent(
+                    reconcile_spec(&kind, "Conditional insertion"),
+                    JobId::new(),
+                    &test_actor(),
+                    Utc::now(),
+                )
+                .await;
+            let mut versions = std::collections::HashSet::new();
+            for writer in writers {
+                let row = writer.await.unwrap();
+                assert!(
+                    versions.insert(row.version),
+                    "round {round}: reused version {}",
+                    row.version
+                );
+            }
+            let rows = registry.list_versions(&kind).await.unwrap();
+            assert_eq!(
+                rows.len(),
+                16 + usize::from(conditional.is_ok()),
+                "round {round}: committed history conserved"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reviewer_discard_never_exposes_absence_before_spending_identity() {
+        let registry = Arc::new(InMemoryWorkflows::for_fixture());
+        let kind = "reviewer-discard-boundary";
+        let draft = registry
+            .create_draft(reconcile_spec(kind, "Draft"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        let (exposed_absence, observed_rows_held) = {
+            let history = registry.discarded_high_water.lock().unwrap();
+            let worker_registry = registry.clone();
+            let runtime = tokio::runtime::Handle::current();
+            let worker = std::thread::spawn(move || {
+                runtime.block_on(worker_registry.discard_draft(
+                    kind,
+                    draft.version,
+                    &test_actor(),
+                    Utc::now(),
+                ))
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut exposed_absence = false;
+            let mut observed_rows_held = false;
+            while std::time::Instant::now() < deadline {
+                match registry.rows.try_lock() {
+                    Ok(rows) if !rows.keys().any(|(row_kind, _)| row_kind == kind) => {
+                        exposed_absence = !history.contains_key(kind);
+                        break;
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => observed_rows_held = true,
+                    _ => {}
+                }
+                std::thread::yield_now();
+            }
+            drop(history);
+            worker.join().unwrap().unwrap();
+            (exposed_absence, observed_rows_held)
+        };
+        assert!(
+            !exposed_absence,
+            "discard exposed no row and no spent identity to the conditional writer's locking order"
+        );
+        assert!(
+            observed_rows_held,
+            "the discard must actually reach the held history boundary"
+        );
+        let before = registry.recorded_events();
+        assert_eq!(before.len(), 2, "draft and discard each record one fact");
+        assert!(matches!(
+            registry
+                .publish_authored_if_absent(
+                    reconcile_spec(kind, "Conditional"),
+                    JobId::new(),
+                    &test_actor(),
+                    Utc::now(),
+                )
+                .await,
+            Err(WorkflowError::Conflict(_))
+        ));
+        assert_eq!(registry.recorded_events().len(), before.len());
+        let authored = registry
+            .publish_authored(
+                reconcile_spec(kind, "Ordinary"),
+                JobId::new(),
+                &test_actor(),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authored.version, draft.version + 1);
+        let next_draft = registry
+            .create_draft(
+                reconcile_spec(kind, "Next draft"),
+                &test_actor(),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(next_draft.version, authored.version + 1);
     }
 
     // -----------------------------------------------------------
@@ -6746,7 +7222,7 @@ mod tests {
     async fn publish_authored_flips_row_out_of_bootstrap_ownership() {
         // Sequence: bootstrap reconcile → operator publish via Job →
         // next reconcile must preserve the operator-published row.
-        let registry = InMemoryWorkflows::new();
+        let registry = InMemoryWorkflows::for_fixture();
         registry
             .bootstrap_reconcile(
                 &[reconcile_spec("morning-brew", "Bootstrap Label")],
@@ -6791,7 +7267,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_records_exactly_one_published_event() {
-        let reg = InMemoryWorkflows::new();
+        let reg = InMemoryWorkflows::for_fixture();
         let actor = test_actor();
         reg.create_draft(seed_spec("repair"), &actor, Utc::now())
             .await
@@ -6820,7 +7296,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_draft_records_draft_saved() {
-        let reg = InMemoryWorkflows::new();
+        let reg = InMemoryWorkflows::for_fixture();
         let draft = reg
             .create_draft(seed_spec("repair"), &test_actor(), Utc::now())
             .await
@@ -6836,7 +7312,7 @@ mod tests {
 
     #[tokio::test]
     async fn retire_records_once_and_stays_silent_when_already_retired() {
-        let reg = InMemoryWorkflows::new();
+        let reg = InMemoryWorkflows::for_fixture();
         let actor = test_actor();
         reg.create_draft(seed_spec("repair"), &actor, Utc::now())
             .await
@@ -6865,7 +7341,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_records_published_per_touched_row_only() {
-        let registry = InMemoryWorkflows::new();
+        let registry = InMemoryWorkflows::for_fixture();
         let actor = boss_core::actor::ActorId::Automation("bootstrap-reconciler".into());
 
         // Fresh insert → one event.

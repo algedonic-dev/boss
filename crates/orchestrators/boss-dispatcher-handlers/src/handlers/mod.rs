@@ -14,11 +14,13 @@
 //! crate has been retired.
 
 pub mod bill_payment_batch;
+pub mod broker_transport_key;
 pub mod cadence_roster;
 pub mod cadence_silence;
 pub mod chore_file_reds;
 pub mod commerce_invoice_issue;
 pub mod common;
+pub mod credential_installation_observe;
 pub mod credential_issuer;
 pub mod credential_rotate_cloudflare_tunnel;
 pub mod credential_rotate_forgejo;
@@ -32,6 +34,7 @@ pub mod estate_recover;
 #[cfg(test)]
 mod forge_stub;
 pub mod gate_resolve;
+mod gate_window_read;
 #[cfg(test)]
 mod github_stub;
 pub mod inventory_bill_approve;
@@ -49,6 +52,7 @@ pub mod jobs_complete_step;
 pub mod jobs_complete_step_from_record;
 pub mod jobs_complete_step_matching;
 pub mod jobs_flight_overdue;
+pub mod jobs_receipt_overdue;
 pub mod jobs_reclaim_abandoned_step;
 pub mod jobs_retract_matching;
 pub mod jobs_run_car_probes;
@@ -65,6 +69,7 @@ pub mod messages_expire_notices;
 pub mod messages_notify;
 pub mod messages_notify_job_terminal;
 pub mod network_census;
+pub mod ops_discover_remedies;
 pub mod ops_file_remedies;
 pub mod ops_file_tag_release;
 pub mod ops_judge;

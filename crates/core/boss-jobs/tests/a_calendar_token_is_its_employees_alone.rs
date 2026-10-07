@@ -288,7 +288,15 @@ impl SchedulingRepository for Tokens {
 }
 
 fn app(tokens: Arc<Tokens>) -> Router {
+    app_with_reporter(tokens, None)
+}
+
+fn app_with_reporter(
+    tokens: Arc<Tokens>,
+    reporter: Option<Arc<boss_policy_client::role_guard::RoleGuardReporter>>,
+) -> Router {
     router(SchedulingApiState {
+        role_guards: reporter,
         repo: tokens,
         publisher: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
@@ -296,6 +304,65 @@ fn app(tokens: Arc<Tokens>) -> Router {
         // the token doors decide on the caller alone and ask no policy.
         policy: Arc::new(boss_policy_client::PermissivePolicyClient),
     })
+}
+
+#[tokio::test]
+async fn calendar_rotation_reports_the_recorded_role_without_changing_revocation() {
+    calendar_role_report(URI).await;
+}
+
+#[tokio::test]
+async fn logged_calendar_revocation_reports_the_recorded_role_without_changing_admission() {
+    calendar_role_report("/api/scheduling/calendar-tokens/logged-raw/revoke").await;
+}
+
+async fn calendar_role_report(path: &str) {
+    use boss_policy_client::role_guard::RoleGuardReporter;
+    use boss_policy_client::role_reader::{RegistryRoles, RoleSnapshotClock, SnapshotRoleReader};
+    use boss_policy_client::role_reporting::{ReportMode, ReportTally};
+    use std::time::{Duration, Instant};
+    struct Clock;
+    impl RoleSnapshotClock for Clock {
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+    }
+    let roles = Arc::new(SnapshotRoleReader::new(
+        Duration::from_secs(30),
+        Arc::new(Clock),
+    ));
+    let ticket = roles.begin_refresh();
+    assert!(
+        roles.finish_refresh(
+            ticket,
+            Ok(RegistryRoles::from_sources(
+                serde_json::json!({"data":[], "total":0}),
+                serde_json::json!({"data":[{"id":"emp-david", "role":"visitor"}], "total":1}),
+                serde_json::json!([]),
+            )
+            .unwrap())
+        )
+    );
+    let tally = Arc::new(ReportTally::new(10));
+    let application = app_with_reporter(
+        Tokens::seeded(),
+        Some(Arc::new(RoleGuardReporter::new(
+            roles,
+            tally.clone(),
+            Arc::new(ReportMode::Report),
+        ))),
+    );
+    let response = TestRequest::post(path)
+        .as_user("emp-david", "platform-admin")
+        .send(&application)
+        .await;
+    response.assert_status(StatusCode::OK);
+    let reports = tally.snapshot();
+    assert_eq!(reports.rows.len(), 1);
+    assert_eq!(reports.rows[0].observation.asserted_allowed, Some(true));
+    assert_eq!(reports.rows[0].observation.recorded_allowed, Some(false));
+    assert_eq!(reports.rows[0].observation.would_deny, Some(true));
+    assert!(!response.body_text().contains(SEEDED));
 }
 
 /// A refusal must not carry the token in any form — not in a JSON

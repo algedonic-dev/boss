@@ -45,11 +45,16 @@
 //! Hexagonal: port trait + Pg adapter + in-memory adapter + HTTP
 //! door, the same shape as `delivery` and `cadence`.
 
+pub mod broker_stage;
 pub mod http;
 pub mod in_memory;
 pub mod port;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "postgres")]
+pub mod rebuild;
+pub mod receipt;
+pub mod runner_delivery;
 pub mod seed;
 pub mod types;
 

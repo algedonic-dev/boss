@@ -32,14 +32,52 @@ Type=oneshot
 # (the host reading takes seconds; five nodes' Talos calls are bounded
 # at 20s each inside their containers).
 TimeoutStartSec=10min
-# Reads df/nproc/meminfo and POSTs — nothing here needs root. The nodefs
-# line below reaches the root-only talosconfig and kubeconfig the way the
-# cluster watchdog does, through `sudo docker run --mount` (ops-credentials.sh),
-# so it runs as david too — and so does the host reading's own credential
-# check, which stats (never reads) the two files through that door when
-# david cannot search /etc/boss-ops (backlog 6296dce1).
-User=david
+# ROOT SINCE 2026-10-06 (design-doc 20058482, question forge-token;
+# backlog 88379df3). It ran as david because nothing here needs root —
+# df/nproc/meminfo and a POST — and that is still true of the reading.
+# What changed is the estate machine token: forge-converge deposits it
+# root-only at /etc/boss/machine-token, because a car's recorded probe
+# runs on this host as david and must not be able to read it, and this
+# unit's wrap pair and its posts present it. Of this host's four units
+# that ran as david this is the one that needs nothing of david's — no
+# git in the owner's checkout, no rootless docker daemon, no state under
+# $HOME — and boss-gcp's twin (infra/estate/boss-estate-observe-host.service)
+# has always run as root. The other three keep their user and stay
+# unstamped; machine_token_deposit_sh.rs names each and why.
+# The credential doors need no change: `sudo -n docker run --mount`
+# (ops-credentials.sh) answers root as it answered david, and the host
+# reading's credential check stats /etc/boss-ops directly, as the
+# converge's does.
+User=root
 Environment=HOST_ID=forge
+# THE SPOOL IS ROOT'S OWN DIRECTORY. observe-lib.sh's default,
+# /var/tmp/boss-estate-spool, was made on this host by this unit while
+# it ran as david, and its replay `cat`s every file there and POSTs it:
+# root replaying out of a directory david can write would send whatever
+# a link planted there points at (the shape review A1 of 5ef6db0b found
+# in forge-converge). /var/lib/boss is root:root 0755, held so on every
+# converge tick (converge-hold.sh prepare). A reading still waiting in
+# the old directory is not replayed; the series shows that gap.
+Environment=SPOOL_DIR=/var/lib/boss/estate-spool
+# WHAT THE MOVE LEAVES BEHIND, said rather than found: up to 200 readings
+# (SPOOL_MAX) still waiting in david's old spool are never replayed, and
+# david's unrecorded-runs ledger for this kind
+# (~david/.boss-maintenance-unrecorded) is orphaned — root keeps its own
+# from here on (infra/boss-maintenance-wrap.sh).
+#
+# THE TOKEN'S HEADER FILE NEVER OUTLIVES A RUN (adversarial review
+# 9a1e289b, F7). As root this unit's wrap pair presents the machine
+# token, and once its posts are stamped they will too; the 0600 header
+# file infra/lib/secret-header.sh hands curl is made in
+# $RUNTIME_DIRECTORY when a unit declares one — tmpfs under /run, 0700,
+# removed by systemd when the oneshot stops whatever the exit, a SIGKILL
+# included — and under the host's shared /tmp otherwise. LimitCORE=0: no
+# curl of this run dumps a core holding it. The shape of
+# forge-converge.service (359a811c); RuntimeDirectory= makes no mount
+# namespace.
+RuntimeDirectory=estate-observe-host
+RuntimeDirectoryMode=0700
+LimitCORE=0
 # BOSS_JOBS_URL and JOBS_API come from /etc/boss/sor.env (EnvironmentFile=
 # above), rendered by install.sh from infra/estate/estate.toml; the
 # helpers refuse without one, and every Exec line reads the same file.

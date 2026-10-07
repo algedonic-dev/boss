@@ -18,6 +18,63 @@ use boss_jobs::dispatcher_firings::{DispatcherFiringsRepository, PgDispatcherFir
 use boss_testing::TestDb;
 use chrono::{TimeZone, Utc};
 
+#[tokio::test(flavor = "multi_thread")]
+async fn retained_failure_pages_preserve_detail_order_filters_and_beyond_end_total() {
+    use boss_jobs::dispatcher_firings::{InMemoryDispatcherFirings, RetainedDeadLetter};
+    let db = TestDb::new().await;
+    let at = Utc.with_ymd_and_hms(2026, 10, 3, 14, 8, 35).unwrap();
+    let since = at - chrono::Duration::days(30);
+    let detail = serde_json::json!({"failures":[{"handler":"mint","error":"complete retained cause"}],"context":{"unparsed":[1,true,null]}});
+    let mut retained = Vec::new();
+    for (id, rule, when, outcome) in [
+        ("a-z", "broker", at, "dead-letter"),
+        ("ab", "broker", at, "dead-letter"),
+        (
+            "old",
+            "broker",
+            since - chrono::Duration::seconds(1),
+            "dead-letter",
+        ),
+        ("other", "different", at, "dead-letter"),
+        ("success", "broker", at, "fired"),
+    ] {
+        sqlx::query("INSERT INTO dispatcher_firings (firing_id, rule_name, fired_on, fired_at, outcome, detail) VALUES ($1,$2,$3,$4,$5,$6)")
+            .bind(id).bind(rule).bind("ops.requested").bind(when).bind(outcome).bind(&detail)
+            .execute(&db.pool).await.unwrap();
+        if outcome == "dead-letter" {
+            retained.push(RetainedDeadLetter {
+                firing_id: id.into(),
+                rule: rule.into(),
+                fired_on: "ops.requested".into(),
+                fired_at: when,
+                detail: detail.clone(),
+            });
+        }
+    }
+    let memory = InMemoryDispatcherFirings::new(Vec::new()).with_retained_dead_letters(retained);
+    let postgres = PgDispatcherFirings::new(db.pool.clone());
+    for repo in [&memory as &dyn DispatcherFiringsRepository, &postgres] {
+        let rollup = repo.unrouted_dead_letters(since).await.unwrap();
+        let broker = rollup.iter().find(|row| row.rule == "broker").unwrap();
+        assert_eq!(broker.count, 2);
+        let page = repo.dead_letter_page("broker", since, 1, 0).await.unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(page.data.len(), 1);
+        assert_eq!(page.data[0].firing_id, "ab");
+        assert_eq!(page.data[0].detail, detail);
+        assert_eq!(page.data[0].fired_on, "ops.requested");
+        let next = repo.dead_letter_page("broker", since, 1, 1).await.unwrap();
+        assert_eq!(next.total, 2);
+        assert_eq!(next.data[0].firing_id, "a-z");
+        let beyond = repo.dead_letter_page("broker", since, 1, 10).await.unwrap();
+        assert_eq!(beyond.total, 2);
+        assert!(beyond.data.is_empty());
+        let absent = repo.dead_letter_page("absent", since, 1, 0).await.unwrap();
+        assert_eq!(absent.total, 0);
+        assert!(absent.data.is_empty());
+    }
+}
+
 async fn insert(pool: &sqlx::PgPool, id: &str, rule: &str, fired_at: &str) {
     sqlx::query(
         "INSERT INTO dispatcher_firings (firing_id, rule_name, fired_on, fired_at, detail) \

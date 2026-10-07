@@ -88,7 +88,7 @@ fn jobs_app() -> (axum::Router, Arc<InMemoryJobs>) {
     );
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     for spec in seedable_platform_workflows() {
         kinds.seed(spec).expect("seed platform kind");
     }

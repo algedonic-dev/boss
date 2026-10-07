@@ -95,6 +95,8 @@
         }))
       : [];
     let saving = false;
+    const saveError = h('p', { role: 'alert', className: 'load-failed' });
+    saveError.hidden = true;
     const isDone = step.status === 'completed';
 
     function allChecked() {
@@ -166,6 +168,9 @@
 
     async function save(autoComplete) {
       saving = true;
+      saveError.hidden = true;
+      saveError.textContent = '';
+      let phase = 'Save not confirmed';
       renderActions();
       try {
         const completing = autoComplete && allChecked();
@@ -181,24 +186,30 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ items }),
         });
-        // The old single PUT went unchecked; with two writes the
-        // follow-up must not fire when the merge it depends on failed,
-        // or a failed save could still move the status. The host
-        // refresh below still runs either way, so a silent failure
-        // shows server truth — exactly what it showed before.
-        if (pr.ok) {
+        // A failed merge moves no status. A refusal is rendered here;
+        // the host's success refresh runs only after confirmed writes.
+        if (!pr.ok) {
+          phase = 'Save request refused';
+          throw new Error(`HTTP ${pr.status}: ${await pr.text()}`);
+        }
+        {
           if (completing) {
+            phase = 'Completion not confirmed. Fields were saved';
             // The status alone (backlog e39a9d2a, design 93d2bddb).
             // This read the merged row back and PUT it whole with the
             // new status — correct, but a metadata body on the step
             // PUT, and that PUT is closing to any metadata body. The
             // PUT keeps every field a body omits, so the merge above
             // is what the step completes with.
-            await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
+            const changed = await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
               method: 'PUT',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ status: 'completed' }),
             });
+            if (!changed.ok) {
+              phase = 'Completion request refused. Fields were saved';
+              throw new Error(`HTTP ${changed.status}: ${await changed.text()}`);
+            }
           }
           // A save no longer flips a pending step active (design
           // 611fbffd, clause b of backlog 6ef4a36b): a step becomes
@@ -206,6 +217,9 @@
           // its protocol's predicate, not by a save on a page.
         }
         onUpdate();
+      } catch (e) {
+        saveError.textContent = `${phase}: ${e instanceof Error ? e.message : String(e)}`;
+        saveError.hidden = false;
       } finally {
         saving = false;
         renderActions();
@@ -223,6 +237,7 @@
         progressSpan,
       ),
       itemsDiv,
+      saveError,
       actionsDiv,
     );
 

@@ -79,10 +79,16 @@ impl PolicyRepository for InMemoryPolicy {
         Ok(())
     }
 
-    async fn deactivate_rule(&self, id: &str, changed_by: &str) -> Result<(), PolicyError> {
+    async fn deactivate_rule_judged(
+        &self,
+        id: &str,
+        changed_by: &str,
+        judge: Judge<'_, PolicyRule>,
+    ) -> Result<(), PolicyError> {
         let mut state = self.inner.lock().expect("poisoned lock");
         match state.rules.get_mut(id) {
             Some(r) => {
+                judge(Some(&*r)).map_err(PolicyError::Refused)?;
                 r.active = false;
                 // A retirement is an edit: postgres stamps `updated_by`
                 // with its author, so an operator's retirement of a

@@ -26,6 +26,7 @@ const job = (id: string, subjectId: string): Record<string, unknown> => ({
   closed_on: null,
   metadata: {},
   tags: [],
+  steps: [],
 });
 
 async function openList(page: Page, route: string): Promise<void> {

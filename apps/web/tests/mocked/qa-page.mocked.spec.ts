@@ -1,3 +1,4 @@
+import { isPageWrite } from './_smokeMocks';
 // /ux/qa — the page as it stands, pinned (page audit 7c8757ea, step `test`).
 //
 // A HOLDING PIN, not a destination. The audit's `measure` step decided
@@ -97,7 +98,7 @@ function watchWrites(page: Page): Request[] {
   const writes: Request[] = [];
   page.on('request', (req) => {
     const u = new URL(req.url());
-    if (req.method() !== 'GET' && u.pathname.startsWith('/api/') && u.pathname !== '/api/surface-opens') {
+    if (isPageWrite(req.method(), u.pathname)) {
       writes.push(req);
     }
   });

@@ -1,3 +1,4 @@
+import { isPageWrite } from './_smokeMocks';
 // /ux/accounts — "Accounts" (department sales), every control and
 // render state pinned as the page behaves TODAY (page audit 030de959,
 // step `test`).
@@ -186,7 +187,6 @@ async function installLive(page: Page): Promise<void> {
 
 /// The shell's own non-GET: App.svelte records every route open
 /// (shell/surface-opens.ts). It is the chrome's write, not this page's.
-const SHELL_WRITES: ReadonlySet<string> = new Set(['/api/surface-opens']);
 
 /// Every read of the page's four URLs, and every non-GET it sends.
 function watch(page: Page): { reads: string[]; writes: Request[] } {
@@ -195,7 +195,7 @@ function watch(page: Page): { reads: string[]; writes: Request[] } {
     const url = new URL(req.url());
     if (!url.pathname.startsWith('/api/')) return;
     if (req.method() !== 'GET') {
-      if (!SHELL_WRITES.has(url.pathname)) seen.writes.push(req);
+      if (isPageWrite(req.method(), url.pathname)) seen.writes.push(req);
       return;
     }
     const read = `${url.pathname}${url.search}`;
@@ -723,4 +723,41 @@ test.describe('/ux/accounts — empty, loading, and a failed read', () => {
       );
     });
   }
+});
+
+// Manifest recovery: an ungated directory remains usable while its
+// optional support read waits for an actual module decision.
+for (const enabled of [true, false]) {
+  test(`an unknown manifest keeps core account reads stable before support becomes ${enabled ? 'on' : 'off'}`, async ({ page }) => {
+    const seen = watch(page);
+    await installFleet(page);
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    await page.route(/\/api\/tenant\/manifest$/, async (r) => {
+      await held;
+      await json(r, { tenant_id: 'test', display_name: 'Test', modules: { support: enabled } });
+    });
+    await mountFleet(page);
+    await expect(page.getByRole('status').filter({ hasText: 'Support availability unknown' })).toBeVisible();
+    expect(seen.reads).toHaveLength(3);
+    expect(seen.reads.filter((url) => url.includes('department=support'))).toEqual([]);
+    release();
+    await expect(page.getByRole('status').filter({ hasText: 'Support availability unknown' })).toHaveCount(0);
+    expect(await settledReads(page, () => seen.reads.length, enabled ? 4 : 3)).toBe(enabled ? 4 : 3);
+    for (const url of [...PAGE_READS].filter((url) => !url.includes('department=support'))) {
+      expect(seen.reads.filter((read) => read === url), url).toHaveLength(1);
+    }
+    expect(seen.writes).toEqual([]);
+  });
+}
+
+test('an unavailable manifest leaves the core account directory usable and support explicitly unknown', async ({ page }) => {
+  const seen = watch(page);
+  await installFleet(page);
+  await page.route(/\/api\/tenant\/manifest$/, (r) => json(r, { error: 'unavailable' }, 503));
+  await mountFleet(page);
+  await expect(page.getByRole('status').filter({ hasText: 'Support availability unknown' })).toBeVisible();
+  expect(await settledReads(page, () => seen.reads.length, 3)).toBe(3);
+  expect(seen.reads.filter((url) => url.includes('department=support'))).toEqual([]);
+  expect(seen.writes).toEqual([]);
 });

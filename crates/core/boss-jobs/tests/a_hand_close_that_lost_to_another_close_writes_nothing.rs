@@ -90,7 +90,7 @@ fn admin_header() -> String {
 }
 
 fn app() -> (axum::Router, Arc<InMemoryJobs>) {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds.seed(spec()).expect("seed the kind");
     let jobs = Arc::new(InMemoryJobs::new());
     let mut policy = FakePolicyClient::builder();

@@ -12,7 +12,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "The 03:00 chain scan + event-kind drift guard."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
 
 [[workflow.step]]
 title = "scheduled"

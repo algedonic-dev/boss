@@ -177,6 +177,7 @@ pub(crate) fn updated_input(
     // type rather than naming one that cannot be loaded.
     if let Some(name) = subagent_type {
         tool_input["subagent_type"] = json!(name);
+        tool_input["model"] = json!(boss_jobs::agent_spec::DEFINITION_MODEL);
     }
     // THE LANE SETS THE ISOLATION (backlog 65cea113, 2026-09-23), by
     // the same reasoning one level over: a car-lane run gets its own
@@ -567,6 +568,22 @@ mod tests {
         assert_eq!(
             next_untracked(&json!({ "metadata": { "untracked_runs": 4 } })),
             5
+        );
+    }
+
+    #[test]
+    fn selecting_a_definition_controls_its_model_despite_a_caller_override() {
+        let mut input = call("Packet: da925366");
+        input["tool_input"]["model"] = json!("sonnet");
+        let selected = updated_input(&input, "p", Some("effort-high"), None);
+        assert_eq!(
+            selected["hookSpecificOutput"]["updatedInput"]["model"],
+            boss_jobs::agent_spec::DEFINITION_MODEL
+        );
+        let untouched = updated_input(&input, "p", None, None);
+        assert_eq!(
+            untouched["hookSpecificOutput"]["updatedInput"]["model"],
+            "sonnet"
         );
     }
 }

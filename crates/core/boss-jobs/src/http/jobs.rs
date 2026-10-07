@@ -38,6 +38,11 @@ pub(super) struct ListJobsQuery {
     limit: Option<i64>,
     offset: Option<i64>,
     kind: Option<String>,
+    /// JSON string arrays; explicit empty inclusion matches no kinds.
+    kinds: Option<String>,
+    exclude_kinds: Option<String>,
+    /// Opt-in admission-time ordering, applied before pagination.
+    order: Option<String>,
     /// Prefix match on kind (e.g. `kind_prefix=refurb` returns both
     /// `refurb-used` and `refurb-oem-new` jobs).
     kind_prefix: Option<String>,
@@ -306,6 +311,24 @@ pub(crate) fn partition_from_query(
     }
 }
 
+fn kind_set_from_query(value: Option<&str>, name: &str) -> Result<Option<Vec<String>>, String> {
+    value
+        .map(|raw| {
+            let kinds: Vec<String> = serde_json::from_str(raw)
+                .map_err(|_| format!("{name}: expected a JSON array of nonempty kind strings"))?;
+            if kinds
+                .iter()
+                .any(|kind| kind.is_empty() || kind.trim() != kind)
+            {
+                return Err(format!(
+                    "{name}: expected nonempty kind strings without surrounding whitespace"
+                ));
+            }
+            Ok(kinds)
+        })
+        .transpose()
+}
+
 pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     CurrentUser(user): CurrentUser,
@@ -327,6 +350,21 @@ pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static
     // (`JobScope::from_predicate`), so every packet read surface
     // passes through one policy path.
     let scope = JobScope::from_predicate(&user, &predicate);
+    let kinds = match kind_set_from_query(q.kinds.as_deref(), "kinds") {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let excluded_kinds = match kind_set_from_query(q.exclude_kinds.as_deref(), "exclude_kinds") {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let oldest_first = match q.order.as_deref() {
+        None | Some("newest") => false,
+        Some("oldest") => true,
+        Some(_) => {
+            return (StatusCode::BAD_REQUEST, "order: expected oldest or newest").into_response();
+        }
+    };
 
     // The two metadata filters are refused at the boundary rather than
     // bound as-is: a document or key the SQL would accept and match
@@ -350,6 +388,9 @@ pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static
 
     let filter = JobFilter {
         kind: q.kind,
+        kinds,
+        excluded_kinds,
+        oldest_first,
         kind_prefix: q.kind_prefix,
         department,
         status: q.status,
@@ -684,7 +725,16 @@ async fn resolve_me<R: JobsRepository + 'static, B: EventBus + 'static>(
                 .into_response()
         })?,
     };
-    Ok(crate::me::me(id, &user.role, &agents))
+    let original = crate::me::me(id, &user.role, &agents);
+    if let Some(reporter) = state.role_guards.as_ref() {
+        reporter.observe_selection(
+            "assignments-for-me-roles",
+            user,
+            &original.roles,
+            |candidate| Some(crate::me::me(id, &candidate.role, &agents).roles),
+        );
+    }
+    Ok(original)
 }
 
 /// The first `limit` assignment rows `user` may see: those on a packet
@@ -715,7 +765,32 @@ async fn assignments_in_scope<R: JobsRepository + 'static, B: EventBus + 'static
     let readable = readable_job_ids(state, user, scope, others).await?;
     Ok(rows
         .into_iter()
-        .filter(|r| readable.contains(&r.job_id) || step_is_callers(user, true, &r.step))
+        .filter(|r| {
+            let original = readable.contains(&r.job_id) || step_is_callers(user, true, &r.step);
+            match &state.role_guards {
+                Some(report) => report.observe_captured(
+                    "assignment-row-under-granted-scope",
+                    "visibility",
+                    user,
+                    original,
+                    |candidate| {
+                        if matches!(scope, boss_policy_client::Scope::All)
+                            || readable.contains(&r.job_id)
+                            || step_is_callers(candidate, true, &r.step)
+                        {
+                            Some(true)
+                        } else if !step_is_callers(user, true, &r.step) {
+                            // The original read captured this packet's scope result.
+                            Some(false)
+                        } else {
+                            // The original role shortcut skipped its packet read.
+                            None
+                        }
+                    },
+                ),
+                None => original,
+            }
+        })
         .take(usize::try_from(limit).unwrap_or(usize::MAX))
         .collect())
 }
@@ -885,6 +960,8 @@ pub(super) async fn jobs_live<R: JobsRepository + 'static, B: EventBus + 'static
         kind: None,
         kind_prefix: None,
         kinds: None,
+        excluded_kinds: None,
+        oldest_first: false,
         department: None,
         status: Some(boss_core::job::JobStatus::Open),
         closed_since: None,
@@ -2041,6 +2118,48 @@ pub(super) async fn get_job<R: JobsRepository + 'static, B: EventBus + 'static>(
     }
 }
 
+/// A reference whose owning packet is not carried by the referring
+/// domain (calendar backlog b6c4d9a1). This is the packet's read scope,
+/// not a second authority: denied callers never reach storage, and a
+/// hidden step answers exactly as an absent one. No packet body leaks.
+pub(super) async fn get_step_reference<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+) -> Response {
+    let scope = match job_read_scope(&state, &user).await {
+        Ok(scope) => scope,
+        Err(refusal) => return refusal,
+    };
+    let Some(step_id) = parse_step_id(&id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "invalid step id: give the full uuid",
+        )
+            .into_response();
+    };
+    if !step_id.to_string().eq_ignore_ascii_case(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "invalid step id: give the full uuid",
+        )
+            .into_response();
+    }
+    let step = match state.jobs.get_step(&step_id).await {
+        Ok(Some(step)) => step,
+        Ok(None) => return packet_not_found(),
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    match readable_job(&state, &user, &scope, &step.job_id).await {
+        Ok(_) => {
+            Json(serde_json::json!({ "step_id": step.id, "job_id": step.job_id })).into_response()
+        }
+        Err(refusal) => refusal,
+    }
+}
+
 /// The job a `{id}` path segment names, on EVERY door that takes one —
 /// reads and job-level writes alike.
 ///
@@ -2284,7 +2403,7 @@ pub(super) async fn job_stream<R: JobsRepository + 'static, B: EventBus + 'stati
         // which is why the steps are read before the packet is judged.
         let initial = match state.jobs.get_job(&job_id).await {
             Ok(Some(job)) => match state.jobs.list_steps(&job_id).await {
-                Ok(steps) => packet_readable(&user, &scope, &job, &steps).then_some((job, steps)),
+                Ok(steps) => packet_readable_reported(&state, &user, &scope, &job, &steps).then_some((job, steps)),
                 Err(e) => {
                     yield Ok::<_, Infallible>(
                         SseEvent::default()
@@ -2334,7 +2453,7 @@ pub(super) async fn job_stream<R: JobsRepository + 'static, B: EventBus + 'stati
                     continue;
                 }
             };
-            if !packet_readable(&user, &scope, &job, &steps) {
+            if !packet_readable_reported(&state, &user, &scope, &job, &steps) {
                 // The packet left the caller's read: its owner changed,
                 // or the caller's step was completed by someone else or
                 // handed on. It ends as a vanished packet does.

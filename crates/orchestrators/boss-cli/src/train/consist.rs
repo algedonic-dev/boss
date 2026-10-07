@@ -1,4 +1,9 @@
-//! The consist check — proving the ASSEMBLED tree before spending CI on it.
+//! The consist verdict — the isolated worker executes the assembled tree.
+//!
+//! Local branch execution below is test-only historical control (2710c8fc).
+//! Clearing environment names never prevented absolute reads of a token
+//! mounted in the conductor. Production uses `consist_job` for both the
+//! branch exclusions script and every discovered lint.
 
 use super::*;
 
@@ -206,6 +211,7 @@ pub(crate) fn consist_refusal_reason(failed: &[LintFailure], file_budget: usize)
 // brief and both probe doors had the same rule written the removal-only
 // way, which on the conductor is no rule at all, so all three now call
 // the one helper (CLAUDE.md §9a).
+#[cfg(test)]
 use crate::door_env::NoTokenInReach;
 
 /// The lint script names the assembled tree's OWN gate leaves out of
@@ -225,6 +231,7 @@ use crate::door_env::NoTokenInReach;
 /// A refusal (a declaration with no reason) or a tree with no gate.sh
 /// is an error the caller turns into a warning on a `Proceed`, by
 /// name — never a silent "then run everything".
+#[cfg(test)]
 fn gate_exclusions(tree: &Path, env: &NoTokenInReach) -> Result<BTreeSet<String>> {
     // The tree's code, so nothing this CLI holds rides into it
     // (crate::door_env; review ef2da426 F1 of design 6805c764 car 4;
@@ -257,6 +264,7 @@ fn gate_exclusions(tree: &Path, env: &NoTokenInReach) -> Result<BTreeSet<String>
 /// minus what the tree's gate declares out — nothing in code to edit
 /// when a lint lands, and nothing anywhere but the lint's own header
 /// to edit when one needs more than a tree.
+#[cfg(test)]
 fn cheap_lints(tree: &Path, env: &NoTokenInReach) -> Result<Vec<PathBuf>> {
     let excluded = gate_exclusions(tree, env)?;
     let dir = tree.join("infra/lint");
@@ -282,6 +290,7 @@ fn cheap_lints(tree: &Path, env: &NoTokenInReach) -> Result<Vec<PathBuf>> {
 /// it directly: the checkout may not carry the executable bit, and
 /// every one of these scripts is a bash script that locates the repo
 /// root from its own path.
+#[cfg(test)]
 fn run_one_lint(
     tree: &Path,
     script: &Path,
@@ -473,6 +482,7 @@ pub(super) fn freshen_trunk(clone: &str) {
 /// All the checks run, not just up to the first failure: they are
 /// seconds each, and learning ONE bit per attempt is precisely the
 /// cost this exists to stop paying.
+#[cfg(test)]
 pub(crate) fn consist_check(tree: &Path, policy: &DeliveryPolicy) -> ConsistVerdict {
     let env = match NoTokenInReach::new() {
         Ok(env) => env,
@@ -538,6 +548,61 @@ pub(crate) fn consist_check(tree: &Path, policy: &DeliveryPolicy) -> ConsistVerd
 mod tests {
     use super::*;
     use crate::train::test_support::*;
+
+    /// Causal control: removing credential env names is not confinement.
+    /// This is a fake capability and an isolated loopback receiver only.
+    #[test]
+    fn the_replaced_local_boundary_can_read_and_use_a_fake_token() {
+        use std::io::{Read, Write};
+        let (_guard, tree) = consist_fixture("direct-token-read", &twelve_migrations());
+        let token = tree.join("held-fake-machine-token");
+        fs::write(&token, "fake-consist-control").expect("fake credential");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fake receiver");
+        listener.set_nonblocking(true).expect("bounded accept");
+        let port = listener.local_addr().expect("receiver address").port();
+        let receiver = std::thread::spawn(move || {
+            let began = std::time::Instant::now();
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && began.elapsed() < Duration::from_secs(5) =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(error) => panic!("fake receiver did not get its bounded request: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("bounded read");
+            let mut bytes = [0; 4096];
+            let count = stream.read(&mut bytes).expect("fake request");
+            let request = String::from_utf8_lossy(&bytes[..count]).to_string();
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("fake response");
+            request
+        });
+        let script = tree.join("infra/lint/direct-read-and-use.sh");
+        fs::write(&script, format!("set -euo pipefail\nvalue=$(cat '{}')\nprintf 'DIRECT-READ:%s\\n' \"$value\"\ncurl --max-time 3 -fsS -H \"x-boss-machine-token: $value\" http://127.0.0.1:{port}/fake-capability\n",token.display())).expect("direct-read fixture");
+        let environment = NoTokenInReach::new().expect("stripped environment");
+        let result = run_one_lint(&tree, &script, 4096, &environment);
+        assert_eq!(
+            result,
+            LintResult::Passed,
+            "the old boundary must reproduce the original exposure"
+        );
+        let request = receiver.join().expect("fake receiver result");
+        assert!(
+            request.contains("x-boss-machine-token: fake-consist-control"),
+            "{request}"
+        );
+        println!("OLD-BOUNDARY-DIRECT-READ-AND-USE: reproduced with fake credential only");
+    }
 
     // -- a machine cancellation says why -------------------------------
 

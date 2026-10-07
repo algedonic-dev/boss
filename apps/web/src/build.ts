@@ -12,6 +12,7 @@ import { join as pathJoin } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { MERMAID_ROUTE } from './it/mermaidUrl';
 import { copyMermaidInto } from './mermaid-vendor';
+import { stageInstanceConfig } from './dev-door-static';
 
 const OUT = 'dist';
 await rm(OUT, { recursive: true, force: true });
@@ -145,6 +146,7 @@ if (!result.success) {
   for (const log of result.logs) console.error(log);
   process.exit(1);
 }
+await stageInstanceConfig(OUT);
 
 // Post-build entry-fixup. Bun's `entrypoints: ['index.html']` chunking
 // has a known glitch where a heavy lazy-loaded dependency can land in

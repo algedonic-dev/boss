@@ -157,7 +157,7 @@ fn access_declares_an_ssh_application_in_front_of_the_door() {
 /// The client steps' one copy, read by the /it/estate page AND the
 /// printed recovery sheet (design 125d405d collapsed the page's literal
 /// into it, so the paper is not a second spelling).
-const DOOR_DATA: &str = "apps/web/src/it/estate/dev-door.json";
+const DOOR_DATA: &str = "infra/estate/dev-door.json";
 
 #[test]
 fn the_estate_page_spells_the_same_hostname_as_the_route() {
@@ -175,8 +175,8 @@ fn the_estate_page_spells_the_same_hostname_as_the_route() {
     );
     let page = read("apps/web/src/it/estate/estate.ts");
     assert!(
-        page.contains("from './dev-door.json'"),
-        "the page reads the one copy rather than spelling the host again"
+        page.contains("fetchRemote(DEV_DOOR_READ, parseDevDoor)"),
+        "the page reads the deployment declaration rather than spelling the host again"
     );
     assert!(
         !page.contains("10.20.0.35"),

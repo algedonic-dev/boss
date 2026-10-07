@@ -102,14 +102,15 @@
 #       publisher; GitHub's merge API mints a new commit (the squash's or
 #       the merge's) and stamps it with an identity the caller cannot set.
 #       GitHub marks the PR merged when its head reaches the base;
-#   M5. proves it — git ls-remote reads main at the snapshot, and GitHub,
+#   M5. proves it — git reads main at or containing the snapshot, and GitHub,
 #       asked with the token (never a cached anonymous answer), reads the
 #       PR merged — revokes the token, writes `pr_state` onto the packet,
 #       and completes `merge` with `merged_sha`.
 #
 # Every refusal happens before the push, names what failed and exits
 # non-zero, and the answer rule troubles the step with it. A re-run after
-# main already reads the snapshot pushes nothing and proves again.
+# main already carries the snapshot pushes nothing and proves again,
+# including an exact original merged PR receipt when main advanced.
 #
 # THE EXIT SAYS WHETHER MAIN MOVED (backlog 16a9c5ae, review 01561b13
 # N2; review af3f2996 B1-B3), and it is decided by READING main, first:
@@ -121,9 +122,9 @@
 # snapshot and before a push: nothing was merged, and the annotation the
 # answer rule writes closes the packet at `merge-refused` — which frees
 # the daily rule, whose next publish closes this PR as superseded.
-# Exit 3, from the moment main reads the snapshot (found there, pushed,
+# Exit 3, from the moment main carries the snapshot (found there, pushed,
 # or a push that errored but landed — a failed push is read back before
-# anything is said): main IS the approved commit and the record has not
+# anything is said): the original approved snapshot is on main and its record has not
 # followed, so the packet stays open and troubled, and a merge-publish-pr
 # request for it proves it again without pushing or needing the publish
 # branch. Exit 4 before main was read: unknown, and left open. The EXIT
@@ -337,7 +338,7 @@ say() { echo "$me: $*"; }
 #      (main_unread, from the argument on): nothing says it did not move;
 #   2/1 once main was read NOT at the snapshot, and until a push
 #      (main_still);
-#   3  once main reads the snapshot — found there, pushed, or a push that
+#   3  once main carries the snapshot — found there, pushed, or a push that
 #      errored but landed (main_moved) — and from then on, whatever the
 #      words. finish() holds every exit the run did not choose (a `set -e`
 #      death) to the state's own, so only these four ever leave.
@@ -877,6 +878,7 @@ fi
 # `for_publish` — which the filing rule (merge-publish-pr-on-merge-ready)
 # sets to the packet whose merge went ready. Read off the request itself.
 for_publish=""
+SETTLE_CONTAINED=0
 if [ "$MODE" = merge ]; then
     [[ ${OPS_REQUEST_ID:-} =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
         || refuse "OPS_REQUEST_ID ('${OPS_REQUEST_ID:0:40}') names no ops-request, so which publish this merge was filed for cannot be read; nothing was merged"
@@ -965,7 +967,8 @@ if [ "$MODE" = merge ]; then
                 0)
                     main_moved
                     MOVED_NOTE=" (exit 3: main carries the approved commit, so packet ${job_id:0:8} stays open and troubled rather than closing as not merged)"
-                    refuse "$MIRROR_SLUG main is $main_seen, which contains the approved snapshot $recorded_snap as an ancestor: the merge happened and main has moved on past it. Proving a merge main has advanced past is not this verb's yet; a person closes the packet on that evidence"
+                    SETTLE_CONTAINED=1
+                    say "$MIRROR_SLUG main contains $recorded_snap; settlement still requires the original approval and merged PR receipt"
                     ;;
                 1) main_still ;;
                 *) fail "asking whether $MIRROR_SLUG main $main_seen contains the snapshot $recorded_snap failed (git merge-base exit $contained)" ;;
@@ -1324,7 +1327,9 @@ if [ "$MODE" = merge ]; then
             no("open-pr recorded no App as the PR'"'"'s opener (opened_by \($m.opened_by // "none" | tostring), opened_by_id \($m.opened_by_id // "none" | tostring)) — the one identity this verb holds the PR to (backlog 16a9c5ae)")
           else {pr_url: $url, number: ($url[($prefix | length):] | tonumber),
                 snapshot: $m.snapshot_commit, branch: $branch,
-                opened_by: $m.opened_by, opened_by_id: ($m.opened_by_id | tostring)} end') \
+                opened_by: $m.opened_by, opened_by_id: ($m.opened_by_id | tostring),
+                original_approval_by: $m.approved_by, original_approval_at: $m.approved_at,
+                original_open_pr_receipt: $m} end') \
         || refuse "what open-pr on ${job_id:0:8} recorded could not be read — jq failed over the packet; nothing was merged"
     why=$(printf '%s' "$recorded" | jq -r '.refuse // empty')
     [ -z "$why" ] || refuse "packet ${job_id:0:8} names no pull request this verb may merge — $why. Nothing was merged"
@@ -1345,9 +1350,14 @@ if [ "$MODE" = merge ]; then
     #     branch on merge, and a re-run that needed it could never prove a
     #     merge that happened (review af3f2996 B2).
     already=0
-    if [ "$mirror_head" = "$snapshot" ]; then
+    if [ "$mirror_head" = "$snapshot" ] || [ "$SETTLE_CONTAINED" = 1 ]; then
         already=1
-        main_moved
+        if [ "$SETTLE_CONTAINED" = 1 ]; then
+            g --no-replace-objects merge-base --is-ancestor "$snapshot" refs/remotes/mirror/main \
+                || fail "the freshly fetched main no longer contains the original snapshot; no settlement was recorded"
+        else
+            main_moved
+        fi
     else
         g fetch -q mirror "+refs/heads/$pr_branch:refs/boss-publish/merge-head" 2>"$workdir/err" \
             || fail "fetching the PR's branch $pr_branch from $MIRROR_URL — git said: $(head -c 300 "$workdir/err" | tr '\n' ' '); nothing was merged"
@@ -1378,7 +1388,7 @@ if [ "$MODE" = merge ]; then
     #     answer here gates a push the git side re-checks (the push below
     #     is a plain fast-forward to this exact sha).
     gh_public() {
-        curl -fsS -H "accept: application/vnd.github+json" "$GITHUB_API/repos/$MIRROR_SLUG/$1" > "$2" 2>"$workdir/err"
+        curl -fsS --connect-timeout 10 --max-time 30 -H "accept: application/vnd.github+json" "$GITHUB_API/repos/$MIRROR_SLUG/$1" > "$2" 2>"$workdir/err"
     }
     gh_public "pulls/$pr_n" "$workdir/pull" \
         || fail "GitHub did not answer for $pr_url — $(head -c 300 "$workdir/err" | tr '\n' ' '); nothing was merged"
@@ -1397,11 +1407,34 @@ if [ "$MODE" = merge ]; then
         elif (.user.type // "") != "Bot" then "it was opened by \(.user.login // "nobody") (\(.user.type // "no type")), not by the App: a pull request a person opened is never merged by machine"
         elif (.user.login // "") != $by or ((.user.id // "") | tostring) != $byid then "it was opened by \(.user.login // "nobody") (id \(.user.id // "none" | tostring)), and open-pr recorded the App that opened it as \($by) (id \($byid)): any other Bot is not this App"
         elif .state == "open" then empty
-        elif $already == "1" and .merged == true then empty
+        elif $already == "1" and .state == "closed" and .merged == true then empty
         else "it reads \(.state // "no state"), \(if .merged == true then "merged" else "not merged" end)" end' \
             "$workdir/pull") \
         || fail "GitHub's answer for $pr_url could not be read as a pull request; nothing was merged"
     [ -z "$pr_why" ] || refuse "$pr_url is not the pull request the publish opened, open, on the approved snapshot — $pr_why. Nothing was merged"
+
+    # Containment says where the original commit is, never who approved
+    # descendants. A separate exact PR receipt proves this publication.
+    if [ "$SETTLE_CONTAINED" = 1 ]; then
+        jq_doc_text "$recorded" && printf '%s' "$recorded" | jq -e --arg by "$approved_by" --arg at "$approved_at" '
+            .original_approval_by == $by and .original_approval_at == $at
+            and ((.original_approval_at | type) == "string")
+            and (.original_approval_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})$"))' \
+            > /dev/null \
+            || refuse "the original open-pr approval does not match the current valid approval; no historical effect was authorized"
+        jq_doc_file "$workdir/pull" && jq -e --arg snap "$snapshot" '
+            .state == "closed" and .merged == true and .merge_commit_sha == $snap
+            and ((.merged_at | type) == "string")
+            and (.merged_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))' \
+            "$workdir/pull" > /dev/null \
+            || refuse "main contains $snapshot, but the original PR supplies no matching merged commit and time; no settlement was recorded"
+        original_merge_time=$(date -u -d "$(jq -r '.merged_at' "$workdir/pull")" +%Y-%m-%dT%H:%M:%S.%NZ 2>/dev/null) \
+            || refuse "the original PR's merge time is invalid; no settlement was recorded"
+        original_approval_time=$(date -u -d "$approved_at" +%Y-%m-%dT%H:%M:%S.%NZ 2>/dev/null) \
+            || refuse "the original approval time is invalid; no settlement was recorded"
+        [[ "$original_approval_time" < "$original_merge_time" || "$original_approval_time" = "$original_merge_time" ]] \
+            || refuse "the original approval is later than the recorded merge; a later signature cannot authorize an earlier effect"
+    fi
 
     #     WHAT GREEN IS, read off main's own rules: the checks a ruleset
     #     requires there. None named is a refusal — main's ruleset
@@ -1411,8 +1444,23 @@ if [ "$MODE" = merge ]; then
         || fail "GitHub did not answer for the rules on $MIRROR_SLUG main — $(head -c 300 "$workdir/err" | tr '\n' ' '); nothing was merged"
     jq_doc_file "$workdir/rules" && jq -e 'type == "array" and length < 100' "$workdir/rules" > /dev/null 2>&1 \
         || fail "the rules on $MIRROR_SLUG main did not read as one page of rules: $(head -c 200 "$workdir/rules" | tr '\n' ' '); nothing was merged"
+    # Review077: an unread second required rule disappeared beside the
+    # successful Gate. Validate each native rule before deriving its set.
+    jq -e 'all(.[];
+        type == "object" and (.type | type) == "string" and (.type | length) > 0
+        and (if .type == "required_status_checks" then
+            (.parameters | type) == "object"
+            and (.parameters.required_status_checks | type) == "array"
+            and all(.parameters.required_status_checks[];
+                type == "object" and (.context | type) == "string"
+                and (.context | test("\\S"))
+                and (.integration_id == null or
+                    ((.integration_id | type) == "number" and .integration_id > 0
+                     and (.integration_id | floor) == .integration_id)))
+        else true end))' "$workdir/rules" > /dev/null 2>&1 \
+        || refuse 'main has an unread or malformed required-check rule; nothing was merged'
     jq -c '[.[] | select(.type == "required_status_checks")
-            | (.parameters.required_status_checks // [])[]
+            | .parameters.required_status_checks[]
             | {context, integration_id: (.integration_id // null)}] | unique' "$workdir/rules" > "$workdir/required" \
         || fail "the rules on $MIRROR_SLUG main could not be read; nothing was merged"
     [ "$(jq 'length' "$workdir/required")" -gt 0 ] \
@@ -1433,7 +1481,9 @@ if [ "$MODE" = merge ]; then
     jq_doc_file "$workdir/runs" && jq -e '(.check_runs | type) == "array"' "$workdir/runs" > /dev/null 2>&1 \
         || fail "the check-runs on $snapshot did not read as a list; nothing was merged"
     # A limit is not a filter: a run on a second page could be the newer one.
-    jq -e '(.total_count // 0) <= (.check_runs | length)' "$workdir/runs" > /dev/null \
+    jq -e '(.total_count | type) == "number" and .total_count >= 0
+        and (.total_count | floor) == .total_count
+        and .total_count == (.check_runs | length)' "$workdir/runs" > /dev/null 2>&1 \
         || refuse "$snapshot carries $(jq -r '.total_count' "$workdir/runs") check-runs and one page shows $(jq -r '.check_runs | length' "$workdir/runs"), so the newest run of a required check may be unread. Nothing was merged"
     #     THE NEWEST RUN, and none still going (review 01561b13 N1): a
     #     queued re-run has no started_at yet, and sorted by it an older
@@ -1455,6 +1505,58 @@ if [ "$MODE" = merge ]; then
         || fail "the check-runs on $snapshot could not be judged; nothing was merged"
     bad=$(printf '%s' "$verdicts" | jq -r '[.[] | .bad // empty] | join("; ")')
     [ -z "$bad" ] || refuse "not every check $MIRROR_SLUG main requires is green on $snapshot — $bad. Nothing was merged"
+    publish_gate_context='Gate (infra/gate.sh, full)'
+    jq_doc_file "$workdir/required" && jq -e --arg gate "$publish_gate_context" '[.[] | select(.context == $gate)] | length == 1' "$workdir/required" >/dev/null \
+        || refuse 'main does not require exactly one full Gate; nothing was merged'
+    # Match the required full Gate to the run and current attempt that
+    # produced its selected check, before any credential is rendered.
+    jq -c --arg gate "$publish_gate_context" --slurpfile req "$workdir/required" '
+        .check_runs as $all | $req[0][]
+        | select(.context == $gate) as $r
+        | [$all[] | select(.name == $r.context and .app.id == $r.integration_id)]
+        | sort_by(.started_at // "", .id) | last' "$workdir/runs" > "$workdir/gate-check" \
+        || fail 'required Gate could not be selected; nothing was merged'
+    if [ -s "$workdir/gate-check" ]; then
+        jq_doc_file "$workdir/gate-check" && jq -e '.id | type == "number" and . > 0 and floor == .' "$workdir/gate-check" >/dev/null \
+            || refuse 'required Gate has no valid check ID; nothing was merged'
+        suite=$(jq_doc_file "$workdir/gate-check" && jq -er '.check_suite.id | select(type == "number" and . > 0 and floor == .)' "$workdir/gate-check") \
+            || refuse 'required Gate has no valid check suite; nothing was merged'
+        gh_public "actions/runs?check_suite_id=$suite&per_page=100" "$workdir/workflow-runs" \
+            || fail 'GitHub did not answer for the Gate workflow runs; nothing was merged'
+        jq_doc_file "$workdir/workflow-runs" && jq -e --argjson suite "$suite" --arg slug "$MIRROR_SLUG" --arg repo_url "$GITHUB_API/repos/$MIRROR_SLUG" --arg snap "$snapshot" --argjson n "$pr_n" '
+            (.total_count | type) == "number" and .total_count == 1
+            and (.workflow_runs | type) == "array" and (.workflow_runs | length) == 1
+            and (.workflow_runs[0] | .id > 0 and (.id | floor) == .id
+                and .check_suite_id == $suite and .run_attempt > 0
+                and (.run_attempt | floor) == .run_attempt
+                and (.path | split("@") | .[0] == ".github/workflows/ci.yml" and length <= 2 and (length == 1 or .[1] != "")) and .event == "pull_request"
+                and .status == "completed" and .conclusion == "success"
+                and .repository.full_name == $slug and .head_repository.full_name == $slug
+                and (.head_sha | type) == "string" and (.head_sha | test("^[0-9a-f]{40}$"))
+                and (.pull_requests | type) == "array"
+                and ([.pull_requests[] | select(.number == $n and .head.sha == $snap
+                    and .head.repo.url == $repo_url and .base.ref == "main"
+                    and .base.repo.url == $repo_url)] | length) == 1)' "$workdir/workflow-runs" >/dev/null \
+            || refuse 'required Gate workflow identity is missing, ambiguous or mismatched; nothing was merged'
+        jq '.workflow_runs[0]' "$workdir/workflow-runs" > "$workdir/workflow-run"
+        run_id=$(jq -r '.id' "$workdir/workflow-run")
+        attempt=$(jq -r '.run_attempt' "$workdir/workflow-run")
+        gh_public "actions/runs/$run_id/attempts/$attempt/jobs?per_page=100" "$workdir/workflow-jobs" \
+            || fail 'GitHub did not answer for the Gate attempt jobs; nothing was merged'
+        jq_doc_file "$workdir/workflow-jobs" && jq -e --slurpfile run "$workdir/workflow-run" --slurpfile check "$workdir/gate-check" --arg api "$GITHUB_API/repos/$MIRROR_SLUG/check-runs/" '
+            (.total_count | type) == "number" and (.jobs | type) == "array"
+            and .total_count == (.jobs | length)
+            and ([.jobs[] | select(.check_run_url == ($api + ($check[0].id | tostring)))
+                | select((.id | type) == "number" and .id > 0 and (.id | floor) == .id
+                    and .run_id == $run[0].id and .head_sha == $run[0].head_sha
+                    and .name == $check[0].name and .status == "completed" and .conclusion == "success")]
+                | length) == 1' "$workdir/workflow-jobs" >/dev/null \
+            || refuse 'required Gate has no unique successful job in its current attempt; nothing was merged'
+        gh_public "actions/runs/$run_id" "$workdir/workflow-run-after" \
+            || fail 'GitHub did not answer for the final Gate run read; nothing was merged'
+        jq_doc_file "$workdir/workflow-run-after" && jq -e --slurpfile before "$workdir/workflow-run" 'def identity: {id, check_suite_id, run_attempt, path, event, status, conclusion, head_sha, repository: .repository.full_name, head_repository: .head_repository.full_name, pull_requests}; identity == ($before[0] | identity)' "$workdir/workflow-run-after" >/dev/null \
+            || refuse 'Gate workflow run changed during verification; nothing was merged'
+    fi
     green=$(printf '%s' "$verdicts" | jq -c '[.[] | .ok]')
     say "every check main requires is green on ${snapshot:0:12}: $(printf '%s' "$green" | jq -r 'join(", ")')"
 
@@ -1464,7 +1566,7 @@ if [ "$MODE" = merge ]; then
     #     while any rule it is not exempt from stands on main.
     take_token
     if [ "$already" = 1 ]; then
-        say "the mirror's main already reads $snapshot — nothing to push; proving it"
+        say "the original snapshot $snapshot is already on main — nothing to push; proving it"
     else
         if g -c credential.helper= -c "credential.helper=$helper" push -q mirror "$snapshot:refs/heads/main" 2>"$workdir/err"; then
             main_moved
@@ -1493,8 +1595,13 @@ if [ "$MODE" = merge ]; then
     g -c credential.helper= ls-remote mirror refs/heads/main > "$workdir/main-now" 2>"$workdir/err" \
         || fail "the push answered, and $MIRROR_SLUG main could not be read back — git said: $(head -c 300 "$workdir/err" | tr '\n' ' ')"
     main_now=$(awk '$2 == "refs/heads/main" { print $1 }' "$workdir/main-now")
-    [ "$main_now" = "$snapshot" ] \
-        || fail "$MIRROR_SLUG main reads ${main_now:-nothing} after the push, not the approved $snapshot — read it before anything else is done"
+    if [ "$SETTLE_CONTAINED" = 1 ]; then
+        [ "$main_now" = "$mirror_head" ] \
+            || fail "main changed during settlement from $mirror_head to ${main_now:-nothing}; retry against a fresh observation"
+    else
+        [ "$main_now" = "$snapshot" ] \
+            || fail "$MIRROR_SLUG main reads ${main_now:-nothing} after the push, not the approved $snapshot — read it before anything else is done"
+    fi
     reads=0
     until gh_t api "repos/$MIRROR_SLUG/pulls/$pr_n" > "$workdir/pull-after" 2>"$workdir/err" \
             && jq_doc_file "$workdir/pull-after" \
@@ -1502,11 +1609,21 @@ if [ "$MODE" = merge ]; then
                 "$workdir/pull-after" > /dev/null 2>&1; do
         reads=$((reads + 1))
         [ "$reads" -lt "$MERGE_READS" ] \
-            || fail "$MIRROR_SLUG main reads the approved $snapshot, and after $reads reads GitHub still answers $pr_url as $(jq -r '"\(.state // "no state"), merged \(.merged // false)"' "$workdir/pull-after" 2>/dev/null || printf 'nothing readable (%s)' "$(head -c 200 "$workdir/err" | tr '\n' ' ')") — main IS the approved commit; the PR's state has not followed it, so the merge is not recorded on ${job_id:0:8}"
+            || fail "$MIRROR_SLUG main carries the approved $snapshot, and after $reads reads GitHub still answers $pr_url as $(jq -r '"\(.state // "no state"), merged \(.merged // false)"' "$workdir/pull-after" 2>/dev/null || printf 'nothing readable (%s)' "$(head -c 200 "$workdir/err" | tr '\n' ' ')") — the original snapshot is on main; the PR's state has not followed it, so the merge is not recorded on ${job_id:0:8}"
         sleep "$READBACK_SLEEP"
     done
     merged_at=$(jq -r '.merged_at // empty' "$workdir/pull-after")
-    say "read back: $MIRROR_SLUG main is $snapshot, and GitHub reads $pr_url merged${merged_at:+ at $merged_at}"
+    if [ "$SETTLE_CONTAINED" = 1 ]; then
+        # Bind the authenticated reread to the original subject/effect.
+        # Incidental API fields may change; retain both whole observations.
+        jq_doc_file "$workdir/pull-after" && jq -e --slurpfile original "$workdir/pull" '
+            def binding: [.number, .state, .merged, .merge_commit_sha, .merged_at,
+                .base.ref, .base.repo.full_name, .head.ref, .head.sha, .head.repo.full_name,
+                .user.type, .user.login, .user.id];
+            binding == ($original[0] | binding)' "$workdir/pull-after" > /dev/null \
+            || fail "the authenticated original PR receipt changed during settlement; no completion was recorded"
+    fi
+    say "read back: $MIRROR_SLUG main is $main_now and carries $snapshot; GitHub reads $pr_url merged${merged_at:+ at $merged_at}"
 
     REVOKE=0
     revoke || say "WARNING — the token this run used is not proven revoked; token_revoked on merge says what stands"
@@ -1518,31 +1635,49 @@ if [ "$MODE" = merge ]; then
     jq -c --arg url "$pr_url" --arg ts "$ts" \
         '{pr_state: {pr_url: $url, number, state, merged: (.merged == true), merged_at, closed_at,
                      read_at: $ts, read_by: "publish-github-pr --merge"}}' "$workdir/pull-after" > "$workdir/pr-state" \
-        || fail "main reads $snapshot and $pr_url is merged, but its state could not be rendered for ${job_id:0:8}"
+        || fail "main carries $snapshot and $pr_url is merged, but its state could not be rendered for ${job_id:0:8}"
     curl -fsS --max-time "$SOR_WRITE_MAX_S" -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
             ${MT_HDR:+-H "$MT_HDR"} --data-binary @"$workdir/pr-state" \
             "$BASE/api/jobs/$job_id/metadata" > /dev/null 2>"$workdir/err" \
-        || fail "main reads $snapshot and $pr_url is merged, but writing pr_state onto ${job_id:0:8} failed — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
+        || fail "main carries $snapshot and $pr_url is merged, but writing pr_state onto ${job_id:0:8} failed — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
     jq -n -c --arg sha "$snapshot" --arg url "$pr_url" --arg was "$mirror_head" --argjson green "$green" \
+            --slurpfile rules "$workdir/rules" --slurpfile checks "$workdir/runs" \
+            --slurpfile selected "$workdir/gate-check" --slurpfile runs "$workdir/workflow-runs" \
+            --slurpfile jobs "$workdir/workflow-jobs" --slurpfile final_run "$workdir/workflow-run-after" \
             --arg src "$source_sha" --arg by "$approved_by" --arg at "$approved_at" \
-            --arg revoked "$TOKEN_REVOKED" --arg merged_at "$merged_at" --arg already "$already" '
+            --arg revoked "$TOKEN_REVOKED" --arg merged_at "$merged_at" --arg already "$already" \
+            --arg observed_main "$main_now" --arg contained "$SETTLE_CONTAINED" \
+            --slurpfile original_receipt "$workdir/pull" \
+            --slurpfile authenticated_receipt "$workdir/pull-after" --argjson original_open_pr "$recorded" '
         {merged_sha: $sha, pr_url: $url, main_was: $was, method: "fast-forward",
          merged_by: "publish-github-pr --merge", merged_at: $merged_at,
          pushed: ($already != "1"), required_checks_green: $green,
-         source_sha: $src, approved_by: $by, approved_at: $at, token_revoked: $revoked}' \
+         required_checks_evidence: {rules: $rules[0], check_runs: $checks[0],
+             selected_gate_check: $selected[0], workflow_runs: $runs[0],
+             current_attempt_jobs: $jobs[0], final_workflow_run: $final_run[0]},
+         source_sha: $src, approved_by: $by, approved_at: $at, token_revoked: $revoked}
+         + (if $contained == "1" then {observed_main: $observed_main,
+               original_merge_receipt: $original_receipt[0],
+               authenticated_merge_receipt: $authenticated_receipt[0],
+               original_open_pr_receipt: $original_open_pr.original_open_pr_receipt} else {} end)' \
         > "$workdir/payload"
     printf '%s\n' '{"status":"completed"}' > "$workdir/done"
     curl -fsS --max-time "$SOR_WRITE_MAX_S" -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
             ${MT_HDR:+-H "$MT_HDR"} --data-binary @"$workdir/payload" \
             "$BASE/api/jobs/$job_id/steps/$step_id/metadata" > /dev/null 2>"$workdir/err" \
-        || fail "main reads $snapshot and $pr_url is merged, but recording it on merge (${job_id:0:8}) failed — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
+        || fail "main carries $snapshot and $pr_url is merged, but recording it on merge (${job_id:0:8}) failed — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
     curl -fsS --max-time "$SOR_WRITE_MAX_S" -X PUT -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
             ${MT_HDR:+-H "$MT_HDR"} --data-binary @"$workdir/done" \
             "$BASE/api/jobs/$job_id/steps/$step_id" > /dev/null 2>"$workdir/err" \
-        || fail "main reads $snapshot and $pr_url is merged and recorded on merge, but completing merge on ${job_id:0:8} failed — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
+        || fail "main carries $snapshot and $pr_url is merged and recorded on merge, but completing merge on ${job_id:0:8} failed — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
     # The answer line: the effect this verb's file declares, and what the
     # answer rule copies merged_sha from. Last, and only after the proof.
-    say "merged $pr_url — main reads $snapshot"
+    if [ "$SETTLE_CONTAINED" = 1 ]; then
+        say "merged $pr_url — main carries $snapshot"
+    else
+        # Preserve the original answer for existing exact-main readers.
+        say "merged $pr_url — main reads $snapshot"
+    fi
     exit 0
 fi
 

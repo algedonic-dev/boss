@@ -1,3 +1,4 @@
+import { isPageWrite } from './_smokeMocks';
 // /it/registry/rules/:ruleName — the rule editor's four writes, pinned
 // (backlog 91e42a8b, page-audit bd5018e1 gap 5), with the gaps that same
 // audit filed against them.
@@ -57,7 +58,6 @@ const retireOf = (rule: string) => new RegExp(`/api/dispatcher/rules/${esc(rule)
 const FIRINGS = /\/api\/yard\/rule-firings$/;
 const SCHEDULE = /\/api\/dispatcher\/schedule$/;
 /// The shell's own write (App.svelte's surface-open), not this page's.
-const SHELL_WRITE = /\/api\/surface-opens$/;
 
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
@@ -156,7 +156,7 @@ async function install(page: Page, setup: Setup): Promise<Harness> {
   let served = setup.versions;
   page.on('request', (req) => {
     const path = new URL(req.url()).pathname;
-    if (path.startsWith('/api/') && req.method() !== 'GET' && !SHELL_WRITE.test(path)) {
+    if (path.startsWith('/api/') && req.method() !== 'GET' && isPageWrite(req.method(), path)) {
       const raw = req.postData();
       sent.push({ method: req.method(), path, body: raw ? JSON.parse(raw) : null });
     }

@@ -2269,6 +2269,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_declared_reconcile_interval_reaches_the_next_window_once_and_keeps_inflight() {
+        let specs = boss_jobs::seed_loader::load_cadence_rules(
+            boss_jobs::cadence_seed::platform_cadence_path(),
+        )
+        .unwrap();
+        let spec = specs
+            .iter()
+            .find(|s| s.name() == "train-reconcile")
+            .unwrap();
+        let rule = rule_from_row(&spec.row).unwrap();
+        let previous = utc(2026, 10, 6, 0, 50, 0);
+        let gate_green = utc(2026, 10, 6, 0, 51, 42);
+        let next = utc(2026, 10, 6, 0, 52, 0);
+        assert_eq!(
+            next_due(std::slice::from_ref(&rule), gate_green),
+            Some(next)
+        );
+        let last = fired(&rule, previous);
+        assert_eq!(
+            decide(&rule, next, Some(&last), None, None, &[]),
+            Decision::Fire(next)
+        );
+        assert_eq!(
+            due_window(&rule, next, Some(&fired(&rule, next)), None),
+            None
+        );
+        assert_eq!(
+            decide(
+                &rule,
+                next,
+                Some(&last),
+                None,
+                None,
+                &[running("train-reconcile", 67)]
+            ),
+            Decision::StillRunning(std::time::Duration::from_secs(67))
+        );
+        assert_eq!(
+            firing_id(&rule.name, next),
+            "cadence:train-reconcile:2026-10-06T00:52Z"
+        );
+    }
+
     fn clock_rule() -> CadenceRule {
         CadenceRule {
             name: "train-window".into(),

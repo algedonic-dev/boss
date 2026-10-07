@@ -26,6 +26,18 @@ use crate::refusals::{StepWriteRefusal, classify, is_refusal, is_step_write};
 /// turn a measurement table into a storage problem.
 const DETAIL_LIMIT: usize = 2000;
 
+/// The atomic first-record and conditional completion doors promise no persisted writes on rejection,
+/// including refusal telemetry. Its route owns this declaration; ordinary
+/// step-write routes retain their existing attempt counters.
+#[derive(Clone)]
+struct NoPersistedRefusal;
+
+pub(super) async fn without_persisted_refusal(req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    response.extensions_mut().insert(NoPersistedRefusal);
+    response
+}
+
 /// The path carries the ids: `/api/jobs/{job}/steps/{step}/...`.
 /// Parsed rather than threaded through the handlers, because the layer
 /// runs after the handler has already returned.
@@ -70,6 +82,9 @@ pub(super) async fn record_step_write_refusals<
         .unwrap_or_else(|| "anonymous".to_string());
 
     let res = next.run(req).await;
+    if res.extensions().get::<NoPersistedRefusal>().is_some() {
+        return res;
+    }
     let status = res.status().as_u16();
     if !is_refusal(status) {
         return res;

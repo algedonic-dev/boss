@@ -1,3 +1,4 @@
+import { pageWrites } from './_smokeMocks';
 // Whole control completion for page audit d2e86594. The existing
 // views-page and views-sources specs retain the landed gap repairs;
 // this file exercises the composer, write effects, every result link
@@ -158,7 +159,7 @@ for (const layout of ['table', 'list', 'count'] as const) {
     await expect(row(page).locator('.v-shown')).toHaveText(/^showing 0 of 0 · read \d\d:\d\d$/);
     await expect(row(page).locator('table,ul,.load-failed')).toHaveCount(0);
     expect(runs).toBe(2);
-    expect((await openedRequests(page)).filter((r) => r.method !== 'GET' && r.path !== '/api/surface-opens')).toEqual([]);
+    expect(pageWrites(await openedRequests(page))).toEqual([]);
   });
 }
 
@@ -213,7 +214,7 @@ for (const layout of ['table', 'list'] as const) {
       await expect(page.getByRole('heading', { name: 'Views', exact: true })).toBeVisible();
       await expect(row(page, link.view)).toBeVisible();
     }
-    expect((await openedRequests(page)).filter((r) => r.method !== 'GET' && r.path !== '/api/surface-opens')).toEqual([]);
+    expect(pageWrites(await openedRequests(page))).toEqual([]);
   });
 }
 

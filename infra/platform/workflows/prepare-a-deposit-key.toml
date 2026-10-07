@@ -1,0 +1,138 @@
+# Source preparation for 1e50e66b. Publication and receiver enrollment
+# are separate recorded operations; shipping this row authorizes neither.
+[[workflow]]
+kind = "prepare-a-deposit-key"
+label = "Prepare a deposit transport key"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "A human scopes one declared SSH transport credential. The broker prepares its pair in its named Secret and puts only the public proposal on the enrollment step. A human separately authorizes the exact receiver, public key and purpose. Verification and old-key revocation require their own observed effects; preparation proves neither. No field carries private credential bytes."
+metadata = { department = "it", owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "scope"
+kind = "credential-rotation"
+ready_when = "true"
+title_template = "Scope transport key preparation"
+authority_role = "platform-admin"
+metadata_defaults = { human_only = true, procedure = "Scope only this credential's public preparation. This is not receiver enrollment, permission to reuse a recovery key, or permission to rotate a runner credential. Name its declared Secret and exact consumer purpose. The broker will leave enrollment, verify and revoke pending." }
+[[workflow.step.fields]]
+name = "credential"
+field_type = "string"
+required = true
+filled_by = "executor"
+[[workflow.step.fields]]
+name = "reason"
+field_type = "string"
+required = true
+filled_by = "executor"
+[[workflow.step.fields]]
+name = "locations"
+field_type = "string"
+required = true
+filled_by = "executor"
+[[workflow.step.fields]]
+name = "consumers"
+field_type = "string"
+required = true
+filled_by = "executor"
+
+[[workflow.step]]
+title = "issue"
+kind = "task"
+audience = { role = "platform-admin" }
+metadata_defaults = { written_by = "rule:broker-prepares-the-runner-deposit-key" }
+ready_when = "steps.scope.done"
+title_template = "Prepare the SSH pair"
+[[workflow.step.fields]]
+name = "issued"
+field_type = "string"
+required = true
+
+[[workflow.step]]
+title = "install"
+kind = "task"
+audience = { role = "platform-admin" }
+metadata_defaults = { written_by = "rule:broker-prepares-the-runner-deposit-key" }
+ready_when = "steps.issue.done"
+title_template = "Read back the pair in declared storage"
+[[workflow.step.fields]]
+name = "installed"
+field_type = "string"
+required = true
+
+[[workflow.step]]
+title = "enroll"
+kind = "sign-off"
+ready_when = "steps.install.done"
+title_template = "Authorize the exact receiver enrollment"
+authority_role = "platform-admin"
+assurance_required = "presence"
+sign_offs_required = ["platform-admin"]
+metadata_defaults = { human_only = true, procedure = "Your passkey signs this step's public_key, receiver_host and purpose. Review all three together. Preparation has not installed a receiver or proved its effect. Complete only after the separately approved exact-purpose receiver enrollment is recorded; do not widen a break-glass key or recovery receiver. Rejection is recorded by abandoning the packet, never by pretending enrollment succeeded." }
+[[workflow.step.fields]]
+name = "public_key"
+field_type = "non-empty-string"
+# Prepared during the work, not owed when the empty packet is filed.
+required = true
+filled_by = "executor"
+[[workflow.step.fields]]
+name = "receiver_host"
+field_type = "non-empty-string"
+required = true
+filled_by = "executor"
+[[workflow.step.fields]]
+name = "purpose"
+field_type = "non-empty-string"
+required = true
+filled_by = "executor"
+[[workflow.step.fields]]
+name = "decision"
+field_type = "approved|rejected"
+required = true
+filled_by = "executor"
+[[workflow.step.fields]]
+name = "enrollment_record"
+field_type = "string"
+required = true
+filled_by = "executor"
+
+[[workflow.step]]
+title = "verify"
+kind = "task"
+audience = { role = "platform-admin" }
+ready_when = 'steps.enroll.done AND steps.enroll.metadata.decision = "approved"'
+title_template = "Verify the authorized receiver by effect"
+metadata_defaults = { human_only = true, procedure = "Record a machine-run effect against the exact authorized receiver. Public key preparation or a passkey decision alone is not this effect. Until the bounded delivery door exists, this step remains pending work." }
+[[workflow.step.fields]]
+name = "verified"
+field_type = "string"
+required = true
+
+[[workflow.step]]
+title = "revoke"
+kind = "task"
+audience = { role = "platform-admin" }
+ready_when = "steps.verify.done"
+title_template = "Revoke a superseded transport identity"
+metadata_defaults = { human_only = true, procedure = "Record the exact superseded public identity and its observed removal only after the new receiver effect is proved. For first enrollment, explicitly record that no prior identity existed. The preparation handler completes nothing here." }
+[[workflow.step.fields]]
+name = "revoked"
+field_type = "string"
+required = true
+
+[[workflow.step]]
+title = "prepared"
+kind = "outcome"
+ready_when = "steps.revoke.done"
+title_template = "Transport lifecycle proved"
+terminal = { outcome = "prepared" }
+metadata_defaults = { outcome_kind = "completed" }
+
+[[workflow.step]]
+title = "abandoned"
+kind = "outcome"
+ready_when = 'steps.scope.done AND job.metadata.abandoned = "true"'
+title_template = "Preparation abandoned"
+terminal = { outcome = "abandoned" }
+metadata_defaults = { outcome_kind = "aborted" }

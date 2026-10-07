@@ -38,10 +38,11 @@
 //! a tenant granting Read on `estate` only at `territory` read HELD
 //! while the door refused every caller.
 //!
-//! THIS CAR REFUSES NOTHING. The coverage core, its read and the backstop
-//! ship now and only report; the guards that would refuse a write that
-//! orphans a control wait for DR readiness (62dac114) — "a refusal with
-//! no recovery path is worse than the gap".
+//! WHAT REFUSES ON IT. The coverage core, its read and the backstop only
+//! report. The guards call [`orphaned_by`], released one per train after
+//! DR readiness (62dac114, design b08725c2): the policy-write guard
+//! (`boss-policy` `guard.rs`, car 3) first; the people guard and the
+//! workflow-publish guard (cars 4 and 5) after it.
 
 use serde::{Deserialize, Serialize};
 
@@ -275,6 +276,10 @@ pub struct Held {
     pub holders: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remedy: Option<String>,
+    /// A guard refusal's first future transition, absent on the current
+    /// coverage report and on a control taken immediately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_expiry: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// A control no real person holds. Named the way a refusal and an alarm
@@ -293,7 +298,13 @@ pub struct Orphan {
 pub fn real_people<'a>(roster: &'a [Person], keys: &[Key]) -> Vec<&'a Person> {
     roster
         .iter()
-        .filter(|p| p.active && keys.iter().any(|k| k.employee_id == p.id))
+        .filter(|p| {
+            p.active
+                && p.id
+                    .parse::<boss_core::actor::ActorId>()
+                    .is_ok_and(|actor| actor.is_human())
+                && keys.iter().any(|k| k.employee_id == p.id)
+        })
         .collect()
 }
 
@@ -416,6 +427,7 @@ pub fn report(
                 .map(|p| p.id.clone())
                 .collect(),
             remedy: c.remedy().map(str::to_string),
+            after_expiry: None,
         })
         .collect()
 }
@@ -439,6 +451,242 @@ pub fn coverage(
             remedy: h.remedy,
         })
         .collect()
+}
+
+/// External holder facts for one proposed publication. Workflows are
+/// deliberately absent: jobs supplies its own transaction's active rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoverageSnapshot {
+    pub rules: Vec<PolicyRule>,
+    pub overrides: Vec<UserOverride>,
+    pub roster: Vec<Person>,
+    pub keys: Vec<Key>,
+}
+
+impl CoverageSnapshot {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.roster.iter().any(|p| p.active) {
+            return Err("coverage snapshot answered no active employee".into());
+        }
+        let mut people = std::collections::BTreeSet::new();
+        if self
+            .roster
+            .iter()
+            .any(|p| p.id.is_empty() || !people.insert(&p.id))
+        {
+            return Err("coverage snapshot has missing or duplicate employee identity".into());
+        }
+        Ok(())
+    }
+
+    /// Refuse new gaps, preserving an unrelated gap that existed already.
+    pub fn judge_workflow(
+        &self,
+        before: &[WorkflowFacts],
+        candidate: &WorkflowFacts,
+    ) -> Result<(), String> {
+        self.validate()?;
+        let prior: std::collections::BTreeSet<_> = coverage(
+            &controls(before),
+            &self.rules,
+            &self.overrides,
+            &self.roster,
+            &self.keys,
+        )
+        .into_iter()
+        .map(|o| o.control)
+        .collect();
+        let mut after: Vec<_> = before
+            .iter()
+            .filter(|w| w.kind != candidate.kind)
+            .cloned()
+            .collect();
+        let mut proposed = candidate.clone();
+        proposed.status = Some("active".into());
+        after.push(proposed);
+        let added: Vec<_> = coverage(
+            &controls(&after),
+            &self.rules,
+            &self.overrides,
+            &self.roster,
+            &self.keys,
+        )
+        .into_iter()
+        .filter(|o| !prior.contains(&o.control))
+        .collect();
+        if added.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "workflow publication would orphan: {}. Add a real holder before publishing",
+                added
+                    .iter()
+                    .map(|o| format!("{} ({})", o.control, o.wants))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }
+    }
+}
+
+/// A whole external snapshot is acquired before any registry write lock.
+#[async_trait::async_trait]
+pub trait CoverageSnapshotSource: Send + Sync {
+    async fn snapshot(&self) -> Result<CoverageSnapshot, String>;
+}
+
+pub const SNAPSHOT_PATH: &str = "/api/policy/coverage/snapshot";
+
+pub struct HttpCoverageSnapshotSource {
+    base: String,
+    http: boss_core::machine_token::Client,
+}
+
+impl HttpCoverageSnapshotSource {
+    pub fn new(base: impl Into<String>) -> Self {
+        let (base, http) = boss_core::http_client::base(base);
+        Self { base, http }
+    }
+}
+
+#[async_trait::async_trait]
+impl CoverageSnapshotSource for HttpCoverageSnapshotSource {
+    async fn snapshot(&self) -> Result<CoverageSnapshot, String> {
+        let mut response = self
+            .http
+            .get(format!("{}{SNAPSHOT_PATH}", self.base))
+            .header(
+                "x-boss-user",
+                serde_json::to_string(&crate::User::service("jobs")).map_err(|e| e.to_string())?,
+            )
+            .send()
+            .await
+            .map_err(|e| format!("coverage snapshot unavailable: {e}"))?;
+        if !response.status().is_success() {
+            return Err(format!("coverage snapshot answered {}", response.status()));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+            if bytes.len().saturating_add(chunk.len()) > 2 * 1024 * 1024 {
+                return Err("coverage snapshot exceeds 2MiB".into());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let snapshot: CoverageSnapshot = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("coverage snapshot malformed: {e}"))?;
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The guard: which controls a write takes the last holder from (car 3 of
+// design 1c4e42e1; G1 of design b08725c2, 2026-09-30).
+// ---------------------------------------------------------------------------
+
+/// The policy table as it stands before a write, or as the write leaves
+/// it: the active rules and the LIVE overrides of the roster's people.
+#[derive(Debug, Clone, Copy)]
+pub struct Table<'a> {
+    pub rules: &'a [PolicyRule],
+    pub overrides: &'a [UserOverride],
+}
+
+/// The live table at one expiry transition. All overrides sharing that
+/// instant lapse together; a permanent deny still applies. No wall clock
+/// belongs here: the caller hands over the overrides live at its snapshot.
+fn overrides_after(
+    table: Table<'_>,
+    expiry: Option<chrono::DateTime<chrono::Utc>>,
+) -> Vec<UserOverride> {
+    table
+        .overrides
+        .iter()
+        .filter(|o| expiry.is_none_or(|t| o.expires_at.is_none_or(|ends| ends > t)))
+        .cloned()
+        .collect()
+}
+
+/// Decision 3, as one pure function: every control a write would leave
+/// held by no real person that some real person holds BEFORE the write
+/// at that same instant — `orphaned(after) ⊄ orphaned(before)`.
+/// Compare now and every distinct expiry in either table, in time order.
+/// Checking only the endpoints missed a gap between a grant's expiry and
+/// a later deny's expiry (review 9b8bacb5, 2026-10-02); combining gaps
+/// across time would let an old gap excuse a new one at another stage.
+/// Each refusal names the first offending transition and its prior holders.
+/// Empty: the write may go. A gap that is there before the write and
+/// after it is not the write's, so the operator-tier gap never blocks
+/// its own repair.
+pub fn orphaned_by(
+    controls: &[Control],
+    roster: &[Person],
+    keys: &[Key],
+    before: Table<'_>,
+    after: Table<'_>,
+) -> Vec<Held> {
+    let expiries: std::collections::BTreeSet<_> = before
+        .overrides
+        .iter()
+        .chain(after.overrides)
+        .filter_map(|o| o.expires_at)
+        .collect();
+    let mut taken = std::collections::BTreeMap::new();
+    for expiry in std::iter::once(None).chain(expiries.into_iter().map(Some)) {
+        let was = overrides_after(before, expiry);
+        let will = overrides_after(after, expiry);
+        let missing: std::collections::BTreeSet<_> =
+            coverage(controls, after.rules, &will, roster, keys)
+                .into_iter()
+                .map(|o| o.control)
+                .collect();
+        for mut held in report(controls, before.rules, &was, roster, keys) {
+            if !held.holders.is_empty() && missing.contains(&held.control) {
+                held.after_expiry = expiry;
+                taken.entry(held.control.clone()).or_insert(held);
+            }
+        }
+    }
+    taken.into_values().collect()
+}
+
+/// The refusal a guard answers with, naming each control, whom the write
+/// would take it from, and what a holder needs. There is no override
+/// flag (decision 4): the way past is a second holder first, so the
+/// refusal says so rather than naming a switch.
+pub fn refusal(taken: &[Held]) -> String {
+    let each: Vec<String> = taken
+        .iter()
+        .map(|h| {
+            let from = if h.holders.is_empty() {
+                "nobody whose hold outlasts its overrides".to_string()
+            } else {
+                h.holders.join(", ")
+            };
+            let remedy = h
+                .remedy
+                .as_deref()
+                .map(|r| format!("; remedy: {r}"))
+                .unwrap_or_default();
+            let stage = h.after_expiry.map_or_else(
+                || "now".to_string(),
+                |t| format!("after expiry {}", t.to_rfc3339()),
+            );
+            format!(
+                "{} ({stage}; held before the write by {from}; it wants {}{remedy})",
+                h.control, h.wants
+            )
+        })
+        .collect();
+    format!(
+        "this write would leave {} control(s) held by no real person, and no write may take a \
+         control's last holder away (design 1c4e42e1): {}. There is no override: grant each \
+         control to a second real person first — a rule on their role, or a user override \
+         that never expires — and then make this write",
+        taken.len(),
+        each.join("; ")
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -654,7 +902,7 @@ mod tests {
     /// Held only at `all` now — and still held there.
     #[test]
     fn a_scope_all_door_is_held_only_at_scope_all() {
-        use crate::controls::{READ_ESTATE, READ_JOB};
+        use crate::controls::{READ_ACCOUNT, READ_ESTATE};
         let roster = vec![person("emp-a", "site-lead")];
         let keys = vec![key("emp-a", AccessTier::User)];
         let c = [declared(READ_ESTATE)];
@@ -671,8 +919,8 @@ mod tests {
         assert!(coverage(&c, &wide, &[], &roster, &keys).is_empty());
 
         // A pair whose door admits any scope keeps decision 2.
-        let jobs = vec![rule("site-lead", "job", Action::Read, Scope::Territory)];
-        assert!(coverage(&[declared(READ_JOB)], &jobs, &[], &roster, &keys).is_empty());
+        let accounts = vec![rule("site-lead", "account", Action::Read, Scope::Territory)];
+        assert!(coverage(&[declared(READ_ACCOUNT)], &accounts, &[], &roster, &keys).is_empty());
     }
 
     /// Every scope-all const reaches coverage as scope-all.
@@ -989,6 +1237,214 @@ mod tests {
         assert_eq!(ids(&orphans), vec!["operator-tier"], "{orphans:#?}");
     }
 
+    // ----- the guard's judgement (car 3 of design 1c4e42e1, G1 of
+    // design b08725c2): which controls a write takes the last holder from.
+
+    fn table<'a>(rules: &'a [PolicyRule], overrides: &'a [UserOverride]) -> Table<'a> {
+        Table { rules, overrides }
+    }
+
+    fn deny(user: &str, resource: &str, action: Action) -> UserOverride {
+        UserOverride {
+            id: format!("ov-{user}-{resource}-{}", action.as_str()),
+            user_id: user.into(),
+            resource: Resource::new(resource),
+            action,
+            scope: Scope::None,
+            reason: "test".into(),
+            expires_at: None,
+        }
+    }
+
+    fn founder() -> (Vec<Person>, Vec<Key>) {
+        (
+            vec![person("emp-founder", PLATFORM_ADMIN_ROLE)],
+            vec![key("emp-founder", AccessTier::User)],
+        )
+    }
+
+    fn update_policy_rule() -> [Control; 1] {
+        [pair(Action::Update, "policy-rule")]
+    }
+
+    fn admin_update(scope: Scope) -> PolicyRule {
+        rule(PLATFORM_ADMIN_ROLE, "policy-rule", Action::Update, scope)
+    }
+
+    /// THE LOCKOUT the triage measured (47aed706): platform-admin setting
+    /// its own `policy-rule:update` to scope none. The founder is the one
+    /// holder, so the write takes the control from its last holder, and
+    /// the judgement names the control and who holds it now.
+    #[test]
+    fn a_write_taking_the_last_holder_is_named() {
+        let (roster, keys) = founder();
+        let before = [admin_update(Scope::All)];
+        let after = [admin_update(Scope::None)];
+        let taken = orphaned_by(
+            &update_policy_rule(),
+            &roster,
+            &keys,
+            table(&before, &[]),
+            table(&after, &[]),
+        );
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].control, "policy:update:policy-rule");
+        assert_eq!(taken[0].holders, vec!["emp-founder"], "who holds it now");
+        let why = refusal(&taken);
+        assert!(why.contains("policy:update:policy-rule"), "{why}");
+        assert!(why.contains("emp-founder"), "{why}");
+        assert!(
+            why.contains("second"),
+            "the way past is a second holder: {why}"
+        );
+
+        // Retiring the rule is the same lockout, and so is a scope-none
+        // override on the founder.
+        let mut retired = admin_update(Scope::All);
+        retired.active = false;
+        assert_eq!(
+            orphaned_by(
+                &update_policy_rule(),
+                &roster,
+                &keys,
+                table(&before, &[]),
+                table(&[retired], &[]),
+            )
+            .len(),
+            1
+        );
+        let denied = [deny("emp-founder", "policy-rule", Action::Update)];
+        assert_eq!(
+            orphaned_by(
+                &update_policy_rule(),
+                &roster,
+                &keys,
+                table(&before, &[]),
+                table(&before, &denied),
+            )
+            .len(),
+            1
+        );
+    }
+
+    /// Decision 3: a write that leaves an existing gap as it was passes —
+    /// or the operator-tier gap would block its own repair — and a write
+    /// that keeps a second holder passes.
+    #[test]
+    fn a_write_that_leaves_a_holder_or_an_old_gap_passes() {
+        let (mut roster, mut keys) = founder();
+        let c = [pair(Action::Update, "policy-rule"), Control::OperatorTier];
+        let before = [admin_update(Scope::All)];
+        // The operator tier is orphaned before AND after: not this write's.
+        assert!(
+            orphaned_by(&c, &roster, &keys, table(&before, &[]), table(&before, &[])).is_empty()
+        );
+        // A second real person holding it through an override of their
+        // own: the founder may now be denied it.
+        roster.push(person("emp-second", "clerk"));
+        keys.push(key("emp-second", AccessTier::User));
+        let second = UserOverride {
+            scope: Scope::All,
+            ..deny("emp-second", "policy-rule", Action::Update)
+        };
+        let denied = [
+            second.clone(),
+            deny("emp-founder", "policy-rule", Action::Update),
+        ];
+        assert!(
+            orphaned_by(
+                &c,
+                &roster,
+                &keys,
+                table(&before, std::slice::from_ref(&second)),
+                table(&before, &denied),
+            )
+            .is_empty(),
+            "a second holder makes the founder's denial safe"
+        );
+    }
+
+    /// With no real person at all — a fresh instance before its founder's
+    /// passkey ceremony — nothing is held, so nothing can be taken: the
+    /// tenant publish that seeds the rules is never refused by the guard.
+    #[test]
+    fn with_no_real_person_no_write_orphans_anything() {
+        let roster = vec![person("emp-founder", PLATFORM_ADMIN_ROLE)];
+        let before = [admin_update(Scope::All)];
+        let after = [admin_update(Scope::None)];
+        assert!(
+            orphaned_by(
+                &update_policy_rule(),
+                &roster,
+                &[],
+                table(&before, &[]),
+                table(&after, &[]),
+            )
+            .is_empty()
+        );
+    }
+
+    /// A holder the write leaves only through an override that EXPIRES
+    /// is not a holder the guard counts: the lockout would arrive by the
+    /// clock, not by a write, and nothing would refuse it then. So a rule
+    /// narrowed to none behind an hour's grant to the founder is refused,
+    /// and so is a deny that lapses in a hundred years.
+    #[test]
+    fn a_holder_kept_only_until_an_override_lapses_is_not_kept() {
+        let (roster, keys) = founder();
+        let before = [admin_update(Scope::All)];
+        let soon = chrono::Utc::now() + chrono::Duration::hours(1);
+        let hours_grant = UserOverride {
+            scope: Scope::All,
+            expires_at: Some(soon),
+            ..deny("emp-founder", "policy-rule", Action::Update)
+        };
+        let taken = orphaned_by(
+            &update_policy_rule(),
+            &roster,
+            &keys,
+            table(&before, &[]),
+            table(&[admin_update(Scope::None)], &[hours_grant]),
+        );
+        assert_eq!(taken.len(), 1, "held for an hour is not held");
+
+        let long_deny = UserOverride {
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::days(36_500)),
+            ..deny("emp-founder", "policy-rule", Action::Update)
+        };
+        assert_eq!(
+            orphaned_by(
+                &update_policy_rule(),
+                &roster,
+                &keys,
+                table(&before, &[]),
+                table(&before, &[long_deny]),
+            )
+            .len(),
+            1,
+            "denied until an expiry is denied now"
+        );
+    }
+
+    /// Lifting the founder's own lockout is a write the guard must let
+    /// through: the control is orphaned before and held after.
+    #[test]
+    fn repairing_a_lockout_passes() {
+        let (roster, keys) = founder();
+        let rules = [admin_update(Scope::All)];
+        let denied = [deny("emp-founder", "policy-rule", Action::Update)];
+        assert!(
+            orphaned_by(
+                &update_policy_rule(),
+                &roster,
+                &keys,
+                table(&rules, &denied),
+                table(&rules, &[]),
+            )
+            .is_empty()
+        );
+    }
+
     #[test]
     fn the_static_pairs_are_the_doors_asks_once_each() {
         let pairs = static_pairs();
@@ -1010,5 +1466,277 @@ mod tests {
         let mut seen = pairs.clone();
         seen.dedup();
         assert_eq!(seen.len(), pairs.len());
+    }
+}
+#[cfg(test)]
+mod expiry_guard_tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+    fn standing() -> (Vec<Person>, Vec<Key>, Vec<PolicyRule>, Vec<UserOverride>) {
+        let roster = vec![
+            Person {
+                id: "emp-founder".into(),
+                role: Some("platform-admin".into()),
+                active: true,
+                hire_date: None,
+            },
+            Person {
+                id: "emp-second".into(),
+                role: Some("second-holder".into()),
+                active: true,
+                hire_date: None,
+            },
+        ];
+        let keys = roster
+            .iter()
+            .map(|p| Key {
+                employee_id: p.id.clone(),
+                access_tier: AccessTier::User,
+            })
+            .collect();
+        let rules = vec![
+            PolicyRule::new(
+                "platform-admin",
+                crate::types::Resource::policy_rule(),
+                Action::Update,
+                Scope::All,
+            ),
+            PolicyRule::new(
+                "second-holder",
+                crate::types::Resource::policy_rule(),
+                Action::Update,
+                Scope::All,
+            ),
+        ];
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let overrides = vec![
+            UserOverride {
+                id: "grant-one-hour".into(),
+                user_id: "emp-founder".into(),
+                resource: crate::types::Resource::policy_rule(),
+                action: Action::Update,
+                scope: Scope::All,
+                reason: "handover".into(),
+                expires_at: Some(now + Duration::hours(1)),
+            },
+            UserOverride {
+                id: "deny-two-hours".into(),
+                user_id: "emp-second".into(),
+                resource: crate::types::Resource::policy_rule(),
+                action: Action::Update,
+                scope: Scope::None,
+                reason: "handover".into(),
+                expires_at: Some(now + Duration::hours(2)),
+            },
+        ];
+        (roster, keys, rules, overrides)
+    }
+    #[test]
+    fn a_write_must_not_create_a_gap_between_distinct_override_expirations() {
+        let (roster, keys, before, overrides) = standing();
+        let control = [Control::Policy {
+            action: Action::Update,
+            resource: "policy-rule".into(),
+            all_only: true,
+        }];
+        let mut after = before.clone();
+        after[0].scope = Scope::None;
+        assert!(coverage(&control, &before, &overrides, &roster, &keys).is_empty());
+        assert!(
+            coverage(&control, &after, &overrides, &roster, &keys).is_empty(),
+            "founder temporarily holds it now"
+        );
+        assert!(
+            coverage(&control, &after, &[], &roster, &keys).is_empty(),
+            "second holder recovers after both expirations"
+        );
+        let middle: Vec<_> = overrides
+            .iter()
+            .filter(|o| o.is_active_at(overrides[0].expires_at.unwrap() + Duration::minutes(30)))
+            .cloned()
+            .collect();
+        assert!(
+            coverage(&control, &before, &middle, &roster, &keys).is_empty(),
+            "before the write the founder's permanent grant prevents the gap"
+        );
+        let missing = coverage(&control, &after, &middle, &roster, &keys);
+        assert_eq!(missing.len(), 1, "one-hour gap follows the accepted write");
+        let taken = orphaned_by(
+            &control,
+            &roster,
+            &keys,
+            Table {
+                rules: &before,
+                overrides: &overrides,
+            },
+            Table {
+                rules: &after,
+                overrides: &overrides,
+            },
+        );
+        assert!(
+            !taken.is_empty(),
+            "guard accepts both endpoints but leaves policy:update:policy-rule unheld between the 1h grant expiry and 2h deny expiry"
+        );
+    }
+    #[test]
+    fn a_handover_with_equal_expirations_has_no_intermediate_gap() {
+        let (roster, keys, before, mut overrides) = standing();
+        overrides[1].expires_at = overrides[0].expires_at;
+        let control = [Control::Policy {
+            action: Action::Update,
+            resource: "policy-rule".into(),
+            all_only: true,
+        }];
+        let mut after = before.clone();
+        after[0].scope = Scope::None;
+        assert!(coverage(&control, &after, &overrides, &roster, &keys).is_empty());
+        assert!(coverage(&control, &after, &[], &roster, &keys).is_empty());
+        assert!(
+            orphaned_by(
+                &control,
+                &roster,
+                &keys,
+                Table {
+                    rules: &before,
+                    overrides: &overrides
+                },
+                Table {
+                    rules: &after,
+                    overrides: &overrides
+                }
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_preexisting_gap_at_another_stage_does_not_hide_a_new_gap() {
+        let (roster, keys, before, mut overrides) = standing();
+        overrides[0].scope = Scope::None;
+        let control = [Control::Policy {
+            action: Action::Update,
+            resource: "policy-rule".into(),
+            all_only: true,
+        }];
+        let mut after = before.clone();
+        after[0].scope = Scope::None;
+        assert_eq!(
+            coverage(&control, &before, &overrides, &roster, &keys).len(),
+            1
+        );
+        let taken = orphaned_by(
+            &control,
+            &roster,
+            &keys,
+            Table {
+                rules: &before,
+                overrides: &overrides,
+            },
+            Table {
+                rules: &after,
+                overrides: &overrides,
+            },
+        );
+        assert_eq!(
+            taken.len(),
+            1,
+            "the old gap now must not excuse the new gap after the first expiry"
+        );
+        let text = refusal(&taken);
+        assert!(text.contains("policy:update:policy-rule"), "{text}");
+        assert!(
+            text.contains(&overrides[0].expires_at.unwrap().to_rfc3339()),
+            "the receipt must name the first offending expiry: {text}"
+        );
+        assert!(
+            text.contains("emp-founder"),
+            "the holder before that expiry must be named: {text}"
+        );
+        let mut reversed = overrides.clone();
+        reversed.reverse();
+        assert_eq!(
+            taken,
+            orphaned_by(
+                &control,
+                &roster,
+                &keys,
+                Table {
+                    rules: &before,
+                    overrides: &reversed
+                },
+                Table {
+                    rules: &after,
+                    overrides: &reversed
+                }
+            ),
+            "expiry enumeration and receipt order are deterministic"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_gap_and_its_partial_repair_still_pass() {
+        let (roster, keys, mut before, mut overrides) = standing();
+        before[0].scope = Scope::None;
+        overrides[0].scope = Scope::None;
+        let control = [Control::Policy {
+            action: Action::Update,
+            resource: "policy-rule".into(),
+            all_only: true,
+        }];
+        let original = Table {
+            rules: &before,
+            overrides: &overrides,
+        };
+        assert!(orphaned_by(&control, &roster, &keys, original, original).is_empty());
+        let mut repaired = before.clone();
+        repaired[0].scope = Scope::All;
+        assert!(
+            orphaned_by(
+                &control,
+                &roster,
+                &keys,
+                original,
+                Table {
+                    rules: &repaired,
+                    overrides: &overrides
+                }
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn shortening_a_temporary_grant_compares_both_tables_expirations() {
+        let (roster, keys, mut rules, before) = standing();
+        rules[0].scope = Scope::None;
+        let control = [Control::Policy {
+            action: Action::Update,
+            resource: "policy-rule".into(),
+            all_only: true,
+        }];
+        let mut after = before.clone();
+        after[0].expires_at = before[0].expires_at.map(|t| t - Duration::minutes(30));
+        let taken = orphaned_by(
+            &control,
+            &roster,
+            &keys,
+            Table {
+                rules: &rules,
+                overrides: &before,
+            },
+            Table {
+                rules: &rules,
+                overrides: &after,
+            },
+        );
+        assert_eq!(
+            taken.len(),
+            1,
+            "a later preexisting gap must not hide the new earlier gap"
+        );
+        assert!(refusal(&taken).contains(&after[0].expires_at.unwrap().to_rfc3339()));
     }
 }

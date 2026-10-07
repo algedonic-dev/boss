@@ -76,6 +76,16 @@ pub enum Completion {
     AutoOnMaterialize,
 }
 
+/// Whether completion's effect shares the step row/outbox transaction.
+/// Inline effects need a separately proved lifecycle before the conditional door.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConditionalCompletion {
+    #[default]
+    RowAndOutbox,
+    InlineEffect,
+}
+
 /// A metadata field descriptor.
 ///
 /// `field_type` carries the whole value shape, including the variants
@@ -141,6 +151,7 @@ pub struct StepType {
     /// computer speed on `step.ready` (`Agent`); the workforce reads it to
     /// skip agent steps. Defaults to `Human`.
     pub completion: Completion,
+    pub conditional_completion: ConditionalCompletion,
     /// The floor a Workflow cannot go below. A kind that is always a
     /// human-presence act says so once here instead of relying on
     /// every protocol author to remember.
@@ -615,6 +626,8 @@ pub const BUILTIN_FIELD_TYPES: &[&str] = &[
     "date",
     "date-time",
     "uri",
+    // Opt in without changing the existing string contract or its bytes.
+    "non-empty-string",
 ];
 
 /// Why `spec` is not a field type a value can be checked against, or
@@ -642,13 +655,14 @@ pub fn field_type_problem(spec: &str) -> Option<String> {
     ))
 }
 
-fn validate_field_type(
+pub(crate) fn validate_field_type(
     name: &str,
     expected: &str,
     value: &serde_json::Value,
 ) -> Result<(), ValidationError> {
     let ok = match expected {
         "string" => value.is_string(),
+        "non-empty-string" => value.as_str().is_some_and(|s| !s.trim().is_empty()),
         "number" => value.is_number(),
         "integer" => value.is_i64() || value.is_u64(),
         "boolean" => value.is_boolean(),
@@ -758,6 +772,8 @@ struct LoadedStepType {
     block_probability: f64,
     #[serde(default)]
     completion: Completion,
+    #[serde(default)]
+    conditional_completion: ConditionalCompletion,
     #[serde(default = "default_surface")]
     surface: String,
     #[serde(default)]
@@ -813,6 +829,7 @@ impl LoadedStepType {
             required_roles: Vec::leak(roles),
             block_probability: self.block_probability,
             completion: self.completion,
+            conditional_completion: self.conditional_completion,
             assurance_floor: Default::default(),
             surface: String::leak(self.surface),
             sign_offs_required: Vec::leak(
@@ -1737,6 +1754,88 @@ mod tests {
         for bad in ["green", "strng", "", "pass|", "|fail", "a||b"] {
             let why = field_type_problem(bad).unwrap_or_else(|| panic!("{bad:?} is refused"));
             assert!(why.contains("string, number"), "names the builtins: {why}");
+        }
+    }
+
+    #[test]
+    fn non_empty_string_is_a_known_scalar_type() {
+        assert_eq!(field_type_problem("non-empty-string"), None);
+    }
+
+    #[test]
+    fn non_empty_string_is_an_opt_in_scalar_with_preserved_bytes() {
+        use boss_core::job::StepField;
+        let field = StepField {
+            required: true,
+            ..StepField::new("proposal", "non-empty-string")
+        };
+        assert!(
+            StepRegistry::validate_authored_fields(
+                std::slice::from_ref(&field),
+                &serde_json::json!({})
+            )
+            .is_err()
+        );
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!(42),
+            serde_json::json!(""),
+            serde_json::json!(" \t\r\n"),
+            serde_json::json!("\u{2003}\u{a0}"),
+        ] {
+            let errors = StepRegistry::validate_authored_fields(
+                std::slice::from_ref(&field),
+                &serde_json::json!({"proposal":value}),
+            )
+            .unwrap_err();
+            assert!(errors.iter().any(|e| e.field == "proposal"));
+        }
+        for value in ["public proposal", " \tpublic\r\nproposal\u{2003}"] {
+            let metadata = serde_json::json!({"proposal":value});
+            assert!(
+                StepRegistry::validate_authored_fields(std::slice::from_ref(&field), &metadata)
+                    .is_ok()
+            );
+            assert_eq!(
+                metadata["proposal"], value,
+                "validation must not normalize signed bytes"
+            );
+        }
+        let mut registry = StepRegistry::v1();
+        registry
+            .types
+            .get_mut("task")
+            .unwrap()
+            .fields
+            .push(FieldSpec {
+                name: "proposal",
+                field_type: "non-empty-string",
+                required: true,
+                description: "Test scalar contract",
+            });
+        assert!(
+            registry
+                .validate_metadata("task", &serde_json::json!({"proposal":"valid"}))
+                .is_ok()
+        );
+        assert!(
+            registry
+                .validate_metadata("task", &serde_json::json!({"proposal":"\u{2003}"}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn original_string_scalar_still_accepts_blank_and_preserves_bytes() {
+        use boss_core::job::StepField;
+        let field = StepField::new("proposal", "string");
+        for value in ["", " \t\r\n", "\u{2003}\u{a0}", " unchanged \n"] {
+            let metadata = serde_json::json!({"proposal":value});
+            assert!(
+                StepRegistry::validate_authored_fields(std::slice::from_ref(&field), &metadata)
+                    .is_ok()
+            );
+            assert_eq!(metadata["proposal"], value);
         }
     }
 

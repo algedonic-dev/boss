@@ -283,6 +283,17 @@ pub enum StepAction {
         #[arg(long = "field-file", value_name = "NAME=PATH")]
         field_file: Vec<String>,
     },
+    /// Nominate an executor for a READY step without claiming or releasing it.
+    Nominate {
+        packet: String,
+        #[arg(long)]
+        step: String,
+        #[arg(long)]
+        assignee: String,
+        /// Why this executor is requested. Recorded as intent, even if a claim wins the race.
+        #[arg(long)]
+        why: String,
+    },
     /// Hand a claimed step back to its station: `ready`, unassigned, no run named.
     ///
     /// The door for a step whose executor never came back and which no
@@ -450,6 +461,12 @@ pub async fn dispatch(cmd: Cmd) -> Result<()> {
                 let given = given_values(&field, &field_file)?;
                 complete(&wire, &packet, &step, &given).await
             }
+            StepAction::Nominate {
+                packet,
+                step,
+                assignee,
+                why,
+            } => nominate_step(&wire, &packet, &step, &assignee, &why).await,
             StepAction::Release { packet, step, why } => {
                 release_step(&wire, &packet, &step, &why).await
             }
@@ -955,6 +972,53 @@ impl Wire {
     ) -> Result<Option<Value>> {
         let signature = identity::signature_for(&method, path, self.caller.clone());
         crate::gate::api_at_signed(&self.http, &self.base, method, path, payload, signature).await
+    }
+
+    /// Read an original record without turning an outage or policy refusal
+    /// into absence. Only the endpoint's actual HTTP404 denotes no record.
+    pub(crate) async fn immutable_record(
+        &self,
+        job: uuid::Uuid,
+        step: uuid::Uuid,
+        key: &str,
+    ) -> Result<Option<boss_jobs::first_record::FirstRecord>> {
+        if job.is_nil()
+            || step.is_nil()
+            || key.is_empty()
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            bail!("invalid immutable record resource");
+        }
+        let path = format!("/api/jobs/{job}/steps/{step}/records/{key}");
+        let signer = self.signer(&reqwest::Method::GET, &path)?;
+        let user = identity::header(&signer);
+        let response = crate::train::send_through_a_roll(&format!("jobs api GET {path}"), || {
+            self.http
+                .request(reqwest::Method::GET, format!("{}{path}", self.base))
+                .header("x-boss-user", user.as_str())
+                .header("content-type", "application/json")
+        })
+        .await?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if status.is_redirection() {
+            bail!("immutable record GET {path}: {status}; redirects are refused");
+        }
+        let body = response
+            .text()
+            .await
+            .context("reading the immutable record response")?;
+        if !status.is_success() {
+            bail!("immutable record GET {path}: {status}: {body}");
+        }
+        let record: boss_jobs::first_record::FirstRecord = serde_json::from_str(&body)
+            .context("the immutable record response is empty or malformed")?;
+        crate::review_verdict::immutable_record_resource(&record, job, step, key)?;
+        Ok(Some(record))
     }
 
     /// The StepType registry, as the API's own validator reads it.
@@ -1467,6 +1531,13 @@ pub(crate) async fn hold_as(
                     title_of(&packet)
                 );
                 return Ok(());
+            }
+            if crate::review_verdict::pinned_executor_requirement(wire, &packet).await?
+                == boss_jobs::executor_attestation::ExecutorProvenanceRequirement::Verified
+            {
+                bail!(
+                    "boss release: the pinned FORMAL executor requirement needs an authenticated reviewer receipt; a bare release cannot erase it"
+                );
             }
             crate::review_verdict::may_release(&packet, releaser.run())
                 .map_err(|why| anyhow!("{why}"))?;
@@ -2090,6 +2161,53 @@ pub(crate) async fn release_step(
     Ok(())
 }
 
+/// Assignment uses the existing server ownership boundary. The annotation is
+/// requested intent, not successful nomination: a concurrent claim may refuse the PUT.
+pub(crate) async fn nominate_step(
+    wire: &Wire,
+    packet_ref: &str,
+    slug: &str,
+    assignee: &str,
+    why: &str,
+) -> Result<()> {
+    if assignee.trim().is_empty() || why.trim().is_empty() {
+        bail!("nomination requires a nonblank --assignee and --why");
+    }
+    let packet = wire.resolve(packet_ref, None).await?;
+    let step = open_step(&packet, slug).map_err(|e| anyhow!("{e}"))?;
+    if status_of(step) != WAITING_STATUS {
+        bail!("only a READY step can be nominated; {}", standing(&packet));
+    }
+    let jid = crate::envelope::job_id(&packet).context("the packet has no id")?;
+    let sid = step_id(step)?;
+    let requested = json!({
+        "assignee_id": assignee.trim(), "why": why.trim(),
+        "by": wire.caller_id(), "at": boss_clock_client::wall_now().to_rfc3339(),
+    });
+    wire.patch_step_metadata(jid, sid, json!({"nomination_requested": requested}))
+        .await?;
+    wire.put_step(jid, sid, json!({"assignee_id": assignee.trim()}))
+        .await?;
+    let after = wire.packet(jid).await?;
+    let observed = step_after(&after, sid)?;
+    if observed.get("assignee_id").and_then(Value::as_str) != Some(assignee.trim())
+        || observed.pointer("/metadata/nomination_requested") != Some(&requested)
+    {
+        bail!(
+            "nomination readback does not match the requested holder and reason; {}",
+            standing(&after)
+        );
+    }
+    println!(
+        "boss step nominate: {} `{slug}` assigned to {}\n  why: {}\n  {}",
+        short(&packet),
+        assignee.trim(),
+        why.trim(),
+        standing(&after)
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2154,6 +2272,37 @@ mod tests {
             "metadata": {},
             "steps": steps,
         })
+    }
+
+    #[test]
+    fn nomination_is_a_named_door_with_a_required_reason() {
+        let command =
+            <StepAction as clap::Subcommand>::augment_subcommands(clap::Command::new("step"));
+        let matches = command.clone().try_get_matches_from([
+            "step",
+            "nominate",
+            "2f7b8c00",
+            "--step",
+            "build",
+            "--assignee",
+            "agent-codex",
+            "--why",
+            "registered executor now owns the supported lane",
+        ]);
+        assert!(matches.is_ok(), "{matches:?}");
+        assert!(
+            command
+                .try_get_matches_from([
+                    "step",
+                    "nominate",
+                    "2f7b8c00",
+                    "--step",
+                    "build",
+                    "--assignee",
+                    "agent-codex",
+                ])
+                .is_err()
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2525,6 +2674,7 @@ mod tests {
         json!({
             "id": "c6bd173e-3dc9-426f-8fff-866a3b2a6117",
             "kind": "ship-a-change",
+            "workflow_version": 7,
             "status": "open",
             "title": "A car lands where its change goes live",
             "metadata": { "branch": "fix/held" },
@@ -2605,6 +2755,10 @@ mod tests {
     }
 
     async fn stub(packets: Vec<Value>) -> Stub {
+        stub_with_protocol(packets, json!({"kind":"ship-a-change","version":7,"status":"active","steps":[{"title":"review"}]})).await
+    }
+
+    async fn stub_with_protocol(packets: Vec<Value>, protocol: Value) -> Stub {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2646,7 +2800,8 @@ mod tests {
                 let target = words.next().unwrap_or("/").to_string();
                 let body_text = text.split("\r\n\r\n").nth(1).unwrap_or("");
                 let dropping = d.load(std::sync::atomic::Ordering::SeqCst);
-                let (status, body) = route(&s, &p, dropping, &method, &target, body_text);
+                let (status, body) =
+                    route(&s, &p, &protocol, dropping, &method, &target, body_text);
                 let resp = format!(
                     "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
                      content-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -2667,12 +2822,16 @@ mod tests {
     fn route(
         store: &Mutex<Vec<Value>>,
         puts: &Mutex<Vec<(String, Value)>>,
+        protocol: &Value,
         dropping: bool,
         method: &str,
         target: &str,
         body: &str,
     ) -> (&'static str, String) {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        if method == "GET" && path == "/api/workflows/ship-a-change/versions/7" {
+            return ("200 OK", protocol.to_string());
+        }
         let param = |k: &str| -> Option<String> {
             query
                 .split('&')
@@ -3501,6 +3660,116 @@ mod tests {
         assert_eq!(
             bare_release_note(&json!({"metadata": {}})),
             "it boards at the next tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn immutable_record_reads_distinguish_absence_from_refusal_and_damage() {
+        use axum::{Router, body::Body, extract::Path, http::StatusCode, response::Response};
+        use boss_core::{
+            actor::ActorId,
+            job::{JobId, StepId},
+            publisher::EventStamp,
+        };
+        let job = uuid::Uuid::from_u128(1);
+        let step = uuid::Uuid::from_u128(2);
+        let original = boss_jobs::first_record::FirstRecord::new(
+            JobId::from_uuid(job),
+            StepId::from_uuid(step),
+            "valid",
+            &serde_json::from_str("9.0").unwrap(),
+            &EventStamp::new(
+                "jobs.record",
+                ActorId::RegisteredAgent("agent-codex".into()),
+            ),
+            uuid::Uuid::from_u128(3),
+        );
+        let served = original.clone();
+        let app = Router::new().route(
+            "/api/jobs/{job}/steps/{step}/records/{key}",
+            axum::routing::get(
+                move |Path((_job, _step, key)): Path<(String, String, String)>| {
+                    let original = served.clone();
+                    async move {
+                        let (status, body) = match key.as_str() {
+                            "missing" => (StatusCode::NOT_FOUND, "not found".into()),
+                            "forbidden" => (StatusCode::FORBIDDEN, "denied".into()),
+                            "broken" => (StatusCode::INTERNAL_SERVER_ERROR, "broken".into()),
+                            "malformed" => (StatusCode::OK, "not JSON".into()),
+                            "empty" => (StatusCode::OK, String::new()),
+                            "mismatch" => {
+                                (StatusCode::OK, serde_json::to_string(&original).unwrap())
+                            }
+                            _ => (StatusCode::OK, serde_json::to_string(&original).unwrap()),
+                        };
+                        Response::builder()
+                            .status(status)
+                            .body(Body::from(body))
+                            .unwrap()
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let wire = Wire::at(
+            format!("http://{}", listener.local_addr().unwrap()),
+            named(),
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        assert_eq!(
+            wire.immutable_record(job, step, "missing").await.unwrap(),
+            None
+        );
+        for key in ["forbidden", "broken", "malformed", "empty", "mismatch"] {
+            assert!(
+                wire.immutable_record(job, step, key).await.is_err(),
+                "{key} cannot mean absent"
+            );
+        }
+        assert_eq!(
+            wire.immutable_record(job, step, "valid").await.unwrap(),
+            Some(original)
+        );
+        server.abort();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let wire = Wire::at(
+            format!("http://{}", listener.local_addr().unwrap()),
+            named(),
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                drop(socket);
+            }
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            wire.immutable_record(job, step, "missing"),
+        )
+        .await
+        .expect("a reset is a transport error, not a connect retry");
+        assert!(result.is_err(), "network failure cannot mean absent");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_bare_release_cannot_downgrade_the_pinned_protocol_through_projection() {
+        let s = stub_with_protocol(vec![car("ready",json!({"hold":"FORMAL required","agent_executor_provenance":"advisory"}))],
+            json!({"kind":"ship-a-change","version":7,"status":"active","steps":[{"title":"review","agent":{"profile":"reviewer","model":"gpt-6.1-sol","budget_usd":1,"effort":"low","executor_provenance":"verified"}}]})).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        assert!(
+            hold(&wire, "fix/held", None).await.is_err(),
+            "an editable advisory projection cannot erase the immutable requirement"
+        );
+        assert!(
+            s.puts.lock().unwrap().is_empty(),
+            "refuse before the first write"
         );
     }
 
@@ -4334,6 +4603,211 @@ mod tests {
                 .contains("something else"),
             "and the reason read back must be the reason that was sent"
         );
+    }
+
+    #[tokio::test]
+    async fn nomination_losing_a_real_claim_keeps_truthful_intent_and_holder_on_retry() {
+        use boss_core::{
+            job::{Job, JobStatus, Priority, Step, StepStatus, Subject},
+            port::EventBus,
+            publisher::DomainPublisher,
+        };
+        use boss_jobs::{InMemoryJobs, JobsRepository};
+        use boss_policy_client::{Action, FakePolicyClient, Resource, Scope};
+        let jobs = Arc::new(InMemoryJobs::new());
+        let bus = boss_testing::RecordingEventBus::new();
+        let event_bus: Arc<dyn EventBus> = bus.clone();
+        let publisher = DomainPublisher::new(event_bus, "jobs");
+        let policy = Arc::new(
+            FakePolicyClient::builder()
+                .allow("platform-admin", Action::Read, Resource::job(), Scope::All)
+                .allow("platform-admin", Action::Read, Resource::step(), Scope::All)
+                .allow(
+                    "platform-admin",
+                    Action::Update,
+                    Resource::step(),
+                    Scope::All,
+                )
+                .allow(
+                    "platform-admin",
+                    Action::Update,
+                    Resource::job(),
+                    Scope::All,
+                )
+                .build(),
+        );
+        let state = boss_jobs::http::JobsApiState::minimal(
+            jobs.clone(),
+            bus,
+            publisher,
+            policy,
+            Arc::new(boss_clock_client::WallClockClient),
+        );
+        let mut job = Job::new(
+            "backlog-item",
+            Subject::new("custom", "nomination"),
+            "Real nomination race",
+            "emp-owner",
+            Priority::Standard,
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 5).unwrap(),
+        );
+        job.status = JobStatus::Open;
+        jobs.create_job(&job).await.unwrap();
+        let mut step = Step::new(job.id, "task", "Build", 0);
+        step.spec_slug = Some("build".into());
+        step.status = StepStatus::Ready;
+        step.metadata = json!({"authority_role": "platform-admin", "agent_run": HELD_RUN});
+        jobs.add_step(&step).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let claim_url = format!("{base}/api/jobs/{}/steps/{}/claim", job.id, step.id);
+        let claimed_metadata = Arc::new(Mutex::new(None));
+        let captured = claimed_metadata.clone();
+        let actual_jobs = jobs.clone();
+        let actual_step = step.id;
+        let app = boss_jobs::http::router(state).layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let claim_url = claim_url.clone();
+                let captured = captured.clone();
+                let actual_jobs = actual_jobs.clone();
+                async move {
+                    let after_intent = request.method() == reqwest::Method::PATCH
+                        && request.uri().path().ends_with("/metadata");
+                    let response = next.run(request).await;
+                    if after_intent && response.status().is_success() {
+                        let claimant = boss_policy_client::User {
+                            id: "emp-claimant".into(),
+                            role: "platform-admin".into(),
+                            access_tier: boss_policy_client::AccessTier::Operator,
+                            territory_account_ids: vec![],
+                            direct_report_ids: vec![],
+                            department: None,
+                        };
+                        let claim = reqwest::Client::new()
+                            .post(&claim_url)
+                            .header("x-boss-user", serde_json::to_string(&claimant).unwrap())
+                            .json(&json!({}))
+                            .send()
+                            .await
+                            .unwrap();
+                        assert_eq!(claim.status(), reqwest::StatusCode::OK);
+                        *captured.lock().unwrap() = Some(
+                            actual_jobs
+                                .get_step(&actual_step)
+                                .await
+                                .unwrap()
+                                .unwrap()
+                                .metadata,
+                        );
+                    }
+                    response
+                }
+            },
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let wire = Wire::at(base, named()).unwrap();
+        let result = nominate_step(
+            &wire,
+            &job.id.to_string(),
+            "build",
+            "agent-codex",
+            "supported lane",
+        )
+        .await;
+        let error = result.expect_err("the real claim must win");
+        assert!(error.to_string().contains("409"), "{error}");
+        let after = jobs.get_step(&step.id).await.unwrap().unwrap();
+        assert_eq!(after.status, StepStatus::Active);
+        assert_eq!(after.assignee_id.as_deref(), Some("emp-claimant"));
+        assert_eq!(
+            Some(after.metadata.clone()),
+            *claimed_metadata.lock().unwrap(),
+            "nomination preserves the claim's actual run-edge treatment"
+        );
+        assert_eq!(
+            after.metadata["nomination_requested"]["why"],
+            "supported lane"
+        );
+        assert_eq!(
+            after.metadata["nomination_requested"]["assignee_id"],
+            "agent-codex"
+        );
+        assert!(after.metadata.get("nominated").is_none());
+        assert!(
+            nominate_step(&wire, &job.id.to_string(), "build", "agent-codex", "retry")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            jobs.get_step(&step.id).await.unwrap().unwrap().metadata,
+            after.metadata
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn nomination_preserves_status_run_and_records_the_requested_reason() {
+        let s = stub(vec![held_packet(claimed("ready", Some(HELD_RUN)))]).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        nominate_step(
+            &wire,
+            "bd93d2be",
+            "build",
+            "agent-codex",
+            "supported executor lane",
+        )
+        .await
+        .unwrap();
+        let writes = s.puts.lock().unwrap();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(
+            writes[0].1["nomination_requested"]["why"],
+            "supported executor lane"
+        );
+        assert_eq!(writes[1].1, json!({"assignee_id": "agent-codex"}));
+        let current = &s.packets.lock().unwrap()[0]["steps"][1];
+        assert_eq!(current["status"], "ready");
+        assert_eq!(
+            current["metadata"][boss_jobs::agent_runs::EDGE_KEY],
+            HELD_RUN
+        );
+    }
+
+    #[tokio::test]
+    async fn nomination_refuses_nonready_and_blank_requests_before_writes() {
+        for status in ["active", "pending", "completed", "skipped"] {
+            let s = stub(vec![held_packet(claimed(status, Some(HELD_RUN)))]).await;
+            let wire = Wire::at(s.base.clone(), named()).unwrap();
+            assert!(
+                nominate_step(&wire, "bd93d2be", "build", "agent-codex", "why")
+                    .await
+                    .is_err()
+            );
+            assert!(s.puts.lock().unwrap().is_empty());
+        }
+        let s = stub(vec![held_packet(claimed("ready", Some(HELD_RUN)))]).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        for (assignee, why) in [(" ", "why"), ("agent-codex", " ")] {
+            assert!(
+                nominate_step(&wire, "bd93d2be", "build", assignee, why)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(s.puts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn nomination_refuses_a_silent_assignment_noop() {
+        let s = stub(vec![held_packet(claimed("ready", Some(HELD_RUN)))]).await;
+        s.drop_puts.store(true, std::sync::atomic::Ordering::SeqCst);
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        let err = nominate_step(&wire, "bd93d2be", "build", "agent-codex", "why")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("readback"), "{err}");
     }
 
     /// THE WHOLE VERB against the stub: one PATCH, one PUT, and the

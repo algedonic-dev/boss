@@ -54,7 +54,13 @@ fn david() -> String {
 }
 
 fn app() -> (Router, Arc<InMemoryJobs>) {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    app_with_guard(None)
+}
+
+fn app_with_guard(
+    guard: Option<Arc<boss_policy_client::role_guard::RoleGuardReporter>>,
+) -> (Router, Arc<InMemoryJobs>) {
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     let row = load_workflows(platform_bundle_path())
         .expect("the platform bundle parses")
         .into_iter()
@@ -87,6 +93,7 @@ fn app() -> (Router, Arc<InMemoryJobs>) {
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let state = JobsApiState {
+        role_guards: guard,
         kind_registry: Some(kinds as Arc<dyn WorkflowRegistry>),
         ..JobsApiState::minimal(
             jobs.clone(),
@@ -322,4 +329,101 @@ async fn an_unidentified_caller_is_in_no_audience() {
     let (status, body) = read(resp).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["flights"], json!([]), "{body}");
+}
+
+#[tokio::test]
+async fn role_flight_visibility_is_reported_without_changing_codes() {
+    use boss_policy_client::role_guard::RoleGuardReporter;
+    use boss_policy_client::role_reader::{RegistryRoles, RoleSnapshotClock, SnapshotRoleReader};
+    use boss_policy_client::role_reporting::{ReportMode, ReportTally};
+    use std::time::{Duration, Instant};
+    struct Clock;
+    impl RoleSnapshotClock for Clock {
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+    }
+    let roles = Arc::new(SnapshotRoleReader::new(
+        Duration::from_secs(30),
+        Arc::new(Clock),
+    ));
+    let ticket = roles.begin_refresh();
+    assert!(
+        roles.finish_refresh(
+            ticket,
+            Ok(RegistryRoles::from_sources(
+                json!({"data":[{"id":"agent-claude", "aliases":[], "role":"operator"}],"total":1}),
+                json!({"data":[],"total":0}),
+                json!([]),
+            )
+            .unwrap())
+        )
+    );
+    let tally = Arc::new(ReportTally::new(100));
+    let guard = Arc::new(RoleGuardReporter::new(
+        roles,
+        tally.clone(),
+        Arc::new(ReportMode::Report),
+    ));
+    let (app, jobs) = app_with_guard(Some(guard));
+    let job = file(&app, &jobs, json!({"roles":["platform-admin"]})).await;
+    complete(&app, &jobs, &job, "ship", &agent(), json!({"car":"c1"})).await;
+    complete(
+        &app,
+        &jobs,
+        &job,
+        "turn-on",
+        &agent(),
+        json!({"turned_on_for":"platform-admin"}),
+    )
+    .await;
+    assert_eq!(mine(&app, &agent()).await, vec![CODE.to_string()]);
+    let report = tally.snapshot();
+    let observations: Vec<_> = report
+        .rows
+        .iter()
+        .filter(|row| row.observation.resource == "flight-code-visibility")
+        .collect();
+    assert_eq!(
+        observations.len(),
+        1,
+        "actual complete flight population must be compared"
+    );
+    let observation = &observations[0].observation;
+    assert_eq!(observation.asserted_allowed, Some(true));
+    assert_eq!(observation.recorded_allowed, Some(false));
+    assert_eq!(observation.would_deny, None);
+
+    // Duplicate codes remain ambiguous for both roles. The observation
+    // must judge the whole group, rather than report either packet as on.
+    let duplicate = file(&app, &jobs, json!({"roles":["operator"]})).await;
+    complete(
+        &app,
+        &jobs,
+        &duplicate,
+        "ship",
+        &agent(),
+        json!({"car":"c2"}),
+    )
+    .await;
+    complete(
+        &app,
+        &jobs,
+        &duplicate,
+        "turn-on",
+        &agent(),
+        json!({"turned_on_for":"operator"}),
+    )
+    .await;
+    assert!(mine(&app, &agent()).await.is_empty());
+    let report = tally.snapshot();
+    assert!(
+        report.rows.iter().any(|row| {
+            row.observation.resource == "flight-code-visibility"
+                && row.observation.asserted_allowed == Some(false)
+                && row.observation.recorded_allowed == Some(false)
+                && row.observation.would_deny.is_none()
+        }),
+        "duplicate-code ambiguity must be conserved in the comparison"
+    );
 }

@@ -13,7 +13,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "Every five minutes the forge reads the cluster's jobs API from outside it and compares what the deployment serves with the last converged build. Dark past a deploy's worth of checks on a non-converged image, it rolls the deployment to the converged build by name; dark on the converged build itself, it says hands are needed. The packet records the run when the API can take it; the run never waits for the packet."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
 
 [[workflow.step]]
 title = "scheduled"

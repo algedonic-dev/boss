@@ -59,19 +59,27 @@ async fn main() -> Result<()> {
             ),
         ));
 
-    // Approved abf9eeae precursor: the classes mount reports a role-only
-    // hypothetical policy answer. Registry readers ask the unchanged
-    // policy service, so this dependency graph is acyclic. No role grant,
-    // canonical identity substitution or enforcement happens here.
-    let roles = Arc::new(boss_policy_client::role_reader::HttpRoleReader::new(
+    // Request-time comparison reads the complete local projection, never
+    // the registry services whose own authorization now reports roles.
+    let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+        boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+        Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+    ));
+    let role_source = Arc::new(boss_policy_client::role_reader::HttpRoleReader::new(
         std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
         std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
         boss_policy_client::User::service("classes"),
     )?);
     let mode = Arc::new(boss_policy_client::role_reader::MountedReportMode::mount());
-    let tally = Arc::new(boss_policy_client::role_reporting::ReportTally::new(512));
-    let app =
-        boss_classes::role_reports::mount(ClassesApiState { classes, policy }, roles, mode, tally);
+    let tally = Arc::new(boss_policy_client::role_reporting::ReportTally::new(
+        boss_policy_client::role_service::REPORT_CAPACITY,
+    ));
+    let app = boss_classes::role_reports::mount_snapshot(
+        ClassesApiState { classes, policy },
+        roles.clone(),
+        mode.clone(),
+        tally,
+    );
     // Sim-origin middleware: extract x-sim-origin header and set the
     // per-request task-local so the publisher inherits the sim
     // marker. Closes the gap where a sim chain could trigger a
@@ -95,6 +103,29 @@ async fn main() -> Result<()> {
         &["/api/classes/health"],
         Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
     );
-    axum::serve(listener, app).await?;
+    let (role_stop, stop) = tokio::sync::watch::channel(false);
+    let role_refresh = tokio::spawn(roles.run_refresh_loop(
+        role_source,
+        mode,
+        boss_policy_client::role_service::REFRESH_CADENCE,
+        stop,
+    ));
+    let served = axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let interrupt = async {
+                if let Err(error) = tokio::signal::ctrl_c().await {
+                    tracing::warn!(%error, "classes interrupt signal unavailable");
+                    std::future::pending::<()>().await;
+                }
+            };
+            // Gate evidence owns process termination; this path owns interrupts.
+            interrupt.await;
+        })
+        .await;
+    let _ = role_stop.send(true);
+    role_refresh
+        .await
+        .context("joining classes actor-role refresh")??;
+    served?;
     Ok(())
 }

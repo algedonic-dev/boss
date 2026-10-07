@@ -156,7 +156,7 @@ async fn dry_run(app: Router, spec: &WorkflowSpec) -> serde_json::Value {
 
 #[tokio::test]
 async fn dry_run_validate_passes_a_viable_spec() {
-    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
+    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::for_fixture());
     let app = build_app(registry);
     let mut spec = draft_spec("viable");
     spec.steps = vec![trigger_step(), terminal_step()];
@@ -172,7 +172,7 @@ async fn dry_run_validate_passes_a_viable_spec() {
 
 #[tokio::test]
 async fn dry_run_validate_flags_missing_terminal_without_persisting() {
-    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
+    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::for_fixture());
     let app = build_app(registry.clone());
     let mut spec = draft_spec("no-terminal");
     spec.steps = vec![trigger_step()]; // trigger only — no terminal
@@ -199,7 +199,7 @@ async fn dry_run_validate_flags_missing_terminal_without_persisting() {
 
 #[tokio::test]
 async fn full_create_publish_retire_cycle() {
-    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
+    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::for_fixture());
     let app = build_app(registry.clone());
 
     // 1. Create draft.
@@ -342,7 +342,7 @@ async fn duration_hours_survives_round_trip_and_publish() {
 
     // (b) Authored → published → read back through the versioned
     // surface (the one an executor resolves a pinned Job against).
-    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
+    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::for_fixture());
     let app = build_app(registry.clone());
     let resp = send_json(app.clone(), "POST", "/api/workflows", &cto(), Some(as_json)).await;
     assert_eq!(resp.status(), StatusCode::CREATED);
@@ -378,7 +378,7 @@ async fn duration_hours_survives_round_trip_and_publish() {
 async fn guest_cannot_publish_even_if_they_could_create() {
     // A policy where guests can create drafts but can't publish. Verifies
     // that Publish is independently gated from Create, per the design.
-    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
+    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::for_fixture());
     let jobs = Arc::new(InMemoryJobs::new());
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
@@ -428,7 +428,7 @@ async fn guest_cannot_publish_even_if_they_could_create() {
 
 #[tokio::test]
 async fn list_kinds_filters_by_category() {
-    let registry = Arc::new(InMemoryWorkflows::new());
+    let registry = Arc::new(InMemoryWorkflows::for_fixture());
     // Seed two actives across two categories — use the raw seed helper
     // so we don't have to drive publish for every one.
     let mut refurb = draft_spec("refurb-test");
@@ -470,7 +470,7 @@ async fn discarding_a_draft_a_packet_is_pinned_to_is_refused() {
     use boss_core::job::{Job, Priority, Subject};
     use boss_jobs::port::JobsRepository;
 
-    let registry = Arc::new(InMemoryWorkflows::new());
+    let registry = Arc::new(InMemoryWorkflows::for_fixture());
     let jobs = Arc::new(InMemoryJobs::new());
     let now = chrono::Utc::now();
     let actor = boss_core::actor::ActorId::Human("emp-cto".into());
@@ -563,7 +563,7 @@ async fn versions_of(app: Router, kind: &str, user: &User) -> Vec<(i32, Workflow
 /// refused; the author sees every row.
 #[tokio::test]
 async fn a_draft_is_read_only_by_who_may_author_it() {
-    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
+    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::for_fixture());
     let app = build_app(registry);
     let kind = "intake-review";
     let body = |label: &str| {
@@ -638,7 +638,7 @@ async fn a_draft_is_read_only_by_who_may_author_it() {
 /// row, and the versioned route still answers v1.
 #[tokio::test]
 async fn the_active_read_refuses_a_parameter_it_does_not_read() {
-    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
+    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::for_fixture());
     let app = build_app(registry);
     let kind = "intake-review";
     let body = |label: &str| {

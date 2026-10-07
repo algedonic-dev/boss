@@ -70,7 +70,7 @@ fn ten_step_kind() -> WorkflowSpec {
 }
 
 fn app() -> (axum::Router, Arc<InMemoryJobs>) {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds.seed(ten_step_kind()).unwrap();
     let jobs = Arc::new(InMemoryJobs::new());
     let policy: Arc<dyn PolicyClient> = Arc::new(

@@ -119,6 +119,9 @@ struct Image {
     top_counter_whiteout: bool,
     no_counter: bool,
     top_zstd: bool,
+    bootstrap_link: bool,
+    bootstrap_duplicate: bool,
+    bootstrap_whiteout: bool,
 }
 
 /// One fixture: a stub `curl` on PATH serving an OCI image from files,
@@ -167,6 +170,28 @@ impl Case {
         // (backlog c4d60110): a stub that prints its own name, so a test
         // can run the installed copy and know which file answered.
         let mut base_members = vec!["usr/local/bin/boss"];
+        create_dir(&base.join("opt/boss"));
+        write_file(
+            &base.join("opt/boss/dev-control.tar"),
+            "published control artifact bytes",
+        );
+        base_members.push("opt/boss/dev-control.tar");
+        write_exec(
+            &base.join("opt/boss/dev-control"),
+            &format!(
+                "#!/bin/sh\ntouch '{}'\n",
+                root.join("bootstrap-executed").display()
+            ),
+        );
+        if image.bootstrap_link {
+            std::fs::remove_file(base.join("opt/boss/dev-control")).unwrap();
+            std::os::unix::fs::symlink("dev-control.tar", base.join("opt/boss/dev-control"))
+                .unwrap();
+        }
+        base_members.push("opt/boss/dev-control");
+        if image.bootstrap_duplicate {
+            base_members.push("opt/boss/dev-control");
+        }
         if !image.no_counter {
             write_exec(
                 &base.join("usr/local/bin/boss-leaked-policy"),
@@ -182,6 +207,8 @@ impl Case {
             "usr/local/bin/.wh.boss"
         } else if image.top_counter_whiteout {
             "usr/local/bin/.wh.boss-leaked-policy"
+        } else if image.bootstrap_whiteout {
+            "opt/boss/.wh.dev-control"
         } else {
             "etc/motd"
         };
@@ -612,6 +639,85 @@ fn the_counter_lands_beside_the_cli_in_the_same_generation() {
     assert_eq!(rc, 0, "{out}");
     assert!(c.requests().is_empty(), "{:?}", c.requests());
     assert_eq!(c.summary("cli_leaked_policy"), "installed", "{out}");
+}
+
+#[test]
+fn the_control_artifact_lands_as_inert_bytes_in_the_verified_cli_generation() {
+    if !tools() {
+        return;
+    }
+    let c = Case::new("control-artifact");
+    let (rc, out) = c.run(SHA_A, &[]);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(
+        std::fs::read(c.store.join(SHA_A).join("dev-control.tar"))
+            .expect("verified control artifact installed"),
+        b"published control artifact bytes",
+        "artifact extraction must conserve the verified layer's bytes: {out}"
+    );
+    assert!(
+        !c.store.join(SHA_A).join("enabled").exists(),
+        "installing an artifact does not activate it"
+    );
+    assert_eq!(
+        std::fs::read(c.store.join(SHA_A).join("dev-control"))
+            .expect("published bootstrap is installed beside inert archive"),
+        std::fs::read(c.root.join("layer-base/opt/boss/dev-control")).unwrap(),
+        "bootstrap bytes must come from the same verified image"
+    );
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(c.store.join(SHA_A).join("dev-control"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    assert!(
+        !c.root.join("bootstrap-executed").exists(),
+        "installation must never execute the bootstrap"
+    );
+}
+
+#[test]
+fn malformed_or_deleted_control_bootstrap_is_never_installed_or_executed() {
+    assert!(tools(), "owning bootstrap controls require fixture tools");
+    for (name, image, expected) in [
+        (
+            "bootstrap-link",
+            Image {
+                bootstrap_link: true,
+                ..Default::default()
+            },
+            1,
+        ),
+        (
+            "bootstrap-duplicate",
+            Image {
+                bootstrap_duplicate: true,
+                ..Default::default()
+            },
+            1,
+        ),
+        (
+            "bootstrap-whiteout",
+            Image {
+                bootstrap_whiteout: true,
+                ..Default::default()
+            },
+            0,
+        ),
+    ] {
+        let c = Case::with_image(name, image);
+        let (rc, out) = c.run(SHA_A, &[]);
+        assert_eq!(rc, expected, "{name}: {out}");
+        assert!(
+            !c.store.join(SHA_A).join("dev-control").exists(),
+            "{name}: {out}"
+        );
+        assert!(!c.root.join("bootstrap-executed").exists(), "{name}: {out}");
+    }
 }
 
 #[test]

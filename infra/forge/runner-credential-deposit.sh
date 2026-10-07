@@ -32,8 +32,9 @@
 #      destination, fsynced, root:root, 0600, renamed into place, the
 #      directory fsynced. A value the door does not resolve changes
 #      nothing. That is "not yet", green, while the door is only BEHIND —
-#      the value the runner holds still resolves, or the staged one is
-#      younger than kubelet's refresh bound — and a red otherwise, because
+#      the held value resolves AND the named install is younger than two
+#      hours, or the first staged value is younger than kubelet's refresh
+#      bound — and a red otherwise, because
 #      then the mount is missing or broken (review 3930a3eb, N1). A jobs
 #      API that answers 404 has no door at all, and says so, red (N5).
 #   4. When the file holds the staged `next` and the door resolves it to
@@ -77,6 +78,9 @@ say() { echo "$ME: $*"; }
 # value to tell a lagging mount from a broken one, its absence is a red:
 # kubelet's Secret refresh (60-90 s) with room to spare.
 STAGED_GRACE_S=300
+# A working held credential is continuity, not evidence that an indefinitely
+# lagging mount is healthy (review3121561f R3). The named install bounds it.
+HELD_GRACE_S=7200
 
 RULE="" DEST=""
 while [ $# -gt 0 ]; do
@@ -119,6 +123,10 @@ NODE="${BOSS_NODE_ID:-}"
 . "$INFRA/run-summary.sh"
 # shellcheck source=infra/lib/secret-header.sh
 . "$INFRA/lib/secret-header.sh"
+# shellcheck source=infra/lib/jq.sh
+. "$INFRA/lib/jq.sh"
+# The remote receiver and local deposit share the exact owner/CAS contract.
+. "$INFRA/lib/runner-delivery-ack.sh"
 
 KERR="$(mktemp)"
 BODY="$(mktemp)"
@@ -242,7 +250,7 @@ say "secret $NS/$NAME: $SECRET_STATE"
 WANT="${NEXT:-$CURRENT}"
 
 # --- the jobs API ------------------------------------------------------
-BOSS_USER="{\"id\":\"automation:credential-deposit\",\"role\":\"platform-admin\",\"access_tier\":\"operator\",\"territory_account_ids\":[],\"direct_report_ids\":[],\"department\":\"platform\"}"
+BOSS_USER="{\"id\":\"automation:runner-credential-deposit\",\"role\":\"platform-admin\",\"access_tier\":\"operator\",\"territory_account_ids\":[],\"direct_report_ids\":[],\"department\":\"platform\"}"
 API_CURL="$INFRA/boss-api-curl.sh"
 [ -x "$API_CURL" ] || API_CURL=boss-api-curl.sh
 HDRS=(-H "x-boss-user: $BOSS_USER")
@@ -269,22 +277,26 @@ api_get() {
 
 # whoami VALUE — what the credential door makes of VALUE, into SEEN
 # ("<host>/<slot>", or "unresolved"). 0 answered; 1 no answer (a
-# transient); 3 no door (a 404: permanent, and named as such). The value
+# transient); 3 no door; 4 an actual HTTP refusal, with CODE retained. The value
 # rides in a 0600 header file, never curl's argv.
-SEEN=""
+SEEN="" DELIVERY_CONTEXT=""
 whoami() {
-    SEEN=""
+    SEEN="" DELIVERY_CONTEXT=""
     [ -n "${BOSS_JOBS_URL:-}" ] || return 1
     secret_header RC_HDR "x-boss-runner-credential: $1" || return 1
     api_get /api/jobs/runner-credential -H "$RC_HDR"
     case "$CODE" in
         200) ;;
         404) return 3 ;;
-        *) return 1 ;;
+        '') return 1 ;;
+        *) return 4 ;;
     esac
     if ! SEEN="$(jq -r 'if .resolved == true then "\(.host)/\(.slot)"
         elif .resolved == false then "unresolved" else error("no resolved") end' "$BODY" 2>/dev/null)"; then
         SEEN=""
+        return 1
+    fi
+    if ! DELIVERY_CONTEXT="$(jq -c '.delivery // null' "$BODY" 2>/dev/null)"; then
         return 1
     fi
 }
@@ -292,15 +304,16 @@ whoami() {
 # packet ID — the rotation packet the staged value names, into PKT_STATE
 # (`awaiting`, `recorded`, or why neither), PKT_STEP (its delivered
 # step's id) and PKT_INSTALLED (its install's epoch, or empty).
-PKT_STATE="" PKT_STEP="" PKT_INSTALLED=""
+PKT_STATE="" PKT_STEP="" PKT_INSTALLED="" PKT_INSTALL_STATE="" PKT_PREPARED=""
 packet() {
     local at
-    PKT_STATE="" PKT_STEP="" PKT_INSTALLED=""
+    PKT_STATE="" PKT_STEP="" PKT_INSTALLED="" PKT_INSTALL_STATE="" PKT_PREPARED=""
     api_get "/api/jobs/$1"
     case "$CODE" in
         200) ;;
         404) PKT_STATE="unknown: the jobs API has no packet ${1:0:8}"; return 0 ;;
-        *) PKT_STATE="unanswered"; return 0 ;;
+        '') PKT_STATE="unanswered"; return 0 ;;
+        *) PKT_STATE="refused: rotation packet HTTP $CODE"; return 0 ;;
     esac
     if ! PKT_STATE="$(jq -r --arg c "$CRED" '
         ([.steps[]? | select(.spec_slug == "delivered")][0]) as $d
@@ -313,13 +326,38 @@ packet() {
         PKT_STATE="unreadable: packet ${1:0:8} did not parse"
         return 0
     fi
-    PKT_STEP="$(jq -r '[.steps[]? | select(.spec_slug == "delivered")][0].id // empty' "$BODY")"
-    at="$(jq -r '[.steps[]? | select(.spec_slug == "install")][0].completed_at // empty' "$BODY")"
+    if ! PKT_STEP="$(jq -r '[.steps[]? | select(.spec_slug == "delivered")][0].id // empty' "$BODY")" \
+        || ! at="$(jq -r '[.steps[]? | select(.spec_slug == "install")][0].completed_at // empty' "$BODY")" \
+        || ! PKT_INSTALL_STATE="$(jq -r '[.steps[]? | select(.spec_slug == "install")][0].status // empty' "$BODY")" \
+        || ! PKT_PREPARED="$(jq -r '([.steps[]? | select(.spec_slug == "issue" and .status == "completed")] + [.steps[]? | select(.spec_slug == "scope" and .status == "completed")])[0].completed_at // empty' "$BODY")"; then
+        PKT_STATE="unreadable: packet ${1:0:8} did not parse"
+        return 0
+    fi
     # An install time that does not parse is no age at all: the staged
     # value then gets no grace, and its absence reads as a broken mount.
     if [ -n "$at" ] && ! PKT_INSTALLED="$(date -u -d "$at" +%s 2>/dev/null)"; then
         PKT_INSTALLED=""
     fi
+}
+
+# Unknown/future times establish no grace. A relative or empty date must not
+# silently become today's midnight or a continuously renewed deadline.
+within_bound() {
+    local now
+    case "$1" in ''|*[!0-9]*) return 1;; esac
+    now="$(date -u +%s)" || return 1
+    [ "$1" -le "$now" ] && [ $((now - $1)) -lt "$2" ]
+}
+
+pending_install() {
+    local prepared_epoch
+    case "$PKT_INSTALL_STATE" in active|ready|pending) ;;
+        *) return 1;; esac
+    # Admission can wait days for a human. The issue completion, or the
+    # completed human scope before issue, bounds this preparation interval.
+    [ -n "$PKT_PREPARED" ] || return 1
+    prepared_epoch="$(date -u -d "$PKT_PREPARED" +%s 2>/dev/null)" || return 1
+    within_bound "$prepared_epoch" "$HELD_GRACE_S"
 }
 
 # held_mode FILE — 0600, and root:root when this runs as root.
@@ -329,7 +367,6 @@ held_mode() {
 }
 
 # --- 3. the file -------------------------------------------------------
-PROVED=0
 if [ -L "$DEST" ]; then
     rc=1
     ACTION="refused: $DEST is a symlink, not the deposit's own file; it was not read or replaced"
@@ -339,6 +376,14 @@ if [ -e "$DEST" ]; then
     if ! CUR="$(cat -- "$DEST" 2>"$KERR")"; then
         CUR=""
         fail_file "refused: $DEST cannot read ($(head -n 1 "$KERR" | cut -c1-200)); nothing was replaced"
+    fi
+fi
+if [ -n "$NEXT" ] && [ -n "$NEXT_FOR" ]; then
+    packet "$NEXT_FOR"
+    if pending_install && [ "$PKT_STATE" = 'delivered step pending' ]; then
+        ACTION="not yet: named packet install is not completed; inside the bounded preparation window; the held file is untouched"
+        if [ -n "$CUR" ]; then held_mode "$DEST" || fail_file "held file mode could not be repaired"; fi
+        finish
     fi
 fi
 if [ -n "$WANT" ] && [ "$WANT" != "$CUR" ]; then
@@ -351,6 +396,9 @@ if [ -n "$WANT" ] && [ "$WANT" != "$CUR" ]; then
     elif [ "$wrc" -eq 3 ]; then
         rc=1
         ACTION="not installed: $NO_DOOR"
+    elif [ "$wrc" -eq 4 ]; then
+        rc=1
+        ACTION="not installed: GET /api/jobs/runner-credential refused: HTTP $CODE; the held file is untouched"
     elif [ "$wrc" -ne 0 ]; then
         ACTION="not installed: the jobs API did not answer GET /api/jobs/runner-credential; the next pass retries"
     elif [ "$SEEN" = unresolved ]; then
@@ -363,17 +411,23 @@ if [ -n "$WANT" ] && [ "$WANT" != "$CUR" ]; then
             hrc=0
             whoami "$CUR" || hrc=$?
             if [ "$hrc" -eq 0 ] && [ "${SEEN%%/*}" = "$HOST" ]; then
-                behind="the value the runner holds (…$(last8 "$CUR")) still resolves as $SEEN, so its mount is live and has not refreshed yet"
+                packet "$NEXT_FOR"
+                if [ "$PKT_INSTALL_STATE" = completed ] && within_bound "$PKT_INSTALLED" "$HELD_GRACE_S"; then
+                    behind="the held value still resolves; the named install is inside the $HELD_GRACE_S-second lag bound"
+                else
+                    why="$why; named install exceeds the lag bound or its past time is unknown ($PKT_STATE)"
+                fi
+            elif [ "$hrc" -eq 4 ]; then
+                why="$why; held credential HTTP $CODE refusal"
             else
                 why="$why, and the value the runner holds (…$(last8 "$CUR")) does not resolve to $HOST either — its mount of $NS/$NAME is missing or broken"
             fi
         elif [ "$SLOT" = next ] && [ -n "$NEXT_FOR" ]; then
             packet "$NEXT_FOR"
-            now="$(date -u +%s)"
-            if [ -n "$PKT_INSTALLED" ] && [ $((now - PKT_INSTALLED)) -lt "$STAGED_GRACE_S" ]; then
-                behind="it was staged $((now - PKT_INSTALLED))s ago, inside kubelet's refresh"
+            if [ "$PKT_INSTALL_STATE" = completed ] && within_bound "$PKT_INSTALLED" "$STAGED_GRACE_S"; then
+                behind="the named install is inside kubelet's $STAGED_GRACE_S-second refresh bound"
             else
-                why="$why, staged ${PKT_INSTALLED:+$((now - PKT_INSTALLED))s ago }past kubelet's refresh — its mount of $NS/$NAME is missing or broken"
+                why="$why, named install is past kubelet's refresh or its time is unknown ($PKT_STATE) — its mount of $NS/$NAME is missing or broken"
             fi
         fi
         if [ -n "$behind" ]; then
@@ -406,7 +460,6 @@ if [ -n "$WANT" ] && [ "$WANT" != "$CUR" ]; then
         TMP=""
         sync -- "$DIR" 2>"$KERR" \
             || fail_file "installed, but $DIR could not be fsynced ($(head -n 1 "$KERR" | cut -c1-200))"
-        PROVED=1
         CUR="$WANT"
         ACTION="installed $HOST.$SLOT (…$(last8 "$WANT")), which the jobs API resolves to $SEEN"
     fi
@@ -418,7 +471,7 @@ fi
 
 # --- 4. the delivery record --------------------------------------------
 record_delivery() {
-    local body l8 moved moved_for wrc
+    local body l8 moved moved_for wrc identity expected receipt attempt
     if [ -z "${BOSS_JOBS_URL:-}" ]; then
         DELIVERY_STATE="not recorded: BOSS_JOBS_URL is unset (/etc/boss/sor.env)"
         return 0
@@ -433,7 +486,7 @@ record_delivery() {
     case "$PKT_STATE" in
         awaiting) ;;
         recorded)
-            DELIVERY_STATE="already recorded on ${NEXT_FOR:0:8}: the broker promotes it"
+            DELIVERY_STATE="already recorded on ${NEXT_FOR:0:8}: promotion not observed; the staged value remains"
             return 0
             ;;
         unanswered)
@@ -446,7 +499,9 @@ record_delivery() {
             return 0
             ;;
     esac
-    if [ "$PROVED" -eq 0 ]; then
+    # Present the installed local value after installation, including the
+    # next-slot bootstrap. The earlier pre-install whoami is not this act.
+    if [ -n "$CUR" ]; then
         wrc=0
         whoami "$CUR" || wrc=$?
         if [ "$wrc" -eq 3 ]; then
@@ -454,6 +509,11 @@ record_delivery() {
             rc=1
             return 0
         elif [ "$wrc" -ne 0 ]; then
+            if [ "$wrc" -eq 4 ]; then
+                DELIVERY_STATE="not recorded: GET /api/jobs/runner-credential refused: HTTP $CODE"
+                rc=1
+                return 0
+            fi
             DELIVERY_STATE="not recorded: the jobs API did not answer GET /api/jobs/runner-credential; the next pass retries"
             return 0
         fi
@@ -481,18 +541,7 @@ record_delivery() {
         esac
         return 0
     fi
-    l8="$(last8 "$CUR")"
-    body="$(jq -nc --arg l8 "$l8" --arg to "$HOST:$DEST" \
-        '{delivered_last_eight: $l8, delivered_to: $to}')"
-    if ! "$API_CURL" -fsS -X PATCH "${HDRS[@]}" -H "content-type: application/json" \
-            -d "$body" "$BOSS_JOBS_URL/api/jobs/$NEXT_FOR/steps/$PKT_STEP/metadata" >/dev/null 2>&1 \
-        || ! "$API_CURL" -fsS -X PUT "${HDRS[@]}" -H "content-type: application/json" \
-            -d '{"status":"completed"}' "$BOSS_JOBS_URL/api/jobs/$NEXT_FOR/steps/$PKT_STEP" >/dev/null 2>&1; then
-        DELIVERY_STATE="not recorded: the write to ${NEXT_FOR:0:8}'s delivered step failed; the next pass retries"
-        rc=1
-        return 0
-    fi
-    DELIVERY_STATE="recorded on ${NEXT_FOR:0:8}: delivered …$l8 (the jobs API resolves it to $SEEN)"
+    runner_delivery_ack "$CRED" "$HOST" "$NEXT_FOR" "$CUR" "$DEST" "$DELIVERY_CONTEXT" "$PKT_STEP"
 }
 if [ -n "$NEXT" ] && [ "$CUR" = "$NEXT" ]; then
     record_delivery

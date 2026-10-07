@@ -250,7 +250,35 @@ async fn main() -> Result<()> {
         .context("resolving [gateway] public_reads from the tenant manifest")?;
     tracing::info!(public_reads = ?public_reads.paths(), "sessionless reads declared by the tenant");
 
-    let app = build_router(local_auth_state.clone(), &public_reads);
+    // The gateway is the trusted session edge: report inventory observes
+    // resolver health, without substituting any forwarded session role.
+    let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+        boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+        Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+    ));
+    let mode = Arc::new(boss_policy_client::role_reader::MountedReportMode::mount());
+    let source = Arc::new(boss_policy_client::role_reader::HttpRoleReader::new(
+        std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
+        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
+        boss_policy_client::User::service("gateway"),
+    )?);
+    let wiring = boss_policy_client::role_service::assemble(
+        "gateway",
+        "/api/gateway/actor-role-reports",
+        Arc::new(boss_policy_client::ReqwestPolicyClient::new(
+            "gateway",
+            std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
+        )),
+        roles.clone(),
+        mode.clone(),
+        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
+            boss_policy_client::role_service::REPORT_CAPACITY,
+        )),
+    );
+    let app = gateway_http_router(
+        build_router(local_auth_state.clone(), &public_reads),
+        wiring.inventory,
+    );
 
     let app = app
         .layer(axum::middleware::from_fn_with_state(
@@ -322,13 +350,25 @@ async fn main() -> Result<()> {
     // With the peer address on every request: the inquiry door's
     // rate limit falls back to it when the tunnel sends no
     // `CF-Connecting-IP`.
-    axum::serve(
+    boss_policy_client::role_service::serve_with_refresh(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        roles,
+        source,
+        mode,
+        boss_policy_client::role_service::REFRESH_CADENCE,
+        boss_policy_client::role_service::shutdown_signal(),
     )
     .await?;
 
     Ok(())
+}
+
+fn gateway_http_router<S: Clone + Send + Sync + 'static>(
+    domain: axum::Router<S>,
+    inventory: axum::Router,
+) -> axum::Router<S> {
+    domain.merge(inventory.with_state(()))
 }
 
 /// Build the gateway route table.
@@ -1196,6 +1236,89 @@ mod routing_tests {
             .unwrap(),
         });
         build_router(local_auth, reads).with_state(state)
+    }
+
+    #[tokio::test]
+    async fn gateway_inventory_uses_the_signed_session_and_preserves_the_edge() {
+        use boss_policy_client::{Action, FakePolicyClient, Resource, Scope};
+        let state = Arc::new(AppState {
+            session_key: vec![0; 32],
+            proxy_client: reqwest::Client::new(),
+            perf: Arc::new(PerfCollector::new()),
+            machine_token: Default::default(),
+            machine: boss_gateway::machine_client::MachineClient::unstamped(
+                reqwest::Client::builder(),
+            )
+            .unwrap(),
+        });
+        let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+            boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+            Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+        ));
+        let tally = Arc::new(boss_policy_client::role_reporting::ReportTally::new(8));
+        let wiring = boss_policy_client::role_service::assemble(
+            "gateway",
+            "/api/gateway/actor-role-reports",
+            Arc::new(
+                FakePolicyClient::builder()
+                    .allow(
+                        "report-reader",
+                        Action::Read,
+                        Resource::policy_rule(),
+                        Scope::All,
+                    )
+                    .build(),
+            ),
+            roles,
+            Arc::new(boss_policy_client::role_reporting::ReportMode::Report),
+            tally.clone(),
+        );
+        let domain =
+            build_router(None, &public_reads::PublicReads::none()).with_state(state.clone());
+        let app = gateway_http_router(domain, wiring.inventory).layer(
+            axum::middleware::from_fn_with_state(state.clone(), role_headers::inject_role_headers),
+        );
+        let health = get(app.clone(), "/health").await;
+        assert_eq!(health.0, StatusCode::OK);
+        let mut forged_user = boss_policy_client::User::service("forged-reader");
+        forged_user.role = "report-reader".into();
+        let forged = serde_json::to_string(&forged_user).unwrap();
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/gateway/actor-role-reports")
+                    .header("x-boss-user", forged)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let mut session = boss_gateway::session::Session::new("reader", 60);
+        session.role = Some("report-reader".into());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/gateway/actor-role-reports")
+                    .header(
+                        "cookie",
+                        format!("boss_session={}", session.encode(&state.session_key)),
+                    )
+                    .header("x-boss-role", "visitor")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["service"], "gateway");
+        assert_eq!(body["snapshot"]["state"], "never-loaded");
+        assert_eq!(body["report"]["durable_window"], false);
+        assert!(tally.snapshot().rows.is_empty());
     }
 
     /// The default: a manifest that declares nothing.

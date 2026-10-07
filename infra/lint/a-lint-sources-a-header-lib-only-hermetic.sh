@@ -31,9 +31,14 @@
 # of both.
 #
 # WHAT IT CHECKS. The header-making libs are DERIVED, never listed:
-# infra/lib/secret-header.sh, plus every infra/lib/*.sh and
-# infra/forge/*.lib.sh that itself sources secret-header.sh (today that
-# adds infra/forge/landed-train-shas.lib.sh). For every infra/lint/*.sh
+# infra/lib/secret-header.sh, plus every infra/lib/*.sh, infra/forge/*.sh
+# and infra/estate/*.sh that itself sources secret-header.sh. Until
+# 2026-10-06 the forge glob was `*.lib.sh` and infra/estate was not read,
+# which found landed-train-shas.lib.sh alone; the day the host senders
+# were stamped (backlog 2710c8fc) alert-lib.sh, cluster-deploy-lib.sh,
+# cluster-node-lib.sh, node-roles.sh and observe-lib.sh became header
+# libs, five lints sourced one of them with a token in reach, and the
+# narrow glob saw none of the five. For every infra/lint/*.sh
 # but this one, a line that sources (`.` or `source`) one of them — the
 # lib's name, or a variable assigned a path naming it, ANYWHERE in the
 # sourcing command up to its `||`, `&&`, `;` or the end of the line, so
@@ -43,6 +48,15 @@
 #     export BOSS_MACHINE_TOKEN_DIR=<an empty dir the lint made>
 #     export BOSS_SOR_ENV=<a path that does not exist>
 #     unset BOSS_JOBS_URL BOSS_MACHINE_TOKEN_HOSTS
+#
+# THE ONE EXCEPTION (2710c8fc). A file whose HEADER declares
+# `# consist: skip — ... against a LIVE deployment; ...` is a live
+# reader, not a tree lint: the roster leaves it out, its chore mounts
+# the token, and its request is the one that must be stamped
+# (conservation-invariants.sh, the hourly sweep). The header is read as
+# gate.sh reads it — the first line that is not a comment ends it — so
+# a lint cannot stay in the roster and claim the exception from its
+# body. Build-only skips and mentions in prose do not qualify.
 #
 # (`NAME=value` and a separate `export NAME` count as the export, from
 # the later of the two lines.) Comment lines and heredoc bodies are
@@ -95,11 +109,11 @@ function prose(s,    t) {
 '
 
 # The libs that make a token header, one basename per line: secret-header.sh
-# and every lib under $1/infra/{lib,forge} that sources it.
+# and every script under $1/infra/{lib,forge,estate} that sources it.
 header_libs() { # root
     echo "secret-header.sh"
     local f
-    for f in "$1"/infra/lib/*.sh "$1"/infra/forge/*.lib.sh; do
+    for f in "$1"/infra/lib/*.sh "$1"/infra/forge/*.sh "$1"/infra/estate/*.sh; do
         [ -f "$f" ] || continue
         [ "${f##*/}" = secret-header.sh ] && continue
         LC_ALL=C awk "$PROSE_AWK"'
@@ -120,6 +134,13 @@ scan() { # libs file...
         LC_ALL=C awk -v libs="$libs" "$PROSE_AWK"'
             BEGIN { n = split(libs, L, " ") }
             {
+                # The header as gate.sh header_declarations reads it: an
+                # optional shebang, then comments and blank lines; the
+                # first other line ends it. A declaration below that
+                # leaves the lint in the roster and excuses nothing.
+                if (FNR == 1) hdr = 1
+                if (hdr && $0 !~ /^#/ && $0 !~ /^[ \t]*$/) hdr = 0
+                if (hdr && !live && $0 ~ /^# consist: skip — [^;]* against a LIVE deployment;/) live = FNR
                 if (prose($0)) next
                 line = $0
                 h = heredoc_open(line)
@@ -173,6 +194,7 @@ scan() { # libs file...
             }
             END {
                 if (!src) exit 0
+                if (live && live < src) exit 0
                 miss = ""
                 if (!tokdir || tokdir > src) miss = miss " export BOSS_MACHINE_TOKEN_DIR"
                 if (!sorenv || sorenv > src) miss = miss " export BOSS_SOR_ENV"
@@ -207,6 +229,36 @@ self_test() {
         rm -rf "$tmp"; return 1
     fi
     libs="secret-header.sh landed-train-shas.lib.sh"
+
+    # The production sweep's declaration needs the mounted credential;
+    # neither a build-only skip nor prose grants that classification.
+    cat > "$tmp/live.sh" <<'SH'
+# consist: skip — psql + curl against a LIVE deployment; an invariant on the running system, not on a tree
+. infra/lib/secret-header.sh || exit 3
+SH
+    cat > "$tmp/build-only.sh" <<'SH'
+# consist: skip — reads a built binary; the gate runs it after build
+. infra/lib/secret-header.sh || exit 3
+SH
+    cat > "$tmp/misdeclared.sh" <<'SH'
+# prose: consist: skip — psql + curl against a LIVE deployment; this is not a declaration
+. infra/lib/secret-header.sh || exit 3
+SH
+    cat > "$tmp/late-live.sh" <<'SH'
+. infra/lib/secret-header.sh || exit 3
+# consist: skip — psql + curl against a LIVE deployment; declared too late
+SH
+    # The roster (gate.sh header_declarations) reads the declaration in
+    # the HEADER only — the first line that is not a comment ends it. One
+    # written below a line of code leaves the lint IN the roster, so it
+    # must not also excuse it from the hermetic block (rescue review of
+    # 759721e7, 2026-10-06: the first draft accepted it anywhere above
+    # the sourcing).
+    cat > "$tmp/body-live.sh" <<'SH'
+set -uo pipefail
+# consist: skip — psql + curl against a LIVE deployment; declared in the body, where the roster does not read it
+. infra/lib/secret-header.sh || exit 3
+SH
 
     # Refused 1 — the shape that held the trains on 2026-10-01: a lib
     # named by a variable, sourced inside $( ( … ) ), no hermetic block.
@@ -279,6 +331,10 @@ MSG
 SH
     hits="$(scan "$libs" "$tmp"/*.sh)"
     want="$(printf '%s\n' \
+        "$tmp/body-live.sh:3: export BOSS_MACHINE_TOKEN_DIR export BOSS_SOR_ENV unset BOSS_JOBS_URL unset BOSS_MACHINE_TOKEN_HOSTS" \
+        "$tmp/build-only.sh:2: export BOSS_MACHINE_TOKEN_DIR export BOSS_SOR_ENV unset BOSS_JOBS_URL unset BOSS_MACHINE_TOKEN_HOSTS" \
+        "$tmp/misdeclared.sh:2: export BOSS_MACHINE_TOKEN_DIR export BOSS_SOR_ENV unset BOSS_JOBS_URL unset BOSS_MACHINE_TOKEN_HOSTS" \
+        "$tmp/late-live.sh:1: export BOSS_MACHINE_TOKEN_DIR export BOSS_SOR_ENV unset BOSS_JOBS_URL unset BOSS_MACHINE_TOKEN_HOSTS" \
         "$tmp/dirname.sh:2: export BOSS_MACHINE_TOKEN_DIR export BOSS_SOR_ENV unset BOSS_JOBS_URL unset BOSS_MACHINE_TOKEN_HOSTS" \
         "$tmp/toplevel-git.sh:2: export BOSS_MACHINE_TOKEN_DIR export BOSS_SOR_ENV unset BOSS_JOBS_URL unset BOSS_MACHINE_TOKEN_HOSTS" \
         "$tmp/late.sh:1: export BOSS_MACHINE_TOKEN_DIR export BOSS_SOR_ENV unset BOSS_JOBS_URL unset BOSS_MACHINE_TOKEN_HOSTS" \
@@ -287,12 +343,12 @@ SH
         "$tmp/toplevel.sh:2: export BOSS_MACHINE_TOKEN_DIR export BOSS_SOR_ENV unset BOSS_JOBS_URL unset BOSS_MACHINE_TOKEN_HOSTS" \
         | LC_ALL=C sort -u)"
     if [ "$hits" != "$want" ]; then
-        echo "$NAME: self-test FAILED — six refused shapes must be named by file:line and what they lack, three accepted shapes must pass; got:" >&2
+        echo "$NAME: self-test FAILED — tree sourcing must be hermetic, including build-only skips and misdeclared live readers; got:" >&2
         printf '%s\n' "$hits" >&2
         rm -rf "$tmp"; return 1
     fi
     rm -rf "$tmp"
-    echo "$NAME: self-test ok — the header libs are derived from what sources secret-header.sh; \$( ( . \"\$var\" ) ) with no hermetic block, a top-level source by name, a block missing the unset, a block after the sourcing, and the dirname and git rev-parse idioms are each named by file:line; the hermetic shape, the two-step export, prose, heredocs and other libs pass"
+    echo "$NAME: self-test ok — header libs are derived; ten unhermetic or misdeclared shapes are refused; hermetic readers and an explicit preceding live-deployment declaration pass"
 }
 
 self_test || exit 1
@@ -335,5 +391,5 @@ MSG
     exit 1
 fi
 
-echo "$NAME: ok — every lint that sources a header-making lib gives itself no token in reach first"
+echo "$NAME: ok — header-making readers are hermetic or explicitly declared against a LIVE deployment"
 exit 0

@@ -62,6 +62,16 @@
 //! through the same function, `job_holds`, so the two agree on what a
 //! record is. A spared packet stays open and is logged, never guessed.
 //!
+//! `unless_linked_job_proves_progress` declares a related kind, its
+//! source-id link, native start step, live step, success step and typed
+//! metadata evidence (d4a3e74f). The newest native launch wins, including
+//! terminal launches: an old open gate cannot hide a newer failure, but
+//! a green gate waiting for linked completion is still progress. Its
+//! branch/SHA describe the linked packet's frozen launch, not a match
+//! to the author's working tree, which the source does not record.
+//! An unreadable or incomplete linked roster refuses before any writes.
+//! Report prose alone proves neither an active gate nor success.
+//!
 //! `now` is the tick's own `_at`, which the schedule runner writes onto
 //! every sub-day firing. The handler holds no clock: a rule that fires
 //! this on a DAILY cadence gets no `_at` and is refused as permanent —
@@ -73,7 +83,7 @@
 //! packet this one aged out. A tick that dies between two packets
 //! leaves the second for the next tick. Nothing is ever written twice.
 
-use super::common::{api_client, complete_step, open_jobs_of_kind};
+use super::common::{api_client, complete_step, get_json, open_jobs_of_kind, rows_or_refuse};
 use super::jobs_complete_linked_step::{is_open, is_unset, step_by_slug, template_arg};
 use super::jobs_complete_step_from_record::job_holds;
 use async_trait::async_trait;
@@ -82,6 +92,254 @@ use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext, 
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use std::sync::Arc;
+
+/// Registry data chooses the linked obligation and the records proving
+/// progress (d4a3e74f). No kind, step or outcome is hardcoded here.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinkedProgress {
+    kind: String,
+    link: String,
+    started_step: String,
+    live_step: String,
+    success_step: String,
+    metadata_formats: std::collections::BTreeMap<String, ProgressFormat>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ProgressFormat {
+    Nonblank,
+    GitSha,
+    Timestamp,
+}
+
+impl LinkedProgress {
+    fn from_args(args: &[(String, Value)]) -> Result<Option<Self>, HandlerError> {
+        let Some(value) = arg(args, "unless_linked_job_proves_progress") else {
+            return Ok(None);
+        };
+        let Value::String(text) = value else {
+            return Err(HandlerError::Permanent(
+                "unless_linked_job_proves_progress must be a JSON string".into(),
+            ));
+        };
+        let guard: Self = serde_json::from_str(text).map_err(|e| {
+            HandlerError::Permanent(format!("unless_linked_job_proves_progress: {e}"))
+        })?;
+        if [
+            &guard.kind,
+            &guard.link,
+            &guard.started_step,
+            &guard.live_step,
+            &guard.success_step,
+        ]
+        .iter()
+        .any(|s| s.trim().is_empty() || s.contains(['&', '?', '=']))
+            || guard.metadata_formats.is_empty()
+            || guard.metadata_formats.keys().any(|s| s.trim().is_empty())
+        {
+            return Err(HandlerError::Permanent(
+                "linked progress requires named kind, link, steps and metadata formats".into(),
+            ));
+        }
+        Ok(Some(guard))
+    }
+
+    fn started_at(&self, linked: &serde_json::Value) -> Option<DateTime<Utc>> {
+        let started = step_by_slug(linked, &self.started_step)?;
+        if started.get("status")?.as_str()? != "completed" {
+            return None;
+        }
+        DateTime::parse_from_rfc3339(started.get("completed_at")?.as_str()?)
+            .ok()
+            .map(|t| t.with_timezone(&Utc))
+    }
+
+    fn latest<'a>(
+        &self,
+        source: &serde_json::Value,
+        linked: &'a [serde_json::Value],
+        now: DateTime<Utc>,
+    ) -> Result<Option<(&'a serde_json::Value, DateTime<Utc>)>, HandlerError> {
+        let Some(id) = source
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(None);
+        };
+        // Include terminal packets: an older open launch must not hide
+        // a newer failed launch. A completed success is progress while
+        // its linked completion settles, not evidence of a dead actor.
+        let launches: Vec<_> = linked
+            .iter()
+            .filter(|j| {
+                j.get("kind").and_then(serde_json::Value::as_str) == Some(self.kind.as_str())
+            })
+            .filter(|j| {
+                j.get("metadata")
+                    .and_then(|m| m.get(&self.link))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(id)
+            })
+            .map(|j| {
+                if step_by_slug(j, &self.started_step)
+                    .and_then(|s| s.get("status"))
+                    .and_then(serde_json::Value::as_str) == Some("completed")
+                    && self.started_at(j).is_none()
+                {
+                    return Err(HandlerError::Downstream(format!(
+                        "linked packet {} for source {id} has an unreadable completed launch stamp — refusing unknown launch ordering",
+                        j["id"]
+                    )));
+                }
+                Ok(self.started_at(j).map(|at| (j, at)))
+            })
+            .collect::<Result<Vec<_>, HandlerError>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        let Some(at) = launches.iter().map(|(_, at)| *at).max() else {
+            return Ok(None);
+        };
+        let latest: Vec<_> = launches.into_iter().filter(|(_, t)| *t == at).collect();
+        if at > now || latest.len() != 1 {
+            return Err(HandlerError::Downstream(format!(
+                "linked progress for source {id} has {} launches at {at}, firing {now} — refusing an ambiguous or stale silence judgment: {}",
+                latest.len(),
+                serde_json::Value::Array(latest.iter().map(|(j, _)| j["id"].clone()).collect())
+            )));
+        }
+        if let Some((job, _)) = latest.first()
+            && let Some(success) = step_by_slug(job, &self.success_step)
+            && success.get("status").and_then(serde_json::Value::as_str) == Some("completed")
+            && success
+                .get("completed_at")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|stamp| DateTime::parse_from_rfc3339(stamp).ok())
+                .is_some_and(|stamp| stamp > now)
+        {
+            return Err(HandlerError::Downstream(format!(
+                "linked packet {} succeeded after firing {now} for source {id} — refusing a stale silence judgment",
+                job["id"]
+            )));
+        }
+        Ok(latest.into_iter().next())
+    }
+
+    fn protects(
+        &self,
+        source: &serde_json::Value,
+        linked: &[serde_json::Value],
+        now: DateTime<Utc>,
+    ) -> bool {
+        let Some((j, at)) = self.latest(source, linked, now).ok().flatten() else {
+            return false;
+        };
+        if last_moved(source, None).is_none_or(|since| at < since) {
+            return false;
+        }
+        let valid_metadata = self.metadata_formats.iter().all(|(key, format)| {
+            let Some(text) = j
+                .get("metadata")
+                .and_then(|m| m.get(key))
+                .and_then(serde_json::Value::as_str)
+            else {
+                return false;
+            };
+            match format {
+                ProgressFormat::Nonblank => !text.trim().is_empty(),
+                ProgressFormat::GitSha => {
+                    text.len() == 40 && text.bytes().all(|c| c.is_ascii_hexdigit())
+                }
+                ProgressFormat::Timestamp => {
+                    // CLI seconds and the server microsecond stamp can
+                    // arrive in either order. Ordering uses the server
+                    // stamp alone; this field proves only its format.
+                    DateTime::parse_from_rfc3339(text).is_ok_and(|t| t <= now)
+                }
+            }
+        });
+        if !valid_metadata {
+            return false;
+        }
+        match j.get("status").and_then(serde_json::Value::as_str) {
+            Some("open") => step_by_slug(j, &self.live_step).is_some_and(is_open),
+            Some("closed") => step_by_slug(j, &self.success_step).is_some_and(|s| {
+                s.get("status").and_then(serde_json::Value::as_str) == Some("completed")
+                    && s.get("completed_at")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+                        .is_some_and(|t| t >= at && t <= now)
+            }),
+            _ => false,
+        }
+    }
+
+    async fn read(
+        &self,
+        handler: &JobsAgeOutStep,
+        rule: &str,
+    ) -> Result<Vec<serde_json::Value>, HandlerError> {
+        let mut rows = Vec::new();
+        let mut expected_total = None;
+        let mut ids = std::collections::HashSet::new();
+        loop {
+            let body = get_json(
+                &handler.client,
+                &format!(
+                    "{}/api/jobs?kind={}&full=true&limit=500&offset={}",
+                    handler.base(),
+                    self.kind,
+                    rows.len()
+                ),
+                rule,
+            )
+            .await?;
+            let total = body
+                .get("total")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    HandlerError::Downstream(
+                        "linked progress GET /api/jobs has no readable total".into(),
+                    )
+                })? as usize;
+            let page: Vec<serde_json::Value> =
+                rows_or_refuse(&body, "linked progress GET /api/jobs")
+                    .map_err(HandlerError::Downstream)?;
+            if expected_total.is_some_and(|expected| expected != total)
+                || rows.len() + page.len() > total
+            {
+                return Err(HandlerError::Downstream("linked progress GET /api/jobs changed its total or returned surplus rows — refusing a silence verdict".into()));
+            }
+            expected_total = Some(total);
+            for row in &page {
+                let id = row
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .ok_or_else(|| {
+                        HandlerError::Downstream(
+                            "linked progress GET /api/jobs row has no readable id".into(),
+                        )
+                    })?;
+                if !ids.insert(id.to_string()) {
+                    return Err(HandlerError::Downstream(format!(
+                        "linked progress GET /api/jobs repeated packet {id} — refusing a silence verdict"
+                    )));
+                }
+            }
+            if page.is_empty() && rows.len() < total {
+                return Err(HandlerError::Downstream("linked progress GET /api/jobs ended before its total — refusing a silence verdict".into()));
+            }
+            rows.extend(page);
+            if rows.len() >= total {
+                return Ok(rows);
+            }
+        }
+    }
+}
 
 /// Default metadata key the measurement lands under on the completed
 /// step. Overridable per rule via the `evidence_key` arg.
@@ -185,6 +443,7 @@ impl Handler for JobsAgeOutStep {
         let kind = arg_string(args, "kind")?;
         let step_slug = arg_string(args, "step")?;
         let bound = bound_hours(args)?;
+        let linked_progress = LinkedProgress::from_args(args)?;
         let evidence_key = match arg(args, "evidence_key") {
             Some(Value::String(s)) if !s.is_empty() => s.as_str(),
             _ => DEFAULT_EVIDENCE_KEY,
@@ -216,6 +475,22 @@ impl Handler for JobsAgeOutStep {
             })?;
 
         let candidates = open_jobs_of_kind(&self.client, self.base(), kind, &ctx.rule_name).await?;
+        // A failed/partial read is not absence. Read before any writes
+        // so an unavailable linked roster cannot produce a false death.
+        let linked = match &linked_progress {
+            Some(guard) => guard.read(self, &ctx.rule_name).await?,
+            None => Vec::new(),
+        };
+        if let Some(guard) = &linked_progress {
+            for source in candidates.iter().filter(|source| {
+                step_by_slug(source, step_slug).is_some_and(is_open)
+                    && silent_hours(source, since_key, now).is_some_and(|hours| hours >= bound)
+            }) {
+                // A future server stamp or tied latest launches are
+                // unknown ordering, not licence to choose a verdict.
+                guard.latest(source, &linked, now)?;
+            }
+        }
         for job in &candidates {
             let job_id = job.get("id").and_then(|v| v.as_str()).unwrap_or("");
             let Some(step) = step_by_slug(job, step_slug).filter(|s| is_open(s)) else {
@@ -248,6 +523,14 @@ impl Handler for JobsAgeOutStep {
                 continue;
             };
             if silent < bound {
+                continue;
+            }
+            if linked_progress
+                .as_ref()
+                .is_some_and(|guard| guard.protects(job, &linked, now))
+            {
+                tracing::info!(rule = %ctx.rule_name, packet = %job_id,
+                    "linked obligation proves progress — silence verdict deferred");
                 continue;
             }
             let Some(step_id) = step.get("id").and_then(|v| v.as_str()) else {
@@ -736,6 +1019,333 @@ mod tests {
         );
         let never = merges.iter().find(|(j, _, _)| j == AGELESS).unwrap();
         assert_eq!(never.2["aged_out"]["silent_hours"], 9.0);
+    }
+
+    fn linked_guard_args() -> Vec<(String, Value)> {
+        let mut a = args();
+        a.push((
+            "unless_linked_job_proves_progress".into(),
+            Value::String(json!({
+                "kind": "gate-run", "link": "agent_run", "live_step": "record-verdict",
+                "started_step": "launched", "success_step": "green",
+                "metadata_formats": {"branch": "nonblank", "sha": "git-sha", "launched_at": "timestamp"}
+            }).to_string()),
+        ));
+        a
+    }
+
+    fn linked_gate(id: &str, run_id: &str, at: &str, status: &str) -> serde_json::Value {
+        json!({
+            "id": id, "kind": "gate-run", "status": status,
+            "metadata": { "agent_run": run_id, "branch": "fix/example", "sha": "a".repeat(40),
+                "launched_at": at },
+            "steps": [
+                { "id": "launched", "spec_slug": "launched", "status": "completed", "completed_at": at },
+                { "id": "verdict", "spec_slug": "record-verdict", "status": if status == "open" { "ready" } else { "completed" } }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn a_live_linked_gate_spares_its_run_but_a_report_alone_does_not() {
+        let mut unprotected = run(FRESH, Some("2026-09-18T00:00:00Z"), None);
+        unprotected["metadata"]["report"] = json!("a builder said it was still running");
+        let (base, puts) = mock_jobs(vec![
+            run(SILENT, Some("2026-09-18T00:00:00Z"), None),
+            unprotected,
+            linked_gate("g", SILENT, "2026-09-18T05:00:00Z", "open"),
+        ])
+        .await;
+        let h = JobsAgeOutStep::with_client(crate::handlers::common::api_client(), &base);
+        h.invoke(&linked_guard_args(), &ctx(tick("2026-09-18T06:00:00Z")))
+            .await
+            .unwrap();
+        let written = puts.lock().unwrap().clone();
+        assert_eq!(
+            written.len(),
+            2,
+            "only the unprotected run gets merge + status: {written:?}"
+        );
+        assert!(written.iter().all(|(id, _, _)| id == FRESH), "{written:?}");
+    }
+
+    #[test]
+    fn linked_progress_requires_native_launch_and_uses_the_latest_verdict() {
+        let guard = LinkedProgress::from_args(&linked_guard_args())
+            .unwrap()
+            .unwrap();
+        let source = run(SILENT, Some("2026-09-18T00:00:00Z"), None);
+        let now = DateTime::parse_from_rfc3339("2026-09-18T06:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let live = linked_gate("g", SILENT, "2026-09-18T04:00:00Z", "open");
+        assert!(guard.protects(&source, std::slice::from_ref(&live), now));
+        let mut green = linked_gate("newer", SILENT, "2026-09-18T05:00:00Z", "closed");
+        green["steps"].as_array_mut().unwrap().push(json!({
+            "spec_slug":"green", "status":"completed", "completed_at":"2026-09-18T05:30:00Z"
+        }));
+        assert!(
+            guard.protects(&source, &[live.clone(), green.clone()], now),
+            "success pending settlement is not death"
+        );
+        green["steps"][2]["status"] = json!("skipped");
+        assert!(
+            !guard.protects(&source, &[live.clone(), green], now),
+            "newer failed launch beats older open one"
+        );
+        assert!(!guard.protects(&source, &[], now));
+        for (pointer, value) in [
+            ("/metadata/agent_run", json!(FRESH)),
+            ("/kind", json!("unrelated-kind")),
+            ("/metadata/branch", json!(" ")),
+            ("/metadata/sha", json!("not-a-frozen-sha")),
+            ("/metadata/launched_at", json!("not-a-time")),
+            ("/metadata/launched_at", json!("2026-09-18T07:00:00Z")),
+            ("/steps/0/status", json!("pending")),
+            ("/steps/0/completed_at", json!(null)),
+            ("/steps/0/completed_at", json!("not-server-time")),
+            ("/steps/0/completed_at", json!("2026-09-18T07:00:00Z")),
+            ("/steps/1/status", json!("completed")),
+            ("/status", json!("closed")),
+        ] {
+            let mut bad = live.clone();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                !guard.protects(&source, &[bad], now),
+                "invalid evidence at {pointer}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_linked_roster_refuses_without_writing_a_death() {
+        let source = run(SILENT, Some("2026-09-18T00:00:00Z"), None);
+        let stub = crate::handlers::listing_stub::serve(vec![
+            (
+                "/api/jobs?kind=agent-run",
+                json!({"data":[source],"total":1}),
+            ),
+            ("/api/jobs?kind=gate-run", json!({"total":1})),
+        ])
+        .await;
+        let handler =
+            JobsAgeOutStep::with_client(crate::handlers::common::api_client(), &stub.base);
+        assert!(matches!(
+            handler
+                .invoke(&linked_guard_args(), &ctx(tick("2026-09-18T06:00:00Z")))
+                .await,
+            Err(HandlerError::Downstream(_))
+        ));
+        assert!(stub.writes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn linked_progress_reads_the_whole_roster_and_refuses_a_short_walk() {
+        let source = run(SILENT, Some("2026-09-18T00:00:00Z"), None);
+        let unrelated = (0..500)
+            .map(|i| linked_gate(&format!("other-{i}"), FRESH, "2026-09-18T04:00:00Z", "open"))
+            .collect::<Vec<_>>();
+        for tail in [
+            json!({"data":[linked_gate("last",SILENT,"2026-09-18T05:00:00Z","open")],"total":501}),
+            json!({"data":[],"total":501}),
+        ] {
+            let complete = !tail["data"].as_array().unwrap().is_empty();
+            let stub = crate::handlers::listing_stub::serve(vec![
+                (
+                    "/api/jobs?kind=agent-run",
+                    json!({"data":[source.clone()],"total":1}),
+                ),
+                (
+                    "/api/jobs?kind=gate-run&offset=0",
+                    json!({"data":unrelated,"total":501}),
+                ),
+                ("/api/jobs?kind=gate-run&offset=500", tail),
+            ])
+            .await;
+            let handler =
+                JobsAgeOutStep::with_client(crate::handlers::common::api_client(), &stub.base);
+            let result = handler
+                .invoke(&linked_guard_args(), &ctx(tick("2026-09-18T06:00:00Z")))
+                .await;
+            if complete {
+                result.unwrap();
+            } else {
+                assert!(matches!(result, Err(HandlerError::Downstream(_))));
+            }
+            assert!(stub.writes().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_launch_after_the_firing_refuses_the_stale_silence_judgment() {
+        let (base, puts) = mock_jobs(vec![
+            run(SILENT, Some("2026-09-18T00:00:00Z"), None),
+            linked_gate("g", SILENT, "2026-09-18T06:01:00Z", "open"),
+        ])
+        .await;
+        let handler = JobsAgeOutStep::with_client(crate::handlers::common::api_client(), &base);
+        assert!(matches!(
+            handler
+                .invoke(&linked_guard_args(), &ctx(tick("2026-09-18T06:00:00Z")))
+                .await,
+            Err(HandlerError::Downstream(_))
+        ));
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "a stale firing cannot declare observed later work dead"
+        );
+    }
+
+    #[tokio::test]
+    async fn success_after_the_firing_refuses_the_stale_silence_judgment() {
+        let mut green = linked_gate("g", SILENT, "2026-09-18T05:00:00Z", "closed");
+        green["steps"].as_array_mut().unwrap().push(json!({
+            "spec_slug":"green", "status":"completed", "completed_at":"2026-09-18T06:01:00Z"
+        }));
+        let (base, puts) =
+            mock_jobs(vec![run(SILENT, Some("2026-09-18T00:00:00Z"), None), green]).await;
+        let handler = JobsAgeOutStep::with_client(crate::handlers::common::api_client(), &base);
+        assert!(matches!(
+            handler
+                .invoke(&linked_guard_args(), &ctx(tick("2026-09-18T06:00:00Z")))
+                .await,
+            Err(HandlerError::Downstream(_))
+        ));
+        assert!(puts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unreadable_completed_launch_refuses_but_pending_launch_keeps_live_proof() {
+        for stamp in [json!(null), json!("unreadable")] {
+            let mut unknown = linked_gate("unknown", SILENT, "2026-09-18T05:30:00Z", "closed");
+            unknown["steps"][0]["completed_at"] = stamp;
+            let (base, puts) = mock_jobs(vec![
+                run(SILENT, Some("2026-09-18T00:00:00Z"), None),
+                linked_gate("older", SILENT, "2026-09-18T05:00:00Z", "open"),
+                unknown,
+            ])
+            .await;
+            let handler = JobsAgeOutStep::with_client(crate::handlers::common::api_client(), &base);
+            assert!(matches!(
+                handler
+                    .invoke(&linked_guard_args(), &ctx(tick("2026-09-18T06:00:00Z")))
+                    .await,
+                Err(HandlerError::Downstream(_))
+            ));
+            assert!(puts.lock().unwrap().is_empty());
+        }
+        let mut pending = linked_gate("pending", SILENT, "2026-09-18T05:30:00Z", "open");
+        pending["steps"][0]["status"] = json!("pending");
+        pending["steps"][0]["completed_at"] = json!(null);
+        let (base, puts) = mock_jobs(vec![
+            run(SILENT, Some("2026-09-18T00:00:00Z"), None),
+            linked_gate("older", SILENT, "2026-09-18T05:00:00Z", "open"),
+            pending,
+        ])
+        .await;
+        let handler = JobsAgeOutStep::with_client(crate::handlers::common::api_client(), &base);
+        handler
+            .invoke(&linked_guard_args(), &ctx(tick("2026-09-18T06:00:00Z")))
+            .await
+            .unwrap();
+        assert!(puts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn valid_launch_timestamp_rounding_is_progress_regression() {
+        let guard = LinkedProgress::from_args(&linked_guard_args())
+            .unwrap()
+            .unwrap();
+        let source = run(SILENT, Some("2026-09-18T00:00:00Z"), None);
+        let now = DateTime::parse_from_rfc3339("2026-09-18T06:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut gate = linked_gate("g", SILENT, "2026-09-18T05:00:00.880636Z", "open");
+        gate["metadata"]["launched_at"] = json!("2026-09-18T05:00:00Z");
+        assert!(
+            guard.protects(&source, &[gate], now),
+            "CLI seconds may precede the server microsecond stamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn equal_launch_timestamps_refuse_in_either_order_regression() {
+        let source = run(SILENT, Some("2026-09-18T00:00:00Z"), None);
+        let live = linked_gate("a", SILENT, "2026-09-18T05:00:00Z", "open");
+        let failed = linked_gate("b", SILENT, "2026-09-18T05:00:00Z", "closed");
+        for gates in [vec![live.clone(), failed.clone()], vec![failed, live]] {
+            let stub = crate::handlers::listing_stub::serve(vec![
+                (
+                    "/api/jobs?kind=agent-run",
+                    json!({"data":[source.clone()],"total":1}),
+                ),
+                ("/api/jobs?kind=gate-run", json!({"data":gates,"total":2})),
+            ])
+            .await;
+            let handler =
+                JobsAgeOutStep::with_client(crate::handlers::common::api_client(), &stub.base);
+            assert!(matches!(
+                handler
+                    .invoke(&linked_guard_args(), &ctx(tick("2026-09-18T06:00:00Z")))
+                    .await,
+                Err(HandlerError::Downstream(_))
+            ));
+            assert!(stub.writes().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn inconsistent_linked_pages_refuse_before_a_verdict_regression() {
+        let source = run(SILENT, Some("2026-09-18T00:00:00Z"), None);
+        let first = (0..500)
+            .map(|i| linked_gate(&format!("other-{i}"), FRESH, "2026-09-18T04:00:00Z", "open"))
+            .collect::<Vec<_>>();
+        for tail in [
+            json!({"data":[first[0]],"total":501}),
+            json!({"data":[linked_gate("tail",FRESH,"2026-09-18T04:00:00Z","open")],"total":502}),
+            json!({"data":[linked_gate("tail",FRESH,"2026-09-18T04:00:00Z","open"),linked_gate("surplus",FRESH,"2026-09-18T04:00:00Z","open")],"total":501}),
+        ] {
+            let stub = crate::handlers::listing_stub::serve(vec![
+                (
+                    "/api/jobs?kind=agent-run",
+                    json!({"data":[source.clone()],"total":1}),
+                ),
+                (
+                    "/api/jobs?kind=gate-run&offset=0",
+                    json!({"data":first,"total":501}),
+                ),
+                ("/api/jobs?kind=gate-run&offset=500", tail),
+            ])
+            .await;
+            let handler =
+                JobsAgeOutStep::with_client(crate::handlers::common::api_client(), &stub.base);
+            assert!(matches!(
+                handler
+                    .invoke(&linked_guard_args(), &ctx(tick("2026-09-18T06:00:00Z")))
+                    .await,
+                Err(HandlerError::Downstream(_))
+            ));
+            assert!(stub.writes().is_empty());
+        }
+    }
+
+    #[test]
+    fn the_authored_silence_rule_declares_the_same_progress_guard() {
+        let path = boss_testing::repo_root()
+            .join("infra/dispatcher/rules/agent-run-dies-when-building-is-silent.toml");
+        let rule: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let raw = rule["rule"][0]["do"][0]["args"]["unless_linked_job_proves_progress"]
+            .as_str()
+            .unwrap();
+        let value: String = serde_json::from_str(raw).unwrap();
+        let expected = linked_guard_args().pop().unwrap().1;
+        let Value::String(expected) = expected else {
+            panic!("guard JSON string");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&value).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&expected).unwrap()
+        );
     }
 
     #[test]

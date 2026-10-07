@@ -48,6 +48,112 @@ use std::path::{Path, PathBuf};
 /// the pin too.
 use boss_core::machine_gate::UNGATED;
 
+const ROLE_SERVER_ADAPTER: &str = "crates/core/boss-policy-client/src/role_service.rs";
+
+/// The report transport serves its caller's finished app. Count the
+/// caller as the boundary that must mount the gate, and verify that the
+/// transport cannot wrap, replace or otherwise consume that app first.
+fn server_calls(relative: &str, source: &str) -> usize {
+    if relative == ROLE_SERVER_ADAPTER {
+        assert!(
+            transparent_role_transport(source),
+            "role-report transport changed the caller's app"
+        );
+        return 0;
+    }
+    source.matches("axum::serve(").count()
+        + source.matches("role_service::serve_with_refresh(").count()
+}
+
+fn transparent_role_transport(source: &str) -> bool {
+    use syn::visit::Visit;
+    #[derive(Default)]
+    struct AppUses {
+        references: usize,
+        direct_serves: usize,
+        total_serves: usize,
+        shadows_app: bool,
+    }
+    impl<'a> Visit<'a> for AppUses {
+        fn visit_pat_ident(&mut self, pat: &'a syn::PatIdent) {
+            if pat.ident == "app" {
+                self.shadows_app = true;
+            }
+            syn::visit::visit_pat_ident(self, pat);
+        }
+        fn visit_expr_path(&mut self, path: &'a syn::ExprPath) {
+            if path.path.is_ident("app") {
+                self.references += 1;
+            }
+            syn::visit::visit_expr_path(self, path);
+        }
+        fn visit_expr_call(&mut self, call: &'a syn::ExprCall) {
+            if let syn::Expr::Path(path) = &*call.func
+                && path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect::<Vec<_>>()
+                    == ["axum", "serve"]
+            {
+                self.total_serves += 1;
+                if matches!(call.args.iter().nth(1), Some(syn::Expr::Path(app)) if app.path.is_ident("app"))
+                {
+                    self.direct_serves += 1;
+                }
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
+    let Ok(file) = syn::parse_file(source) else {
+        return false;
+    };
+    let Some(function) = file.items.iter().find_map(|item| match item {
+        syn::Item::Fn(f) if f.sig.ident == "serve_with_refresh" => Some(f),
+        _ => None,
+    }) else {
+        return false;
+    };
+    let mut whole = AppUses::default();
+    whole.visit_file(&file);
+    let mut transport = AppUses::default();
+    transport.visit_block(&function.block);
+    whole.total_serves == 1
+        && transport.direct_serves == 1
+        && transport.references == 1
+        && !transport.shadows_app
+}
+
+#[test]
+fn the_server_scan_counts_delegated_boundaries_and_refuses_a_changed_transport() {
+    let direct = "fn serve_with_refresh(listener: L, app: A) { axum::serve(listener, app); }";
+    assert!(transparent_role_transport(direct));
+    assert!(!transparent_role_transport(&direct.replace(
+        "axum::serve(listener, app)",
+        "axum::serve(listener, another_app)"
+    )));
+    assert!(!transparent_role_transport(&direct.replace(
+        "axum::serve(listener, app)",
+        "let app = Router::new(); axum::serve(listener, app)"
+    )));
+    assert!(!transparent_role_transport(&direct.replace(
+        "axum::serve(listener, app)",
+        "inspect(app.clone()); axum::serve(listener, app)"
+    )));
+    assert!(!transparent_role_transport(&direct.replace(
+        "axum::serve(listener, app)",
+        "let serve = |app| axum::serve(listener, app); serve(another_app)"
+    )));
+    let boundary = "fn main() { role_service::serve_with_refresh(listener, app); }";
+    assert_eq!(server_calls("service.rs", boundary), 1);
+    assert_eq!(
+        boundary.matches("machine_gate::mount(").count(),
+        0,
+        "a delegate without a gate is still refused"
+    );
+}
+
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -191,7 +297,7 @@ fn every_server_outside_a_test_mounts_the_machine_gate() {
         let rel = f.strip_prefix(&root).unwrap().to_string_lossy().to_string();
         let text = std::fs::read_to_string(f).unwrap_or_default();
         let prod = production_part(&text);
-        let serves = prod.matches("axum::serve(").count();
+        let serves = server_calls(&rel, prod);
         if serves == 0 {
             continue;
         }
@@ -409,6 +515,22 @@ fn a_gated_binary_does_not_listen_for_sigterm() {
 }
 
 #[test]
+fn the_shared_role_shutdown_leaves_sigterm_to_gate_evidence() {
+    let source = std::fs::read_to_string(
+        repo_root().join("crates/core/boss-policy-client/src/role_service.rs"),
+    )
+    .unwrap();
+    let sigterm = Regex::new(r"SignalKind::terminate\b|\bSIGTERM\b\s*[,)]").unwrap();
+    assert!(sigterm.is_match("signal(SignalKind::terminate())"));
+    assert!(!sigterm.is_match("tokio::signal::ctrl_c().await"));
+    assert!(
+        !sigterm.is_match(production_part(&source)),
+        "the shared role-report shutdown registers a second process termination owner"
+    );
+    assert!(source.contains("tokio::signal::ctrl_c().await"));
+}
+
+#[test]
 fn every_mount_names_a_port_roster_service() {
     let root = repo_root();
     let m = mounts(&root);
@@ -527,9 +649,33 @@ fn every_probe_and_the_watchdog_read_are_exempt_where_they_land() {
         needs.push(("jobs".to_string(), path, watchdog.to_string()));
     }
 
+    // The estate observer's dead-letter read (backlog 37742794,
+    // 2026-10-06). It is the same class as the watchdog's: an alarm's
+    // read, sent with no identity ON PURPOSE — boss-dispatcher's http.rs
+    // keeps `readyz` open "by decision rather than oversight", because
+    // an alarm that must be admitted before it can speak is an arm that
+    // needs the patient. The dispatcher's mount exempted `health` alone,
+    // so the gate tallied the read as a would-refuse fact every fifteen
+    // minutes (281 in the 72 hours to 2026-10-06T17:41Z, from 207 pod
+    // addresses) and would have answered it 401 under enforce — the
+    // observer's `dispatcher_unread`, three of which raise an alarm that
+    // says the dispatcher went blind when the gate did.
+    let observer = "infra/cluster/manifests/boss-estate-observe.yaml";
+    let text = std::fs::read_to_string(root.join(observer)).unwrap();
+    let re = Regex::new(r#"curl [^\n]*"\$\{?DISPATCHER_API\}?(/[A-Za-z0-9/_.-]+)""#).unwrap();
+    let reads: Vec<String> = re.captures_iter(&text).map(|c| c[1].to_string()).collect();
+    assert!(
+        !reads.is_empty(),
+        "{observer} reads no $DISPATCHER_API path — it read /api/dispatcher/readyz when this \
+         landed, so the parse is broken"
+    );
+    for path in reads {
+        needs.push(("dispatcher".to_string(), path, observer.to_string()));
+    }
+
     let mut missing = Vec::new();
     for (svc, path, from) in needs {
-        if UNGATED.iter().any(|u| u.service == svc) {
+        if UNGATED.iter().any(|u| u.service == Some(svc.as_str())) {
             continue;
         }
         match m.get(&svc) {

@@ -1757,6 +1757,7 @@ required_roles = []
 
 [[step_type]]
 kind = "workflow-publish"
+conditional_completion = "inline-effect"
 label = "Publish Workflow"
 category = "admin"
 ux = "inline"

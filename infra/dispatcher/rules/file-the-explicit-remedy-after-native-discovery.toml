@@ -1,0 +1,20 @@
+# A native read's conserved stdout proposes arguments, never permission.
+# The relationship lives on the mutation verb (backlog53c8cb72).
+[[rule]]
+name = "file-the-explicit-remedy-after-native-discovery"
+version = 1
+why = """
+A CROSS-PROTOCOL REACTOR: an estate comparison files an allowlisted
+native argument-discovery read, and its completed ops-request supplies
+the explicit arguments for a separate passkey-gated remedy request.
+The registry declares the relationship. Complete successful stdout is
+verified against its retained byte receipt and parsed as one proposal;
+the final target, approval contract and decline/open/recent episode
+guards are read again before filing. A proposal grants no authority:
+the ordinary runner renders the explicit plan for the named approver's
+passkey and rechecks the signed hash before any mutation.
+"""
+on_event = "step.done.task"
+when = 'workflow_kind = "ops-request" AND spec_slug = "execute"'
+[[rule.do]]
+handler = "ops.file_discovered_remedies"

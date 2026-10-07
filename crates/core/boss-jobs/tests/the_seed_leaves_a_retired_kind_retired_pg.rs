@@ -38,7 +38,7 @@ fn operator() -> ActorId {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_retired_kind_with_a_bundle_file_is_left_retired() {
     let db = TestDb::new().await;
-    let registry = PgWorkflows::new(db.pool.clone());
+    let registry = PgWorkflows::for_fixture(db.pool.clone());
     let bundle = load_workflows(platform_bundle_path()).expect("the platform bundle parses");
     assert!(bundle.len() >= 2, "an empty bundle would prove nothing");
     let now = chrono::Utc::now();

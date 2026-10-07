@@ -137,6 +137,7 @@ pub(crate) struct Settings {
     pub model: String,
     pub budget_usd: f64,
     pub effort: String,
+    pub executor_provenance: boss_jobs::executor_attestation::ExecutorProvenanceRequirement,
 }
 
 /// The overrides the flags name. Each is applied over the block's
@@ -160,6 +161,7 @@ pub(crate) fn block_on_step(step: &Value) -> Option<Settings> {
         model: a.model,
         budget_usd: a.budget_usd,
         effort: a.effort.as_str().to_string(),
+        executor_provenance: a.executor_provenance,
     })
 }
 
@@ -178,6 +180,7 @@ pub(crate) fn block_in_row(row: &Value, slug: &str) -> Option<Settings> {
         model: a.model,
         budget_usd: a.budget_usd,
         effort: a.effort.as_str().to_string(),
+        executor_provenance: a.executor_provenance,
     })
 }
 
@@ -303,6 +306,7 @@ pub(crate) fn resolve(block: Settings, over: &Overrides) -> std::result::Result<
         model: over.model.clone().unwrap_or(block.model),
         budget_usd: over.budget_usd.unwrap_or(block.budget_usd),
         effort: over.effort.clone().unwrap_or(block.effort),
+        executor_provenance: block.executor_provenance,
     };
     let effort: boss_jobs::agent_spec::Effort = serde_json::from_value(json!(settings.effort))
         .map_err(|_| {
@@ -316,6 +320,7 @@ pub(crate) fn resolve(block: Settings, over: &Overrides) -> std::result::Result<
         model: settings.model.clone(),
         budget_usd: settings.budget_usd,
         effort,
+        executor_provenance: settings.executor_provenance,
     };
     match boss_jobs::agent_spec::refusal(&spec) {
         Some(why) => Err(why),
@@ -795,6 +800,62 @@ pub(crate) fn definition_in(repo: &Path, settings: &Settings) -> Option<String> 
     path.is_file().then_some(name)
 }
 
+/// Check the actual selected definition before a hook claims work. This
+/// proves compatible configured controls, not an authenticated runtime receipt.
+fn hook_definition_compatibility(repo: &Path, settings: &Settings) -> Result<()> {
+    let Some(name) = definition_in(repo, settings) else {
+        return Ok(());
+    };
+    let path = repo
+        .join(boss_jobs::agent_spec::DEFINITIONS_DIR)
+        .join(format!("{name}.md"));
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let mut lines = text.lines();
+    if lines.next() != Some("---") {
+        bail!("{name}: missing definition frontmatter");
+    }
+    let mut model = None;
+    let mut effort = None;
+    let mut closed = false;
+    for line in lines {
+        if line == "---" {
+            closed = true;
+            break;
+        }
+        if let Some((key, value)) = line.split_once(':') {
+            let target = match key.trim() {
+                "model" => Some(&mut model),
+                "effort" => Some(&mut effort),
+                _ => None,
+            };
+            if let Some(target) = target
+                && target.replace(value.trim()).is_some()
+            {
+                bail!("{name}: duplicate {key} control");
+            }
+        }
+    }
+    let configured_model = settings
+        .model
+        .strip_prefix("claude-")
+        .unwrap_or(&settings.model);
+    if !closed
+        || model != Some(boss_jobs::agent_spec::DEFINITION_MODEL)
+        || effort != Some(settings.effort.as_str())
+        || !(configured_model == boss_jobs::agent_spec::DEFINITION_MODEL
+            || configured_model
+                .starts_with(&format!("{}-", boss_jobs::agent_spec::DEFINITION_MODEL)))
+    {
+        bail!(
+            "{name}: definition model/effort controls cannot execute declared model `{}` at effort `{}`; use a compatible registered launcher; nothing claimed, nothing filed",
+            settings.model,
+            settings.effort
+        );
+    }
+    Ok(())
+}
+
 /// THE UNHELD-REVIEW DOOR (review 0545d1b1 of car bc9ef34f,
 /// 2026-09-30). Every car's `review` step carries the reviewer block
 /// once ship-a-change declares it, held or not, and an unheld car
@@ -871,21 +932,22 @@ impl Isolation {
     }
 }
 
-/// The isolation as a CONTROL, for the operator who pastes the prompt
-/// by hand — the hook sets it on the call ([`effort_line`]'s twin).
+/// Requested isolation; only the owning harness receipt proves it was applied.
 pub(crate) fn isolation_line(isolation: Isolation) -> String {
     match isolation {
-        Isolation::Worktree => "Launched with isolation worktree — this profile's lane ships a \
-             car, so the run builds in a git worktree of its own. The PreToolUse hook sets it \
-             on the Agent call; a prompt pasted by hand must pass it."
+        Isolation::Worktree => "Requested isolation: worktree — this profile ships a car and must \
+             build in its own locked git worktree. For Claude Code, the PreToolUse hook requests \
+             worktree isolation on the Agent call. Other harnesses must use their supported \
+             isolation control; this printed brief does not prove it was applied."
             .to_string(),
-        Isolation::Shared => "Launched WITHOUT isolation — this profile's lane builds nothing \
-             in this tree, so a worktree of it would hold none of the run's work, and a \
-             worktree-isolated session refuses every heredoc and compound command it cannot \
-             verify, about three times the tool calls for a read-only run (backlog 65cea113). \
-             The PreToolUse hook drops it from the Agent call; a prompt pasted by hand must not \
-             pass it."
-            .to_string(),
+        Isolation::Shared => {
+            "Requested isolation: shared — this profile builds no source in this BOSS checkout \
+             (65cea113). A tenant builder builds source in its tenant repository, in the locked \
+             worktree required by its profile. \
+             For Claude Code, the PreToolUse hook omits worktree isolation on the Agent call. \
+             This printed brief does not establish the actual harness or isolation."
+                .to_string()
+        }
     }
 }
 
@@ -943,7 +1005,7 @@ pub(crate) fn run_section(
         .unwrap_or_default();
     format!(
         "== THE RUN ==\n\n\
-         Your run is agent-run {run_id} (profile `{}`, model {}, budget ${}, effort {}).\n\
+         Your run is agent-run {run_id} (profile `{}`, requested model {}, declared budget ${}, requested effort {}).\n\
          {}\n\
          Before `boss gate`, in the shell you gate from: export {}={run_id}\n\
          The gate-run then records this run, and a green lands it by itself.\n\
@@ -974,8 +1036,8 @@ pub(crate) fn run_section(
 pub(crate) fn marker_line(run_id: &str) -> String {
     format!(
         "{} — if one session runs several runs, read each run's prompt when you START that \
-         run, not all of them up front: the report meters each run from the moment its marker \
-         reaches your transcript to the moment the next one does.",
+         run, not all of them up front. When a supported native adapter supplies verified usage, \
+         these markers delimit transcript attribution. A printed marker supplies no usage or spend.",
         crate::transcript_usage::marker(run_id)
     )
 }
@@ -1014,6 +1076,8 @@ pub(crate) fn working_dir_line(run_id: &str) -> String {
     )
 }
 
+/// Requested effort, with the Claude Code control named conditionally.
+/// Printing this block is not an observed launch (2f7b8c00).
 /// The effort as a CONTROL rather than a noun (backlog e720dd00,
 /// 2026-09-19). Until this landed the block's `effort` was validated,
 /// written onto the run packet and printed in the sentence above —
@@ -1025,10 +1089,11 @@ pub(crate) fn working_dir_line(run_id: &str) -> String {
 pub(crate) fn effort_line(settings: &Settings) -> String {
     let name = subagent_type(settings);
     format!(
-        "Launched with subagent_type {name} ({}/{name}.md) — the definition whose `effort` line \
-         is the effort this block declares. The PreToolUse hook sets it on the Agent call; a \
-         prompt pasted by hand must name it, or the run takes the session's own effort and the \
-         record says something untrue of it.",
+        "Requested effort: {}. For Claude Code, subagent_type {name} ({}/{name}.md) selects \
+         the definition and the PreToolUse hook requests it on the Agent call. Other harnesses \
+         must use their supported effort control. A printed brief is not launch evidence: \
+         the native execution receipt records the actual harness and observed model, when known.",
+        settings.effort,
         boss_jobs::agent_spec::DEFINITIONS_DIR
     )
 }
@@ -1046,9 +1111,10 @@ pub(crate) fn budget_line(budget_usd: f64) -> String {
     // stopped most of them mid-car, and David's direction (2026-09-23)
     // is that budgets must not limit building.
     format!(
-        "Budget: ${budget_usd} declared for this run — a cost reading, not a limit. The report \
-         meters your run from its transcript and records the spend against it; do not stop \
-         work to stay under it."
+        "Budget: ${budget_usd} is this run's declared budget, not a limit applied by this brief. \
+         Spend is recorded only from verified native usage supplied by a supported adapter; \
+         absent that evidence, usage and spend remain unknown. The configured model, effort, \
+         budget, and context do not establish consumption. Do not stop work to stay under it."
     )
 }
 
@@ -1414,6 +1480,10 @@ pub(crate) async fn dispatch_at(
     };
     let settings = resolve(block, over).map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    if matches!(source, BriefSource::Handed { .. }) {
+        hook_definition_compatibility(repo, &settings)?;
+    }
+
     // THE VENUE DOOR (10b07b73; the tenant lane, 6a34e9bc): where the
     // deliverable lives decides which profile the run is briefed under —
     // a car-lane block on a tenant-repo packet is briefed as the tenant
@@ -1571,7 +1641,12 @@ pub(crate) async fn dispatch_at(
     // refused by the rendered brief, and a handed prompt's dispatch is
     // not stopped over a control the caller can still set by hand.
     let isolation = Isolation::for_profile(repo, &settings.profile).ok();
-    let prompt = format!("{brief}\n{}", run_section(&run_id, &settings, isolation));
+    let mut prompt = format!("{brief}\n{}", run_section(&run_id, &settings, isolation));
+    if crate::dispatch_started::expectation(&run).is_some() {
+        prompt.push_str(&format!(
+            "\nWorker receipt: after reading this ENTIRE START, and once your own run's building step is ACTIVE and assigned to your running actor, run `BOSS_AGENT_RUN={run_id} boss dispatch {run_id} --started`. This records the own-run receipt through the audited metadata merge door. It carries no timestamp and claims neither physical execution nor delivery. A coordinator claim, host or session cannot substitute; if your assignment is not ACTIVE, report that blocker to the coordinator. Only this newly admitted declaration opts in; never repin an older run to add it.\n"
+        ));
+    }
     if matches!(source, BriefSource::Rendered) {
         print!("{prompt}");
     }
@@ -3292,6 +3367,7 @@ mod tests {
             model: "opus-5[1m]".into(),
             budget_usd: 5.0,
             effort: "high".into(),
+            executor_provenance: Default::default(),
         }
     }
 
@@ -3443,6 +3519,25 @@ mod tests {
             resolve(block(), &bad_budget)
                 .unwrap_err()
                 .contains("positive")
+        );
+    }
+
+    #[test]
+    fn dispatch_overrides_cannot_downgrade_pinned_executor_provenance() {
+        let mut declared = block();
+        declared.executor_provenance =
+            boss_jobs::executor_attestation::ExecutorProvenanceRequirement::Verified;
+        let resolved = resolve(
+            declared,
+            &Overrides {
+                model: Some("gpt-6.1-sol".into()),
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.executor_provenance,
+            boss_jobs::executor_attestation::ExecutorProvenanceRequirement::Verified
         );
     }
 
@@ -3669,7 +3764,10 @@ mod tests {
         assert!(s.contains("opus-5[1m]") && s.contains("$5") && s.contains("high"));
         // The budget reaches the run as a reading, never as a stop
         // (backlog e6b2066f: budgets must not limit building).
-        assert!(s.contains("Budget: $5 declared"), "{s}");
+        assert!(
+            s.contains("Budget: $5 is this run's declared budget"),
+            "{s}"
+        );
         assert!(s.contains("not a limit"), "{s}");
         assert!(!s.contains("stop and report before"), "{s}");
     }
@@ -3731,6 +3829,35 @@ mod tests {
         assert!(s.contains(WORKING_DIR_REFERENCE), "{s}");
     }
 
+    #[test]
+    fn the_budget_does_not_infer_spend_without_verified_native_usage() {
+        let line = budget_line(5.0);
+        assert!(line.contains("declared budget"), "{line}");
+        assert!(line.contains("verified native usage"), "{line}");
+        assert!(line.contains("unknown"), "{line}");
+        assert!(
+            !line.contains("meters your run from its transcript"),
+            "{line}"
+        );
+        assert!(line.contains("not a limit"), "{line}");
+    }
+
+    #[test]
+    fn the_brief_labels_the_model_as_requested_not_observed() {
+        let brief = run_section("316ba359-963e-4e91-bcac-aa88adbb23bc", &block(), None);
+        assert!(brief.contains("requested model"), "{brief}");
+    }
+
+    #[test]
+    fn a_printed_brief_does_not_claim_a_harness_applied_its_controls() {
+        let brief = run_section("316ba359-963e-4e91-bcac-aa88adbb23bc", &block(), None);
+        assert!(!brief.contains("Launched with"), "{brief}");
+        assert!(!brief.contains("Launched WITHOUT"), "{brief}");
+        assert!(brief.contains("Requested effort"), "{brief}");
+        assert!(brief.contains("Claude Code"), "{brief}");
+        assert!(brief.contains("execution receipt"), "{brief}");
+    }
+
     /// The declared effort must reach a CONTROL (backlog e720dd00):
     /// the prompt names the agent definition that runs at it, and the
     /// name is `agent_spec`'s one mapping — not a word retyped here.
@@ -3788,14 +3915,34 @@ mod tests {
 
         const RUN: &str = "5b1d2c3e-0000-4000-8000-000000000001";
         let s = run_section(RUN, &block(), Some(Isolation::Worktree));
-        assert!(s.contains("isolation worktree"), "{s}");
+        assert!(s.contains("Requested isolation: worktree"), "{s}");
         let s = run_section(RUN, &block(), Some(Isolation::Shared));
-        assert!(s.contains("WITHOUT isolation"), "{s}");
+        assert!(s.contains("Requested isolation: shared"), "{s}");
         assert!(s.contains("65cea113"), "the line says why: {s}");
         // Unknown (a lane that would not read) names nothing, and the
         // call keeps the caller's own choice.
         let s = run_section(RUN, &block(), None);
         assert!(!s.contains("isolation"), "{s}");
+    }
+
+    #[test]
+    fn a_tenant_source_builder_is_not_described_as_read_only() {
+        let isolation = Isolation::for_lane(crate::brief::LANE_TENANT);
+        assert_eq!(isolation, Isolation::Shared);
+        let rendered = run_section("tenant-run", &block(), Some(isolation));
+        assert!(
+            rendered.contains("builds no source in this BOSS checkout"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("tenant repository"), "{rendered}");
+        assert!(
+            !rendered.contains("read-only profile builds no source"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("does not establish the actual harness or isolation"),
+            "{rendered}"
+        );
     }
 
     /// A session loads `.claude/agents/*.md` ONCE, at its start
@@ -4749,6 +4896,41 @@ mod wire_tests {
         })
     }
 
+    #[tokio::test]
+    async fn a_hook_cannot_claim_a_non_opus_model_for_an_opus_definition() {
+        let (base, log) = stub(packet_without_projection(), row_with_block(), false).await;
+        let result = dispatch_at(
+            &crate::gate::machine_client().unwrap(),
+            &base,
+            &repo(),
+            PACKET,
+            None,
+            None,
+            &Overrides {
+                model: Some("gpt-6.1-sol".into()),
+                ..Overrides::default()
+            },
+            false,
+            "claude@algedonic.dev",
+            "emp-david",
+            "h",
+            BriefSource::Handed {
+                prompt: "p",
+                session: None,
+            },
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an opus definition cannot execute a GPT declaration"
+        );
+        assert_eq!(
+            writes_of(&log),
+            0,
+            "incompatible controls refuse before claim"
+        );
+    }
+
     /// The whole sequence: read, resolve the block off the row, claim,
     /// file, read back, print, complete `briefed` — and the prompt is
     /// the brief plus the run section, byte for byte what the packet
@@ -5282,7 +5464,11 @@ mod wire_tests {
             !brief.contains("gate uid"),
             "no car-lane gate facts: {brief}"
         );
-        assert!(d.prompt.contains("WITHOUT isolation"), "{}", d.prompt);
+        assert!(
+            d.prompt.contains("Requested isolation: shared"),
+            "{}",
+            d.prompt
+        );
     }
 
     /// A CAR HELD AT `review` DISPATCHES A REVIEWER (backlog bc9ef34f,

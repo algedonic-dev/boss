@@ -103,6 +103,7 @@ const DEPARTMENT_FUNCTIONS = ['operations', 'revenue', 'support', 'governance'].
 );
 
 type Reads = Readonly<{
+  manifest?: (r: Route) => Promise<void>;
   kinds?: (r: Route) => Promise<void>;
   workflows?: (r: Route) => Promise<void>;
   departments?: (r: Route) => Promise<void>;
@@ -114,6 +115,7 @@ type Reads = Readonly<{
 async function openSubjects(page: Page, reads: Reads = {}): Promise<void> {
   await installSmokeMocks(page);
   if (reads.modules) await installTenantManifest(page, reads.modules);
+  if (reads.manifest) await page.route(/\/api\/tenant\/manifest$/, reads.manifest);
   await page.route(/\/api\/subject-kinds$/, reads.kinds ?? ((r) => json(r, KINDS)));
   await page.route(CLASSES_OF('person'), (r) => json(r, []));
   await page.route(CLASSES_OF('employee'), (r) => json(r, [cls('employee', 'ceo', 'role')]));
@@ -185,6 +187,14 @@ test.describe('/it/registry/subjects names each kind by its module and the workf
     await expect(meta(page)).toContainText('module equipment · off on this instance');
     await expect(meta(page)).toContainText('1 active workflow names this kind');
     await expect(meta(page)).not.toContainText('owner');
+  });
+
+  test('an unavailable manifest never labels a declared module off', async ({ page }) => {
+    await openSubjects(page, { manifest: (r) => json(r, { error: 'unavailable' }, 503) });
+    await pick(page, 'asset').click();
+    await expect(meta(page)).toContainText('module equipment');
+    await expect(meta(page)).not.toContainText('off on this instance');
+    await expect(pick(page, 'asset')).not.toContainText('(off)');
   });
 
   test('a module the instance runs is named without the off mark', async ({ page }) => {

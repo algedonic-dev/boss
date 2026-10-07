@@ -1,0 +1,17 @@
+# Source declaration only. Publishing this rule, declaring the credential,
+# human scoping and receiver enrollment are separate recorded operations.
+[[rule]]
+name = "broker-prepares-the-runner-deposit-key"
+why = """
+EXTERNAL GLUE: approved per-host runner credential delivery (1e50e66b)
+needs an exact-purpose transport pair in broker-owned storage. The
+preparation protocol orders human scope, pair preparation and separate
+human receiver enrollment. This executor writes only the declared Secret
+and public preparation evidence; it does not enroll a receiver, verify
+delivery, revoke an identity, or spawn a packet.
+"""
+on_event = "step.done.credential-rotation"
+when = 'subject_id = "runner-deposit-key"'
+[[rule.do]]
+handler = "credential.prepare.ssh-deposit"
+args = { secret_namespace = "\"boss\"", secret_name = "\"runner-deposit-key\"", credential_id = "\"runner-deposit-key\"", protocol_kind = "\"prepare-a-deposit-key\"", receiver_host = "\"boss-gcp\"" }

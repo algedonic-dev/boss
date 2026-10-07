@@ -78,7 +78,7 @@ async fn smoke_tester_can_read_workflows_through_real_policy_api() {
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let publisher = DomainPublisher::new(bus_dyn, "jobs");
     let step_registry = Arc::new(StepRegistry::v1());
-    let kind_registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
+    let kind_registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::for_fixture());
 
     let state = JobsApiState {
         step_registry,

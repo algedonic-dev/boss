@@ -102,7 +102,12 @@ pub fn is_step_race(body: &Value) -> bool {
 /// believes ([`crate::written_by`], backlog aa816dd4). A writer that
 /// could delete it could then write the record it guards, so it is
 /// frozen as the protocol materialised it.
-pub const PROTOCOL_KEYS: &[&str] = &["outcome_kind", "audience", crate::written_by::KEY];
+pub const PROTOCOL_KEYS: &[&str] = &[
+    "outcome_kind",
+    "audience",
+    crate::written_by::KEY,
+    crate::credential_executor::KEY,
+];
 
 /// The hint a refused protocol key carries, on both doors.
 pub const PROTOCOL_KEYS_HINT: &str = "these metadata keys are materialised from the step's \

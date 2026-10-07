@@ -1,0 +1,5 @@
+[package]
+name = "synthetic-build-attack"
+version = "0.0.0"
+edition = "2024"
+build = "build.rs"

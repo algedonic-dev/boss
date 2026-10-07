@@ -52,7 +52,7 @@ async fn outbox_kinds(db: &TestDb) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_draft_and_publish_stage_their_events_in_the_outbox() {
     let db = TestDb::new().await;
-    let registry = PgWorkflows::new(db.pool.clone());
+    let registry = PgWorkflows::for_fixture(db.pool.clone());
     let now = chrono::Utc::now();
 
     registry
@@ -90,7 +90,7 @@ async fn pg_draft_and_publish_stage_their_events_in_the_outbox() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_retire_stages_once_and_stays_silent_when_already_retired() {
     let db = TestDb::new().await;
-    let registry = PgWorkflows::new(db.pool.clone());
+    let registry = PgWorkflows::for_fixture(db.pool.clone());
     let now = chrono::Utc::now();
 
     registry
@@ -119,4 +119,45 @@ async fn pg_retire_stages_once_and_stays_silent_when_already_retired() {
         .await
         .expect("count retired");
     assert_eq!(retired, 1, "the no-op retire must not stage a second event");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conditional_publication_rolls_back_its_row_when_the_outbox_refuses() {
+    let db = TestDb::new().await;
+    let registry = PgWorkflows::for_fixture(db.pool.clone());
+    sqlx::query(
+        "CREATE FUNCTION refuse_conditional_event() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN IF NEW.payload->>'kind' = 'conditional-outbox-refusal' THEN
+           RAISE EXCEPTION 'causal conditional outbox refusal'; END IF; RETURN NEW; END $$",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER refuse_conditional_event BEFORE INSERT ON event_outbox
+         FOR EACH ROW EXECUTE FUNCTION refuse_conditional_event()",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let result = registry
+        .publish_authored_if_absent(
+            spec("conditional-outbox-refusal", "Must roll back"),
+            boss_core::job::JobId::new(),
+            &author(),
+            chrono::Utc::now(),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(boss_jobs::registry::WorkflowError::Storage(_))),
+        "{result:?}"
+    );
+    assert!(
+        registry
+            .list_versions("conditional-outbox-refusal")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(outbox_kinds(&db).await.is_empty());
 }

@@ -8,6 +8,22 @@ import { jobsFilterSearch, searchWithoutNewJob } from './filterQuery';
 describe('jobsFilterSearch', () => {
   const none = { kind: '', status: 'open', subjectId: '' };
 
+  test('department is owned only by a general-list consumer and survives new-job cancel', () => {
+    expect(jobsFilterSearch('?department=finance&keep=yes', { ...none, department: '' })).toBe('?keep=yes');
+    expect(jobsFilterSearch('?keep=yes', { ...none, department: 'finance' })).toBe('?keep=yes&department=finance');
+    expect(jobsFilterSearch('?department=finance', none)).toBe('?department=finance');
+    expect(searchWithoutNewJob('?department=finance&new=1&kind=ad-hoc&subject_id=acc-1&keep=yes', {
+      ...none, department: 'finance',
+    })).toBe('?department=finance&keep=yes');
+  });
+
+  test('group and order survive reload and removal preserves unrelated deep-link parameters', () => {
+    expect(jobsFilterSearch('?other=keep', { ...none, kindGroup: 'group:machine', order: 'oldest' })).toBe('?other=keep&kind_group=group%3Amachine&order=oldest');
+    expect(jobsFilterSearch('?kind_group=other&order=oldest&new=1&kind=sale&subject_id=acc&other=keep', {
+      ...none, kindGroup: '', order: 'newest',
+    })).toBe('?new=1&kind=sale&subject_id=acc&other=keep');
+  });
+
   test('an unchanged filter leaves the URL exactly as it was', () => {
     // Mount runs the write too: it must not normalise a deep link.
     expect(jobsFilterSearch('', none)).toBe('');

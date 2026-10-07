@@ -353,6 +353,34 @@ fn the_image_cli_at_origin_main_is_execd_and_named() {
     );
 }
 
+#[test]
+fn selecting_the_published_cli_never_executes_a_candidate_version_probe() {
+    let f = Fixture::new("candidate-probe-reads-credential");
+    let main = main_sha();
+    f.image(&main);
+    f.build("debug", &main);
+    let fake_secret = f.root.join("synthetic-machine-token");
+    let effect = f.root.join("candidate-read-effect");
+    boss_testing::write_file(&fake_secret, "fake-test-material-only");
+    // --version is still arbitrary candidate execution. Record only
+    // the effect, never the material, against a synthetic fixture.
+    write_exec(
+        &f.root.join("target/debug/boss"),
+        &format!(
+            "#!/usr/bin/env bash\nif [ -r '{}' ]; then printf read > '{}'; fi\nprintf '%s\\n' 'boss built from {main}'\n",
+            fake_secret.display(),
+            effect.display(),
+        ),
+    );
+    let (rc, out) = f.run(&["orient"], &[]);
+    assert_eq!(rc, 0, "published positive control: {out}");
+    assert!(out.contains("ran=image"), "published door must work: {out}");
+    assert!(
+        !effect.exists(),
+        "candidate code read synthetic trusted material merely while selecting the published CLI"
+    );
+}
+
 /// The pod's record is a Service name, which boss-core no longer stamps
 /// by default (review of 54d9a23a, MEDIUM-1): the shim hands the CLI
 /// the host of `sor-url` as its token host list when nothing names one,

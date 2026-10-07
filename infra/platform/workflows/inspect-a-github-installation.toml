@@ -1,0 +1,41 @@
+# Source declaration only; publication is a separately recorded operation.
+[[workflow]]
+kind = "inspect-a-github-installation"
+label = "Inspect GitHub installation permissions"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "A platform administrator authorizes one declared credential's public installation read. The broker records the complete public permission map and exact observed identity, without minting, revoking, installing, granting or publishing anything. A diagnostic observation does not complete the failed publication it investigates."
+metadata = { department = "it", owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "scope"
+kind = "task"
+ready_when = "true"
+title_template = "Authorize the bounded installation read"
+authority_role = "platform-admin"
+audience = { role = "platform-admin" }
+metadata_defaults = { human_only = true, installation_diagnostic = "scope", procedure = "Authorize a public GET of this declared GitHub App installation. Supply the expected account login explicitly; an optional numeric account id adds a separate equality assertion. App id comes from the issuer-owned root; installation id comes from the declaration or issuer default. This does not authorize token minting, permission changes or retrying publication." }
+fields = [
+    { name = "credential", field_type = "non-empty-string", required = true },
+    { name = "expected_account_login", field_type = "non-empty-string", required = true },
+    { name = "expected_account_id", field_type = "integer", required = false },
+    { name = "reason", field_type = "non-empty-string", required = true },
+]
+
+[[workflow.step]]
+title = "observe"
+kind = "task"
+ready_when = "steps.scope.done"
+title_template = "Record the installation's public grants"
+audience = { role = "platform-admin" }
+metadata_defaults = { written_by = "rule:broker-observes-the-github-installation-grants", procedure = "The broker reads only the declared installation endpoint after rechecking human scope. It records full public evidence through the immutable first-record door. Failed or malformed reads leave grants unknown. A matching replay keeps the original receipt and timestamp; conflicting evidence cannot replace it." }
+fields = [{ name = "observation", field_type = "object", required = true }]
+
+[[workflow.step]]
+title = "observed"
+kind = "outcome"
+ready_when = "steps.observe.done"
+title_template = "Public installation observation recorded"
+terminal = { outcome = "observed" }
+metadata_defaults = { outcome_kind = "completed" }

@@ -24,6 +24,13 @@
 # never reach the cluster: `image_boots` runs the image's own launcher
 # check before anything is applied.
 
+# The machine token's one shell reader — sourced when it is beside this
+# lib, and only defines functions. answer_converge_requests and
+# tenant_check_alert say what it is for; a copy of this lib with no
+# reader in reach (a test's scratch tree) sends exactly as before.
+# shellcheck source=infra/lib/secret-header.sh
+if [ -r "$(dirname "${BASH_SOURCE[0]}")/../lib/secret-header.sh" ]; then . "$(dirname "${BASH_SOURCE[0]}")/../lib/secret-header.sh"; fi
+
 # THE CONVERGE APPLIES `*.yaml` AND NOTHING ELSE — one definition, two
 # readers (backlog e37a833d).
 #
@@ -858,6 +865,17 @@ tenant_check() {
 #   environment — sor.sh exits) cannot end the converge: visibility is
 #   never a precondition. Signed as this runner, not as the watchdog.
 tenant_check_alert() {
+    # The alert door stamps the machine token (alert-lib.sh
+    # alert_machine_headers), and it is sourced in the subshell below,
+    # where the reader refuses a FIRST call. So the header directory is
+    # opened here, in the converge's own shell; the door then only
+    # writes its files into it. Never required: with no reader, no slot
+    # or a refusal the alert is raised unstamped, as before (backlog
+    # 2710c8fc).
+    local CDL_ALERT_MT_HDR=""
+    if declare -F machine_token_header >/dev/null; then
+        machine_token_header CDL_ALERT_MT_HDR "${JOBS_API:-${BOSS_JOBS_URL:-}}" || CDL_ALERT_MT_HDR=""
+    fi
     (
         ALERT_ACTOR="automation:cluster-deploy-runner"
         . "$(dirname "${BASH_SOURCE[0]}")/alert-lib.sh"
@@ -1183,7 +1201,7 @@ broker_secrets() {
                     handler=${handler%%\"*} ;;
                 'args = '*)
                     case "$handler" in
-                        credential.rotate.*) ;;
+                        credential.rotate.*|credential.prepare.*) ;;
                         *) continue ;;
                     esac
                     ns=$(sed -nE 's/.*secret_namespace = "\\"([^"\\]+)\\"".*/\1/p' <<< "$line")
@@ -1332,6 +1350,20 @@ answer_converge_requests() {
     fi
     value=$(printf '%s' "$value" | tr -d '"\\' | tr '\n' ' ')
     body=$(printf '{"%s":"%s"}' "$key" "$value")
+    # THE MACHINE TOKEN IS PRESENTED, NEVER REQUIRED (design 6805c764;
+    # backlog 2710c8fc). This runs INSIDE the runner's EXIT trap
+    # (_finish), after the reader's chained cleanup has already removed
+    # any directory opened earlier — so the header is made here, and
+    # closed by hand below, because a trap set while the EXIT trap runs
+    # never fires and the 0600 file would outlive the run
+    # (infra/lib/secret-header.sh secret_header_close). No reader, no
+    # slot, a refused slot, a host off the estate's list or a file that
+    # cannot be made: the annotation goes out unstamped, as before, and
+    # the run's exit status is untouched either way.
+    local CDL_MT_HDR=""
+    if declare -F machine_token_header >/dev/null; then
+        machine_token_header CDL_MT_HDR "$BOSS_JOBS_URL" || CDL_MT_HDR=""
+    fi
     while IFS= read -r id; do
         case "$id" in
             "") continue ;;
@@ -1340,6 +1372,7 @@ answer_converge_requests() {
         esac
         code=$(printf '%s' "$body" | curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
             -X PATCH -H 'content-type: application/json' \
+            ${CDL_MT_HDR:+-H "$CDL_MT_HDR"} \
             -H 'x-boss-user: {"id":"automation:cluster-deploy-runner","role":"platform-admin","access_tier":"operator"}' \
             --data-binary @- "$BOSS_JOBS_URL/api/jobs/$id/metadata") || code="unreachable"
         case "$code" in
@@ -1347,5 +1380,6 @@ answer_converge_requests() {
             *)  echo "cluster-deploy-runner: could not annotate request ${id:0:8} ($key: $value) — API said $code; its maintenance packet still carries the verdict" >&2 ;;
         esac
     done < "$mine"
+    if declare -F secret_header_close >/dev/null; then secret_header_close; fi
     rm -f "$mine"
 }

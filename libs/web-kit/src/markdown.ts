@@ -60,6 +60,11 @@ function inline(escaped: string): string {
       });
       out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
       out = out.replace(/(^|\W)\*([^*\s][^*]*)\*/g, '$1<em>$2</em>');
+      // Underscore delimiters are the authored manual seed's shape.
+      // Transform text only: underscores in hrefs and identifiers stay literal.
+      out = out.split(/(<[^>]+>)/u).map((segment) => segment.startsWith('<') ? segment : segment
+        .replace(/(^|[^\w])__([^_]+)__(?=$|[^\w])/gu, '$1<strong>$2</strong>')
+        .replace(/(^|[^\w])_([^_\s][^_]*)_(?=$|[^\w])/gu, '$1<em>$2</em>')).join('');
       return out;
     })
     .join('');

@@ -435,15 +435,16 @@ pub fn convertibility(from: &WorkflowSpec, to: &WorkflowSpec) -> Convertibility 
 
         // The predicate decides when a step becomes ready. Editing it
         // can un-ready a ready step or re-ready a completed one. A
-        // WEAKER predicate is genuinely safe, but proving implication
-        // between two expressions is a different piece of work than
-        // this function, so any change is referred rather than guessed
+        // WEAKER predicate is genuinely safe. One bounded proof is
+        // P -> P OR X: the parser preserves P as the exact left branch,
+        // including evaluation order and short-circuiting (efacdfdd).
+        // Other implication claims are referred rather than guessed
         // — for a step that has OPENED. One still pending or skipped is
         // re-derived under the target by the re-pin, so for it the
         // question of implication never arises (backlog 4c6b4b74:
         // every backlog-item stuck at `measure` on v2-v11 was refused
         // here on steps that had never been ready).
-        if f.ready_when != t.ready_when {
+        if f.ready_when != t.ready_when && !preserves_left_or_branch(&f.ready_when, &t.ready_when) {
             obstacles.push(Obstacle::step_if_opened(
                 slug,
                 format!(
@@ -532,6 +533,16 @@ pub fn convertibility(from: &WorkflowSpec, to: &WorkflowSpec) -> Convertibility 
     }
 }
 
+/// Parentheses and whitespace disappear in the shared expression AST.
+/// Keep the old expression on the LEFT: X OR P could fail evaluating X
+/// before reaching P. Parse failures and every other rewrite stay unknown.
+fn preserves_left_or_branch(before: &str, after: &str) -> bool {
+    let (Ok(before), Ok(after)) = (boss_expr::parse(before), boss_expr::parse(after)) else {
+        return false;
+    };
+    matches!(after, boss_expr::Expr::BinaryOp(boss_expr::BinaryOp::Or, left, _) if *left == before)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,6 +564,7 @@ mod tests {
             fields: Vec::new(),
             authority_role: None,
             claimable: None,
+            executor: None,
             audience: None,
             agent: None,
             metadata_defaults: serde_json::json!({}),
@@ -895,8 +907,8 @@ mod tests {
     fn a_changed_predicate_on_a_step_that_never_opened_is_re_derived_not_referred() {
         let (before, after) = gains_a_measure_arm();
         assert!(
-            !convertibility(&before, &after).is_automatic(),
-            "the version pair still refers — it speaks for packets whose build opened"
+            convertibility(&before, &after).is_automatic(),
+            "the exact old predicate remains the first OR branch"
         );
         for build in [StepStatus::Skipped, StepStatus::Pending] {
             let at = standing(&[
@@ -918,7 +930,9 @@ mod tests {
     /// and this check still cannot prove the new one agrees.
     #[test]
     fn a_changed_predicate_on_a_step_that_opened_is_still_referred() {
-        let (before, after) = gains_a_measure_arm();
+        let (before, mut after) = gains_a_measure_arm();
+        after.steps[2].ready_when =
+            format!("({}) AND steps.measure.done", before.steps[2].ready_when);
         for build in [StepStatus::Ready, StepStatus::Active, StepStatus::Completed] {
             let at = standing(&[
                 ("triage", StepStatus::Completed),
@@ -936,6 +950,110 @@ mod tests {
         assert!(
             !convertibility_for_packet(&before, &after, &standing(&[])).is_automatic(),
             "a step the packet does not carry cannot be placed, so it bites"
+        );
+    }
+
+    #[test]
+    fn an_existing_left_or_branch_preserves_every_opened_step() {
+        let (before, after) = gains_a_measure_arm();
+        for build in [StepStatus::Ready, StepStatus::Active, StepStatus::Completed] {
+            assert_eq!(
+                convertibility_for_packet(&before, &after, &standing(&[("build", build)])),
+                Convertibility::Automatic,
+                "{build:?} retains its exact predicate"
+            );
+        }
+    }
+
+    #[test]
+    fn predicate_widening_parses_the_exact_left_branch_and_refuses_other_changes() {
+        let mut original = step("build");
+        original.ready_when = "steps.triage.done AND job.metadata.route = \"build\"".into();
+        let before = wf(vec![original.clone()]);
+        for predicate in [
+            "((steps.triage.done AND job.metadata.route = \"build\")) OR steps.measure.done",
+            "( steps.triage.done  AND  job.metadata.route = \"build\" ) OR unknown_helper()",
+        ] {
+            let mut widened = original.clone();
+            widened.ready_when = predicate.into();
+            assert!(
+                convertibility(&before, &wf(vec![widened])).is_automatic(),
+                "{predicate}"
+            );
+        }
+        for predicate in [
+            "steps.measure.done OR (steps.triage.done AND job.metadata.route = \"build\")",
+            "(steps.triage.done AND job.metadata.route = \"build\") AND steps.measure.done",
+            "(steps.triage.done AND job.metadata.route = \"design\") OR steps.measure.done",
+            "(steps.other.done AND job.metadata.route = \"build\") OR steps.measure.done",
+            "job.metadata.route = \"P OR X\"",
+            "(steps.triage.done AND job.metadata.route = \"build\") OR",
+        ] {
+            let mut changed = original.clone();
+            changed.ready_when = predicate.into();
+            assert!(
+                !convertibility(&before, &wf(vec![changed])).is_automatic(),
+                "{predicate}"
+            );
+        }
+        original.ready_when = "steps.triage.done AND".into();
+        let mut changed = original.clone();
+        changed.ready_when = format!("({}) OR true", original.ready_when);
+        assert!(!convertibility(&wf(vec![original]), &wf(vec![changed])).is_automatic());
+    }
+
+    #[test]
+    fn widening_keeps_the_evaluators_short_circuit_and_helper_errors() {
+        let payload = serde_json::json!({"old": true});
+        let context = boss_expr::Context {
+            payload: &payload,
+            helpers: &boss_expr::NoHelpers,
+        };
+        let preserved = boss_expr::parse("old OR unknown_helper()").expect("valid OR");
+        assert_eq!(
+            boss_expr::eval(&preserved, &context),
+            Ok(boss_expr::Value::Bool(true))
+        );
+        let reordered = boss_expr::parse("unknown_helper() OR old").expect("valid reordered OR");
+        assert!(matches!(
+            boss_expr::eval(&reordered, &context),
+            Err(boss_expr::EvalError::UnknownHelper(_))
+        ));
+        let mut old = step("build");
+        old.ready_when = "old".into();
+        let before = wf(vec![old.clone()]);
+        old.ready_when = "unknown_helper() OR old".into();
+        assert!(!convertibility(&before, &wf(vec![old])).is_automatic());
+    }
+
+    #[test]
+    fn predicate_widening_does_not_remove_independent_evidence_or_authority_obstacles() {
+        let (before, mut after) = gains_a_measure_arm();
+        after.steps[2].fields.push(field("receipt", true));
+        let verdict = convertibility_for_packet(
+            &before,
+            &after,
+            &standing(&[("build", StepStatus::Completed)]),
+        );
+        assert!(
+            !verdict.is_automatic(),
+            "retroactive evidence still refuses"
+        );
+        assert!(
+            verdict
+                .obstacles()
+                .iter()
+                .all(|o| !o.reason.contains("ready_when"))
+        );
+        let (before, mut after) = gains_a_measure_arm();
+        after.steps[2].authority_role = Some("platform-admin".into());
+        assert!(
+            !convertibility_for_packet(
+                &before,
+                &after,
+                &standing(&[("build", StepStatus::Active)])
+            )
+            .is_automatic()
         );
     }
 

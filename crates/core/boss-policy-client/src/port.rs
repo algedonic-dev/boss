@@ -88,7 +88,22 @@ pub trait PolicyRepository: Send + Sync {
     }
 
     /// Soft-delete (sets `active=false`). Writes `rule.deactivate` audit.
-    async fn deactivate_rule(&self, id: &str, changed_by: &str) -> Result<(), PolicyError>;
+    /// `judge` sees the row under that id, locked, inside the
+    /// transaction; a missing id is `NotFound` before it is asked. Until
+    /// car 3 of design 1c4e42e1 this write was never judged, so retiring
+    /// the one grant a control rested on went unseen (backlog 47aed706).
+    async fn deactivate_rule_judged(
+        &self,
+        id: &str,
+        changed_by: &str,
+        judge: Judge<'_, PolicyRule>,
+    ) -> Result<(), PolicyError>;
+
+    /// [`Self::deactivate_rule_judged`] with no caller to judge.
+    async fn deactivate_rule(&self, id: &str, changed_by: &str) -> Result<(), PolicyError> {
+        self.deactivate_rule_judged(id, changed_by, &unjudged::<PolicyRule>)
+            .await
+    }
 
     /// Active (non-expired) overrides for one user.
     async fn list_user_overrides(&self, user_id: &str) -> Result<Vec<UserOverride>, PolicyError>;

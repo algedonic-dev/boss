@@ -31,7 +31,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "The hourly conservation-invariant sweep: the platform's eight invariants (infra/lint/conservation-invariants.sh) on every instance, plus the tenant directory's own sweep when the image ships one (examples/brewery/conservation-invariants.sh on the playground). Hourly rather than nightly because a conservation break is a correctness fault, not housekeeping."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
 
 [[workflow.step]]
 title = "scheduled"

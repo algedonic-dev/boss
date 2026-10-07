@@ -24,12 +24,13 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use boss_events::events_api_config::EventsApiConfig;
-use boss_events::outbox_http::outbox_router;
-use boss_events::tail_http::audit_tail_router;
-use boss_events_api::gate_window_http::{LocalTallies, gate_window_router};
+use boss_events::outbox_http::outbox_router_with_reports;
+use boss_events::tail_http::audit_tail_router_with_reports;
+use boss_events_api::gate_window_http::{LocalTallies, gate_window_router_with_reports};
 use clap::Parser;
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
@@ -68,16 +69,45 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| "connecting to Postgres for audit_log reads")?;
 
+    let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+        boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+        Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+    ));
+    let mode = Arc::new(boss_policy_client::role_reader::MountedReportMode::mount());
+    let source = Arc::new(boss_policy_client::role_reader::HttpRoleReader::new(
+        std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
+        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
+        boss_policy_client::User::service("events"),
+    )?);
+    let wiring = boss_policy_client::role_service::assemble(
+        "events",
+        "/api/events/actor-role-reports",
+        Arc::new(boss_policy_client::ReqwestPolicyClient::new(
+            "events",
+            std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
+        )),
+        roles.clone(),
+        mode.clone(),
+        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
+            boss_policy_client::role_service::REPORT_CAPACITY,
+        )),
+    );
+
     // The dead-letter door (backlog e22b692e): this service owns
     // event_outbox, so the act on one of its rows happens here, behind
     // the signed caller and the Operator tier — `outbox_http`'s header.
-    let app = audit_tail_router(pool.clone())
-        .merge(outbox_router(pool.clone()))
-        .merge(gate_window_router(
+    let app = audit_tail_router_with_reports(pool.clone(), Some(wiring.guards.clone()))
+        .merge(outbox_router_with_reports(
+            pool.clone(),
+            Some(wiring.guards.clone()),
+        ))
+        .merge(gate_window_router_with_reports(
             std::sync::Arc::new(boss_events::PgGateEvidence::new(pool.clone())),
             std::sync::Arc::new(LocalTallies::from_ports().context("building gate tally reader")?),
             std::sync::Arc::new(boss_core::clock::WallClock),
-        ));
+            Some(wiring.guards),
+        ))
+        .merge(wiring.inventory);
     // Sim-origin middleware: extract x-sim-origin header and set the
     // per-request task-local so the publisher inherits the sim
     // marker. Closes the gap where a sim chain could trigger a
@@ -101,6 +131,15 @@ async fn main() -> Result<()> {
         &["/api/events/health"],
         Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
     );
-    axum::serve(listener, app).await?;
+    boss_policy_client::role_service::serve_with_refresh(
+        listener,
+        app,
+        roles,
+        source,
+        mode,
+        boss_policy_client::role_service::REFRESH_CADENCE,
+        boss_policy_client::role_service::shutdown_signal(),
+    )
+    .await?;
     Ok(())
 }

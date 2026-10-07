@@ -13,9 +13,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use boss_accounts::account_next_actions::next_actions_router;
+use boss_accounts::account_next_actions::next_actions_router_with_reports;
 use boss_accounts::account_notes::account_notes_router;
-use boss_accounts::account_risk_scores::risk_scores_router;
+use boss_accounts::account_risk_scores::risk_scores_router_with_reports;
 use boss_accounts::account_team_members::account_team_router;
 use boss_accounts::accounts::accounts_router;
 use boss_accounts::accounts_api_config::AccountsApiConfig;
@@ -98,6 +98,30 @@ async fn main() -> Result<()> {
         }
     };
 
+    let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+        boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+        Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+    ));
+    let mode = Arc::new(boss_policy_client::role_reader::MountedReportMode::mount());
+    let source = Arc::new(boss_policy_client::role_reader::HttpRoleReader::new(
+        std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
+        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
+        boss_policy_client::User::service("accounts"),
+    )?);
+    let wiring = boss_policy_client::role_service::assemble(
+        "accounts",
+        "/api/accounts/actor-role-reports",
+        Arc::new(boss_policy_client::ReqwestPolicyClient::new(
+            "accounts",
+            std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
+        )),
+        roles.clone(),
+        mode.clone(),
+        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
+            boss_policy_client::role_service::REPORT_CAPACITY,
+        )),
+    );
+
     // Compose the six routers under one app. Mirrors the boss-people-api
     // merge order so the route table is identical to the pre-split state.
     let app = axum::Router::new()
@@ -120,8 +144,15 @@ async fn main() -> Result<()> {
             clock.clone(),
             Some(classes_client.clone()),
         ))
-        .merge(next_actions_router(pool.clone(), clock.clone()))
-        .merge(risk_scores_router(pool.clone()))
+        .merge(next_actions_router_with_reports(
+            pool.clone(),
+            clock.clone(),
+            Some(wiring.guards.clone()),
+        ))
+        .merge(risk_scores_router_with_reports(
+            pool.clone(),
+            Some(wiring.guards),
+        ))
         .merge(support_cases_router(
             pool.clone(),
             publisher.clone(),
@@ -136,7 +167,8 @@ async fn main() -> Result<()> {
             axum::routing::get(|| async {
                 axum::Json(serde_json::json!({"status":"ok","service":"boss-accounts-api"}))
             }),
-        );
+        )
+        .merge(wiring.inventory);
     // Sim-origin middleware: extract x-sim-origin header and set the
     // per-request task-local so the publisher inherits the sim
     // marker. Closes the gap where a sim chain could trigger a
@@ -160,6 +192,15 @@ async fn main() -> Result<()> {
         &["/api/accounts/health"],
         Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
     );
-    axum::serve(listener, app).await?;
+    boss_policy_client::role_service::serve_with_refresh(
+        listener,
+        app,
+        roles,
+        source,
+        mode,
+        boss_policy_client::role_service::REFRESH_CADENCE,
+        boss_policy_client::role_service::shutdown_signal(),
+    )
+    .await?;
     Ok(())
 }

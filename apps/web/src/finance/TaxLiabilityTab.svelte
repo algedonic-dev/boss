@@ -24,12 +24,6 @@
     payroll_940: 'Payroll (Form 940)',
   };
 
-  const LIABILITY_DESCRIPTION: Record<string, string> = {
-    '2150': 'Payroll withholdings + employer-side tax; drained quarterly (941)',
-    '2300': 'Sales tax collected on invoices; drained monthly per jurisdiction',
-    '2310': 'Estimated income tax; drained quarterly',
-  };
-
   let data = $state<TaxLiabilitySummary | null>(null);
   let loading = $state(true);
 
@@ -101,7 +95,8 @@
               <tr>
                 <td class="mono">{r.account_code} · {r.account_name}</td>
                 <td style="color:var(--static); font-size:13px">
-                  {LIABILITY_DESCRIPTION[r.account_code] ?? ''}
+                  {typeof r.account_description === 'string' && r.account_description.trim()
+                    ? r.account_description : '—'}
                 </td>
                 <td class="num">{formatUsd(r.balance_cents)}</td>
               </tr>
@@ -126,9 +121,7 @@
     <Section title={`Accrued filings (${d.accrued_filings.length})`}>
         {#if d.accrued_filings.length === 0}
           <p class="empty">
-            No filings awaiting remittance. The tax-authorities generator sweeps
-            sales tax on the 20th of each month and payroll-941 on the 15th of
-            Jan / Apr / Jul / Oct.
+            0 accrued tax filings.
           </p>
         {:else}
           <table class="data-table data-table-striped">

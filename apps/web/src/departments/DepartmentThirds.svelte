@@ -75,6 +75,15 @@
     { id: 'working', note: 'a step is active, or one is done and the next waits' },
     { id: 'out', note: `closed in the last ${OUT_WINDOW_DAYS} days` },
   ];
+
+  // The close transition records the pinned terminal's outcome on the
+  // packet (b7263ac5). Closed alone cannot distinguish success from
+  // failure; missing or malformed evidence remains unknown.
+  function outcomeOf(j: Job): string {
+    if (j.status !== 'closed' && j.status !== 'cancelled') return '—';
+    const outcome = j.metadata?.['outcome'];
+    return typeof outcome === 'string' && outcome.trim().length > 0 ? outcome : 'unknown';
+  }
 </script>
 
 {#if page.kind === 'loading'}
@@ -137,6 +146,7 @@
         <th>Priority</th>
         <th>Opened</th>
         <th>Closed</th>
+        <th>Outcome</th>
       </tr>
     </thead>
     <tbody>
@@ -156,6 +166,7 @@
           <td>{j.priority}</td>
           <td>{j.opened_on}</td>
           <td>{j.closed_on ?? ''}</td>
+          <td class="outcome">{outcomeOf(j)}</td>
         </tr>
       {/each}
     </tbody>

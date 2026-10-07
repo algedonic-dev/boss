@@ -15,9 +15,12 @@ use anyhow::{Context, Result};
 use axum::Router;
 use tracing::{info, warn};
 
-use boss_policy::http::{PolicyApiState, router};
 use boss_policy::port::PolicyRepository;
-use boss_policy::{PgPolicy, PolicyEngine, default_rules};
+use boss_policy::{PgPolicy, default_rules};
+use boss_policy_client::role_reader::{
+    HttpRoleReader, MonotonicRoleSnapshotClock, MountedReportMode, SnapshotRoleReader,
+};
+use boss_policy_client::role_reporting::ReportTally;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -62,29 +65,48 @@ async fn main() -> Result<()> {
         "reconciled default policy rules"
     );
 
-    let engine = Arc::new(PolicyEngine::new(repo.clone()));
+    let role_mode = Arc::new(MountedReportMode::mount());
+    let roles = Arc::new(SnapshotRoleReader::new(
+        boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+        Arc::new(MonotonicRoleSnapshotClock),
+    ));
+    let role_source = Arc::new(HttpRoleReader::new(
+        std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
+        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
+        boss_policy_client::User::service("policy"),
+    )?);
     // The coverage read (design 1c4e42e1): the roster and its passkeys
     // from the people API, the active workflows from the jobs API — the
     // same env-over-port-table defaults every consumer takes.
-    let sources = Arc::new(boss_policy::coverage::HttpCoverageSources::new(
-        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
-        std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
-    ));
+    // The write doors' lockout guard reads the same three sources (car 3
+    // of design 1c4e42e1) — per write, never at boot, so the reconcile
+    // above never waits on the people or jobs API.
+    let sources: Arc<dyn boss_policy::coverage::CoverageSources> =
+        Arc::new(boss_policy::coverage::HttpCoverageSources::new(
+            std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
+            std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
+        ));
     let coverage = boss_policy::coverage::router(boss_policy::coverage::CoverageApiState {
         repo: repo.clone(),
-        sources,
+        sources: sources.clone(),
     });
     // F7 of backlog b8e75382 (design b08725c2 row D): what `/check` does
     // with an unsigned caller and a refused service is a mounted word,
     // re-read in seconds, so turning a refusal back is one edit and not a
     // deploy. Absent (every pod today) is `off`.
     let check_mode = boss_policy::check_mode::CheckMode::mount(Arc::clone(&recorder));
-    let state = PolicyApiState {
+    let app: Router = boss_policy::role_reports::mount(
         repo,
-        engine,
         check_mode,
-    };
-    let app: Router = router(state).merge(coverage);
+        sources,
+        roles.clone(),
+        role_mode.clone(),
+        Arc::new(ReportTally::new(
+            boss_policy_client::role_service::REPORT_CAPACITY,
+        )),
+        std::time::Duration::from_millis(100),
+    )
+    .merge(coverage);
 
     // Default port pulled from boss_ports — single source of truth
     // shared with the config generator + every BOSS_POLICY_URL
@@ -110,6 +132,29 @@ async fn main() -> Result<()> {
     info!(%bind, "boss-policy-api listening (postgres-backed)");
     let app =
         boss_core::machine_gate::mount(app, "policy", &["/api/policy/health"], Some(recorder));
-    axum::serve(listener, app).await?;
+    let (role_stop, stop) = tokio::sync::watch::channel(false);
+    let role_refresh = tokio::spawn(roles.run_refresh_loop(
+        role_source,
+        role_mode,
+        boss_policy_client::role_service::REFRESH_CADENCE,
+        stop,
+    ));
+    let served = axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let interrupt = async {
+                if let Err(error) = tokio::signal::ctrl_c().await {
+                    warn!(%error, "policy interrupt signal unavailable");
+                    std::future::pending::<()>().await;
+                }
+            };
+            // Gate evidence owns process termination; this path owns interrupts.
+            interrupt.await;
+        })
+        .await;
+    let _ = role_stop.send(true);
+    role_refresh
+        .await
+        .context("joining policy actor-role refresh")??;
+    served?;
     Ok(())
 }

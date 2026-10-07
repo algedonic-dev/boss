@@ -113,3 +113,17 @@ required-features = ["postgres"]
 [[test]]
 name = "workflow_status_audit_chain"
 required-features = ["postgres"]
+
+[[test]]
+name = "scope_role_reporting_preserves_refusal"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_people_write_preserves_a_real_control_holder"
+required-features = ["postgres"]
+
+# Reads the API binary's source for its PgPeople constructors; the binary
+# is the postgres build, so its pin is declared with it.
+[[test]]
+name = "the_people_binary_mounts_coverage_for_every_mutation"
+required-features = ["postgres"]

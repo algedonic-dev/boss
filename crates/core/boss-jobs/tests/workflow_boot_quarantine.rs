@@ -107,7 +107,7 @@ async fn assert_untouched(registry: &InMemoryWorkflows, jobs: &InMemoryJobs, kin
 
 #[tokio::test]
 async fn an_unviable_row_with_no_open_jobs_is_reported_and_left_untouched() {
-    let registry = Arc::new(InMemoryWorkflows::new());
+    let registry = Arc::new(InMemoryWorkflows::for_fixture());
     registry.seed(viable("healthy")).unwrap();
     registry.seed(unviable("publish-to-github")).unwrap();
     let jobs = Arc::new(InMemoryJobs::new());
@@ -143,7 +143,7 @@ async fn an_unviable_row_with_no_open_jobs_is_reported_and_left_untouched() {
 
 #[tokio::test]
 async fn an_unviable_row_with_open_jobs_pinned_is_reported_and_boot_continues() {
-    let registry = Arc::new(InMemoryWorkflows::new());
+    let registry = Arc::new(InMemoryWorkflows::for_fixture());
     registry.seed(unviable("incident-post-mortem")).unwrap();
     let jobs = Arc::new(InMemoryJobs::new());
     // Two open Jobs pinned to v1 of the offending Workflow, plus a
@@ -173,7 +173,7 @@ async fn an_unviable_row_with_open_jobs_pinned_is_reported_and_boot_continues() 
 /// survive boot unchanged, and boot returns Ok.
 #[tokio::test]
 async fn the_2026_09_07_registry_boots_and_both_unviable_rows_survive() {
-    let registry = Arc::new(InMemoryWorkflows::new());
+    let registry = Arc::new(InMemoryWorkflows::for_fixture());
     registry.seed(viable("healthy")).unwrap();
     registry.seed(unviable("incident-post-mortem")).unwrap();
     registry.seed(unviable("publish-to-github")).unwrap();
@@ -203,7 +203,7 @@ async fn the_2026_09_07_registry_boots_and_both_unviable_rows_survive() {
 
 #[tokio::test]
 async fn a_clean_registry_reports_nothing() {
-    let registry = Arc::new(InMemoryWorkflows::new());
+    let registry = Arc::new(InMemoryWorkflows::for_fixture());
     registry.seed(viable("healthy")).unwrap();
     let jobs = Arc::new(InMemoryJobs::new());
 

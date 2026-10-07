@@ -101,7 +101,7 @@ fn app() -> axum::Router {
 /// event it reacts to — what reaches the policy client when the header
 /// is not the source of the chain.
 fn bare_router() -> axum::Router {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds.seed(kind()).unwrap();
     let inner: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()

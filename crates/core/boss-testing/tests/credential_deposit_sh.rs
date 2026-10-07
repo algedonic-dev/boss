@@ -1107,3 +1107,53 @@ fn the_forge_converge_deposits_before_it_fetches_and_reads_protect_mains_header_
         "the URL-userinfo reader is gone with its only caller"
     );
 }
+
+/// A STALLED READ OF THE SECRET IS STOPPED, NOT WAITED OUT (adversarial
+/// review 9a1e289b of the machine token's deposit, B1). This script runs
+/// ahead of the converge's fetch; its kubectl call had no bound, so a
+/// cluster API or docker daemon that never answered held the converge
+/// there until the unit's TimeoutStartSec killed it, on every tick. The
+/// read is killed at its bound, named as unreadable with the bound in
+/// the words, and the pass ends in seconds.
+#[test]
+fn a_secret_read_that_never_answers_is_stopped_at_its_bound() {
+    let c = Case::new("stalled-read");
+    c.converted(OLD);
+    let sleepy = c.root.join("sleepy-kubectl");
+    write_exec(&sleepy, "#!/bin/sh\nsleep 45\n");
+    let started = std::time::Instant::now();
+    let (rc, text) = c.run(
+        &[],
+        &[
+            ("BOSS_DEPOSIT_KUBECTL", &sleepy.display().to_string()),
+            ("BOSS_DEPOSIT_READ_BOUND_S", "1"),
+        ],
+    );
+    let took = started.elapsed().as_secs();
+    assert!(
+        took < 30,
+        "the pass waited {took}s on a read that never answers: {text}"
+    );
+    assert!(
+        text.contains("did not answer inside 1 seconds"),
+        "the stop is named with its bound: {text}"
+    );
+    assert_eq!(
+        rc, 1,
+        "an unreadable Secret is this script's named failure: {text}"
+    );
+    assert!(
+        c.summary("deposit_secret").starts_with("unreadable"),
+        "{text}"
+    );
+    assert_eq!(
+        c.file().as_deref(),
+        Some(OLD),
+        "the held token is untouched"
+    );
+    let script = std::fs::read_to_string(repo_root().join(SCRIPT)).unwrap();
+    assert!(
+        script.contains("--request-timeout=15s"),
+        "kubectl ends its own request inside the container a killed client would leave running"
+    );
+}

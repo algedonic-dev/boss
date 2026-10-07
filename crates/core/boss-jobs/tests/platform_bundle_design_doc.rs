@@ -196,7 +196,7 @@ fn only_the_explicit_string_flag_bypasses_even_an_empty_question_list() {
 #[tokio::test]
 async fn publication_supersedes_live_v7_and_keeps_its_old_routing_pinned() {
     use boss_jobs::registry::{InMemoryWorkflows, WorkflowRegistry};
-    let registry = InMemoryWorkflows::new();
+    let registry = InMemoryWorkflows::for_fixture();
     let mut old = bundled("design-doc");
     old.version = 7;
     old.steps

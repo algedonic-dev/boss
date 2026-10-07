@@ -67,7 +67,7 @@ fn packet(kind: &str, version: i32, status: JobStatus) -> Job {
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_a_discarded_version_number_is_never_reused() {
     let db = TestDb::new().await;
-    let registry = PgWorkflows::new(db.pool.clone());
+    let registry = PgWorkflows::for_fixture(db.pool.clone());
     let now = chrono::Utc::now();
 
     let v1 = registry
@@ -163,7 +163,7 @@ async fn pg_the_pin_count_names_every_packet_on_the_pair() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_the_discard_itself_refuses_a_draft_a_packet_is_pinned_to() {
     let db = TestDb::new().await;
-    let registry = PgWorkflows::new(db.pool.clone());
+    let registry = PgWorkflows::for_fixture(db.pool.clone());
     let repo = boss_jobs::PgJobs::new(db.pool.clone());
     let now = chrono::Utc::now();
     let d = registry
@@ -208,7 +208,7 @@ async fn pg_the_discard_itself_refuses_a_draft_a_packet_is_pinned_to() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_get_version_serves_a_draft() {
     let db = TestDb::new().await;
-    let registry = PgWorkflows::new(db.pool.clone());
+    let registry = PgWorkflows::for_fixture(db.pool.clone());
     let d = registry
         .create_draft(spec("intake-review"), &author(), chrono::Utc::now())
         .await
@@ -247,6 +247,63 @@ async fn until_a_session_waits_on_a_lock(pool: &sqlx::PgPool) {
     panic!("the racing publish never reached the draft row's lock");
 }
 
+/// The real discard must wait on the broad publication fence BEFORE
+/// taking a row lock. Reversing those locks can deadlock a publisher.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_real_discard_waits_on_publication_fence_before_locking_a_draft() {
+    let db = TestDb::new().await;
+    let registry = PgWorkflows::for_fixture(db.pool.clone());
+    let now = chrono::Utc::now();
+    let draft = registry
+        .create_draft(spec("discard-fence"), &author(), now)
+        .await
+        .expect("draft");
+    let published_before = published_events(&db.pool).await;
+    let mut publication = db.pool.begin().await.expect("publication tx");
+    sqlx::query("LOCK TABLE workflows, workflow_discarded_versions IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *publication)
+        .await
+        .expect("publication fence");
+    let discarder = PgWorkflows::for_fixture(db.pool.clone());
+    let discard = tokio::spawn(async move {
+        discarder
+            .discard_draft("discard-fence", draft.version, &author(), now)
+            .await
+    });
+    until_a_session_waits_on_a_lock(&db.pool).await;
+    let mut probe = db.pool.begin().await.expect("probe tx");
+    let row =
+        sqlx::query("SELECT version FROM workflows WHERE kind = 'discard-fence' FOR UPDATE NOWAIT")
+            .fetch_optional(&mut *probe)
+            .await;
+    assert!(
+        row.is_ok(),
+        "discard took the draft row before the publication fence: {row:?}"
+    );
+    assert!(
+        row.unwrap().is_some(),
+        "blocked discard must not delete the draft"
+    );
+    probe.rollback().await.expect("release row probe");
+    publication
+        .rollback()
+        .await
+        .expect("release publication fence");
+    tokio::time::timeout(std::time::Duration::from_secs(10), discard)
+        .await
+        .expect("discard completes after fence release")
+        .expect("discard task")
+        .expect("discard succeeds after fence");
+    assert_eq!(published_events(&db.pool).await, published_before);
+    let spent: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM workflow_discarded_versions WHERE kind = 'discard-fence'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("spent number");
+    assert_eq!(spent, 1);
+}
+
 /// A PUBLISH THAT LOSES ITS DRAFT TO A DISCARD REFUSES, AND RECORDS
 /// NOTHING (the review of car 06973644, 2026-09-28, finding A). The
 /// publish read its draft WITHOUT a lock, retired the active row, then
@@ -257,16 +314,16 @@ async fn until_a_session_waits_on_a_lock(pool: &sqlx::PgPool) {
 /// `jobs.kind.published` fact for a row that no longer exists.
 ///
 /// The discard is played here by a transaction of the test's own that
-/// does what `discard_draft` does to the row — `FOR UPDATE`, then
+/// does what `discard_draft` does — broad table fence, `FOR UPDATE`, then
 /// DELETE, then the spent number — because the real one cannot be
 /// paused between its lock and its delete. The publish starts while
-/// that lock is held and is observed WAITING on it before the delete
+/// those locks are held and is observed WAITING on the fence before the delete
 /// commits, so the interleaving is the one the review walked, every
 /// run, not a timing hope.
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_a_publish_that_loses_its_draft_to_a_discard_refuses_and_records_nothing() {
     let db = TestDb::new().await;
-    let registry = PgWorkflows::new(db.pool.clone());
+    let registry = PgWorkflows::for_fixture(db.pool.clone());
     let now = chrono::Utc::now();
 
     let v1 = registry
@@ -283,8 +340,12 @@ async fn pg_a_publish_that_loses_its_draft_to_a_discard_refuses_and_records_noth
         .expect("draft v2");
     let published_before = published_events(&db.pool).await;
 
-    // The discard takes the draft's row lock.
+    // Same lock order as the real discard: fence, then draft row.
     let mut discard = db.pool.begin().await.expect("discard tx");
+    sqlx::query("LOCK TABLE workflows, workflow_discarded_versions IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *discard)
+        .await
+        .expect("discard publication fence");
     sqlx::query("SELECT version FROM workflows WHERE kind = $1 AND version = $2 FOR UPDATE")
         .bind("intake-review")
         .bind(v2.version)
@@ -292,8 +353,8 @@ async fn pg_a_publish_that_loses_its_draft_to_a_discard_refuses_and_records_noth
         .await
         .expect("lock the draft");
 
-    // The publish races it, and reaches that lock.
-    let racing = PgWorkflows::new(db.pool.clone());
+    // The publish races it, and waits on the discard's table fence.
+    let racing = PgWorkflows::for_fixture(db.pool.clone());
     let publish =
         tokio::spawn(async move { racing.publish("intake-review", &author(), now).await });
     until_a_session_waits_on_a_lock(&db.pool).await;
@@ -317,8 +378,8 @@ async fn pg_a_publish_that_loses_its_draft_to_a_discard_refuses_and_records_noth
     .expect("spend the number");
     discard.commit().await.expect("discard commits");
 
-    // NotFound, and only NotFound: the publish's FOR UPDATE waited on
-    // the discard and then read the draft as the discard left it — gone.
+    // NotFound, and only NotFound: publication waited on the common fence
+    // and then read the draft as the discard left it — gone.
     // A Conflict here would mean the lock was lost and only the one-row
     // flip check (the documented backstop) caught the race.
     let answer = publish.await.expect("publish task");

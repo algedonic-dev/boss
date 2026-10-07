@@ -68,6 +68,10 @@
     const isDone = step.status === 'completed';
     const isWaived = step.status === 'skipped';
     let saving = false;
+    let recordedEnd = meta.ended_at;
+    let attemptedEnd;
+    const saveError = h('p', { role: 'alert', className: 'load-failed' });
+    saveError.hidden = true;
 
     const header = h(
       'div',
@@ -174,6 +178,9 @@
 
     async function save(status) {
       saving = true;
+      saveError.hidden = true;
+      saveError.textContent = '';
+      let phase = 'Save not confirmed';
       updateDerived();
       try {
         const scheduledRaw = scheduledInput.value;
@@ -188,9 +195,8 @@
         // step PUT is closing to any metadata body, so it must not ride
         // there at all. A draft is the merge alone — it sends no status
         // and no holder, so it cannot release a claim (backlog
-        // 6ef4a36b). A failed merge moves no status; the host refresh
-        // below shows server truth either way, as the one unchecked PUT
-        // did before.
+        // 6ef4a36b). A failed merge moves no status; a refusal stays
+        // visible here instead of invoking the host's success refresh.
         const ownKeys = {
           scheduled_for: scheduledRaw ? new Date(scheduledRaw).toISOString() : null,
           channel: channelSelect.value || null,
@@ -203,8 +209,8 @@
           // Stamped once, on Close call, and only when the page drew
           // none: an omitted key is kept by the merge door, so a draft
           // or a Waive leaves whatever end time the step holds.
-          ...(status === 'completed' && !meta.ended_at
-            ? { ended_at: new Date().toISOString() }
+          ...(status === 'completed' && !recordedEnd
+            ? { ended_at: attemptedEnd ??= new Date().toISOString() }
             : {}),
         };
         const merged = await fetch(
@@ -215,8 +221,21 @@
             body: JSON.stringify(ownKeys),
           },
         );
-        if (merged.ok && status) {
-          await fetch(
+        if (!merged.ok) {
+          phase = 'Save request refused';
+          throw new Error(`HTTP ${merged.status}: ${await merged.text()}`);
+        }
+        // Keep the same attempted timestamp if a PATCH reply is lost:
+        // it may already have persisted. Retry the same value until the
+        // merge is confirmed; this does not claim a lost write succeeded.
+        if (ownKeys.ended_at) recordedEnd = ownKeys.ended_at;
+        if (status) {
+          // The merge can persist an end time before status refuses. Say
+          // which act failed; never roll back another writer's metadata.
+          phase = status === 'completed'
+            ? 'Completion not confirmed. Fields were saved, including the recorded call end time'
+            : 'Skip not confirmed. Fields were saved';
+          const changed = await fetch(
             `/api/jobs/${encodeURIComponent(jobId)}/steps/${encodeURIComponent(step.id)}`,
             {
               method: 'PUT',
@@ -224,8 +243,17 @@
               body: JSON.stringify({ status }),
             },
           );
+          if (!changed.ok) {
+            phase = status === 'completed'
+              ? 'Completion request refused. Fields were saved, including the recorded call end time'
+              : 'Skip request refused. Fields were saved';
+            throw new Error(`HTTP ${changed.status}: ${await changed.text()}`);
+          }
         }
         if (onUpdate) onUpdate();
+      } catch (e) {
+        saveError.textContent = `${phase}: ${e instanceof Error ? e.message : String(e)}`;
+        saveError.hidden = false;
       } finally {
         saving = false;
         updateDerived();
@@ -285,6 +313,7 @@
       { className: 'step-surface step-diagnostic-call' },
       header,
       form,
+      saveError,
       actions,
     );
 

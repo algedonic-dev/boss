@@ -66,7 +66,7 @@ fn app() -> axum::Router {
 /// The router, and the repository behind it — for the one test that
 /// has to stand the car in a state only a race produces.
 fn app_with_jobs() -> (axum::Router, Arc<InMemoryJobs>) {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     // The real platform bundle: a fixture copy would pass while the
     // shipped ship-a-change had no such terminal.
     for spec in seedable_platform_workflows() {

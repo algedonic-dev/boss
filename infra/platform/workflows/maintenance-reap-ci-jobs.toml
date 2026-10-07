@@ -18,7 +18,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "Removes the corpses of crashed CI jobs and the NAMED volumes they hold - `docker volume prune` skips a named volume, so one held 63GB on 2026-08-14 and left the next run less disk than a cold cargo test needs."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
 
 [[workflow.step]]
 title = "scheduled"

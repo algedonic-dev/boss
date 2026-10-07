@@ -1,4 +1,4 @@
-//! An existing run's Codex adapter (2f7b8c00, approved design 59459712).
+//! An existing run's read-only executor adapters (2f7b8c00, approved design 59459712).
 //! The first admission of an execution packet reserves one process across
 //! hosts. An uncertain response never starts or retries an executor. Native
 //! stdout supplies thread identity and outcome, not an observed model, spend,
@@ -17,16 +17,16 @@ const SOURCE: &str = "codex.exec.json";
 
 #[derive(clap::Subcommand)]
 pub enum Cmd {
-    /// Launch an already dispatched analyst or reviewer through Codex.
+    /// Launch an already dispatched analyst or reviewer through a native adapter.
     ///
-    /// Uses an isolated worktree and read-only sandbox. Only a fresh,
+    /// Uses an isolated worktree and harness-specific read-only controls. Only a fresh,
     /// confirmed reservation starts a process; reruns and uncertain admission
     /// refuse. The receipt records native identity/outcome, with model unknown
     /// until a separate native transcript supplies it. It completes no work
-    /// step and reports no usage. Gemini and builder execution are pending.
+    /// step and prices no usage. Builder execution remains unsupported.
     Launch {
         run: String,
-        #[arg(long, value_parser = ["codex"])]
+        #[arg(long, value_parser = ["codex", "gemini"])]
         harness: String,
         /// A new private directory for this attempt's worktree and full logs.
         #[arg(long)]
@@ -37,10 +37,10 @@ pub enum Cmd {
 pub async fn dispatch(cmd: Cmd) -> Result<()> {
     let Cmd::Launch {
         run,
-        harness: _,
+        harness,
         scratch,
     } = cmd;
-    run_at(&run, &scratch).await
+    run_at(&run, &scratch, &harness).await
 }
 
 fn text<'a>(v: &'a Value, field: &str) -> Result<&'a str> {
@@ -283,9 +283,12 @@ async fn revalidate_start(
 /// on disk; only native control events enter the durable observation.
 #[derive(Default)]
 struct Native {
+    gemini: bool,
+    configured_model: Option<String>,
     thread: Option<String>,
     started: bool,
     completed: bool,
+    result_seen: bool,
     failed: bool,
     malformed: bool,
     launcher_error: Option<String>,
@@ -302,6 +305,63 @@ impl Native {
             self.malformed = true;
             return;
         };
+        if self.gemini {
+            match kind {
+                "init" => {
+                    let id = v
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .filter(|s| uuid::Uuid::parse_str(s).is_ok());
+                    let model = v
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty());
+                    if let (Some(id), Some(model)) = (id.filter(|_| self.thread.is_none()), model) {
+                        self.thread = Some(id.into());
+                        self.configured_model = Some(model.into());
+                        self.started = true;
+                    } else {
+                        self.malformed = true;
+                    }
+                    self.events.push(v);
+                }
+                "result" => {
+                    if !self.started
+                        || self.result_seen
+                        || !v
+                            .get("stats")
+                            .is_some_and(crate::gemini_execution::complete_stats)
+                    {
+                        self.malformed = true;
+                    }
+                    match v.get("status").and_then(Value::as_str) {
+                        Some("success") if !self.failed => self.completed = true,
+                        Some("error") => self.failed = true,
+                        _ => self.malformed = true,
+                    }
+                    self.result_seen = true;
+                    self.events.push(v);
+                }
+                "error" => {
+                    if self.result_seen {
+                        self.malformed = true;
+                    }
+                    match v.get("severity").and_then(Value::as_str) {
+                        Some("warning") => {}
+                        Some("error") => self.failed = true,
+                        _ => self.malformed = true,
+                    }
+                    self.events.push(v);
+                }
+                "message" | "tool_use" | "tool_result" => {
+                    if !self.started || self.result_seen {
+                        self.malformed = true;
+                    }
+                }
+                _ => self.malformed = true,
+            }
+            return;
+        }
         match kind {
             "thread.started" => {
                 let id = v
@@ -347,15 +407,19 @@ impl Native {
         } else {
             "completed"
         };
-        json!({"source":SOURCE,"agent_run":run,"execution":execution,"runtime_id":self.thread,
+        let mut receipt = json!({"source":if self.gemini { "gemini.stream-json" } else { SOURCE },"agent_run":run,"execution":execution,"runtime_id":self.thread,
             "parent_runtime_id":null,"status":status,"observed_model":null,
             "observed_at":boss_clock_client::wall_now().to_rfc3339(),"exit_code":code,
             "native_events":self.events,"launcher_error":self.launcher_error,"capture_incomplete":self.capture_incomplete,
-            "stdout_file":scratch.join("native.jsonl"),"stderr_file":scratch.join("native.stderr")})
+            "stdout_file":scratch.join("native.jsonl"),"stderr_file":scratch.join("native.stderr")});
+        if self.gemini {
+            receipt["configured_model"] = json!(self.configured_model);
+        }
+        receipt
     }
 }
 
-async fn run_at(run: &str, scratch: &Path) -> Result<()> {
+async fn run_at(run: &str, scratch: &Path, harness: &str) -> Result<()> {
     uuid::Uuid::parse_str(run).context("launch requires the full registered agent-run UUID")?;
     let actor = crate::identity::sign(&reqwest::Method::POST, "/api/jobs")?;
     let base = crate::gate::resolve_jobs_base(None)?;
@@ -374,19 +438,22 @@ async fn run_at(run: &str, scratch: &Path) -> Result<()> {
     }
     let profile = text(md, "profile")?;
     if !matches!(profile, "analyst" | "reviewer") {
-        bail!("the initial Codex adapter supports analyst/reviewer read-only runs");
+        bail!("native adapters support analyst/reviewer read-only runs");
     }
     let model = text(md, "model")?;
-    if !model.starts_with("gpt-")
-        || !boss_jobs::agent_spec::known_models()
-            .iter()
-            .any(|m| m == model)
+    if !(if harness == "gemini" {
+        model == "gemini-2.5-pro"
+    } else {
+        model.starts_with("gpt-")
+    }) || !boss_jobs::agent_spec::known_models()
+        .iter()
+        .any(|m| m == model)
     {
-        bail!("the requested model is not an admitted Codex model");
+        bail!("the requested model is not admitted for this native adapter");
     }
     let effort = text(md, "effort")?;
     if !matches!(effort, "low" | "medium" | "high" | "xhigh") {
-        bail!("the requested effort is unsupported by this Codex adapter");
+        bail!("the requested effort is unsupported by this native adapter");
     }
     let brief = text(md, "brief")?;
     let packet_id = text(md, "packet")?;
@@ -415,10 +482,10 @@ async fn run_at(run: &str, scratch: &Path) -> Result<()> {
         PathBuf::from(git(&std::env::current_dir()?, &["rev-parse", "--show-toplevel"]).await?);
     let head = git(&repo, &["rev-parse", "HEAD"]).await?;
     let execution = execution_id(run);
-    let requested = json!({"model":model,"effort":effort,"profile":profile,"sandbox":"read-only"});
+    let requested = json!({"model":model,"effort":effort,"profile":profile,"sandbox":if harness=="gemini" {"native-file-read-policy"} else {"read-only"}});
     let body = json!({"id":execution,"kind":KIND,"subject":{"subject_kind":"custom","id":run},
-        "title":format!("Codex execution of {run}"),"owner_id":job["owner_id"],"priority":"standard","status":"open","tags":["executor-adapter"],
-        "metadata":{"agent_run":run,"agent":actor,"harness":"codex.exec","requested":requested,"status":"reserved","source_head":head}});
+        "title":format!("{harness} execution of {run}"),"owner_id":job["owner_id"],"priority":"standard","status":"open","tags":["executor-adapter"],
+        "metadata":{"agent_run":run,"agent":actor,"harness":if harness == "gemini" {"gemini.stream-json"} else {"codex.exec"},"requested":requested,"status":"reserved","source_head":head}});
     // The shared API helper erases HTTP status. This single admission MUST
     // retain it: a duplicate200 is not permission to start a second process.
     let response = http
@@ -479,12 +546,24 @@ async fn run_at(run: &str, scratch: &Path) -> Result<()> {
     let workspace_text=workspace.to_str().context("worktree path is not UTF-8")?;
     git(&repo,&["worktree","add","--detach","--lock",workspace_text,&head]).await?;
     tokio::fs::write(scratch.join("reservation.json"),serde_json::to_vec_pretty(&admitted)?).await?;
-    let prompt=format!("{brief}\n\n== EXECUTOR ADAPTER ==\nYour run is agent-run {run}.\nRequested model {model}, effort {effort}; submitted controls are not observed execution.\nBOSS_ACTOR={actor} and BOSS_AGENT_RUN={run}.\n{}\nThis adapter uses Codex in an isolated read-only worktree. Preserve the brief's safety and evidence requirements using your harness's own tools. Do not start unregistered paid executors. The launcher records no heartbeat, delivery or usage on your behalf.\n",crate::dispatch::marker_line(run));
+    let prompt=format!("{brief}\n\n== EXECUTOR ADAPTER ==\nYour run is agent-run {run}.\nRequested model {model}, effort {effort}; submitted controls are not observed execution.\nBOSS_ACTOR={actor} and BOSS_AGENT_RUN={run}.\n{}\nThis adapter uses {harness} in an isolated worktree with read-only controls. Preserve the brief's safety and evidence requirements using your harness's own tools. Do not start unregistered paid executors. The launcher records no heartbeat, delivery or usage on your behalf.\n",crate::dispatch::marker_line(run));
     let stderr=tokio::fs::OpenOptions::new().write(true).create_new(true).open(scratch.join("native.stderr")).await?;
     let mut log=tokio::fs::OpenOptions::new().write(true).create_new(true).open(scratch.join("native.jsonl")).await?;
-    let executable=executable("codex").await?;
+    let executable=executable(harness).await?;
+    let mut command=tokio::process::Command::new(&executable);
+    if harness == "gemini" {
+        let key=std::env::var_os("GEMINI_API_KEY").filter(|value| !value.is_empty()).context("Gemini environment API key is unavailable; no ambient credential fallback")?;
+        let prepared=crate::gemini_execution::prepare(&scratch,&workspace,effort).await?;
+        crate::gemini_execution::verify_version(&executable,&scratch,&workspace,&prepared).await?;
+        prepared.environment(&mut command);
+        command.env("GEMINI_API_KEY",key);
+        command.args(["--prompt","Execute the persisted BOSS brief supplied on standard input.","--output-format","stream-json","--model",model,"--approval-mode","plan","--extensions","none","--admin-policy"])
+            .arg(prepared.policy);
+    } else {
+        command.args(["exec","--json","--model",model,"-c",&format!("model_reasoning_effort=\"{effort}\""),"--sandbox","read-only","-"]);
+    }
     revalidate_start(&http,&base,&actor,run,&job,&packet).await.context("run and source claim must still match before process start")?;
-    let command=tokio::process::Command::new(&executable).args(["exec","--json","--model",model,"-c",&format!("model_reasoning_effort=\"{effort}\""),"--sandbox","read-only","-"])
+    let command=command
         .current_dir(&workspace).env("BOSS_ACTOR",&actor).env("BOSS_AGENT_RUN",run)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::from(stderr.into_std().await)).kill_on_drop(true).spawn();
     let mut child=match command {
@@ -492,14 +571,14 @@ async fn run_at(run: &str, scratch: &Path) -> Result<()> {
         Err(error)=>{
             return Ok(json!({"source":"os.process","agent_run":run,"execution":execution,
                 "runtime_id":null,"parent_runtime_id":null,"observed_model":null,"status":"failed",
-                "observed_at":boss_clock_client::wall_now().to_rfc3339(),"launcher_error":format!("Codex process could not start: {error}"),
+                "observed_at":boss_clock_client::wall_now().to_rfc3339(),"launcher_error":format!("{harness} process could not start: {error}"),
                 "stdout_file":scratch.join("native.jsonl"),"stderr_file":scratch.join("native.stderr")}));
         }
     };
     let mut stdin=child.stdin.take().context("native process has no prompt input")?;
     let stdout=child.stdout.take().context("native process has no event stream")?;
     let mut reader=BufReader::new(stdout);
-    let mut native=Native::default();
+    let mut native=Native { gemini:harness=="gemini", ..Default::default() };
     let mut line=Vec::new();
     // Either pipe can fill before the child consumes the other. Drain output
     // while writing the brief; a refused input still retains the native stream.
@@ -518,7 +597,7 @@ async fn run_at(run: &str, scratch: &Path) -> Result<()> {
         native.read(&line);
         if !before && native.thread.is_some() {
             log.flush().await?;
-            let started=json!({"source":SOURCE,"agent_run":run,"execution":execution,
+            let started=json!({"source":if native.gemini {"gemini.stream-json"} else {SOURCE},"agent_run":run,"execution":execution,
                 "runtime_id":native.thread,"parent_runtime_id":null,"status":"accepted","observed_model":null,
                 "observed_at":boss_clock_client::wall_now().to_rfc3339(),"native_events":native.events});
             tokio::fs::write(scratch.join("native-start.json"),serde_json::to_vec_pretty(&started)?).await?;

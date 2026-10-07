@@ -12,9 +12,12 @@
 # while it is open. Since the image-only policy's Deny car (backlog
 # e4a9a9b3) a must-refuse patch that lands is a refusal too — the
 # binding deleted or moved off Deny, named on the RED line — so no run
-# closes `not-yet` any more.
+# closes `not-yet` any more. A crash before a RED line still files ONE
+# item on the declared deposit route (e4a9a9b3); other chore rules keep
+# their existing no-RED behavior.
 [[rule]]
 name = "file-backlog-items-on-break-glass-deposit-red"
+version = 2
 why = """
 A CROSS-PROTOCOL REACTOR: maintenance-break-glass-deposit ->
 backlog-item, which no single Workflow consequence can express — the
@@ -28,11 +31,13 @@ packet's output and a pod log (review b6d2a716, N1). No authority
 widened: the handler is the crawl's judge (maintenance.chore.file_reds),
 its only writes are standard backlog-items owned by the platform owner
 and one `judged` note on the chore's own packet, and the dedup keys are
-the two routes the Job prints, so a refusal repeated nightly is ONE item
-until someone closes it.
+the two routes the Job prints, plus the declared deposit route when a
+failed run prints no shaped RED line, so a refusal or crash repeated
+nightly is ONE item until someone closes it. The fallback copies bounded
+recorded evidence and does not infer a cause or mint a diagnostic.
 """
 on_event = "jobs.job.closed"
 when = 'kind = "maintenance-break-glass-deposit" AND outcome = "failed"'
 [[rule.do]]
 handler = "maintenance.chore.file_reds"
-args = { step = "\"run\"", design = "\"835c0c9c\"", area = "\"credentials\"" }
+args = { step = "\"run\"", design = "\"835c0c9c\"", area = "\"credentials\"", no_red_failure_route = "\"break-glass-deposit\"" }

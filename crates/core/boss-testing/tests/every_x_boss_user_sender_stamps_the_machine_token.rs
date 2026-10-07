@@ -99,7 +99,34 @@ const NOT_SENDERS: &[(&str, &str)] = &[
          It sends nothing; listed so it is not passed by naming machine_token::HEADER, which \
          it reads rather than stamps.",
     ),
+    (
+        "crates/core/boss-jobs/src/runner_credential.rs",
+        "the credential resolver: it replaces the INBOUND request's asserted actor with \
+         the credential's actor before the handler reads it (design f623e425 option A). \
+         It sends nothing; stamping an unused outbound client would conceal this distinction.",
+    ),
 ];
+
+/// Middleware classification holds only while the file contains no
+/// outgoing client or send. A later sender must return to the scan,
+/// not inherit a file-level exclusion (gate 41371f4b, 2026-10-05).
+fn not_a_network_sender(path: &str, source: &str) -> bool {
+    let Some((prefix, _)) = NOT_SENDERS
+        .iter()
+        .find(|(prefix, _)| path.starts_with(prefix))
+    else {
+        return false;
+    };
+    if prefix.ends_with('/') {
+        return true; // In-process test support, not a production middleware.
+    }
+    let code = without_comments(source);
+    let outgoing = Regex::new(
+        r"reqwest\s*::|machine_token\s*::\s*(?:Blocking)?Client\b|http_client\s*::|\bMachineClient\b|\.(?:send|execute)\s*\(",
+    )
+    .unwrap();
+    !outgoing.is_match(&code)
+}
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -180,12 +207,12 @@ fn senders(root: &Path) -> Vec<(String, Vec<usize>, bool)> {
                 .ok()?
                 .to_string_lossy()
                 .replace('\\', "/");
-            if NOT_SENDERS.iter().any(|(s, _)| rel.starts_with(s)) {
-                return None;
-            }
             let src = std::fs::read_to_string(p).ok()?;
             let prod = production_text(&src)
                 .unwrap_or_else(|e| panic!("{rel} does not parse as Rust: {e}"));
+            if not_a_network_sender(&rel, &prod) {
+                return None;
+            }
             let lines = sends_identity(&prod);
             (!lines.is_empty()).then(|| (rel, lines, stamps(&prod)))
         })
@@ -282,5 +309,31 @@ fn the_scan_sees_a_sender_and_not_a_reader() {
     assert!(
         found.iter().filter(|(_, _, s)| *s).count() >= 10,
         "the scan found under ten stamping senders — it is not reading the tree: {found:?}"
+    );
+}
+
+#[test]
+fn inbound_runner_resolution_is_not_an_outgoing_sender() {
+    let root = repo_root();
+    let path = "crates/core/boss-jobs/src/runner_credential.rs";
+    assert!(
+        !senders(&root).iter().any(|(file, _, _)| file == path),
+        "the credential resolver rewrites an incoming axum request; it sends no HTTP request"
+    );
+    // An inbound classification must not hide an outgoing client later
+    // added to the same middleware file. Keep the actual inbound source.
+    let fixture = boss_testing::scratch_dir("runner-resolution-outgoing-control");
+    let target = fixture.join(path);
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let mut source = std::fs::read_to_string(root.join(path)).unwrap();
+    source.push_str(
+        "\nasync fn outgoing_control() {\n let client = reqwest::Client::new();\n client.get(\"http://example.invalid\").header(\"x-boss-user\", \"asserted\").send().await;\n}\n",
+    );
+    std::fs::write(&target, source).unwrap();
+    assert!(
+        senders(&fixture)
+            .iter()
+            .any(|(file, lines, stamped)| file == path && !lines.is_empty() && !stamped),
+        "an unstamped outgoing sender in the resolver must still be refused"
     );
 }

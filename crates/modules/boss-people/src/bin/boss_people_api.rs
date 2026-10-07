@@ -9,6 +9,10 @@ use boss_classes_client::{ClassesClient, ReqwestClassesClient};
 use boss_locations_client::{LocationsClient, ReqwestLocationsClient};
 use boss_people::http::{PeopleApiState, router};
 use boss_people::people_config::PeopleApiConfig;
+use boss_policy_client::role_reader::{
+    HttpRoleReader, MonotonicRoleSnapshotClock, MountedReportMode, SnapshotRoleReader,
+};
+use boss_policy_client::role_reporting::{ReportTally, ReportingPolicyClient};
 use clap::Parser;
 use tokio::net::TcpListener;
 use tracing::info;
@@ -74,11 +78,19 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| "connecting to Postgres")?;
 
-    let people = Arc::new(boss_people::PgPeople::with_registries(
-        pool.clone(),
-        classes_client.clone(),
-        locations_client.clone(),
-    ));
+    let policy_url = std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy"));
+    let jobs_url = std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs"));
+    let coverage: Arc<dyn boss_people::coverage_guard::CoverageRead> = Arc::new(
+        boss_people::coverage_guard::HttpCoverageRead::new(policy_url.clone(), jobs_url.clone()),
+    );
+    let people = Arc::new(
+        boss_people::PgPeople::with_registries(
+            pool.clone(),
+            classes_client.clone(),
+            locations_client.clone(),
+        )
+        .with_coverage(coverage.clone()),
+    );
 
     // Connect to NATS for domain event publishing (optional).
     let publisher = match &cfg.nats_url {
@@ -127,19 +139,45 @@ async fn main() -> Result<()> {
     // rules grant Update on `employee`.
     // The bypass is installed on a sim instance only, and admits only a
     // sim caller there (backlog 85e7f10f).
-    let policy: Arc<dyn boss_policy_client::PolicyClient> =
+    let original_policy: Arc<dyn boss_policy_client::PolicyClient> =
         boss_policy_client::SimBypassPolicyClient::from_env(Arc::new(
-            boss_policy_client::ReqwestPolicyClient::new(
-                "people",
-                std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
-            ),
+            boss_policy_client::ReqwestPolicyClient::new("people", policy_url),
         ));
+
+    let role_mode = Arc::new(MountedReportMode::mount());
+    let roles = Arc::new(SnapshotRoleReader::new(
+        boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+        Arc::new(MonotonicRoleSnapshotClock),
+    ));
+    let role_source = Arc::new(HttpRoleReader::new(
+        std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
+        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
+        boss_policy_client::User::service("people"),
+    )?);
+    let role_tally = Arc::new(ReportTally::new(
+        boss_policy_client::role_service::REPORT_CAPACITY,
+    ));
+    let policy: Arc<dyn boss_policy_client::PolicyClient> =
+        Arc::new(ReportingPolicyClient::with_mode_source(
+            original_policy.clone(),
+            roles.clone(),
+            role_tally.clone(),
+            role_mode.clone(),
+        ));
+
+    let role_guards = Arc::new(boss_policy_client::role_guard::RoleGuardReporter::new(
+        roles.clone(),
+        role_tally.clone(),
+        role_mode.clone(),
+    ));
 
     // Mount workflow and search routers first (more-specific routes),
     // then merge the people CRUD router (has catch-all /{id}).
     let mut app = boss_people::workflows::workflow_router(
         pool.clone(),
-        std::sync::Arc::new(boss_people::PgPeople::new(pool.clone())),
+        std::sync::Arc::new(
+            boss_people::PgPeople::new(pool.clone()).with_coverage(coverage.clone()),
+        ),
         publisher.clone(),
         clock.clone(),
         Some(policy.clone()),
@@ -156,10 +194,14 @@ async fn main() -> Result<()> {
         clock.clone(),
         Some(policy.clone()),
     ))
-    .merge(boss_people::scope::scope_router(pool.clone()))
-    .merge(boss_people::webauthn::webauthn_router(
+    .merge(boss_people::scope::scope_router_with_reports(
+        pool.clone(),
+        Some(role_guards),
+    ))
+    .merge(boss_people::webauthn::webauthn_router_with_coverage(
         pool.clone(),
         clock.clone(),
+        Some(coverage.clone()),
     ))
     // The passkey promote door (design 2cb6256f): it flips a key to the
     // operator tier only on a ticket the gateway signed after the
@@ -169,9 +211,7 @@ async fn main() -> Result<()> {
     // 293d5dc1); pinned in the module as mounted here, once.
     .merge(boss_people::passkey_promotion::promotion_router(
         pool.clone(),
-        std::sync::Arc::new(
-            boss_people::passkey_promotion::JobsApiPromotionPackets::new(boss_ports::url("jobs")),
-        ),
+        std::sync::Arc::new(boss_people::passkey_promotion::JobsApiPromotionPackets::new(jobs_url)),
         std::sync::Arc::new(boss_people::passkey_promotion::TicketKey::from_env()),
     ));
     // people-api owns only the employee-side routers. The
@@ -229,6 +269,14 @@ async fn main() -> Result<()> {
         clock,
     };
     app = app.merge(router(state));
+    app = app.merge(boss_policy_client::role_inventory::router(
+        "people",
+        "/api/people/actor-role-reports",
+        original_policy,
+        roles.clone(),
+        role_mode.clone(),
+        role_tally,
+    ));
     // Sim-origin middleware: extract x-sim-origin header and set the
     // per-request task-local so the publisher inherits the sim
     // marker. Closes the gap where a sim chain could trigger a
@@ -252,6 +300,29 @@ async fn main() -> Result<()> {
         &["/api/people/health"],
         Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
     );
-    axum::serve(listener, app).await?;
+    let (role_stop, stop) = tokio::sync::watch::channel(false);
+    let role_refresh = tokio::spawn(roles.run_refresh_loop(
+        role_source,
+        role_mode,
+        boss_policy_client::role_service::REFRESH_CADENCE,
+        stop,
+    ));
+    let served = axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let interrupt = async {
+                if let Err(error) = tokio::signal::ctrl_c().await {
+                    tracing::warn!(%error, "people interrupt signal unavailable");
+                    std::future::pending::<()>().await;
+                }
+            };
+            // Gate evidence owns process termination; this path owns interrupts.
+            interrupt.await;
+        })
+        .await;
+    let _ = role_stop.send(true);
+    role_refresh
+        .await
+        .context("joining people actor-role refresh")??;
+    served?;
     Ok(())
 }

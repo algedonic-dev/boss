@@ -208,6 +208,26 @@ export const SHELL_ENDPOINTS: ReadonlyArray<RegExp> = [
   DEPARTMENTS_ENDPOINT,
 ];
 
+// Navigation records one shell observation. Every other API write belongs
+// to the page, including another method or a child of this exact path.
+export const SHELL_WRITES = [
+  { method: 'POST', path: '/api/surface-opens' },
+] as const;
+
+export function isShellWrite(method: string, path: string): boolean {
+  return SHELL_WRITES.some((write) => write.method === method && write.path === path);
+}
+
+export function isPageWrite(method: string, path: string): boolean {
+  return method !== 'GET' && path.startsWith('/api/') && !isShellWrite(method, path);
+}
+
+export function pageWrites<T extends Readonly<{ method: string; path: string }>>(
+  requests: ReadonlyArray<T>,
+): ReadonlyArray<T> {
+  return requests.filter((request) => isPageWrite(request.method, request.path));
+}
+
 /// The endpoints whose fixture is an OBJECT, not a list. Named once,
 /// used below to route them and exported for interaction-crawl's empty
 /// leg, which answers `[]` to every collection read and must let these
@@ -401,9 +421,9 @@ export const PAGED_ENDPOINTS: ReadonlyArray<RegExp> = [
   /\/api\/shipping\/shipments(\?|$)/,
   /\/api\/commerce\/invoices(\?|$)/,
   /\/api\/commerce\/open-ar(\?|$)/,
-  // The department's packets (AccountsList, SupportPage, and the
-  // department thirds, whose parser reads the envelope too).
-  /\/api\/jobs\?(?:[^#]*&)?department=/,
+  // Every native Jobs listing is counted, including the generic list
+  // and the department views. A bare [] is malformed, not empty.
+  /\/api\/jobs\?/,
 ];
 export const EMPTY_PAGE = { data: [], total: 0, limit: 0, offset: 0 } as const;
 /// The inbox read (boss-messages `GET /api/messages/inbox/{id}`), which

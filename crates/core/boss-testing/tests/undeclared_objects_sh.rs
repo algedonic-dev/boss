@@ -220,6 +220,10 @@ get)
         exit 1
     fi
     if [ -z "$name" ]; then
+        if [ "$out" = json ]; then
+            cat "$STUB_LIVE/$kind.$ns.json"
+            exit $?
+        fi
         # A label selector keeps the rows it matches. The third column is
         # either the bare part-of value (the tree's own mark) or, when it
         # holds an `=`, the object's full `key=value,...` label set.
@@ -452,6 +456,398 @@ fn a_repo_sourced_instances_delivered_tenant_is_exempt_by_derivation_and_never_s
     );
 }
 
+/// The instance list both instances of the estate have: prod repo-sourced
+/// in `boss`, the playground image-sourced in `boss-playground`.
+const TWO_INSTANCES: &str = "source = \"prod\"\n\n[prod]\nnamespace = \"boss\"\ntenant_repo = \"david/algedonic-llc\"\ntenant_ref = \"main\"\nsim = false\nhostname = \"h.example\"\nguest = false\n\n[playground]\nnamespace = \"boss-playground\"\ntenant_dir = \"examples/brewery\"\nsim = true\nhostname = \"p.example\"\nguest = \"audit\"\n";
+
+/// The renderer of the per-instance runtime ConfigMap, and the converge
+/// that calls it.
+const RENDERER_REL: &str = "infra/estate/render-dev-door-config.sh";
+const RUNNER_REL: &str = "infra/forge/cluster-deploy-runner.sh";
+
+/// The `Kind/name` the SHIPPED renderer says it renders — read off its
+/// one `RENDERS=` line the way the derivation reads it, so no test here
+/// types the object's name a second time.
+fn rendered_object() -> (String, String) {
+    let body = std::fs::read_to_string(repo_root().join(RENDERER_REL)).expect("the renderer");
+    let lines: Vec<&str> = body.lines().filter(|l| l.starts_with("RENDERS=")).collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "{RENDERER_REL} must name the object it renders on exactly one `RENDERS=\"Kind/name\"` \
+         line at column 0 — infra/cluster/undeclared-objects.sh derives its exemption from it \
+         (backlog cb0c9937). Found: {lines:?}"
+    );
+    let value = lines[0]
+        .trim_start_matches("RENDERS=")
+        .trim_matches('"')
+        .to_string();
+    let (kind, name) = value
+        .split_once('/')
+        .unwrap_or_else(|| panic!("{RENDERER_REL}: `{}` is not Kind/name", lines[0]));
+    (kind.to_string(), name.to_string())
+}
+
+/// Put the shipped renderer into a fixture tree, optionally rewritten.
+fn install_renderer(tree: &Path, rewrite: impl Fn(&str) -> String) {
+    let dst = tree.join(RENDERER_REL);
+    std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+    let body = std::fs::read_to_string(repo_root().join(RENDERER_REL)).expect("the renderer");
+    std::fs::write(&dst, rewrite(&body)).unwrap();
+}
+
+/// THE DEFECT (backlog cb0c9937, measured 2026-10-06). The converge
+/// renders one runtime ConfigMap per instance namespace
+/// (render-dev-door-config.sh, called for the source instance and for
+/// every other applied one), no manifest declares it, and the derivation
+/// did not know: converge packets 8d5c8f93 and 79f23714 both closed
+/// FAILED at `check orphans` on `ConfigMap/boss-instance-config (ns
+/// boss)`, and the stage after it — rolling the playground — never ran.
+///
+/// It is exempt BY DERIVATION: the name from the renderer's own line, the
+/// namespaces from the instance list the converge walks. And only that —
+/// the three controls are the point of the test:
+///   * a hand-made ConfigMap of another name in `boss` is still an orphan;
+///   * the SAME name in a namespace no instance has (`boss-dev`, the
+///     pipeline's) is still an orphan; and
+///   * `--check`, which is where `delete-orphan-object` gets its
+///     authority, answers NO for the rendered object and YES for both
+///     controls.
+#[test]
+fn the_rendered_instance_config_is_exempt_by_derivation_in_the_instances_namespaces_only() {
+    let (kind, name) = rendered_object();
+    assert_eq!(kind, "ConfigMap", "the fixture below assumes a ConfigMap");
+    let c = Case::new(
+        "derived-instance-config",
+        &[
+            ("ConfigMap", "boss", &name, ""),
+            ("ConfigMap", "boss", "hand-made", ""),
+        ],
+    );
+    // boss-dev declares no ConfigMap in the fixture, so the object is in
+    // scope there by the tree's own label.
+    c.add_live_labelled("ConfigMap", "boss-dev", &name, "boss");
+    let rendered_boss = format!("ConfigMap/boss/{name}");
+    let rendered_dev = format!("ConfigMap/boss-dev/{name}");
+
+    // A tree that renders nothing (no renderer, no instance list) accounts
+    // for none of them — so the exemption below is the derivation's doing.
+    let (rc, stdout, all) = c.run(&["--list"]);
+    assert_eq!(rc, 0, "{all}");
+    let mut before: Vec<&str> = stdout.lines().collect();
+    before.sort_unstable();
+    let row_boss = format!("ConfigMap\tboss\t{name}");
+    let row_dev = format!("ConfigMap\tboss-dev\t{name}");
+    let mut all_three = vec!["ConfigMap\tboss\thand-made", &row_boss, &row_dev];
+    all_three.sort_unstable();
+    assert_eq!(before, all_three, "{all}");
+
+    std::fs::write(c.tree.join("infra/cluster/instances.toml"), TWO_INSTANCES).unwrap();
+    install_renderer(&c.tree, |b| b.to_string());
+
+    let (rc, derived, all) = c.run(&["--exemptions-derived"]);
+    assert_eq!(rc, 0, "{all}");
+    let mut derived: Vec<&str> = derived.lines().collect();
+    derived.sort_unstable();
+    let rendered_playground = format!("ConfigMap/boss-playground/{name}");
+    let mut want = vec![
+        "ConfigMap/boss/boss-tenant",
+        rendered_boss.as_str(),
+        rendered_playground.as_str(),
+    ];
+    want.sort_unstable();
+    assert_eq!(
+        derived, want,
+        "one rendered object per INSTANCE namespace — the converge calls the renderer for the \
+         source instance and for every other one — and none for boss-dev, which is no instance"
+    );
+    let (rc, hand, _) = c.run(&["--exemptions"]);
+    assert_eq!(rc, 0);
+    assert!(
+        !hand.contains(&name),
+        "a derived exemption is not a hand entry — the lint's stale check would ask the cluster \
+         for it on a converge that skipped the instance: {hand}"
+    );
+
+    let (rc, stdout, all) = c.run(&["--list"]);
+    assert_eq!(rc, 0, "{all}");
+    let mut after: Vec<&str> = stdout.lines().collect();
+    after.sort_unstable();
+    assert_eq!(
+        after,
+        vec!["ConfigMap\tboss\thand-made", &row_dev],
+        "the rendered object is accounted for, and ONLY it: a hand-made ConfigMap of another \
+         name, and the same name where no instance lives, are still findings:\n{all}"
+    );
+
+    // The verb's authority. Exit 3 is NO — `delete-orphan-object` refuses.
+    let (rc, stdout, all) = c.run(&["--check", &rendered_boss]);
+    assert_eq!(
+        rc, 3,
+        "the object the converge renders was named DELETABLE:\n{all}"
+    );
+    assert_eq!(stdout, "", "a refusal prints no `undeclared` row:\n{all}");
+    names_all(&all, &["REFUSED", &rendered_boss, "EXEMPT"], "the check");
+    for still in ["ConfigMap/boss/hand-made", rendered_dev.as_str()] {
+        let (rc, stdout, all) = c.run(&["--check", still]);
+        assert_eq!(rc, 0, "{still} is still undeclared:\n{all}");
+        assert!(stdout.starts_with("undeclared\tConfigMap\t"), "{all}");
+    }
+}
+
+/// A RENDERER THE DERIVATION CANNOT READ IS NOT A TREE THAT RENDERS
+/// NOTHING. If the `RENDERS=` line is gone (renamed, split over two
+/// lines, made a computed value) the exemption silently disappears, the
+/// rendered object reads as undeclared, and `--check` would hand
+/// `delete-orphan-object` the authority to delete a live mount of the
+/// operating instance. So every mode that uses the exemptions says
+/// CANNOT ANSWER and names the file.
+#[test]
+fn a_renderer_whose_object_cannot_be_read_is_cannot_answer_not_no_exemption() {
+    let (_, name) = rendered_object();
+    let c = Case::new(
+        "derived-instance-config-unreadable",
+        &[("ConfigMap", "boss", &name, "")],
+    );
+    std::fs::write(c.tree.join("infra/cluster/instances.toml"), TWO_INSTANCES).unwrap();
+    install_renderer(&c.tree, |b| b.replace("\nRENDERS=", "\nOBJECT="));
+    let target = format!("ConfigMap/boss/{name}");
+    for args in [
+        vec!["--list"],
+        vec!["--check", target.as_str()],
+        vec!["--exemptions-derived"],
+    ] {
+        let (rc, stdout, all) = c.run(&args);
+        assert_eq!(
+            rc, CANNOT_ANSWER,
+            "{args:?} answered from an exemption set it could not derive:\n{all}"
+        );
+        assert_eq!(stdout, "", "{args:?} printed an answer:\n{all}");
+        names_all(&all, &[RENDERER_REL, "RENDERS="], "the unreadable renderer");
+    }
+}
+
+/// WHERE THE RENDERER IS CALLED is the other half of the derivation, and
+/// it lives in the converge: `converge_dev_door` for the source
+/// instance's namespace and for each other instance the apply loop
+/// reaches. The derivation says "every instance namespace"; this holds
+/// the converge to that, by name, so a third call site (a namespace that
+/// is no instance) or a removed one fails here and not as an orphan on
+/// every converge (CLAUDE.md §9a: a fact that lives twice gets a test).
+#[test]
+fn the_converge_renders_the_instance_config_for_instances_and_nothing_else() {
+    let body = std::fs::read_to_string(repo_root().join(RUNNER_REL)).expect("the runner");
+    let calls: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("converge_dev_door ") && !l.ends_with('{'))
+        .collect();
+    assert_eq!(
+        calls,
+        vec![
+            "converge_dev_door \"$SOURCE_NS\"",
+            "converge_dev_door \"$ins_ns\""
+        ],
+        "{RUNNER_REL} must render the instance config for the source instance and for each other \
+         instance of infra/cluster/instances.toml, and nowhere else: {DERIVE_REL} \
+         derived_exemptions accounts for exactly those namespaces. Change both together."
+    );
+    assert!(
+        body.contains(&format!("\"$REPO/{RENDERER_REL}\"")),
+        "{RUNNER_REL} no longer renders through {RENDERER_REL}, the file {DERIVE_REL} reads the \
+         rendered object's name from"
+    );
+    let renderers: Vec<&str> = body
+        .lines()
+        .filter(|l| l.contains("render-dev-door-config.sh"))
+        .collect();
+    assert_eq!(
+        renderers.len(),
+        1,
+        "the renderer has one caller in {RUNNER_REL}, inside converge_dev_door: {renderers:?}"
+    );
+}
+
+/// WHY #916 WAS NOT CAUGHT AT THE GATE, closed. Train #916 added a mount
+/// of a ConfigMap no manifest declares and a renderer for it, and no
+/// check tied the two to the orphan derivation — so the first notice was
+/// a FAILED converge, and then every one after it. A gate has no cluster,
+/// but it has the tree: a ConfigMap a manifest REFERENCES (a volume, an
+/// envFrom, a key ref) is one the pod expects to find, so it is either
+/// DECLARED by a manifest or GENERATED by something — and a generated one
+/// is exactly what the derivation must exempt, by hand entry or by
+/// derivation, in the namespace the reference is in. Anything else is the
+/// next `boss-instance-config`, named here with its file and line.
+///
+/// Read as text, deliberately narrow: the gate image has no kubectl and
+/// no YAML parser, so this recognises the two spellings the tree uses —
+/// `configMap: {name: X …}` inline and a `configMap:` block whose `name:`
+/// follows — and FAILS on a reference it cannot name rather than skipping
+/// it.
+#[test]
+fn every_configmap_a_manifest_mounts_is_declared_or_exempt_in_the_derivation() {
+    let root = repo_root();
+    let reference =
+        regex::Regex::new(r"^(\s*)(?:-\s+)?configMap(?:Ref|KeyRef)?:\s*(.*)$").expect("regex");
+    let inline_name = regex::Regex::new(r"\bname:\s*([A-Za-z0-9.-]+)").expect("regex");
+    let top_kind = regex::Regex::new(r"^kind:\s*(\S+)").expect("regex");
+    let meta_key = regex::Regex::new(r"^  (name|namespace):\s*(\S+)").expect("regex");
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    for dir in ["infra/cluster/manifests", "infra/gate-runner"] {
+        for entry in std::fs::read_dir(root.join(dir)).expect("manifest dir") {
+            let p = entry.expect("dir entry").path();
+            if p.extension().is_some_and(|e| e == "yaml") {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+    assert!(
+        files.len() >= 10,
+        "the scrape broke: {} manifests",
+        files.len()
+    );
+
+    // (namespace, name) of every ConfigMap a manifest declares, and
+    // (file:line, namespace, name) of every reference.
+    let mut declared: Vec<(String, String)> = Vec::new();
+    let mut references: Vec<(String, String, String)> = Vec::new();
+    for path in &files {
+        let rel = path.strip_prefix(&root).unwrap().display().to_string();
+        let body = std::fs::read_to_string(path).expect("manifest");
+        let lines: Vec<&str> = body.lines().collect();
+        let mut start = 0;
+        let mut line_no = 0;
+        while start <= lines.len() {
+            let end = lines[start..]
+                .iter()
+                .position(|l| l.trim_end() == "---")
+                .map_or(lines.len(), |i| start + i);
+            let doc = &lines[start..end];
+            let kind = doc
+                .iter()
+                .find_map(|l| top_kind.captures(l))
+                .map(|c| c[1].to_string());
+            // The object's own metadata: the first two-space `name:` and
+            // `namespace:` after the top-level `metadata:` line.
+            let (mut name, mut ns) = (None, None);
+            if let Some(m) = doc.iter().position(|l| l.trim_end() == "metadata:") {
+                for l in doc[m + 1..].iter().take_while(|l| !top_level(l)) {
+                    if let Some(c) = meta_key.captures(l) {
+                        let v = c[2].trim_matches('"').to_string();
+                        match &c[1] {
+                            "name" if name.is_none() => name = Some(v),
+                            "namespace" if ns.is_none() => ns = Some(v),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            if kind.as_deref() == Some("ConfigMap")
+                && let (Some(ns), Some(name)) = (ns.clone(), name.clone())
+            {
+                declared.push((ns, name));
+            }
+            for (i, l) in doc.iter().enumerate() {
+                if l.trim_start().starts_with('#') {
+                    continue;
+                }
+                let Some(c) = reference.captures(l) else {
+                    continue;
+                };
+                let at = format!("{rel}:{}", line_no + i + 1);
+                let indent = c[1].len();
+                let rest = c[2].trim();
+                let found = if rest.is_empty() || rest.starts_with('#') {
+                    // Block form: the `name:` among the deeper-indented
+                    // lines that follow.
+                    doc[i + 1..]
+                        .iter()
+                        .take_while(|n| {
+                            n.trim().is_empty() || n.len() - n.trim_start().len() > indent
+                        })
+                        .filter(|n| !n.trim_start().starts_with('#'))
+                        .find_map(|n| {
+                            n.trim_start()
+                                .strip_prefix("name:")
+                                .map(|v| v.trim().trim_matches('"').to_string())
+                        })
+                } else {
+                    inline_name.captures(rest).map(|c| c[1].to_string())
+                };
+                let found = found.unwrap_or_else(|| {
+                    panic!(
+                        "{at}: a ConfigMap reference this reader cannot name: `{}`. Not being \
+                         able to read it is not the same as there being none — teach this test \
+                         the spelling.",
+                        l.trim()
+                    )
+                });
+                let ns = ns.clone().unwrap_or_else(|| {
+                    panic!("{at}: references ConfigMap `{found}` from an object with no namespace")
+                });
+                references.push((at, ns, found));
+            }
+            line_no += doc.len() + 1;
+            start = end + 1;
+        }
+    }
+    assert!(
+        references.len() >= 5 && !declared.is_empty(),
+        "the scrape broke: {} reference(s), {} declared ConfigMap(s)",
+        references.len(),
+        declared.len()
+    );
+
+    let ask = |mode: &str| -> String {
+        let out = Command::new("bash")
+            .arg(root.join(DERIVE_REL))
+            .arg(mode)
+            .env_remove("BOSS_CLUSTER_TREE")
+            .output()
+            .expect("the derivation runs");
+        assert!(
+            out.status.success(),
+            "{DERIVE_REL} {mode} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let exempt: Vec<String> = format!("{}\n{}", ask("--exemptions"), ask("--exemptions-derived"))
+        .lines()
+        .map(str::to_string)
+        .collect();
+
+    let unaccounted: Vec<String> = references
+        .iter()
+        .filter(|(_, ns, name)| {
+            !declared.contains(&(ns.clone(), name.clone()))
+                && !exempt.contains(&format!("ConfigMap/{ns}/{name}"))
+                && !exempt.contains(&format!("ConfigMap/{name}"))
+        })
+        .map(|(at, ns, name)| format!("{at}: ConfigMap/{ns}/{name}"))
+        .collect();
+    assert!(
+        unaccounted.is_empty(),
+        "a manifest references a ConfigMap that no manifest declares and {DERIVE_REL} does not \
+         exempt:\n    {}\n\
+         Something generates it (or nothing does, and the pod will not start). A generated \
+         object is undeclared as far as the orphan check can tell, so the first converge that \
+         creates it closes FAILED at `check orphans` and never rolls the other instances — \
+         train #916 did exactly this (backlog cb0c9937). Declare it in a manifest, or account \
+         for it in {DERIVE_REL}: `derived_exemptions` when a script renders it per instance, \
+         EXEMPT with the reason when it is built once.",
+        unaccounted.join("\n    ")
+    );
+}
+
+/// A line at column 0 that is not blank or a comment: the end of a
+/// top-level YAML block.
+fn top_level(line: &str) -> bool {
+    !line.is_empty() && !line.starts_with(' ') && !line.starts_with('#')
+}
+
 // ---------------------------------------------------------------------------
 // A manifest that will not parse. The defect this file was written for.
 // ---------------------------------------------------------------------------
@@ -679,6 +1075,310 @@ fn a_labelled_object_of_a_kind_the_tree_never_declares_stays_out_of_scope() {
 /// placeholders `boss gate` fills at launch.
 fn gate_template() -> String {
     r#"{"kind":"Job","metadata":{"generateName":"gate-$GATE_NAME_HINT-","namespace":"boss-dev","labels":{"app":"gate-runner","boss.dev/packet":"$GATE_RUN_JOB_ID","boss.dev/branch":"$GATE_NAME_HINT"}}}"#.to_string()
+}
+
+#[test]
+fn owning_worker_isolation_must_be_present_before_either_reader_answers() {
+    let c = Case::new("worker-source-isolation", &[]);
+    let source: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(repo_root().join("infra/consist-worker/job.json")).unwrap(),
+    )
+    .unwrap();
+    let template = c.root.join("worker.json");
+    let empty = c.root.join("empty.json");
+    std::fs::write(&empty, r#"{"items":[]}"#).unwrap();
+    let reader = repo_root().join("infra/consist-worker/declaration.py");
+    for (pointer, replacement) in [
+        ("/spec/template/spec", Some(serde_json::json!([]))),
+        (
+            "/spec/template/spec/securityContext",
+            Some(serde_json::Value::Null),
+        ),
+        (
+            "/spec/template/spec/securityContext/seccompProfile",
+            Some(serde_json::json!([])),
+        ),
+        (
+            "/spec/template/spec/containers/0",
+            Some(serde_json::Value::Null),
+        ),
+        (
+            "/spec/template/spec/containers/0/securityContext",
+            Some(serde_json::json!([])),
+        ),
+        (
+            "/spec/template/spec/containers/0/securityContext/capabilities",
+            Some(serde_json::Value::Null),
+        ),
+        (
+            "/spec/template/spec/containers/0/securityContext/runAsUser",
+            Some(serde_json::json!(true)),
+        ),
+        ("/spec/template/spec/automountServiceAccountToken", None),
+        ("/spec/template/spec/securityContext", None),
+        ("/spec/template/spec/containers/0/securityContext", None),
+        ("/spec/template/spec/initContainers/0/securityContext", None),
+        ("/spec/template/spec/hostPID", None),
+        ("/spec/template/spec/hostIPC", None),
+        ("/spec/template/spec/hostNetwork", None),
+        ("/spec/template/spec/shareProcessNamespace", None),
+        ("/spec/template/spec/hostPID", Some(serde_json::json!(true))),
+        ("/spec/template/spec/hostIPC", Some(serde_json::json!(true))),
+        (
+            "/spec/template/spec/hostNetwork",
+            Some(serde_json::json!(true)),
+        ),
+        (
+            "/spec/template/spec/shareProcessNamespace",
+            Some(serde_json::json!(true)),
+        ),
+        (
+            "/spec/template/spec/automountServiceAccountToken",
+            Some(serde_json::json!(true)),
+        ),
+        (
+            "/spec/template/spec/securityContext/runAsNonRoot",
+            Some(serde_json::json!(false)),
+        ),
+        (
+            "/spec/template/spec/securityContext/fsGroup",
+            Some(serde_json::json!(0)),
+        ),
+        (
+            "/spec/template/spec/securityContext/seccompProfile/type",
+            Some(serde_json::json!("Unconfined")),
+        ),
+        (
+            "/spec/template/spec/containers/0/securityContext/allowPrivilegeEscalation",
+            Some(serde_json::json!(true)),
+        ),
+        (
+            "/spec/template/spec/containers/0/securityContext/readOnlyRootFilesystem",
+            Some(serde_json::json!(false)),
+        ),
+        (
+            "/spec/template/spec/containers/0/securityContext/runAsUser",
+            Some(serde_json::json!(0)),
+        ),
+        (
+            "/spec/template/spec/containers/0/securityContext/runAsGroup",
+            Some(serde_json::json!(0)),
+        ),
+        (
+            "/spec/template/spec/initContainers/0/securityContext/allowPrivilegeEscalation",
+            Some(serde_json::json!(true)),
+        ),
+        (
+            "/spec/template/spec/initContainers/0/securityContext/readOnlyRootFilesystem",
+            Some(serde_json::json!(false)),
+        ),
+        (
+            "/spec/template/spec/containers/0/securityContext/capabilities/drop",
+            Some(serde_json::json!([])),
+        ),
+    ] {
+        let mut malformed = source.clone();
+        if let Some(value) = replacement {
+            *malformed.pointer_mut(pointer).unwrap() = value;
+        } else {
+            let (parent, key) = pointer.rsplit_once('/').unwrap();
+            malformed
+                .pointer_mut(parent)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+        }
+        std::fs::write(&template, serde_json::to_vec(&malformed).unwrap()).unwrap();
+        for mode in ["--declaration", "--names"] {
+            let out = Command::new("python3")
+                .arg(&reader)
+                .arg(mode)
+                .arg(&template)
+                .arg(&empty)
+                .output()
+                .unwrap();
+            assert_eq!(
+                out.status.code(),
+                Some(4),
+                "{pointer} {mode}: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            assert!(
+                out.stdout.is_empty(),
+                "{pointer} {mode} returned a partial answer"
+            );
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("worker declaration cannot answer")
+            );
+        }
+    }
+    std::fs::write(&template, serde_json::to_vec(&source).unwrap()).unwrap();
+    for mode in ["--declaration", "--names"] {
+        let out = Command::new("python3")
+            .arg(&reader)
+            .arg(mode)
+            .arg(&template)
+            .arg(&empty)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn generated_workers_require_the_declared_shape_not_just_a_forged_app_label() {
+    let c = Case::new("generated-worker-shape", &[]);
+    let dir = c.tree.join("infra/consist-worker");
+    std::fs::create_dir_all(&dir).unwrap();
+    // The fixture uses the owning definition, rather than a second copy
+    // of its mount/security roster. A controller-generated Job may gain
+    // server defaults, but never new execution privileges or mounts.
+    let template: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_root().join("infra/consist-worker/job.json")).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(dir.join("job.json"), serde_json::to_vec(&template).unwrap()).unwrap();
+    let values = serde_json::json!({
+        "$NAME": "consist-0123456789abcdef0123456789abcdef",
+        "$IMAGE": "example.invalid/boss-ci:fixed",
+        "$CLONE": "fixed historical clone script", "$WORKER": "fixed historical worker script",
+        "$URL": "https://example.invalid/repo.git", "$REFERENCE": "refs/heads/test",
+        "$HEAD": "0123456789abcdef0123456789abcdef01234567",
+        "$BASELINE": "fedcba9876543210fedcba9876543210fedcba98",
+        "$BUDGET": "120", "$DEADLINE": 300
+    });
+    fn fill(value: &mut serde_json::Value, bindings: &serde_json::Value) {
+        match value {
+            serde_json::Value::String(s) if bindings.get(s.as_str()).is_some() => {
+                *value = bindings[s.as_str()].clone();
+            }
+            serde_json::Value::Array(a) => a.iter_mut().for_each(|v| fill(v, bindings)),
+            serde_json::Value::Object(o) => o.values_mut().for_each(|v| fill(v, bindings)),
+            _ => {}
+        }
+    }
+    let mut good = template.clone();
+    fill(&mut good, &values);
+    let mut objects = vec![good.clone()];
+    let mut defaulted = good.clone();
+    defaulted["spec"]["template"]["spec"]
+        .as_object_mut()
+        .unwrap()
+        .remove("hostPID");
+    defaulted["spec"]["template"]["spec"]
+        .as_object_mut()
+        .unwrap()
+        .remove("hostIPC");
+    defaulted["spec"]["template"]["spec"]
+        .as_object_mut()
+        .unwrap()
+        .remove("hostNetwork");
+    defaulted["metadata"]["uid"] = serde_json::json!("336bc114-d132-44c1-8200-2b6ceef74a64");
+    defaulted["spec"]["selector"] = serde_json::json!({"matchLabels":{"batch.kubernetes.io/controller-uid":"336bc114-d132-44c1-8200-2b6ceef74a64"}});
+    defaulted["spec"]["template"]["metadata"]["labels"]["batch.kubernetes.io/controller-uid"] =
+        serde_json::json!("336bc114-d132-44c1-8200-2b6ceef74a64");
+    defaulted["spec"]["parallelism"] = serde_json::json!(1);
+    defaulted["spec"]["template"]["spec"]["dnsPolicy"] = serde_json::json!("ClusterFirst");
+    // A second representation of the same Job is a fixture control for
+    // server defaults, not a second runtime object or creator claim.
+    objects[0] = defaulted;
+    for (i, key, value) in [
+        (1, "hostPID", serde_json::json!(true)),
+        (2, "automountServiceAccountToken", serde_json::json!(true)),
+        (
+            3,
+            "containers",
+            serde_json::json!([{"name":"forged","image":"evil"}]),
+        ),
+        (
+            4,
+            "volumes",
+            serde_json::json!([{"name":"host","hostPath":{"path":"/"}}]),
+        ),
+    ] {
+        let mut bad = good.clone();
+        bad["metadata"]["name"] = serde_json::json!(format!("consist-{i:032x}"));
+        bad["spec"]["template"]["spec"]["containers"][0]["command"][6] =
+            bad["metadata"]["name"].clone();
+        bad["spec"]["template"]["spec"][key] = value;
+        objects.push(bad);
+    }
+    let mut unrelated = good.clone();
+    unrelated["metadata"]["name"] = serde_json::json!("unrelated-same-app");
+    unrelated["spec"]["template"]["spec"]["containers"][0]["command"][6] =
+        unrelated["metadata"]["name"].clone();
+    objects.push(unrelated);
+    for (i, key, value) in [
+        (
+            5,
+            "env",
+            serde_json::json!([{"name":"INJECT","value":"yes"}]),
+        ),
+        (6, "command", serde_json::json!(["sh", "-c", "evil"])),
+        (
+            7,
+            "volumeMounts",
+            serde_json::json!([{"name":"forge-read","mountPath":"/etc/forge"}]),
+        ),
+        (8, "securityContext", serde_json::json!({"privileged":true})),
+    ] {
+        let mut bad = good.clone();
+        bad["metadata"]["name"] = serde_json::json!(format!("consist-{i:032x}"));
+        bad["spec"]["template"]["spec"]["containers"][0]["command"][6] =
+            bad["metadata"]["name"].clone();
+        bad["spec"]["template"]["spec"]["containers"][0][key] = value;
+        objects.push(bad);
+    }
+    for object in &objects {
+        c.add_live_labelled(
+            "Job",
+            "boss-dev",
+            object["metadata"]["name"].as_str().unwrap(),
+            "app=consist-worker",
+        );
+    }
+    std::fs::write(
+        c.live.join("Job.boss-dev.json"),
+        serde_json::to_vec(&serde_json::json!({"items":objects})).unwrap(),
+    )
+    .unwrap();
+    let (rc, stdout, all) = c.run(&["--list"]);
+    assert_eq!(rc, 0, "{all}");
+    assert!(
+        !stdout.contains(values["$NAME"].as_str().unwrap()),
+        "legitimate retained worker must be declared: {all}"
+    );
+    assert_eq!(
+        stdout.lines().count(),
+        9,
+        "every hostile/unrelated labelled Job remains undeclared: {all}"
+    );
+    let (rc, _, all) = c.run(&[
+        "--check",
+        "Job/boss-dev/consist-0123456789abcdef0123456789abcdef",
+    ]);
+    assert_eq!(
+        rc, 3,
+        "declared worker cannot be an orphan-deletion target: {all}"
+    );
+    assert!(all.contains("infra/consist-worker/job.json"), "{all}");
+    // A declaration reader cannot turn a malformed source into a
+    // smaller declared set, which the deletion verb might act on.
+    std::fs::write(dir.join("job.json"), r#"{"kind":"Job","metadata":{"name":"$NAME","namespace":"boss-dev","labels":{"app":"consist-worker"}}}"#).unwrap();
+    let (rc, stdout, all) = c.run(&["--list"]);
+    assert_eq!(
+        rc, CANNOT_ANSWER,
+        "partial owning declaration must refuse: {all}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "no orphan answer may come from a broken declaration: {all}"
+    );
 }
 
 /// Backlog 4438217e. `Job/boss-dev/seed-dir-probe-2` was made by hand on
@@ -1197,6 +1897,122 @@ fn the_lint_still_catches_a_stale_exemption_in_the_derivation() {
             DERIVE_REL,
         ],
         "the stale-because-absent case",
+    );
+}
+
+/// THE CONVERGE'S PACKET NAMES THE OBJECT (backlog cb0c9937). The lint is
+/// the converge's `check orphans` stage, and a finding used to leave the
+/// packet `failed_stage: check orphans` and nothing more — which object
+/// took an ops-request for the forge journal (packets 8d5c8f93, 79f23714).
+/// The lint records `orphans_check` itself, through run-summary.sh, in the
+/// file the unit names: the count and the names on a finding, bounded with
+/// the remainder COUNTED, a stated ok on a pass — and nothing at all when
+/// no packet asked (a gate, a hand run).
+#[test]
+fn the_lint_leaves_the_named_objects_for_the_converges_packet() {
+    let with_summary = |name: &str, extra: &[(&str, &str, &str, &str)]| {
+        let c = LintCase::new(name, extra);
+        for rel in ["infra/run-summary.sh", "infra/lib/jq.sh"] {
+            let dst = c.c.tree.join(rel);
+            std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+            std::fs::write(&dst, std::fs::read(repo_root().join(rel)).unwrap()).unwrap();
+        }
+        c
+    };
+    let read = |file: &Path| -> serde_json::Value {
+        let body = std::fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("no run summary at {}: {e}", file.display()));
+        serde_json::from_str(&body).unwrap_or_else(|e| panic!("summary is not JSON ({e}): {body}"))
+    };
+    let two = [
+        ("Service", "boss", "ghost-svc", ""),
+        ("ConfigMap", "boss", "generated-thing", ""),
+    ];
+
+    // A finding: the count and both names.
+    let c = with_summary("lint-summary-found", &two);
+    let file = c.c.root.join("summary.json");
+    let (rc, out) = c.run(&[("BOSS_RUN_SUMMARY_FILE", file.display().to_string())]);
+    assert_ne!(rc, 0, "{out}");
+    let got = read(&file)["orphans_check"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    names_all(
+        &got,
+        &[
+            "2 finding(s)",
+            "Service/boss/ghost-svc",
+            "ConfigMap/boss/generated-thing",
+        ],
+        "the packet's orphans_check",
+    );
+
+    // Bounded: the names that do not fit are counted, never dropped in
+    // silence — and the journal still has every one.
+    let c = with_summary("lint-summary-bounded", &two);
+    let file = c.c.root.join("summary.json");
+    let (rc, out) = c.run(&[
+        ("BOSS_RUN_SUMMARY_FILE", file.display().to_string()),
+        ("BOSS_ORPHANS_SUMMARY_CAP", "70".to_string()),
+    ]);
+    assert_ne!(rc, 0, "{out}");
+    let got = read(&file)["orphans_check"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    names_all(
+        &got,
+        &["2 finding(s)", "and 1 more"],
+        "the bounded orphans_check",
+    );
+    assert_eq!(
+        got.matches("no manifest declares it").count(),
+        1,
+        "the cap did not bound the names: {got}"
+    );
+    names_all(&out, &["ghost-svc", "generated-thing"], "the journal");
+
+    // A pass says so, on the packet.
+    let c = with_summary("lint-summary-clean", &[]);
+    let file = c.c.root.join("summary.json");
+    let (rc, out) = c.run(&[("BOSS_RUN_SUMMARY_FILE", file.display().to_string())]);
+    assert_eq!(rc, 0, "{out}");
+    let got = read(&file)["orphans_check"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(got.starts_with("ok"), "a clean run's orphans_check: {got}");
+
+    // A refusal to sweep is not a finding and not a pass, there either.
+    let c = with_summary("lint-summary-refused", &two);
+    let file = c.c.root.join("summary.json");
+    let (rc, out) = c.run(&[
+        ("BOSS_RUN_SUMMARY_FILE", file.display().to_string()),
+        ("STUB_LIST_REFUSES", "ghost.yaml".to_string()),
+    ]);
+    assert_ne!(rc, 0, "{out}");
+    let got = read(&file)["orphans_check"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    names_all(
+        &got,
+        &["CANNOT ANSWER", "ghost.yaml"],
+        "the refused orphans_check",
+    );
+    assert!(
+        !got.contains("ghost-svc"),
+        "a refusal named an object: {got}"
+    );
+
+    // No packet asked: nothing is written anywhere.
+    let c = with_summary("lint-summary-unasked", &two);
+    let (rc, out) = c.run(&[]);
+    assert_ne!(rc, 0, "{out}");
+    assert!(
+        !c.c.root.join("summary.json").exists(),
+        "a run outside a packet wrote a summary"
     );
 }
 

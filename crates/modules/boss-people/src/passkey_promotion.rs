@@ -434,6 +434,9 @@ async fn flip(
         .begin()
         .await
         .map_err(|e| internal(e.to_string()))?;
+    crate::coverage_guard_pg::lock(&mut tx)
+        .await
+        .map_err(|e| internal(e.to_string()))?;
     // FOR UPDATE: two racing promotes of one key serialise here, so the
     // second reads `operator` and records nothing.
     let row = sqlx::query(
@@ -581,6 +584,364 @@ async fn flip(
 mod tests {
     use super::*;
     use boss_core::presence::now_epoch;
+
+    #[tokio::test]
+    async fn removing_the_last_operator_key_keeps_its_row_when_user_keys_remain() {
+        let db = boss_testing::TestDb::new().await;
+        sqlx::query("INSERT INTO employees (id, role, status, hire_date) VALUES ('emp-owner', 'platform-admin', 'active', '2024-01-15')")
+            .execute(&db.pool).await.unwrap();
+        // The isolated fixture lands the historical operator row under
+        // the trigger's actual promotion mark; no production door or
+        // permission is weakened to manufacture the after-state.
+        let mut tx = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT set_config($1, $2, true)")
+            .bind(PROMOTION_MARK)
+            .bind(PACKET)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        for (credential, tier) in [
+            (b"operator-key".as_slice(), "operator"),
+            (b"user-key".as_slice(), "user"),
+        ] {
+            sqlx::query("INSERT INTO webauthn_credentials (employee_id, credential_id, public_key, access_tier) VALUES ('emp-owner', $1, $2, $3)")
+                .bind(credential).bind(b"fixture-public-key".as_slice()).bind(tier)
+                .execute(&mut *tx).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+        struct Fixed;
+        #[async_trait]
+        impl crate::coverage_guard::CoverageRead for Fixed {
+            async fn standing(
+                &self,
+                ids: &[String],
+            ) -> Result<crate::coverage_guard::Standing, crate::port::PeopleError> {
+                Ok(crate::coverage_guard::Standing {
+                    controls: vec![
+                        boss_policy_client::coverage::Control::PlatformOwner,
+                        boss_policy_client::coverage::Control::OperatorTier,
+                    ],
+                    rules: vec![],
+                    overrides: vec![],
+                    employee_ids: ids.iter().cloned().collect(),
+                })
+            }
+        }
+        let router = crate::webauthn::webauthn_router_with_coverage(
+            db.pool.clone(),
+            Arc::new(boss_clock_client::WallClockClient),
+            Some(Arc::new(Fixed)),
+        );
+        let credential = URL_SAFE_NO_PAD.encode(b"operator-key");
+        let response = boss_testing::TestRequest::delete(format!(
+            "/api/people/emp-owner/webauthn-credentials/{credential}"
+        ))
+        .as_user(GATEWAY_ACTOR_ID, "platform-admin")
+        .send(&router)
+        .await;
+        response.assert_status(StatusCode::CONFLICT);
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM webauthn_credentials WHERE employee_id = 'emp-owner' AND access_tier = 'operator'")
+            .fetch_one(&db.pool).await.unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// Removing a key reads the coverage basis only when it can take a
+    /// holder away (review c3b96c09 F1): one of two user keys beside an
+    /// operator key leaves the owner real and operator-tier, so it reads
+    /// nothing and is removed; the operator key is judged and refused.
+    #[tokio::test]
+    async fn only_a_key_removal_that_can_take_a_holder_away_reads_the_basis() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let db = boss_testing::TestDb::new().await;
+        sqlx::query("INSERT INTO employees (id, role, status, hire_date) VALUES ('emp-owner', 'platform-admin', 'active', '2024-01-15')")
+            .execute(&db.pool).await.unwrap();
+        let mut tx = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT set_config($1, $2, true)")
+            .bind(PROMOTION_MARK)
+            .bind(PACKET)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        for (credential, tier) in [
+            (b"operator-key".as_slice(), "operator"),
+            (b"user-key-one".as_slice(), "user"),
+            (b"user-key-two".as_slice(), "user"),
+        ] {
+            sqlx::query("INSERT INTO webauthn_credentials (employee_id, credential_id, public_key, access_tier) VALUES ('emp-owner', $1, $2, $3)")
+                .bind(credential).bind(b"fixture-public-key".as_slice()).bind(tier)
+                .execute(&mut *tx).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+        struct Counted(Arc<AtomicUsize>);
+        #[async_trait]
+        impl crate::coverage_guard::CoverageRead for Counted {
+            async fn standing(
+                &self,
+                ids: &[String],
+            ) -> Result<crate::coverage_guard::Standing, crate::PeopleError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                G2Fixed.standing(ids).await
+            }
+        }
+        let reads = Arc::new(AtomicUsize::new(0));
+        let router = crate::webauthn::webauthn_router_with_coverage(
+            db.pool.clone(),
+            Arc::new(boss_clock_client::WallClockClient),
+            Some(Arc::new(Counted(reads.clone()))),
+        );
+        let remove = |credential: &'static [u8]| {
+            boss_testing::TestRequest::delete(format!(
+                "/api/people/emp-owner/webauthn-credentials/{}",
+                URL_SAFE_NO_PAD.encode(credential)
+            ))
+            .as_user(GATEWAY_ACTOR_ID, "platform-admin")
+        };
+        remove(b"user-key-one")
+            .send(&router)
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        remove(b"no-such-key")
+            .send(&router)
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        remove(b"operator-key")
+            .send(&router)
+            .await
+            .assert_status(StatusCode::CONFLICT);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        let left: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM webauthn_credentials WHERE employee_id = 'emp-owner'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(left, 2);
+    }
+
+    use crate::{PeopleError, PeopleRepository};
+    use boss_core::{actor::ActorId, publisher::EventStamp};
+    // Historical G2 fixtures belong beside the private promotion mark.
+    // They do not expose a second operator writer or a live ceremony.
+    struct G2Fixed;
+    #[async_trait]
+    impl crate::coverage_guard::CoverageRead for G2Fixed {
+        async fn standing(
+            &self,
+            ids: &[String],
+        ) -> Result<crate::coverage_guard::Standing, crate::PeopleError> {
+            Ok(crate::coverage_guard::Standing {
+                controls: vec![
+                    boss_policy_client::coverage::Control::PlatformOwner,
+                    boss_policy_client::coverage::Control::OperatorTier,
+                ],
+                rules: vec![],
+                overrides: vec![],
+                employee_ids: ids.iter().cloned().collect(),
+            })
+        }
+    }
+    #[tokio::test]
+    async fn employee_retirement_and_operator_key_removal_share_one_serialized_basis() {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use base64::Engine;
+        use tower::ServiceExt;
+        struct Concurrent(tokio::sync::Barrier);
+        #[async_trait::async_trait]
+        impl crate::coverage_guard::CoverageRead for Concurrent {
+            async fn standing(
+                &self,
+                ids: &[String],
+            ) -> Result<crate::coverage_guard::Standing, PeopleError> {
+                self.0.wait().await;
+                G2Fixed.standing(ids).await
+            }
+        }
+        let db = boss_testing::TestDb::new().await;
+        // Historical operator rows in this isolated fixture use the existing
+        // promotion trigger's mark; no live ceremony or permission is changed.
+        let mut fixture = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT set_config($1, $2, true)")
+            .bind(PROMOTION_MARK)
+            .bind(PACKET)
+            .execute(&mut *fixture)
+            .await
+            .unwrap();
+        for id in ["emp-retire", "emp-key-removal"] {
+            sqlx::query("INSERT INTO employees (id, role, status, hire_date) VALUES ($1, 'platform-admin', 'active', '2024-01-15')")
+            .bind(id).execute(&mut *fixture).await.unwrap();
+            sqlx::query("INSERT INTO webauthn_credentials (employee_id, credential_id, public_key, access_tier) VALUES ($1, $2, $3, 'operator')")
+            .bind(id).bind(id.as_bytes()).bind(b"fixture-public-key".as_slice()).execute(&mut *fixture).await.unwrap();
+        }
+        fixture.commit().await.unwrap();
+        sqlx::query("INSERT INTO webauthn_credentials (employee_id, credential_id, public_key, access_tier) VALUES ('emp-key-removal', $1, $2, 'user')")
+        .bind(b"remaining-user-key".as_slice()).bind(b"fixture-public-key".as_slice()).execute(&db.pool).await.unwrap();
+        let source = std::sync::Arc::new(Concurrent(tokio::sync::Barrier::new(2)));
+        let repo = crate::PgPeople::new(db.pool.clone()).with_coverage(source.clone());
+        let app = crate::webauthn::webauthn_router_with_coverage(
+            db.pool.clone(),
+            std::sync::Arc::new(boss_clock_client::WallClockClient),
+            Some(source),
+        );
+        let mut person = repo.employee_by_id("emp-retire").await.unwrap().unwrap();
+        person.status = Some("terminated".into());
+        let credential =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"emp-key-removal");
+        let user = serde_json::to_string(&boss_policy_client::User::service("gateway")).unwrap();
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!(
+                "/api/people/emp-key-removal/webauthn-credentials/{credential}"
+            ))
+            .header("x-boss-user", user)
+            .body(Body::empty())
+            .unwrap();
+        let stamp = EventStamp::new("people", ActorId::Automation("agent-codex".into()));
+        let (retirement, deletion) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                tokio::join!(
+                    repo.update_employee_at(&person.id, &person, chrono::Utc::now(), &stamp),
+                    app.oneshot(request)
+                )
+            })
+            .await
+            .expect("the two local mutation kinds must terminate");
+        let deletion = deletion.unwrap().status();
+        assert_eq!(
+            usize::from(retirement.is_ok()) + usize::from(deletion == StatusCode::NO_CONTENT),
+            1
+        );
+        assert!(
+            matches!(retirement, Err(PeopleError::Conflict(_))) || deletion == StatusCode::CONFLICT
+        );
+        let holders: i64 = sqlx::query_scalar("SELECT count(*) FROM employees e JOIN webauthn_credentials k ON e.id = k.employee_id WHERE e.status = 'active' AND k.access_tier = 'operator'")
+        .fetch_one(&db.pool).await.unwrap();
+        assert_eq!(holders, 1);
+        let facts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM event_outbox WHERE kind = 'people.employee.updated'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(facts, i64::from(retirement.is_ok()));
+    }
+
+    #[tokio::test]
+    async fn postgres_enrollment_and_later_revocation_of_a_nonholder_preserve_owner_and_key() {
+        let db = boss_testing::TestDb::new().await;
+        sqlx::query("INSERT INTO employees (id, role, status, hire_date) VALUES ('emp-existing-owner', 'platform-admin', 'active', '2024-01-15')")
+        .execute(&db.pool).await.unwrap();
+        let mut fixture = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT set_config($1, $2, true)")
+            .bind(PROMOTION_MARK)
+            .bind(PACKET)
+            .execute(&mut *fixture)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO webauthn_credentials (employee_id, credential_id, public_key, access_tier) VALUES ('emp-existing-owner', $1, $2, 'operator')")
+        .bind(b"existing-owner-key".as_slice()).bind(b"existing-owner-public".as_slice()).execute(&mut *fixture).await.unwrap();
+        fixture.commit().await.unwrap();
+        let repo =
+            crate::PgPeople::new(db.pool.clone()).with_coverage(std::sync::Arc::new(G2Fixed));
+        let before = repo
+            .employee_by_id("emp-existing-owner")
+            .await
+            .unwrap()
+            .unwrap();
+        let newcomer = crate::Employee {
+            id: "emp-native-nonholder".into(),
+            name: Some("Test Employee emp-native-nonholder".into()),
+            email: Some("emp-native-nonholder@boss.io".into()),
+            role: Some("service-tech".into()),
+            department: Some("service".into()),
+            skill_level: Some(3),
+            skills: vec![],
+            hire_date: chrono::NaiveDate::from_ymd_opt(2024, 1, 15),
+            location: None,
+            manager_id: None,
+            employment_type: Some("full-time".into()),
+            status: Some("active".into()),
+            certifications: vec![],
+            annual_salary_cents: None,
+        };
+        let stamp = EventStamp::new("people", ActorId::Automation("agent-codex".into()));
+        let now = chrono::Utc::now();
+        repo.create_employee_at(&newcomer, now, &stamp)
+            .await
+            .unwrap();
+        // Enroll a real, ordinary user key through the existing native key door.
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use base64::Engine;
+        use tower::ServiceExt;
+        let app = crate::webauthn::webauthn_router_with_coverage(
+            db.pool.clone(),
+            std::sync::Arc::new(boss_clock_client::WallClockClient),
+            Some(std::sync::Arc::new(G2Fixed)),
+        );
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let body = serde_json::json!({"credential_id":b64.encode(b"newcomer-key"), "public_key":b64.encode(b"newcomer-public")});
+        let user = serde_json::to_string(&boss_policy_client::User::service("gateway")).unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/people/{}/webauthn-credentials", newcomer.id))
+                    .header("content-type", "application/json")
+                    .header("x-boss-user", user)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let ordinary: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM webauthn_credentials WHERE employee_id = $1 AND access_tier = 'user'",
+    )
+    .bind(&newcomer.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+        assert_eq!(ordinary, 1);
+        repo.delete_employee_at(&newcomer.id, now, &stamp)
+            .await
+            .unwrap();
+        assert!(repo.employee_by_id(&newcomer.id).await.unwrap().is_none());
+        assert_eq!(repo.employee_by_id(&before.id).await.unwrap(), Some(before));
+        let original: Vec<(Vec<u8>, Vec<u8>, String)> = sqlx::query_as("SELECT credential_id, public_key, access_tier FROM webauthn_credentials WHERE employee_id = 'emp-existing-owner'")
+        .fetch_all(&db.pool).await.unwrap();
+        assert_eq!(
+            original,
+            vec![(
+                b"existing-owner-key".to_vec(),
+                b"existing-owner-public".to_vec(),
+                "operator".into()
+            )]
+        );
+        let facts: Vec<String> = sqlx::query_scalar(
+            "SELECT kind FROM event_outbox WHERE kind LIKE 'people.employee.%' ORDER BY id",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            facts,
+            vec!["people.employee.created", "people.employee.deleted"]
+        );
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM webauthn_credentials WHERE employee_id = $1")
+                .bind(&newcomer.id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, 0);
+    }
 
     // The judge's own tests moved with it to boss_core::passkey_promotion.
 

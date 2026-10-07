@@ -54,6 +54,10 @@ pub fn declared_event(
 
 #[derive(Debug, thiserror::Error)]
 pub enum CredentialsError {
+    #[error("invalid phase observation: {0}")]
+    InvalidObservation(String),
+    #[error("phase observation conflicts with its original receipt")]
+    ObservationConflict,
     #[error("storage: {0}")]
     Storage(String),
     /// A rotation write named a credential the registry does not
@@ -67,6 +71,33 @@ pub enum CredentialsError {
 
 #[async_trait]
 pub trait CredentialsRegistry: Send + Sync {
+    /// Authenticate an installation observation against the original installed
+    /// receipt and retain acknowledgment in the same owner transaction/outbox.
+    async fn record_delivery(
+        &self,
+        _context: &super::runner_delivery::ResolvedDelivery,
+        _stamp: &EventStamp,
+    ) -> Result<super::receipt::RotationOutcome, CredentialsError> {
+        Err(CredentialsError::Storage(
+            "authenticated delivery owner unavailable".into(),
+        ))
+    }
+    /// Read an original acknowledgment; no mutable packet marker is proof.
+    async fn delivery_receipt(
+        &self,
+        _id: &str,
+        _attempt: uuid::Uuid,
+    ) -> Result<Option<super::receipt::RotationReceipt>, CredentialsError> {
+        Err(CredentialsError::Storage(
+            "authenticated delivery owner unavailable".into(),
+        ))
+    }
+    /// Restore an original phase fact without publishing a second fact.
+    async fn restore_rotation(&self, _event: &Event) -> Result<(), CredentialsError> {
+        Err(CredentialsError::Storage(
+            "phase restoration is unavailable".into(),
+        ))
+    }
     /// Every credential the registry knows, ordered by id so the
     /// rendered list is stable run to run.
     async fn list(&self) -> Result<Vec<CredentialRow>, CredentialsError>;
@@ -109,5 +140,5 @@ pub trait CredentialsRegistry: Send + Sync {
         phase: RotationPhase,
         evidence: serde_json::Value,
         stamp: &EventStamp,
-    ) -> Result<(), CredentialsError>;
+    ) -> Result<super::receipt::RotationOutcome, CredentialsError>;
 }

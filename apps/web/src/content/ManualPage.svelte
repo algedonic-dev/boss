@@ -29,6 +29,7 @@
   let active = $state<ManualSection | null>(null);
   let activeLoading = $state(false);
   let activeNotFound = $state(false);
+  let activeFailed = $state<string | null>(null);
   let empNames = $state<ReadonlyMap<string, string>>(new Map());
   let namesRead = $state<ReadState>(okRead);
 
@@ -105,6 +106,10 @@
 
   $effect(() => {
     const s = slug;
+    // A newly selected URL must never borrow another section's content
+    // while its own read fails (backlog e8394d44).
+    active = null;
+    activeFailed = null;
     if (!s) {
       active = null;
       activeLoading = false;
@@ -125,9 +130,11 @@
         } else if (r.ok) {
           const body = (await r.json()) as ManualSection;
           if (!cancelled) active = body;
+        } else {
+          if (!cancelled) activeFailed = `HTTP ${r.status}`;
         }
-      } catch {
-        // ignore
+      } catch (e) {
+        if (!cancelled) activeFailed = e instanceof Error ? e.message : String(e);
       }
       if (!cancelled) activeLoading = false;
     })();
@@ -223,6 +230,10 @@
         <div class="manual-placeholder">
           Section <code>{slug}</code> not found, or you don't have access to it.
         </div>
+      {:else if activeFailed !== null}
+        <div class="manual-placeholder load-failed" role="alert">
+          Couldn't load section — {activeFailed}
+        </div>
       {:else if !active}
         <div class="manual-placeholder">Unable to load section.</div>
       {:else}
@@ -257,17 +268,21 @@
     class="manual-tree-node{isActive ? ' manual-tree-active' : ''}"
     style={`padding-left:${10 + depth * 14}px`}
   >
-    <button
-      type="button"
-      class="manual-tree-toggle"
-      aria-label={hasChildren ? (isCollapsed ? 'Expand' : 'Collapse') : undefined}
-      onclick={(e) => {
-        e.stopPropagation();
-        if (hasChildren) toggle(node.section.slug);
-      }}
-    >
-      {hasChildren ? (isCollapsed ? '▸' : '▾') : ''}
-    </button>
+    {#if hasChildren}
+      <button
+        type="button"
+        class="manual-tree-toggle"
+        aria-label={isCollapsed ? 'Expand' : 'Collapse'}
+        onclick={(e) => {
+          e.stopPropagation();
+          toggle(node.section.slug);
+        }}
+      >
+        {isCollapsed ? '▸' : '▾'}
+      </button>
+    {:else}
+      <span class="manual-tree-toggle" style="cursor:default" aria-hidden="true"></span>
+    {/if}
     <a
       class="manual-tree-label"
       href={href(`/ux/manual/${node.section.slug}`)}

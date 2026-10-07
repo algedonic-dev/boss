@@ -50,6 +50,9 @@ import { FAILURE_MARKER } from './_routes';
 import { installSmokeMocks } from './_smokeMocks';
 import { parseRoute } from '../../src/router';
 import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
+import { readFileSync } from 'node:fs';
+
+const DEV_DOOR_DECLARATION = JSON.parse(readFileSync(new URL('../../../../infra/estate/dev-door.json', import.meta.url), 'utf8')) as unknown;
 
 const PATH = ROUTE_CATALOG['system-estate'].path;
 const TITLE = { titleMatch: /The estate/ };
@@ -265,6 +268,7 @@ type Seen = Record<'nodes' | 'cluster' | 'series' | 'cmp' | 'host', number>;
 async function install(page: Page, reads: Reads = {}): Promise<Seen> {
   const seen: Seen = { nodes: 0, cluster: 0, series: 0, cmp: 0, host: 0 };
   await installSmokeMocks(page);
+  await page.route('**/instance-config/dev-door.json', (r) => json(r, DEV_DOOR_DECLARATION));
   const answer = (key: keyof Seen, mode: Answer, body: () => unknown) => (r: Route) => {
     seen[key] += 1;
     if (mode === 'down') return json(r, { error: 'estate upstream unavailable' }, 503);
@@ -1265,7 +1269,7 @@ test.describe('/it/estate — 04 THE DEV WORKSPACE', () => {
     );
   });
 
-  test('the door renders from the page itself, so it stands when every read fails', async ({ page }) => {
+  test('the declared door remains visible when the estate reads fail', async ({ page }) => {
     await install(page, { nodes: 'down', cluster: 'down', series: 'down', cmp: 'down', host: 'down' });
     await mountPage(page, PATH, TITLE);
 

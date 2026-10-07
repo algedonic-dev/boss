@@ -283,6 +283,60 @@ async fn send(app: &Router, uri: &str, who: &Option<User>) -> (StatusCode, Strin
     (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
+#[tokio::test]
+async fn a_step_reference_reads_its_actual_packet_only_inside_scope() {
+    let app = app().await;
+    for (job, reader) in [(OWN, brewer()), (HANDED, brewer()), (CLAIMABLE, brewer())] {
+        let (_, body) = send(&app, &format!("/api/jobs/{job}/steps"), &operator()).await;
+        let steps: Value = serde_json::from_str(&body).unwrap();
+        let step = steps[0]["id"].as_str().unwrap();
+        let (status, body) = send(&app, &format!("/api/jobs/steps/{step}"), &reader).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            serde_json::json!({
+                "step_id": step, "job_id": job,
+            })
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_step_reference_outside_scope_is_identical_to_absent() {
+    let app = app().await;
+    let (_, body) = send(&app, &format!("/api/jobs/{OTHERS}/steps"), &operator()).await;
+    let steps: Value = serde_json::from_str(&body).unwrap();
+    let step = steps[0]["id"].as_str().unwrap();
+    let hidden = send(&app, &format!("/api/jobs/steps/{step}"), &brewer()).await;
+    let absent = send(&app, &format!("/api/jobs/steps/{ABSENT}"), &brewer()).await;
+    assert_eq!(hidden.0, StatusCode::NOT_FOUND);
+    assert_eq!(hidden, absent);
+}
+
+#[tokio::test]
+async fn a_step_reference_denial_precedes_even_malformed_identity() {
+    let app = app().await;
+    for id in ["malformed", ABSENT] {
+        assert_eq!(
+            send(&app, &format!("/api/jobs/steps/{id}"), &None).await.0,
+            StatusCode::FORBIDDEN
+        );
+    }
+    for id in [
+        "malformed",
+        "46a00001",
+        "46a00001000000000000000000000000",
+        "urn:uuid:46a00001-0000-0000-0000-000000000000",
+    ] {
+        assert_eq!(
+            send(&app, &format!("/api/jobs/steps/{id}"), &operator())
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+}
+
 /// The single-packet reads, each a path on one packet.
 fn packet_routes(job: &str) -> [String; 3] {
     [

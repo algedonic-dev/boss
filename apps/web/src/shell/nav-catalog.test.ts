@@ -347,6 +347,13 @@ describe('nav catalog — app assignment', () => {
         .map((item) => `${item?.id ?? '(no catalog entry)'} (listed under ${app}, owner ${item?.owner ?? 'none'})`),
     );
     expect(dead, `sidebar rows no role can ever see: ${dead.join(', ')}`).toEqual([]);
+    const listed = new Set(allGroups.flatMap(([, rows]) => rows.map((item) => item?.id)));
+    const missing = entries
+      .filter(([, item]) => !item.unlisted)
+      .filter(([, item]) => item.owner === 'home' || SEEDED.some((d) => d.code === item.owner))
+      .filter(([, item]) => !listed.has(item.id))
+      .map(([name]) => name);
+    expect(missing, `listed catalog surfaces without a sidebar entrance: ${missing.join(', ')}`).toEqual([]);
   });
 
   it("a department's sidebar is its listed surfaces in catalog order, then Jobs", () => {

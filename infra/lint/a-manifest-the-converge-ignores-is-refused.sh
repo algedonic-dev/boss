@@ -93,6 +93,13 @@ MIN_MANIFESTS=10
     exit 1
 }
 
+# No token in reach (a-lint-sources-a-header-lib-only-hermetic): the lib
+# sourced below now sources the machine token's reader, and a lint's
+# answer must not depend on what credentials its runner holds
+# (backlog 920524dc; 2710c8fc).
+export BOSS_MACHINE_TOKEN_DIR=/nonexistent/no-machine-token
+export BOSS_SOR_ENV=/nonexistent/no-sor.env
+unset BOSS_JOBS_URL BOSS_MACHINE_TOKEN_HOSTS
 # shellcheck source=/dev/null
 . "$LIB"
 

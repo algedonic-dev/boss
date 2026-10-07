@@ -144,7 +144,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_registry_gets_every_kind_at_v1() {
-        let registry = InMemoryWorkflows::new();
+        let registry = InMemoryWorkflows::for_fixture();
         let report = seed_workflows(
             &registry,
             &[spec("alpha"), spec("beta")],
@@ -165,8 +165,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trusted_bootstrap_initialization_needs_no_live_holder_service() {
+        let registry = InMemoryWorkflows::for_bootstrap();
+        seed_workflows(
+            &registry,
+            &[spec("bootstrap-independent")],
+            &actor(),
+            now(),
+            false,
+        )
+        .await
+        .expect("trusted deployment bootstrap must stay independent of runtime services");
+        assert_eq!(
+            registry
+                .get_active("bootstrap-independent")
+                .await
+                .unwrap()
+                .version,
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn an_active_kind_is_present_whatever_it_says() {
-        let registry = InMemoryWorkflows::new();
+        let registry = InMemoryWorkflows::for_fixture();
         seed_workflows(&registry, &[spec("alpha")], &actor(), now(), false)
             .await
             .expect("seed");
@@ -199,7 +221,7 @@ mod tests {
     /// is still in the bundle is left retired.
     #[tokio::test]
     async fn a_retired_kind_is_left_retired() {
-        let registry = InMemoryWorkflows::new();
+        let registry = InMemoryWorkflows::for_fixture();
         seed_workflows(&registry, &[spec("alpha")], &actor(), now(), false)
             .await
             .expect("seed");
@@ -236,7 +258,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_dry_run_reports_and_writes_nothing() {
-        let registry = InMemoryWorkflows::new();
+        let registry = InMemoryWorkflows::for_fixture();
         let report = seed_workflows(&registry, &[spec("alpha")], &actor(), now(), true)
             .await
             .expect("dry run");

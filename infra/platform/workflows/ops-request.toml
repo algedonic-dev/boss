@@ -42,7 +42,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "A host-side debug read, as a packet instead of an ssh session. The requester names a host (the Subject: custom/<estate node id>) and an allowlisted read-only verb in job metadata (`host`, `verb`, `args`); the runner on that host polls about once a minute, executes the verb from infra/ops/verbs.json — never a packet-supplied string — and completes `execute` with the output and exit code. `answered` is the output arriving in the system of record with provenance; `refused` is the runner declining a verb outside the allowlist or an arg outside its pattern, with the reason in `output`. Phase 1 is read-only; mutating verbs are phase 2, behind per-verb policy. The operator stops being the transport."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
 
 [[workflow.step]]
 title = "filed"

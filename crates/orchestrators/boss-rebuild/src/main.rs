@@ -265,6 +265,10 @@ async fn main() -> Result<()> {
     step!("accounts", boss_accounts::rebuild_accounts(&pool));
     step!("jobs", boss_jobs::rebuild_jobs_and_steps(&pool));
     step!(
+        "credentials",
+        boss_jobs::credentials::rebuild::rebuild_credentials(&pool)
+    );
+    step!(
         "scheduling",
         boss_jobs::scheduling::rebuild_scheduling(&pool)
     );

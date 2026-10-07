@@ -910,7 +910,7 @@ pub struct Misses {
 }
 
 impl Misses {
-    fn judge(&mut self) {
+    pub(crate) fn judge(&mut self) {
         let mut why = Vec::new();
         if self.mode == Mode::Off {
             why.push("mode `off` records nothing, so its silence is no evidence".to_string());
@@ -961,24 +961,39 @@ impl Misses {
 /// `/api/machine-gate/accepts`, and a rotation's verify waited forever).
 #[derive(Clone, Copy, Debug)]
 pub struct Ungated {
-    pub service: &'static str,
+    /// None for a private socket that owns no network service port.
+    pub service: Option<&'static str>,
     pub file: &'static str,
     pub why: &'static str,
 }
 
-pub const UNGATED: &[Ungated] = &[Ungated {
-    service: "gateway",
-    file: "crates/core/boss-gateway/src/main.rs",
-    why: "the edge, not a machine door: its first act on every request is the edge strip \
+pub const UNGATED: &[Ungated] = &[
+    Ungated {
+        service: Some("gateway"),
+        file: "crates/core/boss-gateway/src/main.rs",
+        why: "the edge, not a machine door: its first act on every request is the edge strip \
           (role_headers.rs strip_boss_headers), which removes every inbound x-boss-* header \
           INCLUDING x-boss-machine-token, so it trusts no asserted identity and a gate on it \
           could only ever refuse the browsers it exists to serve. The gateway's side of the \
           design is stamping the token on what it forwards (car 2).",
-}];
+    },
+    Ungated {
+        service: None,
+        file: "crates/orchestrators/boss-cli/src/probe_reader.rs",
+        why: "a per-probe Unix socket, mode 0600, in a directory that stays its parent's own \
+          (0700; 0711 when root hands the socket alone to the probe user); no network \
+          listener or estate service port. It exists only where a reader credential is \
+          deposited AND a gate names that credential a reader slot; its parent holds the \
+          credential and forwards only body-free GET/HEAD requests to pinned estate \
+          origins. The guard cancels all connections and removes the socket at probe exit \
+          or at its own 60 s bound. Each of these is held by a test beside the code \
+          (review 0bd6a9c2, F1), not by this sentence.",
+    },
+];
 
 /// Does the server named `service` (a `boss-ports` name) mount a gate?
 pub fn is_gated(service: &str) -> bool {
-    !UNGATED.iter().any(|u| u.service == service)
+    !UNGATED.iter().any(|u| u.service == Some(service))
 }
 
 /// What the accepts route answers.
@@ -2556,10 +2571,23 @@ mod tests {
     #[test]
     fn the_ungated_servers_are_named_once_by_their_ports_name() {
         assert_eq!(
-            UNGATED.iter().map(|u| u.service).collect::<Vec<_>>(),
+            UNGATED.iter().filter_map(|u| u.service).collect::<Vec<_>>(),
             vec!["gateway"]
         );
         assert!(!is_gated("gateway"));
+        assert!(is_gated("jobs") && is_gated("dispatcher"));
+    }
+
+    #[test]
+    fn the_private_probe_reader_has_no_network_gate_to_rotate() {
+        let reader = UNGATED
+            .iter()
+            .find(|entry| entry.file == "crates/orchestrators/boss-cli/src/probe_reader.rs");
+        assert!(
+            reader.is_some(),
+            "the private reader requires an explicit ungated rationale"
+        );
+        assert_eq!(reader.unwrap().service, None);
         assert!(is_gated("jobs") && is_gated("dispatcher"));
     }
 

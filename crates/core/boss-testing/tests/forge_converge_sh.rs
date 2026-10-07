@@ -92,6 +92,10 @@ impl Converge {
             &infra.join("forge/runner-credential-deposit.sh"),
             &logged("runner-credential-deposit"),
         );
+        write_exec(
+            &infra.join("forge/machine-token-deposit.sh"),
+            &logged("machine-token-deposit"),
+        );
         write_exec(&infra.join("forge/install.sh"), &logged("install"));
         write_exec(
             &infra.join("forge/protect-main.sh"),
@@ -331,5 +335,122 @@ fn the_new_script_under_the_old_unit_still_installs() {
             "[{leg}] the packet's summary carries `refused` naming RUNTIME_DIRECTORY: {}",
             c.summary()
         );
+    }
+}
+
+/// THE MACHINE TOKEN'S DEPOSIT RUNS BEFORE THE FETCH AND NEVER REDS THE
+/// CONVERGE (backlog 88379df3). A deposit that fails — the Secret
+/// unreadable, the directory unwritable, the gate matching nothing —
+/// leaves its status on the packet and the run green: the converge
+/// installs this host's repairs and owes the token nothing. And it runs
+/// before the owner's git, the first step that can end the run, so a
+/// broken forge token cannot stop the machine token following a rotation.
+#[test]
+fn a_failed_machine_token_deposit_never_reds_the_converge() {
+    for (leg, status) in [("ok", 0), ("fault", 1), ("refused", 78), ("missing", 127)] {
+        let c = Converge::new(&format!("machine-token-{leg}"));
+        let stub = c.root.join("infra/forge/machine-token-deposit.sh");
+        if status == 127 {
+            // A checkout from before the script existed: nothing to run.
+            std::fs::remove_file(&stub).expect("remove the stub");
+        } else {
+            write_exec(
+                &stub,
+                &format!(
+                    "#!/bin/sh\necho \"machine-token-deposit $*\" >> '{}'\nexit {status}\n",
+                    c.log.display()
+                ),
+            );
+        }
+        let out = c
+            .cmd()
+            .env_remove("BOSS_MACHINE_TOKEN_DIR")
+            .output()
+            .expect("forge-converge.sh runs");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "[{leg}] the deposit's exit {status} must not become the converge's: {}",
+            text(&out)
+        );
+        assert_eq!(
+            c.summary()["machine_token_deposit_status"],
+            status.to_string(),
+            "[{leg}] the deposit's status rides on the packet"
+        );
+        let calls = c.calls();
+        for ran in ["install", "protect-main", "offsite-push", "runuser-git"] {
+            assert!(calls.contains(ran), "[{leg}] {ran} still ran: {calls}");
+        }
+        if status == 127 {
+            continue;
+        }
+        let at = |needle: &str| {
+            calls
+                .lines()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("[{leg}] `{needle}` never ran: {calls}"))
+        };
+        assert!(
+            at("machine-token-deposit") < at("runuser-git"),
+            "[{leg}] the deposit runs before the fetch: {calls}"
+        );
+        assert!(
+            calls.contains("broker-rotates-the-machine-token.toml --dest /etc/boss/machine-token"),
+            "[{leg}] it is handed the machine token's rule and the reader's default directory: \
+             {calls}"
+        );
+    }
+}
+
+/// A DEPOSIT THAT NEVER RETURNS COSTS THE CONVERGE ITS BOUND, NOT ITS
+/// TICK (adversarial review 9a1e289b, B1). The first draft carried the
+/// deposit's exit nowhere and its TIME everywhere: a sleeping kubectl
+/// held the converge at that line until the unit's TimeoutStartSec
+/// killed it, before the fetch and before install.sh, on every tick. The
+/// deposit is stopped at the converge's bound, 124 rides on the packet
+/// with what it means, and the fetch, install.sh and main's protection
+/// all still run, in seconds.
+#[test]
+fn a_deposit_that_never_returns_is_stopped_and_the_converge_goes_on() {
+    let c = Converge::new("machine-token-hang");
+    write_exec(
+        &c.root.join("infra/forge/machine-token-deposit.sh"),
+        &format!(
+            "#!/bin/sh\necho machine-token-deposit >> '{}'\nsleep 45\n",
+            c.log.display()
+        ),
+    );
+    let started = std::time::Instant::now();
+    let out = c
+        .cmd()
+        .env("BOSS_FORGE_DEPOSIT_BOUND_S", "1")
+        .output()
+        .expect("forge-converge.sh runs");
+    let took = started.elapsed().as_secs();
+    assert!(
+        took < 30,
+        "the converge waited {took}s on a deposit that never returns: {}",
+        text(&out)
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(c.summary()["machine_token_deposit_status"], "124");
+    assert!(
+        c.summary()["machine_token_action"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("STOPPED: the deposit did not finish inside 1 seconds"),
+        "the packet says what 124 means: {}",
+        c.summary()
+    );
+    let calls = c.calls();
+    for ran in [
+        "machine-token-deposit",
+        "runuser-git",
+        "install",
+        "protect-main",
+        "offsite-push",
+    ] {
+        assert!(calls.contains(ran), "{ran} still ran: {calls}");
     }
 }

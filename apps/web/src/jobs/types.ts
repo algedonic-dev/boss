@@ -143,6 +143,7 @@ export type Job = {
   status: JobStatus;
   priority: 'emergency' | 'urgent' | 'standard' | 'scheduled';
   opened_on: string;
+  opened_at?: string | null;
   due_on: string | null;
   closed_on: string | null;
   metadata: Record<string, unknown>;

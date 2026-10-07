@@ -75,7 +75,7 @@ fn admin_header() -> String {
 }
 
 fn app() -> axum::Router {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     // Seeded from the real platform registry, not a hand-built spec —
     // a fixture copy would have kept passing while the shipped kind
     // was broken.

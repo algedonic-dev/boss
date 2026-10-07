@@ -672,7 +672,7 @@ pub fn render(snap: &Snapshot, dir: &Path) -> Result<Vec<Rendered>> {
     let accounts = parent_first(&snap.accounts, "code", "parent")
         .iter()
         .map(|a| {
-            let mut row = pick(a, &["code", "name", "kind", "parent"]);
+            let mut row = pick(a, &["code", "name", "description", "kind", "parent"]);
             row["normal_balance"] = a
                 .get("normal_balance")
                 .or_else(|| a.get("normal_side"))
@@ -1132,9 +1132,9 @@ mod tests {
                 json!({"id": "x", "code": "1010", "name": "Stripe", "kind": "asset",
                        "normal_side": "debit", "is_active": true, "parent": "1000"}),
                 json!({"id": "y", "code": "1000", "name": "Bank", "kind": "asset",
-                       "normal_side": "debit", "is_active": true, "parent": null}),
+                       "normal_side": "debit", "is_active": true, "parent": null, "description": null}),
                 json!({"id": "z", "code": "2300", "name": "Sales tax payable", "kind": "liability",
-                       "normal_side": "credit", "is_active": true, "parent": null}),
+                       "normal_side": "credit", "is_active": true, "parent": null, "description": "Tenant sales obligation"}),
             ],
             tax_kinds: vec![json!({"kind": "sales", "liability_account": "2300",
                                    "expense_account": null, "derive_basis": "period-sales-tax"})],
@@ -1296,6 +1296,15 @@ mod tests {
         );
         assert_eq!(chart[2].parent.as_deref(), Some("1000"));
         assert_eq!(chart[2].normal_balance, "debit");
+        assert_eq!(chart[0].description, None, "explicit null stays absent");
+        assert_eq!(
+            chart[1].description.as_deref(),
+            Some("Tenant sales obligation")
+        );
+        assert_eq!(
+            chart[2].description, None,
+            "historical omission stays absent"
+        );
 
         // Grants: (role, scope, resource) groups with sorted actions, a
         // department scope in its db spelling.

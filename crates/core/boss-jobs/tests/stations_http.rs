@@ -138,7 +138,7 @@ fn watchlist_station() -> StationSpec {
 }
 
 fn app() -> (axum::Router, Arc<InMemoryJobs>) {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds.seed(car_kind()).unwrap();
     let stations = Arc::new(InMemoryStations::new());
     stations.seed(dock_station()).unwrap();

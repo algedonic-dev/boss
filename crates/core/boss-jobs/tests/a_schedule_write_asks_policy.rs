@@ -46,6 +46,7 @@ fn defaults() -> Arc<dyn PolicyClient> {
 
 fn app(pool: PgPool, policy: Arc<dyn PolicyClient>) -> Router {
     router(SchedulingApiState {
+        role_guards: None,
         repo: Arc::new(PgScheduling::new(pool)),
         publisher: None,
         clock: Arc::new(boss_clock_client::WallClockClient),

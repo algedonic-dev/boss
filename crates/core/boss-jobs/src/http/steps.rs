@@ -3,7 +3,31 @@
 
 use super::*;
 
+use crate::conditional_completion::CompletionOutcome;
+// A proxy may name the person it represents; an agent is itself the CPU.
+// Both create and update use this same predicate and record attribution
+// separately from authority, without changing the event's signed actor.
+fn writer_is_proxy_reported<R: JobsRepository, B: EventBus>(
+    state: &JobsApiState<R, B>,
+    user: &boss_policy_client::User,
+) -> bool {
+    let predicate = |candidate: &boss_policy_client::User| {
+        candidate.id == "anonymous"
+            || candidate.id.starts_with("automation:")
+            || candidate.id.starts_with("rule:")
+            || candidate.id.ends_with("-sim")
+            || candidate.id.ends_with("-runner")
+            || candidate.role == "system-sim"
+            || candidate.role == "system"
+    };
+    match &state.role_guards {
+        Some(report) => report.evaluate("step-writer-proxy", "attribution", user, predicate),
+        None => predicate(user),
+    }
+}
+
 use axum::extract::Path;
+use boss_policy_client::User;
 
 use crate::registry::ProtocolReading;
 
@@ -51,6 +75,50 @@ pub(super) async fn list_steps<R: JobsRepository + 'static, B: EventBus + 'stati
 
     match state.jobs.list_steps(&job_id).await {
         Ok(steps) => Json(steps).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// Original evidence follows the same packet read authority as step detail.
+/// It returns the stored receipt, never a projection reconstructed from metadata.
+pub(super) async fn get_first_step_record<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    CurrentUser(user): CurrentUser,
+    Path((id, sid, key)): Path<(String, String, String)>,
+) -> Response {
+    let scope = match job_read_scope(&state, &user).await {
+        Ok(scope) => scope,
+        Err(refusal) => return refusal,
+    };
+    let Some(job_id) = parse_job_id(&id) else {
+        return (StatusCode::BAD_REQUEST, "invalid job id").into_response();
+    };
+    let Some(step_id) = parse_step_id(&sid) else {
+        return (StatusCode::BAD_REQUEST, "invalid step id").into_response();
+    };
+    if !crate::first_record::valid_key(&key) {
+        return (StatusCode::BAD_REQUEST, "invalid record key").into_response();
+    }
+    if let Err(refusal) = readable_job(&state, &user, &scope, &job_id).await {
+        return refusal;
+    }
+    match state.jobs.get_step(&step_id).await {
+        Ok(Some(step)) if step.job_id == job_id => (),
+        Ok(_) => return step_not_found(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+    match state.jobs.first_step_record(&step_id, &key).await {
+        Ok(Some(record))
+            if record.job_id == job_id && record.step_id == step_id && record.key == key =>
+        {
+            Json(record).into_response()
+        }
+        Ok(Some(_)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "original record resource mismatch",
+        )
+            .into_response(),
+        Ok(None) => step_not_found(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -346,13 +414,7 @@ pub(super) async fn add_step<R: JobsRepository + 'static, B: EventBus + 'static>
     // a proxy: it IS the CPU that did the work, and redirecting its
     // attribution to `assignee_id` would erase exactly the agent
     // attribution the `<mode>:<model>` actor id exists to record.
-    let is_automation = user.id == "anonymous"
-        || user.id.starts_with("automation:")
-        || user.id.starts_with("rule:")
-        || user.id.ends_with("-sim")
-        || user.id.ends_with("-runner")
-        || user.role == "system-sim"
-        || user.role == "system";
+    let is_automation = writer_is_proxy_reported(&state, &user);
     let actor = match (is_automation, step.assignee_id.as_deref()) {
         (true, Some(emp_id)) if !emp_id.is_empty() => {
             boss_core::actor::ActorId::Human(emp_id.to_string())
@@ -448,6 +510,7 @@ async fn dispatch_workflow_publish(
     job_id: boss_core::job::JobId,
     actor: &boss_core::actor::ActorId,
     now: chrono::DateTime<chrono::Utc>,
+    insert_if_absent: bool,
 ) -> Result<crate::registry::WorkflowSpec, (StatusCode, String)> {
     let spec_value = step.metadata.get("workflow_spec").ok_or((
         StatusCode::BAD_REQUEST,
@@ -484,7 +547,8 @@ async fn dispatch_workflow_publish(
     // packet's publish happened once, and a later one superseding it does
     // not undo that; the re-send is answered with the row it wrote.
     let authored_here = Some(*job_id.inner().as_uuid());
-    if let Ok(versions) = registry.list_versions(&spec.kind).await
+    if !insert_if_absent
+        && let Ok(versions) = registry.list_versions(&spec.kind).await
         && let Some(own) = versions.into_iter().rev().find(|row| {
             row.authoring_job_id == authored_here
                 && row.status != crate::registry::WorkflowStatus::Draft
@@ -494,22 +558,30 @@ async fn dispatch_workflow_publish(
         return Ok(own);
     }
 
-    registry
-        .publish_authored(spec, job_id, actor, now)
-        .await
-        .map_err(|e| match e {
-            crate::registry::WorkflowError::Unviable(problems) => {
-                let mut msg = String::from("workflow-publish: spec is not viable:");
-                for p in &problems {
-                    msg.push_str(&format!("\n  {p}"));
-                }
-                (StatusCode::UNPROCESSABLE_ENTITY, msg)
+    let result = if insert_if_absent {
+        registry
+            .publish_authored_if_absent(spec, job_id, actor, now)
+            .await
+    } else {
+        registry.publish_authored(spec, job_id, actor, now).await
+    };
+    result.map_err(|e| match e {
+        crate::registry::WorkflowError::CoverageUnavailable(message) => {
+            (StatusCode::SERVICE_UNAVAILABLE, message)
+        }
+        crate::registry::WorkflowError::Conflict(message) => (StatusCode::CONFLICT, message),
+        crate::registry::WorkflowError::Unviable(problems) => {
+            let mut msg = String::from("workflow-publish: spec is not viable:");
+            for p in &problems {
+                msg.push_str(&format!("\n  {p}"));
             }
-            other => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("publish_authored failed: {other}"),
-            ),
-        })
+            (StatusCode::UNPROCESSABLE_ENTITY, msg)
+        }
+        other => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("publish_authored failed: {other}"),
+        ),
+    })
 }
 
 /// What a step DEMANDS and what a request can actually PRODUCE.
@@ -670,10 +742,42 @@ pub(super) fn judge_assurance(
     }
 }
 
+async fn recorded_completion<R: JobsRepository>(
+    jobs: &R,
+    request: &crate::conditional_completion::CompletionRequest,
+    step: &Step,
+    caller: &str,
+) -> Result<Option<crate::conditional_completion::CompletionReceipt>, crate::port::JobsError> {
+    if step.status != StepStatus::Completed {
+        return Ok(None);
+    }
+    let Some(event) = jobs
+        .recorded_event(request.event_id(&step.job_id, &step.id, caller))
+        .await?
+    else {
+        return Ok(None);
+    };
+    let recorded = event
+        .payload
+        .get(crate::conditional_completion::RECEIPT_KEY)
+        .cloned()
+        .and_then(|value| {
+            serde_json::from_value::<crate::conditional_completion::RecordedCompletion>(value).ok()
+        });
+    Ok(recorded
+        .filter(|record| {
+            record.request == *request
+                && record.caller == caller
+                && record.authenticated_by(&event, step)
+        })
+        .map(|record| record.receipt))
+}
+
 pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     Path((id, step_id_str)): Path<(String, String)>,
     CurrentUser(user): CurrentUser,
+    caller: Option<axum::Extension<crate::field_writer::CredentialedCaller>>,
     // The presence claim rides here, exactly as it does on the sign-off
     // door: `x-boss-presence`, the gateway's signed ticket, verified by
     // `judge_assurance` before it is believed, so this handler judges
@@ -681,6 +785,94 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    update_step_with_condition(
+        state,
+        (id, step_id_str),
+        user,
+        headers,
+        body,
+        None,
+        caller.map(|axum::Extension(value)| value),
+    )
+    .await
+}
+
+pub(super) async fn complete_step_if<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    Path((id, step_id_str)): Path<(String, String)>,
+    CurrentUser(user): CurrentUser,
+    headers: axum::http::HeaderMap,
+    caller: Option<axum::Extension<crate::field_writer::CredentialedCaller>>,
+    Json(request): Json<crate::conditional_completion::CompletionRequest>,
+) -> Response {
+    if user.id.trim().is_empty()
+        || boss_core::roles::is_anonymous_visitor(&user.id, &user.role)
+        || user.ambient_actor().is_none()
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "conditional completion requires an authenticated named writer",
+        )
+            .into_response();
+    }
+    if !request.valid() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid conditional completion expectation or evidence",
+        )
+            .into_response();
+    }
+    update_step_with_condition(
+        state,
+        (id, step_id_str),
+        user,
+        headers,
+        serde_json::json!({"status": "completed"}),
+        Some(request),
+        caller.map(|axum::Extension(value)| value),
+    )
+    .await
+}
+
+pub(super) async fn get_step_version<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    Path((id, step_id_str)): Path<(String, String)>,
+    CurrentUser(user): CurrentUser,
+) -> Response {
+    let scope = match job_read_scope(&state, &user).await {
+        Ok(scope) => scope,
+        Err(refusal) => return refusal,
+    };
+    let (Some(job_id), Some(step_id)) = (parse_job_id(&id), parse_step_id(&step_id_str)) else {
+        return (StatusCode::BAD_REQUEST, "invalid job or step id").into_response();
+    };
+    if let Err(refusal) = readable_job(&state, &user, &scope, &job_id).await {
+        return refusal;
+    }
+    match state.jobs.get_step_versioned(&step_id).await {
+        Ok(Some((step, version))) if step.job_id == job_id => Json(
+            serde_json::json!({"step": step, "version": version.scoped_token(&job_id, &step_id)}),
+        )
+        .into_response(),
+        Ok(_) => step_not_found(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "versioned step read unavailable",
+        )
+            .into_response(),
+    }
+}
+
+async fn update_step_with_condition<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: Arc<JobsApiState<R, B>>,
+    ids: (String, String),
+    user: User,
+    headers: axum::http::HeaderMap,
+    body: serde_json::Value,
+    condition: Option<crate::conditional_completion::CompletionRequest>,
+    caller: Option<crate::field_writer::CredentialedCaller>,
+) -> Response {
+    let (id, step_id_str) = ids;
     let job_id = match parse_job_id(&id) {
         Some(id) => id,
         None => return (StatusCode::BAD_REQUEST, "invalid job id").into_response(),
@@ -720,7 +912,17 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     // row as this read saw it (backlog 6ec22d71).
     let (old, old_version) = match state.jobs.get_step_versioned(&step_id).await {
         Ok(Some(read)) => read,
-        Ok(None) => return (StatusCode::NOT_FOUND, "step not found").into_response(),
+        Ok(None) => {
+            return if condition.is_some() {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(CompletionOutcome::NotFound { step_id }),
+                )
+                    .into_response()
+            } else {
+                (StatusCode::NOT_FOUND, "step not found").into_response()
+            };
+        }
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
     // Same containment rule as the metadata PATCH and the claim route,
@@ -770,8 +972,90 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     // (backlog 0a8a2463). Judged on the STORED step, before the body is
     // laid over it: a PUT naming the caller as holder is exactly the
     // write that must not be able to make itself admissible.
-    if !step_writable(&user, &scope, parent_job.as_ref(), &old) {
+    if !step_writable_reported(&state, &user, &scope, parent_job.as_ref(), &old) {
         return step_not_found();
+    }
+
+    // A credential proves the executor; policy still grants authority.
+    // Judge before overlay and preserve the versioned write below, so a
+    // concurrent change cannot remove the declaration we just judged.
+    let executor = match crate::credential_executor::judge(
+        &old.metadata,
+        caller.as_ref(),
+        parent_job
+            .as_ref()
+            .and_then(|j| j.metadata.get(crate::field_writer::HOST_KEY))
+            .and_then(|h| h.as_str()),
+    ) {
+        Ok(c) => c,
+        Err(why) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(crate::credential_executor::refusal(
+                    &old.metadata,
+                    &user.id,
+                    &why,
+                )),
+            )
+                .into_response();
+        }
+    };
+    if let Some(c) = executor
+        && body
+            .get("assignee_id")
+            .is_some_and(|v| v.as_str() != Some(c.actor_id.as_str()))
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(crate::credential_executor::refusal(
+                &old.metadata,
+                &user.id,
+                "a credentialed execution is assigned to its authenticated actor",
+            )),
+        )
+            .into_response();
+    }
+
+    if let Some(request) = &condition {
+        match state.step_registry.get(&old.kind) {
+            Some(kind)
+                if kind.conditional_completion
+                    == crate::step_registry::ConditionalCompletion::RowAndOutbox => {}
+            declared => {
+                return (StatusCode::CONFLICT, Json(CompletionOutcome::UnsupportedCapability {
+                    step_id: old.id, kind: old.kind.clone(),
+                    capability: declared.map(|kind| kind.conditional_completion),
+                    error: "this kind has no supported atomic row-and-outbox conditional completion; no evidence, completion or inline effect was written".into(),
+                })).into_response();
+            }
+        }
+        if matches!(old.status, StepStatus::Completed | StepStatus::Skipped) {
+            match recorded_completion(state.jobs.as_ref(), request, &old, &user.id).await {
+                Ok(Some(receipt)) => {
+                    return Json(CompletionOutcome::Replayed { receipt }).into_response();
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "completion receipt unavailable",
+                    )
+                        .into_response();
+                }
+                _ => {}
+            }
+            return (
+                StatusCode::CONFLICT,
+                Json(CompletionOutcome::TerminalConflict { step_id: old.id }),
+            )
+                .into_response();
+        }
+        if !request.matches(&old, &old_version.scoped_token(&job_id, &step_id)) {
+            return (
+                StatusCode::CONFLICT,
+                Json(CompletionOutcome::PreconditionFailed { step_id: old.id }),
+            )
+                .into_response();
+        }
     }
 
     let mut merged = match serde_json::to_value(&old) {
@@ -854,6 +1138,40 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
 
     for (k, v) in body_obj {
         merged_obj.insert(k.clone(), v.clone());
+    }
+
+    if let Some(request) = &condition {
+        let mut evidence = request.evidence.clone();
+        // Evidence cannot introduce a protocol declaration and complete
+        // against the earlier declaration in the same act.
+        if evidence
+            .get(crate::human_only::KEY)
+            .is_some_and(|value| old.metadata.get(crate::human_only::KEY) != Some(value))
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(crate::human_only::change_refusal_body(
+                    &step_id.to_string(),
+                    &old.title,
+                    &old.metadata,
+                )),
+            )
+                .into_response();
+        }
+        if let Some(refusal) =
+            metadata_patch_refusal(&state, &user, &old, caller.as_ref(), &mut evidence, false).await
+        {
+            return refusal;
+        }
+        let mut metadata = old.metadata.as_object().cloned().unwrap_or_default();
+        for (key, value) in evidence {
+            if value.is_null() {
+                metadata.remove(&key);
+            } else {
+                metadata.insert(key, value);
+            }
+        }
+        merged_obj.insert("metadata".into(), serde_json::Value::Object(metadata));
     }
 
     let mut step: Step = match serde_json::from_value(merged) {
@@ -1735,15 +2053,13 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let is_automation = user.id == "anonymous"
-        || user.id.starts_with("automation:")
-        || user.id.starts_with("rule:")
-        || user.id.ends_with("-sim")
-        || user.id.ends_with("-runner")
-        || user.role == "system-sim"
-        || user.role == "system";
-    let actor = match (is_automation, body_completed_by.as_deref()) {
-        (true, Some(emp_id)) => boss_core::actor::ActorId::Human(emp_id.to_string()),
+    let is_automation = writer_is_proxy_reported(&state, &user);
+    let actor = match (executor, is_automation, body_completed_by.as_deref()) {
+        (Some(c), _, _) => match c.actor_id.parse() {
+            Ok(actor) => actor,
+            Err(never) => match never {},
+        },
+        (None, true, Some(emp_id)) => boss_core::actor::ActorId::Human(emp_id.to_string()),
         _ => user
             .ambient_actor()
             .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into())),
@@ -1780,6 +2096,41 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     // a step whose side effect couldn't fire — keeping audit_log
     // integrity on partial failure.
     if is_flipping_to_done && step.kind == "workflow-publish" {
+        let insert_if_absent = match step.metadata.get("insert_if_absent") {
+            None => false,
+            Some(serde_json::Value::Bool(mode)) => *mode,
+            Some(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "workflow-publish insert_if_absent must be a boolean",
+                )
+                    .into_response();
+            }
+        };
+        if insert_if_absent {
+            if let Err(response) =
+                super::kinds::policy_check(&state, &user, controls::PUBLISH_WORKFLOW).await
+            {
+                return response;
+            }
+            // Conditional publication is a protocol-bound authoring act,
+            // never an ad-hoc Active step whose approval cannot be read.
+            match protocol_reading(&state, parent_job.as_ref(), &old).await {
+                Ok(ProtocolReading::Holds { .. }) => {}
+                Ok(_) => return (
+                    StatusCode::CONFLICT,
+                    "conditional workflow publication requires a holding pinned authoring protocol",
+                )
+                    .into_response(),
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("reading conditional authoring protocol failed: {error}"),
+                    )
+                        .into_response();
+                }
+            }
+        }
         let Some(reg) = &state.kind_registry else {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1788,7 +2139,8 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                 .into_response();
         };
         if let Err((status, msg)) =
-            dispatch_workflow_publish(reg.as_ref(), &step, job_id, &actor, now).await
+            dispatch_workflow_publish(reg.as_ref(), &step, job_id, &actor, now, insert_if_absent)
+                .await
         {
             return (status, msg).into_response();
         }
@@ -1802,9 +2154,61 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     if let Some(j) = &parent_job {
         stamp = stamp.with_partition(j.partition);
     }
+    if condition.is_some() {
+        // One canonical instant at the precision both adapters retain.
+        // A JSON nanosecond receipt beside a Pg microsecond event is not
+        // equal provenance and must not be repaired by a fuzzy compare.
+        let Some(timestamp) =
+            chrono::DateTime::from_timestamp_micros(stamp.timestamp.timestamp_micros())
+        else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "completion event instant is not representable",
+            )
+                .into_response();
+        };
+        stamp.timestamp = timestamp;
+    }
     let stamp = stamp;
-    let mut step_events =
-        vec![stamp.event(events::STEP_UPDATED, events::step_state_payload(&step))];
+    let mut state_event = stamp.event(events::STEP_UPDATED, events::step_state_payload(&step));
+    let completion_receipt = if let Some(request) = &condition {
+        state_event.id = request.event_id(&job_id, &step_id, &user.id);
+        let receipt = crate::conditional_completion::CompletionReceipt {
+            operation_id: request.operation_id,
+            job_id,
+            step_id,
+            event_id: state_event.id,
+            actor: actor.clone(),
+            recorded_at: stamp.timestamp,
+        };
+        let record = crate::conditional_completion::RecordedCompletion {
+            request: request.clone(),
+            caller: user.id.clone(),
+            receipt: receipt.clone(),
+        };
+        let value = match serde_json::to_value(&record) {
+            Ok(value) => value,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "completion receipt serialization failed",
+                )
+                    .into_response();
+            }
+        };
+        let Some(payload) = state_event.payload.as_object_mut() else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "completion event must be an object",
+            )
+                .into_response();
+        };
+        payload.insert(crate::conditional_completion::RECEIPT_KEY.into(), value);
+        Some(receipt)
+    } else {
+        None
+    };
+    let mut step_events = vec![state_event];
 
     // The `workflow-publish` dispatch's WORKFLOW_PUBLISHED event —
     // the full published spec `rebuild_workflows` reads to
@@ -2005,6 +2409,47 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     match written {
         Ok(()) => {}
         Err(crate::port::JobsError::StepChanged { .. }) => {
+            if let Some(request) = &condition {
+                // Another identical request may have committed while this
+                // request waited at CAS. Observe its immutable receipt;
+                // never retry the mutation against the newly held row.
+                match state.jobs.get_step(&step_id).await {
+                    Ok(Some(current))
+                        if current.job_id == job_id
+                            && step_writable(&user, &scope, parent_job.as_ref(), &current) =>
+                    {
+                        match recorded_completion(state.jobs.as_ref(), request, &current, &user.id)
+                            .await
+                        {
+                            Ok(Some(receipt)) => {
+                                return Json(CompletionOutcome::Replayed { receipt })
+                                    .into_response();
+                            }
+                            Err(_) => {
+                                return (
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "completion receipt unavailable",
+                                )
+                                    .into_response();
+                            }
+                            Ok(None) => {}
+                        }
+                    }
+                    Err(_) => {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "completion state unavailable",
+                        )
+                            .into_response();
+                    }
+                    _ => {}
+                }
+                return (
+                    StatusCode::CONFLICT,
+                    Json(CompletionOutcome::PreconditionFailed { step_id }),
+                )
+                    .into_response();
+            }
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
@@ -2219,7 +2664,11 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
         }
     }
 
-    StatusCode::NO_CONTENT.into_response()
+    if let Some(receipt) = completion_receipt {
+        Json(CompletionOutcome::Completed { receipt }).into_response()
+    } else {
+        StatusCode::NO_CONTENT.into_response()
+    }
 }
 
 /// The answer to a step write whose close did not land: a 500 NAMING
@@ -2278,6 +2727,489 @@ fn refuse_undeclared_writer(
     )
 }
 
+async fn metadata_patch_refusal<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &Arc<JobsApiState<R, B>>,
+    user: &User,
+    old: &Step,
+    caller: Option<&crate::field_writer::CredentialedCaller>,
+    patch: &mut serde_json::Map<String, serde_json::Value>,
+    allow_noop: bool,
+) -> Option<Response> {
+    let job_id = old.job_id;
+    let step_id = old.id;
+    // `authority_role` is immutable across writes, same rule as the
+    // PUT: the persisted value wins, so a body can neither raise nor
+    // lower the required sign-off authority — nor shed it with null.
+    patch.remove("authority_role");
+
+    // THE STANDING REFUSALS, AS THE WRITE LANDS (design 26a89f11,
+    // exhibits). A repeated anchor, a value over the field's inline
+    // bound, or a binding to an anchor the step does not carry is what a
+    // record may never say, so it is refused here, where the writer is on
+    // the line — not at done, where it would land on the reviewer. Judged
+    // against the row AS IT WOULD STAND (the patch overlaid, null
+    // removing), and only for the fields this write touches or that bind
+    // one it touches. A step whose fields declare none of these answers
+    // exactly as before.
+    let merged_view = {
+        let mut md = old.metadata.as_object().cloned().unwrap_or_default();
+        for (k, v) in patch.iter() {
+            if v.is_null() {
+                md.remove(k);
+            } else {
+                md.insert(k.clone(), v.clone());
+            }
+        }
+        serde_json::Value::Object(md)
+    };
+    // `human_only` is the protocol's, same rule as the PUT (adac8fa4):
+    // deleting it here with `null`, or flipping it, and then PUTting the
+    // status alone was the second road round the completion check.
+    if crate::human_only::declaration_changed(&old.metadata, &merged_view) {
+        return Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(crate::human_only::change_refusal_body(
+                    &step_id.to_string(),
+                    &old.title,
+                    &old.metadata,
+                )),
+            )
+                .into_response(),
+        );
+    }
+    // THE PERSON'S RECORD (backlog 50f012ed). Completions write their
+    // fields here and then PUT the status (e39a9d2a), and the PUT's
+    // completion check refuses only the flip — so an agent completing a
+    // person's step landed its fields and was refused the status, and
+    // the record kept a write the step reserves for a person. The same
+    // person check as the PUT, on the actor that SIGNED this write, over
+    // every key it would change that is not context for the person
+    // (`human_only::record_keys_changed` holds the rule and its why).
+    // Open steps only: a terminal row is the adapter's refusal below.
+    if !matches!(old.status, StepStatus::Completed | StepStatus::Skipped)
+        && crate::human_only::declared(&old.metadata)
+    {
+        let refused =
+            crate::human_only::record_keys_changed(&old.metadata, &merged_view, &old.fields);
+        if !refused.is_empty()
+            && let Err(why) =
+                crate::human_only::person_check(state.roster.as_deref(), &user.id).await
+        {
+            return Some(
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(crate::human_only::write_refusal_body(
+                        &step_id.to_string(),
+                        &old.title,
+                        &format!("PATCH /api/jobs/{job_id}/steps/{step_id}/metadata"),
+                        &user.id,
+                        &why,
+                        &refused,
+                    )),
+                )
+                    .into_response(),
+            );
+        }
+    }
+    // `outcome_kind` too (b433bdf3): the PUT's abort exemption reads the
+    // stored value, so a merge of `aborted` onto an ordinary terminal
+    // followed by a bare completing PUT walked past the blocker gate.
+    // Refused rather than stripped like `authority_role`, as
+    // `human_only` is, so the caller is told; an unchanged re-send is
+    // not a change and lands. On a terminal row the adapter's refusal
+    // below speaks instead, as it does for every other key.
+    let protocol_keys =
+        crate::step_metadata_write::protocol_keys_changed(&old.metadata, &merged_view);
+    if !protocol_keys.is_empty()
+        && !matches!(old.status, StepStatus::Completed | StepStatus::Skipped)
+    {
+        return Some(
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "metadata patch changes a key the protocol owns",
+                    "step_id": step_id.to_string(),
+                    "refused_keys": protocol_keys,
+                    "hint": crate::step_metadata_write::PROTOCOL_KEYS_HINT,
+                })),
+            )
+                .into_response(),
+        );
+    }
+    // A RECORD ONE MACHINE ACTOR WRITES (backlog aa816dd4). ops-request's
+    // `nothing-to-do` record closes a request with nobody asked, and any
+    // caller with Update could write it; a step declaring `written_by`
+    // refuses its fields from every OTHER automation or agent session,
+    // and never from a person (`written_by` holds the rule and its why).
+    // Open steps only: a terminal row is the adapter's refusal below.
+    if !matches!(old.status, StepStatus::Completed | StepStatus::Skipped)
+        && let Some(writer) = crate::written_by::declared(&old.metadata)
+    {
+        let refused =
+            crate::written_by::refused_keys(&old.metadata, &merged_view, &old.fields, &user.id);
+        if !refused.is_empty() {
+            return Some(
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(crate::written_by::refusal_body(
+                        &step_id.to_string(),
+                        &old.title,
+                        &format!("PATCH /api/jobs/{job_id}/steps/{step_id}/metadata"),
+                        &user.id,
+                        writer,
+                        &refused,
+                    )),
+                )
+                    .into_response(),
+            );
+        }
+    }
+    // A KEY WITH ONE DECLARED WRITER (design f623e425; backlog
+    // 6c9183de). The approve step's runner keys were writable here by
+    // anyone with Update on the step, so a passkey could be asked to sign
+    // a plan the runner never rendered. The packet is read only for a
+    // step that declares a writer, since only the host binding needs it;
+    // a read that fails is refused, not read as "no packet".
+    if !matches!(old.status, StepStatus::Completed | StepStatus::Skipped)
+        && old.fields.iter().any(|f| f.writer.is_some())
+    {
+        let job = match state.jobs.get_job(&job_id).await {
+            Ok(job) => job,
+            Err(e) => {
+                return Some(
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("reading packet {job_id} failed, so its step is not written: {e}"),
+                    )
+                        .into_response(),
+                );
+            }
+        };
+        if let Some(refusal) = refuse_undeclared_writer(
+            old,
+            &merged_view,
+            job.as_ref(),
+            caller,
+            &user.id,
+            &format!("PATCH /api/jobs/{job_id}/steps/{step_id}/metadata"),
+        ) {
+            return Some(refusal);
+        }
+        // Judged against `old`, applied to the row as it stands: an
+        // unchanged re-send of a reserved key could put back a value the
+        // writer replaced in between (review S3). It changes nothing by
+        // this door's own judgement, so it is dropped, and a patch that
+        // was nothing else is the no-op it is — unless the caller IS the
+        // key's writer, whose own write is the record and lands as sent
+        // (follow-up a of the review of car f3365343).
+        let job_host = job
+            .as_ref()
+            .and_then(|j| j.metadata.get(crate::field_writer::HOST_KEY))
+            .and_then(|v| v.as_str());
+        if crate::field_writer::strip_unchanged_reserved(
+            &old.fields,
+            &old.metadata,
+            patch,
+            caller,
+            job_host,
+        ) && patch.is_empty()
+            && allow_noop
+        {
+            return Some(StatusCode::NO_CONTENT.into_response());
+        }
+    }
+    let refusals =
+        crate::step_registry::StepRegistry::standing_refusals(&old.fields, &merged_view, |k| {
+            patch.contains_key(k)
+        });
+    if !refusals.is_empty() {
+        let msg = refusals
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Some(
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("invalid step metadata: {msg}"),
+            )
+                .into_response(),
+        );
+    }
+
+    None
+}
+
+/// Record first evidence without replacing its immutable receipt.
+pub(super) async fn record_step_metadata<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    Path((id, step_id_str)): Path<(String, String)>,
+    CurrentUser(user): CurrentUser,
+    caller: Option<axum::Extension<crate::field_writer::CredentialedCaller>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    use crate::first_record::FirstRecordResult;
+    let (first_scope, ordinary_refusal) =
+        match super::signer::policy_first(&state, &user, &headers).await {
+            Ok(scope) => scope,
+            Err(refusal) => return refusal,
+        };
+    let Some(job_id) = parse_job_id(&id) else {
+        return (StatusCode::BAD_REQUEST, "invalid job id").into_response();
+    };
+    let Some(step_id) = parse_step_id(&step_id_str) else {
+        return (StatusCode::BAD_REQUEST, "invalid step id").into_response();
+    };
+    let Some(object) = body.as_object() else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "record body must be an object",
+        )
+            .into_response();
+    };
+    let Some(key) = object.get("key").and_then(|v| v.as_str()) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "record key must be a string",
+        )
+            .into_response();
+    };
+    let Some(value) = object.get("value") else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "record value is required; null is a value",
+        )
+            .into_response();
+    };
+    if !crate::first_record::valid_key(key)
+        || object.get("expected_absence") != Some(&serde_json::Value::Bool(true))
+        || object.len() != 3
+    {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "record requires a nonblank bounded key, value and expected_absence:true, with no other fields").into_response();
+    }
+    let (old, version) = match state.jobs.get_step_versioned(&step_id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return step_not_found(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    if old.job_id != job_id {
+        return step_not_found();
+    }
+    let changed = old.metadata.get(key) != Some(value);
+    let signer = match super::signer::resolve(
+        &state,
+        &old,
+        [key].into_iter().filter(|_| changed),
+        &headers,
+        caller.as_ref().map(|axum::Extension(c)| c),
+        &user.id,
+        &format!("POST /api/jobs/{job_id}/steps/{step_id}/metadata/records"),
+    )
+    .await
+    {
+        Ok(signer) => signer,
+        Err(refusal) => return refusal,
+    };
+    if signer.is_none()
+        && let Some(refusal) = ordinary_refusal
+    {
+        return refusal;
+    }
+    let user = signer
+        .as_ref()
+        .map(|signer| signer.user.clone())
+        .unwrap_or(user);
+    let scope = if signer.is_none() {
+        first_scope
+    } else {
+        match state.policy.ask(&user, controls::UPDATE_STEP).await {
+            Ok(Decision::Allow { scope }) => scope,
+            Ok(Decision::Deny { reason }) => {
+                return (StatusCode::FORBIDDEN, reason).into_response();
+            }
+            Err(e) => return e.into_response(),
+        }
+    };
+    let job = match state.jobs.get_job(&job_id).await {
+        Ok(Some(job)) if step_writable(&user, &scope, Some(&job), &old) => job,
+        Ok(_) => return step_not_found(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let caller = match signer.as_ref() {
+        Some(signer) => match signer.caller(&state, &old, &job).await {
+            Ok(caller) => Some(axum::Extension(caller)),
+            Err(refusal) => return refusal,
+        },
+        None => caller,
+    };
+    let mut metadata = old.metadata.as_object().cloned().unwrap_or_default();
+    metadata.insert(key.into(), value.clone());
+    let proposed = serde_json::Value::Object(metadata);
+    let route = format!("POST /api/jobs/{job_id}/steps/{step_id}/metadata/records");
+    if key == "authority_role"
+        || key == crate::human_only::KEY
+        || crate::human_only::declaration_changed(&old.metadata, &proposed)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "a record cannot change protocol authority or human admission",
+        )
+            .into_response();
+    }
+    let protocol_keys = crate::step_metadata_write::protocol_keys_changed(&old.metadata, &proposed);
+    if !protocol_keys.is_empty() {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({"error":"record changes protocol-owned keys", "refused_keys":protocol_keys}))).into_response();
+    }
+    if crate::human_only::declared(&old.metadata) {
+        let refused = crate::human_only::record_keys_changed(&old.metadata, &proposed, &old.fields);
+        if !refused.is_empty()
+            && let Err(why) =
+                crate::human_only::person_check(state.roster.as_deref(), &user.id).await
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(crate::human_only::write_refusal_body(
+                    &step_id.to_string(),
+                    &old.title,
+                    &route,
+                    &user.id,
+                    &why,
+                    &refused,
+                )),
+            )
+                .into_response();
+        }
+    }
+    if let Some(writer) = crate::written_by::declared(&old.metadata) {
+        let refused =
+            crate::written_by::refused_keys(&old.metadata, &proposed, &old.fields, &user.id);
+        if !refused.is_empty() {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(crate::written_by::refusal_body(
+                    &step_id.to_string(),
+                    &old.title,
+                    &route,
+                    &user.id,
+                    writer,
+                    &refused,
+                )),
+            )
+                .into_response();
+        }
+    }
+    if let Some(refusal) = refuse_undeclared_writer(
+        &old,
+        &proposed,
+        Some(&job),
+        caller.as_ref().map(|axum::Extension(c)| c),
+        &user.id,
+        &route,
+    ) {
+        return refusal;
+    }
+    let fields: Vec<_> = old
+        .fields
+        .iter()
+        .filter(|field| field.name == key)
+        .cloned()
+        .map(|mut field| {
+            field.required = false;
+            field
+        })
+        .collect();
+    if let Err(errors) =
+        crate::step_registry::StepRegistry::validate_authored_fields(&fields, &proposed)
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+            .into_response();
+    }
+    let errors =
+        crate::step_registry::StepRegistry::standing_refusals(&old.fields, &proposed, |name| {
+            name == key
+        });
+    if !errors.is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+            .into_response();
+    }
+    let Some(actor) = user.ambient_actor() else {
+        return (
+            StatusCode::FORBIDDEN,
+            "a first record requires an authenticated actor",
+        )
+            .into_response();
+    };
+    let stamp = state
+        .publisher
+        .stamp_with_actor(actor.clone())
+        .await
+        .with_partition(job.partition);
+    if let Some(signer) = &signer
+        && let Err(refusal) = signer.before_write()
+    {
+        return (StatusCode::CONFLICT, refusal.to_string()).into_response();
+    }
+    let guard = match signer
+        .as_ref()
+        .map(|signer| signer.write_guard(version, &job))
+        .transpose()
+    {
+        Ok(guard) => guard,
+        Err(refusal) => return (StatusCode::CONFLICT, refusal.to_string()).into_response(),
+    };
+    match state
+        .jobs
+        .record_step_metadata_guarded_at(
+            &step_id,
+            key,
+            value,
+            Some(version),
+            &stamp,
+            guard.as_ref(),
+        )
+        .await
+    {
+        Ok(result @ FirstRecordResult::Recorded(_)) => {
+            if job.status == JobStatus::Open {
+                reevaluate_and_persist(&state, &job, &actor).await;
+            }
+            (StatusCode::CREATED, Json(result)).into_response()
+        }
+        Ok(result @ FirstRecordResult::Replayed(_)) => {
+            (StatusCode::OK, Json(result)).into_response()
+        }
+        Ok(result @ (FirstRecordResult::Conflict { .. } | FirstRecordResult::Terminal)) => {
+            (StatusCode::CONFLICT, Json(result)).into_response()
+        }
+        Ok(FirstRecordResult::NotFound) => step_not_found(),
+        Err(crate::port::JobsError::StepChanged { .. }) => (
+            StatusCode::CONFLICT,
+            "step changed since record authority was judged; retry after reading it",
+        )
+            .into_response(),
+        Err(crate::port::JobsError::SignerWriteRefused { reason }) => {
+            (StatusCode::CONFLICT, reason).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 /// `PATCH /api/jobs/{id}/steps/{step_id}/metadata` — merge top-level
 /// metadata keys into the Step, atomically, server-side. The step-side
 /// twin of `PATCH /api/jobs/{id}/metadata`, and the same contract: the
@@ -2313,6 +3245,7 @@ pub(super) async fn patch_step_metadata<R: JobsRepository + 'static, B: EventBus
     // The caller as a server-side credential door resolved it — the only
     // identity a declared field writer believes (design f623e425).
     caller: Option<axum::Extension<crate::field_writer::CredentialedCaller>>,
+    headers: axum::http::HeaderMap,
     Json(patch): Json<serde_json::Value>,
 ) -> Response {
     let job_id = match parse_job_id(&id) {
@@ -2331,17 +3264,13 @@ pub(super) async fn patch_step_metadata<R: JobsRepository + 'static, B: EventBus
             .into_response();
     };
 
-    let scope = match state.policy.ask(&user, controls::UPDATE_STEP).await {
-        Ok(Decision::Deny { reason }) => {
-            return (StatusCode::FORBIDDEN, reason).into_response();
-        }
-        Ok(Decision::Allow { scope }) => scope,
-        Err(e) => {
-            return e.into_response();
-        }
-    };
+    let (first_scope, ordinary_refusal) =
+        match super::signer::policy_first(&state, &user, &headers).await {
+            Ok(scope) => scope,
+            Err(refusal) => return refusal,
+        };
 
-    let old = match state.jobs.get_step(&step_id).await {
+    let (old, version) = match state.jobs.get_step_versioned(&step_id).await {
         Ok(Some(s)) => s,
         Ok(None) => return (StatusCode::NOT_FOUND, "step not found").into_response(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -2351,12 +3280,56 @@ pub(super) async fn patch_step_metadata<R: JobsRepository + 'static, B: EventBus
     if old.job_id != job_id {
         return (StatusCode::NOT_FOUND, "step not on this job").into_response();
     }
+    let changed_keys = patch
+        .iter()
+        .filter(|(key, value)| {
+            if value.is_null() {
+                old.metadata.get(*key).is_some()
+            } else {
+                old.metadata.get(*key) != Some(*value)
+            }
+        })
+        .map(|(key, _)| key);
+    let signer = match super::signer::resolve(
+        &state,
+        &old,
+        changed_keys,
+        &headers,
+        caller.as_ref().map(|axum::Extension(c)| c),
+        &user.id,
+        &format!("PATCH /api/jobs/{job_id}/steps/{step_id}/metadata"),
+    )
+    .await
+    {
+        Ok(signer) => signer,
+        Err(refusal) => return refusal,
+    };
+    if signer.is_none()
+        && let Some(refusal) = ordinary_refusal
+    {
+        return refusal;
+    }
+    let user = signer
+        .as_ref()
+        .map(|signer| signer.user.clone())
+        .unwrap_or(user);
+    let scope = if signer.is_none() {
+        first_scope
+    } else {
+        match state.policy.ask(&user, controls::UPDATE_STEP).await {
+            Ok(Decision::Deny { reason }) => {
+                return (StatusCode::FORBIDDEN, reason).into_response();
+            }
+            Ok(Decision::Allow { scope }) => scope,
+            Err(e) => return e.into_response(),
+        }
+    };
     // The PUT's scope rule, at the door that writes the same record
     // (backlog 0a8a2463): the packet in the caller's scope, or the step
     // already theirs. A read that fails is refused, not read as "no
     // packet" (5186c5e1).
-    match state.jobs.get_job(&job_id).await {
-        Ok(job) if step_writable(&user, &scope, job.as_ref(), &old) => {}
+    let signer_job = match state.jobs.get_job(&job_id).await {
+        Ok(job) if step_writable_reported(&state, &user, &scope, job.as_ref(), &old) => job,
         Ok(_) => return step_not_found(),
         Err(e) => {
             return (
@@ -2365,194 +3338,29 @@ pub(super) async fn patch_step_metadata<R: JobsRepository + 'static, B: EventBus
             )
                 .into_response();
         }
-    }
-
-    // `authority_role` is immutable across writes, same rule as the
-    // PUT: the persisted value wins, so a body can neither raise nor
-    // lower the required sign-off authority — nor shed it with null.
-    patch.remove("authority_role");
-
-    // THE STANDING REFUSALS, AS THE WRITE LANDS (design 26a89f11,
-    // exhibits). A repeated anchor, a value over the field's inline
-    // bound, or a binding to an anchor the step does not carry is what a
-    // record may never say, so it is refused here, where the writer is on
-    // the line — not at done, where it would land on the reviewer. Judged
-    // against the row AS IT WOULD STAND (the patch overlaid, null
-    // removing), and only for the fields this write touches or that bind
-    // one it touches. A step whose fields declare none of these answers
-    // exactly as before.
-    let merged_view = {
-        let mut md = old.metadata.as_object().cloned().unwrap_or_default();
-        for (k, v) in &patch {
-            if v.is_null() {
-                md.remove(k);
-            } else {
-                md.insert(k.clone(), v.clone());
-            }
-        }
-        serde_json::Value::Object(md)
     };
-    // `human_only` is the protocol's, same rule as the PUT (adac8fa4):
-    // deleting it here with `null`, or flipping it, and then PUTting the
-    // status alone was the second road round the completion check.
-    if crate::human_only::declaration_changed(&old.metadata, &merged_view) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(crate::human_only::change_refusal_body(
-                &step_id.to_string(),
-                &old.title,
-                &old.metadata,
-            )),
-        )
-            .into_response();
-    }
-    // THE PERSON'S RECORD (backlog 50f012ed). Completions write their
-    // fields here and then PUT the status (e39a9d2a), and the PUT's
-    // completion check refuses only the flip — so an agent completing a
-    // person's step landed its fields and was refused the status, and
-    // the record kept a write the step reserves for a person. The same
-    // person check as the PUT, on the actor that SIGNED this write, over
-    // every key it would change that is not context for the person
-    // (`human_only::record_keys_changed` holds the rule and its why).
-    // Open steps only: a terminal row is the adapter's refusal below.
-    if !matches!(old.status, StepStatus::Completed | StepStatus::Skipped)
-        && crate::human_only::declared(&old.metadata)
+    let caller = match signer.as_ref() {
+        Some(signer) => match signer_job.as_ref() {
+            Some(job) => match signer.caller(&state, &old, job).await {
+                Ok(caller) => Some(axum::Extension(caller)),
+                Err(refusal) => return refusal,
+            },
+            None => return step_not_found(),
+        },
+        None => caller,
+    };
+
+    if let Some(refusal) = metadata_patch_refusal(
+        &state,
+        &user,
+        &old,
+        caller.as_ref().map(|axum::Extension(c)| c),
+        &mut patch,
+        true,
+    )
+    .await
     {
-        let refused =
-            crate::human_only::record_keys_changed(&old.metadata, &merged_view, &old.fields);
-        if !refused.is_empty()
-            && let Err(why) =
-                crate::human_only::person_check(state.roster.as_deref(), &user.id).await
-        {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(crate::human_only::write_refusal_body(
-                    &step_id.to_string(),
-                    &old.title,
-                    &format!("PATCH /api/jobs/{job_id}/steps/{step_id}/metadata"),
-                    &user.id,
-                    &why,
-                    &refused,
-                )),
-            )
-                .into_response();
-        }
-    }
-    // `outcome_kind` too (b433bdf3): the PUT's abort exemption reads the
-    // stored value, so a merge of `aborted` onto an ordinary terminal
-    // followed by a bare completing PUT walked past the blocker gate.
-    // Refused rather than stripped like `authority_role`, as
-    // `human_only` is, so the caller is told; an unchanged re-send is
-    // not a change and lands. On a terminal row the adapter's refusal
-    // below speaks instead, as it does for every other key.
-    let protocol_keys =
-        crate::step_metadata_write::protocol_keys_changed(&old.metadata, &merged_view);
-    if !protocol_keys.is_empty()
-        && !matches!(old.status, StepStatus::Completed | StepStatus::Skipped)
-    {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "metadata patch changes a key the protocol owns",
-                "step_id": step_id.to_string(),
-                "refused_keys": protocol_keys,
-                "hint": crate::step_metadata_write::PROTOCOL_KEYS_HINT,
-            })),
-        )
-            .into_response();
-    }
-    // A RECORD ONE MACHINE ACTOR WRITES (backlog aa816dd4). ops-request's
-    // `nothing-to-do` record closes a request with nobody asked, and any
-    // caller with Update could write it; a step declaring `written_by`
-    // refuses its fields from every OTHER automation or agent session,
-    // and never from a person (`written_by` holds the rule and its why).
-    // Open steps only: a terminal row is the adapter's refusal below.
-    if !matches!(old.status, StepStatus::Completed | StepStatus::Skipped)
-        && let Some(writer) = crate::written_by::declared(&old.metadata)
-    {
-        let refused =
-            crate::written_by::refused_keys(&old.metadata, &merged_view, &old.fields, &user.id);
-        if !refused.is_empty() {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(crate::written_by::refusal_body(
-                    &step_id.to_string(),
-                    &old.title,
-                    &format!("PATCH /api/jobs/{job_id}/steps/{step_id}/metadata"),
-                    &user.id,
-                    writer,
-                    &refused,
-                )),
-            )
-                .into_response();
-        }
-    }
-    // A KEY WITH ONE DECLARED WRITER (design f623e425; backlog
-    // 6c9183de). The approve step's runner keys were writable here by
-    // anyone with Update on the step, so a passkey could be asked to sign
-    // a plan the runner never rendered. The packet is read only for a
-    // step that declares a writer, since only the host binding needs it;
-    // a read that fails is refused, not read as "no packet".
-    if !matches!(old.status, StepStatus::Completed | StepStatus::Skipped)
-        && old.fields.iter().any(|f| f.writer.is_some())
-    {
-        let job = match state.jobs.get_job(&job_id).await {
-            Ok(job) => job,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("reading packet {job_id} failed, so its step is not written: {e}"),
-                )
-                    .into_response();
-            }
-        };
-        if let Some(refusal) = refuse_undeclared_writer(
-            &old,
-            &merged_view,
-            job.as_ref(),
-            caller.as_ref().map(|axum::Extension(c)| c),
-            &user.id,
-            &format!("PATCH /api/jobs/{job_id}/steps/{step_id}/metadata"),
-        ) {
-            return refusal;
-        }
-        // Judged against `old`, applied to the row as it stands: an
-        // unchanged re-send of a reserved key could put back a value the
-        // writer replaced in between (review S3). It changes nothing by
-        // this door's own judgement, so it is dropped, and a patch that
-        // was nothing else is the no-op it is — unless the caller IS the
-        // key's writer, whose own write is the record and lands as sent
-        // (follow-up a of the review of car f3365343).
-        let job_host = job
-            .as_ref()
-            .and_then(|j| j.metadata.get(crate::field_writer::HOST_KEY))
-            .and_then(|v| v.as_str());
-        if crate::field_writer::strip_unchanged_reserved(
-            &old.fields,
-            &old.metadata,
-            &mut patch,
-            caller.as_ref().map(|axum::Extension(c)| c),
-            job_host,
-        ) && patch.is_empty()
-        {
-            return StatusCode::NO_CONTENT.into_response();
-        }
-    }
-    let refusals =
-        crate::step_registry::StepRegistry::standing_refusals(&old.fields, &merged_view, |k| {
-            patch.contains_key(k)
-        });
-    if !refusals.is_empty() {
-        let msg = refusals
-            .iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-            .join("; ");
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("invalid step metadata: {msg}"),
-        )
-            .into_response();
+        return refusal;
     }
 
     // The parent packet: the event stamp inherits its admission-fixed
@@ -2567,6 +3375,19 @@ pub(super) async fn patch_step_metadata<R: JobsRepository + 'static, B: EventBus
         stamp = stamp.with_partition(j.partition);
     }
     let stamp = stamp;
+    if let Some(signer) = &signer
+        && let Err(refusal) = signer.before_write()
+    {
+        return (StatusCode::CONFLICT, refusal.to_string()).into_response();
+    }
+    let guard = match (signer.as_ref(), signer_job.as_ref()) {
+        (Some(signer), Some(job)) => match signer.write_guard(version, job) {
+            Ok(guard) => Some(guard),
+            Err(refusal) => return (StatusCode::CONFLICT, refusal.to_string()).into_response(),
+        },
+        (Some(_), None) => return step_not_found(),
+        (None, _) => None,
+    };
 
     // A merge that moves the shape voids the stamps it leaves behind
     // INSIDE the adapter's transaction, judged against the row under its
@@ -2576,10 +3397,21 @@ pub(super) async fn patch_step_metadata<R: JobsRepository + 'static, B: EventBus
     // a void the log could lose, which the rebuild now depends on.
     match state
         .jobs
-        .merge_step_metadata_at(&step_id, &patch, &stamp)
+        .merge_step_metadata_guarded_at(&step_id, &patch, &stamp,guard.as_ref())
         .await
     {
         Ok(_) => {}
+        Err(crate::port::JobsError::FirstRecordImmutable { id, key }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "first-record evidence is immutable",
+                    "step_id": id.to_string(),
+                    "key": key,
+                })),
+            )
+                .into_response();
+        }
         // The adapter's row-riding check wins over our `old` fetch —
         // it saw the step at write time — so both the pre-known and
         // the raced terminal case land here, in the PUT's 409 shape.
@@ -2613,6 +3445,10 @@ pub(super) async fn patch_step_metadata<R: JobsRepository + 'static, B: EventBus
         Err(crate::port::JobsError::StepNotFound(_)) => {
             return (StatusCode::NOT_FOUND, "step not found").into_response();
         }
+        Err(crate::port::JobsError::StepChanged {..})=>return (StatusCode::CONFLICT,Json(serde_json::json!({
+            "error":crate::step_metadata_write::STEP_CHANGED_ERROR,"code":crate::step_metadata_write::STEP_CHANGED_CODE
+        }))).into_response(),
+        Err(crate::port::JobsError::SignerWriteRefused{reason})=>return (StatusCode::CONFLICT,reason).into_response(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 
@@ -2783,6 +3619,7 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     State(state): State<Arc<JobsApiState<R, B>>>,
     Path((id, step_id_str)): Path<(String, String)>,
     CurrentUser(user): CurrentUser,
+    caller: Option<axum::Extension<crate::field_writer::CredentialedCaller>>,
     axum::extract::Query(q): axum::extract::Query<ClaimQuery>,
 ) -> Response {
     let job_id = match parse_job_id(&id) {
@@ -2842,8 +3679,47 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
                 .into_response();
         }
     };
-    if !step_writable(&user, &scope, parent_job.as_ref(), &old) {
+    if !step_writable_reported(&state, &user, &scope, parent_job.as_ref(), &old) {
         return step_not_found();
+    }
+    let executor = match crate::credential_executor::judge(
+        &old.metadata,
+        caller.as_ref().map(|axum::Extension(c)| c),
+        parent_job
+            .as_ref()
+            .and_then(|j| j.metadata.get(crate::field_writer::HOST_KEY))
+            .and_then(|h| h.as_str()),
+    ) {
+        Ok(c) => c,
+        Err(why) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(crate::credential_executor::refusal(
+                    &old.metadata,
+                    &user.id,
+                    &why,
+                )),
+            )
+                .into_response();
+        }
+    };
+    let mut user = user;
+    if let Some(c) = executor {
+        if q.claimed_for
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty() && s != c.actor_id)
+        {
+            return (
+                StatusCode::CONFLICT,
+                Json(crate::credential_executor::refusal(
+                    &old.metadata,
+                    &user.id,
+                    "a claim cannot substitute another actor for the authenticated executor",
+                )),
+            )
+                .into_response();
+        }
+        user.id = c.actor_id.clone();
     }
     let mut nominee: Option<String> = None;
     // The holders an authorised claim for someone else may take a READY
@@ -3102,8 +3978,25 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
         let held_roles: Vec<&str> = std::iter::once(user.role.as_str())
             .chain(agent_row.as_ref().and_then(|a| a.role.as_deref()))
             .collect();
+        let role_admitted = row.capability.as_ref().is_none_or(|capability| {
+            let original = capability.admits_roles(&held_roles);
+            state.role_guards.as_ref().map_or(original, |reporter| {
+                reporter.observe_captured(
+                    "station-claim-capability",
+                    "admission",
+                    &user,
+                    original,
+                    |candidate| {
+                        let candidate_roles: Vec<&str> = std::iter::once(candidate.role.as_str())
+                            .chain(agent_row.as_ref().and_then(|agent| agent.role.as_deref()))
+                            .collect();
+                        Some(capability.admits_roles(&candidate_roles))
+                    },
+                )
+            })
+        });
         if let Some(capability) = &row.capability
-            && !capability.admits_roles(&held_roles)
+            && !role_admitted
         {
             return (
                 StatusCode::FORBIDDEN,
@@ -3444,7 +4337,21 @@ async fn claimant_holds_authority<R: JobsRepository + 'static, B: EventBus + 'st
     let held_roles: Vec<&str> = std::iter::once(user.role.as_str())
         .chain(agent_row.and_then(|a| a.role.as_deref()))
         .collect();
-    if held_roles.contains(&authority) {
+    let role_matches = held_roles.contains(&authority);
+    if let Some(reporter) = state.role_guards.as_ref() {
+        reporter.observe_selection(
+            "claim-authority-role-match",
+            user,
+            &role_matches,
+            |candidate| {
+                Some(
+                    candidate.role == authority
+                        || agent_row.and_then(|row| row.role.as_deref()) == Some(authority),
+                )
+            },
+        );
+    }
+    if role_matches {
         return Ok(());
     }
     // The sign-off route names a role only a workflow declares, so it is

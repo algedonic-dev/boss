@@ -1,3 +1,4 @@
+import { isPageWrite } from './_smokeMocks';
 // The Marshalling Yard — every control its board renders, pinned (page
 // audit 7c228914, step `test`).
 //
@@ -565,7 +566,7 @@ test.describe('the marshalling station — every control', () => {
   test('the page writes nothing: every control used, no non-GET call leaves it', async ({ page }) => {
     const writes: string[] = [];
     page.on('request', (req) => {
-      if (req.method() !== 'GET' && req.url().includes('/api/') && !req.url().includes('/api/surface-opens')) {
+      if (isPageWrite(req.method(), new URL(req.url()).pathname)) {
         writes.push(`${req.method()} ${req.url()}`);
       }
     });

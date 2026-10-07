@@ -106,7 +106,11 @@ fn is_an_employee(user: &User) -> bool {
 /// Ask policy who `user` may read, or the response that refuses.
 /// A policy service that cannot answer refuses with 500: a gate that
 /// cannot be asked is not a gate that passed.
-pub(crate) async fn readable(policy: &dyn PolicyClient, user: &User) -> Result<Readable, Response> {
+pub(crate) async fn readable(
+    policy: &dyn PolicyClient,
+    user: &User,
+    reporter: Option<&boss_policy_client::role_guard::RoleGuardReporter>,
+) -> Result<Readable, Response> {
     let predicate = policy
         .scope_of(user, controls::READ_SCHEDULE)
         .await
@@ -117,7 +121,13 @@ pub(crate) async fn readable(policy: &dyn PolicyClient, user: &User) -> Result<R
             )
                 .into_response()
         })?;
-    from_predicate(&predicate, user).ok_or_else(|| {
+    let original = from_predicate(&predicate, user);
+    if let Some(reporter) = reporter {
+        reporter.observe_selection("schedule-self-floor", user, &original, |candidate| {
+            Some(from_predicate(&predicate, candidate))
+        });
+    }
+    original.ok_or_else(|| {
         (
             StatusCode::FORBIDDEN,
             format!(

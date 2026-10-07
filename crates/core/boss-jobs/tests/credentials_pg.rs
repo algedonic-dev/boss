@@ -14,6 +14,37 @@ use boss_jobs::credentials::types::{Consumer, CredentialInput, RotationPhase};
 use boss_jobs::credentials::{CredentialsError, CredentialsRegistry, PgCredentials};
 use boss_testing::TestDb;
 
+#[tokio::test]
+async fn a_caller_supplied_event_is_not_a_postgres_reconstruction_door() {
+    let db = TestDb::new().await;
+    let repo = declared(&db).await;
+    let before = repo.get("boss-dev-forge-token").await.unwrap().unwrap();
+    let event = boss_core::event::Event {
+        id: uuid::Uuid::new_v4(),
+        timestamp: chrono::Utc::now(),
+        source: "jobs".into(),
+        kind: RotationPhase::Installed.event_kind().into(),
+        payload: serde_json::json!({"credential_id":"boss-dev-forge-token"}),
+    };
+    assert!(
+        repo.restore_rotation(&event).await.is_err(),
+        "caller event is not immutable audit membership"
+    );
+    assert_eq!(
+        repo.get("boss-dev-forge-token")
+            .await
+            .unwrap()
+            .unwrap()
+            .rotated_at,
+        before.rotated_at
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credential_phase_receipts")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
 fn stamp() -> EventStamp {
     EventStamp::new(
         "jobs",
@@ -279,6 +310,245 @@ async fn a_recorded_install_stamps_rotated_at_and_lands_one_event() {
     assert_eq!(
         payload["_actor"],
         "automation:rule:broker-rotates-the-boss-dev-forge-token"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replaying_one_install_observation_preserves_one_outbox_fact_and_its_original_instant() {
+    let db = TestDb::new().await;
+    let repo = declared(&db).await;
+    let evidence = serde_json::json!({
+        "observation_id": "917e55fc-f19b-43aa-951f-7d763805b172",
+        "host": "forge",
+        "last_eight": "fixture1"
+    });
+    let first = stamp();
+    repo.record_rotation(
+        "boss-dev-forge-token",
+        RotationPhase::Installed,
+        evidence.clone(),
+        &first,
+    )
+    .await
+    .unwrap();
+    let original: (uuid::Uuid, chrono::DateTime<chrono::Utc>, serde_json::Value) = sqlx::query_as(
+        "SELECT event_id, timestamp, payload FROM event_outbox WHERE kind = 'credential.installed'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    repo.record_rotation(
+        "boss-dev-forge-token",
+        RotationPhase::Installed,
+        evidence,
+        &stamp(),
+    )
+    .await
+    .unwrap();
+    let facts: Vec<(uuid::Uuid, chrono::DateTime<chrono::Utc>, serde_json::Value)> = sqlx::query_as(
+        "SELECT event_id, timestamp, payload FROM event_outbox WHERE kind = 'credential.installed'",
+    ).fetch_all(&db.pool).await.unwrap();
+    assert_eq!(
+        facts.len(),
+        1,
+        "replayed observation must preserve one durable outbox fact"
+    );
+    assert_eq!(facts[0], original);
+    assert_eq!(
+        repo.get("boss-dev-forge-token")
+            .await
+            .unwrap()
+            .unwrap()
+            .rotated_at
+            .map(|t| t.timestamp_micros()),
+        Some(first.timestamp.timestamp_micros())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_observations_serialize_conflicts_and_outbox_failure_rolls_back_every_fact() {
+    use boss_jobs::credentials::receipt::RotationOutcome;
+    let db = TestDb::new().await;
+    let repo = declared(&db).await;
+    let evidence = serde_json::json!({"observation_id":"concurrent-original","measured":9.0});
+    let (first, second) = (stamp(), stamp());
+    let (a, b) = tokio::join!(
+        repo.record_rotation(
+            "boss-dev-forge-token",
+            RotationPhase::Installed,
+            evidence.clone(),
+            &first
+        ),
+        repo.record_rotation(
+            "boss-dev-forge-token",
+            RotationPhase::Installed,
+            evidence.clone(),
+            &second
+        )
+    );
+    let outcomes = [a.unwrap(), b.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|o| matches!(o, RotationOutcome::Recorded { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|o| matches!(o, RotationOutcome::Replayed { .. }))
+            .count(),
+        1
+    );
+    let original = repo
+        .get("boss-dev-forge-token")
+        .await
+        .unwrap()
+        .unwrap()
+        .rotated_at;
+    let foreign = EventStamp::new("jobs", boss_core::actor::ActorId::automation("different"));
+    assert!(matches!(
+        repo.record_rotation(
+            "boss-dev-forge-token",
+            RotationPhase::Installed,
+            evidence.clone(),
+            &foreign
+        )
+        .await,
+        Err(CredentialsError::ObservationConflict)
+    ));
+    let changed = serde_json::json!({"observation_id":"concurrent-original","measured":10});
+    assert!(matches!(
+        repo.record_rotation(
+            "boss-dev-forge-token",
+            RotationPhase::Installed,
+            changed,
+            &stamp()
+        )
+        .await,
+        Err(CredentialsError::ObservationConflict)
+    ));
+    sqlx::raw_sql("CREATE FUNCTION refuse_fixture_outbox() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture outbox unavailable'; END $$; CREATE TRIGGER refuse_fixture_outbox BEFORE INSERT ON event_outbox FOR EACH ROW EXECUTE FUNCTION refuse_fixture_outbox();").execute(&db.pool).await.unwrap();
+    assert!(
+        repo.record_rotation(
+            "boss-dev-forge-token",
+            RotationPhase::Installed,
+            serde_json::json!({"observation_id":"rolled-back"}),
+            &stamp()
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        repo.get("boss-dev-forge-token")
+            .await
+            .unwrap()
+            .unwrap()
+            .rotated_at,
+        original
+    );
+    let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credential_phase_receipts")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM event_outbox WHERE kind='credential.installed'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (receipts, events),
+        (1, 1),
+        "receipt/state/outbox commit or roll back together"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn actual_owner_rebuild_restores_original_receipts_after_outbox_pruning() {
+    use boss_jobs::credentials::{rebuild::rebuild_credentials, receipt::RotationOutcome};
+    let db = TestDb::new().await;
+    let repo = declared(&db).await;
+    let evidence =
+        serde_json::json!({"observation_id":"restore-actual-owner","measured":[9.0,-0.0]});
+    let original = repo
+        .record_rotation(
+            "boss-dev-forge-token",
+            RotationPhase::Installed,
+            evidence.clone(),
+            &stamp(),
+        )
+        .await
+        .unwrap();
+    let RotationOutcome::Recorded { receipt } = original else {
+        panic!("fresh original");
+    };
+    assert!(
+        rebuild_credentials(&db.pool).await.is_err(),
+        "unrelayed writes must refuse reconstruction"
+    );
+    sqlx::query("INSERT INTO audit_log(event_id,timestamp,source,kind,payload) SELECT event_id,timestamp,source,kind,payload FROM event_outbox ORDER BY id").execute(&db.pool).await.unwrap();
+    sqlx::query("UPDATE event_outbox SET delivered_at=NOW()-INTERVAL '2 days',created_at=NOW()-INTERVAL '2 days'").execute(&db.pool).await.unwrap();
+    let pruned = boss_events::outbox::prune_delivered_outbox(
+        &db.pool,
+        std::time::Duration::from_secs(86400),
+        100,
+        100,
+    )
+    .await
+    .unwrap();
+    assert!(
+        pruned.deleted > 0,
+        "actual retention prunes delivered originals"
+    );
+    sqlx::query("INSERT INTO audit_log(event_id,timestamp,source,kind,payload) SELECT event_id,timestamp,source,kind,payload FROM event_outbox ORDER BY id").execute(&db.pool).await.unwrap();
+    sqlx::query("UPDATE event_outbox SET delivered_at=NOW()")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    // Model loss of the reconstructible owner projections, not the log.
+    sqlx::query("DELETE FROM credential_phase_receipts")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM credentials")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rebuild_credentials(&db.pool).await.unwrap(), 3);
+    assert_eq!(
+        rebuild_credentials(&db.pool).await.unwrap(),
+        3,
+        "repeated reconstruction is identical"
+    );
+    let replay = repo
+        .record_rotation(
+            "boss-dev-forge-token",
+            RotationPhase::Installed,
+            evidence,
+            &stamp(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(replay,RotationOutcome::Replayed { receipt: restored } if restored==receipt));
+    assert_eq!(
+        repo.get("boss-dev-forge-token")
+            .await
+            .unwrap()
+            .unwrap()
+            .rotated_at
+            .unwrap()
+            .timestamp_micros(),
+        receipt.timestamp.timestamp_micros()
+    );
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM event_outbox WHERE kind='credential.installed'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        count, 0,
+        "reconstruction and retry never republish originals"
     );
 }
 

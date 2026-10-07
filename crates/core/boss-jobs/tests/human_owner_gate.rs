@@ -86,7 +86,7 @@ async fn stored_owner(jobs: &InMemoryJobs) -> String {
 }
 
 fn app_with(specs: Vec<WorkflowSpec>) -> (axum::Router, Arc<InMemoryJobs>) {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     for s in specs {
         kinds.seed(s).unwrap();
     }

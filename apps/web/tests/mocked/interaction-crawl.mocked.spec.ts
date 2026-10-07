@@ -1,3 +1,4 @@
+import { isPageWrite, isShellWrite } from './_smokeMocks';
 // THE INTERACTION CRAWL — backlog f2b8a01c, decided on design 0e07ce64.
 //
 // route-smoke asks every surface "do you survive?"; outage-crawl asks
@@ -197,7 +198,6 @@ const REFUSAL = 'refused by policy: the interaction crawl declined this write';
 /// operator BY DESIGN (surface-opens.ts: "a measurement must never get
 /// in the way of the thing it measures"), so a 403 on them is not a
 /// refusal the page owes anyone, and issuing one is not a response.
-const SILENT_WRITES: ReadonlyArray<RegExp> = [/\/api\/surface-opens$/];
 
 /// Class tokens and aria flags that say "this control is currently
 /// selected". Stripped from a control's key so a filter button is one
@@ -417,7 +417,7 @@ async function installLegs(page: Page, mode: Mode): Promise<void> {
   await installSmokeMocks(page);
   await page.route('**/api/**', async (r) => {
     const url = r.request().url();
-    const write = r.request().method() !== 'GET' && !SILENT_WRITES.some((re) => re.test(url));
+    const write = isPageWrite(r.request().method(), new URL(url).pathname);
     if (mode.refuse && write) {
       return r.fulfill({ status: 403, contentType: 'application/json', body: JSON.stringify({ error: REFUSAL }) });
     }
@@ -632,7 +632,7 @@ async function clickLeg(
       .then(() => true, () => false);
     if (navigated) await page.waitForLoadState('domcontentloaded').catch(() => undefined);
     else own = await settleOwn();
-    const issued = (own ?? heard.map(lineOf)).filter((line) => !SILENT_WRITES.some((re) => re.test(line.split(' ')[1] ?? '')));
+    const issued = (own ?? heard.map(lineOf)).filter((line) => !isShellWrite(line.split(' ')[0] ?? '', new URL(line.split(' ')[1] ?? '/', 'http://mock.invalid').pathname));
     const writes = issued.filter((line) => !line.startsWith('GET '));
     if (writes.length) tally.writes += writes.length;
     if (errors.length) findings.push({ route, control: next.label, what: `pageerror: ${errors.join(' | ')}` });

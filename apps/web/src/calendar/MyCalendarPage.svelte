@@ -9,6 +9,7 @@
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { session } from '@boss/web-kit/session/session.svelte';
   import { appNow } from '@boss/web-kit/sim-clock';
+  import { safeLinkHref } from '@boss/web-kit/links';
 
   type Reservation = {
     id: string;
@@ -26,7 +27,9 @@
   };
 
   let employeeId = $derived(
-    session.value.kind === 'ready' ? session.value.user.id : null,
+    // The shared session classifies guests as read-only synthetic identities.
+    // Their username is not an employee reservation resource (cfe3f465).
+    session.value.kind === 'ready' && !session.readonly ? session.value.user.id : null,
   );
 
   // Week starts Monday in local time, ends following Sunday.
@@ -54,6 +57,29 @@
   let reservations = $state<Reservation[]>([]);
   let loading = $state(false);
   let error = $state<string | null>(null);
+  type StepLink = { kind: 'ready'; href: string } | { kind: 'unavailable' };
+  let stepLinks = $state<Readonly<Record<string, StepLink>>>({});
+  const nativeId = (value: unknown): value is string => typeof value === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+
+  // Calendar reasons keep their cancellation identity. The jobs owner
+  // resolves a step's packet under the SAME scope as the packet read.
+  async function stepLink(stepId: string): Promise<StepLink> {
+    if (!nativeId(stepId)) return { kind: 'unavailable' };
+    try {
+      const response = await fetch(`/api/jobs/steps/${encodeURIComponent(stepId)}`);
+      if (!response.ok) return { kind: 'unavailable' };
+      const body: unknown = await response.json();
+      if (typeof body !== 'object' || body === null || !('step_id' in body)
+        || !('job_id' in body) || body.step_id !== stepId || !nativeId(body.job_id)) {
+        return { kind: 'unavailable' };
+      }
+      const from = new URLSearchParams({ from: '/ux/calendar/me', from_label: 'My schedule' });
+      return { kind: 'ready', href: `/jobs/${encodeURIComponent(body.job_id)}/steps/${encodeURIComponent(stepId)}?${from}` };
+    } catch {
+      return { kind: 'unavailable' };
+    }
+  }
 
   $effect(() => {
     const eid = employeeId;
@@ -63,6 +89,7 @@
     let cancelled = false;
     loading = true;
     error = null;
+    stepLinks = {};
     (async () => {
       try {
         const url = `/api/calendar/reservations?resource_kind=employee&resource_id=${encodeURIComponent(
@@ -72,7 +99,7 @@
         if (!r.ok) {
           if (r.status === 503 || r.status === 502) {
             throw new Error(
-              'calendar service unavailable — wire calendar_api_url',
+              'calendar service unavailable — please try again later',
             );
           }
           throw new Error(`calendar HTTP ${r.status}`);
@@ -81,6 +108,13 @@
         if (!cancelled) {
           reservations = body;
           loading = false;
+          const ids = [...new Set(body.filter((row) => row.reason_kind === 'job-step').map((row) => row.reason_ref_id))];
+          await Promise.all(ids.map(async (id) => {
+            const link = await stepLink(id);
+            // Each answer belongs to this employee/week read. A slow
+            // reference cannot hold back another resolved destination.
+            if (!cancelled) stepLinks = { ...stepLinks, [id]: link };
+          }));
         }
       } catch (e) {
         if (!cancelled) {
@@ -169,7 +203,11 @@
     <button onclick={() => shiftWeek(1)} disabled={!employeeId}>Next week →</button>
   </div>
 
-  {#if !employeeId}
+  {#if session.value.kind === 'loading'}
+    <p class="empty">Loading session…</p>
+  {:else if session.value.kind === 'ready' && !employeeId}
+    <p class="empty">This session is not linked to an employee calendar.</p>
+  {:else if !employeeId}
     <p class="empty">Sign in to see your week.</p>
   {:else if loading}
     <p class="empty">Loading reservations…</p>
@@ -186,6 +224,7 @@
             <div class="week-col-empty">—</div>
           {:else}
             {#each dayRows as r (r.id)}
+              {@const link = r.reason_kind === 'job-step' ? stepLinks[r.reason_ref_id] : undefined}
               <div class="week-cell">
                 <div class="week-cell-time">
                   {formatTime(r.window.start)}–{formatTime(r.window.end)}
@@ -193,7 +232,16 @@
                 <div class={reasonClass(r.reason_kind)}>
                   {reasonLabel(r.reason_kind)}
                 </div>
-                <div class="week-cell-ref mono">{r.reason_ref_id}</div>
+                <div class="week-cell-ref mono">
+                  {#if link?.kind === 'ready'}
+                    <a href={safeLinkHref(link.href)}>{r.reason_ref_id}</a>
+                  {:else}
+                    {r.reason_ref_id}
+                    {#if r.reason_kind === 'job-step'}
+                      <span role="status">{link ? 'Step unavailable' : 'Loading step…'}</span>
+                    {/if}
+                  {/if}
+                </div>
                 {#if r.notes}
                   <div class="week-cell-notes">{r.notes}</div>
                 {/if}

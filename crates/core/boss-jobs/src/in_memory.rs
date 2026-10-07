@@ -17,6 +17,8 @@ use crate::port::{
 pub struct InMemoryJobs {
     inner: Mutex<State>,
     recorded: Mutex<Vec<boss_core::event::Event>>,
+    #[cfg(test)]
+    before_step_events: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     refusals: Mutex<Vec<crate::refusals::RecordedRefusal>>,
     /// The step-plugin registry a new step's `step_plugin_version` is
     /// stamped from — this adapter's `step_plugins` table. `None` is
@@ -31,6 +33,7 @@ pub struct InMemoryJobs {
 struct State {
     jobs: HashMap<String, Job>,
     steps: HashMap<String, Step>,
+    first_records: HashMap<(String, String), crate::first_record::FirstRecord>,
     /// The in-memory mirror of `steps.became_ready_at`: the instant a
     /// step FIRST landed in `Ready`, written once and never moved by a
     /// later write — which is exactly the property the queue-age lens
@@ -262,6 +265,10 @@ impl InMemoryJobs {
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
         let mut state = self.inner.lock().expect("poisoned");
+        let mut recorded = self
+            .recorded
+            .lock()
+            .map_err(|_| JobsError::Storage("event log unavailable".into()))?;
         let key = step_key(&step.id);
         if read.is_some()
             && let Some(change) = state.change_before_write.remove(&key)
@@ -274,6 +281,14 @@ impl InMemoryJobs {
         let Some(existing) = state.steps.get(&key) else {
             return Err(JobsError::StepNotFound(step.id));
         };
+        crate::first_record::preserve(
+            state
+                .first_records
+                .iter()
+                .filter(|((id, _), _)| id == &key)
+                .map(|(_, record)| record),
+            &step.metadata,
+        )?;
         if let Some(read) = read {
             if version_of(&state, &key) != read {
                 return Err(JobsError::StepChanged { id: step.id });
@@ -337,8 +352,11 @@ impl InMemoryJobs {
         }
         touch_step(&mut state, key.clone(), now);
         state.steps.insert(key, next);
-        drop(state);
-        self.record_all(events);
+        #[cfg(test)]
+        if let Some(pause) = self.before_step_events.lock().unwrap().take() {
+            pause();
+        }
+        recorded.extend_from_slice(events);
         Ok(())
     }
 
@@ -414,6 +432,13 @@ fn matches_filter(job: &Job, filter: &JobFilter) -> bool {
     // packet, the same as the SQL adapter's `kind = ANY('{}')`.
     if let Some(ref kinds) = filter.kinds
         && !kinds.contains(&job.kind)
+    {
+        return false;
+    }
+    if filter
+        .excluded_kinds
+        .as_ref()
+        .is_some_and(|kinds| kinds.contains(&job.kind))
     {
         return false;
     }
@@ -583,8 +608,12 @@ impl JobsRepository for InMemoryJobs {
             stamped.push(self.stamp_plugin_version(step).await?);
         }
         let mut recorded = Vec::with_capacity(job_events.len() + step_events.len());
-        let admission = {
+        let (admission, mut event_log) = {
             let mut state = self.inner.lock().expect("poisoned");
+            let event_log = self
+                .recorded
+                .lock()
+                .map_err(|_| JobsError::Storage("event log unavailable".into()))?;
             // A NUMBER A DISCARD SPENT ADMITS NO PACKET (backlog
             // ce8b7d66, part 4), judged under the lock the insert below
             // takes and the discard's spend took — the Pg adapter's
@@ -618,12 +647,12 @@ impl JobsRepository for InMemoryJobs {
                         recorded.push(event.clone());
                     }
                 }
-                Admission::Admitted
+                (Admission::Admitted, event_log)
             } else {
-                Admission::AlreadyAdmitted
+                (Admission::AlreadyAdmitted, event_log)
             }
         };
-        self.record_all(&recorded);
+        event_log.extend(recorded);
         Ok(admission)
     }
 
@@ -1069,6 +1098,17 @@ impl JobsRepository for InMemoryJobs {
         Ok(rows)
     }
 
+    async fn recorded_event(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<boss_core::event::Event>, JobsError> {
+        let recorded = self
+            .recorded
+            .lock()
+            .map_err(|error| JobsError::Storage(error.to_string()))?;
+        Ok(recorded.iter().find(|event| event.id == id).cloned())
+    }
+
     async fn repin_workflow_version_at(
         &self,
         id: &JobId,
@@ -1080,8 +1120,32 @@ impl JobsRepository for InMemoryJobs {
         // The whole move under one lock — the Pg adapter's transaction,
         // as Rust — and every event built from the rows as they stand
         // afterwards.
-        let (repinned, rewritten, inserted, invalidated) = {
+        let (repinned, rewritten, inserted, invalidated, mut recorded) = {
             let mut state = self.inner.lock().expect("poisoned");
+            let recorded = self
+                .recorded
+                .lock()
+                .map_err(|_| JobsError::Storage("event log unavailable".into()))?;
+            // Validate the entire plan before even its envelope changes.
+            for r in &plan.reprojected {
+                let key = step_key(&r.step.id);
+                let stored = state
+                    .steps
+                    .get(&key)
+                    .ok_or(JobsError::StepNotFound(r.step.id))?;
+                if !matches!(stored.status, StepStatus::Completed | StepStatus::Skipped)
+                    || r.unskipped
+                {
+                    crate::first_record::preserve(
+                        state
+                            .first_records
+                            .iter()
+                            .filter(|((id, _), _)| id == &key)
+                            .map(|(_, record)| record),
+                        &r.step.metadata,
+                    )?;
+                }
+            }
             let Some(job) = state.jobs.get_mut(&job_key(id)) else {
                 return Err(JobsError::NotFound(*id));
             };
@@ -1149,7 +1213,7 @@ impl JobsRepository for InMemoryJobs {
                 .filter(|s| insert_step_locked(&mut state, s, stamp.timestamp))
                 .cloned()
                 .collect();
-            (repinned, rewritten, inserted, invalidated)
+            (repinned, rewritten, inserted, invalidated, recorded)
         };
         let mut events = vec![stamp.event(
             crate::events::JOB_UPDATED,
@@ -1172,7 +1236,7 @@ impl JobsRepository for InMemoryJobs {
             crate::events::JOB_REPINNED,
             crate::repin::repinned_payload(&id.to_string(), record),
         ));
-        self.record_all(&events);
+        recorded.extend_from_slice(&events);
         Ok(repinned)
     }
 
@@ -1203,6 +1267,15 @@ impl JobsRepository for InMemoryJobs {
         // same page from either store. `Uuid`'s Ord is its byte order,
         // which is how Postgres orders a uuid column.
         jobs.sort_by(|a, b| {
+            if filter.oldest_first {
+                let admitted = |j: &Job| {
+                    j.opened_at
+                        .or_else(|| state.job_created_at.get(&job_key(&j.id)).copied())
+                };
+                return admitted(a)
+                    .cmp(&admitted(b))
+                    .then_with(|| a.id.inner().as_uuid().cmp(b.id.inner().as_uuid()));
+            }
             b.opened_on
                 .cmp(&a.opened_on)
                 .then_with(|| {
@@ -1228,12 +1301,16 @@ impl JobsRepository for InMemoryJobs {
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
         let step = self.stamp_plugin_version(step).await?;
-        let inserted = {
+        let (inserted, mut recorded) = {
             let mut state = self.inner.lock().expect("poisoned");
-            insert_step_locked(&mut state, &step, now)
+            let recorded = self
+                .recorded
+                .lock()
+                .map_err(|_| JobsError::Storage("event log unavailable".into()))?;
+            (insert_step_locked(&mut state, &step, now), recorded)
         };
         if inserted {
-            self.record_all(events);
+            recorded.extend_from_slice(events);
         }
         Ok(())
     }
@@ -1291,11 +1368,136 @@ impl JobsRepository for InMemoryJobs {
         self.write_step(step, Some(read), now, events)
     }
 
+    async fn first_step_record(
+        &self,
+        id: &StepId,
+        key: &str,
+    ) -> Result<Option<crate::first_record::FirstRecord>, JobsError> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| JobsError::Storage("state lock unavailable".into()))?;
+        Ok(state
+            .first_records
+            .get(&(step_key(id), key.to_owned()))
+            .cloned())
+    }
+
+    async fn record_step_metadata_if_unchanged_at(
+        &self,
+        id: &StepId,
+        key: &str,
+        value: &serde_json::Value,
+        read: Option<StepVersion>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<crate::first_record::FirstRecordResult, JobsError> {
+        self.record_step_metadata_guarded_at(id, key, value, read, stamp, None)
+            .await
+    }
+    async fn record_step_metadata_guarded_at(
+        &self,
+        id: &StepId,
+        key: &str,
+        value: &serde_json::Value,
+        read: Option<StepVersion>,
+        stamp: &boss_core::publisher::EventStamp,
+        guard: Option<&crate::signer_write::SignerWriteGuard>,
+    ) -> Result<crate::first_record::FirstRecordResult, JobsError> {
+        use crate::first_record::{FirstRecord, FirstRecordResult};
+        if !crate::first_record::valid_key(key) {
+            return Err(JobsError::Storage("invalid first record key".into()));
+        }
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| JobsError::Storage("state lock unavailable".into()))?;
+        let step_key = step_key(id);
+        if let Some(guard) = guard {
+            guard.check_job(state.jobs.get(&guard.job().id.to_string()), stamp)?;
+        }
+        let Some(step) = state.steps.get(&step_key) else {
+            return Ok(FirstRecordResult::NotFound);
+        };
+        if let Some(guard) = guard {
+            guard.check_row(version_of(&state, &step_key), id, stamp)?;
+        }
+        // Checked callers judged authorization on this version, even for replay.
+        // Trusted unversioned replay retains its original receipt semantics.
+        if read.is_some_and(|read| version_of(&state, &step_key) != read) {
+            return Err(JobsError::StepChanged { id: *id });
+        }
+        let record_key = (step_key.clone(), key.to_owned());
+        if let Some(record) = state.first_records.get(&record_key) {
+            return Ok(if record.matches(value) {
+                FirstRecordResult::Replayed(record.clone())
+            } else {
+                FirstRecordResult::Conflict {
+                    job_id: step.job_id,
+                    step_id: *id,
+                    key: key.into(),
+                }
+            });
+        }
+        if matches!(step.status, StepStatus::Completed | StepStatus::Skipped) {
+            return Ok(FirstRecordResult::Terminal);
+        }
+        if step.metadata.get(key).is_some() {
+            return Ok(FirstRecordResult::Conflict {
+                job_id: step.job_id,
+                step_id: *id,
+                key: key.into(),
+            });
+        }
+        let mut next = step.clone();
+        let mut metadata = next.metadata.as_object().cloned().unwrap_or_default();
+        metadata.insert(key.into(), value.clone());
+        let shape = next.shape_hash();
+        next.metadata = serde_json::Value::Object(metadata);
+        let invalidated = crate::events::void_stamps_if_moved(stamp, &shape, &mut next);
+        let mut event = stamp.event(crate::events::STEP_FIRST_RECORDED, serde_json::Value::Null);
+        let record = FirstRecord::new(next.job_id, *id, key, value, stamp, event.id);
+        event.payload = stamp
+            .event(
+                crate::events::STEP_FIRST_RECORDED,
+                serde_json::json!({"step":next,"record":record}),
+            )
+            .payload;
+        let state_event = stamp.event(
+            crate::events::STEP_UPDATED,
+            crate::events::step_state_payload(&next),
+        );
+        // Both locks precede mutation: a failed event lock cannot leave an unrecorded row.
+        let mut events = self
+            .recorded
+            .lock()
+            .map_err(|_| JobsError::Storage("event lock unavailable".into()))?;
+        if let Some(guard) = guard {
+            guard.check_before_dispatch(stamp)?;
+        }
+        state.first_records.insert(record_key, record.clone());
+        state.steps.insert(step_key.clone(), next);
+        touch_step(&mut state, step_key, stamp.timestamp);
+        events.push(event);
+        events.push(state_event);
+        events.extend(invalidated);
+        Ok(FirstRecordResult::Recorded(record))
+    }
+
     async fn merge_step_metadata_at(
         &self,
         id: &StepId,
         patch: &serde_json::Map<String, serde_json::Value>,
         stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<Step, JobsError> {
+        self.merge_step_metadata_guarded_at(id, patch, stamp, None)
+            .await
+    }
+    async fn merge_step_metadata_guarded_at(
+        &self,
+        id: &StepId,
+        patch: &serde_json::Map<String, serde_json::Value>,
+        stamp: &boss_core::publisher::EventStamp,
+        guard: Option<&crate::signer_write::SignerWriteGuard>,
     ) -> Result<Step, JobsError> {
         // Mirror the Pg adapter: merge under the lock against the row
         // as it stands, null removes, no other field moves, a terminal
@@ -1303,9 +1505,28 @@ impl JobsRepository for InMemoryJobs {
         // STEP_UPDATED event is built from the post-merge row — with
         // the stamps a moved shape killed voided on it, and their
         // invalidation event recorded after it (design 87329a13).
-        let (merged, invalidated) = {
-            let mut state = self.inner.lock().expect("poisoned");
+        let (merged, invalidated, mut recorded) = {
+            let mut state = self
+                .inner
+                .lock()
+                .map_err(|_| JobsError::Storage("state lock unavailable".into()))?;
+            let recorded = self
+                .recorded
+                .lock()
+                .map_err(|_| JobsError::Storage("event log unavailable".into()))?;
             let key = step_key(id);
+            if let Some(guard) = guard {
+                guard.check_job(state.jobs.get(&guard.job().id.to_string()), stamp)?;
+            }
+            if let Some(guard) = guard {
+                guard.check_row(version_of(&state, &key), id, stamp)?;
+            }
+            let records: Vec<_> = state
+                .first_records
+                .iter()
+                .filter(|((id, _), _)| id == &key)
+                .map(|(_, record)| record.clone())
+                .collect();
             let Some(step) = state.steps.get_mut(&key) else {
                 return Err(JobsError::StepNotFound(*id));
             };
@@ -1326,20 +1547,24 @@ impl JobsRepository for InMemoryJobs {
                     md.insert(k.clone(), v.clone());
                 }
             }
+            crate::first_record::preserve(records.iter(), &serde_json::Value::Object(md.clone()))?;
+            if let Some(guard) = guard {
+                guard.check_before_dispatch(stamp)?;
+            }
             let shape_before = step.shape_hash();
             step.metadata = serde_json::Value::Object(md);
             let invalidated = crate::events::void_stamps_if_moved(stamp, &shape_before, step);
             let merged = step.clone();
             // Mirrors the SQL's `updated_at = stamp.timestamp`.
             touch_step(&mut state, key, stamp.timestamp);
-            (merged, invalidated)
+            (merged, invalidated, recorded)
         };
         let event = stamp.event(
             crate::events::STEP_UPDATED,
             crate::events::step_state_payload(&merged),
         );
-        self.record_all(&[event]);
-        self.record_all(invalidated.as_slice());
+        recorded.push(event);
+        recorded.extend(invalidated);
         Ok(merged)
     }
 
@@ -1351,9 +1576,31 @@ impl JobsRepository for InMemoryJobs {
         stamp: &boss_core::publisher::EventStamp,
         events: &[boss_core::event::Event],
     ) -> Result<Step, JobsError> {
-        let (claimed, invalidated) = {
+        let (claimed, invalidated, mut recorded) = {
             let mut state = self.inner.lock().expect("poisoned");
+            let recorded = self
+                .recorded
+                .lock()
+                .map_err(|_| JobsError::Storage("event log unavailable".into()))?;
             let key = step_key(step_id);
+            let records: Vec<_> = state
+                .first_records
+                .iter()
+                .filter(|((id, _), _)| id == &key)
+                .map(|(_, record)| record.clone())
+                .collect();
+            for event in events
+                .iter()
+                .filter(|event| event.kind == crate::events::STEP_UPDATED)
+            {
+                crate::first_record::preserve(
+                    records.iter(),
+                    event
+                        .payload
+                        .get("metadata")
+                        .unwrap_or(&serde_json::Value::Null),
+                )?;
+            }
             let Some(existing) = state.steps.get_mut(&key) else {
                 return Err(JobsError::StepNotFound(*step_id));
             };
@@ -1383,7 +1630,9 @@ impl JobsRepository for InMemoryJobs {
             let shape_before = existing.shape_hash();
             if crate::agent_runs::claim_changes_holder(existing.assignee_id.as_deref(), actor, &[])
             {
-                existing.metadata = crate::agent_runs::without_edge(&existing.metadata);
+                let next = crate::agent_runs::without_edge(&existing.metadata);
+                crate::first_record::preserve(records.iter(), &next)?;
+                existing.metadata = next;
             }
             existing.assignee_id = Some(actor.to_string());
             existing.status = StepStatus::Active;
@@ -1395,10 +1644,10 @@ impl JobsRepository for InMemoryJobs {
             // A claim bumps `updated_at` in the Pg adapter; the ready
             // stamp, already written at the flip, stays put.
             touch_step(&mut state, key, stamp.timestamp);
-            (claimed, invalidated)
+            (claimed, invalidated, recorded)
         };
-        self.record_all(events);
-        self.record_all(invalidated.as_slice());
+        recorded.extend_from_slice(events);
+        recorded.extend(invalidated);
         Ok(claimed)
     }
 
@@ -1409,8 +1658,12 @@ impl JobsRepository for InMemoryJobs {
         event_stamp: &boss_core::publisher::EventStamp,
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
-        let written = {
+        let (written, mut recorded) = {
             let mut state = self.inner.lock().expect("poisoned");
+            let recorded = self
+                .recorded
+                .lock()
+                .map_err(|_| JobsError::Storage("event log unavailable".into()))?;
             let key = step_key(step_id);
             let Some(existing) = state.steps.get_mut(&key) else {
                 return Err(JobsError::StepNotFound(*step_id));
@@ -1437,15 +1690,15 @@ impl JobsRepository for InMemoryJobs {
             let written = existing.clone();
             // Mirrors the sign-off UPDATE's `updated_at = $3`.
             touch_step(&mut state, key, event_stamp.timestamp);
-            written
+            (written, recorded)
         };
         // The row as the append left it, recorded before the caller's
         // marker — the Pg adapter's order (backlog f146a13a).
-        self.record_all(&[event_stamp.event(
+        recorded.push(event_stamp.event(
             crate::events::STEP_UPDATED,
             crate::events::step_state_payload(&written),
-        )]);
-        self.record_all(events);
+        ));
+        recorded.extend_from_slice(events);
         Ok(())
     }
 
@@ -1702,8 +1955,229 @@ mod tests {
     use super::*;
     use crate::port::DepartmentFilter;
 
+    #[tokio::test]
+    async fn first_record_admission_cannot_expose_rows_without_their_events() {
+        for graph in [false, true] {
+            let repo = std::sync::Arc::new(InMemoryJobs::new());
+            let job = Job::new(
+                "user-feedback",
+                Subject::new("custom", "admit-log"),
+                "Atomic admission",
+                "automation:test",
+                Priority::Standard,
+                test_date(),
+            );
+            let step = Step::new(job.id, "task", "Record", 0);
+            if !graph {
+                repo.create_job(&job).await.unwrap();
+            }
+            let poison = repo.clone();
+            assert!(
+                std::thread::spawn(move || {
+                    let _guard = poison.recorded.lock().unwrap();
+                    panic!("injected event-log failure");
+                })
+                .join()
+                .is_err()
+            );
+            let stamp = boss_core::publisher::EventStamp::new(
+                "jobs",
+                boss_core::actor::ActorId::Automation("test".into()),
+            );
+            let step_event = stamp.event(
+                crate::events::STEP_CREATED,
+                crate::events::step_state_payload(&step),
+            );
+            let result = if graph {
+                repo.create_job_with_steps_at(
+                    &job,
+                    std::slice::from_ref(&step),
+                    stamp.timestamp,
+                    &[stamp.event(
+                        crate::events::JOB_CREATED,
+                        serde_json::to_value(&job).unwrap(),
+                    )],
+                    &[step_event],
+                )
+                .await
+                .map(|_| ())
+            } else {
+                repo.add_step_at(&step, stamp.timestamp, &[step_event])
+                    .await
+            };
+            assert!(
+                result.is_err(),
+                "admission cannot expose rows whose event log is unavailable"
+            );
+            assert!(repo.get_step(&step.id).await.unwrap().is_none());
+            if graph {
+                assert!(repo.get_job(&job.id).await.unwrap().is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn first_record_related_writers_refuse_unavailable_event_log_before_mutation() {
+        for writer in ["merge", "row", "repin", "signoff"] {
+            let repo = std::sync::Arc::new(InMemoryJobs::new());
+            let job = Job::new(
+                "user-feedback",
+                Subject::new("custom", "atomic-log"),
+                "Conserve state and event",
+                "automation:test",
+                Priority::Standard,
+                test_date(),
+            );
+            repo.create_job(&job).await.unwrap();
+            let step = Step::new(job.id, "task", "Evidence", 0);
+            repo.add_step(&step).await.unwrap();
+            let poison = repo.clone();
+            assert!(
+                std::thread::spawn(move || {
+                    let _guard = poison.recorded.lock().unwrap();
+                    panic!("injected event-log failure");
+                })
+                .join()
+                .is_err()
+            );
+            let stamp = boss_core::publisher::EventStamp::new(
+                "jobs",
+                boss_core::actor::ActorId::Automation("test".into()),
+            );
+            let mut changed = step.clone();
+            changed.metadata = serde_json::json!({"other":true});
+            let result = match writer {
+                "merge" => repo
+                    .merge_step_metadata_at(&step.id, changed.metadata.as_object().unwrap(), &stamp)
+                    .await
+                    .map(|_| ()),
+                "row" => {
+                    repo.update_step_at(
+                        &changed,
+                        stamp.timestamp,
+                        &[stamp.event(
+                            crate::events::STEP_UPDATED,
+                            crate::events::step_state_payload(&changed),
+                        )],
+                    )
+                    .await
+                }
+                "signoff" => {
+                    repo.append_sign_off(
+                        &step.id,
+                        &boss_core::job::SignOffStamp {
+                            authority_id: "emp-control".into(),
+                            role: "platform-admin".into(),
+                            stamped_at: stamp.timestamp,
+                            shape_hash: step.shape_hash(),
+                            assurance: boss_core::job::Assurance::Session,
+                            presence_nonce: None,
+                            voided_at: None,
+                            voided_by_event: None,
+                        },
+                        &stamp,
+                        &[],
+                    )
+                    .await
+                }
+                _ => repo
+                    .repin_workflow_version_at(
+                        &job.id,
+                        2,
+                        &crate::repin::RepinPlan {
+                            reprojected: vec![crate::repin::Reprojected {
+                                step: changed,
+                                changed: vec!["metadata".into()],
+                                kept: vec![],
+                                unskipped: false,
+                            }],
+                            inserted: vec![],
+                        },
+                        &serde_json::json!({"to":2}),
+                        &stamp,
+                    )
+                    .await
+                    .map(|_| ()),
+            };
+            assert!(
+                result.is_err(),
+                "{writer} must refuse an unavailable event log"
+            );
+            assert_eq!(repo.get_step(&step.id).await.unwrap().unwrap(), step);
+            assert_eq!(repo.get_job(&job.id).await.unwrap().unwrap(), job);
+        }
+    }
+
     fn test_date() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 4, 16).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_completed_row_is_never_visible_before_its_committed_receipt() {
+        let repo = std::sync::Arc::new(InMemoryJobs::new());
+        let job = make_job("receipt-race");
+        repo.create_job(&job).await.unwrap();
+        let mut step = Step::new(job.id, "task", "Finish", 0);
+        repo.add_step(&step).await.unwrap();
+        let (_, version) = repo.get_step_versioned(&step.id).await.unwrap().unwrap();
+        step.status = StepStatus::Completed;
+        let stamp = boss_core::publisher::EventStamp::new(
+            "jobs",
+            boss_core::actor::ActorId::human("emp-1"),
+        );
+        let event = stamp.event(
+            crate::events::STEP_UPDATED,
+            serde_json::to_value(&step).unwrap(),
+        );
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *repo.before_step_events.lock().unwrap() = Some(Box::new(move || {
+            paused_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+        }));
+        let writer_repo = repo.clone();
+        let writer_step = step.clone();
+        let writer_event = event.clone();
+        let writer = std::thread::spawn(move || {
+            writer_repo.write_step(
+                &writer_step,
+                Some(version),
+                stamp.timestamp,
+                &[writer_event],
+            )
+        });
+        paused_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        // The writer is paused at the exact row/event seam, not a timed
+        // guess about which worker reached it. A competing row read must
+        // remain behind the same commit boundary as the receipt.
+        let hidden_until_commit = matches!(
+            repo.inner.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        resume_tx.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        assert!(
+            hidden_until_commit,
+            "completed row escaped before its receipt committed"
+        );
+        assert_eq!(
+            repo.get_step(&step.id).await.unwrap().unwrap().status,
+            StepStatus::Completed
+        );
+        let recorded = repo.recorded_event(event.id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(recorded).unwrap(),
+            serde_json::to_value(&event).unwrap()
+        );
+        assert_eq!(
+            repo.recorded_events()
+                .iter()
+                .filter(|e| e.id == event.id)
+                .count(),
+            1
+        );
     }
 
     /// THE PARTITION HAS TO HAPPEN IN THE QUERY, not on the page.

@@ -105,7 +105,30 @@ async fn main() -> Result<()> {
         clock,
         classes_client,
     };
-    let app = router(state);
+    let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+        boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+        Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+    ));
+    let mode = Arc::new(boss_policy_client::role_reader::MountedReportMode::mount());
+    let source = Arc::new(boss_policy_client::role_reader::HttpRoleReader::new(
+        std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
+        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
+        boss_policy_client::User::service("messages"),
+    )?);
+    let wiring = boss_policy_client::role_service::assemble(
+        "messages",
+        "/api/messages/actor-role-reports",
+        Arc::new(boss_policy_client::ReqwestPolicyClient::new(
+            "messages",
+            std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
+        )),
+        roles.clone(),
+        mode.clone(),
+        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
+            boss_policy_client::role_service::REPORT_CAPACITY,
+        )),
+    );
+    let app = messages_http_router(router(state), wiring.inventory);
     // Sim-origin middleware: extract x-sim-origin header and set the
     // per-request task-local so the publisher inherits the sim
     // marker. Closes the gap where a sim chain could trigger a
@@ -129,6 +152,133 @@ async fn main() -> Result<()> {
         &["/api/messages/health"],
         Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
     );
-    axum::serve(listener, app).await?;
+    boss_policy_client::role_service::serve_with_refresh(
+        listener,
+        app,
+        roles,
+        source,
+        mode,
+        boss_policy_client::role_service::REFRESH_CADENCE,
+        boss_policy_client::role_service::shutdown_signal(),
+    )
+    .await?;
     Ok(())
+}
+
+fn messages_http_router(domain: axum::Router, inventory: axum::Router) -> axum::Router {
+    domain.merge(inventory)
+}
+
+#[cfg(test)]
+mod role_inventory_tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use boss_policy_client::{Action, FakePolicyClient, Resource, Scope, User};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn messages_mount_preserves_domain_and_protects_inventory() {
+        let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+            boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+            Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+        ));
+        let tally = Arc::new(boss_policy_client::role_reporting::ReportTally::new(8));
+        let policy = Arc::new(
+            FakePolicyClient::builder()
+                .allow(
+                    "report-reader",
+                    Action::Read,
+                    Resource::policy_rule(),
+                    Scope::All,
+                )
+                .build(),
+        );
+        let wiring = boss_policy_client::role_service::assemble(
+            "messages",
+            "/api/messages/actor-role-reports",
+            policy,
+            roles,
+            Arc::new(boss_policy_client::role_reporting::ReportMode::Report),
+            tally.clone(),
+        );
+        let app = messages_http_router(
+            router(MessageApiState {
+                messages: Arc::new(boss_messages::InMemoryMessages::new(vec![])),
+                publisher: None,
+                clock: Arc::new(boss_clock_client::WallClockClient),
+                classes_client: None,
+            }),
+            wiring.inventory,
+        );
+        let domain = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/messages/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(domain.status(), StatusCode::OK);
+        let health: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(domain.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(health["status"], "ok");
+        let mut unrelated = User::service("unrelated");
+        unrelated.role = "platform-admin".into();
+        unrelated.access_tier = boss_policy_client::AccessTier::User;
+        let inbox = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/messages/inbox/other")
+                    .header("x-boss-user", serde_json::to_string(&unrelated).unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inbox.status(), StatusCode::FORBIDDEN);
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/messages/actor-role-reports")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let mut user = User::service("reader");
+        user.role = "report-reader".into();
+        let allowed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/messages/actor-role-reports")
+                    .header("x-boss-user", serde_json::to_string(&user).unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(allowed.into_body(), 16384)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["service"], "messages");
+        assert_eq!(body["snapshot"]["state"], "never-loaded");
+        assert_eq!(body["report"]["durable_window"], false);
+        assert!(tally.snapshot().rows.is_empty());
+    }
 }

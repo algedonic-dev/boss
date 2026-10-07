@@ -1,0 +1,23 @@
+# Arrival is not execution. The cadence sweep watches requests arriving
+# and approvals holding; ops.judge watches closed reap requests' recorded
+# exit and final effect line. Exit 0 without that line is no evidence.
+# This covers the daily and ad hoc uses of the SAME registered verb.
+# The early "reaping" line is not the final "reaped" effect.
+# No follow-on verb is filed and no approval is manufactured.
+[[rule]]
+name = "watch-pod-reap-outcomes"
+why = """
+A CROSS-PROTOCOL READER: ops-request answered means the verb ran, even
+when its recorded exit was nonzero. The cadence sweep sees only that
+a request arrived and cannot decide whether the signed reap completed.
+The existing ops.judge watch reads every answered/refused reap request,
+alarms on refused/failed or unproved execution and records clean ones.
+Its verb filter excludes other operations. No follow-on action or new
+delete authority is introduced; the per-request passkey remains required.
+"""
+version = 1
+on_event = "jobs.job.closed"
+when = 'kind = "ops-request" AND (outcome = "answered" OR outcome = "refused")'
+[[rule.do]]
+handler = "ops.judge"
+args = { verb = '"reap-terminated-pods"', verdict_pattern = '"^reap-terminated-pods: (reaped [0-9]+ pod[(]s[)]|plan .+ still holds and names no pod — nothing to reap)$"', when = '"true"' }

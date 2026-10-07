@@ -44,6 +44,9 @@ pub(super) async fn write_stamp<R: JobsRepository, B: EventBus>(
 
 pub(super) fn kind_err_response(err: WorkflowError) -> Response {
     match err {
+        WorkflowError::CoverageUnavailable(msg) => {
+            (StatusCode::SERVICE_UNAVAILABLE, msg).into_response()
+        }
         WorkflowError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
         WorkflowError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
         WorkflowError::Invalid(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),

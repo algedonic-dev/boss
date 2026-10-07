@@ -193,30 +193,114 @@ if [[ "${1:-}" == "--plan" ]]; then
     exit 0
 fi
 
+# THE LAUNCH RECORD (backlog 93e0814a, 2026-10-06). What this launch
+# decided, per service, written where the pod's own processes can read
+# it: `start <binary>` or `skip <binary> <reason>`, between a version
+# line and an `end <count>` line so a truncated file cannot pass for a
+# short roster. The gate-window reader (boss-events-api) takes its
+# required services from it. Until this record existed that reader
+# required every gated row of boss-ports, so the six services this
+# instance's tenant never asked for (assets, catalog, inventory,
+# shipping, the simulator and the sim daemon's control port — each a
+# SKIP line in the live pod's log) were six named gaps and the machine-
+# gate window could not read clean at zero misses. The loop below and
+# the record take every decision from the ONE function, launch_decision,
+# so the record cannot name a service skipped that the loop starts.
+# The record can only EXCUSE: the reader still probes an excused port
+# and refuses a clean reading when anything answers there, and a
+# missing, truncated or unreadable record requires every service.
+#
+# launch_decision <service> — 0 to start it; 1 with LAUNCH_SKIP_REASON.
+launch_decision() {
+    LAUNCH_SKIP_REASON=""
+    if ! service_wanted "$1"; then
+        LAUNCH_SKIP_REASON="$SERVICE_SKIP_REASON"
+        return 1
+    fi
+    if ! command -v "$1" >/dev/null 2>&1; then
+        LAUNCH_SKIP_REASON="binary not in image"
+        return 1
+    fi
+    return 0
+}
+
+# embedded_rows <service> — the port-registry rows a binary serves under
+# another name, in the registry's launcher spelling (boss-<row>). The
+# tick daemon embeds the `sim-control` port; the record repeats the
+# daemon's decision under that row's name, so the reader finds every
+# row by the registry's own rule and boss-ports names no tenant binary.
+embedded_rows() {
+    case "$1" in
+        boss-brewery-sim) echo boss-sim-control ;;
+    esac
+}
+
+# launch_record — the record's text. boss-brewery-sim is the one entry
+# the loop "starts" without always running a process: its step publishes
+# the tenant and starts the tick daemon only when sim_enabled
+# (launch_tenant_and_sim, the same predicate read here), so a parked sim
+# is recorded as the skip it is.
+launch_record() {
+    local svc name reason count=0
+    echo "boss-launch-record v1"
+    for svc in "${SERVICES[@]}"; do
+        # An empty reason is a start.
+        reason=""
+        if ! launch_decision "$svc"; then
+            reason="$LAUNCH_SKIP_REASON"
+        elif [[ "$svc" == "boss-brewery-sim" ]] && ! sim_enabled; then
+            reason="the tick daemon is parked (BOSS_SIM_ENABLED is not on)"
+        fi
+        for name in "$svc" $(embedded_rows "$svc"); do
+            count=$((count + 1))
+            if [[ -n "$reason" ]]; then
+                echo "skip $name $reason"
+            else
+                echo "start $name"
+            fi
+        done
+    done
+    echo "end $count"
+}
+
+# `--record` prints the record and exits without starting anything: the
+# door the shell test uses, as `--plan` is for the tenant's modules.
+if [[ "${1:-}" == "--record" ]]; then
+    launch_record
+    exit 0
+fi
+
+# Written BEFORE the first service starts, whole or not at all (a temp
+# file renamed into place), and exported so every child reads the path
+# this launch wrote rather than a default of its own. A record that
+# cannot be written is a WARNING, never a refused launch: the reader
+# then requires every service and says why, which is loud and safe,
+# while a launcher that stopped here would take the system of record
+# down over an observability file.
+export BOSS_LAUNCH_RECORD="${BOSS_LAUNCH_RECORD:-/etc/boss-launch-record}"
+rm -f "$BOSS_LAUNCH_RECORD" 2>/dev/null || true
+if launch_record > "$BOSS_LAUNCH_RECORD.tmp" 2>/dev/null && mv "$BOSS_LAUNCH_RECORD.tmp" "$BOSS_LAUNCH_RECORD" 2>/dev/null; then
+    echo "==> launch record: $BOSS_LAUNCH_RECORD"
+else
+    echo "WARN: could not write the launch record at $BOSS_LAUNCH_RECORD — the gate window will require every service and read not clean" >&2
+fi
+
 echo "==> boss-launch starting ${#SERVICES[@]} services"
 for svc in "${SERVICES[@]}"; do
-    if ! service_wanted "$svc"; then
-        echo "    SKIP: $svc ($SERVICE_SKIP_REASON)"
+    if ! launch_decision "$svc"; then
+        echo "    SKIP: $svc ($LAUNCH_SKIP_REASON)"
         continue
     fi
     # Just before the sim — which posts jobs immediately — make sure the
     # brewery Workflows + policy grants exist (the jobs-api it needs is up
     # by now, having been started earlier in this loop).
     if [[ "$svc" == "boss-brewery-sim" ]]; then
-        if ! command -v "$svc" >/dev/null 2>&1; then
-            echo "    SKIP: $svc (binary not in image)"
-            continue
-        fi
         # Publishes the tenant, gates on the dispatcher's readyz, and
         # starts the sim as a background child — or degrades and
         # retries. Never returns non-zero; the launch goes on.
         echo "    starting $svc (after the tenant publish)"
         launch_tenant_and_sim PIDS
         sleep 0.1
-        continue
-    fi
-    if ! command -v "$svc" >/dev/null 2>&1; then
-        echo "    SKIP: $svc (binary not in image)"
         continue
     fi
     echo "    starting $svc"

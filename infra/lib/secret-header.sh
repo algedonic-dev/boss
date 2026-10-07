@@ -83,6 +83,23 @@ _secret_header_close() {
     fi
 }
 
+# secret_header_close — remove the header directory NOW, without waiting
+# for the EXIT trap. For the one shape the trap cannot serve: a caller
+# that makes its header INSIDE its own EXIT trap. The cleanup chained at
+# the first call runs in front of the caller's trap, so by the time that
+# trap sends, the directory is gone; the call it makes then opens a new
+# one, and a trap set while the EXIT trap is running never fires —
+# measured in bash 5.2, 2026-10-06: the 0600 file outlived the run. Such
+# a caller calls this after its last request
+# (infra/forge/cluster-deploy-lib.sh answer_converge_requests, backlog
+# 2710c8fc). Every header made before it is gone afterwards: a VAR still
+# holding `@<file>` names a file that no longer exists, so make the
+# header again before the next request. Always returns 0.
+secret_header_close() {
+    _secret_header_close
+    return 0
+}
+
 # _secret_header_capture -- CMD SIGNAL — one entry of `trap`'s listing,
 # re-read: the command of the EXIT entry is kept, every other entry is
 # ignored. The listing is `trap -- 'cmd' EXIT` in bash and in dash, and

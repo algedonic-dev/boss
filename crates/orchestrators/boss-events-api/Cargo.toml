@@ -46,3 +46,7 @@ required-features = ["postgres"]
 
 [lints]
 workspace = true
+
+[[test]]
+name = "events_role_reports"
+required-features = ["postgres"]

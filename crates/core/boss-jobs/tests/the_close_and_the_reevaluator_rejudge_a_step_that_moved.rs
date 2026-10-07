@@ -84,7 +84,7 @@ fn admin_header() -> String {
 /// `promotes`: work → review, where review waits on work.
 /// `closes`: finish (a declared terminal) beside other, both open at once.
 fn app() -> (axum::Router, Arc<InMemoryJobs>) {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds
         .seed(spec(
             "promotes",

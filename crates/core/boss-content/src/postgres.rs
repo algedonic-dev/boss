@@ -14,27 +14,22 @@ use crate::types::{
 
 pub struct PgContent {
     pool: PgPool,
+    audience_observer: Option<std::sync::Arc<dyn crate::port::AudienceObserver>>,
 }
 
 impl PgContent {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            audience_observer: None,
+        }
     }
-
-    /// Fetch a section by slug regardless of audience/published flags.
-    /// Used after writes so the author always sees the row they just
-    /// saved even if its audience excludes them.
-    async fn fetch_section_raw(&self, slug: &str) -> Result<Option<ManualSection>, ContentError> {
-        let row = sqlx::query(
-            "SELECT id, slug, parent_slug, title, body, sort_order, audience, \
-                    current_version, published, created_at, updated_at \
-             FROM manual_sections WHERE slug = $1",
-        )
-        .bind(slug)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(store)?;
-        row.as_ref().map(row_to_section).transpose()
+    pub fn with_audience_observer(
+        mut self,
+        observer: std::sync::Arc<dyn crate::port::AudienceObserver>,
+    ) -> Self {
+        self.audience_observer = Some(observer);
+        self
     }
 }
 
@@ -70,7 +65,12 @@ impl ContentRepository for PgContent {
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let b = row_to_bulletin(&row)?;
-            if !b.audience.matches(user) {
+            if !crate::port::matches_observed(
+                self.audience_observer.as_deref(),
+                "content-bulletin-audience",
+                &b.audience,
+                user,
+            ) {
                 continue;
             }
             if !include_dismissed && b.dismissed_by_viewer {
@@ -372,7 +372,14 @@ impl ContentRepository for PgContent {
         let all: Vec<ManualSection> = rows.iter().map(row_to_section).collect::<Result<_, _>>()?;
         Ok(all
             .into_iter()
-            .filter(|s| s.audience.matches(user))
+            .filter(|s| {
+                crate::port::matches_observed(
+                    self.audience_observer.as_deref(),
+                    "content-manual-tree-audience",
+                    &s.audience,
+                    user,
+                )
+            })
             .collect())
     }
 
@@ -392,17 +399,25 @@ impl ContentRepository for PgContent {
         .map_err(store)?;
         let Some(row) = row else { return Ok(None) };
         let section = row_to_section(&row)?;
-        if !section.published || !section.audience.matches(user) {
+        if !section.published
+            || !crate::port::matches_observed(
+                self.audience_observer.as_deref(),
+                "content-section-audience",
+                &section.audience,
+                user,
+            )
+        {
             return Ok(None);
         }
         Ok(Some(section))
     }
 
-    async fn create_section(
+    async fn create_section_at(
         &self,
         draft: ManualSectionDraft,
-        editor_id: &str,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<ManualSection, ContentError> {
+        let editor_id = stamp.actor().to_string();
         if draft.slug.trim().is_empty() {
             return Err(ContentError::Validation("slug is required".into()));
         }
@@ -414,8 +429,8 @@ impl ContentRepository for PgContent {
         sqlx::query(
             "INSERT INTO manual_sections \
                 (id, slug, parent_slug, title, body, sort_order, audience, \
-                 current_version, published) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8)",
+                 current_version, published, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9, $9)",
         )
         .bind(id)
         .bind(&draft.slug)
@@ -425,13 +440,14 @@ impl ContentRepository for PgContent {
         .bind(draft.sort_order)
         .bind(&draft.audience.0)
         .bind(draft.published)
+        .bind(stamp.timestamp)
         .execute(&mut *tx)
         .await
         .map_err(|e| section_insert_refused(e, &draft))?;
         sqlx::query(
             "INSERT INTO manual_section_history \
-                (section_id, version, title, body, audience, edited_by, reason) \
-             VALUES ($1, 1, $2, $3, $4, $5, $6)",
+                (section_id, version, title, body, audience, edited_by, reason, edited_at) \
+             VALUES ($1, 1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(id)
         .bind(&draft.title)
@@ -439,22 +455,23 @@ impl ContentRepository for PgContent {
         .bind(&draft.audience.0)
         .bind(editor_id)
         .bind("initial version")
+        .bind(stamp.timestamp)
         .execute(&mut *tx)
         .await
         .map_err(store)?;
+        let section =
+            record_manual_fact(&mut tx, id, crate::events::SECTION_CREATED, stamp).await?;
         tx.commit().await.map_err(store)?;
-
-        self.fetch_section_raw(&draft.slug)
-            .await?
-            .ok_or_else(|| ContentError::Storage("just-created section vanished".into()))
+        Ok(section)
     }
 
-    async fn update_section(
+    async fn update_section_at(
         &self,
         slug: &str,
         patch: ManualPatch,
-        editor_id: &str,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<ManualSection, ContentError> {
+        let editor_id = stamp.actor().to_string();
         let mut tx = self.pool.begin().await.map_err(store)?;
         let row = sqlx::query(
             "SELECT id, slug, parent_slug, title, body, sort_order, audience, \
@@ -479,12 +496,15 @@ impl ContentRepository for PgContent {
         let audience = patch.audience.unwrap_or(current.audience.clone());
         let sort_order = patch.sort_order.unwrap_or(current.sort_order);
         let published = patch.published.unwrap_or(current.published);
-        let new_version = current.current_version + 1;
+        let new_version = current
+            .current_version
+            .checked_add(1)
+            .ok_or_else(|| ContentError::Validation("manual version exhausted".into()))?;
 
         sqlx::query(
             "UPDATE manual_sections SET \
                 title = $2, body = $3, audience = $4, sort_order = $5, \
-                published = $6, current_version = $7, updated_at = NOW() \
+                published = $6, current_version = $7, updated_at = $8 \
              WHERE id = $1",
         )
         .bind(current.id)
@@ -494,13 +514,14 @@ impl ContentRepository for PgContent {
         .bind(sort_order)
         .bind(published)
         .bind(new_version)
+        .bind(stamp.timestamp)
         .execute(&mut *tx)
         .await
         .map_err(store)?;
         sqlx::query(
             "INSERT INTO manual_section_history \
-                (section_id, version, title, body, audience, edited_by, reason) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                (section_id, version, title, body, audience, edited_by, reason, edited_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(current.id)
         .bind(new_version)
@@ -509,14 +530,14 @@ impl ContentRepository for PgContent {
         .bind(&audience.0)
         .bind(editor_id)
         .bind(patch.reason.as_deref())
+        .bind(stamp.timestamp)
         .execute(&mut *tx)
         .await
         .map_err(store)?;
+        let section =
+            record_manual_fact(&mut tx, current.id, crate::events::SECTION_UPDATED, stamp).await?;
         tx.commit().await.map_err(store)?;
-
-        self.fetch_section_raw(slug)
-            .await?
-            .ok_or_else(|| ContentError::Storage("section vanished mid-update".into()))
+        Ok(section)
     }
 
     async fn section_history(&self, slug: &str) -> Result<Vec<ManualSectionVersion>, ContentError> {
@@ -541,6 +562,38 @@ impl ContentRepository for PgContent {
         .map_err(store)?;
         rows.iter().map(row_to_version).collect()
     }
+}
+
+/// Read the exact rows being committed and record their fact in the same transaction.
+async fn record_manual_fact(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: Uuid,
+    kind: &str,
+    stamp: &boss_core::publisher::EventStamp,
+) -> Result<ManualSection, ContentError> {
+    let row = sqlx::query("SELECT * FROM manual_sections WHERE id = $1")
+        .bind(id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(store)?;
+    let section = row_to_section(&row)?;
+    let row =
+        sqlx::query("SELECT * FROM manual_section_history WHERE section_id = $1 AND version = $2")
+            .bind(id)
+            .bind(section.current_version)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(store)?;
+    let version = row_to_version(&row)?;
+    let history_id: i64 = row.try_get("id").map_err(store)?;
+    let event = stamp.event(
+        kind,
+        serde_json::json!({"section": section, "version": version, "history_id": history_id}),
+    );
+    boss_events::outbox::record_event_in_tx(tx, &event)
+        .await
+        .map_err(ContentError::Storage)?;
+    Ok(section)
 }
 
 /// Fetch one bulletin INSIDE the caller's transaction — the in-tx

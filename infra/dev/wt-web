@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+if [[ -e /etc/boss-dev-control/enabled || -L /etc/boss-dev-control/enabled ]]; then
+    exec /opt/boss-dev-control/wt-web "$@"
+fi
 # wt-web — prepare a WORKTREE for web checks by giving it its OWN
 # node_modules, prove Playwright can start there, then run the given
 # command (backlog ef4394e1, 2026-09-14; rebuilt 44f1cd1e, 2026-09-27).

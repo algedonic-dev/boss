@@ -4,9 +4,11 @@
 //! the full row state so the rebuild path can reconstruct
 //! `bulletins` + `bulletin_dismissals` from the event log alone.
 //!
-//! Manual-section events (SECTION_CREATED / SECTION_UPDATED) are
-//! reserved for the follow-up commit that ships the manual
-//! rebuilder.
+//! Manual events carry the resulting section and the single newly
+//! committed history version. They never invent earlier history.
+
+pub const SECTION_CREATED: &str = "content.manual.section_created";
+pub const SECTION_UPDATED: &str = "content.manual.section_updated";
 
 pub const BULLETIN_CREATED: &str = "content.bulletin.created";
 pub const BULLETIN_UPDATED: &str = "content.bulletin.updated";

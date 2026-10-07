@@ -1,0 +1,7 @@
+{
+  "about": "READ-ONLY fixed installed admission reader identity prerequisite, approved ad504a45 and partial parent90218205. No parameters, credentials, server calls or network. Resolves the existing resident ops_image to an immutable Docker image ID without pulling or pinning. Executes the actual existing host-mounted Talos binary in that image using version --client and /dev/null configuration; records strictly parsed client fields, bounded complete binary SHA256 and the fourteen fixed method file identities the two admission doors consume, snapshotted before/inside/after. LIMIT of methods: only identity and source are execution-bound, hashed from the bytes this run compiled and executed; identity_bootstrap and identity_host, like every other entry, are on-disk-stable only, meaning the file kept one hash and incarnation across the window, not that those bytes were the ones the interpreter or shell had already read. Runs with network none, read-only mounts/root, no capabilities, no new privileges, bounded memory/tasks/time/output. Raw diagnostics are refused and never exported. Exit4 means unavailable. This receipt is point-in-time prerequisite evidence, never a complete or clean historical interval and never G1 release. Any later source-access invocation must bind the actually consumed same binary/image/method rather than assume this receipt remains current. Independent held source review precedes live use.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/probe-admission-reader-identity.sh"],
+  "params": [],
+  "timeout": 60
+}

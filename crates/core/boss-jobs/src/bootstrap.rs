@@ -309,7 +309,14 @@ fn sorted<'a>(entries: impl Iterator<Item = (&'a String, Value)>) -> Value {
 /// its TOP-LEVEL numbers as floats (`budget_usd = 5` against the
 /// registry's `5.0`). The lint's `agent_facet`.
 fn agent_facet(block: Option<&Value>) -> Option<String> {
-    let o = block?.as_object()?;
+    let mut o = block?.as_object()?.clone();
+    // Legacy omission has AgentSpec's declared advisory meaning. Preserve
+    // every explicit value (including null/unknown) and every other key.
+    // The real-bundle comparator controls pin this to the build-free lint.
+    o.entry("executor_provenance".to_string())
+        .or_insert_with(|| {
+            json!(crate::executor_attestation::ExecutorProvenanceRequirement::default())
+        });
     Some(
         sorted(o.iter().map(|(k, v)| match v {
             Value::Number(n) => (k, n.as_f64().map(Value::from).unwrap_or(Value::Null)),

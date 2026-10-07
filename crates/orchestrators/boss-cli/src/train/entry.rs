@@ -130,7 +130,7 @@ pub(crate) fn contended(phase: &Phase) -> Contended {
 // FAIRNESS — the starvable side waits a bounded time for its turn:
 //
 //   - RECONCILE and RUN wait (`CONDUCTOR_LOCK_WAIT`). Waiting 14 seconds
-//     out of a 600-second period costs nothing, and the cadence loop's
+//     is bounded, and the cadence loop's
 //     one-in-flight-run-per-rule guard means a waiting pass cannot stack
 //     up behind itself.
 //   - BOARD and PREFLIGHT do not wait. A board must never queue behind a
@@ -154,8 +154,9 @@ pub(crate) fn contended(phase: &Phase) -> Contended {
 /// How long a starvable phase waits for the conductor's lock. Two
 /// minutes: comfortably longer than the 12–14s a refusing board holds it
 /// and than a board that departs a train (push + PR + per-car writes),
-/// and a fifth of the reconcile's own 10-minute period, so a pass that
-/// waits its whole budget has still left the next window clear.
+/// and unchanged when the reconcile interval shortened to two minutes
+/// (8eca7b2f). A pass may occupy a whole window; the per-rule in-flight
+/// guard skips that window rather than stacking another waiter.
 pub(crate) const CONDUCTOR_LOCK_WAIT: Duration = Duration::from_secs(120);
 
 /// How often the waiter retries. The hold it waits out is seconds long,

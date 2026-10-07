@@ -12,6 +12,8 @@ use crate::types::Employee;
 pub enum PeopleError {
     #[error("storage failure: {0}")]
     Storage(String),
+    #[error("coverage unavailable: {0}")]
+    Unavailable(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("conflict: {0}")]

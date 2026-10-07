@@ -68,6 +68,7 @@ use boss_policy_client::CurrentUser;
 pub struct WebauthnState {
     pub pool: Arc<PgPool>,
     pub clock: Arc<dyn ClockClient>,
+    pub coverage: Option<Arc<dyn crate::coverage_guard::CoverageRead>>,
 }
 
 /// Small error value for helper Results (clippy::result_large_err —
@@ -120,9 +121,18 @@ fn machinery_read_gate(user: &boss_policy::User) -> Result<(), ErrResp> {
 }
 
 pub fn webauthn_router(pool: PgPool, clock: Arc<dyn ClockClient>) -> Router {
+    webauthn_router_with_coverage(pool, clock, None)
+}
+
+pub fn webauthn_router_with_coverage(
+    pool: PgPool,
+    clock: Arc<dyn ClockClient>,
+    coverage: Option<Arc<dyn crate::coverage_guard::CoverageRead>>,
+) -> Router {
     let state = WebauthnState {
         pool: Arc::new(pool),
         clock,
+        coverage,
     };
     Router::new()
         .route(
@@ -302,6 +312,13 @@ async fn register_credential(
         Err(r) => return r.into_response(),
     };
     let now = now_from(&state.clock).await;
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    if let Err(e) = crate::coverage_guard_pg::lock(&mut tx).await {
+        return coverage_error(e);
+    }
     // The tier is a literal in the statement, not a bind: nothing a
     // caller sends can reach the column (backlog 1d9970d1).
     let res = sqlx::query(
@@ -314,10 +331,13 @@ async fn register_credential(
     .bind(&pub_key)
     .bind(&body.label)
     .bind(now)
-    .execute(state.pool.as_ref())
+    .execute(&mut *tx)
     .await;
     match res {
-        Ok(_) => StatusCode::CREATED.into_response(),
+        Ok(_) => match tx.commit().await {
+            Ok(()) => StatusCode::CREATED.into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        },
         Err(sqlx::Error::Database(e)) if e.is_unique_violation() => (
             StatusCode::CONFLICT,
             "credential_id already registered — a credential binds to one authenticator forever",
@@ -357,6 +377,75 @@ async fn remove_credential(
         Ok(v) => v,
         Err(r) => return r.into_response(),
     };
+    // The basis is read before the transaction, and only when removing
+    // this key can take a holder away: the last key of a real person, or
+    // their operator-tier standing (`coverage_guard::can_orphan`). One of
+    // several user keys reads nothing (review c3b96c09 F1, 2026-10-06).
+    let standing = if let Some(source) = &state.coverage {
+        let local = match crate::coverage_guard_pg::read_unlocked(state.pool.as_ref()).await {
+            Ok(local) => local,
+            Err(e) => return coverage_error(e),
+        };
+        let tier = match stored_tier(state.pool.as_ref(), &employee_id, &cred).await {
+            Ok(tier) => tier,
+            Err(e) => return coverage_error(e),
+        };
+        // No such key, or one the forecast cannot place: the transaction
+        // below answers, on the rows it reads under the lock.
+        match tier
+            .and_then(|tier| crate::coverage_guard::keys_without(&local.keys, &employee_id, &tier))
+        {
+            Some(after) => {
+                match crate::coverage_guard::standing_for(
+                    source.as_ref(),
+                    &local.roster,
+                    &local.keys,
+                    &local.roster,
+                    &after,
+                )
+                .await
+                {
+                    Ok(standing) => standing,
+                    Err(e) => return coverage_error(e),
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let local = match crate::coverage_guard_pg::read_locked(&mut tx).await {
+        Ok(local) => local,
+        Err(e) => return coverage_error(e),
+    };
+    if state.coverage.is_some() {
+        let tier = match stored_tier(&mut *tx, &employee_id, &cred).await {
+            Ok(tier) => tier,
+            Err(e) => return coverage_error(e),
+        };
+        let Some(tier) = tier else {
+            return (StatusCode::NOT_FOUND, "no such passkey on this account").into_response();
+        };
+        let Some(after) = crate::coverage_guard::keys_without(&local.keys, &employee_id, &tier)
+        else {
+            return coverage_error(crate::port::PeopleError::Unavailable(
+                "the selected key is absent from the complete key snapshot".into(),
+            ));
+        };
+        if let Err(e) = crate::coverage_guard::judge_at_commit(
+            standing.as_ref(),
+            &local.roster,
+            &local.keys,
+            &local.roster,
+            &after,
+        ) {
+            return coverage_error(e);
+        }
+    }
     let deleted = sqlx::query(
         "DELETE FROM webauthn_credentials
           WHERE employee_id = $1 AND credential_id = $2
@@ -364,10 +453,13 @@ async fn remove_credential(
     )
     .bind(&employee_id)
     .bind(&cred)
-    .execute(state.pool.as_ref())
+    .execute(&mut *tx)
     .await;
     match deleted {
-        Ok(r) if r.rows_affected() == 1 => StatusCode::NO_CONTENT.into_response(),
+        Ok(r) if r.rows_affected() == 1 => match tx.commit().await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        },
         Ok(_) => {
             let exists = sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(SELECT 1 FROM webauthn_credentials
@@ -375,7 +467,7 @@ async fn remove_credential(
             )
             .bind(&employee_id)
             .bind(&cred)
-            .fetch_one(state.pool.as_ref())
+            .fetch_one(&mut *tx)
             .await
             .unwrap_or(false);
             if exists {
@@ -391,6 +483,35 @@ async fn remove_credential(
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// The guard's answer in the People door's own terms — one mapping,
+/// where a 503 is also logged with its reason (`http.rs`).
+fn coverage_error(error: crate::port::PeopleError) -> Response {
+    crate::http::people_error_response(error)
+}
+
+/// The tier one stored key carries, or `None` when the account holds no
+/// such key. A tier the guard cannot read is not judged as some tier.
+async fn stored_tier<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    employee_id: &str,
+    credential: &[u8],
+) -> Result<Option<boss_policy_client::AccessTier>, crate::port::PeopleError> {
+    use crate::port::PeopleError;
+    let tier: Option<String> = sqlx::query_scalar(
+        "SELECT access_tier FROM webauthn_credentials WHERE employee_id = $1 AND credential_id = $2",
+    )
+    .bind(employee_id)
+    .bind(credential)
+    .fetch_optional(executor)
+    .await
+    .map_err(|e| PeopleError::Storage(e.to_string()))?;
+    tier.map(|tier| {
+        serde_json::from_value(serde_json::Value::String(tier))
+            .map_err(|_| PeopleError::Unavailable("stored key tier cannot be judged".into()))
+    })
+    .transpose()
 }
 
 async fn record_credential_use(

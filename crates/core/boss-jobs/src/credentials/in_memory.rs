@@ -40,38 +40,152 @@ fn row_of(c: &CredentialInput) -> Result<CredentialRow, CredentialsError> {
 
 #[derive(Default)]
 pub struct InMemoryCredentials {
-    rows: Mutex<Vec<CredentialRow>>,
-    events: Mutex<Vec<Event>>,
+    state: Mutex<State>,
+}
+
+#[derive(Default)]
+struct State {
+    rows: Vec<CredentialRow>,
+    events: Vec<Event>,
+    receipts: Vec<super::receipt::RotationReceipt>,
 }
 
 impl InMemoryCredentials {
     pub fn new(rows: Vec<CredentialRow>) -> Self {
         Self {
-            rows: Mutex::new(rows),
-            events: Mutex::new(Vec::new()),
+            state: Mutex::new(State {
+                rows,
+                ..State::default()
+            }),
         }
     }
 
     /// Every rotation event recorded through this adapter, in order —
     /// what a Pg deployment would find on the outbox.
-    pub fn recorded_events(&self) -> Vec<Event> {
-        self.events.lock().expect("events lock").clone()
+    pub fn recorded_events(&self) -> Result<Vec<Event>, CredentialsError> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| CredentialsError::Storage("credential state lock poisoned".into()))?
+            .events
+            .clone())
     }
 }
 
 #[async_trait]
 impl CredentialsRegistry for InMemoryCredentials {
+    async fn record_delivery(
+        &self,
+        context: &super::runner_delivery::ResolvedDelivery,
+        stamp: &EventStamp,
+    ) -> Result<super::receipt::RotationOutcome, CredentialsError> {
+        use super::receipt::RotationOutcome;
+        context.validate_actor(stamp)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CredentialsError::Storage("credential state lock poisoned".into()))?;
+        let id = &context.credential_id;
+        let row = state
+            .rows
+            .iter()
+            .find(|row| &row.id == id)
+            .ok_or_else(|| CredentialsError::UnknownCredential(id.clone()))?;
+        if row.kind != "ops-runner-credential" {
+            return Err(CredentialsError::ObservationConflict);
+        }
+        let outcome = super::runner_delivery::prepare_receipt(context, &state.receipts, stamp)?;
+        if let RotationOutcome::Recorded { receipt } = &outcome {
+            state
+                .events
+                .push(receipt.event(stamp, context.evidence(), RotationPhase::Verified)?);
+            state.receipts.push(receipt.clone());
+        }
+        Ok(outcome)
+    }
+
+    async fn delivery_receipt(
+        &self,
+        id: &str,
+        attempt: uuid::Uuid,
+    ) -> Result<Option<super::receipt::RotationReceipt>, CredentialsError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| CredentialsError::Storage("credential state lock poisoned".into()))?;
+        Ok(state
+            .receipts
+            .iter()
+            .find(|receipt| {
+                receipt.credential_id == id
+                    && receipt.phase == "verified"
+                    && receipt.observation_id == format!("{attempt}:delivered")
+            })
+            .cloned())
+    }
+
+    async fn restore_rotation(&self, event: &Event) -> Result<(), CredentialsError> {
+        use super::receipt::RotationReceipt;
+        let receipt = RotationReceipt::from_event(event)?;
+        let phase = RotationPhase::ALL
+            .into_iter()
+            .find(|p| p.event_kind() == event.kind)
+            .ok_or(CredentialsError::ObservationConflict)?;
+        let id = receipt
+            .as_ref()
+            .map(|r| r.credential_id.as_str())
+            .or_else(|| {
+                event
+                    .payload
+                    .get("credential_id")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .ok_or(CredentialsError::ObservationConflict)?
+            .to_owned();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CredentialsError::Storage("credential state lock poisoned".into()))?;
+        if !state.rows.iter().any(|r| r.id == id) {
+            return Err(CredentialsError::UnknownCredential(id));
+        }
+        if let Some(receipt) = receipt {
+            if let Some(original) = state.receipts.iter().find(|r| {
+                r.credential_id == receipt.credential_id
+                    && r.phase == receipt.phase
+                    && r.observation_id == receipt.observation_id
+            }) {
+                if *original != receipt {
+                    return Err(CredentialsError::ObservationConflict);
+                }
+            } else {
+                state.receipts.push(receipt);
+            }
+        }
+        if phase == RotationPhase::Installed {
+            for row in state.rows.iter_mut().filter(|r| r.id == id) {
+                row.rotated_at = Some(event.timestamp);
+            }
+        }
+        Ok(())
+    }
     async fn list(&self) -> Result<Vec<CredentialRow>, CredentialsError> {
-        let mut rows = self.rows.lock().expect("rows lock").clone();
+        let mut rows = self
+            .state
+            .lock()
+            .map_err(|_| CredentialsError::Storage("credential state lock poisoned".into()))?
+            .rows
+            .clone();
         rows.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(rows)
     }
 
     async fn get(&self, id: &str) -> Result<Option<CredentialRow>, CredentialsError> {
         Ok(self
-            .rows
+            .state
             .lock()
-            .expect("rows lock")
+            .map_err(|_| CredentialsError::Storage("credential state lock poisoned".into()))?
+            .rows
             .iter()
             .find(|r| r.id == id)
             .cloned())
@@ -98,8 +212,11 @@ impl CredentialsRegistry for InMemoryCredentials {
                 bad.id, bad.rotation_policy
             )));
         }
-        let mut rows = self.rows.lock().expect("rows lock");
-        let mut events = self.events.lock().expect("events lock");
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CredentialsError::Storage("credential state lock poisoned".into()))?;
+        let State { rows, events, .. } = &mut *state;
         let mut inserted = 0;
         for c in declared {
             if rows.iter().any(|r| r.id == c.id) {
@@ -119,19 +236,56 @@ impl CredentialsRegistry for InMemoryCredentials {
         &self,
         id: &str,
         phase: RotationPhase,
-        evidence: serde_json::Value,
+        mut evidence: serde_json::Value,
         stamp: &EventStamp,
-    ) -> Result<(), CredentialsError> {
-        let mut rows = self.rows.lock().expect("rows lock");
-        let Some(row) = rows.iter_mut().find(|r| r.id == id) else {
-            return Err(CredentialsError::UnknownCredential(id.to_string()));
-        };
-        let event = stamp.event(phase.event_kind(), evidence);
-        if phase == RotationPhase::Installed {
-            row.rotated_at = Some(stamp.timestamp);
+    ) -> Result<super::receipt::RotationOutcome, CredentialsError> {
+        use super::receipt::{RotationOutcome, RotationReceipt, observation};
+        let observation_id = observation(&mut evidence)?;
+        if observation_id.is_some() {
+            evidence["credential_id"] = serde_json::json!(id);
         }
-        self.events.lock().expect("events lock").push(event);
-        Ok(())
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CredentialsError::Storage("credential state lock poisoned".into()))?;
+        if !state.rows.iter().any(|r| r.id == id) {
+            return Err(CredentialsError::UnknownCredential(id.to_string()));
+        }
+        if let Some(observation_id) = &observation_id
+            && let Some(receipt) = state.receipts.iter().find(|r| {
+                r.credential_id == id
+                    && r.phase == phase.as_str()
+                    && r.observation_id == *observation_id
+            })
+        {
+            return if receipt.matches(&evidence, stamp) {
+                Ok(RotationOutcome::Replayed {
+                    receipt: receipt.clone(),
+                })
+            } else {
+                Err(CredentialsError::ObservationConflict)
+            };
+        }
+        let receipt = observation_id
+            .map(|observation_id| RotationReceipt::new(id, phase, observation_id, &evidence, stamp))
+            .transpose()?;
+        let event = match &receipt {
+            Some(receipt) => receipt.event(stamp, evidence, phase)?,
+            None => stamp.event(phase.event_kind(), evidence),
+        };
+        if phase == RotationPhase::Installed {
+            for row in state.rows.iter_mut().filter(|r| r.id == id) {
+                row.rotated_at = Some(stamp.timestamp);
+            }
+        }
+        state.events.push(event);
+        Ok(match receipt {
+            Some(receipt) => {
+                state.receipts.push(receipt.clone());
+                RotationOutcome::Recorded { receipt }
+            }
+            None => RotationOutcome::LegacyRecorded,
+        })
     }
 }
 
@@ -203,7 +357,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let events = repo.recorded_events();
+        let events = repo.recorded_events().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "credential.minted");
         assert_eq!(events[0].source, "jobs");
@@ -309,6 +463,7 @@ mod tests {
         );
         let declared: Vec<_> = repo
             .recorded_events()
+            .unwrap()
             .into_iter()
             .filter(|e| e.kind == "credential.declared")
             .collect();
@@ -331,6 +486,7 @@ mod tests {
         assert_eq!((again.received, again.inserted), (1, 0));
         assert_eq!(
             repo.recorded_events()
+                .unwrap()
                 .iter()
                 .filter(|e| e.kind == "credential.declared")
                 .count(),
@@ -347,8 +503,172 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, CredentialsError::UnknownCredential(id) if id == "ghost"));
         assert!(
-            repo.recorded_events().is_empty(),
+            repo.recorded_events().unwrap().is_empty(),
             "no event may detach from the row it annotates"
+        );
+    }
+
+    #[tokio::test]
+    async fn replaying_one_phase_observation_preserves_its_original_event_and_rotation_instant() {
+        let repo = InMemoryCredentials::new(vec![row("boss-dev-forge-token")]);
+        let evidence = json!({
+            "observation_id": "917e55fc-f19b-43aa-951f-7d763805b172",
+            "job_id": "a2dc6dfb-ea69-4bfb-9867-f9d509fb752b",
+            "host": "forge",
+            "last_eight": "fixture1"
+        });
+        let first = stamp();
+        repo.record_rotation(
+            "boss-dev-forge-token",
+            RotationPhase::Installed,
+            evidence.clone(),
+            &first,
+        )
+        .await
+        .unwrap();
+        let original = repo.recorded_events().unwrap()[0].clone();
+        repo.record_rotation(
+            "boss-dev-forge-token",
+            RotationPhase::Installed,
+            evidence,
+            &stamp(),
+        )
+        .await
+        .unwrap();
+        let events = repo.recorded_events().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "one durable observation must leave one event despite lost acknowledgement"
+        );
+        assert_eq!(events[0].id, original.id);
+        assert_eq!(
+            repo.get("boss-dev-forge-token")
+                .await
+                .unwrap()
+                .unwrap()
+                .rotated_at,
+            Some(first.timestamp)
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicting_phase_observation_refuses_without_a_second_event_or_rotation_change() {
+        let repo = InMemoryCredentials::new(vec![row("boss-dev-forge-token")]);
+        let observation = "917e55fc-f19b-43aa-951f-7d763805b172";
+        let first = stamp();
+        repo.record_rotation(
+            "boss-dev-forge-token",
+            RotationPhase::Installed,
+            json!({"observation_id": observation, "last_eight": "original"}),
+            &first,
+        )
+        .await
+        .unwrap();
+        let conflict = repo
+            .record_rotation(
+                "boss-dev-forge-token",
+                RotationPhase::Installed,
+                json!({"observation_id": observation, "last_eight": "different"}),
+                &stamp(),
+            )
+            .await;
+        assert!(
+            conflict.is_err(),
+            "same observation with different evidence must refuse"
+        );
+        assert_eq!(repo.recorded_events().unwrap().len(), 1);
+        assert_eq!(
+            repo.get("boss-dev-forge-token")
+                .await
+                .unwrap()
+                .unwrap()
+                .rotated_at,
+            Some(first.timestamp)
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_phase_observations_record_distinct_effects() {
+        let repo = InMemoryCredentials::new(vec![row("boss-dev-forge-token")]);
+        for id in [
+            "917e55fc-f19b-43aa-951f-7d763805b172",
+            "ac275a7b-faf2-4769-ab46-9d2f5e50ae39",
+        ] {
+            repo.record_rotation(
+                "boss-dev-forge-token",
+                RotationPhase::Installed,
+                json!({"observation_id": id, "last_eight": "fixture1"}),
+                &stamp(),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            repo.recorded_events().unwrap().len(),
+            2,
+            "different observations remain separate facts"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_restoration_retains_the_receipt_without_reemitting_the_event() {
+        let original = InMemoryCredentials::new(vec![row("fixture")]);
+        let evidence = json!({"observation_id":"restore-1","measured":9.0});
+        original
+            .record_rotation(
+                "fixture",
+                RotationPhase::Installed,
+                evidence.clone(),
+                &stamp(),
+            )
+            .await
+            .unwrap();
+        let event = original.recorded_events().unwrap()[0].clone();
+        let restored = InMemoryCredentials::new(vec![row("fixture")]);
+        restored.restore_rotation(&event).await.unwrap();
+        restored.restore_rotation(&event).await.unwrap();
+        let replay = restored
+            .record_rotation("fixture", RotationPhase::Installed, evidence, &stamp())
+            .await
+            .unwrap();
+        assert!(
+            matches!(replay, super::super::receipt::RotationOutcome::Replayed { receipt } if receipt.event_id == event.id)
+        );
+        assert!(
+            restored.recorded_events().unwrap().is_empty(),
+            "restoration and replay emit nothing"
+        );
+        assert_eq!(
+            restored.get("fixture").await.unwrap().unwrap().rotated_at,
+            Some(event.timestamp)
+        );
+        let mut damaged = event.clone();
+        damaged.payload["measured"] = json!(10);
+        assert!(restored.restore_rotation(&damaged).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_callers_cannot_supply_an_owner_receipt() {
+        let repo = InMemoryCredentials::new(vec![row("fixture")]);
+        assert!(
+            repo.record_rotation(
+                "fixture",
+                RotationPhase::Installed,
+                json!({"_rotation_receipt":{"version":1}}),
+                &stamp()
+            )
+            .await
+            .is_err()
+        );
+        assert!(repo.recorded_events().unwrap().is_empty());
+        assert!(
+            repo.get("fixture")
+                .await
+                .unwrap()
+                .unwrap()
+                .rotated_at
+                .is_none()
         );
     }
 }

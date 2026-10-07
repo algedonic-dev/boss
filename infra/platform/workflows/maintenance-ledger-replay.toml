@@ -12,7 +12,8 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "The 03:30 rooted-at-audit-log replay comparison."
-metadata = { department = "it", owner_role = "platform-admin" }
+# Finance owns this ledger run; platform supplies the protocol (b7263ac5).
+metadata = { department = "finance", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "scheduled"

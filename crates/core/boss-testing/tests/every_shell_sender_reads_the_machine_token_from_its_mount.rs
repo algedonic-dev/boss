@@ -90,6 +90,45 @@ fn writes_the_header_by_hand(line: &str) -> bool {
     line.contains("secret_header ") && line.to_ascii_lowercase().contains("x-boss-machine-token:")
 }
 
+fn negative_fixture_data(path: &str, line: &str) -> bool {
+    // Exactly two inert hostile inputs in the owning worker tests.
+    // The file still passes through the whole scan: actual env reads
+    // and manual headers, including later additions HERE, are refused.
+    path == "infra/dev/dev-build_test.py"
+        && matches!(
+            line.trim(),
+            r#"{"name": "BOSS_MACHINE_TOKEN", "value": "fake"}),"#
+                | r#"for entry in ("BASH_ENV=/candidate", "PATH=/candidate", "BOSS_ACTOR=admin", "BOSS_MACHINE_TOKEN=secret", "BOSS_JOBS_URL=bad\0value"):"#
+        )
+}
+
+#[test]
+fn fake_worker_inputs_do_not_hide_a_real_token_use_in_the_same_file() {
+    let path = "infra/dev/dev-build_test.py";
+    let data = r#"{"name": "BOSS_MACHINE_TOKEN", "value": "fake"}),"#;
+    assert!(negative_fixture_data(path, data));
+    assert!(!negative_fixture_data("infra/dev/real-sender.py", data));
+    for live in [
+        r#"token = os.environ["BOSS_MACHINE_TOKEN"]"#,
+        r#"secret_header MT_HDR "x-boss-machine-token: $BOSS_MACHINE_TOKEN""#,
+    ] {
+        assert!(!negative_fixture_data(path, live));
+        assert!(names_the_env_var(live) || writes_the_header_by_hand(live));
+    }
+    let root = boss_testing::scratch_dir("fake-input-real-token-read");
+    let target = root.join(path);
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let source = std::fs::read_to_string(repo_root().join(path)).unwrap();
+    std::fs::write(&target, &source).unwrap();
+    assert!(offenders(&root).is_empty());
+    std::fs::write(&target, format!("{source}\ntoken = os.environ[\"BOSS_MACHINE_TOKEN\"]\nsecret_header MT_HDR \"x-boss-machine-token: $token\"\n")).unwrap();
+    assert_eq!(
+        offenders(&root).len(),
+        2,
+        "real reads and header sends still fail inside the fixture file"
+    );
+}
+
 fn offenders(root: &Path) -> Vec<String> {
     let mut files = Vec::new();
     walk(&root.join("infra"), &mut files);
@@ -109,6 +148,9 @@ fn offenders(root: &Path) -> Vec<String> {
         };
         for (n, line) in text.lines().enumerate() {
             if is_comment(line) {
+                continue;
+            }
+            if negative_fixture_data(&rel, line) {
                 continue;
             }
             if names_the_env_var(line) {

@@ -24,6 +24,7 @@ import { parseRoute } from '../router';
 import { CLAIMS } from './claims';
 import { checkClaims, refuses, reportLines } from './check-claims';
 import { resolveClaims, type ClaimReaders } from './resolve-claims';
+import { PUBLIC_MIRROR_URL } from '../public-source';
 
 const REPO = join(import.meta.dir, '..', '..', '..', '..');
 const LANDING = join(import.meta.dir, '..', 'landing', 'LandingPage.svelte');
@@ -38,8 +39,19 @@ const READERS: ClaimReaders = {
   serves: (path) => path === '/' || parseRoute(path).kind !== FALLBACK,
 };
 
+// This caller reads source without a Svelte pass. Materialize only the
+// exact imported mirror binding, not arbitrary expressions; the browser
+// control also checks the actual rendered anchor. A changed expression
+// or absent import remains unreadable to checkClaims and refuses.
+function mirrorMarkup(source: string): string {
+  const binding = 'href={safeLinkHref(PUBLIC_MIRROR_URL)}';
+  if (!source.includes("import { PUBLIC_MIRROR_URL } from '../public-source';")
+    || source.split(binding).length !== 2) return source;
+  return source.replace(binding, `href="${PUBLIC_MIRROR_URL}"`);
+}
+
 describe('the landing page, checked against the tree', () => {
-  const html = readFileSync(LANDING, 'utf8');
+  const html = mirrorMarkup(readFileSync(LANDING, 'utf8'));
   const report = checkClaims(html, resolveClaims(CLAIMS, READERS), null);
   const lines = reportLines(report).join('\n');
 
@@ -63,7 +75,19 @@ describe('the landing page, checked against the tree', () => {
 describe('the caller can fail', () => {
   // A resolver that could only ever agree would make the test above a
   // wrong green. Each leg here is a real reader pointed at a wrong row.
-  const html = readFileSync(LANDING, 'utf8');
+  const source = readFileSync(LANDING, 'utf8');
+  const html = mirrorMarkup(source);
+
+  it('refuses an unknown expression or a missing mirror import', () => {
+    for (const changed of [
+      source.replace('href={safeLinkHref(PUBLIC_MIRROR_URL)}', 'href={unknownMirror}'),
+      source.replace("import { PUBLIC_MIRROR_URL } from '../public-source';", ''),
+    ]) {
+      const r = checkClaims(mirrorMarkup(changed), resolveClaims(CLAIMS, READERS), null);
+      expect(refuses(r)).toBe(true);
+      expect(r.findings.find((f) => f.id === 'source.repo')?.kind).toBe('disagrees');
+    }
+  });
 
   it('refuses when the tree names a different tenant', () => {
     const moved = CLAIMS.map((c) =>

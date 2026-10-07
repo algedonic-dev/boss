@@ -161,7 +161,7 @@ fn viable_spec(kind: &str) -> WorkflowSpec {
 
 #[tokio::test]
 async fn publish_refuses_the_unviable_protocol_retro_spec() {
-    let registry = Arc::new(InMemoryWorkflows::new());
+    let registry = Arc::new(InMemoryWorkflows::for_fixture());
     let app = build_app(registry.clone());
 
     // A draft of the broken spec saves fine — drafts are work in
@@ -228,7 +228,7 @@ async fn publish_refuses_the_unviable_protocol_retro_spec() {
 
 #[tokio::test]
 async fn publish_accepts_a_viable_spec() {
-    let registry = Arc::new(InMemoryWorkflows::new());
+    let registry = Arc::new(InMemoryWorkflows::for_fixture());
     let app = build_app(registry.clone());
 
     let resp = send_json(
@@ -258,7 +258,7 @@ async fn publish_accepts_a_viable_spec() {
 
 #[tokio::test]
 async fn draft_save_still_accepts_an_unviable_spec() {
-    let registry = Arc::new(InMemoryWorkflows::new());
+    let registry = Arc::new(InMemoryWorkflows::for_fixture());
     let app = build_app(registry.clone());
 
     // Half-authored: one step, no terminal, no trigger.
@@ -301,7 +301,7 @@ async fn publish_authored_refuses_an_unviable_spec() {
     // The workflow-publish Step's dispatch path writes through
     // `publish_authored`, which sets a row active WITHOUT a draft
     // ever existing — same gate, same refusal.
-    let registry = InMemoryWorkflows::new();
+    let registry = InMemoryWorkflows::for_fixture();
     let actor = boss_core::actor::ActorId::Automation("test".into());
     let now = chrono::Utc::now();
 
@@ -334,7 +334,7 @@ async fn bootstrap_reconcile_refuses_to_seed_an_unviable_default() {
     // shipped default that fails the lint is a code bug; it must not
     // reach the registry, and the reconcile must say so rather than
     // seed it and let boot quarantine clean up after itself.
-    let registry = InMemoryWorkflows::new();
+    let registry = InMemoryWorkflows::for_fixture();
     let actor = boss_core::actor::ActorId::Automation("bootstrap-reconciler".into());
     let now = chrono::Utc::now();
 

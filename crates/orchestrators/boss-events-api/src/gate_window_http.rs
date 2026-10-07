@@ -1,7 +1,12 @@
 //! Protected, report-only joined gate evidence in Apps (design 21946380).
 //! No caller supplies a service subset or an upstream URL. The port
-//! registry defines every required machine gate; an unavailable or
-//! non-recording service stays a named gap, never a silent exemption.
+//! registry names every machine gate there could be, and the launcher's
+//! record says which of them this pod started: those are required, and
+//! an unavailable or non-recording one stays a named gap, never a
+//! silent exemption. A gate the launcher recorded as skipped is excused
+//! only while its port refuses a connection and the log holds nothing
+//! from it; a record that cannot be read excuses nothing (backlog
+//! 93e0814a, `boss_core::gate_window::LaunchRoster`).
 
 use std::sync::Arc;
 
@@ -13,14 +18,16 @@ use axum::routing::get;
 use axum::{Json, Router};
 use boss_core::clock::Clock;
 use boss_core::gate_evidence::{Gate, GateEvidenceLog};
-use boss_core::gate_window::{LiveRead, join_window};
+use boss_core::gate_window::{
+    LaunchRoster, LiveRead, PortProbe, join_launched_window, launch_roster,
+};
 use boss_core::machine_token;
-use boss_policy_client::{AccessTier, CurrentUser, User};
+use boss_policy_client::{CurrentUser, User};
 use chrono::Duration;
 use serde::Deserialize;
 use serde_json::Value;
 
-pub const PATH: &str = "/api/events/gate-window";
+pub const PATH: &str = boss_core::gate_window::PATH;
 pub const MAX_HOURS: u32 = 168;
 pub const POLICY_REFUSALS_PATH: &str = "/api/policy/check/refusals";
 
@@ -29,12 +36,31 @@ pub const POLICY_REFUSALS_PATH: &str = "/api/policy/check/refusals";
 pub trait LiveTallies: Send + Sync {
     fn required_services(&self, gate: Gate) -> Vec<String>;
     async fn read(&self, gate: Gate, service: &str) -> Result<Value, String>;
+    /// Which of the gate's services this deployment started. The default
+    /// consults no record and requires every one of them.
+    fn roster(&self, gate: Gate) -> LaunchRoster {
+        LaunchRoster::all_required(self.required_services(gate))
+    }
+    /// Whether anything accepts a connection at the service's port:
+    /// `Ok(false)` only for a refused connection. The default cannot
+    /// say, which holds an excuse rather than granting it.
+    async fn listening(&self, service: &str) -> Result<bool, String> {
+        Err(format!("this reader has no port probe for {service}"))
+    }
 }
+
+/// The variable the launcher exports with the path of the record it
+/// wrote (`services-launcher.sh`). Read once, at construction.
+pub const LAUNCH_RECORD_ENV: &str = "BOSS_LAUNCH_RECORD";
 
 /// Existing stamped machine client, at the registry's local ports.
 pub struct LocalTallies {
     http: machine_token::Client,
     services: Vec<(String, String)>,
+    /// `Some` only on the production path: `Ok(path)` of the launcher's
+    /// record, or why no path is known. `None` (explicit test rosters)
+    /// consults no record and requires every service.
+    launch_record: Option<Result<std::path::PathBuf, String>>,
 }
 
 impl LocalTallies {
@@ -44,7 +70,29 @@ impl LocalTallies {
                 .connect_timeout(std::time::Duration::from_secs(2))
                 .timeout(std::time::Duration::from_secs(4)),
         )?;
-        Ok(Self::at_declared_ports(http))
+        // The launcher exports the path of the record it wrote; a
+        // process it did not start has none and can excuse nothing.
+        // The variable can aim this reader at another file, and that
+        // buys nothing: a record only excuses, and every excuse is
+        // checked against the port and the log before it counts.
+        let record = std::env::var(LAUNCH_RECORD_ENV)
+            .ok()
+            .filter(|path| !path.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| {
+                format!(
+                    "{LAUNCH_RECORD_ENV} is unset: this process was not started by the launcher, so what is deployed is unknown"
+                )
+            });
+        Ok(Self::at_declared_ports(http).with_launch_record(record))
+    }
+
+    /// The same reader, deriving its required services from the
+    /// launcher's record at `record` — or, given why there is no path,
+    /// requiring every service and saying so.
+    pub fn with_launch_record(mut self, record: Result<std::path::PathBuf, String>) -> Self {
+        self.launch_record = Some(record);
+        self
     }
 
     /// Same production roster with an explicitly supplied client. It
@@ -63,7 +111,11 @@ impl LocalTallies {
     /// Explicit private ports and client for transport tests. Production
     /// uses only from_ports; no request field selects these targets.
     pub fn new(http: machine_token::Client, services: Vec<(String, String)>) -> Self {
-        Self { http, services }
+        Self {
+            http,
+            services,
+            launch_record: None,
+        }
     }
 }
 
@@ -73,6 +125,53 @@ impl LiveTallies for LocalTallies {
         match gate {
             Gate::MachineGate => self.services.iter().map(|(name, _)| name.clone()).collect(),
             Gate::PolicyCheck => vec!["policy".into()],
+        }
+    }
+
+    fn roster(&self, gate: Gate) -> LaunchRoster {
+        let all = self.required_services(gate);
+        let (Gate::MachineGate, Some(record)) = (gate, &self.launch_record) else {
+            return LaunchRoster::all_required(all);
+        };
+        let gated: Vec<(String, Vec<String>)> = all
+            .into_iter()
+            .map(|service| {
+                let binaries = boss_ports::launcher_binaries(&service);
+                (service, binaries)
+            })
+            .collect();
+        // Read on every request: the file is small, and a record that
+        // disappears or changes under a running pod must be seen.
+        let text = record.clone().and_then(|path| {
+            std::fs::read_to_string(&path)
+                .map_err(|e| format!("the launch record {} is unreadable: {e}", path.display()))
+        });
+        launch_roster(&gated, text.as_deref().map_err(Clone::clone))
+    }
+
+    async fn listening(&self, service: &str) -> Result<bool, String> {
+        let targets: Vec<&str> = self
+            .services
+            .iter()
+            .filter(|(s, _)| s == service)
+            .map(|(_, url)| url.as_str())
+            .collect();
+        let [target] = targets.as_slice() else {
+            return Err(format!(
+                "{service}: {} declared upstreams, expected one",
+                targets.len()
+            ));
+        };
+        let url = reqwest::Url::parse(target).map_err(|e| format!("{target}: {e}"))?;
+        let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+            return Err(format!("{target} names no host and port"));
+        };
+        let connect = tokio::net::TcpStream::connect((host, port));
+        match tokio::time::timeout(std::time::Duration::from_secs(2), connect).await {
+            Ok(Ok(_)) => Ok(true),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => Ok(false),
+            Ok(Err(e)) => Err(format!("connect {host}:{port}: {e}")),
+            Err(_) => Err(format!("connect {host}:{port}: no answer in 2s")),
         }
     }
 
@@ -124,6 +223,7 @@ struct ReaderState {
     log: Arc<dyn GateEvidenceLog>,
     live: Arc<dyn LiveTallies>,
     clock: Arc<dyn Clock>,
+    role_guards: Option<Arc<boss_policy_client::role_guard::RoleGuardReporter>>,
 }
 
 pub fn gate_window_router(
@@ -131,9 +231,23 @@ pub fn gate_window_router(
     live: Arc<dyn LiveTallies>,
     clock: Arc<dyn Clock>,
 ) -> Router {
+    gate_window_router_with_reports(log, live, clock, None)
+}
+
+pub fn gate_window_router_with_reports(
+    log: Arc<dyn GateEvidenceLog>,
+    live: Arc<dyn LiveTallies>,
+    clock: Arc<dyn Clock>,
+    role_guards: Option<Arc<boss_policy_client::role_guard::RoleGuardReporter>>,
+) -> Router {
     Router::new()
         .route(PATH, get(read_window))
-        .with_state(ReaderState { log, live, clock })
+        .with_state(ReaderState {
+            log,
+            live,
+            clock,
+            role_guards,
+        })
 }
 
 #[derive(Deserialize)]
@@ -149,9 +263,11 @@ async fn read_window(
     Query(query): Query<WindowQuery>,
 ) -> Response {
     // Exactly the existing audit-log read door, not a new policy grant.
-    if !(matches!(user.access_tier, AccessTier::Operator | AccessTier::Auditor)
-        || boss_core::roles::has_global_read(&user.role))
-    {
+    if !boss_events::tail_http::observed_audit_read(
+        &user,
+        state.role_guards.as_deref(),
+        "gate-window-read",
+    ) {
         return (
             StatusCode::FORBIDDEN,
             "operator tier or executive role required",
@@ -171,18 +287,37 @@ async fn read_window(
     // injects WallClock; fixed clocks exercise the same read in tests.
     let now = state.clock.now();
     let from = now - Duration::hours(i64::from(hours));
-    let required = state.live.required_services(query.gate);
-    let reads = futures::future::join_all(required.iter().map(|service| async {
-        LiveRead {
+    // What this pod started, from the launcher's record. An excused
+    // service is still read and its port probed: the excuse is a claim
+    // this observation checks, and a consumer with its own roster (the
+    // rotation's drain) is owed every port's answer.
+    let roster = state.live.roster(query.gate);
+    let excused: Vec<String> = roster
+        .not_launched
+        .iter()
+        .map(|n| n.service.clone())
+        .collect();
+    let read_all =
+        futures::future::join_all(roster.required.iter().chain(&excused).map(|service| async {
+            LiveRead {
+                service: service.clone(),
+                answer: state.live.read(query.gate, service).await,
+            }
+        }));
+    let probe_all = futures::future::join_all(excused.iter().map(|service| async {
+        PortProbe {
             service: service.clone(),
-            answer: state.live.read(query.gate, service).await,
+            listening: state.live.listening(service).await,
         }
-    }))
-    .await;
+    }));
+    let (reads, probes) = futures::future::join(read_all, probe_all).await;
     // Read the log after the live half. A restart/mode move that passes
     // between the reads cannot retain the old instance's clean answer:
     // the join demands the exact latest sourced start. This is an
     // observation, not an atomic authorization or a future safety grant.
     let facts = state.log.facts(query.gate, from).await;
-    Json(join_window(query.gate, &required, from, now, facts, reads)).into_response()
+    Json(join_launched_window(
+        query.gate, &roster, &probes, from, now, facts, reads,
+    ))
+    .into_response()
 }

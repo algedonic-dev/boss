@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 
+use crate::coverage_guard::Change;
 use crate::port::{
     PeopleError, PeopleRepository, in_read_order, refuse_another_id, refuse_malformed,
 };
@@ -10,6 +11,10 @@ use crate::types::Employee;
 pub struct InMemoryPeople {
     employees: std::sync::RwLock<Vec<Employee>>,
     recorded: std::sync::Mutex<Vec<boss_core::event::Event>>,
+    coverage: Option<std::sync::Arc<dyn crate::coverage_guard::CoverageRead>>,
+    /// Explicit key facts for the port double; production reads its
+    /// own credential rows inside the guarded transaction.
+    keys: Vec<boss_policy_client::coverage::Key>,
 }
 
 impl InMemoryPeople {
@@ -17,7 +22,69 @@ impl InMemoryPeople {
         Self {
             employees: std::sync::RwLock::new(employees),
             recorded: std::sync::Mutex::new(Vec::new()),
+            coverage: None,
+            keys: Vec::new(),
         }
+    }
+
+    pub fn with_coverage(
+        mut self,
+        source: std::sync::Arc<dyn crate::coverage_guard::CoverageRead>,
+        keys: Vec<boss_policy_client::coverage::Key>,
+    ) -> Self {
+        self.coverage = Some(source);
+        self.keys = keys;
+        self
+    }
+
+    /// The coverage basis for one employee write, or `None` when the
+    /// guard is not mounted, the write's own existence check will answer,
+    /// or the roster and keys show it cannot take a holder away — the
+    /// same forecast the Postgres adapter makes before its transaction.
+    async fn standing(
+        &self,
+        id: &str,
+        change: Change<'_>,
+    ) -> Result<Option<crate::coverage_guard::Standing>, PeopleError> {
+        let Some(source) = &self.coverage else {
+            return Ok(None);
+        };
+        let before = crate::coverage_guard::people(
+            &self
+                .employees
+                .read()
+                .map_err(|_| PeopleError::Storage("roster lock unavailable".into()))?,
+        );
+        let Some(after) = crate::coverage_guard::roster_after(&before, id, &change) else {
+            return Ok(None);
+        };
+        crate::coverage_guard::standing_for(
+            source.as_ref(),
+            &before,
+            &self.keys,
+            &after,
+            &self.keys,
+        )
+        .await
+    }
+
+    /// The judgement under the roster's write lock, on the rows as they
+    /// stand there.
+    fn judge(
+        &self,
+        standing: Option<&crate::coverage_guard::Standing>,
+        employees: &[Employee],
+        id: &str,
+        change: Change<'_>,
+    ) -> Result<(), PeopleError> {
+        if self.coverage.is_none() {
+            return Ok(());
+        }
+        let before = crate::coverage_guard::people(employees);
+        let Some(after) = crate::coverage_guard::roster_after(&before, id, &change) else {
+            return Ok(());
+        };
+        crate::coverage_guard::judge_at_commit(standing, &before, &self.keys, &after, &self.keys)
     }
 
     /// Events the outbox paths recorded — test visibility (the
@@ -113,6 +180,7 @@ impl PeopleRepository for InMemoryPeople {
         _now: chrono::DateTime<chrono::Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<String, PeopleError> {
+        let standing = self.standing(&emp.id, Change::Create(emp)).await?;
         {
             let mut employees = self.employees.write().unwrap();
             if employees.iter().any(|e| e.id == emp.id) {
@@ -122,6 +190,7 @@ impl PeopleRepository for InMemoryPeople {
                 )));
             }
             refuse_unholdable(&employees, emp)?;
+            self.judge(standing.as_ref(), &employees, &emp.id, Change::Create(emp))?;
             employees.push(emp.clone());
         }
         self.record(stamp.event(
@@ -138,6 +207,7 @@ impl PeopleRepository for InMemoryPeople {
         _now: chrono::DateTime<chrono::Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), PeopleError> {
+        let standing = self.standing(id, Change::Update(emp)).await?;
         {
             let mut employees = self.employees.write().unwrap();
             let pos = employees
@@ -146,6 +216,7 @@ impl PeopleRepository for InMemoryPeople {
                 .ok_or_else(|| PeopleError::NotFound(id.to_string()))?;
             refuse_another_id(id, emp)?;
             refuse_unholdable(&employees, emp)?;
+            self.judge(standing.as_ref(), &employees, id, Change::Update(emp))?;
             employees[pos] = emp.clone();
         }
         self.record(stamp.event(
@@ -161,6 +232,7 @@ impl PeopleRepository for InMemoryPeople {
         now: chrono::DateTime<chrono::Utc>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), PeopleError> {
+        let standing = self.standing(id, Change::Delete).await?;
         {
             let mut employees = self.employees.write().unwrap();
             let pos = employees
@@ -177,6 +249,7 @@ impl PeopleRepository for InMemoryPeople {
                     "employee {id} still manages {report}"
                 )));
             }
+            self.judge(standing.as_ref(), &employees, id, Change::Delete)?;
             employees.remove(pos);
         }
         self.record(stamp.event(

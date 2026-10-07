@@ -528,7 +528,7 @@ async fn serve_jobs() -> (String, Arc<InMemoryJobs>) {
     let bus = boss_testing::RecordingEventBus::new();
     let bus_dyn: Arc<dyn boss_core::port::EventBus> = bus.clone();
     let publisher = boss_core::publisher::DomainPublisher::new(bus_dyn, "jobs");
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     for spec in seedable_platform_workflows() {
         kinds.seed(spec).expect("seed platform kind");
     }

@@ -1,0 +1,7 @@
+{
+  "about": "READ-ONLY fixed sanitized admission audit-source configuration discovery (approved design 25bdb2cc Q1; partial delivery of build 90218205). No parameters: reconciles the complete current live estate control-plane roster with Kubernetes Node identities, roles and InternalIPs before fixed Talos StaticPods.kubernetes.talos.dev k8s/kube-apiserver and AuditPolicyConfigs.kubernetes.talos.dev controlplane/audit-policy reads. Sensitive native objects and errors remain transient in bounded pipes INSIDE the existing operator container; the ops receipt receives only the exact JSON allowlist. Reports generated audit configuration, opaque sink and capture-policy identities, conservative first-match coverage for the source-owned request declaration, configured retention bounds and explicit unavailable runtime/retained/drop/completeness fields. A denied, malformed, missing, duplicate, unstable-identity or unsupported source never becomes a clean history verdict. No machineconfig, Secrets, raw logs, arbitrary paths/commands, new grant, capture, export or retention change. Existing operator credentials only. Exit 4 is unavailable, with a fixed sanitized reason. Source car requires a distinct formal release before any privileged use; later real retained-source adapter and native controls remain separate obligations. Never releases G1, changes policy mode or proves clean history.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/discover-admission-source.sh"],
+  "params": [],
+  "timeout": 900
+}

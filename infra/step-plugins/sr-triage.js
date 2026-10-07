@@ -48,6 +48,8 @@
     const isDone = step.status === 'completed' || step.status === 'skipped';
     let outcome = String(meta.triage_outcome || '');
     let saving = false;
+    const saveError = h('p', { role: 'alert', className: 'load-failed' });
+    saveError.hidden = true;
 
     const accountInput = h('input', { type: 'text', value: String(meta.account_id || ''), placeholder: 'acc-00001', disabled: isDone });
     const deviceInput = h('input', { type: 'text', value: String(meta.device_serial || ''), placeholder: 'SN-00042', disabled: isDone });
@@ -141,6 +143,9 @@
 
     async function save(status) {
       saving = true;
+      saveError.hidden = true;
+      saveError.textContent = '';
+      let phase = 'Save not confirmed';
       updateDerived();
       try {
         // Two doors, one per kind of write (backlog e39a9d2a, design
@@ -154,9 +159,8 @@
         // step PUT is closing to any metadata body, so it must not ride
         // there at all. A draft is the merge alone — it sends no status
         // and no holder, so it cannot release a claim (backlog
-        // 6ef4a36b). A failed merge moves no status; the host refresh
-        // below shows server truth either way, as the one unchecked PUT
-        // did before.
+        // 6ef4a36b). A failed merge moves no status; a refusal stays
+        // visible here instead of invoking the host's success refresh.
         const ownKeys = {
           account_id: accountInput.value.trim() || null,
           device_serial: deviceInput.value.trim() || null,
@@ -175,8 +179,13 @@
             body: JSON.stringify(ownKeys),
           },
         );
-        if (merged.ok && status) {
-          await fetch(
+        if (!merged.ok) {
+          phase = 'Save request refused';
+          throw new Error(`HTTP ${merged.status}: ${await merged.text()}`);
+        }
+        if (status) {
+          phase = 'Completion not confirmed. Fields were saved';
+          const changed = await fetch(
             `/api/jobs/${encodeURIComponent(jobId)}/steps/${encodeURIComponent(step.id)}`,
             {
               method: 'PUT',
@@ -184,8 +193,16 @@
               body: JSON.stringify({ status }),
             },
           );
+          if (!changed.ok) {
+            phase = 'Completion request refused. Fields were saved';
+            throw new Error(`HTTP ${changed.status}: ${await changed.text()}`);
+          }
         }
         if (onUpdate) onUpdate();
+      } catch (e) {
+        // A refresh is the host's success callback, not a refusal receipt.
+        saveError.textContent = `${phase}: ${e instanceof Error ? e.message : String(e)}`;
+        saveError.hidden = false;
       } finally {
         saving = false;
         updateDerived();
@@ -239,6 +256,7 @@
       ),
       form,
       outcomePicker,
+      saveError,
       actions,
     );
 

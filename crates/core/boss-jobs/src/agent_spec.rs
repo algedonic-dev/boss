@@ -113,6 +113,9 @@ pub struct AgentSpec {
     /// The spend cap for one run of this step, in USD. Positive.
     pub budget_usd: f64,
     pub effort: Effort,
+    /// Pinned launch provenance required for this outcome.
+    #[serde(default)]
+    pub executor_provenance: crate::executor_attestation::ExecutorProvenanceRequirement,
 }
 
 /// The metadata keys [`projection`] writes, in the order it writes them.
@@ -120,12 +123,19 @@ pub const PROFILE_KEY: &str = "agent_profile";
 pub const MODEL_KEY: &str = "agent_model";
 pub const BUDGET_KEY: &str = "agent_budget_usd";
 pub const EFFORT_KEY: &str = "agent_effort";
-pub const KEYS: [&str; 4] = [PROFILE_KEY, MODEL_KEY, BUDGET_KEY, EFFORT_KEY];
+pub const EXECUTOR_PROVENANCE_KEY: &str = "agent_executor_provenance";
+pub const KEYS: [&str; 5] = [
+    PROFILE_KEY,
+    MODEL_KEY,
+    BUDGET_KEY,
+    EFFORT_KEY,
+    EXECUTOR_PROVENANCE_KEY,
+];
 
 /// THE projection: one block, four plain keys on the packet. Pure and
 /// total, and the only place the mapping lives — the sibling of
 /// [`crate::audience::selectors_for`].
-pub fn projection(spec: &AgentSpec) -> [(&'static str, serde_json::Value); 4] {
+pub fn projection(spec: &AgentSpec) -> [(&'static str, serde_json::Value); 5] {
     [
         (PROFILE_KEY, serde_json::Value::String(spec.profile.clone())),
         (MODEL_KEY, serde_json::Value::String(spec.model.clone())),
@@ -133,6 +143,10 @@ pub fn projection(spec: &AgentSpec) -> [(&'static str, serde_json::Value); 4] {
         (
             EFFORT_KEY,
             serde_json::Value::String(spec.effort.as_str().to_string()),
+        ),
+        (
+            EXECUTOR_PROVENANCE_KEY,
+            serde_json::json!(spec.executor_provenance),
         ),
     ]
 }
@@ -148,6 +162,12 @@ pub fn projected(metadata: &serde_json::Value) -> Option<AgentSpec> {
         model: text(MODEL_KEY)?,
         budget_usd: metadata.get(BUDGET_KEY)?.as_f64()?,
         effort: serde_json::from_value(metadata.get(EFFORT_KEY)?.clone()).ok()?,
+        executor_provenance: metadata
+            .get(EXECUTOR_PROVENANCE_KEY)
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .ok()?
+            .unwrap_or_default(),
     })
 }
 
@@ -264,7 +284,8 @@ pub fn resolved_steps(
 
 /// The migrations that insert `agent_rate_card` rows: the seed, then
 /// Opus 5.5 (backlog 6bb85880), then the Codex and Gemini CLIs' models
-/// (backlog 5840c068). Read at compile time so the lint can
+/// (backlog 5840c068), then GPT-6 Sol's fallback (backlog 936d1a83).
+/// Read at compile time so the lint can
 /// name the priced models without a database; the pin tests below hold
 /// them equal to the whole schema directory and to the live table.
 const RATE_CARD_SEED: &[&str] = &[
@@ -277,6 +298,9 @@ const RATE_CARD_SEED: &[&str] = &[
     // The Codex and Gemini CLIs' pinned models (backlog 5840c068).
     include_str!(
         "../../../../infra/postgres/schema/20261001183105-codex-and-gemini-are-priced-at-their-published-rates.sql"
+    ),
+    include_str!(
+        "../../../../infra/postgres/schema/20261004045200-gpt-6-sol-is-priced-for-native-fallback.sql"
     ),
 ];
 
@@ -353,6 +377,7 @@ mod tests {
 
     fn builder() -> AgentSpec {
         AgentSpec {
+            executor_provenance: Default::default(),
             profile: "builder".into(),
             model: "opus-5[1m]".into(),
             budget_usd: 5.0,
@@ -595,6 +620,25 @@ mod tests {
         for m in ["opus-5-5", "opus-5-5[1m]"] {
             assert!(models.iter().any(|k| k == m), "{m} is priced: {models:?}");
         }
+    }
+
+    #[test]
+    fn the_gpt_6_sol_fallback_is_admitted_without_admitting_unknown_models() {
+        let fallback = AgentSpec {
+            model: "gpt-6-sol".into(),
+            ..builder()
+        };
+        assert_eq!(refusal(&fallback), None);
+        let unknown = AgentSpec {
+            model: "gpt-unpriced-regression-control".into(),
+            ..fallback.clone()
+        };
+        assert!(refusal(&unknown).is_some());
+        let unbounded = AgentSpec {
+            budget_usd: 0.0,
+            ..fallback
+        };
+        assert!(refusal(&unbounded).is_some());
     }
 
     /// The one definition is the schema directory, whole: a later

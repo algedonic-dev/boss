@@ -47,6 +47,157 @@ pub struct RoleObservation {
     pub would_change_scope: Option<bool>,
 }
 
+fn asserted_observation(
+    user: &User,
+    action: Action,
+    resource: &Resource,
+    decision: Option<&Decision>,
+) -> RoleObservation {
+    RoleObservation {
+        actor: user.id.clone(),
+        asserted_role: user.role.clone(),
+        recorded_actor: None,
+        recorded_role: None,
+        action: action.as_str().into(),
+        resource: resource.as_str().into(),
+        lookup_status: if decision.is_some() {
+            "unregistered"
+        } else {
+            "asserted-policy-unavailable"
+        }
+        .into(),
+        asserted_allowed: decision.map(Decision::is_allowed),
+        recorded_allowed: None,
+        would_deny: None,
+        would_change_scope: None,
+    }
+}
+
+fn compare_decisions(observation: &mut RoleObservation, asserted: &Decision, candidate: &Decision) {
+    observation.recorded_allowed = Some(candidate.is_allowed());
+    observation.would_deny = Some(asserted.is_allowed() && !candidate.is_allowed());
+    observation.would_change_scope = Some(match (asserted, candidate) {
+        (Decision::Allow { scope: a }, Decision::Allow { scope: b }) => a != b,
+        _ => false,
+    });
+}
+
+/// Observes the policy service's local evaluator without making a
+/// recursive HTTP policy request. The candidate has no observer and
+/// shares the admission's evaluation instant, not a transactional snapshot.
+pub struct LocalReportingObserver<R: crate::port::PolicyRepository> {
+    candidate: crate::engine::PolicyEngine<R>,
+    roles: Arc<dyn RoleOfRecord>,
+    sink: Arc<dyn RoleReportSink>,
+    mode: Arc<dyn ReportModeSource>,
+    budget: std::time::Duration,
+}
+
+impl<R: crate::port::PolicyRepository> LocalReportingObserver<R> {
+    pub fn new(
+        repo: Arc<R>,
+        roles: Arc<dyn RoleOfRecord>,
+        sink: Arc<dyn RoleReportSink>,
+        mode: Arc<dyn ReportModeSource>,
+        budget: std::time::Duration,
+    ) -> Self {
+        Self {
+            candidate: crate::engine::PolicyEngine::new(repo),
+            roles,
+            sink,
+            mode,
+            budget,
+        }
+    }
+}
+
+#[async_trait]
+impl<R: crate::port::PolicyRepository> crate::engine::PolicyDecisionObserver
+    for LocalReportingObserver<R>
+{
+    async fn observe(
+        &self,
+        user: &User,
+        action: Action,
+        resource: Resource,
+        at: chrono::DateTime<chrono::Utc>,
+        result: &Result<
+            (Decision, Option<chrono::DateTime<chrono::Utc>>),
+            crate::port::PolicyError,
+        >,
+    ) {
+        if self.mode.mode() == ReportMode::Off {
+            return;
+        }
+        let decision = result.as_ref().ok().map(|(decision, _)| decision);
+        let base = asserted_observation(user, action, &resource, decision);
+        let Some(decision) = decision else {
+            self.sink.record(base);
+            return;
+        };
+        // Repository adapters filter expired overrides at their own read
+        // time. Once the asserted override expires they cannot reproduce
+        // that earlier view, even with the evaluator's captured instant.
+        if result
+            .as_ref()
+            .ok()
+            .and_then(|(_, expiry)| *expiry)
+            .is_some_and(|expiry| expiry <= crate::engine::expiry_now())
+        {
+            self.sink.record(RoleObservation {
+                lookup_status: "comparison-expired".into(),
+                ..base
+            });
+            return;
+        }
+        let comparison = async {
+            let mut observation = base.clone();
+            match self.roles.role_for(&user.id).await {
+                Ok(Some(record)) => {
+                    observation.recorded_actor = Some(record.actor_id);
+                    observation.recorded_role = record.role.filter(|role| !role.trim().is_empty());
+                    if let Some(role) = &observation.recorded_role {
+                        observation.lookup_status = "registered".into();
+                        let candidate_user = User {
+                            role: role.clone(),
+                            ..user.clone()
+                        };
+                        match self
+                            .candidate
+                            .check_at(&candidate_user, action, resource.clone(), at)
+                            .await
+                        {
+                            Ok((candidate, _)) => {
+                                compare_decisions(&mut observation, decision, &candidate)
+                            }
+                            Err(_) => observation.lookup_status = "policy-unavailable".into(),
+                        }
+                    } else {
+                        observation.lookup_status = "missing-role".into();
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    observation.lookup_status = match error {
+                        boss_core::role_of_record::RoleLookupError::Ambiguous(_) => "ambiguous",
+                        _ => "unavailable",
+                    }
+                    .into()
+                }
+            }
+            observation
+        };
+        let observation = match tokio::time::timeout(self.budget, comparison).await {
+            Ok(observation) => observation,
+            Err(_) => RoleObservation {
+                lookup_status: "comparison-timeout".into(),
+                ..base
+            },
+        };
+        self.sink.record(observation);
+    }
+}
+
 pub trait RoleReportSink: Send + Sync {
     fn record(&self, observation: RoleObservation);
 }
@@ -146,6 +297,7 @@ pub struct ReportingPolicyClient {
     roles: Arc<dyn RoleOfRecord>,
     sink: Arc<dyn RoleReportSink>,
     mode: Arc<dyn ReportModeSource>,
+    budget: std::time::Duration,
 }
 
 impl ReportingPolicyClient {
@@ -169,13 +321,49 @@ impl ReportingPolicyClient {
             roles,
             sink,
             mode,
+            budget: std::time::Duration::from_millis(100),
         }
+    }
+
+    pub fn with_comparison_budget(mut self, budget: std::time::Duration) -> Self {
+        self.budget = budget;
+        self
     }
 
     async fn observe(&self, user: &User, action: Action, resource: Resource, decision: &Decision) {
         if self.mode.mode() == ReportMode::Off {
             return;
         }
+        if tokio::time::timeout(
+            self.budget,
+            self.observe_within_budget(user, action, resource.clone(), decision),
+        )
+        .await
+        .is_err()
+        {
+            self.comparison_timeout(user, action, &resource, Some(decision));
+        }
+    }
+
+    fn comparison_timeout(
+        &self,
+        user: &User,
+        action: Action,
+        resource: &Resource,
+        decision: Option<&Decision>,
+    ) {
+        let mut observation = asserted_observation(user, action, resource, decision);
+        observation.lookup_status = "comparison-timeout".into();
+        self.sink.record(observation);
+    }
+
+    async fn observe_within_budget(
+        &self,
+        user: &User,
+        action: Action,
+        resource: Resource,
+        decision: &Decision,
+    ) {
         let mut observation = RoleObservation {
             actor: user.id.clone(),
             asserted_role: user.role.clone(),
@@ -203,15 +391,7 @@ impl ReportingPolicyClient {
                     };
                     match self.inner.check(&recorded, action, resource).await {
                         Ok(candidate) => {
-                            observation.recorded_allowed = Some(candidate.is_allowed());
-                            observation.would_deny =
-                                Some(decision.is_allowed() && !candidate.is_allowed());
-                            observation.would_change_scope = Some(match (decision, &candidate) {
-                                (Decision::Allow { scope: a }, Decision::Allow { scope: b }) => {
-                                    a != b
-                                }
-                                _ => false,
-                            });
+                            compare_decisions(&mut observation, decision, &candidate);
                         }
                         Err(error) => {
                             tracing::warn!(actor = %user.id, %error, "role comparison could not ask policy; asserted decision preserved");
@@ -288,12 +468,20 @@ impl PolicyClient for ReportingPolicyClient {
             }
         };
         if self.mode.mode() == ReportMode::Report {
-            match self.inner.check(user, Action::Read, resource.clone()).await {
-                Ok(decision) => self.observe(user, Action::Read, resource, &decision).await,
-                Err(error) => {
-                    self.unavailable(user, Action::Read, &resource);
-                    tracing::warn!(%error, "role report read comparison unavailable; original predicate preserved");
+            let comparison = async {
+                match self.inner.check(user, Action::Read, resource.clone()).await {
+                    Ok(decision) => {
+                        self.observe_within_budget(user, Action::Read, resource.clone(), &decision)
+                            .await
+                    }
+                    Err(error) => {
+                        self.unavailable(user, Action::Read, &resource);
+                        tracing::warn!(%error, "role report read comparison unavailable; original predicate preserved");
+                    }
                 }
+            };
+            if tokio::time::timeout(self.budget, comparison).await.is_err() {
+                self.comparison_timeout(user, Action::Read, &resource, None);
             }
         }
         Ok(predicate)

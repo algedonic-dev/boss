@@ -69,3 +69,12 @@ fn the_cluster_image_carries_kubectl_and_the_gate_runner_manifest() {
         "the tag the image copies kubectl from must be one the mirror list puts on the forge"
     );
 }
+
+#[test]
+fn the_compiler_image_receives_the_generators_owning_job_template() {
+    let d = read("infra/oss-quickstart/Dockerfile");
+    assert!(
+        d.contains("COPY infra/consist-worker/job.json ./infra/consist-worker/job.json"),
+        "the Rust generator includes the owning template at compile time; the build context must carry it"
+    );
+}

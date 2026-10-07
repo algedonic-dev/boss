@@ -19,6 +19,8 @@ export const JOBS_DEFAULT_STATUS = 'open';
 export type JobsFilters = Readonly<{
   kind: string; status: string; subjectId: string;
   ownerId?: string; kindPrefix?: string;
+  kindGroup?: string; order?: string;
+  department?: string;
 }>;
 
 /** The search string that makes parseRoute read `f` back, built from
@@ -48,6 +50,9 @@ export function jobsFilterSearch(search: string, f: JobsFilters): string {
   // supplies both, so removing a visible chip survives reload (6c9672c2).
   if (f.ownerId !== undefined) put('owner_id', params.get('owner_id') ?? '', f.ownerId, '');
   if (f.kindPrefix !== undefined) put('kind_prefix', params.get('kind_prefix') ?? '', f.kindPrefix, '');
+  if (f.kindGroup !== undefined) put('kind_group', params.get('kind_group') ?? '', f.kindGroup, '');
+  if (f.order !== undefined) put('order', params.get('order') ?? 'newest', f.order, 'newest');
+  if (f.department !== undefined) put('department', params.get('department') ?? '', f.department, '');
   if (!changed) return search;
   const s = params.toString();
   return s ? `?${s}` : '';

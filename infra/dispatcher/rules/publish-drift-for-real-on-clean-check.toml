@@ -24,6 +24,17 @@
 # files nothing either. A check with no verdict line (a `not yet`, a
 # killed run) is warned and left alone.
 #
+# A HELD KIND IS IN NEITHER GROUP (backlog 083d240e). A row that turns
+# on a refusal goes live at a deliberate publish, so the verb holds it
+# out (infra/platform/workflow-holds/, and by default every row that
+# declares a writer or an executor) and says `, held H` AFTER `refused
+# K` — the three groups keep their places and this pattern reads the
+# line unchanged. A held kind is not in `n` (the --for-real this rule
+# files will not publish it, and re-reads the holds before each publish
+# in case this check predates one) and not in `k` (it must not stop the
+# other kinds). Holds that cannot be read print no verdict line at all,
+# so there is nothing here to match.
+#
 # The pattern is written `[0-9]+`, not `\d+`: the arg crosses two
 # string lexers (TOML's, then boss-expr's, which reads `\d` as `d`).
 # It deliberately does not match the --for-real answer (`published N`),

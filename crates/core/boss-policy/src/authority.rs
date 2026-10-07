@@ -155,6 +155,21 @@ impl Holdings {
         }
     }
 
+    /// Whether the caller holds any policy write at all. Asked before the
+    /// lockout guard's cross-service reads (`crate::guard`), so a caller
+    /// the judge refuses anyway costs the people and jobs APIs nothing;
+    /// the judge inside the transaction still decides which verb.
+    pub fn may_write_policy(&self) -> Result<(), String> {
+        let refusals: Vec<String> = POLICY_WRITES
+            .iter()
+            .filter_map(|p| self.may(p.action()).err())
+            .collect();
+        if refusals.len() < POLICY_WRITES.len() {
+            return Ok(());
+        }
+        Err(refusals.join("; "))
+    }
+
     /// Rule 1: a grant at `scope` whose effect ends at `ends` (`None`,
     /// never).
     fn holds(&self, scope: &Scope, ends: Option<DateTime<Utc>>) -> Result<(), String> {

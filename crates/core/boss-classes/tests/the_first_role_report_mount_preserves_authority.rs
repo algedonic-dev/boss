@@ -24,6 +24,63 @@ use serde_json::{Value, json};
 
 const REGISTRY_BUDGET: usize = 4;
 
+struct UnreadCoverage;
+
+#[async_trait::async_trait]
+impl boss_policy::coverage::CoverageSources for UnreadCoverage {
+    async fn roster(&self) -> Result<Vec<boss_policy_client::coverage::Person>, String> {
+        panic!("a policy check must not read the write guard's roster")
+    }
+    async fn keys(&self) -> Result<Vec<boss_policy_client::coverage::Key>, String> {
+        panic!("a policy check must not read the write guard's keys")
+    }
+    async fn workflows(&self) -> Result<Vec<boss_policy_client::coverage::WorkflowFacts>, String> {
+        panic!("a policy check must not read the write guard's workflows")
+    }
+}
+
+#[tokio::test]
+async fn classes_report_names_an_unloaded_snapshot_without_claiming_a_clean_window() {
+    use boss_policy_client::FakePolicyClient;
+    use boss_policy_client::role_reader::{MonotonicRoleSnapshotClock, SnapshotRoleReader};
+    let roles = Arc::new(SnapshotRoleReader::new(
+        Duration::from_secs(30),
+        Arc::new(MonotonicRoleSnapshotClock),
+    ));
+    let app = role_reports::mount_snapshot(
+        ClassesApiState {
+            classes: Arc::new(InMemoryClasses::new(vec![])),
+            policy: Arc::new(
+                FakePolicyClient::builder()
+                    .allow(
+                        "report-reader",
+                        Action::Read,
+                        Resource::policy_rule(),
+                        Scope::All,
+                    )
+                    .build(),
+            ),
+        },
+        roles,
+        Arc::new(ReportMode::Report),
+        Arc::new(ReportTally::new(8)),
+    );
+    let (url, task) = serve(app).await;
+    let mut user = User::service("reader");
+    user.role = "report-reader".into();
+    let response = reqwest::Client::new()
+        .get(format!("{url}/api/classes/actor-role-reports"))
+        .header("x-boss-user", serde_json::to_string(&user).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["snapshot"]["state"], "never-loaded");
+    assert_eq!(body["report"]["durable_window"], false);
+    task.abort();
+}
+
 async fn serve(app: Router) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -117,6 +174,7 @@ async fn exercise(role: Value, dark: bool, asserted: &str, want: u16, expected: 
         engine: Arc::new(PolicyEngine::new(repo.clone())),
         repo,
         check_mode: CheckMode::fixed(Mode::Off),
+        sources: Arc::new(UnreadCoverage),
     })
     .layer(axum::middleware::from_fn_with_state(
         policy_calls.clone(),
@@ -164,12 +222,25 @@ async fn exercise(role: Value, dark: bool, asserted: &str, want: u16, expected: 
     );
     let classes = Arc::new(InMemoryClasses::new(vec![]));
     let tally = Arc::new(ReportTally::new(16));
-    let app = role_reports::mount(
+    let snapshot = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+        Duration::from_secs(30),
+        Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+    ));
+    let refreshed = snapshot.refresh_from(roles.as_ref()).await;
+    assert_eq!(
+        refreshed,
+        if dark {
+            boss_policy_client::role_reader::RoleRefreshOutcome::Unavailable
+        } else {
+            boss_policy_client::role_reader::RoleRefreshOutcome::Published
+        }
+    );
+    let app = role_reports::mount_snapshot(
         ClassesApiState {
             classes: classes.clone(),
             policy: inner,
         },
-        roles,
+        snapshot,
         Arc::new(ReportMode::Report),
         tally.clone(),
     );
@@ -263,7 +334,7 @@ async fn exercise(role: Value, dark: bool, asserted: &str, want: u16, expected: 
         .unwrap();
     assert_eq!(response.status().as_u16(), 200);
     assert_eq!(
-        response.json::<Value>().await.unwrap()["durable_window"],
+        response.json::<Value>().await.unwrap()["report"]["durable_window"],
         false
     );
     assert_eq!(

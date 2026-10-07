@@ -97,8 +97,61 @@ fn gate_cmd(args: &[&str]) -> std::process::Command {
         .env("GIT_CONFIG_COUNT", (slot + 1).to_string())
         .env(format!("GIT_CONFIG_KEY_{slot}"), "safe.directory")
         .env(format!("GIT_CONFIG_VALUE_{slot}"), &root)
+        .env("BOSS_GATE_RECEIPT", nested_receipt())
         .current_dir(&root);
     cmd
+}
+
+// Each nested invocation owns its evidence, including simultaneous tests.
+// Inheriting the runner's path overwrote its receipt with fixture refusals
+// (a546e5fa). Callers reading a specific receipt may override this default.
+fn nested_receipt() -> std::path::PathBuf {
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    boss_testing::scratch_dir(&format!(
+        "nested-gate-receipt-{:?}-{at}",
+        std::thread::current().id()
+    ))
+    .join("receipt.json")
+}
+
+#[test]
+fn nested_gate_refusals_preserve_the_enclosing_receipt() {
+    // Run real fixtures in child test processes, preserving their original
+    // assertions without mutating the parent process's environment.
+    let dir = boss_testing::scratch_dir("nested-gate-parent-receipt");
+    let parent = dir.join("parent.json");
+    let sentinel = "parent-gate-must-retain-this\n";
+    for fixture in [
+        "the_gate_rechecks_headroom_as_the_run_proceeds",
+        "the_gate_refuses_to_run_without_headroom",
+        "the_receipt_times_every_check",
+    ] {
+        boss_testing::write_file(&parent, sentinel);
+        let out = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", fixture, "--nocapture"])
+            .env("BOSS_GATE_RECEIPT", &parent)
+            .output()
+            .expect("run the nested gate fixture");
+        assert!(
+            out.status.success(),
+            "{fixture} failed: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+            "the exact fixture must run, rather than silently select no test"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&parent).expect("parent receipt"),
+            sentinel,
+            "{fixture} must never replace the enclosing gate's evidence"
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Since 2026-09-13 (design 128b5496) the workflow has NO `test` job:
@@ -337,6 +390,7 @@ fn skeleton_gate(tree: &std::path::Path, mode: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new("bash");
     cmd.arg(tree.join("infra/gate.sh"))
         .arg(mode)
+        .env("BOSS_GATE_RECEIPT", nested_receipt())
         .current_dir(tree);
     cmd
 }
@@ -475,6 +529,7 @@ fn the_gate_refuses_to_run_without_headroom() {
         .arg(repo_root().join("infra/gate.sh"))
         .arg("--auto")
         .env("BOSS_GATE_MIN_FREE_GB", "99999999")
+        .env("BOSS_GATE_RECEIPT", nested_receipt())
         .current_dir(repo_root())
         .output()
         .expect("run gate.sh");
@@ -527,20 +582,13 @@ fn the_gate_rechecks_headroom_as_the_run_proceeds() {
         ),
     );
 
-    let out = gate_cmd(&["--auto"])
+    let out = gate_cmd(&["--quick"])
         .env("BOSS_GATE_DF_CMD", fake.to_str().expect("utf8"))
         .env("BOSS_GATE_MIN_FREE_GB", "12")
-        // THE POLL NEEDS THE GATE TO REACH A PHASE, and `--auto` only
-        // reaches one if it derives a scope. Against the default trunk
-        // that holds on a feature branch and NOT on main, where the
-        // tree is clean and HEAD is its own trunk — so this test
-        // passed everywhere except the one place it had to run, and
-        // left main red after the startup half was fixed.
-        //
-        // `HEAD~1` always yields exactly the last commit's changes, on
-        // a branch or on main, so the derivation succeeds in both and
-        // the poll is tested rather than the scope.
-        .env("BOSS_GATE_TRUNK", "HEAD~1")
+        // The poll needs a phase, not a changed tree. An ancestry-only
+        // merge can have the same tree as HEAD~1, so AUTO correctly
+        // refuses before the poll. QUICK reaches its build-free phase
+        // on both changed and unchanged trees (gate3ad12d6b).
         .output()
         .expect("run gate.sh");
 
@@ -1811,6 +1859,7 @@ impl LevelTree {
         std::process::Command::new("bash")
             .arg(self.tree.join("infra/gate.sh"))
             .arg("--quick")
+            .env("BOSS_GATE_RECEIPT", nested_receipt())
             .current_dir(&self.tree)
             .env("PATH", format!("{}:{path}", self.dir.join("bin").display()))
             .env("BOSS_GATE_DF_CMD", self.dir.join("df"))

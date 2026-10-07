@@ -19,6 +19,9 @@
 //! failure that cannot be read costs the next diagnosis its evidence
 //! (CLAUDE.md §Diagnosis, 2026-09-09).
 
+#[path = "credential_installation_read.rs"]
+pub mod installation_read;
+
 use async_trait::async_trait;
 use base64::Engine as _;
 use serde_json::{Value as JsonValue, json};
@@ -92,6 +95,18 @@ pub trait ForgeTokenIssuer: Send + Sync {
 /// Secret to pre-exist because `create` cannot be name-scoped.
 #[async_trait]
 pub trait SecretStore: Send + Sync {
+    /// Atomic keys on the same observed object, refusing replacement as
+    /// well as version movement. No fallback to an unconditional write.
+    async fn write_keys_if(
+        &self,
+        namespace: &str,
+        name: &str,
+        entries: &[(&str, &str)],
+        observed: &SecretData,
+    ) -> Result<WriteAt, String> {
+        let _ = (namespace, name, entries, observed);
+        Err("this Secret store has no object-identity conditional write".into())
+    }
     async fn read_key(
         &self,
         namespace: &str,
@@ -152,6 +167,7 @@ pub trait SecretStore: Send + Sync {
 /// keys and never a value.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct SecretData {
+    pub uid: String,
     pub version: String,
     pub data: std::collections::BTreeMap<String, String>,
 }
@@ -159,6 +175,7 @@ pub struct SecretData {
 impl std::fmt::Debug for SecretData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SecretData")
+            .field("uid", &self.uid)
             .field("version", &self.version)
             .field("keys", &self.data.keys().collect::<Vec<_>>())
             .finish()
@@ -525,7 +542,7 @@ impl SecretStore for KubeSecretStore {
         name: &str,
         entries: &[(&str, &str)],
     ) -> Result<(), String> {
-        self.patch_data(namespace, name, entries, None)
+        self.patch_data(namespace, name, entries, None, None)
             .await
             .and_then(|w| match w {
                 WriteAt::Written => Ok(()),
@@ -574,7 +591,13 @@ impl SecretStore for KubeSecretStore {
                 .map_err(|_| format!("secret {namespace}/{name} key {key}: not utf-8"))?;
             data.insert(key.clone(), text.trim().to_string());
         }
-        Ok(Some(SecretData { version, data }))
+        let uid = body
+            .pointer("/metadata/uid")
+            .and_then(JsonValue::as_str)
+            .filter(|uid| !uid.is_empty())
+            .ok_or_else(|| format!("secret {namespace}/{name}: no metadata.uid"))?
+            .to_string();
+        Ok(Some(SecretData { uid, version, data }))
     }
 
     /// The merge-patch carries `metadata.resourceVersion`, which the API
@@ -587,8 +610,28 @@ impl SecretStore for KubeSecretStore {
         entries: &[(&str, &str)],
         version: &str,
     ) -> Result<WriteAt, String> {
-        self.patch_data(namespace, name, entries, Some(version))
+        self.patch_data(namespace, name, entries, Some(version), None)
             .await
+    }
+
+    async fn write_keys_if(
+        &self,
+        namespace: &str,
+        name: &str,
+        entries: &[(&str, &str)],
+        observed: &SecretData,
+    ) -> Result<WriteAt, String> {
+        if observed.uid.is_empty() || observed.version.is_empty() {
+            return Err("Secret precondition lacks UID or resourceVersion".into());
+        }
+        self.patch_data(
+            namespace,
+            name,
+            entries,
+            Some(&observed.version),
+            Some(&observed.uid),
+        )
+        .await
     }
 }
 
@@ -599,6 +642,7 @@ impl KubeSecretStore {
         name: &str,
         entries: &[(&str, &str)],
         version: Option<&str>,
+        uid: Option<&str>,
     ) -> Result<WriteAt, String> {
         let url = format!(
             "{}/api/v1/namespaces/{namespace}/secrets/{name}",
@@ -613,9 +657,12 @@ impl KubeSecretStore {
                 )
             })
             .collect();
-        let body = match version {
-            Some(v) => json!({ "metadata": { "resourceVersion": v }, "data": data }),
-            None => json!({ "data": data }),
+        let body = match (version, uid) {
+            (Some(v), Some(uid)) => {
+                json!({ "metadata": { "resourceVersion": v, "uid": uid }, "data": data })
+            }
+            (Some(v), None) => json!({ "metadata": { "resourceVersion": v }, "data": data }),
+            (None, _) => json!({ "data": data }),
         };
         let resp = self
             .client
@@ -2004,6 +2051,7 @@ pub trait GitHubAppIssuer: Send + Sync {
 /// The public GitHub REST API, or a stub standing in for it.
 pub struct GitHubApi {
     client: reqwest::Client,
+    installation_read_client: reqwest::Client,
     base: String,
     root: GitHubAppRoot,
 }
@@ -2018,8 +2066,15 @@ impl GitHubApi {
             .user_agent(GITHUB_USER_AGENT)
             .build()
             .map_err(|e| format!("http client: {e}"))?;
+        // An observation is about one named endpoint, never its redirect.
+        let installation_read_client = reqwest::Client::builder()
+            .user_agent(GITHUB_USER_AGENT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| "installation read client unavailable".to_string())?;
         Ok(Arc::new(Self {
             client,
+            installation_read_client,
             base: base.into(),
             root,
         }))
@@ -2043,6 +2098,70 @@ fn permissions_of(v: Option<&JsonValue>) -> std::collections::BTreeMap<String, S
         .flatten()
         .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
         .collect()
+}
+
+#[async_trait]
+impl installation_read::InstallationReader for GitHubApi {
+    fn app_id(&self) -> Result<u64, String> {
+        Ok(self.root.app_id())
+    }
+
+    fn default_installation_id(&self) -> Result<u64, String> {
+        Ok(self.root.installation_id())
+    }
+
+    async fn read_installation(
+        &self,
+        expected: &installation_read::ExpectedInstallation,
+    ) -> Result<installation_read::InstallationSnapshot, String> {
+        if expected.app_id != self.root.app_id()
+            || expected.installation_id == 0
+            || expected.account_login.is_empty()
+            || expected.account_login.trim() != expected.account_login
+            || expected.account_id == Some(0)
+        {
+            return Err("installation selection differs from issuer or is incomplete".into());
+        }
+        let jwt = self.root.jwt(boss_clock_client::wall_now())?;
+        let response = self
+            .versioned(
+                self.installation_read_client
+                    .get(self.url(&format!("/app/installations/{}", expected.installation_id))),
+            )
+            .bearer_auth(jwt)
+            .send()
+            .await
+            .map_err(|_| "installation GET transport unavailable".to_string())?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(format!(
+                "installation GET returned {}, not200",
+                response.status()
+            ));
+        }
+        let body = response
+            .json::<JsonValue>()
+            .await
+            .map_err(|_| "installation GET200 response is unreadable JSON".to_string())?;
+        installation_read::parse_snapshot(body, expected, boss_clock_client::wall_now())
+    }
+}
+
+#[async_trait]
+impl installation_read::InstallationReader for Unconfigured {
+    fn app_id(&self) -> Result<u64, String> {
+        Err(self.0.clone())
+    }
+
+    fn default_installation_id(&self) -> Result<u64, String> {
+        Err(self.0.clone())
+    }
+
+    async fn read_installation(
+        &self,
+        _expected: &installation_read::ExpectedInstallation,
+    ) -> Result<installation_read::InstallationSnapshot, String> {
+        Err(self.0.clone())
+    }
 }
 
 #[async_trait]

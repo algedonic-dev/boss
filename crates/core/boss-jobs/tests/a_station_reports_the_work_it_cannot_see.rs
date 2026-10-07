@@ -88,6 +88,7 @@ fn protocol_v1() -> WorkflowSpec {
 fn protocol_v2() -> WorkflowSpec {
     let mut spec = protocol_v1();
     spec.steps[0].agent = Some(AgentSpec {
+        executor_provenance: Default::default(),
         profile: "builder".into(),
         model: "opus-5[1m]".into(),
         budget_usd: 5.0,
@@ -131,7 +132,7 @@ struct Harness {
 }
 
 fn harness() -> Harness {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds.seed(protocol_v1()).expect("seed v1");
     let stations = Arc::new(InMemoryStations::new());
     stations.seed(agent_station()).expect("seed station");

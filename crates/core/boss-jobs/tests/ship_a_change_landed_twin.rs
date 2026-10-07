@@ -59,7 +59,7 @@ fn admin_header() -> String {
 }
 
 fn app() -> axum::Router {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     // The real platform bundle: a fixture copy would pass while the
     // shipped ship-a-change had no such terminal.
     for spec in seedable_platform_workflows() {

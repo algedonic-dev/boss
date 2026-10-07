@@ -17,10 +17,9 @@
 //! next page cannot reintroduce the line one review at a time; this
 //! file is what keeps the lint honest.
 //!
-//! The allowlist (PartsList's four guarded reads, the two web-kit
-//! registry loaders whose `null` is refused by the `Array.isArray` on
-//! the next line) is copied from the REAL tree into every fixture, so a
-//! fixture is exactly as clean as the tree the lint guards.
+//! The lint's literal allowance declaration supplies every fixture's
+//! roster. Its allowed files are copied from the real tree, so a fixture
+//! is exactly as clean as the tree the lint guards.
 
 use boss_testing::repo_root;
 use boss_testing::scratch;
@@ -29,12 +28,34 @@ use std::process::{Command, Output};
 
 const LINT: &str = "infra/lint/a-failed-read-is-not-an-empty-one.sh";
 
-/// The files the lint's allowlist names, copied verbatim into fixtures.
-const ALLOWED: [&str; 3] = [
-    "apps/web/src/parts/PartsList.svelte",
-    "libs/web-kit/src/session/classes.svelte.ts",
-    "libs/web-kit/src/session/departments.svelte.ts",
-];
+/// Read the literal declaration instead of maintaining a second roster.
+fn allowed_files(body: &str) -> Vec<&str> {
+    let declaration = body
+        .split_once("declare -A ALLOW=(\n")
+        .expect("lint declares its literal allowances")
+        .1
+        .split_once("\n)")
+        .expect("allowance declaration closes")
+        .0;
+    let files: Vec<_> = declaration
+        .lines()
+        .map(|line| {
+            let (path, count) = line
+                .trim()
+                .strip_prefix("[\"")
+                .and_then(|entry| entry.split_once("\"]="))
+                .expect("allowance is a literal path and count");
+            assert!(count.parse::<usize>().is_ok(), "literal allowance count");
+            assert!(!path.is_empty(), "allowance names a file");
+            path
+        })
+        .collect();
+    assert!(
+        !files.is_empty(),
+        "count controls require an actual allowance"
+    );
+    files
+}
 
 struct Tree(PathBuf);
 
@@ -47,7 +68,7 @@ impl Tree {
         scratch::write_exec(&root.join(LINT), &body);
         let tree = Tree(root);
         git(&tree.0, &["init", "-q", "-b", "main"]);
-        for rel in ALLOWED {
+        for rel in allowed_files(&body) {
             let real = std::fs::read_to_string(repo_root().join(rel))
                 .unwrap_or_else(|e| panic!("read {rel}: {e}"));
             tree.file(rel, &real);
@@ -240,35 +261,36 @@ fn prose_the_helper_a_test_and_a_checked_read_are_clean() {
 /// to walk through (lib/allowlist.sh's rule, applied to a count).
 #[test]
 fn an_allowance_is_held_to_its_count_both_ways() {
-    let rel = ALLOWED[0];
-    let real = std::fs::read_to_string(repo_root().join(rel)).expect("read the allowed file");
+    let body = std::fs::read_to_string(repo_root().join(LINT)).expect("read the lint");
+    for rel in allowed_files(&body) {
+        let real = std::fs::read_to_string(repo_root().join(rel)).expect("read the allowed file");
 
-    let tree = Tree::new("over");
-    tree.file(
-        rel,
-        &format!("{real}\n<script>const extra = x.ok ? await x.json() : [];</script>\n"),
-    );
-    let out = tree.run();
-    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
-    assert!(text(&out).contains(rel), "{}", text(&out));
+        let tree = Tree::new("over");
+        tree.file(
+            rel,
+            &format!("{real}\n<script>const extra = x.ok ? await x.json() : [];</script>\n"),
+        );
+        let out = tree.run();
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+        assert!(text(&out).contains(rel), "{}", text(&out));
 
-    let fixed: String = real
-        .lines()
-        // PartsList's one allowed site since 0ef5e008: the PO read.
-        .filter(|l| !l.contains("pResp.ok ? await pResp.json()"))
-        .map(|l| format!("{l}\n"))
-        .collect();
-    assert_ne!(fixed, real, "the fixture must remove one allowed site");
-    let tree = Tree::new("under");
-    tree.file(rel, &fixed);
-    let out = tree.run();
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "an allowance above its file's count must be lowered:\n{}",
-        text(&out)
-    );
-    assert!(text(&out).contains(rel), "{}", text(&out));
+        let fixed: String = real
+            .lines()
+            .filter(|l| !l.contains(".ok ? await") || !l.contains(".json()"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_ne!(fixed, real, "the fixture must remove one allowed site");
+        let tree = Tree::new("under");
+        tree.file(rel, &fixed);
+        let out = tree.run();
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "an allowance above its file's count must be lowered:\n{}",
+            text(&out)
+        );
+        assert!(text(&out).contains(rel), "{}", text(&out));
+    }
 }
 
 /// A tree the lint cannot read is refused (exit 3), never certified.

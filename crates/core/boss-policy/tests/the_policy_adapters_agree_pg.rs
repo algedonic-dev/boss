@@ -182,6 +182,37 @@ async fn a_refused_rule_write_sees_its_row_and_writes_nothing<R: PolicyRepositor
     assert_eq!(repo.rule_for(&fresh.id).await.unwrap(), None, "{adapter}");
 }
 
+/// A retirement is a judged write (car 3 of design 1c4e42e1, backlog
+/// 47aed706): the judge sees the live row it would retire, and its
+/// refusal leaves that row active.
+async fn a_refused_retirement_sees_its_row_and_leaves_it_active<R: PolicyRepository>(
+    repo: &R,
+    adapter: &str,
+) {
+    let held = PolicyRule::new("service-tech", Resource::job(), Action::Close, Scope::Self_);
+    repo.upsert_rule(&held, "t").await.unwrap();
+    let seen = Mutex::new(None);
+    let refuse = |existing: Option<&PolicyRule>| {
+        *seen.lock().unwrap() = Some(existing.cloned());
+        Err("the last holder".to_string())
+    };
+    let err = repo
+        .deactivate_rule_judged(&held.id, "t", &refuse)
+        .await
+        .expect_err("refused");
+    assert!(matches!(err, PolicyError::Refused(_)), "{adapter}: {err:?}");
+    assert_eq!(
+        seen.into_inner().unwrap(),
+        Some(Some(held.clone())),
+        "{adapter}: the judge saw the live row"
+    );
+    assert_eq!(
+        repo.rule_for(&held.id).await.unwrap(),
+        Some(held),
+        "{adapter}: still active"
+    );
+}
+
 // ----- bootstrap reconcile ---------------------------------------------
 
 /// One reconcile, every branch: a missing default is inserted, a
@@ -461,6 +492,7 @@ boss_testing::adapters_agree! {
         a_retired_rule_leaves_the_listing,
         retiring_or_reading_a_missing_rule,
         a_refused_rule_write_sees_its_row_and_writes_nothing,
+        a_refused_retirement_sees_its_row_and_leaves_it_active,
         reconcile_inserts_refreshes_preserves_and_leaves_alone,
         an_operator_retirement_of_a_bootstrap_rule_survives_reconcile,
         the_override_listing_is_live_and_the_lookup_is_not,

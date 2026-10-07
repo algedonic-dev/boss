@@ -470,6 +470,15 @@ apply_instance() {
     apply_namespaces "$ns"
     $KM apply -f "/manifests/$ns"
 }
+# A generic image ships an explicit empty declaration. This estate's
+# declaration is delivered separately, without baking it into the SPA.
+# The whole-directory mount observes ConfigMap updates; never subPath.
+converge_dev_door() {
+    local ns="$1" stage="$APPLY_DIR/dev-door-$1"
+    bash "$REPO/infra/estate/render-dev-door-config.sh" \
+        "$REPO/infra/estate/dev-door.json" "$stage" "$ns"
+    $KAPPLY apply -f - < "$stage/configmap.json"
+}
 # `-i`, and that single flag is the whole bug this replaces. The first
 # version piped the generated ConfigMap into `$K apply -f -`, but $K is
 # `docker run --rm` with no `-i`, so the container never attached
@@ -649,6 +658,9 @@ echo "cluster-deploy-runner: apply is additive — NO --prune. An object whose m
 # stage that knows the skipped set.
 TUNNEL_CONFIG_FILE=cloudflared-config.yaml
 rm -f "$APPLY_DIR/$SOURCE_NS/$TUNNEL_CONFIG_FILE"
+apply_namespaces "$SOURCE_NS"
+converge_dev_door "$SOURCE_NS"
+run_summary_field dev_door_declaration_sha256 "$(sha256sum "$APPLY_DIR/dev-door-$SOURCE_NS/dev-door.json" | cut -d ' ' -f 1)"
 apply_instance "$SOURCE_NS"
 
 # StepPlugin bundles converge from the tree too (job d35aec77).
@@ -891,6 +903,8 @@ while IFS="$IFS_ROW" read -r iname ins_ns tdir _s _h share_ns trepo tref site; d
         converge_tenant "$iname" "$ins_ns" "$trepo" "$tref" "$site"
         STAGE="apply $ins_ns"
     fi
+    apply_namespaces "$ins_ns"
+    converge_dev_door "$ins_ns"
     apply_instance "$ins_ns"
     converge_step_plugins "$ins_ns"
     $K set image -n "$ins_ns" cronjobs -l boss-chore=true "chore=$REGISTRY:$HEAD" || true
@@ -1068,13 +1082,24 @@ _stage_done verify_s
 # the check working: declare it, delete it, or add it to EXEMPT with the
 # reason — one car either way. The deploy is already stamped above, so a
 # finding here never rolls anything back.
+#
+# ITS VERDICT RIDES THE PACKET AS `orphans_check` (backlog cb0c9937),
+# like `manifests_check` above — the count and the NAMED objects, bounded,
+# recorded by the lint itself through run-summary.sh (it inherits this
+# unit's BOSS_RUN_SUMMARY_FILE), on a pass, a finding and a refusal alike.
+# Until 2026-10-06 the packet read `failed_stage: check orphans` and
+# nothing else: two converges failed on ConfigMap/boss/boss-instance-config
+# — a generated object the derivation had no entry for — and the name was
+# in this journal alone. This stage is also the last one before the other
+# instances are rolled, so a failure here that nobody can read from the
+# packet is a playground left on an old build with no stated reason.
 STAGE="check orphans"
 echo "cluster-deploy-runner: checking for objects the tree no longer declares"
 orphan_rc=0
 KUBECONFIG="$KUBECONFIG_PATH" bash "$REPO/infra/lint/a-deleted-manifest-leaves-no-object.sh" || orphan_rc=$?
 if [ "$orphan_rc" -ne 0 ]; then
     rc=$orphan_rc
-    echo "cluster-deploy-runner: ORPHAN CHECK FAILED (rc=$rc) — something is running that no manifest declares; the apply cannot remove it (no --prune) so the delete is a named human step, printed above" >&2
+    echo "cluster-deploy-runner: ORPHAN CHECK FAILED (rc=$rc) — something is running that no manifest declares; the apply cannot remove it (no --prune) so the delete is a named human step, printed above (and named on this run's packet as orphans_check); the other instances are NOT rolled to $HEAD by this run" >&2
     exit 1
 fi
 echo "cluster-deploy-runner: no orphans — nothing is running that the tree cannot account for"

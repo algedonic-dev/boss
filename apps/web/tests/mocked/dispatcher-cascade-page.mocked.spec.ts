@@ -1,3 +1,4 @@
+import { isPageWrite } from './_smokeMocks';
 // /it/registry/dispatcher — every control the page audit counted, pinned
 // (page-audit 2ee7cdfc, step `test`).
 //
@@ -172,13 +173,12 @@ async function install(page: Page, rules: unknown[] = ROWS): Promise<void> {
 
 /// The shell's own write: App.svelte posts one surface-open per
 /// navigation. It is chrome, not a control of this page.
-const SHELL_WRITE = /\/api\/surface-opens$/;
 
 function watchWrites(page: Page): Request[] {
   const writes: Request[] = [];
   page.on('request', (r) => {
     const url = r.url();
-    if (url.includes('/api/') && r.method() !== 'GET' && !SHELL_WRITE.test(new URL(url).pathname)) {
+    if (url.includes('/api/') && r.method() !== 'GET' && isPageWrite(r.method(), new URL(url).pathname)) {
       writes.push(r);
     }
   });

@@ -38,11 +38,35 @@
 SPOOL_DIR="${SPOOL_DIR:-/var/tmp/boss-estate-spool}"
 SPOOL_MAX="${SPOOL_MAX:-200}"
 
+# THE MACHINE TOKEN IS PRESENTED, NEVER REQUIRED (design 6805c764;
+# backlog 2710c8fc). The observers run on the forge and boss-gcp, and
+# their POST reached the jobs port with x-boss-user alone — a
+# would-refuse fact at every tick once the gate reported. The one shell
+# reader (infra/lib/secret-header.sh machine_token_header) is sourced
+# from beside the observer that runs — every caller of this lib lives in
+# infra/estate, and POSIX sh gives a sourced file no path of its own —
+# and only when it is there: `.` on a missing file ENDS a dash script,
+# and an observer that cannot observe is the alarm dying with its
+# patient. No lib, no slot, a slot the reader refuses, a host that is not
+# the estate's, a header file that cannot be made: the reading goes out
+# exactly as it did before, unstamped.
+if [ -r "$(dirname "$0")/../lib/secret-header.sh" ]; then . "$(dirname "$0")/../lib/secret-header.sh"; fi
+
 # post_observation JSON — POST to $JOBS_API/api/estate/observation.
 # Prints "jobs api: <code> <body>" on an answer. Returns 0 only on 202.
+#
+# The header is made HERE, in the caller's shell and before the `$(…)`
+# below, on every post: the reader refuses a FIRST call inside a
+# subshell, and each observer sets its own `trap … EXIT` before its
+# first post, which is the order the reader's chained cleanup needs.
 post_observation() {
+    OBSERVE_MT_HDR=""
+    if command -v machine_token_header >/dev/null 2>&1; then
+        machine_token_header OBSERVE_MT_HDR "$JOBS_API" || OBSERVE_MT_HDR=""
+    fi
     resp=$(printf '%s' "$1" | curl -s -w '\n%{http_code}' \
       -X POST -H 'content-type: application/json' \
+      ${OBSERVE_MT_HDR:+-H "$OBSERVE_MT_HDR"} \
       -H 'x-boss-user: {"id":"automation:estate-observer-host","role":"platform-admin","access_tier":"operator"}' \
       --data-binary @- \
       "$JOBS_API/api/estate/observation") \

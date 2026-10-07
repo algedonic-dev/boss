@@ -282,6 +282,7 @@ async fn a_role_model_station_admits_the_agent_that_runs_the_model() {
     wf.steps[0].authority_role = Some("platform-admin".into());
     wf.steps[0].audience = None;
     wf.steps[0].agent = Some(boss_jobs::agent_spec::AgentSpec {
+        executor_provenance: Default::default(),
         profile: "builder".into(),
         model: "haiku-4-5".into(),
         budget_usd: 1.0,

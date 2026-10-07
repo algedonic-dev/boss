@@ -116,6 +116,19 @@ pub struct LastFiring {
 
 #[async_trait]
 pub trait DispatcherFiringsRepository: Send + Sync {
+    /// A counted page of complete retained failure records. A reader that
+    /// cannot supply them refuses rather than reporting an empty history.
+    async fn dead_letter_page(
+        &self,
+        _rule: &str,
+        _since: DateTime<Utc>,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<DeadLetterPage, DispatcherFiringsError> {
+        Err(DispatcherFiringsError::Storage(
+            "retained failure reader unavailable".into(),
+        ))
+    }
     /// The newest firing of `rule`, or `None` when the record holds no
     /// row for it. An error is NOT a `None`: the caller has to be able
     /// to tell "never fired" from "could not be read", because the
@@ -140,6 +153,21 @@ pub trait DispatcherFiringsRepository: Send + Sync {
         &self,
         since: DateTime<Utc>,
     ) -> Result<Vec<UnroutedDeadLetters>, DispatcherFiringsError>;
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RetainedDeadLetter {
+    pub firing_id: String,
+    pub rule: String,
+    pub fired_on: String,
+    pub fired_at: DateTime<Utc>,
+    pub detail: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct DeadLetterPage {
+    pub data: Vec<RetainedDeadLetter>,
+    pub total: usize,
 }
 
 /// One rule's dead-letters that name no packet, as the firing record
@@ -282,6 +310,7 @@ pub fn dead_letter_rollup(jobs: &[Job], since: DateTime<Utc>) -> Vec<DeadLetterR
 pub struct InMemoryDispatcherFirings {
     firings: Vec<(String, LastFiring)>,
     dead_letters: Vec<(String, DateTime<Utc>)>,
+    retained: Option<Vec<RetainedDeadLetter>>,
 }
 
 impl InMemoryDispatcherFirings {
@@ -289,6 +318,7 @@ impl InMemoryDispatcherFirings {
         Self {
             firings,
             dead_letters: Vec::new(),
+            retained: Some(Vec::new()),
         }
     }
 
@@ -296,6 +326,16 @@ impl InMemoryDispatcherFirings {
     pub fn with_unrouted_dead_letters(self, dead_letters: Vec<(String, DateTime<Utc>)>) -> Self {
         Self {
             dead_letters,
+            retained: None,
+            ..self
+        }
+    }
+
+    /// Complete retained rows, rather than a count-only fixture.
+    pub fn with_retained_dead_letters(self, retained: Vec<RetainedDeadLetter>) -> Self {
+        Self {
+            dead_letters: Vec::new(),
+            retained: Some(retained),
             ..self
         }
     }
@@ -303,6 +343,32 @@ impl InMemoryDispatcherFirings {
 
 #[async_trait]
 impl DispatcherFiringsRepository for InMemoryDispatcherFirings {
+    async fn dead_letter_page(
+        &self,
+        rule: &str,
+        since: DateTime<Utc>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<DeadLetterPage, DispatcherFiringsError> {
+        let records = self.retained.as_ref().ok_or_else(|| {
+            DispatcherFiringsError::Storage("fixture holds counts without retained detail".into())
+        })?;
+        let mut matched: Vec<_> = records
+            .iter()
+            .filter(|row| row.rule == rule && row.fired_at >= since)
+            .collect();
+        matched.sort_by(|a, b| (b.fired_at, &b.firing_id).cmp(&(a.fired_at, &a.firing_id)));
+        Ok(DeadLetterPage {
+            total: matched.len(),
+            data: matched
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .cloned()
+                .collect(),
+        })
+    }
+
     async fn last_firing(&self, rule: &str) -> Result<Option<LastFiring>, DispatcherFiringsError> {
         Ok(self
             .firings
@@ -340,14 +406,21 @@ impl DispatcherFiringsRepository for InMemoryDispatcherFirings {
     ) -> Result<Vec<UnroutedDeadLetters>, DispatcherFiringsError> {
         let mut out: std::collections::BTreeMap<&str, UnroutedDeadLetters> =
             std::collections::BTreeMap::new();
-        for (rule, at) in self.dead_letters.iter().filter(|(_, at)| *at >= since) {
+        let complete = self
+            .retained
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .map(|row| (&row.rule, row.fired_at));
+        let counted = self.dead_letters.iter().map(|(rule, at)| (rule, *at));
+        for (rule, at) in counted.chain(complete).filter(|(_, at)| *at >= since) {
             let e = out.entry(rule.as_str()).or_insert(UnroutedDeadLetters {
                 rule: rule.clone(),
                 count: 0,
-                newest_at: *at,
+                newest_at: at,
             });
             e.count += 1;
-            e.newest_at = e.newest_at.max(*at);
+            e.newest_at = e.newest_at.max(at);
         }
         Ok(out.into_values().collect())
     }
@@ -375,6 +448,63 @@ mod pg {
 
     #[async_trait]
     impl DispatcherFiringsRepository for PgDispatcherFirings {
+        async fn dead_letter_page(
+            &self,
+            rule: &str,
+            since: DateTime<Utc>,
+            limit: usize,
+            offset: usize,
+        ) -> Result<DeadLetterPage, DispatcherFiringsError> {
+            let limit = i64::try_from(limit).map_err(|_| {
+                DispatcherFiringsError::Storage("page limit exceeds storage bound".into())
+            })?;
+            let offset = i64::try_from(offset).map_err(|_| {
+                DispatcherFiringsError::Storage("page offset exceeds storage bound".into())
+            })?;
+            // One statement holds count and page to the same snapshot and
+            // predicate. The count survives even when the page is empty.
+            let sql = format!(
+                "WITH matched AS MATERIALIZED (\
+                   SELECT firing_id, rule_name, fired_on, fired_at, detail \
+                   FROM dispatcher_firings \
+                   WHERE rule_name = $1 AND outcome = $2 AND fired_at >= $3\
+                 ), counted AS (SELECT count(*) AS total FROM matched), \
+                 page AS (SELECT * FROM matched ORDER BY {NEWEST_FIRST} LIMIT $4 OFFSET $5) \
+                 SELECT counted.total, page.* FROM counted LEFT JOIN page ON true \
+                 ORDER BY {NEWEST_FIRST}"
+            );
+            let rows = sqlx::query(&sql)
+                .bind(rule)
+                .bind(OUTCOME_DEAD_LETTER)
+                .bind(since)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(storage)?;
+            let counted = rows.first().ok_or_else(|| {
+                DispatcherFiringsError::Storage("counted failure page returned no count".into())
+            })?;
+            let total: i64 = counted.try_get("total").map_err(storage)?;
+            let total = usize::try_from(total).map_err(|_| {
+                DispatcherFiringsError::Storage("failure count exceeds response bound".into())
+            })?;
+            let mut data = Vec::new();
+            for row in rows {
+                let id: Option<String> = row.try_get("firing_id").map_err(storage)?;
+                if let Some(firing_id) = id {
+                    data.push(RetainedDeadLetter {
+                        firing_id,
+                        rule: row.try_get("rule_name").map_err(storage)?,
+                        fired_on: row.try_get("fired_on").map_err(storage)?,
+                        fired_at: row.try_get("fired_at").map_err(storage)?,
+                        detail: row.try_get("detail").map_err(storage)?,
+                    });
+                }
+            }
+            Ok(DeadLetterPage { data, total })
+        }
+
         async fn last_firing(
             &self,
             rule: &str,

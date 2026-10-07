@@ -309,10 +309,30 @@ pub(crate) mod tests {
             .expect("main.rs never uses `app` after the outermost layer");
         let before = &code[..next_app];
         assert!(
-            before.contains("axum::serve("),
-            "the outermost layer's `app` must go straight to axum::serve; it is used first \
+            before.contains("axum::serve(")
+                || before.contains("boss_policy_client::role_service::serve_with_refresh("),
+            "the outermost layer's `app` must go straight to the server; it is used first \
              here: {before}"
         );
+    }
+
+    #[test]
+    fn the_server_reader_accepts_refresh_but_refuses_an_intervening_app_use() {
+        for serve in [
+            "axum::serve(",
+            "boss_policy_client::role_service::serve_with_refresh(",
+        ] {
+            let direct = format!("{serve}listener, app.into_make_service()).await;");
+            assert_app_goes_straight_to_serve(&direct, 0);
+            for use_before in ["let app = unsafe_layer(app);", "inspect(app.clone());"] {
+                let changed = format!("{use_before}\n{direct}");
+                assert!(
+                    std::panic::catch_unwind(|| assert_app_goes_straight_to_serve(&changed, 0))
+                        .is_err(),
+                    "the server reader accepted an app use ahead of {serve}"
+                );
+            }
+        }
     }
 
     /// The LAN spelling of the gateway's own origin — host and port —

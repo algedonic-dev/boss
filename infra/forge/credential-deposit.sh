@@ -245,7 +245,9 @@ else
     # kubectl container every forge script uses (kubectl is not on the
     # host: infra/forge/host-absent-tools.txt).
     KC="${BOSS_OPS_DIR:-/etc/boss-ops}/kubeconfig"
-    KUBECTL=(docker run --rm --network host -v "$KC:/kc:ro" alpine/k8s:1.33.3 kubectl --kubeconfig=/kc)
+    # --request-timeout: the read ends itself inside the container, which
+    # the outer kill in read_secret would otherwise leave running.
+    KUBECTL=(docker run --rm --network host -v "$KC:/kc:ro" alpine/k8s:1.33.3 kubectl --kubeconfig=/kc --request-timeout=15s)
     # ABSENT is not REFUSED (backlog 714bc71f). A kubeconfig David has
     # not placed is root material no converge can mint or repair, so it
     # is recorded as not ready and does not red the pass — install-
@@ -264,10 +266,20 @@ fi
 # value, or empty) and READ_STATE (what a record may say about it). A
 # function because the delivery record reads it a second time (step 4).
 read_secret() {
-    local b64
+    local b64 read_rc=0
     READ_VALUE="" READ_STATE="$KC_STATE"
     [ -z "$READ_STATE" ] || return 0
-    if b64="$("${KUBECTL[@]}" -n "$NS" get secret "$NAME" -o "jsonpath={.data.$KEY}" 2>"$KERR")"; then
+    # BOUNDED (adversarial review 9a1e289b of the machine token's deposit,
+    # B1): this runs ahead of the converge's fetch, and an unbounded read
+    # of a stalled cluster API or docker daemon held the converge here
+    # until the unit's TimeoutStartSec killed it, tick after tick, so the
+    # host installed nothing. `timeout -k 5` outside, kubectl's own
+    # --request-timeout inside the container (infra/estate/
+    # ops-credentials.sh bounds the same door both ways).
+    b64="$(timeout -k 5 "${BOSS_DEPOSIT_READ_BOUND_S:-25}" "${KUBECTL[@]}" -n "$NS" get secret "$NAME" -o "jsonpath={.data.$KEY}" 2>"$KERR")" || read_rc=$?
+    if [ "$read_rc" -eq 124 ] || [ "$read_rc" -eq 137 ]; then
+        READ_STATE="unreadable: the read of $NS/$NAME did not answer inside ${BOSS_DEPOSIT_READ_BOUND_S:-25} seconds and was stopped (a stalled cluster API or docker daemon)"
+    elif [ "$read_rc" -eq 0 ]; then
         if [ -z "$b64" ]; then
             READ_STATE=empty
         elif ! READ_VALUE="$(printf '%s' "$b64" | base64 -d 2>/dev/null)"; then

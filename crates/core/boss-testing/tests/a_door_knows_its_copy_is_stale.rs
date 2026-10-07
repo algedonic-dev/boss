@@ -54,6 +54,42 @@ use std::process::Command;
 /// without a decision about its severity.
 const DOORS: &[&str] = &["boss-api", "boss", "wt-cargo", "wt-web"];
 
+fn published_generation_frontend(body: &str) -> bool {
+    // This one installed entrypoint runs from an admitted artifact,
+    // not the operator's mutable checkout. Its runtime observation
+    // must remain wired before tool dispatch; never exempt all Python.
+    [
+        "\n    observed_generation(generation)\n",
+        "module.validate_generation(generation, generation.name)",
+        "record['commit'] != generation.name",
+        "hashlib.sha256(raw).hexdigest() != expected['sha256']",
+        "os.O_RDONLY | os.O_NOFOLLOW",
+        "generation / 'infra/dev/control-artifact.py'",
+    ]
+    .iter()
+    .all(|required| body.contains(required))
+}
+
+#[test]
+fn a_published_frontend_observes_its_generation_instead_of_candidate_freshness_code() {
+    let body = std::fs::read_to_string(repo_root().join("infra/dev/control-tools.py")).unwrap();
+    assert!(published_generation_frontend(&body));
+    for required in [
+        "\n    observed_generation(generation)\n",
+        "module.validate_generation(generation, generation.name)",
+        "record['commit'] != generation.name",
+        "hashlib.sha256(raw).hexdigest() != expected['sha256']",
+    ] {
+        assert!(
+            !published_generation_frontend(&body.replace(required, "")),
+            "missing {required}"
+        );
+    }
+    assert!(!published_generation_frontend(
+        "#!/bin/bash\necho arbitrary source door\n"
+    ));
+}
+
 struct Pod {
     root: PathBuf,
     /// A git checkout holding a copy of `infra/dev/`.
@@ -271,6 +307,13 @@ fn every_door_in_the_tree_consults_the_one_helper() {
             continue;
         }
         let body = std::fs::read_to_string(&path).expect("read door");
+        if name == "control-tools.py" {
+            assert!(
+                published_generation_frontend(&body),
+                "the published PATH frontend must observe its owned commit and complete artifact binding before any exec"
+            );
+            continue;
+        }
         assert!(
             body.contains("door-freshness.sh"),
             "infra/dev/{name} is a door on the pod's PATH and does not source \

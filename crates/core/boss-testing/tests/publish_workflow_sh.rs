@@ -269,12 +269,16 @@ esac
             r#"#!/bin/sh
 # stub curl: GET /api/workflows/<kind> serves the live row from a file
 # (HTTP code via -w when asked); STUB_REGISTRY_DOWN answers nothing.
+[ -n "${STUB_CURL_LOG:-}" ] && printf 'curl %s\n' "$*" >> "$STUB_CURL_LOG"
 [ -n "${STUB_REGISTRY_DOWN:-}" ] && { echo "curl: (7) Failed to connect" >&2; exit 7; }
 out=""; code=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift ;;
     -w) code=1 ;;
+    # A header FILE: what it holds is kept, so a test can see what was
+    # presented without the value ever being in an argv.
+    -H) case "$2" in @*) [ -n "${STUB_CURL_LOG:-}" ] && cat "${2#@}" >> "$STUB_CURL_LOG.headers" ;; esac; shift ;;
   esac
   shift
 done
@@ -447,6 +451,87 @@ fn a_live_row_equal_to_the_tree_is_nothing_to_publish() {
     assert!(c.publishes().is_empty(), "a publish ran: {out}");
 }
 
+/// The live read presents the estate machine token and never needs it
+/// (design 6805c764; backlog 2710c8fc). `read_live` signs nothing —
+/// /api/workflows is a public registry surface — so every machine gate
+/// recorded it as a caller it would refuse, once per kind on every
+/// publish-drift tick from boss-gcp. With a slot and the system of
+/// record on the host list the read carries the token, in a header FILE;
+/// in every other state the verdict is the one it always reached.
+#[test]
+fn the_live_read_presents_the_machine_token_and_never_needs_it() {
+    if !ready() {
+        return;
+    }
+    const TOKEN: &str = "synthetic-machine-fixture";
+    for (tag, slot, hosts, stamped) in [
+        ("absent", None, "sor.invalid", false),
+        ("present", Some(TOKEN), "sor.invalid", true),
+        ("off-host", Some(TOKEN), "elsewhere.invalid", false),
+        (
+            "line-break",
+            Some("synthetic\nmachine-fixture"),
+            "sor.invalid",
+            false,
+        ),
+    ] {
+        let c = Case::new(&format!("machine-token-{tag}"));
+        write_file(&c.live, &live_row(2, REV2_DESC, REV2_STEPS));
+        let mount = c.root.join("mount");
+        boss_testing::create_dir(&mount);
+        if let Some(value) = slot {
+            write_file(&mount.join("current"), value);
+        }
+        let tmp = c.root.join("tmp");
+        boss_testing::create_dir(&tmp);
+        let log = c.root.join("curl.log");
+        let (rc, out) = c.run_env(
+            &[KIND],
+            &[
+                ("BOSS_MACHINE_TOKEN_DIR", mount.display().to_string()),
+                ("BOSS_MACHINE_TOKEN_HOSTS", hosts.into()),
+                (
+                    "BOSS_SOR_ENV",
+                    c.root.join("no-sor.env").display().to_string(),
+                ),
+                ("TMPDIR", tmp.display().to_string()),
+                ("STUB_CURL_LOG", log.display().to_string()),
+            ],
+        );
+        assert_eq!(
+            rc, 5,
+            "{tag}: the verdict is the one it always reached: {out}"
+        );
+        contains_all(&out, &["nothing to publish"], tag);
+        let argv = std::fs::read_to_string(&log).unwrap_or_default();
+        let headers = std::fs::read_to_string(c.root.join("curl.log.headers")).unwrap_or_default();
+        assert!(
+            argv.contains("/api/workflows/"),
+            "{tag}: the read went out: {argv}"
+        );
+        assert_eq!(
+            headers.contains(&format!("x-boss-machine-token: {TOKEN}")),
+            stamped,
+            "{tag}: headers presented: {headers:?}; argv: {argv}"
+        );
+        assert_eq!(argv.contains(" -H @"), stamped, "{tag}: {argv}");
+        assert!(
+            !argv.contains("machine-fixture") && !out.contains("machine-fixture"),
+            "{tag}: the token reached an argv or the verdict"
+        );
+        let leaked: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("boss-secret-header."))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "{tag}: a header directory outlived the run: {leaked:?}"
+        );
+    }
+}
+
 /// The load-bearing refusal: a live row carrying what no revision of
 /// the tree ever said is an operator's edit, and publishing the tree
 /// over it would regress the protocol. Refused, with the drift named
@@ -521,6 +606,159 @@ fn a_live_row_the_tree_once_said_is_republished_and_confirmed() {
         ),
         "the publish names the kind, the tree's file, and signs as the runner's automation"
     );
+}
+
+const HOLD: &str = "drift_publish = \"held\"\nwhy = 'This row turns on a refusal; it goes live at a deliberate publish.'\nlifts = 'backlog 6c9183de'\n";
+
+fn hold_file(c: &Case, name: &str, body: &str) {
+    let dir = c.repo.join("infra/platform/workflow-holds");
+    std::fs::create_dir_all(&dir).unwrap();
+    write_file(&dir.join(name), body);
+}
+
+/// A HELD kind is not published by this verb (backlog 083d240e; review
+/// R1 of the signer car, run 7cee49b9). `publish-workflow` declares no
+/// approval, so any actor who may file an ops-request could have
+/// published a held row as automation:ops-runner — and published it
+/// again after a rollback — while the hold bound only publish-drift.
+/// The hold sits HERE, where both machine roads pass: refused (9) in
+/// real mode and under --force-tree before the registry or the CLI is
+/// touched, naming the kind, the hold's source, why, what lifts it, and
+/// the deliberate door; `--check` says HELD and never `--check ok`.
+#[test]
+fn a_held_kind_is_refused_in_real_mode_and_under_force_tree_and_check_says_held() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("held-refused");
+    hold_file(&c, &format!("{KIND}.toml"), HOLD);
+    for mode in [&[KIND][..], &[KIND, "--force-tree"][..]] {
+        let (rc, out) = c.run(mode);
+        assert_eq!(rc, 9, "{mode:?}: {out}");
+        contains_all(
+            &out,
+            &[
+                "REFUSED",
+                "'maintenance-widget' is HELD out of every unattended publish",
+                "declared in infra/platform/workflow-holds/maintenance-widget.toml",
+                "turns on a refusal",
+                "6c9183de",
+                "boss workflow publish maintenance-widget infra/platform/workflows/maintenance-widget.toml",
+                "run by a person from a checkout",
+                "nothing published",
+            ],
+            &format!("{mode:?}"),
+        );
+        assert!(
+            c.boss_calls().is_empty(),
+            "{mode:?}: a held kind reached the CLI: {:?}",
+            c.boss_calls()
+        );
+    }
+
+    // --check still answers: HELD up front, the registry's state, and
+    // where `--check ok` would have been, `--check HELD`, exit 9.
+    let (rc, out) = c.run(&[KIND, "--check"]);
+    assert_eq!(rc, 9, "{out}");
+    contains_all(
+        &out,
+        &[
+            "HELD: 'maintenance-widget' is HELD",
+            "tree moved ahead",
+            "--check HELD: would NOT publish infra/platform/workflows/maintenance-widget.toml over live v1",
+        ],
+        "the held check",
+    );
+    assert!(
+        !out.contains("--check ok"),
+        "a held kind is never one this verb would publish: {out}"
+    );
+    assert!(c.publishes().is_empty(), "{:?}", c.boss_calls());
+
+    // Equal to live: the ordinary verdict (5), with HELD said.
+    write_file(&c.live, &live_row(2, REV2_DESC, REV2_STEPS));
+    let (rc, out) = c.run(&[KIND, "--check"]);
+    assert_eq!(rc, 5, "{out}");
+    contains_all(&out, &["HELD:", "nothing to publish"], "held and equal");
+}
+
+/// FAIL CLOSED, here too: holds that cannot be read refuse EVERY mode
+/// (78), naming the file, before the CLI or the registry is touched.
+#[test]
+fn holds_that_cannot_be_read_refuse_every_mode_of_the_one_kind_verb() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("held-unreadable");
+    hold_file(&c, &format!("{KIND}.toml"), "drift_publish = \"held\"\n");
+    for mode in [
+        &[KIND][..],
+        &[KIND, "--force-tree"][..],
+        &[KIND, "--check"][..],
+    ] {
+        let (rc, out) = c.run(mode);
+        assert_eq!(rc, 78, "{mode:?}: {out}");
+        contains_all(
+            &out,
+            &[
+                "REFUSED",
+                "workflow-holds/maintenance-widget.toml",
+                "`why`",
+                "nothing published",
+            ],
+            &format!("{mode:?}"),
+        );
+        assert!(c.boss_calls().is_empty(), "{mode:?}: {:?}", c.boss_calls());
+    }
+    // A hold for ANOTHER kind that cannot be read refuses this one too:
+    // the reader answers whole or not at all.
+    let c = Case::new("held-unreadable-other");
+    hold_file(&c, "some-other-kind.toml", HOLD);
+    let (rc, out) = c.run(&[KIND]);
+    assert_eq!(rc, 78, "{out}");
+    assert!(c.boss_calls().is_empty(), "{:?}", c.boss_calls());
+}
+
+/// The default and its release: a row that declares a field `writer` is
+/// held with no file at all (9), and a `released` file hands it back —
+/// then it publishes exactly as an unheld row does.
+#[test]
+fn a_row_declaring_a_writer_is_refused_by_default_and_published_once_released() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("held-default");
+    let with_writer = REV2_KIND_FILE.replacen(
+        "fields = [{ name = \"result\", field_type = \"string\", required = true }]",
+        "fields = [{ name = \"result\", field_type = \"string\", required = true, writer = \"signer\" }]",
+        1,
+    );
+    assert_ne!(
+        with_writer, REV2_KIND_FILE,
+        "the fixture row gained a writer"
+    );
+    write_file(
+        &c.repo.join(format!("infra/platform/workflows/{KIND}.toml")),
+        &with_writer,
+    );
+    let (rc, out) = c.run(&[KIND]);
+    assert_eq!(rc, 9, "{out}");
+    contains_all(
+        &out,
+        &["by default: step run field result declares writer signer"],
+        "the default hold names what it read",
+    );
+    assert!(c.boss_calls().is_empty(), "{:?}", c.boss_calls());
+
+    hold_file(
+        &c,
+        &format!("{KIND}.toml"),
+        "drift_publish = \"released\"\nwhy = 'Published by hand and the positive control passed; later edits may ride the machine roads.'\n",
+    );
+    let (rc, out) = c.run(&[KIND]);
+    assert_eq!(rc, 0, "{out}");
+    contains_all(&out, &["v1 -> v2", "confirmed"], "the released row");
+    assert_eq!(c.publishes().len(), 1, "{:?}", c.boss_calls());
 }
 
 /// `--check` reaches the same verdict and stops short of writing: the

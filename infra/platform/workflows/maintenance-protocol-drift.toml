@@ -47,7 +47,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "The daily drift between the authored protocol bundle (infra/platform/workflows) and the live workflow registry: live kinds the tree does not author, bundle kinds not yet admitted, and operator-facing fields (label, description, category) where the live row disagrees with its file — each named by kind, field, live version and excerpt, filed from the converged checkout on boss-gcp."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
 
 [[workflow.step]]
 title = "scheduled"

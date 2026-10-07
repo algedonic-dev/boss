@@ -46,7 +46,7 @@ async fn the_gate_runs_launched_trigger_is_born_with_its_completed_at() {
         .into_iter()
         .find(|w| w.kind == "gate-run")
         .expect("the bundle ships gate-run");
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds.seed(spec).expect("spec seeds");
     let jobs = Arc::new(InMemoryJobs::new());
     let kind_registry: Arc<dyn WorkflowRegistry> = kinds;

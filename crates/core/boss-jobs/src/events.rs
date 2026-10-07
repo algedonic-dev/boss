@@ -19,6 +19,9 @@ pub const JOB_CREATED: &str = "jobs.job.created";
 pub const JOB_UPDATED: &str = "jobs.job.updated";
 pub const STEP_CREATED: &str = "jobs.step.created";
 pub const STEP_UPDATED: &str = "jobs.step.updated";
+/// Full step state plus the immutable first record and server receipt.
+/// Unlike a marker, this event reconstructs both projections on replay.
+pub const STEP_FIRST_RECORDED: &str = "jobs.step.first_recorded";
 /// A STAMP DIED (design 87329a13, option C decided 2026-09-25): an edit
 /// moved a stamped step's completion-relevant shape, and every stamp
 /// still alive on it was voided — kept on the step, marked `voided_at` /
@@ -239,9 +242,19 @@ pub fn workflow_registry_event(
     actor: &boss_core::actor::ActorId,
     spec: &crate::registry::WorkflowSpec,
 ) -> boss_core::event::Event {
+    workflow_registry_event_at(kind, actor, spec, boss_clock_client::wall_now())
+}
+
+/// A conditional publication records the clock supplied to its owning port.
+pub fn workflow_registry_event_at(
+    kind: &str,
+    actor: &boss_core::actor::ActorId,
+    spec: &crate::registry::WorkflowSpec,
+    now: chrono::DateTime<chrono::Utc>,
+) -> boss_core::event::Event {
     let payload =
         boss_core::publisher::inject_actor(serde_json::to_value(spec).unwrap_or_default(), actor);
-    boss_core::event::Event::new("jobs", kind, payload, boss_clock_client::wall_now())
+    boss_core::event::Event::new("jobs", kind, payload, now)
 }
 
 /// The `jobs.kind.quarantined` marker: which Workflow row a

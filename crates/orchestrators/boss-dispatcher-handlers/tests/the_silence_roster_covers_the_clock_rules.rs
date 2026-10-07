@@ -174,6 +174,16 @@ const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
          sweep keyed by kind could watch.",
     ),
     (
+        "a-declared-worker-receipt-is-observed-every-five-minutes",
+        "runs `jobs.receipt_overdue`, which files one urgent backlog-item alarm only when \
+         a newly declared worker receipt is missing past its native dispatch bound, and \
+         records recovery when the receipt arrives or the work ends (da708aaf). A tick \
+         with no overdue declared receipt produces NOTHING, and that zero is healthy; \
+         an existing alarm prevents another filing. Its alarm identity is keyed by rule \
+         and run, not a periodic packet kind a silence sweep could count. It watches an \
+         absence without killing, reclaiming, or advancing the worker run.",
+    ),
+    (
         "agent-held-real-work-is-watched-hourly",
         "runs `jobs.agent_step_overdue`, which files one urgent backlog-item alarm per step \
          held by an agent past the wait its workflow declares on the rule's args (backlog \

@@ -9,7 +9,16 @@ use uuid::Uuid;
 
 use super::*;
 
-type AccountRow = (Uuid, String, String, String, String, bool, Option<String>);
+type AccountRow = (
+    Uuid,
+    String,
+    String,
+    String,
+    String,
+    bool,
+    Option<String>,
+    Option<String>,
+);
 type TrialBalanceRowTuple = (String, String, String, String, i64, i64);
 
 // --- chart of accounts ----------------------------------------------------
@@ -19,6 +28,7 @@ pub struct Account {
     pub id: Uuid,
     pub code: String,
     pub name: String,
+    pub description: Option<String>,
     pub kind: String,
     pub normal_side: String,
     pub is_active: bool,
@@ -30,7 +40,7 @@ pub struct Account {
 
 pub(super) async fn list_accounts(State(state): State<Arc<LedgerApiState>>) -> Response {
     let rows: Result<Vec<AccountRow>, _> = sqlx::query_as(
-        "SELECT a.id, a.code, a.name, a.kind, a.normal_side, a.is_active, p.code \
+        "SELECT a.id, a.code, a.name, a.kind, a.normal_side, a.is_active, p.code, a.description \
          FROM gl_accounts a LEFT JOIN gl_accounts p ON p.id = a.parent_id \
          WHERE a.is_active = true ORDER BY a.code",
     )
@@ -42,10 +52,11 @@ pub(super) async fn list_accounts(State(state): State<Arc<LedgerApiState>>) -> R
             let accounts: Vec<Account> = rows
                 .into_iter()
                 .map(
-                    |(id, code, name, kind, normal_side, is_active, parent)| Account {
+                    |(id, code, name, kind, normal_side, is_active, parent, description)| Account {
                         id,
                         code,
                         name,
+                        description,
                         kind,
                         normal_side,
                         is_active,

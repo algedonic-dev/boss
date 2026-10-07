@@ -173,6 +173,46 @@ async fn the_one_passkey_router_carries_the_credential_removal() {
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 }
 
+/// People answering the removal with one fixed status and text.
+async fn people_answering_removal(status: StatusCode, text: &'static str) -> String {
+    let app = Router::new().route(
+        "/api/people/{id}/webauthn-credentials/{cid}",
+        delete(move || async move { (status, text) }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+/// People's coverage guard answers a removal it cannot judge with 503
+/// and the reason, in its own fixed words (which source, which status).
+/// The gateway turned that into 502 "credential removal failed", so the
+/// one person removing a key could not read why (review c3b96c09 F2,
+/// 2026-10-06). It passes through like the 409 it sits beside; any
+/// other failure keeps the fixed text and never an upstream body.
+#[tokio::test]
+async fn a_removal_people_cannot_judge_keeps_its_status_and_reason() {
+    const REASON: &str = "policy coverage snapshot answered 502 Bad Gateway";
+    let people = people_answering_removal(StatusCode::SERVICE_UNAVAILABLE, REASON).await;
+    let router_503 = router(people.clone(), people);
+    let path = format!("/api/auth/passkey/credentials/{CREDENTIAL_ID}");
+    let (status, body) = call(&router_503, "DELETE", &path, json!({})).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, REASON)
+    );
+
+    let people = people_answering_removal(StatusCode::INTERNAL_SERVER_ERROR, STORED).await;
+    let router_500 = router(people.clone(), people);
+    let (status, body) = call(&router_500, "DELETE", &path, json!({})).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::BAD_GATEWAY, "credential removal failed"),
+        "a storage failure's body is never shown"
+    );
+}
+
 /// A well-formed assertion envelope — enough to reach the challenge
 /// consume.
 fn assertion() -> Value {

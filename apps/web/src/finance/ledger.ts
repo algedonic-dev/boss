@@ -185,6 +185,7 @@ export type TaxFiling = {
 export type TaxLiabilityRow = {
   account_code: string;
   account_name: string;
+  account_description?: string | null;
   balance_cents: number;
 };
 
@@ -200,6 +201,7 @@ export type Account = {
   id: string;
   code: string;
   name: string;
+  description?: string | null;
   kind: 'asset' | 'liability' | 'equity' | 'revenue' | 'expense';
   normal_side: 'debit' | 'credit';
   is_active: boolean;

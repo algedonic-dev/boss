@@ -35,6 +35,10 @@ ALERT_SPOOL="${ALERT_SPOOL:-/var/tmp/boss-alert-spool}"
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/sor.sh"
 sor_require JOBS_API
 ALERT_API="$JOBS_API"
+# The machine token's one shell reader — sourced when it is there, and
+# only defines functions; alert_machine_headers says what it is for.
+# shellcheck source=infra/lib/secret-header.sh
+if [ -r "$(dirname "${BASH_SOURCE[0]}")/../lib/secret-header.sh" ]; then . "$(dirname "${BASH_SOURCE[0]}")/../lib/secret-header.sh"; fi
 # Who files: the watchdog unless the sourcing script names itself
 # (the cluster converge signs its tenant-check refusals as
 # automation:cluster-deploy-runner, backlog 1af5119d) — an alert that
@@ -56,6 +60,42 @@ alert_people_api() {
     printf '%s://%s:%s' "$scheme" "${hostport%%:*}" "$port"
 }
 
+# alert_machine_headers — the estate machine token for this lib's two
+# requests, PRESENTED AND NEVER REQUIRED (design 6805c764; backlog
+# 2710c8fc). Both go to the system of record and nowhere else: the
+# alert's POST to the jobs port (ALERT_MT_HDR) and the owner read on the
+# people port of the same host (ALERT_PEOPLE_MT_HDR). Each header is
+# made for its own URL, and the reader stamps only a host on the
+# estate's list, so an ALERT_API pointed anywhere else gets none.
+#
+# `alert` and `alert_replay` call this FIRST, in the caller's own shell:
+# the owner read runs two `$(…)` deep, and the reader refuses a first
+# call inside a subshell. The watchdog sets its `trap … EXIT` before its
+# first alert, which is the order the reader's chained cleanup needs.
+# Sourced inside `( … )` (the converge's tenant_check_alert), the call
+# is in a subshell: it stamps when the converge opened the header
+# directory first, and otherwise the reader says so and the alert goes
+# out unstamped.
+#
+# It cannot stop an alert. No lib, no slot, a slot the reader refuses, a
+# host off the list, a header file that cannot be made: both variables
+# are empty and the alert is raised, filed or kept exactly as before —
+# the alert that matters most is "the system of record is dark".
+alert_machine_headers() {
+    ALERT_MT_HDR="" ALERT_PEOPLE_MT_HDR=""
+    declare -F machine_token_header >/dev/null || return 0
+    machine_token_header ALERT_MT_HDR "$ALERT_API" || ALERT_MT_HDR=""
+    if [ -z "${BOSS_PLATFORM_OWNER:-}" ]; then
+        # alert_people_api always returns 0: no table or no port is an
+        # empty answer, and an empty answer makes no header.
+        local api; api=$(alert_people_api)
+        if [ -n "$api" ]; then
+            machine_token_header ALERT_PEOPLE_MT_HDR "$api" || ALERT_PEOPLE_MT_HDR=""
+        fi
+    fi
+    return 0
+}
+
 # alert_owner — the owner_id an alert is filed with. Pure shell + awk
 # (the forge units must not need jq or python): the roster is split at
 # object boundaries, each object's id and hire_date are lifted off its
@@ -66,7 +106,7 @@ alert_owner() {
     if [ -n "${BOSS_PLATFORM_OWNER:-}" ]; then printf '%s' "$BOSS_PLATFORM_OWNER"; return; fi
     local api; api=$(alert_people_api)
     [ -n "$api" ] || return 0
-    curl -s --max-time 5 -H "x-boss-user: $ALERT_USER" \
+    curl -s --max-time 5 ${ALERT_PEOPLE_MT_HDR:+-H "$ALERT_PEOPLE_MT_HDR"} -H "x-boss-user: $ALERT_USER" \
         "$api/api/people?role=platform-admin&status=active" 2>/dev/null \
         | tr '}' '\n' \
         | awk -F'"' '{ id=""; hd="~"
@@ -103,7 +143,7 @@ python_free_json() {
 alert_post() {
     local code
     code=$(printf '%s' "$1" | curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
-        -X POST -H 'content-type: application/json' -H "x-boss-user: $ALERT_USER" \
+        -X POST -H 'content-type: application/json' ${ALERT_MT_HDR:+-H "$ALERT_MT_HDR"} -H "x-boss-user: $ALERT_USER" \
         --data-binary @- "$ALERT_API/api/jobs") || return 1
     [ "$code" = "201" ]
 }
@@ -113,6 +153,7 @@ alert_count() { [ -d "$ALERT_SPOOL" ] || { echo 0; return; }; ls -1 "$ALERT_SPOO
 
 # alert TITLE DETAIL — raise an alert: journal it, file it, or keep it.
 alert() {
+    alert_machine_headers
     local body; body=$(alert_body "$1" "$2")
     echo "ALERT: $1 — $2" >&2
     if alert_post "$body"; then
@@ -129,6 +170,7 @@ alert() {
 # alert_replay — file every kept alert, oldest first; stop at the first failure.
 alert_replay() {
     local n f; n=$(alert_count); [ "$n" -gt 0 ] || return 0
+    alert_machine_headers
     echo "alert: filing $n kept alert(s), oldest first" >&2
     for f in $(ls -1 "$ALERT_SPOOL" | grep '\.json$' | sort); do
         if alert_post "$(cat "$ALERT_SPOOL/$f")"; then rm -f "$ALERT_SPOOL/$f"; else echo "alert: replay stopped at $f — $(alert_count) still waiting" >&2; return 1; fi

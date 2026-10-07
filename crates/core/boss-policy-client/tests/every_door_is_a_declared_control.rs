@@ -18,6 +18,12 @@
 //! each with the reason its resource is data, held to its count and to
 //! the digest of its ask lines (car 1's review, L1). A door that asks
 //! for a static pair raw is refused, naming the const to ask instead.
+//! Since the release review of car 2 (005eb5b4, LOW-1) "raw" also means
+//! the four shapes that hid an ask from the first scan: a check naming
+//! its resource with no `Action::` in sight (a const's `.action()` with
+//! another resource), a glob or braced import of the verbs, a verb parsed
+//! from text, and any ask below a test-only item in the middle of a file
+//! (the cut is the test module now, not the first `#[cfg(test)]`).
 //! Two more pins ride beside it: every declared control is asked by
 //! some door (a const no door asks would be a control coverage reports
 //! that nothing checks), and every `scope_of` read names a `READ_`
@@ -36,6 +42,12 @@ use boss_policy_client::controls::CONTROLS;
 /// many raw asks the scan sees; `digest` hashes those lines and the
 /// resource tokens beside them, so an ask changed in place fails too.
 const RAW_ASKS: &[RawAsk] = &[
+    RawAsk {
+        file: "crates/core/boss-jobs/src/http/signer.rs",
+        mentions: 1,
+        digest: "db53570313edd2cf",
+        why: "signer SignOff on step-signoff:<role>, a required role named by the admitted workflow; static step Update uses UPDATE_STEP",
+    },
     RawAsk {
         file: "crates/core/boss-jobs/src/http/steps.rs",
         mentions: 2,
@@ -71,6 +83,22 @@ const RAW_ASKS: &[RawAsk] = &[
         why: "the engine's scope_predicate is check(Read) on the resource its caller names",
     },
     RawAsk {
+        file: "crates/core/boss-policy-client/src/coverage.rs",
+        mentions: 1,
+        digest: "84462133fa9e6b4e",
+        why: "coverage itself, not a door: it imports SignOff and Update bare to build the \
+              step-signoff controls off the workflows and to read the claim door's three \
+              routes (seen since review 005eb5b4 made a braced import count)",
+    },
+    RawAsk {
+        file: "crates/core/boss-policy-client/src/defaults.rs",
+        mentions: 1,
+        digest: "b4dd46a563156089",
+        why: "the shipped default rules, a grant table and not a door: it imports every verb \
+              bare to spell the platform roles' rows (seen since review 005eb5b4 made a glob \
+              import count)",
+    },
+    RawAsk {
         file: "crates/core/boss-policy-client/src/lib.rs",
         mentions: 4,
         digest: "a428b54a5135ea96",
@@ -78,8 +106,8 @@ const RAW_ASKS: &[RawAsk] = &[
     },
     RawAsk {
         file: "crates/core/boss-policy-client/src/role_reporting.rs",
-        mentions: 5,
-        digest: "ce25d1644ea1fe52",
+        mentions: 6,
+        digest: "0698f2b27d97eae4",
         why: "the report-only PolicyClient decorator forwards the caller's dynamic action/resource; \
               a scope read compares Read on that same caller-supplied resource",
     },
@@ -106,8 +134,23 @@ fn ident(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || !b.is_ascii()
 }
 
+/// The forms that hand a door a verb no `Action::<verb>` names: a glob or
+/// braced import (every bare `Create` after it is invisible to the
+/// scan), and a verb parsed from text (review 005eb5b4 of car 2, LOW-1).
+const VERB_SOURCES: [&str; 4] = [
+    "Action::*",
+    "Action::{",
+    "Action::from_str(",
+    "parse::<Action>",
+];
+
+/// The calls that ask policy a pair: a check whose resource is named on
+/// the call itself is an ask, whatever names its verb.
+const CHECK_CALLS: [&str; 2] = [".check(", ".check_until("];
+
 /// How many raw policy asks the scan sees on one line of code: an
-/// `Action::<verb>` standing alone, or a `.scope_predicate(` call.
+/// `Action::<verb>` standing alone, a `.scope_predicate(` call, or a verb
+/// brought in bare or parsed ([`VERB_SOURCES`]).
 fn asks_on(line: &str) -> usize {
     let bytes = line.as_bytes();
     let alone_before = |at: usize| at == 0 || !ident(bytes[at - 1]);
@@ -122,16 +165,62 @@ fn asks_on(line: &str) -> usize {
                 .any(|v| rest.starts_with(v) && alone_after(at + needle.len() + v.len()))
         })
         .count();
-    verbs + line.matches(".scope_predicate(").count()
+    let sources: usize = VERB_SOURCES
+        .iter()
+        .map(|needle| {
+            line.match_indices(needle)
+                .filter(|(at, _)| alone_before(*at))
+                .count()
+        })
+        .sum();
+    verbs + sources + line.matches(".scope_predicate(").count()
+}
+
+/// Checks whose verb the scan cannot see but whose resource it can: a
+/// `.check(` or `.check_until(` call with a `Resource::<name>` on its
+/// line or the [`RESOURCE_WINDOW`] lines after it, and no counted ask in
+/// that span — `check(user, CREATE_CLASS.action(), Resource::ledger())`
+/// asks a static pair raw with no `Action::` in sight (005eb5b4, LOW-1).
+/// A check whose resource is data (`body.resource`) names none.
+fn unnamed_verb_checks(lines: &[&str]) -> Vec<usize> {
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| CHECK_CALLS.iter().any(|c| l.contains(c)))
+        .filter_map(|(i, _)| {
+            let to = (i + RESOURCE_WINDOW).min(lines.len().saturating_sub(1));
+            let span = &lines[i..=to];
+            let named = span.iter().any(|l| !resource_tokens(l).is_empty());
+            let counted = span.iter().any(|l| asks_on(l) > 0);
+            (named && !counted).then_some(i)
+        })
+        .collect()
 }
 
 /// The code lines of one source file the scan reads: everything before
-/// its first `#[cfg(test)]`, with a comment line blanked (kept, so the
-/// resource window counts real lines) — the triage's own cut.
+/// its test module — a `#[cfg(test)]` whose item is a `mod` — with a
+/// comment line blanked (kept, so the resource window counts real
+/// lines). Until review 005eb5b4 (LOW-1) the cut was the FIRST
+/// `#[cfg(test)]`, so a test-only helper mid-file hid every ask below it.
 fn code_lines(source: &str) -> Vec<&str> {
-    source
-        .lines()
-        .take_while(|l| !l.trim_start().starts_with("#[cfg(test)]"))
+    let lines: Vec<&str> = source.lines().collect();
+    let test_module = |i: usize| {
+        lines[i].trim_start().starts_with("#[cfg(test)]")
+            && lines[i + 1..]
+                .iter()
+                .map(|l| l.trim_start())
+                .find(|l| !l.is_empty() && !l.starts_with("#[") && !l.starts_with("//"))
+                .is_some_and(|l| {
+                    l.starts_with("mod ")
+                        || l.starts_with("pub(crate) mod ")
+                        || l.starts_with("pub mod ")
+                })
+    };
+    let end = (0..lines.len())
+        .find(|&i| test_module(i))
+        .unwrap_or(lines.len());
+    lines[..end]
+        .iter()
         .map(|l| {
             if l.trim_start().starts_with("//") {
                 ""
@@ -175,10 +264,11 @@ fn fnv(text: &str) -> String {
 /// One file's raw-ask count and digest.
 fn door_of(source: &str) -> (usize, String) {
     let lines = code_lines(source);
+    let unnamed = unnamed_verb_checks(&lines);
     let mut count = 0;
     let mut parts: Vec<String> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        let n = asks_on(line);
+        let n = asks_on(line) + usize::from(unnamed.contains(&i));
         if n == 0 {
             continue;
         }
@@ -353,13 +443,51 @@ fn the_scan_counts_a_policy_verb_and_not_a_lookalike() {
     assert_eq!(asks_on("boss_policy_client::Action::Read,"), 1);
     assert_eq!(asks_on("CarAction::Retire { name } =>"), 0);
     assert_eq!(asks_on("Action::Reader"), 0);
-    assert_eq!(asks_on("use Action::{Close, Create};"), 0);
     assert_eq!(asks_on("    .scope_predicate(user, Resource::job())"), 1);
     assert_eq!(asks_on("policy.ask(user, controls::CREATE_CLASS)"), 0);
     assert_eq!(
-        door_of("x(Action::Read);\n// Action::Update\n#[cfg(test)]\nAction::Close").0,
+        door_of("x(Action::Read);\n// Action::Update\n#[cfg(test)]\nmod tests {\nAction::Close").0,
         1
     );
+}
+
+/// The four evasions the release review of car 2 found (005eb5b4,
+/// LOW-1), each an ask the scan read as none. Folded into car 3 of
+/// design 1c4e42e1.
+#[test]
+fn the_scan_sees_the_four_evasions_of_review_005eb5b4() {
+    // 1. A const's verb with another resource: no `Action::` at all.
+    assert_eq!(
+        door_of("policy.check(user, CREATE_CLASS.action(), Resource::ledger())").0,
+        1
+    );
+    assert_eq!(
+        door_of(
+            "    .check(\n        &user,\n        verb,\n        Resource::new(\"estate\"),\n    )"
+        )
+        .0,
+        1,
+        "the resource on a later line of the call"
+    );
+    // ... and not a check whose resource is data, nor one already
+    // counted by its verb.
+    assert_eq!(
+        door_of("engine.check(&body.user, body.action, body.resource)").0,
+        0
+    );
+    assert_eq!(door_of("p.check(u, Action::Read, Resource::job())").0, 1);
+    // 2. Verbs brought in bare: every later `Create` is invisible.
+    assert_eq!(asks_on("    use Action::*;"), 1);
+    assert_eq!(asks_on("use Action::{Close, Create};"), 1);
+    // 3. An ask below a test-only item in the MIDDLE of a file: the cut
+    // is the test module, not the first `#[cfg(test)]`.
+    assert_eq!(
+        door_of("#[cfg(test)]\nfn helper() {}\nfn door() { x(Action::Read) }\n#[cfg(test)]\nmod tests {}").0,
+        1
+    );
+    // 4. A verb parsed from text.
+    assert_eq!(asks_on("let v = Action::from_str(\"create\")?;"), 1);
+    assert_eq!(asks_on("let v: Action = s.parse::<Action>()?;"), 1);
 }
 
 /// Review L1, the mutation that stayed green under a count alone: the

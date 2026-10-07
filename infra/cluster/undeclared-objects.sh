@@ -115,9 +115,12 @@
 #   undeclared-objects.sh --exemptions
 #   undeclared-objects.sh --exemptions-derived
 #       the generated per-instance objects (ConfigMap/<ns>/boss-tenant
-#       for every tenant_repo instance in instances.toml, and
-#       ConfigMap/<ns>/boss-site for every one that declares a site) —
-#       exempt when present, never stale when absent
+#       for every tenant_repo instance in instances.toml,
+#       ConfigMap/<ns>/boss-site for every one that declares a site, and
+#       for EVERY instance the object infra/estate/
+#       render-dev-door-config.sh says it renders) — exempt when
+#       present, never stale when absent. exit 4 when the renderer is
+#       there and what it renders cannot be read.
 #       the exemption entries, as `Kind/ns/name` or `Kind/name`.
 #   undeclared-objects.sh --kubectl
 #       the resolved kubectl argv, so a caller needing its own kubectl
@@ -224,11 +227,54 @@ EXEMPT=(
 # with awk the way render-instance.sh reads the file (one key per line).
 # An instance that also declares a `site` (design b64c4377) gets its
 # site delivered the same way, as ConfigMap/<namespace>/boss-site.
+#
+# AND EVERY INSTANCE GETS THE RENDERED RUNTIME CONFIG (backlog cb0c9937).
+# The converge calls $RENDERER once for the source instance's namespace
+# and once for each other instance it applies (`converge_dev_door` in
+# infra/forge/cluster-deploy-runner.sh — both call sites pinned by
+# boss-testing's undeclared_objects_sh.rs), so the object it renders is
+# derived for EVERY instance namespace, repo-sourced or not, and for no
+# other: the same name in boss-dev, which is no instance, is an orphan.
+# Measured 2026-10-06: the renderer arrived in train #916 (2026-10-03)
+# with no entry here, and converge packets 8d5c8f93 and 79f23714 closed
+# FAILED at `check orphans` on ConfigMap/boss/boss-instance-config — the
+# object the same run had just applied — so the stage after it, rolling
+# the other instances to the new head, never ran.
+#
+# THE NAME IS THE RENDERER'S, READ, NOT TYPED HERE (CLAUDE.md §9a): its
+# one `RENDERS="Kind/name"` line, taken as TEXT — never by running a
+# script out of $TREE, which `delete-orphan-object` reads as root. A tree
+# with no renderer renders nothing and derives nothing. A renderer whose
+# line cannot be read is NOT that: the exemption would vanish in silence,
+# the rendered object would read as undeclared, and the verb that takes
+# its authority from this computation could be asked to delete it. So
+# that case returns 1 and every caller says CANNOT ANSWER.
+RENDERER_REL="infra/estate/render-dev-door-config.sh"
 derived_exemptions() {
     local f="$TREE/infra/cluster/instances.toml"
     [ -f "$f" ] || return 0
-    awk '
+    local renderer="$TREE/$RENDERER_REL" rendered=""
+    if [ -f "$renderer" ]; then
+        rendered=$(LC_ALL=C awk '
+            /^RENDERS="[A-Z][A-Za-z0-9]*\/[a-z0-9]([a-z0-9.-]*[a-z0-9])?"[[:space:]]*$/ {
+                n++; v = $0; sub(/^RENDERS="/, "", v); sub(/"[[:space:]]*$/, "", v)
+            }
+            END { if (n == 1) print v }
+        ' "$renderer")
+        if [ -z "$rendered" ]; then
+            say "cannot read what $RENDERER_REL renders — it must carry exactly one line"
+            say "  RENDERS=\"Kind/name\" at column 0. Refusing to answer without the exemption that line"
+            say "  derives: the object it renders would read as undeclared, and deletable."
+            return 1
+        fi
+    fi
+    awk -v rendered="$rendered" '
         function flush() {
+            if (ns != "" && rendered != "") {
+                kind = rendered; sub(/\/.*/, "", kind)
+                name = rendered; sub(/^[^\/]*\//, "", name)
+                print kind "/" ns "/" name
+            }
             if (ns != "" && repo != "") {
                 print "ConfigMap/" ns "/boss-tenant"
                 if (site != "") print "ConfigMap/" ns "/boss-site"
@@ -398,7 +444,10 @@ if [ "$MODE" = "--exemptions" ]; then
     exit 0
 fi
 if [ "$MODE" = "--exemptions-derived" ]; then
-    derived_exemptions
+    # Its refusal is carried out as CANNOT ANSWER: an exemption set this
+    # run failed to derive is not a smaller exemption set.
+    DERIVED_EXEMPT=$(derived_exemptions) || exit "$CANNOT_ANSWER"
+    [ -z "$DERIVED_EXEMPT" ] || printf '%s\n' "$DERIVED_EXEMPT"
     exit 0
 fi
 
@@ -450,6 +499,15 @@ objects_in_file() { # path
     objects_from_json "$TMP/parse.json" "$rel" templates >> "$TMP/templates"
 }
 : > "$TMP/templates"
+WORKER_DECLARATION="$TREE/infra/consist-worker/job.json"
+WORKER_READER="$(dirname "${BASH_SOURCE[0]}")/../consist-worker/declaration.py"
+if [ -f "$WORKER_DECLARATION" ]; then
+    # The generator consumes this exact fixed spec. This declares a shape,
+    # not a creator: labels alone never recognize these retained workers.
+    python3 "$WORKER_READER" --declaration "$WORKER_DECLARATION" \
+        infra/consist-worker/job.json >> "$TMP/templates" \
+        || cannot_answer "cannot read owning consist worker declaration"
+fi
 
 # --- what the tree declares ------------------------------------------------
 declared_converged="$TMP/declared-converged"
@@ -496,7 +554,6 @@ is_exempt() { # kind ns name
     done
     return 1
 }
-DERIVED_EXEMPT=$(derived_exemptions)
 
 is_excluded_kind() { # kind
     local k
@@ -559,6 +616,11 @@ mapfile -t pairs < <(LC_ALL=C awk -F'\t' -v mns="$(printf '%s\n' "${managed_ns[@
 # kinds, because a template is a claim on what it stamped, not on the
 # kind everywhere. Templates are read from every manifest this script
 # reads, converged or not, like the objects in $declared_all.
+# The isolated consist generator shares infra/consist-worker/job.json
+# with this reader. Its exact fixed spec and bounded launch fields must
+# also match: a copied app label alone declares no worker. API defaults
+# are normalized narrowly by declaration.py. Historical script payloads
+# are retained shapes, never authenticated creators or execution proof.
 mapfile -t template_pairs < <(LC_ALL=C awk -F'\t' -v mns="$(printf '%s\n' "${managed_ns[@]}")" '
     BEGIN { n = split(mns, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") own[a[i]] = 1 }
     $2 != "" && ($2 in own) { print $1 "\t" $2 }
@@ -628,7 +690,16 @@ template_names() { # kind ns
     local sel file names
     while IFS=$'\t' read -r sel file; do
         [ -n "$sel" ] || continue
-        names=$(live_selected_names "$1" "$2" "$sel") || return 1
+        if [ "$file" = infra/consist-worker/job.json ]; then
+            if ! "${KUBECTL[@]}" get "$1" -n "$2" -l "$sel" -o json \
+                    --request-timeout=10s > "$TMP/workers.json" 2> "$TMP/get.err"; then
+                return 1
+            fi
+            names=$(python3 "$WORKER_READER" --names "$WORKER_DECLARATION" \
+                "$TMP/workers.json" 2> "$TMP/get.err") || return 1
+        else
+            names=$(live_selected_names "$1" "$2" "$sel") || return 1
+        fi
         [ -n "$names" ] || continue
         printf '%s\n' "$names" | LC_ALL=C awk -v s="$sel" -v f="$file" '{ print $0 "\t" s "\t" f }'
     done <<EOF
@@ -660,6 +731,13 @@ owner_of() { # kind ns name
     "${KUBECTL[@]}" get "$1" "$3" -n "$2" \
         -o 'jsonpath={.metadata.ownerReferences[0].kind}' --request-timeout=10s 2>"$TMP/owner.err"
 }
+
+# The derived exemptions, for the two modes that decide "undeclared" —
+# after every mode that does not (--namespaces, --declared, --kubectl
+# answer without them, and are not refused over them). A derivation that
+# FAILED is CANNOT ANSWER here, before either mode can name an object:
+# see derived_exemptions for what a silently shorter set would allow.
+DERIVED_EXEMPT=$(derived_exemptions) || exit "$CANNOT_ANSWER"
 
 # ---------------------------------------------------------------------------
 # --check: one object, and the name of whatever refuses it.
@@ -721,7 +799,7 @@ if [ "$MODE" = "--check" ]; then
         hit=$(LC_ALL=C awk -F'\t' -v n="$name" '$1 == n { print $2 " (" $3 ")"; exit }' <<<"$stamped")
         if [ -n "$hit" ]; then
             say "REFUSED $kind/$ns/$name — the tree DECLARES it by template: it carries $hit,"
-            say "  the literal labels of a generateName $kind template."
+            say "  matched by its owning $kind template (consist workers also require the fixed isolated spec)."
             exit 3
         fi
     fi

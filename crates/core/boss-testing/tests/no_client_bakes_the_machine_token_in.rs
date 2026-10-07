@@ -63,6 +63,11 @@ const BAKED: &[(&str, &str)] = &[];
 /// carries the token on every request and follows no redirect.
 const SPELLERS: &[(&str, &str)] = &[
     (
+        "crates/orchestrators/boss-cli/src/probe_reader.rs",
+        "the per-probe private Unix socket stamps its parent-held scoped reader credential; \
+         its client follows no redirects, uses no proxy, and forwards only pinned GET/HEAD.",
+    ),
+    (
         "crates/core/boss-core/src/machine_token.rs",
         "the definition, and the stamp every machine client applies.",
     ),

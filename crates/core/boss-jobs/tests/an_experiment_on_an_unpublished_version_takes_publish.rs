@@ -104,7 +104,7 @@ fn spec(version: i32, status: WorkflowStatus) -> WorkflowSpec {
 
 /// v1 ran and was superseded, v2 is live, v3 is a draft nobody published.
 fn seeded() -> Arc<InMemoryWorkflows> {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     for s in seedable_platform_workflows()
         .into_iter()
         .filter(|s| s.kind == EXPERIMENT_KIND)

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+if [[ ( -e /etc/boss-dev-control/enabled || -L /etc/boss-dev-control/enabled ) && "$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}")" != /opt/boss-dev-control/generations/*/infra/dev/boss-api ]]; then
+    exec /opt/boss-dev-control/boss-api "$@"
+fi
 # boss-api METHOD /api/path [body.json] — the door to the system of record.
 #
 # The curl wrapper every session, probe and builder uses to read and

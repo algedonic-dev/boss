@@ -1,3 +1,4 @@
+import { isPageWrite } from './_smokeMocks';
 // /ux/parts — "Ingredients & parts" (department warehouse), every
 // control and render state pinned as the page behaves TODAY (page audit
 // 63d810aa, step `test`).
@@ -129,16 +130,16 @@ const ORDERS_BODY = [
 /// The table, in the page's sort order, cell by cell:
 /// Part SKU · Name · Kind · On hand · Allocated · Reorder pt · On order · Status · Used by · Bin.
 const ROWS: ReadonlyArray<ReadonlyArray<string>> = [
-  ['PKG-CAN-01', '16oz can', 'packaging', '1000', '1000', '500', '2000', 'out', '0', 'B-01'],
-  ['ING-HOPS-01', 'Citra hops', 'ingredient', '30', '0', '100', '250', 'critical', '0', 'A-02'],
+  ['PKG-CAN-01', '16oz can', 'packaging', '1000', '1000', '500', '2000', 'out', 'Not tracked', 'B-01'],
+  ['ING-HOPS-01', 'Citra hops', 'ingredient', '30', '0', '100', '250', 'critical', 'Not tracked', 'A-02'],
   ['SP-GASKET-01', 'Tri-clamp gasket', 'spare', '12', '2', '10', '—', 'low', '2', 'C-01'],
-  ['ING-MALT-01', 'Pale malt', 'ingredient', '500', '100', '200', '—', 'healthy', '0', 'A-01'],
+  ['ING-MALT-01', 'Pale malt', 'ingredient', '500', '100', '200', '—', 'healthy', 'Not tracked', 'A-01'],
   ['CN-CIP-01', 'CIP caustic', 'consumable', '40', '0', '10', '—', 'healthy', '1', 'C-02'],
   // Stocked under a catalog MODEL's sku: no name from either source, so
   // the name is the SKU; kind from the prefix fallback; Used by "—".
   ['DM-KEG-1', 'DM-KEG-1', 'spare', '3', '0', '1', '—', 'healthy', '—', 'D-01'],
   // Catalogued, no inventory row (4cb8c06a): no stock figures to show.
-  ['ING-YEAST-01', 'Ale yeast', 'ingredient', '—', '—', '—', '—', 'never stocked', '0', '—'],
+  ['ING-YEAST-01', 'Ale yeast', 'ingredient', '—', '—', '—', '—', 'never stocked', 'Not tracked', '—'],
 ];
 const SKUS = ROWS.map((r) => r[0]!);
 
@@ -159,7 +160,6 @@ async function installParts(page: Page): Promise<void> {
 
 /// The shell's own non-GET: App.svelte records every route open
 /// (shell/surface-opens.ts). It is the chrome's write, not this page's.
-const SHELL_WRITES: ReadonlySet<string> = new Set(['/api/surface-opens']);
 
 /// Every read of the page's four paths, and every non-GET it sends.
 function watch(page: Page): { reads: string[]; writes: Request[] } {
@@ -168,7 +168,7 @@ function watch(page: Page): { reads: string[]; writes: Request[] } {
     const url = new URL(req.url());
     if (!url.pathname.startsWith('/api/')) return;
     if (req.method() !== 'GET') {
-      if (!SHELL_WRITES.has(url.pathname)) seen.writes.push(req);
+      if (isPageWrite(req.method(), url.pathname)) seen.writes.push(req);
       return;
     }
     if (READ_PATHS.has(url.pathname)) seen.reads.push(url.pathname);
@@ -230,20 +230,27 @@ test.describe('/ux/parts — State A, the parts module off (the live instance)',
     });
   }
 
-  // Measured while writing this spec: with no inlined manifest (the
-  // fetch fallback), the page behind the gate mounts first and makes
-  // its four reads before the notice replaces it. On a served page the
-  // gateway inlines the manifest, so this is the fallback's behaviour,
-  // not the live instance's.
-  test('without an inlined manifest the page behind the gate reads once before the notice replaces it', async ({ page }) => {
+  // Gap 1 (a1fcee7b): an unread manifest authorizes no Parts reads.
+  // Hold its answer to distinguish loading from known disabled.
+  test('without an inlined manifest Parts waits without reads before the disabled answer', async ({ page }) => {
     const seen = watch(page);
     await installParts(page);
-    await installTenantManifest(page, MODULES_LIVE);
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    await page.route(/\/api\/tenant\/manifest$/, async (r) => {
+      await held;
+      await json(r, { display_name: 'Algedonic', tenant_id: 'algedonic', modules: MODULES_LIVE });
+    });
     await mountPage(page, PATH);
+    await expect(page.getByRole('status').filter({ hasText: 'Loading tenant manifest' })).toBeVisible();
+    expect(seen.reads).toEqual([]);
+    expect(seen.writes).toEqual([]);
+    await expect(page.locator('.catalog-filters')).toHaveCount(0);
+    release();
     await expect(page.locator('.module-disabled h1')).toHaveText('Not enabled for this tenant');
     await expect(page.locator('.catalog-filters')).toHaveCount(0);
-    expect(await settledReads(page, () => seen.reads.length, 4)).toBe(4);
-    expect([...seen.reads].sort()).toEqual([...READ_PATHS].sort());
+    expect(seen.reads).toEqual([]);
+    expect(seen.writes).toEqual([]);
   });
 });
 
@@ -316,9 +323,23 @@ test.describe('/ux/parts — State B, the module on: the list', () => {
     ]);
     await expect(button(page, /^Spare parts/)).toHaveCount(0);
     await expect(button(page, /^Consumables/)).toHaveCount(0);
-    // Gap 9 (e709ee79): with no device linkage every row reads "used by 0".
-    await expect(body(page).locator('tbody tr td:nth-child(9)')).toHaveText(['0', '0', '0', '0']);
+    // Gap 9 (e709ee79): absence of model linkage is untracked, not unused.
+    await expect(body(page).locator('tbody tr td:nth-child(9)')).toHaveText(['Not tracked', 'Not tracked', 'Not tracked', 'Not tracked']);
   });
+});
+
+test('model usage distinguishes linked parts from an untracked stocked SKU without guessing its kind', async ({ page }) => {
+  const seen = watch(page);
+  await installParts(page);
+  await page.route(ITEMS, (r) => json(r, [...ITEMS_BODY, item('SP-UNTRACKED-01', 5, 0, 1, 'E-01')]));
+  await mountPage(page, PATH);
+  const row = (sku: string) => body(page).locator('tbody tr').filter({ has: page.getByRole('link', { name: sku, exact: true }) });
+  await expect(row('SP-GASKET-01').locator('td').nth(8)).toHaveText('2');
+  await expect(row('CN-CIP-01').locator('td').nth(8)).toHaveText('1');
+  await expect(row('DM-KEG-1').locator('td').nth(8)).toHaveText('—');
+  await expect(row('SP-UNTRACKED-01').locator('td').nth(8)).toHaveText('Not tracked');
+  await expect(row('SP-UNTRACKED-01').locator('td').nth(3)).toHaveText('5');
+  expect(seen.writes).toEqual([]);
 });
 
 test.describe('/ux/parts — State B: every filter button does what its label says', () => {
@@ -585,15 +606,65 @@ test.describe('/ux/parts — State B: empty, loading, and a failed read', () => 
     await expect(body(page).locator('table')).toHaveCount(0);
   });
 
-  // Gap 4 (61c16b17): the purchase-order read is not a primary; its
-  // outage paints "—" in every On order cell, the paint of "nothing on
-  // order", with no failure line.
-  test('a failed purchase-order read is swallowed: every On order cell reads "—"', async ({ page }) => {
+  // Gap 4 (61c16b17): this secondary read retains its own knowledge;
+  // an outage cannot claim no orders or discard the usable catalog.
+  test('a failed purchase-order read preserves parts and marks On order unknown', async ({ page }) => {
     await installParts(page);
     await page.route(ORDERS, (r) => json(r, { error: 'down' }, 503));
     await mountParts(page);
+    await expect(body(page).locator('tbody tr td:nth-child(7)')).toHaveText(Array(ROWS.length).fill('Unknown'));
+    await expect(page.locator(FAILURE_MARKER)).toHaveText("Couldn't load purchase orders — /api/inventory/orders: HTTP 503");
+    await expect(page.locator(FAILURE_MARKER)).toHaveAttribute('role', 'alert');
+  });
+
+  test('a pending purchase-order read leaves the catalog usable with loading quantities', async ({ page }) => {
+    await installParts(page);
+    let release: (() => void) | undefined;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    await page.route(ORDERS, async (r) => {
+      await pending;
+      await json(r, ORDERS_BODY);
+    });
+    try {
+      await mountParts(page);
+      await expect(body(page).locator('tbody tr td:nth-child(7)')).toHaveText(Array(ROWS.length).fill('Loading…'));
+      await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
+    } finally {
+      release?.();
+    }
+    await expect(body(page).locator('tbody tr td:nth-child(7)')).toHaveText(ROWS.map((r) => r[6]!));
+  });
+
+  test('a purchase-order network failure names its source and preserves the catalog', async ({ page }) => {
+    await installParts(page);
+    await page.route(ORDERS, (r) => r.abort('failed'));
+    await mountParts(page);
+    await expect(body(page).locator('tbody tr td:nth-child(7)')).toHaveText(Array(ROWS.length).fill('Unknown'));
+    await expect(page.locator(FAILURE_MARKER)).toHaveText("Couldn't load purchase orders — /api/inventory/orders: Failed to fetch");
+  });
+
+  test('invalid purchase-order JSON names the read without discarding known stock', async ({ page }) => {
+    await installParts(page);
+    await page.route(ORDERS, (r) => r.fulfill({ status: 200, contentType: 'application/json', body: '{' }));
+    await mountParts(page);
+    await expect(body(page).locator('tbody tr td:nth-child(7)')).toHaveText(Array(ROWS.length).fill('Unknown'));
+    await expect(page.locator(FAILURE_MARKER)).toContainText("Couldn't load purchase orders — /api/inventory/orders:");
+  });
+
+  test('a confirmed empty purchase-order list alone means none on order', async ({ page }) => {
+    await installParts(page);
+    await page.route(ORDERS, (r) => json(r, []));
+    await mountParts(page);
     await expect(body(page).locator('tbody tr td:nth-child(7)')).toHaveText(Array(ROWS.length).fill('—'));
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
+  });
+
+  test('malformed purchase-order quantities are unknown rather than zero', async ({ page }) => {
+    await installParts(page);
+    await page.route(ORDERS, (r) => json(r, [{ id: 'bad', status: 'submitted', lines: [{ part_sku: 'hops', qty: '250' }] }]));
+    await mountParts(page);
+    await expect(body(page).locator('tbody tr td:nth-child(7)')).toHaveText(Array(ROWS.length).fill('Unknown'));
+    await expect(page.locator(FAILURE_MARKER)).toContainText('/api/inventory/orders: HTTP 200');
   });
 
   // Gap 7 (b6b74115), fixed: a 200 whose body is neither a list nor
@@ -601,9 +672,8 @@ test.describe('/ux/parts — State B: empty, loading, and a failed read', () => 
   // that painted every catalogued part as never stocked (0f239091). It
   // is a failed read naming the read and what came back. 0ef5e008 fixed
   // the three row sources; b6b74115 holds the purchase-order read to it
-  // too, since a contract break is not an outage (gap 4 is the outage).
-  // Each read, one at a time: the line names it, and no part is called
-  // never stocked on a read that said nothing about stock.
+  // too. A malformed PO list invalidates quantities, while the three
+  // independent primary reads still establish stock and catalog facts.
   for (const [path, re] of [
     ['/api/catalog/models', MODELS],
     ['/api/inventory/items', ITEMS],
@@ -617,9 +687,14 @@ test.describe('/ux/parts — State B: empty, loading, and a failed read', () => 
 
       const failed = page.locator(FAILURE_MARKER);
       await expect(failed).toHaveText(
-        `Couldn't load parts — ${path}: HTTP 200, but the body is an object with no data list, not a list or a {data: [...]} envelope`,
+        `${path === '/api/inventory/orders' ? "Couldn't load purchase orders" : "Couldn't load parts"} — ${path}: HTTP 200, but the body is an object with no data list, not a list or a {data: [...]} envelope`,
       );
       await expect(failed).toHaveAttribute('role', 'alert');
+      if (path === '/api/inventory/orders') {
+        await expect(skuColumn(page)).toHaveText(SKUS);
+        await expect(body(page).locator('tbody tr td:nth-child(7)')).toHaveText(Array(ROWS.length).fill('Unknown'));
+        return;
+      }
       await expect(body(page).locator('table')).toHaveCount(0);
       await expect(page.getByText('never stocked', { exact: true })).toHaveCount(0);
       await expect(body(page).getByRole('button', { name: /never stocked/i })).toHaveCount(0);

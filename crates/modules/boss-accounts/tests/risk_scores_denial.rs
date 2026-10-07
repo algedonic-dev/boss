@@ -60,3 +60,39 @@ async fn an_admitted_caller_with_nothing_scored_gets_an_empty_200() {
     assert_eq!(list["accounts"], serde_json::json!([]));
     assert_eq!(list["total_scored"], 0);
 }
+
+#[tokio::test]
+async fn observed_risk_refusal_stays_forbidden_when_the_registry_role_is_broad() {
+    use boss_policy_client::role_reader::{
+        MonotonicRoleSnapshotClock, RegistryRoles, SnapshotRoleReader,
+    };
+    use boss_policy_client::role_reporting::{ReportMode, ReportTally};
+    use std::sync::Arc;
+    let roles = Arc::new(SnapshotRoleReader::new(
+        std::time::Duration::from_secs(30),
+        Arc::new(MonotonicRoleSnapshotClock),
+    ));
+    let ticket = roles.begin_refresh();
+    assert!(roles.finish_refresh(ticket,Ok(RegistryRoles::from_sources(serde_json::json!({"data":[{"id":"emp-field","aliases":[],"role":"platform-admin"}],"total":1}),serde_json::json!({"data":[],"total":0}),serde_json::json!([])).unwrap())));
+    let tally = Arc::new(ReportTally::new(8));
+    let reporter = Arc::new(boss_policy_client::role_guard::RoleGuardReporter::new(
+        roles,
+        tally.clone(),
+        Arc::new(ReportMode::Report),
+    ));
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_millis(50))
+        .connect_lazy("postgres://boss@127.0.0.1:1/boss")
+        .unwrap();
+    let app =
+        boss_accounts::account_risk_scores::risk_scores_router_with_reports(pool, Some(reporter));
+    let response = TestRequest::get(PATH)
+        .as_user("emp-field", "service-tech")
+        .send(&app)
+        .await;
+    response.assert_status(StatusCode::FORBIDDEN);
+    let report = tally.snapshot();
+    assert_eq!(report.rows.len(), 1);
+    assert_eq!(report.rows[0].observation.asserted_allowed, Some(false));
+    assert_eq!(report.rows[0].observation.recorded_allowed, Some(true));
+}

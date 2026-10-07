@@ -106,3 +106,23 @@ fn the_kinds_every_department_has_declare_none() {
         );
     }
 }
+
+/// Ledger recognition and replay are Finance's work (b7263ac5), even
+/// though the platform supplies their maintenance protocols. The
+/// broader IT declaration sweep must preserve this specific assignment.
+#[test]
+fn finance_reads_its_ledger_recognition_and_replay_kinds() {
+    let rows = bundle();
+    let finance = kinds_declaring(&rows, "finance");
+    let it = kinds_declaring(&rows, "it");
+    for kind in ["maintenance-ledger-recognize", "maintenance-ledger-replay"] {
+        assert!(
+            finance.iter().any(|k| k == kind),
+            "`{kind}` does not declare Finance; Finance declares {finance:?}"
+        );
+        assert!(
+            !it.iter().any(|k| k == kind),
+            "`{kind}` is counted as IT's work as well as Finance's"
+        );
+    }
+}

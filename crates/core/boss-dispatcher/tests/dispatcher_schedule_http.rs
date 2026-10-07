@@ -488,3 +488,41 @@ async fn a_policy_outage_withholds_the_schedule() {
     // no withheld flag (backlog 1805bac0).
     assert!(v.get("withheld").is_none(), "{v}");
 }
+
+#[tokio::test]
+async fn role_reporting_preserves_the_dispatcher_scope_refusal_without_reading_rules() {
+    use boss_policy_client::role_reader::{
+        MonotonicRoleSnapshotClock, RegistryRoles, SnapshotRoleReader,
+    };
+    use boss_policy_client::role_reporting::{ReportMode, ReportTally};
+    let roles = Arc::new(SnapshotRoleReader::new(
+        std::time::Duration::from_secs(30),
+        Arc::new(MonotonicRoleSnapshotClock),
+    ));
+    let ticket = roles.begin_refresh();
+    assert!(roles.finish_refresh(ticket, Ok(RegistryRoles::from_sources(
+        serde_json::json!({"data":[{"id":"emp-david","aliases":[],"role":"operator"}],"total":1}),
+        serde_json::json!({"data":[],"total":0}), serde_json::json!([])).unwrap())));
+    let tally = Arc::new(ReportTally::new(8));
+    let baseline = router(state(unreachable_pool(), policy()));
+    let expected = get(&baseline, Some("builder")).await;
+    assert_eq!(expected.0, StatusCode::OK);
+    assert_eq!(expected.1["withheld"], true);
+    let wiring = boss_policy_client::role_service::assemble(
+        "dispatcher",
+        "/api/dispatcher/actor-role-reports",
+        policy(),
+        roles,
+        Arc::new(ReportMode::Report),
+        tally.clone(),
+    );
+    let app = router(state(unreachable_pool(), wiring.policy)).merge(wiring.inventory);
+    assert_eq!(get(&app, Some("builder")).await, expected);
+    let report = tally.snapshot();
+    assert_eq!(report.rows.len(), 1);
+    let observed = &report.rows[0].observation;
+    assert_eq!(observed.actor, "emp-david");
+    assert_eq!(observed.asserted_role, "builder");
+    assert_eq!(observed.recorded_role.as_deref(), Some("operator"));
+    assert_eq!(observed.would_change_scope, Some(true));
+}

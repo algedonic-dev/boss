@@ -788,7 +788,7 @@ async fn with_no_slot_directory_every_caller_is_as_before() {
 /// so one test can write as the credentialed runner and then try the
 /// forged caller on the same row.
 fn app_with_jobs(jobs: Arc<InMemoryJobs>, caller: Option<CredentialedCaller>) -> Router {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds.seed(spec()).unwrap();
     kinds.seed(plain_spec()).unwrap();
     let mut policy = FakePolicyClient::builder();

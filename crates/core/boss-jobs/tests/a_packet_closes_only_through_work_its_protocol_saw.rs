@@ -161,7 +161,7 @@ fn app_with(protocols: bool) -> axum::Router {
 /// The router and the store behind it, for a test that injects a
 /// storage failure.
 fn app_and_jobs(protocols: bool) -> (axum::Router, Arc<InMemoryJobs>) {
-    let kinds = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds.seed(spec()).expect("seed the kind");
     let jobs = Arc::new(InMemoryJobs::new());
     let mut policy = FakePolicyClient::builder();

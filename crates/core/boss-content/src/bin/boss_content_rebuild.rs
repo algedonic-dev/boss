@@ -1,5 +1,5 @@
-//! `boss-content-rebuild` — drop the bulletins + bulletin_dismissals
-//! projections and reconstruct from `audit_log`.
+//! `boss-content-rebuild` — reconstruct content from audit_log, refusing
+//! uncovered legacy manual rows before any content projection is cleared.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -67,6 +67,7 @@ async fn main() -> Result<()> {
         bulletins_upserted = report.bulletins_upserted,
         bulletins_deleted = report.bulletins_deleted,
         dismissals_inserted = report.dismissals_inserted,
+        manual_versions_replayed = report.manual_versions_replayed,
         "content rebuild complete"
     );
 

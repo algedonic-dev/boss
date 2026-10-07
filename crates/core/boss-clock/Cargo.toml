@@ -18,6 +18,7 @@ default = ["postgres"]
 postgres = ["dep:sqlx", "dep:boss-events"]
 
 [dependencies]
+boss-policy-client = { path = "../boss-policy-client" }
 boss-core = { path = "../boss-core" }
 # The machine gate states its facts through the outbox, in the binary
 # only (design 21946380).

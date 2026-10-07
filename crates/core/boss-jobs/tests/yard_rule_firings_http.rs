@@ -44,6 +44,270 @@ use uuid::Uuid;
 
 const NOW: &str = "2026-09-24T12:00:00Z";
 
+struct UnreadRecord(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl DispatcherFiringsRepository for UnreadRecord {
+    async fn dead_letter_page(
+        &self,
+        _: &str,
+        _: DateTime<Utc>,
+        _: usize,
+        _: usize,
+    ) -> Result<
+        boss_jobs::dispatcher_firings::DeadLetterPage,
+        boss_jobs::dispatcher_firings::DispatcherFiringsError,
+    > {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(
+            boss_jobs::dispatcher_firings::DispatcherFiringsError::Storage(
+                "private storage diagnostic".into(),
+            ),
+        )
+    }
+    async fn last_firing(
+        &self,
+        _: &str,
+    ) -> Result<Option<LastFiring>, boss_jobs::dispatcher_firings::DispatcherFiringsError> {
+        unreachable!("detail endpoint must not read the firing rollup")
+    }
+    async fn last_firings(
+        &self,
+    ) -> Result<
+        Vec<boss_jobs::dispatcher_firings::RuleLastFiring>,
+        boss_jobs::dispatcher_firings::DispatcherFiringsError,
+    > {
+        unreachable!("detail endpoint must not read the firing rollup")
+    }
+    async fn unrouted_dead_letters(
+        &self,
+        _: DateTime<Utc>,
+    ) -> Result<
+        Vec<boss_jobs::dispatcher_firings::UnroutedDeadLetters>,
+        boss_jobs::dispatcher_firings::DispatcherFiringsError,
+    > {
+        unreachable!("detail endpoint must not read the failure rollup")
+    }
+}
+
+struct UnreadPolicy;
+
+#[async_trait::async_trait]
+impl PolicyClient for UnreadPolicy {
+    async fn check(
+        &self,
+        _: &User,
+        _: Action,
+        _: Resource,
+    ) -> Result<boss_policy_client::Decision, boss_policy_client::PolicyClientError> {
+        Err(boss_policy_client::PolicyClientError::Unreachable(
+            "private policy diagnostic".into(),
+        ))
+    }
+    async fn scope_predicate(
+        &self,
+        _: &User,
+        _: Resource,
+    ) -> Result<boss_policy_client::Predicate, boss_policy_client::PolicyClientError> {
+        Err(boss_policy_client::PolicyClientError::Unreachable(
+            "private policy diagnostic".into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn retained_failures_refuse_before_repository_access_and_distinguish_outages() {
+    let record = Arc::new(UnreadRecord(std::sync::atomic::AtomicUsize::new(0)));
+    let policy = Arc::new(
+        FakePolicyClient::builder()
+            .allow("operator", Action::Read, Resource::job(), Scope::All)
+            .allow("builder", Action::Read, Resource::job(), Scope::Self_)
+            .build(),
+    );
+    let (app, _) = app_with_ports(Some(record.clone()), policy);
+    let mut headers = vec![
+        None,
+        Some(user_header("builder")),
+        Some(user_header("denied")),
+    ];
+    for id in boss_core::roles::ANONYMOUS_VISITOR_IDS
+        .into_iter()
+        .chain(["", "  "])
+    {
+        let mut user: Value = serde_json::from_str(&user_header("operator")).unwrap();
+        user["id"] = json!(id);
+        headers.push(Some(user.to_string()));
+    }
+    for header in headers {
+        let mut request = Request::builder().uri("/api/yard/rule-firings/broker/dead-letters");
+        if let Some(header) = header {
+            request = request.header("x-boss-user", header);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(record.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+    for (app, expected_calls) in [
+        (app, 1),
+        (
+            app_with_ports(Some(record.clone()), Arc::new(UnreadPolicy)).0,
+            1,
+        ),
+    ] {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/yard/rule-firings/broker/dead-letters")
+                    .header("x-boss-user", user_header("operator"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body.get("total").is_none());
+        assert!(!body.to_string().contains("private"));
+        assert_eq!(
+            record.0.load(std::sync::atomic::Ordering::SeqCst),
+            expected_calls
+        );
+    }
+}
+
+#[tokio::test]
+async fn retained_dead_letter_reader_refuses_withheld_and_unwired_records() {
+    let (app, _) = app(None);
+    for (role, expected) in [
+        ("builder", StatusCode::FORBIDDEN),
+        ("operator", StatusCode::SERVICE_UNAVAILABLE),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/yard/rule-firings/broker-mints-publish-token/dead-letters")
+                    .header("x-boss-user", user_header(role))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{role}");
+    }
+}
+
+#[tokio::test]
+async fn retained_dead_letter_reader_distinguishes_a_counted_empty_record_from_unread() {
+    let (app, _) = app(Some(InMemoryDispatcherFirings::new(Vec::new())));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/yard/rule-firings/broker-mints-publish-token/dead-letters")
+                .header("x-boss-user", user_header("operator"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let page: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(page["data"], json!([]));
+    assert_eq!(page["total"], 0);
+}
+
+#[tokio::test]
+async fn retained_failure_details_require_identity_even_with_a_full_role_grant() {
+    let (app, _) = app(Some(InMemoryDispatcherFirings::new(Vec::new())));
+    let mut user: Value = serde_json::from_str(&user_header("operator")).unwrap();
+    user["id"] = json!("");
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/yard/rule-firings/broker-mints-publish-token/dead-letters")
+                .header("x-boss-user", user.to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn retained_failure_http_page_keeps_complete_json_and_reports_its_window() {
+    use boss_jobs::dispatcher_firings::RetainedDeadLetter;
+    let detail = json!({"failures":[{"handler":"mint","error":"cause <tag> & \"quoted\""}],"nested":{"unknown":[1,true,null]}});
+    let row = RetainedDeadLetter {
+        firing_id: "dispatcher:broker:event-1".into(),
+        rule: "broker".into(),
+        fired_on: "ops.requested".into(),
+        fired_at: t(NOW),
+        detail: detail.clone(),
+    };
+    let (app, _) = app(Some(
+        InMemoryDispatcherFirings::new(Vec::new()).with_retained_dead_letters(vec![row]),
+    ));
+    for role in ["operator", "it-lead"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/yard/rule-firings/broker/dead-letters?limit=1&offset=0")
+                    .header("x-boss-user", user_header(role))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["data"][0]["detail"], detail);
+        assert_eq!(page["data"][0]["firing_id"], "dispatcher:broker:event-1");
+        assert_eq!(page["retention_days"], RETENTION_DAYS);
+        assert_eq!(
+            page["since"],
+            json!(t(NOW) - chrono::Duration::days(RETENTION_DAYS))
+        );
+    }
+}
+
+#[tokio::test]
+async fn retained_failure_http_page_refuses_invalid_query_bounds() {
+    let (app, _) = app(Some(InMemoryDispatcherFirings::new(Vec::new())));
+    for query in [
+        "limit=0",
+        "limit=101",
+        "limit=-1",
+        "limit=unknown",
+        "offset=-1",
+        "offset=18446744073709551615",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/yard/rule-firings/broker/dead-letters?{query}"
+                    ))
+                    .header("x-boss-user", user_header("operator"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+    }
+}
+
 fn t(rfc3339: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(rfc3339).unwrap().into()
 }
@@ -72,7 +336,6 @@ fn firing(rule: &str, at: &str) -> (String, LastFiring) {
 }
 
 fn app(firings: Option<InMemoryDispatcherFirings>) -> (axum::Router, Arc<InMemoryJobs>) {
-    let jobs = Arc::new(InMemoryJobs::new());
     let policy_client: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()
             .allow("operator", Action::Read, Resource::job(), Scope::All)
@@ -95,9 +358,17 @@ fn app(firings: Option<InMemoryDispatcherFirings>) -> (axum::Router, Arc<InMemor
             )
             .build(),
     );
+    let dispatcher_firings = firings.map(|f| Arc::new(f) as Arc<dyn DispatcherFiringsRepository>);
+    app_with_ports(dispatcher_firings, policy_client)
+}
+
+fn app_with_ports(
+    dispatcher_firings: Option<Arc<dyn DispatcherFiringsRepository>>,
+    policy_client: Arc<dyn PolicyClient>,
+) -> (axum::Router, Arc<InMemoryJobs>) {
+    let jobs = Arc::new(InMemoryJobs::new());
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
-    let dispatcher_firings = firings.map(|f| Arc::new(f) as Arc<dyn DispatcherFiringsRepository>);
     let state = JobsApiState {
         dispatcher_firings,
         ..JobsApiState::minimal(

@@ -35,11 +35,20 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct AuditTailState {
     pub pool: Arc<PgPool>,
+    pub role_guards: Option<Arc<boss_policy_client::role_guard::RoleGuardReporter>>,
 }
 
 pub fn audit_tail_router(pool: PgPool) -> Router {
+    audit_tail_router_with_reports(pool, None)
+}
+
+pub fn audit_tail_router_with_reports(
+    pool: PgPool,
+    role_guards: Option<Arc<boss_policy_client::role_guard::RoleGuardReporter>>,
+) -> Router {
     let state = AuditTailState {
         pool: Arc::new(pool),
+        role_guards,
     };
     Router::new()
         .route("/api/events/health", get(events_health))
@@ -59,6 +68,27 @@ pub fn audit_tail_router(pool: PgPool) -> Router {
         // into what the operating company is doing right now.
         .route("/api/events/public-tail", get(public_tail))
         .with_state(state)
+}
+
+/// Compare only the captured caller at the existing privileged read door.
+/// Reporting returns the original decision and performs no candidate log read.
+pub fn observed_audit_read(
+    user: &boss_policy_client::User,
+    reporter: Option<&boss_policy_client::role_guard::RoleGuardReporter>,
+    site: &str,
+) -> bool {
+    let original = matches!(user.access_tier, AccessTier::Operator | AccessTier::Auditor)
+        || boss_core::roles::has_global_read(&user.role);
+    reporter.map_or(original, |reporter| {
+        reporter.observe_captured(site, "admission", user, original, |candidate| {
+            Some(
+                matches!(
+                    candidate.access_tier,
+                    AccessTier::Operator | AccessTier::Auditor
+                ) || boss_core::roles::has_global_read(&candidate.role),
+            )
+        })
+    })
 }
 
 /// One row of the audit_log returned to the client. Payload is the
@@ -192,9 +222,7 @@ pub async fn audit_stats(pool: &PgPool) -> Result<AuditStats, String> {
 /// `GET /api/events/stats` — the same door as the tail: operator or
 /// auditor tier, or a role with global read.
 async fn stats(State(state): State<AuditTailState>, CurrentUser(user): CurrentUser) -> Response {
-    let tier_ok = matches!(user.access_tier, AccessTier::Operator | AccessTier::Auditor);
-    let role_ok = boss_core::roles::has_global_read(&user.role);
-    if !(tier_ok || role_ok) {
+    if !observed_audit_read(&user, state.role_guards.as_deref(), "audit-stats-read") {
         return (
             StatusCode::FORBIDDEN,
             "operator tier or executive role required",
@@ -526,6 +554,24 @@ pub async fn recent_for_job(
     Ok(rows)
 }
 
+/// Read the exact committed event, including one the relay still owes
+/// the audit log. Both retain the same immutable fact; a disagreement
+/// is unavailable provenance, never a receipt chosen arbitrarily.
+pub async fn recorded_event(pool: &PgPool, id: Uuid) -> Result<Option<AuditEntry>, String> {
+    let mut rows = sqlx::query_as::<_, AuditEntry>(
+        "SELECT event_id, timestamp, source, kind, payload FROM audit_log WHERE event_id = $1 \
+         UNION SELECT event_id, timestamp, source, kind, payload FROM event_outbox WHERE event_id = $1",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    if rows.len() > 1 {
+        return Err("recorded event copies disagree".into());
+    }
+    Ok(rows.pop())
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct TailQuery {
     /// Exact-match filter on the `source` column (e.g. "jobs").
@@ -602,9 +648,7 @@ async fn tail(
     CurrentUser(user): CurrentUser,
     Query(q): Query<TailQuery>,
 ) -> Response {
-    let tier_ok = matches!(user.access_tier, AccessTier::Operator | AccessTier::Auditor);
-    let role_ok = boss_core::roles::has_global_read(&user.role);
-    if !(tier_ok || role_ok) {
+    if !observed_audit_read(&user, state.role_guards.as_deref(), "audit-tail-read") {
         return (
             StatusCode::FORBIDDEN,
             "operator tier or executive role required",
@@ -690,9 +734,7 @@ async fn export(
     use axum::http::header;
     use futures::stream::StreamExt;
 
-    let tier_ok = matches!(user.access_tier, AccessTier::Operator | AccessTier::Auditor);
-    let role_ok = boss_core::roles::has_global_read(&user.role);
-    if !(tier_ok || role_ok) {
+    if !observed_audit_read(&user, state.role_guards.as_deref(), "audit-export-read") {
         return (
             StatusCode::FORBIDDEN,
             "operator tier or executive role required",
@@ -904,9 +946,7 @@ async fn stream(
     use std::convert::Infallible;
     use std::time::Duration;
 
-    let tier_ok = matches!(user.access_tier, AccessTier::Operator | AccessTier::Auditor);
-    let role_ok = boss_core::roles::has_global_read(&user.role);
-    if !(tier_ok || role_ok) {
+    if !observed_audit_read(&user, state.role_guards.as_deref(), "audit-stream-read") {
         return (
             StatusCode::FORBIDDEN,
             "operator tier or executive role required",

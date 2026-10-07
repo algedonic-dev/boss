@@ -143,13 +143,17 @@ fn published(specs: &[WorkflowSpec]) -> Vec<Value> {
 /// `(kind, facet)` for every DRIFT line the lint's comparator prints
 /// over the real bundle against `live`.
 fn lint_drift(live: &[Value]) -> BTreeSet<(String, String)> {
+    lint_drift_at(live, &repo_root().join(BUNDLE))
+}
+
+fn lint_drift_at(live: &[Value], bundle_path: &std::path::Path) -> BTreeSet<(String, String)> {
     let dir = scratch_dir("the-drift-facets-are-one-list");
     let answer = dir.join("live.json");
     std::fs::write(&answer, serde_json::to_vec(live).unwrap()).unwrap();
     let out = Command::new("bash")
         .arg(repo_root().join(LINT))
         .arg("--compare")
-        .arg(repo_root().join(BUNDLE))
+        .arg(bundle_path)
         .arg(&answer)
         .output()
         .expect("running the lint's comparator");
@@ -229,6 +233,130 @@ fn a_bundle_published_as_written_is_adrift_on_neither_side() {
     assert!(
         lint.is_empty(),
         "a row published from its own file drifts: {lint:?}"
+    );
+}
+
+#[test]
+fn advisory_default_agrees_but_verified_unknown_and_other_agent_fields_remain_drift() {
+    let specs = bundle();
+    let baseline = published(&specs);
+    let (kind_index, step_index) = specs
+        .iter()
+        .enumerate()
+        .find_map(|(i, spec)| {
+            spec.steps
+                .iter()
+                .position(|step| step.agent.is_some())
+                .map(|j| (i, j))
+        })
+        .expect("the real bundle declares an agent");
+    let expected = BTreeSet::from([(
+        specs[kind_index].kind.clone(),
+        format!("steps.{}.agent", specs[kind_index].steps[step_index].title),
+    )]);
+    for (label, edit, drift) in [
+        ("legacy omission", None, false),
+        ("explicit advisory", Some(json!("advisory")), false),
+        ("verified requirement", Some(json!("verified")), true),
+        (
+            "unknown requirement",
+            Some(json!("future-unrecognized")),
+            true,
+        ),
+        ("null is not the default", Some(Value::Null), true),
+    ] {
+        let mut live = baseline.clone();
+        let block = live[kind_index]["steps"][step_index]["agent"]
+            .as_object_mut()
+            .unwrap();
+        block.remove("executor_provenance");
+        if let Some(value) = edit {
+            block.insert("executor_provenance".into(), value);
+        }
+        let lint = lint_drift(&live);
+        let rust = rust_drift(&specs, &live);
+        assert_same(&lint, &rust);
+        assert_eq!(
+            rust,
+            if drift {
+                expected.clone()
+            } else {
+                BTreeSet::new()
+            },
+            "{label}"
+        );
+    }
+    let mut live = baseline;
+    live[kind_index]["steps"][step_index]["agent"]["extra_authored_property"] = json!(true);
+    let lint = lint_drift(&live);
+    let rust = rust_drift(&specs, &live);
+    assert_same(&lint, &rust);
+    assert_eq!(
+        rust, expected,
+        "normalizing a single known default must not erase other fields"
+    );
+}
+
+#[test]
+fn an_authored_verified_requirement_cannot_be_downgraded_by_a_legacy_live_row() {
+    let fixture = scratch_dir("the-drift-facets-authored-verified");
+    // Preserve the lint's real roster floor; change one declaration in a
+    // complete copied bundle rather than disabling the bound for a fixture.
+    for entry in std::fs::read_dir(repo_root().join(BUNDLE)).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "toml")
+        {
+            std::fs::copy(&path, fixture.join(path.file_name().unwrap())).unwrap();
+        }
+    }
+    let original =
+        std::fs::read_to_string(repo_root().join(BUNDLE).join("backlog-item.toml")).unwrap();
+    assert!(original.contains("agent = {"));
+    std::fs::write(
+        fixture.join("backlog-item.toml"),
+        original.replacen(
+            "agent = {",
+            "agent = { executor_provenance = \"verified\",",
+            1,
+        ),
+    )
+    .unwrap();
+    let specs = boss_jobs::seed_loader::load_workflows(&fixture).unwrap();
+    let kind_index = specs
+        .iter()
+        .position(|spec| spec.kind == "backlog-item")
+        .unwrap();
+    let step_index = specs[kind_index]
+        .steps
+        .iter()
+        .position(|step| {
+            step.agent.as_ref().is_some_and(|agent| {
+                agent.executor_provenance
+                    == boss_jobs::executor_attestation::ExecutorProvenanceRequirement::Verified
+            })
+        })
+        .expect("the actual loader must retain the authored verified requirement");
+    let mut live = published(&specs);
+    let lint = lint_drift_at(&live, &fixture);
+    let rust = rust_drift(&specs, &live);
+    assert_same(&lint, &rust);
+    assert!(rust.is_empty(), "an unchanged verified requirement agrees");
+    live[kind_index]["steps"][step_index]["agent"]
+        .as_object_mut()
+        .unwrap()
+        .remove("executor_provenance");
+    let lint = lint_drift_at(&live, &fixture);
+    let rust = rust_drift(&specs, &live);
+    assert_same(&lint, &rust);
+    assert_eq!(
+        rust,
+        BTreeSet::from([(
+            specs[kind_index].kind.clone(),
+            format!("steps.{}.agent", specs[kind_index].steps[step_index].title),
+        )]),
+        "omission may mean advisory but cannot satisfy an authored verified requirement"
     );
 }
 

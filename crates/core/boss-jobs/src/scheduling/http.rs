@@ -24,6 +24,7 @@ use super::port::{SchedulingError, SchedulingRepository};
 use super::types::{AssignmentStatus, NewScheduledAssignment, NewTechAvailability};
 
 pub struct SchedulingApiState {
+    pub role_guards: Option<Arc<boss_policy_client::role_guard::RoleGuardReporter>>,
     pub repo: Arc<dyn SchedulingRepository>,
     /// Audit-log + NATS publisher. `None` allowed for tests that
     /// only exercise projection writes.
@@ -132,7 +133,7 @@ async fn list_avail(
     CurrentUser(user): CurrentUser,
     Query(q): Query<RangeQuery>,
 ) -> Response {
-    let who = match readable(state.policy.as_ref(), &user).await {
+    let who = match readable(state.policy.as_ref(), &user, state.role_guards.as_deref()).await {
         Ok(who) => who,
         Err(refused) => return refused,
     };
@@ -254,7 +255,7 @@ async fn list_assign(
     CurrentUser(user): CurrentUser,
     Query(q): Query<AssignQuery>,
 ) -> Response {
-    let who = match readable(state.policy.as_ref(), &user).await {
+    let who = match readable(state.policy.as_ref(), &user, state.role_guards.as_deref()).await {
         Ok(who) => who,
         Err(refused) => return refused,
     };
@@ -300,7 +301,7 @@ async fn get_assign(
     CurrentUser(user): CurrentUser,
     Path(id): Path<Uuid>,
 ) -> Response {
-    let who = match readable(state.policy.as_ref(), &user).await {
+    let who = match readable(state.policy.as_ref(), &user, state.role_guards.as_deref()).await {
         Ok(who) => who,
         Err(refused) => return refused,
     };
@@ -388,7 +389,7 @@ async fn list_shifts(
     CurrentUser(user): CurrentUser,
     Query(q): Query<ShiftQuery>,
 ) -> Response {
-    let who = match readable(state.policy.as_ref(), &user).await {
+    let who = match readable(state.policy.as_ref(), &user, state.role_guards.as_deref()).await {
         Ok(who) => who,
         Err(refused) => return refused,
     };
@@ -582,7 +583,15 @@ async fn rotate_calendar_token(
     CurrentUser(user): CurrentUser,
     Path(emp_id): Path<String>,
 ) -> Response {
-    if !may_rotate(&user, &emp_id) {
+    let allowed = match state.role_guards.as_ref() {
+        Some(reporter) => {
+            reporter.evaluate("calendar-token-rotate", "admission", &user, |candidate| {
+                may_rotate(candidate, &emp_id)
+            })
+        }
+        None => may_rotate(&user, &emp_id),
+    };
+    if !allowed {
         return not_yours(&emp_id, "rotate");
     }
     let now = boss_clock_client::now_from(&state.clock).await;
@@ -645,7 +654,16 @@ async fn revoke_logged_raw(
     State(state): State<Arc<SchedulingApiState>>,
     CurrentUser(user): CurrentUser,
 ) -> Response {
-    if user.role != PLATFORM_ADMIN_ROLE {
+    let allowed = match state.role_guards.as_ref() {
+        Some(reporter) => reporter.evaluate(
+            "logged-calendar-token-revoke",
+            "admission",
+            &user,
+            |candidate| candidate.role == PLATFORM_ADMIN_ROLE,
+        ),
+        None => user.role == PLATFORM_ADMIN_ROLE,
+    };
+    if !allowed {
         return (
             StatusCode::FORBIDDEN,
             "revoking the logged calendar tokens is a platform-admin's act",
@@ -714,7 +732,7 @@ async fn week_grid(
     CurrentUser(user): CurrentUser,
     Query(q): Query<WeekGridQuery>,
 ) -> Response {
-    let who = match readable(state.policy.as_ref(), &user).await {
+    let who = match readable(state.policy.as_ref(), &user, state.role_guards.as_deref()).await {
         Ok(who) => who,
         Err(refused) => return refused,
     };

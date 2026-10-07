@@ -35,6 +35,7 @@ use tracing_subscriber::EnvFilter;
 
 struct AppState {
     http: Client,
+    role_guards: Arc<boss_policy_client::role_guard::RoleGuardReporter>,
     jobs_url: String,
     clock_url: String,
     /// The brewery-sim DAEMON's localhost control+telemetry server
@@ -56,9 +57,32 @@ and deploy it to <code>BOSS_SIM_STATIC_DIR</code>.</p></body></html>";
 /// where the instance opts in — design 2830b6b7) or the headerless
 /// `guest` fallback. Mirrors jobs-api's `operator_guard`, and asks the
 /// same `boss_core::roles::is_read_only_floor` rather than a role name.
+#[cfg(test)]
 fn operator_guard(user: &CurrentUser) -> Option<Response> {
+    operator_guard_with_reports(user, None)
+}
+
+fn operator_guard_with_reports(
+    user: &CurrentUser,
+    reporter: Option<&boss_policy_client::role_guard::RoleGuardReporter>,
+) -> Option<Response> {
     let role = user.0.role.as_str();
-    if boss_core::roles::is_read_only_floor(role) || role == "guest" {
+    let original = !(boss_core::roles::is_read_only_floor(role) || role == "guest");
+    let allowed = reporter.map_or(original, |reporter| {
+        reporter.observe_captured(
+            "simulator-control",
+            "admission",
+            &user.0,
+            original,
+            |candidate| {
+                Some(
+                    !(boss_core::roles::is_read_only_floor(&candidate.role)
+                        || candidate.role == "guest"),
+                )
+            },
+        )
+    });
+    if !allowed {
         return Some(
             (
                 StatusCode::FORBIDDEN,
@@ -160,7 +184,7 @@ async fn post_config(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Some(r) = operator_guard(&user) {
+    if let Some(r) = operator_guard_with_reports(&user, Some(&s.role_guards)) {
         return r;
     }
     forward_post(
@@ -177,7 +201,7 @@ async fn control_pause(
     user: CurrentUser,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(r) = operator_guard(&user) {
+    if let Some(r) = operator_guard_with_reports(&user, Some(&s.role_guards)) {
         return r;
     }
     forward_post(
@@ -194,7 +218,7 @@ async fn control_resume(
     user: CurrentUser,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(r) = operator_guard(&user) {
+    if let Some(r) = operator_guard_with_reports(&user, Some(&s.role_guards)) {
         return r;
     }
     forward_post(
@@ -211,7 +235,7 @@ async fn control_restart_epoch(
     user: CurrentUser,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(r) = operator_guard(&user) {
+    if let Some(r) = operator_guard_with_reports(&user, Some(&s.role_guards)) {
         return r;
     }
     forward_post(
@@ -229,7 +253,7 @@ async fn control_configure(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Some(r) = operator_guard(&user) {
+    if let Some(r) = operator_guard_with_reports(&user, Some(&s.role_guards)) {
         return r;
     }
     // The new capability with no public path: epoch_start / epoch_end /
@@ -241,6 +265,14 @@ async fn control_configure(
         Some(body),
     )
     .await
+}
+
+fn simulator_http_router(sim: Router, inventory: Router) -> Router {
+    Router::new()
+        .nest("/simulator", sim)
+        .merge(inventory)
+        .layer(axum::middleware::from_fn(request_context_middleware))
+        .layer(TraceLayer::new_for_http())
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -268,9 +300,35 @@ async fn main() -> Result<()> {
     let static_dir = std::env::var("BOSS_SIM_STATIC_DIR")
         .unwrap_or_else(|_| "/var/lib/boss-simulator/dist".to_string());
 
+    let jobs_url = std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs"));
+    let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
+        boss_policy_client::role_service::SNAPSHOT_MAX_AGE,
+        Arc::new(boss_policy_client::role_reader::MonotonicRoleSnapshotClock),
+    ));
+    let mode = Arc::new(boss_policy_client::role_reader::MountedReportMode::mount());
+    let source = Arc::new(boss_policy_client::role_reader::HttpRoleReader::new(
+        jobs_url.clone(),
+        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
+        boss_policy_client::User::service("simulator"),
+    )?);
+    let wiring = boss_policy_client::role_service::assemble(
+        "simulator",
+        "/simulator/api/actor-role-reports",
+        Arc::new(boss_policy_client::ReqwestPolicyClient::new(
+            "simulator",
+            std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
+        )),
+        roles.clone(),
+        mode.clone(),
+        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
+            boss_policy_client::role_service::REPORT_CAPACITY,
+        )),
+    );
+
     let state = Arc::new(AppState {
         http: Client::new(),
-        jobs_url: std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
+        role_guards: wiring.guards,
+        jobs_url,
         clock_url: std::env::var("BOSS_CLOCK_URL").unwrap_or_else(|_| boss_ports::url("clock")),
         sim_control_url: std::env::var("BOSS_SIM_CONTROL_URL")
             .unwrap_or_else(|_| boss_ports::url("sim-control")),
@@ -299,12 +357,7 @@ async fn main() -> Result<()> {
         api.fallback(stub)
     };
 
-    let app = Router::new()
-        .nest("/simulator", sim)
-        // Scopes the request actor (x-boss-user) + sim-origin flag for the
-        // duration of each handler, like every other service.
-        .layer(axum::middleware::from_fn(request_context_middleware))
-        .layer(TraceLayer::new_for_http());
+    let app = simulator_http_router(sim, wiring.inventory);
 
     let addr: SocketAddr = bind
         .parse()
@@ -317,7 +370,17 @@ async fn main() -> Result<()> {
     // and a clean window that names `simulator` is never clean (design
     // 21946380) — said at WARN by the mount.
     let app = boss_core::machine_gate::mount(app, "simulator", &["/simulator/api/health"], None);
-    axum::serve(listener, app).await.context("serving HTTP")?;
+    boss_policy_client::role_service::serve_with_refresh(
+        listener,
+        app,
+        roles,
+        source,
+        mode,
+        boss_policy_client::role_service::REFRESH_CADENCE,
+        boss_policy_client::role_service::shutdown_signal(),
+    )
+    .await
+    .context("serving HTTP")?;
     Ok(())
 }
 
@@ -357,5 +420,165 @@ mod tests {
         }
         assert!(operator_guard(&as_role(boss_core::roles::VISITOR_ROLE)).is_some());
         assert!(operator_guard(&as_role("platform-admin")).is_none());
+    }
+    #[test]
+    fn reporting_keeps_the_original_floor_and_signed_in_control_decisions() {
+        use boss_policy_client::role_guard::RoleGuardReporter;
+        use boss_policy_client::role_reader::{
+            MonotonicRoleSnapshotClock, RegistryRoles, SnapshotRoleReader,
+        };
+        use boss_policy_client::role_reporting::{ReportMode, ReportTally};
+        let roles = Arc::new(SnapshotRoleReader::new(
+            std::time::Duration::from_secs(30),
+            Arc::new(MonotonicRoleSnapshotClock),
+        ));
+        let ticket = roles.begin_refresh();
+        assert!(roles.finish_refresh(ticket, Ok(RegistryRoles::from_sources(
+            serde_json::json!({"data":[{"id":"x","aliases":[],"role":"platform-admin"}],"total":1}),
+            serde_json::json!({"data":[],"total":0}), serde_json::json!([])).unwrap())));
+        let tally = Arc::new(ReportTally::new(8));
+        let reporter = RoleGuardReporter::new(roles, tally.clone(), Arc::new(ReportMode::Report));
+        for role in ["visitor", "guest", "platform-admin"] {
+            let original = operator_guard(&as_role(role)).map(|response| response.status());
+            let reported = operator_guard_with_reports(&as_role(role), Some(&reporter))
+                .map(|response| response.status());
+            assert_eq!(reported, original);
+        }
+        let report = tally.snapshot();
+        assert_eq!(report.rows.len(), 3);
+        assert_eq!(
+            report
+                .rows
+                .iter()
+                .filter(|row| row.observation.asserted_allowed == Some(false)
+                    && row.observation.recorded_allowed == Some(true))
+                .count(),
+            2
+        );
+    }
+    #[tokio::test]
+    async fn simulator_inventory_is_mounted_once_at_its_public_prefix() {
+        let inventory = Router::new().route(
+            "/simulator/api/actor-role-reports",
+            get(|| async { "fixture-report" }),
+        );
+        let app = simulator_http_router(Router::new(), inventory);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/simulator/api/actor-role-reports",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let response = Client::new().get(url).send().await.unwrap();
+        server.abort();
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(response.text().await.unwrap(), "fixture-report");
+    }
+    #[tokio::test]
+    async fn report_mode_preserves_all_simulator_forwards_and_refused_zero_effects() {
+        use boss_policy_client::role_guard::RoleGuardReporter;
+        use boss_policy_client::role_reader::{
+            MonotonicRoleSnapshotClock, RegistryRoles, SnapshotRoleReader,
+        };
+        use boss_policy_client::role_reporting::{ReportMode, ReportTally};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (asserted, recorded, original_allowed) in [
+            ("visitor", "platform-admin", false),
+            ("platform-admin", "visitor", true),
+        ] {
+            let user = as_role(asserted);
+            let identity = serde_json::to_string(&user.0).unwrap();
+            let roles = Arc::new(SnapshotRoleReader::new(
+                std::time::Duration::from_secs(30),
+                Arc::new(MonotonicRoleSnapshotClock),
+            ));
+            let ticket = roles.begin_refresh();
+            assert!(roles.finish_refresh(ticket,Ok(RegistryRoles::from_sources(
+                serde_json::json!({"data":[{"id":"x","aliases":[],"role":recorded}],"total":1}),
+                serde_json::json!({"data":[],"total":0}),serde_json::json!([])).unwrap())));
+            let tally = Arc::new(ReportTally::new(8));
+            let reporter = Arc::new(RoleGuardReporter::new(
+                roles,
+                tally.clone(),
+                Arc::new(ReportMode::Report),
+            ));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counted = calls.clone();
+            let expected = identity.clone();
+            let upstream = Router::new().route(
+                "/{*path}",
+                post(move |headers: HeaderMap, body: Bytes| {
+                    let counted = counted.clone();
+                    let expected = expected.clone();
+                    async move {
+                        assert_eq!(
+                            headers.get("x-boss-user").unwrap().to_str().unwrap(),
+                            expected
+                        );
+                        assert!(body.is_empty() || body.as_ref() == b"{\"warp\":2}");
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        (StatusCode::ACCEPTED, "{\"forwarded\":true}")
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, upstream).await.unwrap();
+            });
+            let state = Arc::new(AppState {
+                http: Client::new(),
+                role_guards: reporter,
+                jobs_url: base.clone(),
+                clock_url: base.clone(),
+                sim_control_url: base,
+            });
+            let mut headers = HeaderMap::new();
+            headers.insert("x-boss-user", identity.parse().unwrap());
+            for control in 0..5 {
+                let user = as_role(asserted);
+                let body = Bytes::from_static(b"{\"warp\":2}");
+                let response = match control {
+                    0 => post_config(State(state.clone()), user, headers.clone(), body).await,
+                    1 => control_pause(State(state.clone()), user, headers.clone()).await,
+                    2 => control_resume(State(state.clone()), user, headers.clone()).await,
+                    3 => control_restart_epoch(State(state.clone()), user, headers.clone()).await,
+                    _ => control_configure(State(state.clone()), user, headers.clone(), body).await,
+                };
+                assert_eq!(
+                    response.status(),
+                    if original_allowed {
+                        StatusCode::ACCEPTED
+                    } else {
+                        StatusCode::FORBIDDEN
+                    }
+                );
+                let body = axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    body.as_ref(),
+                    if original_allowed {
+                        b"{\"forwarded\":true}".as_slice()
+                    } else {
+                        b"sim controls require a signed-in operator".as_slice()
+                    }
+                );
+            }
+            server.abort();
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                if original_allowed { 5 } else { 0 }
+            );
+            let report = tally.snapshot();
+            assert!(!report.rows.is_empty());
+            assert_eq!(report.rows.iter().map(|row| row.count).sum::<u64>(), 5);
+            for row in report.rows {
+                assert_eq!(row.observation.asserted_allowed, Some(original_allowed));
+                assert_eq!(row.observation.recorded_allowed, Some(!original_allowed));
+            }
+        }
     }
 }

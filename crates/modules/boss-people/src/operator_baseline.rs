@@ -93,6 +93,73 @@ pub struct Summary {
     pub skipped: u64,
 }
 
+/// Per-hire evidence survives even when the caller has no tracing subscriber
+/// (48b0a505). No request headers or hire payload are copied into this record.
+#[derive(Debug, serde::Serialize)]
+pub struct PostFailure {
+    pub employee_id: String,
+    pub method: &'static str,
+    pub target: String,
+    #[serde(flatten)]
+    pub cause: PostFailureCause,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PostFailureCause {
+    Transport { error: String },
+    Response { status: u16, body: String },
+    BodyRead { status: u16, error: String },
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct BaselinePostError {
+    pub inserted: u64,
+    pub skipped: u64,
+    pub failures: Vec<PostFailure>,
+}
+
+impl std::fmt::Display for BaselinePostError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let evidence = serde_json::to_string(self).map_err(|_| std::fmt::Error)?;
+        write!(
+            f,
+            "{} operator-baseline POSTs failed (inserted={}, skipped={}). The operator-baseline must land before downstream references resolve.\nPOST failures: {evidence}",
+            self.failures.len(),
+            self.inserted,
+            self.skipped
+        )
+    }
+}
+
+impl std::error::Error for BaselinePostError {}
+
+fn diagnostic_target(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.to_string()
+        }
+        Err(_) => "invalid people API URL".to_string(),
+    }
+}
+
+fn transport_cause(error: reqwest::Error) -> String {
+    // reqwest attaches the request URL, which may contain authentication data.
+    let error = error.without_url();
+    let mut message = error.to_string();
+    let mut cause = std::error::Error::source(&error);
+    while let Some(source) = cause {
+        message.push_str(": ");
+        message.push_str(&source.to_string());
+        cause = source.source();
+    }
+    message
+}
+
 /// Find the bootstrap-admin email. Precedence:
 ///   1. BOSS_BOOTSTRAP_ADMIN_EMAIL env var
 ///   2. First `[[credential]]` row in BOSS_AUTH_FILE (default
@@ -461,7 +528,7 @@ pub fn seed(
     let url = format!("{}/api/people", people_base.trim_end_matches('/'));
     let mut inserted = 0u64;
     let mut skipped = 0u64;
-    let mut failed = 0u64;
+    let mut failures = Vec::new();
     for emp in &seed.hire {
         let sent = client
             .post(&url)
@@ -471,8 +538,16 @@ pub fn seed(
         let resp = match sent {
             Ok(r) => r,
             Err(e) => {
-                warn!(operator_id = %emp.id, error = %e, "POST operator transport error");
-                failed += 1;
+                let failure = PostFailure {
+                    employee_id: emp.id.clone(),
+                    method: "POST",
+                    target: diagnostic_target(&url),
+                    cause: PostFailureCause::Transport {
+                        error: transport_cause(e),
+                    },
+                };
+                warn!(failure = ?failure, "POST operator transport error");
+                failures.push(failure);
                 continue;
             }
         };
@@ -484,17 +559,34 @@ pub fn seed(
             skipped += 1;
             info!(operator_id = %emp.id, "operator already hired, skipping");
         } else {
-            let body = resp.text().unwrap_or_default();
-            warn!(operator_id = %emp.id, %status, body = %body, "POST operator failed");
-            failed += 1;
+            let cause = match resp.text() {
+                Ok(body) => PostFailureCause::Response {
+                    status: status.as_u16(),
+                    body,
+                },
+                Err(error) => PostFailureCause::BodyRead {
+                    status: status.as_u16(),
+                    error: transport_cause(error),
+                },
+            };
+            let failure = PostFailure {
+                employee_id: emp.id.clone(),
+                method: "POST",
+                target: diagnostic_target(&url),
+                cause,
+            };
+            warn!(failure = ?failure, "POST operator failed");
+            failures.push(failure);
         }
     }
 
-    if failed > 0 {
-        anyhow::bail!(
-            "{failed} operator-baseline POSTs failed (inserted={inserted}, skipped={skipped}). \
-             The operator-baseline must land before downstream references resolve."
-        );
+    if !failures.is_empty() {
+        return Err(BaselinePostError {
+            inserted,
+            skipped,
+            failures,
+        }
+        .into());
     }
 
     info!(inserted, skipped, "operator-baseline seed complete");

@@ -159,6 +159,8 @@ try:
         raise ValueError("receipt is not an object")
     body["report"] = {"attempts": int(attempt), "waited_s": int(waited),
                       "sor_unreachable": unreachable == "true"}
+    body.setdefault("runtime_evidence", {"state": "unavailable",
+                    "collection_errors": ["runner ended before source collector was available"]})
     receipt = json.dumps(body, separators=(",", ":"))
 except Exception:
     pass
@@ -315,9 +317,28 @@ report() { # verdict, note
 }
 # --- report-back (end) ---
 
+# --- raw-runtime retention (begin) ---
+RUNTIME_RAW_RETAINED=false
+retain_runtime_raw() {
+    [ "$RUNTIME_RAW_RETAINED" = true ] && return 0
+    local helper=/gate-target/repo/infra/gate-runner/runtime-evidence.py
+    if [ ! -f "$helper" ]; then
+        echo 'gate-runtime-raw: unavailable: collector has not been cloned; no raw journal retained'
+        RUNTIME_RAW_RETAINED=true
+        return 0
+    fi
+    if python3 "$helper" retain "${BOSS_GATE_RUNTIME_EVIDENCE:-/gate-target/runtime-evidence.jsonl}" "${RECEIPT:-/gate-target/receipt.json}"; then
+        RUNTIME_RAW_RETAINED=true
+    else
+        echo 'gate-runtime-raw: unavailable: retention failed; workspace cleanup will discard unretained bytes'
+    fi
+    return 0
+}
+# --- raw-runtime retention (end) ---
+
 # The run itself is guarded so ANY failure below still reports `lost`
 # with the reason, rather than leaving the packet to go overdue.
-fail_lost() { report lost "runner died before a receipt: $1" || true; exit 1; }
+fail_lost() { retain_runtime_raw; report lost "runner died before a receipt: $1" || true; exit 1; }
 trap 'fail_lost "line $LINENO"' ERR
 
 # One job, one branch, one PRIVATE disk. /gate-target is a per-run
@@ -472,7 +493,7 @@ fi
 # passed: the workspace is then this pod's own directory of the gate
 # disk, and emptying it at exit is what an emptyDir did by dying.
 if [ "${GATE_DISK:-}" = required ]; then
-    trap 'empty_workspace' EXIT
+    trap 'retain_runtime_raw; empty_workspace' EXIT
 fi
 
 # --- workspace-sweep (begin) ---
@@ -716,6 +737,10 @@ CPUS=$(gate_cpus)
 # been bitten by. Raising both at once would also make the result
 # unattributable. Widen it as a separate, measured change.
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$CPUS}" RUST_TEST_THREADS="${RUST_TEST_THREADS:-2}"
+export BOSS_GATE_RUNTIME_EVIDENCE=/gate-target/runtime-evidence.jsonl
+export BOSS_GATE_SOURCE_HEAD="$HEAD_SHA"
+python3 infra/gate-runner/runtime-evidence.py sample "$BOSS_GATE_RUNTIME_EVIDENCE" runner-start \
+    || { echo 'gate-runtime-evidence: runner-start collection failed'; printf '%s\n' runner-start >> "${BOSS_GATE_RUNTIME_EVIDENCE}.failed"; }
 echo "gate-runner: building ${CARGO_BUILD_JOBS}-wide (cgroup quota), tests 2-wide"
 
 # THIS IS A LOADED GATE, SAID TO THE WEB SUITES (backlog ebb750cd). On
@@ -743,6 +768,11 @@ if BOSS_GATE_RECEIPT="$RECEIPT" ./infra/gate.sh ${GATE_MODE:-} > /gate-target/ga
 else
     VERDICT=failed
 fi
+python3 infra/gate-runner/runtime-evidence.py sample "$BOSS_GATE_RUNTIME_EVIDENCE" runner-finish \
+    || { echo 'gate-runtime-evidence: runner-finish collection failed'; printf '%s\n' runner-finish >> "${BOSS_GATE_RUNTIME_EVIDENCE}.failed"; }
+python3 infra/gate-runner/runtime-evidence.py merge "$BOSS_GATE_RUNTIME_EVIDENCE" "$RECEIPT" \
+    || { echo 'gate-runtime-evidence: final receipt merge failed; original receipt preserved'; printf '%s\n' receipt-merge >> "${BOSS_GATE_RUNTIME_EVIDENCE}.failed"; }
+retain_runtime_raw
 # THE VERDICT COMES FROM THE RECEIPT, not from a second reading of the
 # exit status (backlog c67bdbae). gate.sh already decided and wrote it
 # down; deriving it again here made the fact live twice, and the two

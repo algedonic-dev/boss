@@ -98,6 +98,13 @@ impl AgentsRegistry for DarkRegistry {
 }
 
 fn app(agents: Arc<dyn AgentsRegistry>) -> (axum::Router, Arc<InMemoryJobs>) {
+    app_with_reporter(agents, None)
+}
+
+fn app_with_reporter(
+    agents: Arc<dyn AgentsRegistry>,
+    reporter: Option<Arc<boss_policy_client::role_guard::RoleGuardReporter>>,
+) -> (axum::Router, Arc<InMemoryJobs>) {
     let jobs = Arc::new(InMemoryJobs::new());
     let policy: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()
@@ -108,6 +115,7 @@ fn app(agents: Arc<dyn AgentsRegistry>) -> (axum::Router, Arc<InMemoryJobs>) {
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let state = JobsApiState {
+        role_guards: reporter,
         agent_budget: Some(Arc::new(BudgetDoor {
             agents,
             runs: Arc::new(InMemoryAgentRuns::new(Vec::new())),
@@ -121,6 +129,57 @@ fn app(agents: Arc<dyn AgentsRegistry>) -> (axum::Router, Arc<InMemoryJobs>) {
         )
     };
     (router(state), jobs)
+}
+
+#[tokio::test]
+async fn for_me_reports_role_selection_without_dropping_alias_work() {
+    use boss_policy_client::role_guard::RoleGuardReporter;
+    use boss_policy_client::role_reader::{RegistryRoles, RoleSnapshotClock, SnapshotRoleReader};
+    use boss_policy_client::role_reporting::{ReportMode, ReportTally};
+    use std::time::{Duration, Instant};
+    struct Clock;
+    impl RoleSnapshotClock for Clock {
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+    }
+    let roles = Arc::new(SnapshotRoleReader::new(
+        Duration::from_secs(30),
+        Arc::new(Clock),
+    ));
+    let ticket = roles.begin_refresh();
+    assert!(roles.finish_refresh(ticket, Ok(RegistryRoles::from_sources(
+        json!({"data":[{"id":AGENT,"aliases":[ALIAS],"role":"engineering-agent"}], "total":1}),
+        json!({"data":[], "total":0}), json!([]),
+    ).unwrap())));
+    let tally = Arc::new(ReportTally::new(20));
+    let (app, jobs) = app_with_reporter(
+        registry(),
+        Some(Arc::new(RoleGuardReporter::new(
+            roles,
+            tally.clone(),
+            Arc::new(ReportMode::Report),
+        ))),
+    );
+    seed(&jobs).await;
+    let (status, body) = get(
+        &app,
+        "/api/jobs/assignments?for=me",
+        Some(user_header(ALIAS, "platform-admin")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(titles(&body), ["claimable", "on the alias", "on the id"]);
+    assert_eq!(body["for"]["ids"], json!([ALIAS, AGENT]));
+    let reports = tally.snapshot();
+    let observations: Vec<_> = reports
+        .rows
+        .iter()
+        .filter(|row| row.observation.resource == "assignments-for-me-roles")
+        .collect();
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].observation.would_change_scope, Some(true));
+    assert_eq!(observations[0].observation.would_deny, None);
 }
 
 fn registry() -> Arc<dyn AgentsRegistry> {

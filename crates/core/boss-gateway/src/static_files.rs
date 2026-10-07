@@ -100,6 +100,7 @@ async fn serve(state: &AppState, req: Request, base: &Path) -> Response {
     let Some(full_path) = resolve(base, file_path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let is_instance_config = full_path.starts_with(base.join("instance-config"));
 
     // Try to read the file. If it doesn't exist, serve index.html (SPA fallback).
     let (content, serving_path) = match read_inside(base, &full_path).await {
@@ -122,7 +123,13 @@ async fn serve(state: &AppState, req: Request, base: &Path) -> Response {
         // honest answer was 404, which is the same silent-loss shape as a
         // JSON endpoint falling through to index.html (see main.rs, where
         // the missing bare matcher was fixed for exactly this reason).
-        Err(_) if is_static_asset => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) if is_static_asset => {
+            return if is_instance_config {
+                (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, "no-store")]).into_response()
+            } else {
+                StatusCode::NOT_FOUND.into_response()
+            };
+        }
         Err(_) => {
             // SPA fallback: serve index.html for any non-file path.
             let index = base.join("index.html");
@@ -177,7 +184,9 @@ async fn serve(state: &AppState, req: Request, base: &Path) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, content_type);
 
-    // Cache static assets (JS, CSS) aggressively — they have content hashes in filenames.
+    // Deployment declarations keep their names while their content
+    // changes. Like index.html, they must be read again on refresh.
+    // Other static assets have content hashes in their filenames.
     // Don't cache index.html *anywhere* — Cloudflare's edge will hold
     // it for minutes under plain `no-cache` (which means "store but
     // revalidate"), and a stale HTML pointing at a no-longer-current
@@ -185,7 +194,7 @@ async fn serve(state: &AppState, req: Request, base: &Path) -> Response {
     // exactly because the browser then trusts its own immutable
     // cache for the stale hash. The fix is to tell every layer to
     // not store it at all.
-    if !serving_path.ends_with("index.html") {
+    if !serving_path.ends_with("index.html") && !is_instance_config {
         headers.insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("public, max-age=31536000, immutable"),
@@ -672,6 +681,51 @@ mod traversal_tests {
         let headers = resp.headers().clone();
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn instance_declarations_are_read_fresh_without_changing_asset_auth() {
+        let (_root, dist) = fixture("instance-declaration");
+        boss_testing::create_dir(&dist.join("instance-config"));
+        let declaration = dist.join("instance-config/dev-door.json");
+        let (status, headers, _) = get(&dist, "/instance-config/dev-door.json", false).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("no-store"))
+        );
+        boss_testing::write_file(&declaration, "{}");
+        for path in [
+            "/instance-config/dev-door.json",
+            "/dashboard/instance-config/dev-door.json",
+            "//instance-config/dev-door.json",
+        ] {
+            for signed_in in [false, true] {
+                let (status, headers, body) = get(&dist, path, signed_in).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(body, "{}");
+                assert!(
+                    headers[header::CACHE_CONTROL]
+                        .to_str()
+                        .unwrap()
+                        .contains("no-store")
+                );
+            }
+        }
+        boss_testing::write_file(&declaration, "{\"host\":null}");
+        assert_eq!(
+            get(&dist, "/instance-config/dev-door.json", false).await.2,
+            "{\"host\":null}"
+        );
+        let (_, headers, _) = get(&dist, "/chunk-abc123.js", false).await;
+        assert!(
+            headers[header::CACHE_CONTROL]
+                .to_str()
+                .unwrap()
+                .contains("immutable")
+        );
     }
 
     /// Every shape of climb named in the packet, each with a dotted

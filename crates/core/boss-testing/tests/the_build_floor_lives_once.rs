@@ -19,6 +19,35 @@
 use boss_testing::repo_root;
 use std::process::Command;
 
+#[test]
+fn the_floor_fixture_preserves_the_enclosing_receipt() {
+    let dir = boss_testing::scratch_dir("build-floor-parent-receipt");
+    let parent = dir.join("parent.json");
+    let sentinel = "parent-gate-must-retain-this\n";
+    boss_testing::write_file(&parent, sentinel);
+    let out = Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "the_gate_refuses_below_the_floor_the_file_defines",
+            "--nocapture",
+        ])
+        .env("BOSS_GATE_RECEIPT", &parent)
+        .output()
+        .expect("run actual floor fixture");
+    assert!(
+        out.status.success(),
+        "floor fixture failed: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"));
+    assert_eq!(
+        std::fs::read_to_string(&parent).expect("parent receipt"),
+        sentinel
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// The value of `name` in `infra/build-floor.env`, read the way the two
 /// scripts read it: the last `NAME=<number>` line.
 fn build_floor(name: &str) -> u64 {

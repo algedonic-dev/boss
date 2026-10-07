@@ -15,7 +15,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "Compare the forge's live access tokens against the declared inventory in infra/platform/forge-tokens.toml and report the difference. Four kinds of drift: a token on the forge that no one declared (an unattributable credential, which in practice is one nobody dares revoke), a declared token missing from the forge (a revocation nobody wrote down, and a consumer about to fail), a scope that widened behind our back, and a token unused past the staleness window. A declaration entry whose consumer is still UNKNOWN counts as debt in its own right, so a forge that matches the declaration perfectly does NOT pass while any consumer is unidentified. The check is read-only against the forge's SQLite database and never reads the credential columns; the only credential-shaped value it prints is the last eight characters, which is what the forge's own UI shows."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
 
 [[workflow.step]]
 title = "scheduled"

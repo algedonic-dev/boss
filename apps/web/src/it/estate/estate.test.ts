@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import {
   comparisonVerdict,
-  DEV_DOOR_HOST,
+  parseDevDoor,
   devDoorSteps,
   ESTATE_LOOPS,
   fetchEstate,
@@ -874,6 +874,7 @@ describe('the loops the page reads are in the registry', () => {
 });
 
 describe('the dev workspace door', () => {
+  const declaration = parseDevDoor(JSON.parse(readFileSync(new URL('../../../../../infra/estate/dev-door.json', import.meta.url), 'utf8')) as unknown);
   // The door moved from a LAN VIP behind a WireGuard bastion to one
   // public hostname behind a Cloudflare Access SSH application (design
   // 5fc71f03; backlog e4cedb46). The hostname is pinned to the tunnel
@@ -881,11 +882,11 @@ describe('the dev workspace door', () => {
   // the_dev_door_is_an_access_ssh_application.rs — this file pins the
   // WORDS an operator pastes, which nothing else reads.
   test('the hostname is the declared one', () => {
-    expect(DEV_DOOR_HOST).toBe('dev.algedonic.dev');
+    expect(declaration.host).toBe('dev.algedonic.dev');
   });
 
   test('the block is the three-line setup, in order, each with its reason', () => {
-    const steps = devDoorSteps();
+    const steps = devDoorSteps(declaration.host, declaration.steps);
     expect(steps.map((s) => s.command)).toEqual([
       'cloudflared --version',
       "grep -qsF 'Match host dev.algedonic.dev ' ~/.ssh/config || cloudflared access ssh-config --hostname dev.algedonic.dev --short-lived-cert | sed '/^Add to your/d' >> ~/.ssh/config",
@@ -901,13 +902,13 @@ describe('the dev workspace door', () => {
     // ssh refuses to parse, and the operator deleted it by hand every
     // time. A second run appended a second stanza, so the step is
     // guarded on the one it writes.
-    const route = devDoorSteps()[1]?.command ?? '';
+    const route = devDoorSteps(declaration.host, declaration.steps)[1]?.command ?? '';
     expect(route).toContain("sed '/^Add to your/d'");
     expect(route.startsWith("grep -qsF 'Match host dev.algedonic.dev ' ~/.ssh/config || ")).toBe(true);
   });
 
   test('every step names the host it was given, so one constant moves them all', () => {
-    const steps = devDoorSteps('dev.example.test');
+    const steps = devDoorSteps('dev.example.test', declaration.steps);
     expect(steps[1]?.command).toContain('dev.example.test');
     expect(steps[2]?.command).toBe('ssh root@dev.example.test');
     // The root login is what the certificate's principal must match:
@@ -1344,7 +1345,7 @@ describe('EstatePage renders the door from the module', () => {
   });
 
   test('the setup block is rendered from devDoorSteps, not retyped', () => {
-    expect(code).toMatch(/devDoorSteps\(\)/);
+    expect(code).toMatch(/devDoorSteps\(door\.data\.host, door\.data\.steps\)/);
     expect(code).toMatch(/\{#each\s+doorSteps\b/);
     expect(code).toMatch(/\{step\.command\}/);
     expect(code).not.toMatch(/cloudflared access ssh-config/);

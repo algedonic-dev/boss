@@ -120,6 +120,19 @@ use super::credential_rotate_forgejo::last_eight;
 /// The handler's registered name — the `handler = "…"` of both rules.
 pub const HANDLER: &str = "credential.rotate.github-app-installation";
 
+/// The credential registry's `kind` for a row this handler mints — the
+/// spelling the LIVE registry holds on `github-app-algedonic-dev` and
+/// `github-dr-push-token` (read 2026-10-06), and the one
+/// `infra/cluster/manifests/boss-credential-broker.yaml` declares for both.
+/// The rows are instance data (`POST /api/credentials/batch`), so no seed
+/// in the tree spells it; this is the tree's ONE definition, and every
+/// reader that judges a row's kind takes it from here. The installation
+/// read (`credential_installation_observe`) compared against its own
+/// literal, the handler's NAME without the `credential.rotate.` prefix,
+/// and its fixture invented a row to agree: green in the suite while every
+/// live packet dead-lettered at the declaration check (backlog 8dbef2a7).
+pub const REGISTRY_KIND: &str = "github-app-installation-token";
+
 /// The one value of the `phase` arg: the clock rule's re-mint.
 pub const REFRESH_PHASE: &str = "refresh";
 

@@ -67,7 +67,7 @@
 //! name the problem the whole time, and publish never asked it.
 
 use crate::registry::{StepSpec, WorkflowSpec, predicate_refs_job_metadata, predicate_step_refs};
-use crate::step_registry::{StepRegistry, field_type_problem};
+use crate::step_registry::{StepRegistry, field_type_problem, validate_field_type};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
@@ -1161,6 +1161,26 @@ fn check_writers_are_resolvable(
     resolvable: &[&str],
     errs: &mut Vec<WorkflowLintError>,
 ) {
+    if step
+        .metadata_defaults
+        .get(crate::credential_executor::KEY)
+        .is_some()
+    {
+        errs.push(WorkflowLintError {
+            workflow: spec.kind.clone(),
+            step: step.title.clone(),
+            reason: "credential executor is a step executor declaration, never a metadata default"
+                .into(),
+        });
+    }
+    if let Some(executor) = step.executor.as_deref()
+        && !resolvable.contains(&executor)
+    {
+        errs.push(WorkflowLintError {
+            workflow: spec.kind.clone(), step: step.title.clone(),
+            reason: format!("executor `{executor}` is not a principal a deployed credential door resolves; refusing a step no caller could execute"),
+        });
+    }
     for field in &step.fields {
         let Some(writer) = field.writer.as_deref() else {
             continue;
@@ -1180,6 +1200,18 @@ fn check_writers_are_resolvable(
                     field.name
                 ),
             });
+        }
+        // A signer is the verified gateway session with a required role,
+        // not an enrolled host credential. This adds no runner principal.
+        if writer == crate::field_writer::SIGNER_WRITER {
+            if step.sign_offs_required.is_empty() {
+                errs.push(WorkflowLintError {
+                    workflow: spec.kind.clone(),
+                    step: step.title.clone(),
+                    reason: "a signer writer requires at least one sign_offs_required role".into(),
+                });
+            }
+            continue;
         }
         if resolvable.contains(&writer) {
             continue;
@@ -1370,25 +1402,11 @@ fn check_field_value(field_type: &str, value: &Value, field_name: &str) -> Optio
     {
         return None;
     }
-    let ok = match field_type {
-        "string" => value.is_string(),
-        "number" => value.is_number(),
-        "integer" => value.is_i64() || value.is_u64(),
-        "boolean" => value.is_boolean(),
-        "array" => value.is_array(),
-        "object" => value.is_object(),
-        "date" => value.as_str().is_some_and(|s| s.len() == 10),
-        "date-time" => value.as_str().is_some_and(|s| s.len() >= 19),
-        "uri" => value.is_string(),
-        s if field_type_problem(s).is_none() => {
-            let allowed: Vec<&str> = s.split('|').collect();
-            value.as_str().is_some_and(|v| allowed.contains(&v))
-        }
-        // An unknown type is refused once, by `check_field_types_are_known`,
-        // not again for every default a step sets under it.
-        _ => true,
-    };
-    if ok {
+    // Unknown declarations are diagnosed once by check_field_types_are_known.
+    // Known defaults and runtime completion use the SAME pure value contract.
+    if field_type_problem(field_type).is_some()
+        || validate_field_type(field_name, field_type, value).is_ok()
+    {
         return None;
     }
     Some(format!(
@@ -1423,6 +1441,38 @@ fn truncate_value(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_signer_writer_requires_an_actual_required_role_but_no_runner_principal() {
+        let mut spec = crate::registry::WorkflowSpec::platform_seed(
+            "signer-fixture",
+            "Signer",
+            "test",
+            vec!["custom".into()],
+            vec![crate::registry::StepSpec {
+                title: "approve".into(),
+                kind: "sign-off".into(),
+                ready_when: "true".into(),
+                sign_offs_required: vec!["approver".into()],
+                fields: vec![boss_core::job::StepField {
+                    writer: Some("signer".into()),
+                    ..boss_core::job::StepField::new("decision", "string")
+                }],
+                ..Default::default()
+            }],
+        );
+        let mut errors = Vec::new();
+        super::check_writers_are_resolvable(&spec, &spec.steps[0], &[], &mut errors);
+        assert!(
+            errors.is_empty(),
+            "gateway session signer is a different mechanism from enrolled runner principals: {errors:?}"
+        );
+        spec.steps[0].sign_offs_required.clear();
+        super::check_writers_are_resolvable(&spec, &spec.steps[0], &[], &mut errors);
+        assert!(
+            !errors.is_empty(),
+            "no required role means no possible signer"
+        );
+    }
     use super::*;
     use crate::registry::{StepSpec, Terminal};
     use serde_json::json;
@@ -1459,6 +1509,65 @@ mod tests {
     fn minimal_viable_jobkind_passes() {
         let reg = StepRegistry::v1();
         assert!(validate_workflow(&viable_spec("ok"), &reg).is_empty());
+    }
+
+    #[test]
+    fn non_empty_string_defaults_share_the_runtime_scalar_contract() {
+        use boss_core::job::StepField;
+        let reg = StepRegistry::v1();
+        let mut spec = viable_spec("nonblank-defaults");
+        spec.steps[1].fields = vec![StepField::new("proposal", "non-empty-string")];
+        for value in [
+            "public proposal",
+            " \tpublic\r\nproposal\u{2003}",
+            "{subject.id}",
+        ] {
+            spec.steps[1].metadata_defaults = json!({"proposal":value});
+            let errors = validate_workflow(&spec, &reg);
+            assert!(errors.is_empty(), "{value:?}: {errors:?}");
+        }
+        for value in [
+            json!(null),
+            json!(42),
+            json!(""),
+            json!(" \t\r\n"),
+            json!("\u{2003}\u{a0}"),
+        ] {
+            spec.steps[1].metadata_defaults = json!({"proposal":value});
+            let errors = validate_workflow(&spec, &reg);
+            assert!(
+                errors.iter().any(|e| e.reason.contains("metadata_defaults")
+                    && e.reason.contains("non-empty-string")),
+                "{errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn original_string_defaults_and_unknown_type_diagnostics_stay_unchanged() {
+        use boss_core::job::StepField;
+        let reg = StepRegistry::v1();
+        let mut spec = viable_spec("original-string-defaults");
+        spec.steps[1].fields = vec![StepField::new("proposal", "string")];
+        for value in ["", " \t\r\n", "\u{2003}\u{a0}", "{subject.id}"] {
+            spec.steps[1].metadata_defaults = json!({"proposal":value});
+            assert!(validate_workflow(&spec, &reg).is_empty());
+        }
+        spec.steps[1].fields[0].field_type = "strng".into();
+        spec.steps[1].metadata_defaults = json!({"proposal":42});
+        let errors = validate_workflow(&spec, &reg);
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|e| e.reason.contains("not a field type"))
+                .count(),
+            1
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.reason.contains("metadata_defaults"))
+        );
     }
 
     // Phase 7 — a step declares its audience ONCE (f5ebd2e1 car 1).
@@ -1540,6 +1649,7 @@ mod tests {
 
     fn builder() -> crate::agent_spec::AgentSpec {
         crate::agent_spec::AgentSpec {
+            executor_provenance: Default::default(),
             profile: "builder".into(),
             model: "opus-5[1m]".into(),
             budget_usd: 5.0,
@@ -1816,6 +1926,23 @@ mod tests {
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(
             errs[0].reason.contains("'plan'") && errs[0].reason.contains("metadata_defaults"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_credential_executor_uses_the_same_resolvable_principals_and_refuses_default_injection() {
+        let mut spec = viable_spec("execute");
+        spec.steps[1].executor = Some("runner:ops".into());
+        let mut errs = Vec::new();
+        check_writers_are_resolvable(&spec, &spec.steps[1], &["runner:ops"], &mut errs);
+        assert!(errs.is_empty(), "{errs:?}");
+        spec.steps[1].metadata_defaults[crate::credential_executor::KEY] =
+            serde_json::json!("other");
+        check_writers_are_resolvable(&spec, &spec.steps[1], &["runner:ops"], &mut errs);
+        assert!(
+            errs.iter()
+                .any(|e| e.reason.contains("never a metadata default")),
             "{errs:?}"
         );
     }

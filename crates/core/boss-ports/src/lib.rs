@@ -266,6 +266,20 @@ pub fn url(name: &str) -> String {
     format!("http://127.0.0.1:{}", prod(name))
 }
 
+/// The names the launcher decides the registry row `name` under, in
+/// `infra/oss-quickstart/services-launcher.sh`'s spelling: `boss-<name>-api`,
+/// or `boss-<name>` for the services that are not `-api` binaries. One
+/// definition, read by the roster pin below and by the gate-window
+/// reader, which takes a row's launch decision from the launcher's
+/// record under these names (backlog 93e0814a). A row that is a port
+/// embedded in another binary (`sim-control`, the sim daemon's) has no
+/// binary of its own: the launcher records that binary's decision a
+/// second time under the row's name (`embedded_rows` there), so no
+/// tenant's binary is named in this crate.
+pub fn launcher_binaries(name: &str) -> Vec<String> {
+    vec![format!("boss-{name}-api"), format!("boss-{name}")]
+}
+
 /// Default localhost URL for a service in scratch. Returns
 /// `None` for solo services that have no scratch counterpart.
 pub fn scratch_url(name: &str) -> Option<String> {
@@ -372,8 +386,9 @@ mod launcher_roster_agreement {
     /// the roster that runs.
     ///
     /// The binary for a registry name is `boss-<name>-api`, or
-    /// `boss-<name>` for the three non-`-api` services. `sim-control` is
-    /// the one legitimate absence: it is the sim daemon's
+    /// `boss-<name>` for the three non-`-api` services
+    /// (`launcher_binaries`, the one spelling of this mapping).
+    /// `sim-control` is the one legitimate absence: it is the sim daemon's
     /// embedded port, alive only while the daemon runs, not a binary.
     /// The launcher may carry binaries with no port row (the event
     /// relay, the sim daemon, the gateway) — only `boss-*-api` lines
@@ -412,9 +427,9 @@ mod launcher_roster_agreement {
             .chain(SOLO.iter())
             .filter(|s| s.name != "sim-control")
             .filter(|s| {
-                !launched.iter().any(|b| {
-                    b == &format!("boss-{}-api", s.name) || b == &format!("boss-{}", s.name)
-                })
+                !super::launcher_binaries(s.name)
+                    .iter()
+                    .any(|b| launched.contains(b))
             })
             .map(|s| s.name.to_string())
             .collect();

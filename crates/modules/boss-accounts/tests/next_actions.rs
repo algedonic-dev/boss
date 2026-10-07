@@ -699,3 +699,69 @@ async fn multiple_rules_fire_and_sort_by_severity() {
     assert_eq!(arr[1]["rule"], "contract-expiring");
     assert_eq!(arr[1]["severity"], "info");
 }
+
+#[tokio::test]
+async fn role_reports_preserve_next_actions_and_name_skipped_relationship_context() {
+    use boss_policy_client::role_reader::{
+        MonotonicRoleSnapshotClock, RegistryRoles, SnapshotRoleReader,
+    };
+    use boss_policy_client::role_reporting::{ReportMode, ReportTally};
+    use std::sync::Arc;
+    let db = TestDb::new().await;
+    seed_refs(&db.pool).await;
+    for (actor, asserted, recorded, expected, lookup) in [
+        (
+            "broad-reader",
+            "platform-admin",
+            "service-tech",
+            None,
+            "context-unavailable",
+        ),
+        (
+            "unrelated-reader",
+            "service-tech",
+            "platform-admin",
+            Some(true),
+            "registered",
+        ),
+        (EMP_REP, "service-tech", "visitor", Some(true), "registered"),
+    ] {
+        let roles = Arc::new(SnapshotRoleReader::new(
+            std::time::Duration::from_secs(30),
+            Arc::new(MonotonicRoleSnapshotClock),
+        ));
+        let ticket = roles.begin_refresh();
+        assert!(roles.finish_refresh(ticket,Ok(RegistryRoles::from_sources(serde_json::json!({"data":[{"id":actor,"aliases":[],"role":recorded}],"total":1}),serde_json::json!({"data":[],"total":0}),serde_json::json!([])).unwrap())));
+        let tally = Arc::new(ReportTally::new(8));
+        let reporter = Arc::new(boss_policy_client::role_guard::RoleGuardReporter::new(
+            roles,
+            tally.clone(),
+            Arc::new(ReportMode::Report),
+        ));
+        let baseline = next_actions_router(
+            db.pool.clone(),
+            Arc::new(boss_clock_client::WallClockClient),
+        );
+        let app = boss_accounts::account_next_actions::next_actions_router_with_reports(
+            db.pool.clone(),
+            Arc::new(boss_clock_client::WallClockClient),
+            Some(reporter),
+        );
+        let path = format!("/api/people/accounts/{ACCOUNT_ID}/next-actions");
+        let original = TestRequest::get(&path)
+            .as_user(actor, asserted)
+            .send(&baseline)
+            .await;
+        let reported = TestRequest::get(&path)
+            .as_user(actor, asserted)
+            .send(&app)
+            .await;
+        original.assert_status(StatusCode::OK);
+        reported.assert_status(StatusCode::OK);
+        assert_eq!(original.body_bytes, reported.body_bytes);
+        let report = tally.snapshot();
+        assert_eq!(report.rows.len(), 1);
+        assert_eq!(report.rows[0].observation.recorded_allowed, expected);
+        assert_eq!(report.rows[0].observation.lookup_status, lookup);
+    }
+}

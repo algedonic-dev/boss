@@ -1916,7 +1916,7 @@ mod tests {
         );
         assert_eq!(
             prose.iter().map(String::as_str).collect::<Vec<_>>(),
-            ["apps/web/src/it/estate/dev-door.json"],
+            ["infra/estate/dev-door.json"],
             "derived from the sheet's own `fields` lines (backlog 27272837)"
         );
     }
@@ -1984,11 +1984,8 @@ mod tests {
     #[test]
     fn on_the_real_tree_a_change_to_the_dev_door_steps_alone_is_held() {
         let tree = real_tree();
-        let judged = touched(&paths(&["apps/web/src/it/estate/dev-door.json"]), &[&tree]);
-        assert_eq!(
-            judged,
-            touches(&["apps/web/src/it/estate/dev-door.json"], &[])
-        );
+        let judged = touched(&paths(&["infra/estate/dev-door.json"]), &[&tree]);
+        assert_eq!(judged, touches(&["infra/estate/dev-door.json"], &[]));
     }
 
     /// THE REAL TREE: a change to the dev pod's login selector ALONE is
