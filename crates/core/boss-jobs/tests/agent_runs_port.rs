@@ -902,3 +902,130 @@ async fn a_total_only_run_on_a_model_that_declares_a_blend_is_priced_and_says_so
     let events = log.recorded_events().await;
     assert_eq!(events[0].payload["usd_micros"], 1_500_000);
 }
+
+// -- a row that holds no count, and the report that prices it -----------
+//
+// Backlog b5a3a174, measured 2026-10-08: 21 of the day's 56 rows were
+// written before their run's report — 19 holding no count at all and 2
+// a metered zero at $0 — and every one then REFUSED the report that
+// carried the run's real usage, because the row was insert-once
+// whatever it held. A row that holds no count prices nothing; it is a
+// placeholder, and the first record that carries a count takes its
+// place, once, saying what it replaced.
+
+fn unreported(branch: &str) -> NewAgentRun {
+    with_tokens(branch, TokenUsage::Unreported, 0, 1)
+}
+
+/// TODAY'S FAILING ORDER, at the door: the row first, the report after.
+#[tokio::test]
+async fn a_report_carrying_a_count_replaces_a_row_that_held_none_exactly_once() {
+    let log = InMemoryAgentRuns::new(card());
+    let first = log
+        .record_run(&unreported("fix/x"), &filer())
+        .await
+        .expect("a run with no count is still a record");
+    assert!(first.recorded && !first.replaced);
+    assert_eq!(first.run.usd_micros, None, "no count, no price — not $0");
+
+    let report = measured("fix/x", 142_982, 52, 10);
+    let second = log.record_run(&report, &filer()).await.expect("records");
+    assert!(second.recorded, "the report did its job");
+    assert!(second.replaced, "and says it took a placeholder's place");
+    assert_eq!(second.run.run.tokens, report.tokens);
+    assert_eq!(second.run.usd_micros, Some(1_000_865));
+    assert_eq!(second.run.run.tool_calls, 52);
+    // THE REPLACEMENT IS ON THE RECORD: the row names what it replaced,
+    // and the caller's own detail is kept beside it.
+    let was = &second.run.run.detail["replaced"];
+    assert_eq!(was["recorded_at"], serde_json::json!(first.run.recorded_at));
+    assert_explicit_null!(was, "total_tokens", "the row it replaced held no count");
+    assert_explicit_null!(was, "usd_micros", "and no price");
+    assert_eq!(second.run.run.detail["host"], "dev-pod");
+
+    // ONCE: the row holds a count now, and nothing replaces a count.
+    let third = log
+        .record_run(&measured("fix/x", 999_999, 1, 10), &filer())
+        .await
+        .expect("a second report collapses");
+    assert!(!third.recorded && !third.replaced);
+    assert_eq!(third.run, second.run, "the held row is unchanged");
+
+    let held = log.list_runs(&RunFilter::default()).await.expect("lists");
+    assert_eq!(held.len(), 1, "one run, one row");
+    assert_eq!(held[0], second.run);
+
+    // Two facts on the log, in order: the placeholder, then the record
+    // that replaced it — a rebuild replays both and ends where this did.
+    let events = log.recorded_events().await;
+    assert_eq!(
+        events.len(),
+        2,
+        "the collapsed third report recorded nothing"
+    );
+    assert!(events.iter().all(|e| e.kind == AGENT_RUN_RECORDED));
+    assert!(events[0].payload["detail"].get("replaced").is_none());
+    assert_eq!(
+        events[1].payload["detail"]["replaced"]["recorded_at"],
+        serde_json::json!(first.run.recorded_at)
+    );
+    assert_eq!(events[1].payload["usd_micros"], 1_000_865);
+}
+
+/// A metered zero is a placeholder too: two of the day's rows read
+/// 0 tokens at $0 because the meter ran before the run's first turn.
+#[tokio::test]
+async fn a_row_holding_a_zero_count_is_replaced_by_the_first_real_count() {
+    let log = InMemoryAgentRuns::new(card());
+    let zero = with_tokens(
+        "fix/z",
+        TokenUsage::Split {
+            input: 0,
+            output: 0,
+        },
+        0,
+        1,
+    );
+    let first = log.record_run(&zero, &filer()).await.expect("records");
+    assert_eq!(first.run.usd_micros, Some(0), "the $0 this item is about");
+    let second = log
+        .record_run(&measured("fix/z", 142_982, 52, 10), &filer())
+        .await
+        .expect("records");
+    assert!(second.replaced);
+    assert_eq!(second.run.usd_micros, Some(1_000_865));
+    assert_eq!(second.run.run.detail["replaced"]["total_tokens"], 0);
+    assert_eq!(second.run.run.detail["replaced"]["usd_micros"], 0);
+}
+
+/// Only a count replaces, and only a row without one is replaced.
+#[tokio::test]
+async fn nothing_but_a_count_replaces_and_nothing_replaces_a_count() {
+    let log = InMemoryAgentRuns::new(card());
+    log.record_run(&unreported("fix/a"), &filer())
+        .await
+        .expect("records");
+    // A second report that also carries no count is a retry.
+    let again = log
+        .record_run(&unreported("fix/a"), &filer())
+        .await
+        .expect("collapses");
+    assert!(!again.recorded && !again.replaced);
+    // A zero does not replace a placeholder either: it prices nothing.
+    let zero = with_tokens("fix/a", TokenUsage::TotalOnly { total: 0 }, 0, 1);
+    let zeroed = log.record_run(&zero, &filer()).await.expect("collapses");
+    assert!(!zeroed.recorded && !zeroed.replaced);
+
+    // A row that holds a count stands, whatever arrives after it
+    // (backlog b4fd594e: correcting a recorded cost is another decision).
+    log.record_run(&measured("fix/b", 100, 1, 1), &filer())
+        .await
+        .expect("records");
+    let later = log
+        .record_run(&measured("fix/b", 200, 1, 1), &filer())
+        .await
+        .expect("collapses");
+    assert!(!later.recorded && !later.replaced);
+    assert_eq!(later.run.run.tokens.total(), Some(100));
+    assert_eq!(log.recorded_events().await.len(), 2);
+}

@@ -135,7 +135,11 @@ async function opsApproval(
   await page.route(new RegExp(`/api/jobs/${JOB_ID}/steps/s1$`), async (r) => {
     const ticket = await r.request().headerValue('x-presence-ticket');
     seen.writes.push(`PUT ${ticket ?? '-'}`);
-    if (ticket !== TICKET) return json(r, PRESENCE_REFUSAL, 422);
+    // The completion stands on the stamp (design 1ce67f7e): bare.
+    if (step.sign_offs.length === 0) {
+      return json(r, { error: 'stamps', completes_on: 'stamps',
+        missing_or_stale_roles: ['platform-admin'] }, 422);
+    }
     step.status = 'completed';
     return json(r, step);
   });
@@ -179,7 +183,7 @@ test('Approve: the keys on screen when the passkey is asked are exactly the keys
     expect(signedKeys).toContain(k);
   }
   expect(seen.writes).toEqual([
-    'PATCH metadata', 'POST sign-offs -', `POST sign-offs ${TICKET}`, `PUT ${TICKET}`,
+    'PATCH metadata', 'POST sign-offs -', `POST sign-offs ${TICKET}`, 'PUT -',
   ]);
 });
 

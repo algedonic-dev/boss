@@ -107,6 +107,10 @@ const LISTING_CEILING: i64 = 1000;
 pub struct RecordResponse {
     /// `false` means this `run_id` was already held — a retried report.
     pub recorded: bool,
+    /// `true` means the held row carried no count and this record took
+    /// its place (`port::replaces`); the row's `detail.replaced` says
+    /// what it held.
+    pub replaced: bool,
     /// The held row with its derived basis — see [`AgentRunView`].
     pub run: AgentRunView,
 }
@@ -181,6 +185,7 @@ async fn record_run(
             StatusCode::OK,
             Json(RecordResponse {
                 recorded: out.recorded,
+                replaced: out.replaced,
                 run: out.run.into(),
             }),
         )

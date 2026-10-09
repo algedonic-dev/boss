@@ -133,6 +133,10 @@ pub fn validate_workflow(spec: &WorkflowSpec, registry: &StepRegistry) -> Vec<Wo
             &mut errs,
         );
     }
+    // Phase 10 — a presence step declares what its passkey signs.
+    for step in &spec.steps {
+        check_presence_steps_declare_what_they_sign(spec, step, registry, &mut errs);
+    }
     errs
 }
 
@@ -1113,6 +1117,69 @@ fn check_metadata_defaults_values(
             });
         }
     }
+}
+
+/// The keys a signer writes with the signature itself — the decision,
+/// its time and a comment. The sign-off surface holds the same list as
+/// `TRIO` (infra/step-plugins/sign-off.js); the two are held equal by
+/// tests/a_presence_step_declares_what_it_signs.rs (CLAUDE.md §9a).
+pub const SIGNERS_OWN_KEYS: [&str; 3] = ["decision", "decided_at", "comment"];
+
+/// Phase 10: a step that requires presence declares the fields it signs
+/// (design 1ce67f7e, the rule David added on `completer`, 2026-10-07:
+/// "anything an approval depends on must be rendered onto the step being
+/// signed … and the workflow lint checks that a presence step declares
+/// the fields it signs").
+///
+/// A presence stamp binds the STEP — `step_shape_hash(title, metadata)`
+/// — not the job, and since that design the stamps alone carry the
+/// step's completion, sent by any actor. So whatever the approval
+/// depends on has to BE on the step: an ops-request renders its plan,
+/// verb, host, args and the plan's hash onto `approve`; publish-to-github
+/// copies the measured shas there. A presence step that declares no
+/// field but the signer's own decision signs a title and a yes: what was
+/// approved lives somewhere the signature does not cover, and can be
+/// changed after it without voiding anything.
+///
+/// Judged on the declaration, which is what a lint can read: at least
+/// one field outside [`SIGNERS_OWN_KEYS`]. It cannot prove the declared
+/// fields are the RIGHT ones; it refuses the row that names none.
+/// Measured when written: all eight presence steps of the platform
+/// bundle, and the same eight active on the live registry, declare one.
+fn check_presence_steps_declare_what_they_sign(
+    spec: &WorkflowSpec,
+    step: &StepSpec,
+    registry: &StepRegistry,
+    errs: &mut Vec<WorkflowLintError>,
+) {
+    let floor = registry
+        .get(&step.kind)
+        .map(|t| t.assurance_floor)
+        .unwrap_or_default();
+    let required = step.assurance_required.unwrap_or_default().max(floor);
+    if required <= boss_core::job::Assurance::Session {
+        return;
+    }
+    let signs = step
+        .fields
+        .iter()
+        .any(|f| !SIGNERS_OWN_KEYS.contains(&f.name.as_str()));
+    if signs {
+        return;
+    }
+    errs.push(WorkflowLintError {
+        workflow: spec.kind.clone(),
+        step: step.title.clone(),
+        reason: format!(
+            "requires presence and declares no field it signs: a passkey stamp binds this \
+             step's title and metadata and nothing else on the packet, so what the approval \
+             depends on must be rendered onto the step and declared in its `fields` (as \
+             ops-request's approve declares plan, verb, host, args and rendered_plan_sha256). \
+             The signer's own keys ({}) do not count — they are the signature's answer, not \
+             what it answers.",
+            SIGNERS_OWN_KEYS.join(", ")
+        ),
+    });
 }
 
 /// True when the value is an obvious placeholder rather than a real

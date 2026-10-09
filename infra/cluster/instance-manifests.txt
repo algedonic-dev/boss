@@ -103,11 +103,32 @@ gate-seed-local.yaml pipeline
 # namespace on that cluster, and a per-instance copy would grant a
 # second credential over the same nodes for no added reach.
 boss-break-glass-operator.yaml pipeline
+# The admission bound on the node-maintenance namespace (backlog
+# 8eac4893): a ValidatingAdmissionPolicy and its binding, both
+# cluster-scoped, and the Namespace itself — declared HERE for good,
+# never in the trim manifest (review 9dc7696c F3: the converge applies
+# the files that carry a Namespace first, so the policy is always
+# written before the CronJob it judges). PIPELINE because every object
+# in it exists once per CLUSTER: rendered per instance it would be
+# applied again under each instance's directory, the same three names
+# each time. It landed (train #987) with the namespace unprivileged, so
+# the bound was in place before there was anything for it to bound; the
+# trim car changed that one label line to `privileged`.
+boss-node-maintenance-admission.yaml pipeline
 # Its delivery (backlog 7336cb5f): the CronJob that reads that one
 # credential and deposits it on boss-gcp. PIPELINE for the same reason —
 # one cluster, one credential, one host to hand it to; a per-instance
 # copy would read a token Secret the other namespaces do not hold.
 boss-break-glass-deposit.yaml pipeline
+# The estate machine token's push to boss-gcp (backlog 88379df3;
+# design-doc bdc60b65, gcp-push). PIPELINE, as the deposit above and for
+# the same shape of reason: there is one boss-gcp, one receiver on it and
+# one deposit key enrolled there, and the token it carries is prod's
+# (Secret boss/boss-machine-token — the one boss-gcp's callers present to
+# prod's jobs API). A per-instance copy would put a second pusher in
+# every other namespace, mounting a key Secret that namespace does not
+# hold and overwriting boss-gcp's slots with nothing.
+boss-machine-token-push.yaml pipeline
 
 # The break-glass ceremony is the business system of record's; the
 # boss pod mounts this ConfigMap `optional: true`, so an instance
@@ -158,3 +179,13 @@ boss-recovery-sheet.yaml pipeline
 # reproducible from examples/brewery/seeds plus the sim. A per-instance
 # backup that names its dumps by instance is its own car.
 boss-backup.yaml pipeline
+
+# The node-maintenance namespace's one CronJob and its deny-all
+# NetworkPolicy (backlog 17f6170c): a daily fstrim of the BUILD NODE's
+# two filesystems, in the one namespace labelled `privileged` — which
+# the admission file above declares and bounds; this one declares no
+# Namespace. PIPELINE because it maintains a machine, not an instance —
+# there is one w-1 — and rendered per instance it would be applied once
+# more for every instance. Each object names its namespace, so the
+# render copies it as written and substitutes nothing.
+boss-node-maintenance.yaml pipeline

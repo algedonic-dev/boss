@@ -332,7 +332,7 @@ fn the_forge_reads_the_volumes_on_its_fifteen_minute_cadence_best_effort() {
         .expect("the forge's host observer unit");
     assert!(
         unit.lines()
-            .any(|l| l == "ExecStart=-/home/david/boss/infra/estate/observe-volumes.sh"),
+            .any(|l| l == "ExecStart=-/var/lib/boss/tree/current/infra/estate/observe-volumes.sh"),
         "the forge's host observer runs the volume reading, best-effort: {unit}"
     );
     let timer = std::fs::read_to_string(repo_root().join("infra/forge/estate-observe-host.timer"))

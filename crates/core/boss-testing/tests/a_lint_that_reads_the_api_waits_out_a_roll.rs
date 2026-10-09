@@ -263,6 +263,98 @@ fn an_answer_after_the_wait_is_judged_as_an_answer() {
     assert!(r.stdout.contains("clean"), "{}", r.stdout);
 }
 
+/// HANDED ITS ANSWER, THE EDIT-LEVEL LINT MAKES NO REQUEST (backlog
+/// 934ccad1). A gate pod runs a car's branch and holds no machine token,
+/// so the launcher — `boss gate`, the conductor — reads the door once and
+/// hands its answer in as `BOSS_EDIT_LEVEL_ANSWER`. The lint judges that
+/// object exactly as it judges a read one, and curl never runs: not for
+/// "declares none", not for a level, and not for an answer it cannot
+/// read — which is CANNOT ANSWER (exit 3), never a pass and never a
+/// quiet fall back to the request the hand-in exists to remove.
+#[test]
+fn a_handed_edit_level_is_judged_without_a_request() {
+    const LINT: &str = "infra/lint/a-car-stays-under-the-edit-level.sh";
+    for (i, (answer, code, said)) in [
+        (
+            r#"{"edit_level":null,"manifest":"/opt/boss/tenant/seeds/tenant.toml"}"#,
+            0,
+            "the instance's manifest declares none (/opt/boss/tenant/seeds/tenant.toml)",
+        ),
+        // The innermost level admits every path, whatever this tree's
+        // diff against the trunk happens to be.
+        (r#"{"edit_level":"core"}"#, 0, "edit level `core` admits"),
+        (
+            r#"{"edit_level":"no-such-tier"}"#,
+            3,
+            "an edit level the tier map does not know",
+        ),
+        ("not json", 3, "something other than an edit-level object"),
+        (
+            r#"{"error":"denied"}"#,
+            3,
+            "something other than an edit-level object",
+        ),
+        (
+            r#"["data"]"#,
+            3,
+            "something other than an edit-level object",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let s = stubs(&format!("handed-level-{i}"));
+        let r = run_lint(
+            &s,
+            LINT,
+            "BOSS_JOBS_URL",
+            &[("BOSS_EDIT_LEVEL_ANSWER", answer)],
+        );
+        assert!(
+            read_lines(&s.calls).is_empty(),
+            "handed `{answer}`, the lint still made a request: {:?}",
+            read_lines(&s.calls)
+        );
+        assert_eq!(r.code, code, "`{answer}`:\n{}\n{}", r.stdout, r.stderr);
+        assert!(
+            format!("{}{}", r.stdout, r.stderr).contains(said),
+            "`{answer}`:\n{}\n{}",
+            r.stdout,
+            r.stderr
+        );
+        assert!(
+            r.stdout
+                .contains("handed in by this run's launcher (BOSS_EDIT_LEVEL_ANSWER)"),
+            "{}",
+            r.stdout
+        );
+        assert_eq!(
+            r.stdout.contains("clean"),
+            code == 0,
+            "`{answer}` (exit {code}):\n{}",
+            r.stdout
+        );
+    }
+    // Handed nothing — or an empty value, which is nothing — it says so
+    // and reads the door itself, as it always did.
+    for (i, extra) in [vec![], vec![("BOSS_EDIT_LEVEL_ANSWER", "")]]
+        .into_iter()
+        .enumerate()
+    {
+        let s = stubs(&format!("unhanded-level-{i}"));
+        let mut env = vec![("STUB_CODE", "404")];
+        env.extend(extra);
+        let r = run_lint(&s, LINT, "BOSS_JOBS_URL", &env);
+        assert_eq!(read_lines(&s.calls).len(), 1, "{}\n{}", r.stdout, r.stderr);
+        assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+        assert!(
+            r.stdout.contains("no edit level was handed in"),
+            "{}",
+            r.stdout
+        );
+    }
+}
+
 /// Past the window the lint refuses as it always did — exit 3, the
 /// CANNOT ANSWER marker, `HTTP 000` — with the wait's own line naming
 /// how long it waited, and never a clean pass.

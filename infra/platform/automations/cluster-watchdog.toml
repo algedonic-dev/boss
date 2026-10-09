@@ -1,0 +1,15 @@
+# automation:cluster-watchdog — not in the role-report tally read
+# 2026-10-07T02:13Z (that tally is held in memory and starts again with the
+# pod, so absence there is not absence of the caller); registered from the
+# tree, where every_script_sender_signs_as_a_registered_automation found it.
+# Signs as platform-admin today: infra/forge/alert-lib.sh (the default of
+# ALERT_ACTOR).
+# AT THE ROLE IT SIGNS. It reads the active platform-admins and files an
+# urgent backlog-item (POST /api/jobs); no role narrower than platform-admin
+# is granted a write today, so this is the role design abf9eeae decision 2
+# gives a writer, to be narrowed as its own change once one exists.
+
+[[automation]]
+id = "automation:cluster-watchdog"
+role = "platform-admin"
+description = 'The cluster watchdog and every forge script that files an alert without naming itself: it finds the platform owner and files an urgent alert item (infra/forge/alert-lib.sh).'

@@ -260,6 +260,19 @@ HDRS=(-H "x-boss-user: $BOSS_USER")
 machine_token_header MT_HDR "${BOSS_JOBS_URL:-}" \
     || refuse "the machine token's header file could not be written"
 [ -z "$MT_HDR" ] || HDRS+=(-H "$MT_HDR")
+# THE RUNNER CREDENTIAL GOES ONLY WHERE THE MACHINE TOKEN MAY (backlog
+# 50708d76, F2 of review 927f8602). whoami made its header with plain
+# secret_header, which judges no host, so with BOSS_JOBS_URL pointed off
+# the estate the token above stayed home and the credential — staged or
+# held — went to whatever answered. It is held to the same rule by asking
+# the rule (machine_token_admits: loopback or BOSS_MACHINE_TOKEN_HOSTS),
+# the door car 025640e3 gave the ops runner. Withheld is RED, not a
+# retry: nothing can be proved until the URL or the list is repaired. The
+# sentence names the rule and nothing of the URL.
+RC_WITHHELD=""
+if [ -n "${BOSS_JOBS_URL:-}" ] && ! machine_token_admits "$BOSS_JOBS_URL"; then
+    RC_WITHHELD="the runner credential is NOT presented — the host of BOSS_JOBS_URL is not loopback and not in BOSS_MACHINE_TOKEN_HOSTS (/etc/boss/sor.env)"
+fi
 NO_DOOR="the jobs API at ${BOSS_JOBS_URL:-(unset)} has no credential door (GET /api/jobs/runner-credential answered 404) — a build without it; no value can be proved until it is back"
 
 # api_get PATH [CURL ARGS…] — GET into $BODY; CODE is the HTTP status, or
@@ -277,12 +290,15 @@ api_get() {
 
 # whoami VALUE — what the credential door makes of VALUE, into SEEN
 # ("<host>/<slot>", or "unresolved"). 0 answered; 1 no answer (a
-# transient); 3 no door; 4 an actual HTTP refusal, with CODE retained. The value
+# transient); 3 no door; 4 an actual HTTP refusal, with CODE retained; 5 the
+# value was NOT presented, because the machine token's host rule does not
+# admit the system of record ($RC_WITHHELD says so). The value
 # rides in a 0600 header file, never curl's argv.
 SEEN="" DELIVERY_CONTEXT=""
 whoami() {
     SEEN="" DELIVERY_CONTEXT=""
     [ -n "${BOSS_JOBS_URL:-}" ] || return 1
+    [ -z "$RC_WITHHELD" ] || return 5
     secret_header RC_HDR "x-boss-runner-credential: $1" || return 1
     api_get /api/jobs/runner-credential -H "$RC_HDR"
     case "$CODE" in
@@ -393,6 +409,9 @@ if [ -n "$WANT" ] && [ "$WANT" != "$CUR" ]; then
     whoami "$WANT" || wrc=$?
     if [ -z "${BOSS_JOBS_URL:-}" ]; then
         ACTION="not installed: BOSS_JOBS_URL is unset (/etc/boss/sor.env), so $HOST.$SLOT (…$(last8 "$WANT")) cannot be proved; the next pass retries"
+    elif [ "$wrc" -eq 5 ]; then
+        rc=1
+        ACTION="not installed: $RC_WITHHELD, so $HOST.$SLOT (…$(last8 "$WANT")) cannot be proved; the held file is untouched"
     elif [ "$wrc" -eq 3 ]; then
         rc=1
         ACTION="not installed: $NO_DOOR"
@@ -504,7 +523,11 @@ record_delivery() {
     if [ -n "$CUR" ]; then
         wrc=0
         whoami "$CUR" || wrc=$?
-        if [ "$wrc" -eq 3 ]; then
+        if [ "$wrc" -eq 5 ]; then
+            DELIVERY_STATE="not recorded: $RC_WITHHELD"
+            rc=1
+            return 0
+        elif [ "$wrc" -eq 3 ]; then
             DELIVERY_STATE="not recorded: $NO_DOOR"
             rc=1
             return 0

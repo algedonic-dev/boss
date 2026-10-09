@@ -339,6 +339,28 @@ if [ -r "$SECRET_LIB" ]; then
   READ_TOKEN_HOST=$(machine_token_host "$(head -n1 "$HERE/sor-read-url" 2>/dev/null || true)")
   [ -z "$READ_TOKEN_HOST" ] || TOKEN_HOSTS="$TOKEN_HOSTS,$READ_TOKEN_HOST"
   machine_token_header TOKEN_HDR "$BASE" "$TOKEN_HOSTS"
+  # NO FILE WHILE THE REQUEST IS OUT (backlog df38075a, F1 of review
+  # a92c0b94). The lib removes its directory from an EXIT trap, and a
+  # killed door runs none: on 2026-10-06 this pod's /tmp held four
+  # header directories dated 10-03 to 10-06, three with this TOKEN_HDR
+  # file, left by killed calls — a session's tool timeout, an interrupt
+  # — each waiting out the two-minute roll window below. The door has no
+  # unit, so no RuntimeDirectory= to remove them for it. So the file is
+  # opened HERE and removed before curl starts: curl is handed the open
+  # descriptor by its /proc name, and a kill at any later point leaves
+  # nothing on disk to find. Each attempt of the roll wait is a new curl,
+  # and opening /proc/self/fd/N opens the file afresh from its first
+  # byte (Linux; elsewhere /dev/fd shares one offset, a retry would read
+  # an empty header, so without /proc the path is kept as it was). The
+  # descriptor reaches only what this door starts — curl, and the sleep
+  # between attempts. What a kill inside these few lines leaves, the
+  # lib's sweep removes at this account's next call.
+  if [ -n "$TOKEN_HDR" ] && [ -d /proc/self/fd ]; then
+    if { exec {TOKEN_FD}< "${TOKEN_HDR#@}"; } 2>/dev/null; then
+      secret_header_close
+      TOKEN_HDR="@/proc/self/fd/$TOKEN_FD"
+    fi
+  fi
   [ -z "$TOKEN_HDR" ] || args+=( -H "$TOKEN_HDR" )
 elif [ -e "${BOSS_MACHINE_TOKEN_DIR:-/etc/boss/machine-token}/current" ]; then
   echo "boss-api: refusing $METHOD $API_PATH: $SECRET_LIB is missing — without it the machine token would ride in curl's command line, readable in ps by every local user (backlog 5f3ad356)" >&2

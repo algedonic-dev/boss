@@ -602,7 +602,7 @@ pub(crate) fn judge_board(rows: &[Value], now: DateTime<Utc>, hours: i64) -> Res
 }
 
 /// Does alarm packet `a` carry one of `findings`?
-fn carries(a: &Value, findings: &[String]) -> bool {
+pub(crate) fn carries(a: &Value, findings: &[String]) -> bool {
     a.get("metadata")
         .and_then(|m| m.get("estate_finding"))
         .and_then(Value::as_str)

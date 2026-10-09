@@ -357,31 +357,34 @@ export async function performPresenceCeremony(
  * ceremony on the step as `shown` and ONE retry carrying the ticket that
  * ceremony was issued (backlog 3ce3c15f, review of car 5b30ccf9).
  *
- * The jobs API judges assurance on the request that completes a step,
- * from that request's own ticket. A surface can reach it with none it
- * will honour three ways: after a reload the stamp is already on the step
- * and no ceremony runs; the ticket its stamp was issued is past its
- * two-minute life; or the user's role carries no sign-off on the step, so
- * the stamp ceremony never runs. Each stopped the surface at the raw 422.
+ * The first attempt is sent BARE (design 1ce67f7e, 2026-10-07). A step
+ * that names sign-off roles completes on the live passkey stamps it
+ * holds, so the request that flips its status carries no proof of its
+ * own — and no ticket is kept from the stamp to ride it. This function
+ * used to take one (`heldTicket`, backlog b568044a), because the jobs API
+ * judged a completion on that request's header alone; that parameter and
+ * every caller's copy of the ticket are gone.
  *
- * `heldTicket` is a ticket a ceremony on THIS step just issued to the
- * surface, spent on the first attempt and never re-sent. Nothing here
- * mints or widens one: the gateway issues it for this step and person,
- * and the server re-checks step, person, shape and expiry on the retry.
- * Never a second ceremony — a retry the server refuses again for presence
- * is returned failed, saying so; refused for anything else, it is
- * returned as the server said it.
+ * The refusal it still answers is `{required: "presence"}`: a presence
+ * step that names NO sign-off role, whose completion is its only act and
+ * so carries the ticket itself. Nothing here mints or widens one: the
+ * gateway issues it for this step and person, and the server re-checks
+ * step, person, shape and expiry on the retry. Never a second ceremony —
+ * a retry the server refuses again for presence is returned failed,
+ * saying so; refused for anything else, it is returned as the server
+ * said it. A step whose STAMPS do not carry it (a role unsigned, a
+ * signature past its age) is refused without that key and returned as
+ * the server said it: no ticket would help, the roles sign again.
  */
 export async function completeWithPresence(
   jobId: string,
   stepId: string,
   shown: ShownStep,
   onScreen: () => ShownStep | null,
-  heldTicket?: string,
   signal?: AbortSignal,
 ): Promise<StepWriteResult> {
   const body = { status: 'completed' };
-  const first = await putStep(jobId, stepId, body, heldTicket);
+  const first = await putStep(jobId, stepId, body);
   if (first.kind === 'ok' || !first.presenceRequired) return first;
   let ticket: string;
   try {

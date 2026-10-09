@@ -25,7 +25,12 @@
 //!   alone is never clean: without these a projection cannot tell a
 //!   quiet gate from one in `off`, or from a process that never
 //!   recorded. `instance` is the process's own id, on every fact it
-//!   states.
+//!   states. The machine gate's also carries `roster` — the generation
+//!   of the launch record the process was started under and its image's
+//!   commit, or why it has none (design 3cc6152a, backlog 14fe115c;
+//!   `gate_window::roster_stamp`) — so every watch on the log names the
+//!   selection it was kept under, and through `instance` so does every
+//!   fact of that process.
 //! * `<gate>.recording_ended` — `{instance, lost, unstated, clean}`,
 //!   stated at SIGTERM after the queue has drained. A process's watch
 //!   joins the next one's only through a CLEAN end; a process that
@@ -48,6 +53,13 @@
 //!   source's share: its reads are admitted and its writes refused in
 //!   EVERY mode, so `enforce` changes nothing for it and it ends no
 //!   clean window. On the log for the reader's own rotation.
+//! * `machine_gate.asked` — a key ASKING the gate's accepts route about
+//!   one value no slot holds (`machine_gate::asks`; backlog 89fc511e),
+//!   at its first sighting or past its source's share. A rotation asks
+//!   every gate about a value it has just staged, ahead of kubelet's
+//!   projection; so may anyone testing a value. Named, so that neither
+//!   is invisible, and NOT a would-refuse: an ask is answered `none`
+//!   whatever the mode, and ends no clean window.
 //!
 //! TWO HALVES, and neither is the verdict alone (design point 3). The
 //! log half is [`window`] over what a [`GateEvidenceLog`] reads back.
@@ -65,6 +77,12 @@
 //! to an ERROR line and a not-clean reading, never to silence. The
 //! reader that joins the two halves, and the enforce flips that record
 //! its answer, are later cars of the design.
+//!
+//! A THIRD GATE, by the same mechanism (backlog e0bdba74): every
+//! service's actor-role report ([`Gate::ActorRole`], `actor_role.*`),
+//! whose key is the shape of an observation `enforce` would answer
+//! differently ([`actor_role_would_refuse`]). It refuses nothing, so it
+//! states no `refused`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -107,6 +125,90 @@ pub fn policy_tally_reasons(
     why
 }
 
+/// The actions of an actor-role observation that change nothing: a
+/// policy `read`, and the two guard purposes that only choose what a
+/// read shows. Every other action — the policy writes, a guard's
+/// `admission` and `attribution`, and any door named after this list was
+/// written — is a write, so a new door is never read as harmless.
+pub const ACTOR_ROLE_READS: [&str; 3] = ["read", "visibility", "selection"];
+
+/// Why `enforce` would answer one actor-role observation differently,
+/// or `None` when it would not. ONE definition, for the tally that
+/// states a shape's first sighting and for the joined reader that
+/// re-judges every live row (`gate_window`): the rule is design
+/// abf9eeae's precondition for row H — "zero would-deny for every
+/// registered actor and zero unregistered writers" — with two additions
+/// in the safe direction, each named by its reason so a reader can tell
+/// them apart:
+///
+/// * `would-deny` — a registered actor whose role of record is refused
+///   what its asserted role is allowed. Read from `would_deny`, and from
+///   the two answers themselves, because a visibility guard states no
+///   `would_deny` and still hides a row.
+/// * `would-change-scope` — allowed either way, over a different scope:
+///   the request succeeds and returns something else.
+/// * `unregistered-writer` — no registry row and not a read
+///   ([`ACTOR_ROLE_READS`]): the read-only floor at enforce.
+/// * `unjudged` — the comparison could not be made (the registry was
+///   unavailable or ambiguous, the row holds no role, policy did not
+///   answer for the role of record, the budget ran out). What enforce
+///   would have answered is unknown, and no evidence is not a pass.
+///
+/// `asserted-policy-unavailable` is none of them: the request itself got
+/// no answer, so there is no outcome for enforce to change.
+pub fn actor_role_would_refuse(
+    lookup_status: &str,
+    action: &str,
+    asserted_allowed: Option<bool>,
+    recorded_allowed: Option<bool>,
+    would_deny: Option<bool>,
+    would_change_scope: Option<bool>,
+) -> Option<&'static str> {
+    match lookup_status {
+        "registered" => {
+            if would_deny == Some(true)
+                || (asserted_allowed == Some(true) && recorded_allowed == Some(false))
+            {
+                Some("would-deny")
+            } else if would_change_scope == Some(true) {
+                Some("would-change-scope")
+            } else {
+                None
+            }
+        }
+        "unregistered" => (!ACTOR_ROLE_READS.contains(&action)).then_some("unregistered-writer"),
+        "asserted-policy-unavailable" => None,
+        _ => Some("unjudged"),
+    }
+}
+
+/// Why a live actor-role tally is not clean — the producer's reasons and
+/// the reader's, from one function of the same bounded input.
+pub fn actor_role_tally_reasons(
+    mode: Mode,
+    would_refuse_rows: usize,
+    would_refuse_count: u64,
+    overflow: u64,
+    evidence: &EvidenceHealth,
+) -> Vec<String> {
+    let mut why = Vec::new();
+    if mode == Mode::Off {
+        why.push("mode `off` records nothing, so its silence is no evidence of anything".into());
+    }
+    if would_refuse_rows != 0 {
+        why.push(format!(
+            "{would_refuse_rows} shape(s), {would_refuse_count} observation(s), that `enforce` answers differently"
+        ));
+    }
+    if overflow != 0 {
+        why.push(format!(
+            "overflow {overflow}: observations past the tally's bounds, which name no caller and may include any — a full tally is never clean"
+        ));
+    }
+    why.extend(evidence.not_clean());
+    why
+}
+
 /// Which refusing gate a fact is about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -115,6 +217,12 @@ pub enum Gate {
     MachineGate,
     /// The policy check's two open arms (row D, backlog b8e75382).
     PolicyCheck,
+    /// Every service's actor-role report: what a request would be
+    /// answered if its role were read from the registry instead of
+    /// believed from the header (row H, design abf9eeae; backlog
+    /// e0bdba74). Report-only: nothing is refused, so it states no
+    /// `refused`.
+    ActorRole,
 }
 
 /// What a fact says.
@@ -134,6 +242,11 @@ pub enum Fact {
     /// b35c22b4) — reads admitted and writes refused in every mode, so
     /// never a would-refuse.
     ReaderPresented,
+    /// The machine gate only: an ASK — one value no slot holds, on a GET
+    /// of the accepts route (`machine_gate::asks`; backlog 89fc511e).
+    /// Answered and named, and never a would-refuse: it is the question
+    /// the route exists for, so it ends no clean window.
+    Asked,
 }
 
 impl Fact {
@@ -147,6 +260,7 @@ impl Fact {
             Fact::FactsLost => "facts_lost",
             Fact::PreviousPresented => "previous_presented",
             Fact::ReaderPresented => "reader_presented",
+            Fact::Asked => "asked",
         }
     }
 
@@ -161,10 +275,14 @@ impl Fact {
 }
 
 impl Gate {
+    /// Every gate, in [`KINDS`]' order.
+    pub const ALL: [Gate; 3] = [Gate::MachineGate, Gate::PolicyCheck, Gate::ActorRole];
+
     pub fn prefix(self) -> &'static str {
         match self {
             Gate::MachineGate => "machine_gate",
             Gate::PolicyCheck => "policy.check",
+            Gate::ActorRole => "actor_role",
         }
     }
 
@@ -180,11 +298,19 @@ impl Gate {
                 Fact::FactsLost,
                 Fact::PreviousPresented,
                 Fact::ReaderPresented,
+                Fact::Asked,
             ],
             Gate::PolicyCheck => &[
                 Fact::RecordingBegan,
                 Fact::WouldRefuse,
                 Fact::Refused,
+                Fact::TallyOverflowed,
+                Fact::RecordingEnded,
+                Fact::FactsLost,
+            ],
+            Gate::ActorRole => &[
+                Fact::RecordingBegan,
+                Fact::WouldRefuse,
                 Fact::TallyOverflowed,
                 Fact::RecordingEnded,
                 Fact::FactsLost,
@@ -208,11 +334,11 @@ impl Gate {
     }
 }
 
-/// Every kind both gates state, as the `event_kinds` migration declares
+/// Every kind the gates state, as the `event_kinds` migrations declare
 /// them — held equal to that migration's rows by a test in boss-events
 /// (`every_gate_evidence_kind_is_registered`), because a fact that lives
 /// twice gets an equality test (CLAUDE.md §9a).
-pub const KINDS: [&str; 14] = [
+pub const KINDS: [&str; 20] = [
     "machine_gate.recording_began",
     "machine_gate.would_refuse",
     "machine_gate.refused",
@@ -221,12 +347,18 @@ pub const KINDS: [&str; 14] = [
     "machine_gate.facts_lost",
     "machine_gate.previous_presented",
     "machine_gate.reader_presented",
+    "machine_gate.asked",
     "policy.check.recording_began",
     "policy.check.would_refuse",
     "policy.check.refused",
     "policy.check.tally_overflowed",
     "policy.check.recording_ended",
     "policy.check.facts_lost",
+    "actor_role.recording_began",
+    "actor_role.would_refuse",
+    "actor_role.tally_overflowed",
+    "actor_role.recording_ended",
+    "actor_role.facts_lost",
 ];
 
 /// How many facts may wait for the recorder. A process emits at most a
@@ -243,6 +375,36 @@ pub const QUEUE_DEPTH: usize = 2048;
 const RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis(500);
 const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How often an outage that is still an outage is said again at ERROR.
+/// A recorder that refuses is said when it first does, and an outage
+/// said once and silent after was read for a day as a recovered one
+/// (backlog 06ae925a) — so while a fact still waits, or a loss is still
+/// unstated, the line repeats on this interval until the log takes it.
+pub const RESAY_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// When an outage was last said, and how many times.
+#[derive(Default)]
+struct Said {
+    last: Option<std::time::Instant>,
+    times: u64,
+}
+
+impl Said {
+    /// Whether to say it now: at the outage's first refusal, and again
+    /// once [`RESAY_EVERY`] has passed since it was last said.
+    fn due(&mut self, first: bool, now: std::time::Instant) -> bool {
+        let due = first
+            || self
+                .last
+                .is_none_or(|last| now.saturating_duration_since(last) >= RESAY_EVERY);
+        if due {
+            self.last = Some(now);
+            self.times += 1;
+        }
+        due
+    }
+}
+
 /// How long a process given SIGTERM spends draining its queue and
 /// stating its end before it exits regardless. Inside the pod's grace
 /// period (30 s); a process that runs out states no clean end, which
@@ -253,7 +415,8 @@ const END_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 /// The LAST one to finish after SIGTERM exits the process: registering a
 /// SIGTERM listener replaces the signal's default (terminate), so the
 /// process's exit has to be someone's act, and it must wait for every
-/// gate the process holds — the policy service holds two. Signal
+/// gate the process holds — every service holds two (its machine gate
+/// and its actor-role report), the policy service three. Signal
 /// disposition is process-wide by nature, so this count is too.
 ///
 /// THE LIBRARY OWNS SIGTERM IN A GATED BINARY (review c49cb4e1, S2): a
@@ -323,6 +486,10 @@ struct Inner {
     unstated: Mutex<(u64, Option<DateTime<Utc>>)>,
     retrying: std::sync::atomic::AtomicBool,
     last_error: Mutex<Option<String>>,
+    said: Mutex<Said>,
+    /// What every `recording_began` of this process says about its
+    /// launch roster ([`Evidence::state_roster`]); unset, nothing.
+    roster: std::sync::OnceLock<Value>,
 }
 
 /// One process's hand-off of a gate's facts to the log. Cheap to clone;
@@ -355,6 +522,8 @@ impl Evidence {
                 unstated: Mutex::new((0, None)),
                 retrying: std::sync::atomic::AtomicBool::new(false),
                 last_error: Mutex::new(None),
+                said: Mutex::new(Said::default()),
+                roster: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -528,17 +697,42 @@ impl Evidence {
 
     /// A fact the recorder refused, about to be tried again.
     fn refused(&self, event: &Event, why: &str) {
+        self.refused_at(event, why, std::time::Instant::now());
+    }
+
+    /// Said at the outage's first refusal and again every
+    /// [`RESAY_EVERY`] while it lasts — never once and then silence.
+    fn refused_at(&self, event: &Event, why: &str, now: std::time::Instant) {
         let first = !self.inner.retrying.swap(true, Ordering::SeqCst);
         self.note_error(why);
-        if first {
+        if self.say(first, now) {
             tracing::error!(
                 kind = %event.kind,
                 service = %self.inner.service,
+                gate = self.inner.gate.prefix(),
                 why,
                 "gate evidence refused by the recorder — retrying; the live tally reads not \
-                 clean until the log takes it"
+                 clean until the log takes it (said again every {RESAY_EVERY:?} while it lasts)"
             );
         }
+    }
+
+    fn say(&self, first: bool, now: std::time::Instant) -> bool {
+        self.inner
+            .said
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .due(first, now)
+    }
+
+    /// How many times this process has said, at ERROR, that its recorder
+    /// refuses a fact or that a loss is still unstated.
+    pub fn outage_statements(&self) -> u64 {
+        self.inner
+            .said
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .times
     }
 
     /// A fact that will never reach the log: counted, and owed to it as
@@ -594,7 +788,19 @@ impl Evidence {
                     unstated.1 = None;
                 }
             }
-            Err(e) => self.note_error(&format!("stating {count} lost fact(s): {e}")),
+            Err(e) => {
+                self.note_error(&format!("stating {count} lost fact(s): {e}"));
+                // `lose` said each loss once; while the log still will
+                // not take the statement, say that on the interval too.
+                if self.say(false, std::time::Instant::now()) {
+                    tracing::error!(
+                        service = %self.inner.service,
+                        gate = self.inner.gate.prefix(),
+                        error = %e,
+                        "gate evidence: {count} lost fact(s) are still not stated on the log"
+                    );
+                }
+            }
         }
     }
 
@@ -640,12 +846,24 @@ impl Evidence {
         }
     }
 
+    /// What this process says about the launch roster it was started
+    /// under, stated on EVERY `recording_began` from here on — the
+    /// start and each mode move (design 3cc6152a; backlog 14fe115c).
+    /// The stamp is `gate_window::roster_stamp`'s: a generation, or why
+    /// there is none. Set once, where the gate is mounted, before the
+    /// first start is stated; a second call changes nothing, because a
+    /// process is launched under one record.
+    pub fn state_roster(&self, stamp: Value) {
+        let _ = self.inner.roster.set(stamp);
+    }
+
     /// `<gate>.recording_began`: the gate records in `mode` from `since`.
     pub fn recording_began(&self, mode: Mode, since: DateTime<Utc>) {
-        self.emit(
-            Fact::RecordingBegan,
-            json!({ "mode": mode, "since": since }),
-        );
+        let mut fields = json!({ "mode": mode, "since": since });
+        if let Some(stamp) = self.inner.roster.get() {
+            fields[crate::gate_window::ROSTER_FIELD] = stamp.clone();
+        }
+        self.emit(Fact::RecordingBegan, fields);
     }
 }
 
@@ -1035,18 +1253,57 @@ pub fn window(
     })
 }
 
-/// The previous-slot drain shares recording coverage with enforcement,
-/// but an unrelated token miss cannot say that the previous value is used.
-pub fn previous_window(
-    services: &[&str],
-    from: DateTime<Utc>,
-    now: DateTime<Utc>,
-    facts: &[Event],
-) -> Window {
-    let gate = Gate::MachineGate;
-    window_selected(gate, services, from, now, facts, |e| {
+/// Which of a machine gate's two slot sets a drain waits out the
+/// `previous` of: the estate token's, or the probe-reader credential's
+/// (design b35c22b4; backlog d26515c5). A rotation blanks `previous` only
+/// once nothing has presented it for a whole window, and the two sets
+/// state that presentation differently: the estate's is its own fact,
+/// `previous_presented`; the reader's is a `reader_presented` whose key
+/// names the slot, because a probe-reader read is one fact whichever of
+/// its slots it matched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainedSlot {
+    Estate,
+    Reader,
+}
+
+impl DrainedSlot {
+    /// What a tally row or a fact's key names a presentation of this
+    /// set's `previous`.
+    pub fn presented(self) -> crate::machine_gate::Presented {
+        match self {
+            DrainedSlot::Estate => crate::machine_gate::Presented::Previous,
+            DrainedSlot::Reader => crate::machine_gate::Presented::ReaderPrevious,
+        }
+    }
+
+    /// Does this fact leave the drain unproven? One definition for the
+    /// log's window and for the join's retired-epoch rule, which held it
+    /// as two copies of one match while there was one set to drain.
+    ///
+    /// A `reader_presented` counts against the reader's drain when its
+    /// key (or, past a source's share, the fact itself) names
+    /// `reader.previous` — and when it names nothing readable, because a
+    /// presentation nobody can place may be the old value: no evidence is
+    /// not a pass. It never counts against the estate's drain, and a
+    /// `previous_presented` never counts against the reader's.
+    pub(crate) fn dirtied_by(self, gate: Gate, e: &Event) -> bool {
+        use crate::machine_gate::Presented;
+        let stated = |v: Option<&Value>| {
+            serde_json::from_value::<Presented>(v.cloned().unwrap_or(Value::Null)).ok()
+        };
         match gate.fact_of(&e.kind) {
-            Some(Fact::PreviousPresented | Fact::FactsLost) => true,
+            Some(Fact::FactsLost) => true,
+            Some(Fact::PreviousPresented) => self == DrainedSlot::Estate,
+            Some(Fact::ReaderPresented) => {
+                self == DrainedSlot::Reader
+                    && stated(
+                        e.payload
+                            .pointer("/key/presented")
+                            .or_else(|| e.payload.get("presented")),
+                    )
+                    .is_none_or(|p| p == self.presented())
+            }
             Some(Fact::TallyOverflowed) => {
                 // A named source's known unrelated presentation cannot hide
                 // previous; malformed and global overflow remain unknown.
@@ -1055,13 +1312,28 @@ pub fn previous_window(
                         .get("source")
                         .and_then(Value::as_str)
                         .is_none_or(str::is_empty)
-                    || serde_json::from_value::<crate::machine_gate::Presented>(
-                        e.payload.get("presented").cloned().unwrap_or(Value::Null),
-                    )
-                    .map_or(true, |p| p == crate::machine_gate::Presented::Previous)
+                    || stated(e.payload.get("presented")).is_none_or(|p| p == self.presented())
             }
             _ => false,
         }
+    }
+}
+
+/// A previous-slot drain shares recording coverage with enforcement, but
+/// an unrelated token miss cannot say that the previous value is used:
+/// only the facts that say `drained`'s `previous` was presented, or that
+/// one may be hidden, end it. For [`DrainedSlot::Estate`] this is the
+/// `previous_window` it replaced, fact for fact.
+pub fn drain_window(
+    drained: DrainedSlot,
+    services: &[&str],
+    from: DateTime<Utc>,
+    now: DateTime<Utc>,
+    facts: &[Event],
+) -> Window {
+    let gate = Gate::MachineGate;
+    window_selected(gate, services, from, now, facts, |e| {
+        drained.dirtied_by(gate, e)
     })
 }
 
@@ -1327,6 +1599,40 @@ mod tests {
         }
     }
 
+    /// Backlog 06ae925a: a failure said once and silent after reads as
+    /// a recovery. The first refusal of an outage is said, a refusal
+    /// seconds later is not, and one an interval later is — and a new
+    /// outage after a recovery is said at once.
+    #[test]
+    fn a_recorder_that_refuses_is_said_at_once_and_again_on_an_interval() {
+        let evidence = Evidence::none(Gate::ActorRole, "jobs");
+        let event = evidence.event(Fact::WouldRefuse, json!({}));
+        let t0 = std::time::Instant::now();
+        evidence.refused_at(&event, "the database is down", t0);
+        assert_eq!(evidence.outage_statements(), 1);
+        evidence.refused_at(&event, "the database is down", t0 + RETRY_MAX);
+        assert_eq!(evidence.outage_statements(), 1, "not once per retry");
+        evidence.refused_at(&event, "the database is down", t0 + RESAY_EVERY);
+        assert_eq!(
+            evidence.outage_statements(),
+            2,
+            "said again on the interval"
+        );
+        evidence.refused_at(
+            &event,
+            "the database is down",
+            t0 + RESAY_EVERY * 2 - RETRY_MAX,
+        );
+        assert_eq!(evidence.outage_statements(), 2);
+        evidence.refused_at(&event, "the database is down", t0 + RESAY_EVERY * 2);
+        assert_eq!(evidence.outage_statements(), 3);
+        // The log took a write: the next refusal opens a new outage.
+        evidence.inner.retrying.store(false, Ordering::SeqCst);
+        evidence.refused_at(&event, "down again", t0 + RESAY_EVERY * 2 + RETRY_MAX);
+        assert_eq!(evidence.outage_statements(), 4);
+        assert!(evidence.health().retrying);
+    }
+
     /// Wait up to ten seconds for `ready`.
     async fn until(ready: impl Fn() -> bool) {
         for _ in 0..1000 {
@@ -1394,6 +1700,34 @@ mod tests {
         let end = &flaky.took()[1];
         assert_eq!(end.payload["clean"], true);
         assert_eq!(end.payload["instance"], json!(h.instance));
+    }
+
+    /// Design 3cc6152a (backlog 14fe115c): the selection a process was
+    /// launched under is on the log with its start, and with every later
+    /// mode move of the same process — never on any other fact, and not
+    /// at all from a process that was handed none.
+    #[tokio::test]
+    async fn every_start_states_the_roster_the_process_was_launched_under() {
+        let stamp = json!({"generation": "sha256:fixture", "commit": "abc123"});
+        let (evidence, mut rx) = Evidence::channel(Gate::MachineGate, "jobs");
+        evidence.state_roster(stamp.clone());
+        // A process is launched under one record: a later stamp is not it.
+        evidence.state_roster(json!({"generation": "sha256:another"}));
+        evidence.recording_began(Mode::Report, at(1));
+        evidence.emit(Fact::WouldRefuse, json!({"mode": "report"}));
+        evidence.recording_began(Mode::Off, at(2));
+        let began = rx.try_recv().unwrap();
+        let miss = rx.try_recv().unwrap();
+        let moved = rx.try_recv().unwrap();
+        assert_eq!(began.payload["roster"], stamp, "{}", began.payload);
+        assert_eq!(moved.payload["roster"], stamp, "{}", moved.payload);
+        assert!(miss.payload.get("roster").is_none(), "{}", miss.payload);
+        assert_eq!(began.payload["instance"], moved.payload["instance"]);
+
+        let (bare, mut rx) = Evidence::channel(Gate::PolicyCheck, "policy");
+        bare.recording_began(Mode::Report, at(1));
+        let began = rx.try_recv().unwrap();
+        assert!(began.payload.get("roster").is_none(), "{}", began.payload);
     }
 
     /// Review e4417d48, B1 repair 2: a fact the full queue could not take
@@ -1532,17 +1866,66 @@ mod tests {
     /// the gates emit from.
     #[test]
     fn kinds_are_every_kind_each_gate_states() {
-        let stated: Vec<String> = [Gate::MachineGate, Gate::PolicyCheck]
-            .into_iter()
-            .flat_map(Gate::kinds)
-            .collect();
+        let stated: Vec<String> = Gate::ALL.into_iter().flat_map(Gate::kinds).collect();
         assert_eq!(stated, KINDS.map(String::from).to_vec());
+        // The report-only gate states no refusal of its own.
+        assert_eq!(Gate::ActorRole.fact_of("actor_role.refused"), None);
+        assert_eq!(
+            Gate::ActorRole.fact_of("actor_role.would_refuse"),
+            Some(Fact::WouldRefuse)
+        );
         assert_eq!(
             Gate::PolicyCheck.fact_of("policy.check.would_refuse"),
             Some(Fact::WouldRefuse)
         );
         assert_eq!(Gate::PolicyCheck.fact_of("machine_gate.refused"), None);
         assert!(!Fact::PreviousPresented.dirties() && !Fact::RecordingBegan.dirties());
+        // An ask is the machine gate's alone, and ends no clean window
+        // (backlog 89fc511e).
+        assert!(!Fact::Asked.dirties());
+        assert!(Gate::MachineGate.facts().contains(&Fact::Asked));
+        assert!(!Gate::PolicyCheck.facts().contains(&Fact::Asked));
+    }
+
+    /// The LOG half of 89fc511e: a window holding nothing but a watch
+    /// and an `asked` is clean, and the same window with the fact main
+    /// stated for that ask — a `would_refuse` — is not.
+    #[test]
+    fn an_asked_fact_ends_no_clean_window_on_the_log() {
+        let gate = Gate::MachineGate;
+        let t = |minutes: i64| Utc::now() - Duration::hours(80) + Duration::minutes(minutes);
+        let fact = |fact: Fact, at: DateTime<Utc>, payload: Value| {
+            Event::new("things", gate.kind(fact), payload, at)
+        };
+        let began = fact(
+            Fact::RecordingBegan,
+            t(0),
+            json!({"service": "things", "mode": "report", "since": t(0), "instance": "p1"}),
+        );
+        let key = |presented: &str| {
+            json!({"service": "things", "mode": "report", "recording_since": t(0), "instance": "p1",
+                   "key": {"peer": "127.0.0.1", "user": "automation:dispatcher", "method": "GET",
+                           "route": "/api/machine-gate/accepts", "presented": presented}})
+        };
+        let from = Utc::now() - Duration::hours(72);
+        let now = Utc::now();
+        let seen = from + Duration::hours(1);
+        let asked = [began.clone(), fact(Fact::Asked, seen, key("asked"))];
+        let v = window(gate, &["things"], from, now, &asked);
+        assert!(v.dirty.is_empty(), "{v:?}");
+        assert!(v.not_clean.is_empty(), "{v:?}");
+        assert!(
+            v.log_clean_since.is_some_and(|since| since < seen),
+            "clean from before the ask, through it: {v:?}"
+        );
+
+        let missed = [began, fact(Fact::WouldRefuse, seen, key("mismatch"))];
+        let v = window(gate, &["things"], from, now, &missed);
+        assert_eq!(v.dirty.len(), 1, "the control: {v:?}");
+        assert!(
+            v.log_clean_since.is_none_or(|since| since > seen),
+            "the control: clean only since after the miss: {v:?}"
+        );
     }
 
     /// A fact names its service, carries the service's automation actor,

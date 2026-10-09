@@ -761,6 +761,74 @@ fn a_row_declaring_a_writer_is_refused_by_default_and_published_once_released() 
     assert_eq!(c.publishes().len(), 1, "{:?}", c.boss_calls());
 }
 
+/// THE SHIPPED SIGNER ROW (design 09618594, question `signer`; backlog
+/// 6c9183de; review 7cee49b9, condition R1). `publish-workflow
+/// ops-request` is the road the review found that needs no approval: any
+/// actor who may file an ops-request could ask for it, so while the row
+/// waited for David's publish this test pinned it REFUSED (9).
+///
+/// The hold is lifted (2026-10-07: v10 published by hand, the positive
+/// control ef9e591c held), and what the one-kind verb does now is pinned
+/// instead, over the SHIPPED row and the SHIPPED release, with a live row
+/// that says what the tree says — the state the release was made in. The
+/// verb's own comparator reads them equal: nothing to publish (5), in
+/// real mode and under --check, no HELD line, and the CLI is never
+/// reached. That equality is why releasing the row publishes nothing.
+#[test]
+fn the_shipped_signer_row_is_released_and_equal_to_live_is_nothing_to_publish() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("released-shipped-signer");
+    let shipped = |rel: &str| std::fs::read_to_string(repo_root().join(rel));
+    let row_path = c.repo.join("infra/platform/workflows/ops-request.toml");
+    write_file(
+        &row_path,
+        &shipped("infra/platform/workflows/ops-request.toml").expect("the shipped ops-request row"),
+    );
+    hold_file(
+        &c,
+        "ops-request.toml",
+        &shipped("infra/platform/workflow-holds/ops-request.toml")
+            .expect("the shipped tree declares what it says about ops-request"),
+    );
+    // The live row as the registry hands it back for the shipped file:
+    // the same row under `steps`, with a version. Rendered from the file
+    // so this test moves with the row instead of pinning a copy of it.
+    let render = Command::new("python3")
+        .args([
+            "-c",
+            "import json, sys, tomllib\nrow = [w for w in tomllib.load(open(sys.argv[1], 'rb'))['workflow'] if w['kind'] == 'ops-request'][0]\nrow['steps'] = row.pop('step')\nrow['version'] = 10\nrow['status'] = 'active'\njson.dump(row, open(sys.argv[2], 'w'))\n",
+        ])
+        .arg(&row_path)
+        .arg(&c.live)
+        .output()
+        .expect("python3 runs");
+    assert!(
+        render.status.success(),
+        "{}",
+        String::from_utf8_lossy(&render.stderr)
+    );
+    for mode in [&["ops-request"][..], &["ops-request", "--check"][..]] {
+        let (rc, out) = c.run(mode);
+        assert_eq!(rc, 5, "{mode:?}: {out}");
+        contains_all(
+            &out,
+            &["nothing to publish", "ops-request v10", "already says what"],
+            &format!("{mode:?}"),
+        );
+        assert!(
+            !out.contains("HELD"),
+            "{mode:?}: the released signer row still reads held: {out}"
+        );
+        assert!(
+            c.boss_calls().is_empty(),
+            "{mode:?}: an equal row reached the CLI: {:?}",
+            c.boss_calls()
+        );
+    }
+}
+
 /// `--check` reaches the same verdict and stops short of writing: the
 /// lint runs, no publish does, and the output says what would happen.
 #[test]

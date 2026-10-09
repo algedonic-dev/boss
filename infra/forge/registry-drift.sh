@@ -54,9 +54,80 @@
 # registry's publish authority. Until Q1 says otherwise the machine asks
 # for the publish BY NAME and a person runs it.
 #
+# HELD KINDS: NO PUBLISH IS EVER ADVISED (backlog c6bd9f18)
+# ---------------------------------------------------------
+# A kind can be HELD out of every unattended publish — a row that turns
+# on a refusal goes live at a deliberate publish, with David present and a
+# control straight after (infra/platform/workflow-holds/README.md, backlog
+# 083d240e). For a held kind the tree is ahead of live BY DESIGN, and the
+# hand publish this script names for everyone else is the ONE door a hold
+# does not bind. Until this section existed the item it filed told its
+# reader to run exactly that (review 72485f08 of car ca5d0218, finding
+# F1), and an agent draining the queue could have followed it. So the
+# holds are read first, through their one reader
+# (infra/gcp/workflow-holds.py, §9a), and for a held kind:
+#
+#   both moved, or side not measured
+#       FILED, with the hold and no publish: live may carry work the
+#       deliberate publish would overwrite, and the summary line has no
+#       reader (review 8d088b41, F5). Its remedy is the read that shows
+#       what live carries.
+#   the tree is ahead by an edit
+#       NOT FILED. It is the disagreement the hold exists to keep, the
+#       hold's own `lifts` already names the item that ends it, and an
+#       item nobody may resolve is either a warning nobody reads or — as
+#       closing it re-files it on the next converge (below) — one filed
+#       ~28 times a day. The measurement is not lost: every converge says
+#       the kind, the side, the hold's source, why and what lifts it on
+#       one journal line, and counts and names it in the summary that
+#       rides the converge's packet (`N held and not filed (<kinds>)`).
+#   never admitted
+#       FILED, with no publish in it. That is not the hold's doing: a hold
+#       does not reach the seed, which admits a missing kind held or not.
+#   live ahead
+#       FILED as ever (its remedy was never a publish), saying the kind is
+#       held — a held row rolled back by hand reads exactly so.
+#
+# A kind that is not held reads as it always did. HOLDS THAT CANNOT BE
+# READ ARE NOT ABSENT HOLDS: the reader missing from the tree, exiting
+# non-zero, or answering a line this script does not know withholds EVERY
+# remedy that would name a publish. Those kinds are not filed under a
+# remedy nobody can vouch for; ONE item (`holds-check:unreadable`) says
+# the holds cannot be read, in the reader's words, and names what was
+# withheld. The next converge after the repair files each under its own.
+#
+# AN OPEN ITEM FOR A HELD KIND (review 8d088b41, B2). An item's text is a
+# snapshot, and one filed BEFORE a kind was held still ends in the hand
+# publish — on 2026-10-06 backlog-item 7ad62d1c had said so about
+# ops-request for five days. Not filing a held kind would have left that
+# advice standing for ever: the dedup is the only reader of open items,
+# and a kind that is no candidate never reaches it. So for EVERY held
+# kind, drifting or not, the open `protocol:<kind>` item is read, and one
+# that still names the publish (in `resolve` or `description`) is
+# CORRECTED through the metadata merge door, PATCH /api/jobs/{id}/metadata:
+# `resolve`, `description` and `side` become the held text — why, what
+# lifts it, no publish — and `publish_withdrawn` marks it with the hold
+# and this converge's head. Said on the journal and counted in the
+# summary. COUNTED BY ITS EFFECT: the door answers 204 with no body, and
+# an answer is a claim, so the item is read back and is corrected when it
+# carries the mark for this hold and the remedy just written; anything
+# else is said on stderr with the PATCH's code and what the read showed,
+# counted "NOT corrected", and retried by the next converge. THE MARK
+# DECIDES WHO IS OWED ONE, not the prose: a marked item is done — its
+# text quotes the hold's own why, which may name the door — unless the
+# hold's source, why or lifts has changed since, which corrects it once
+# more (review 6ff3210e, N1 and N2).
+# CORRECTED, NOT CLOSED: closing needs the close door's authority over an
+# item a person may own, a both-moved held kind would be re-filed by the
+# very next converge, and the item is still true — the registries do
+# disagree. Only its remedy was wrong. An item once corrected is not
+# touched again; an item for a kind that is not held is never touched.
+# When the holds cannot be read, which kinds are held is unknown and no
+# item is corrected — `holds-check:unreadable` says so.
+#
 # ONE ITEM PER DISAGREEMENT, NOT PER CONVERGE. Every item carries
 # `registry_drift` (`protocol:<kind>`, `rule:<name>`, `rules-check:
-# <check>`) and an OPEN item with the same key is the item: a second
+# <check>`, `holds-check:unreadable`) and an OPEN item with the same key is the item: a second
 # converge finding the same disagreement files nothing. If the open list
 # cannot be read whole, NOTHING is filed — a duplicate per converge (~28
 # a day) is worse than one converge's silence, and the next converge
@@ -110,6 +181,7 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$SELF_DIR/../.."
 PLINT="infra/lint/the-live-protocols-are-the-authored-protocols.sh"
 RLINT="infra/lint/the-live-rules-are-the-authored-rules.sh"
+HOLDS_PY="infra/gcp/workflow-holds.py"
 ACTOR="automation:cluster-deploy-runner"
 WRITER='{"id":"'"$ACTOR"'","role":"platform-admin","access_tier":"operator"}'
 
@@ -198,13 +270,29 @@ fi
 # ---------------------------------------------------------------------------
 # Classify: one candidate item per disagreeing kind, rule or check.
 # ---------------------------------------------------------------------------
+# The holds, from their one reader, BEFORE any remedy is worded (see HELD
+# KINDS in the header). A tree without the reader, or a reader that did
+# not answer 0, is holds that cannot be read — never holds that are absent.
+hrc=0
+if [ -f "$REPO/$HOLDS_PY" ]; then
+    python3 "$REPO/$HOLDS_PY" "$REPO" > "$work/holds.tsv" 2> "$work/holds.err" || hrc=$?
+else
+    hrc=127
+    : > "$work/holds.tsv"
+    echo "$REPO does not carry $HOLDS_PY" > "$work/holds.err"
+fi
+[ "$hrc" -eq 0 ] || sed "s/^/$NAME: [holds exit $hrc] /" "$work/holds.tsv" "$work/holds.err" >&2
+
 HEAD_SHA=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)
-python3 - "$REPO" "$work" "$prc" "$rrc" "$HEAD_SHA" "$ACTOR" <<'PY' > "$work/classify.out" 2>&1
+python3 - "$REPO" "$work" "$prc" "$rrc" "$HEAD_SHA" "$ACTOR" "$hrc" <<'PY' > "$work/classify.out" 2>&1
 import datetime, json, os, subprocess, sys
 
 repo, work, prc, rrc, head, actor = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6]
+holds_rc = int(sys.argv[7])
 BUNDLE = "infra/platform/workflows"
 RULES = "infra/dispatcher/rules"
+HOLDS = "infra/platform/workflow-holds"
+HOLDS_PY = "infra/gcp/workflow-holds.py"
 
 def git(*args):
     try:
@@ -238,6 +326,54 @@ for r in rows or []:
 items = []
 def item(key, title, side, command, detail):
     items.append({"key": key, "title": title, "side": side, "command": command, "detail": detail})
+
+# The holds: kind -> (source, why, lifts), or the reason they cannot be
+# read. Anything the reader said that this script does not know how to
+# read is the second case, never an empty first one.
+def text_of(name):
+    try:
+        with open(os.path.join(work, name)) as f:
+            return f.read()
+    except Exception:
+        return ""
+
+held, holds_problem = {}, None
+if holds_rc == 0:
+    for line in text_of("holds.tsv").splitlines():
+        cells = line.split("\t")
+        if len(cells) == 5 and cells[0] == "held":
+            held[cells[1]] = (cells[2], cells[3], cells[4])
+        elif len(cells) == 5 and cells[0] == "released":
+            continue
+        elif line.strip():
+            holds_problem = f"{HOLDS_PY} answered a line this script does not read: {line.strip()}"
+else:
+    said = [l.split("\t", 1)[-1].strip() for l in (text_of("holds.tsv") + text_of("holds.err")).splitlines() if l.strip()]
+    holds_problem = f"{HOLDS_PY} exited {holds_rc}: " + ("; ".join(said) if said else "it said nothing")
+
+def hold_of(kind):
+    """What a held kind's item or journal line says about its hold."""
+    source, why, lifts = held[kind]
+    return f"{kind} is HELD out of the publish ({source}). Why: {why} What lifts it: {lifts}"
+
+held_lines, held_sides, withheld = [], {}, []
+def publish_item(kind, title, side, command, detail, held_remedy=None):
+    """A candidate whose remedy NAMES THE HAND PUBLISH — the one door a
+    hold does not bind — so it is worded only once the holds have been
+    read and say the kind is open (see HELD KINDS in the header).
+    `held_remedy` is what a HELD kind's item says to do instead; without
+    one the held kind is not filed at all."""
+    if holds_problem:
+        withheld.append((kind, title))
+    elif kind not in held:
+        item(f"protocol:{kind}", f"Registry drift: protocol {kind} — {title}", side, command, detail)
+    elif held_remedy:
+        item(f"protocol:{kind}", f"Registry drift: protocol {kind} — {title} — held", side,
+             f"no publish — {hold_of(kind)}. {held_remedy}", detail)
+    else:
+        held_sides[kind] = side
+        held_lines.append((kind, f"protocol:{kind} — HELD, not filed: {side}. {hold_of(kind)}. The tree is "
+                                 "ahead of live by design until then; no publish is advised"))
 
 # A SHALLOW checkout cannot say what it does not hold: a deletion older
 # than its depth is simply absent from `git log`, so "never authored"
@@ -301,11 +437,15 @@ if isinstance(report, dict):
                  "version live stays legal; leaving the tree unable to describe it is the gap.")
     for kind in report.get("pending") or []:
         path = f"{BUNDLE}/{kind}.toml"
-        item(f"protocol:{kind}", f"Registry drift: protocol {kind} — tree ahead, never admitted",
+        publish_item(kind, "tree ahead, never admitted",
              f"tree ahead: {path} authors {kind} and the registry has no row for it after the seed",
              f"boss workflow publish {kind} {path}",
              f"The converged tree authors {kind} and the live registry admits no version of it, after a converge "
-             "whose boot seed inserts every missing bundle kind. Read the boss pod's init log for the seed's answer.")
+             "whose boot seed inserts every missing bundle kind. Read the boss pod's init log for the seed's answer.",
+             # Not the hold's doing: a hold does not reach the seed, which
+             # admits a kind with no live row whether or not it is held.
+             held_remedy="A kind with no live row is the seed's to admit (insert-if-missing, hold or no "
+                         "hold): read the boss pod's init log for the seed's answer")
     by_kind = {}
     for d in (report.get("fields") or {}).get("drift") or []:
         by_kind.setdefault(d.get("kind"), []).append(d)
@@ -359,11 +499,62 @@ if isinstance(report, dict):
         else:
             why = "the file has no commit on this checkout" if not file_ct.isdigit() else "the live row's date could not be read"
             title, side, cmd = "side not measured", f"side not measured: {why}", f"{publish} (tree ahead), or {export} (live ahead)"
-        item(f"protocol:{kind}", f"Registry drift: protocol {kind} — {title}", side, cmd,
-             f"{kind}: {len(drifts)} field(s) disagree between {path} and live v{version}: {fields}. {excerpt}. "
-             "Which side is ahead is read by date and by the file's previous revision until the publish "
-             "records its lineage (9235802a).")
-    states["protocols"] = f"{len(items) - n0} disagreement(s)" if len(items) > n0 else "agree"
+        detail = (f"{kind}: {len(drifts)} field(s) disagree between {path} and live v{version}: {fields}. {excerpt}. "
+                  "Which side is ahead is read by date and by the file's previous revision until the publish "
+                  "records its lineage (9235802a).")
+        if title != "live ahead":
+            # Every other remedy here ends in the hand publish. Held, only
+            # "tree ahead by an edit" is the state the hold exists to keep
+            # and goes unfiled; the other two say live may carry work the
+            # deliberate publish would overwrite, and the summary line has
+            # no reader, so they are filed — with the hold, and the read
+            # that shows what live carries (review 8d088b41, F5).
+            keep = {
+                "both moved — side not measured":
+                    # "May" and "could": this branch is reached when live is
+                    # not the file's previous revision OR that could not be
+                    # read — a tree two edits ahead lands here too.
+                    "Live may carry work the file never had, which the deliberate publish could "
+                    f"overwrite: read it with boss-api GET /api/workflows/{kind} and fold anything "
+                    f"to be kept into {path} in a car first",
+                "side not measured":
+                    f"Which side is ahead was not measured: read boss-api GET /api/workflows/{kind} against "
+                    f"{path}, and write anything only live carries back in a car before the deliberate publish",
+            }
+            publish_item(kind, title, side, cmd, detail, held_remedy=keep.get(title))
+        else:
+            # Never a publish, so filed held or not. But a held row rolled
+            # back by hand reads exactly like this — live newer than the
+            # file — and writing it back would undo the tree's row, so the
+            # item says the kind is held when the holds say so.
+            if kind in held:
+                detail += (f" NOTE: {hold_of(kind)}. A held row rolled back by hand reads as live ahead; read "
+                           "what lifts the hold before writing anything back.")
+            elif holds_problem:
+                detail += f" NOTE: whether {kind} is held could not be read ({holds_problem})."
+            item(f"protocol:{kind}", f"Registry drift: protocol {kind} — {title}", side, cmd, detail)
+    if withheld:
+        # ONE item for the holds, not one per kind under a remedy nobody
+        # can vouch for: an item's text is a snapshot, and the dedup would
+        # keep a withheld remedy open after the holds read whole again.
+        item("holds-check:unreadable", "Registry drift: the workflow holds cannot be read — no publish is advised",
+             f"not measured: {holds_problem}",
+             f"repair {HOLDS} (or {HOLDS_PY}) in a car until python3 {HOLDS_PY} <checkout> exits 0; the next "
+             "converge then files each kind below under its own remedy",
+             f"{len(withheld)} disagreement(s) a publish would resolve were found and are NOT filed: whether each "
+             "kind is held out of the publish cannot be told, and a hold that cannot be read is not a hold that "
+             "is absent. Withheld: " + "; ".join(f"{k} ({t})" for k, t in withheld)
+             + f". The reader said: {holds_problem}")
+    found = len(items) - n0 - (1 if withheld else 0) + len(held_lines) + len(withheld)
+    states["protocols"] = f"{found} disagreement(s)" if found else "agree"
+    # The measurement is kept where every converge already records it: the
+    # summary line rides the converge's packet as `registry_drift`.
+    if held_lines:
+        states["protocols"] += (f", {len(held_lines)} held and not filed ("
+                                + ", ".join(k for k, _ in held_lines) + ")")
+    if withheld:
+        states["protocols"] += (f", {len(withheld)} withheld — the holds could not be read ("
+                                + ", ".join(k for k, _ in withheld) + ")")
 elif prc != 0:
     states["protocols"] = f"not compared (exit {prc})"
 else:
@@ -413,13 +604,56 @@ else:
 
 with open(os.path.join(work, "candidates.json"), "w") as f:
     json.dump(items, f)
-print(f"protocols: {states['protocols']}; rules: {states['rules']}")
+with open(os.path.join(work, "held.txt"), "w") as f:
+    f.writelines(text + "\n" for _, text in held_lines)
+
+# What an item ALREADY OPEN for a held kind should say (see AN OPEN ITEM
+# FOR A HELD KIND in the header): for EVERY held kind, drifting or not,
+# because the item that names the publish may be older than the hold and
+# older than the drift. This converge's own candidate when it has one,
+# else the hold alone. Nothing here when the holds could not be read:
+# which kinds are held is then not known.
+corrections = {}
+if not holds_problem:
+    by_key = {c["key"]: c for c in items}
+    for kind in sorted(held):
+        key = f"protocol:{kind}"
+        source, why, lifts = held[kind]
+        if key in by_key:
+            command, side, detail = by_key[key]["command"], by_key[key]["side"], by_key[key]["detail"]
+        elif kind in held_sides:
+            command = (f"no publish — {hold_of(kind)}. The tree is ahead of live by design until the hold "
+                       "lifts; nothing here is to be resolved before then")
+            side, detail = held_sides[kind], f"{kind}: the converged tree is ahead of the live row, and the kind is held."
+        elif not isinstance(report, dict):
+            command = f"no publish — {hold_of(kind)}. This converge could not compare {kind} with its live row"
+            side, detail = None, f"{kind}: not compared at this converge ({states['protocols']})."
+        else:
+            command = (f"no publish — {hold_of(kind)}. This converge finds no disagreement on {kind}; "
+                       "close this item if nothing else keeps it open")
+            side, detail = None, f"{kind}: the converged tree and the live row agree at this converge."
+        corrections[key] = {"kind": kind, "command": command, "side": side, "detail": detail,
+                            "hold": {"source": source, "why": why, "lifts": lifts}}
+with open(os.path.join(work, "corrections.json"), "w") as f:
+    json.dump(corrections, f)
+# Holds that could not be read are said in the summary even when nothing
+# was withheld: no open item for a held kind was looked at this converge.
+unread = "; holds: could not be read, so no open item for a held kind was checked" if holds_problem else ""
+print(f"protocols: {states['protocols']}; rules: {states['rules']}{unread}")
 PY
 [ $? -eq 0 ] || { sed "s/^/$NAME: [classify] /" "$work/classify.out" >&2; finish "nothing filed — the classification failed (above)"; }
 STATES=$(tail -n 1 "$work/classify.out")
+# A held disagreement is SAID on every converge and filed on none: one
+# journal line per kind, here, before any way out through `finish`.
+while IFS= read -r line; do echo "$NAME: $line"; done < "$work/held.txt"
 N=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$work/candidates.json") \
     || finish "$STATES; nothing filed — the candidates could not be read back"
-[ "$N" -gt 0 ] || finish "$STATES; nothing to file"
+# The open list is read when there is something to file OR a held kind
+# whose open item may still name a publish — which can be true on a
+# converge that finds no disagreement at all.
+HELD_N=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$work/corrections.json") \
+    || finish "$STATES; nothing filed — the held kinds could not be read back"
+[ "$N" -gt 0 ] || [ "$HELD_N" -gt 0 ] || finish "$STATES; nothing to file"
 
 # ---------------------------------------------------------------------------
 # Dedup against what is OPEN — every page, or nothing is filed.
@@ -445,18 +679,35 @@ open_read=""
 while :; do
     code=$(api GET "/api/jobs?kind=backlog-item&status=open&metadata_has=registry_drift&limit=500&offset=$offset" "$work/page.json")
     if [ "$code" != "200" ]; then open_read="the open list answered HTTP $code at offset $offset"; break; fi
-    read -r rows total < <(python3 - "$work/page.json" "$work/open.tsv" <<'PY'
+    read -r rows total < <(python3 - "$work/page.json" "$work/open.tsv" "$work/corrections.json" <<'PY'
 import json, sys
 try:
     doc = json.load(open(sys.argv[1]))
     data, total = doc["data"], int(doc["total"])
+    corrections = json.load(open(sys.argv[3]))
 except Exception:
     print("x x"); sys.exit(0)
 with open(sys.argv[2], "a") as out:
     for r in data:
-        key = (r.get("metadata") or {}).get("registry_drift")
+        md = r.get("metadata") or {}
+        key = md.get("registry_drift")
         if isinstance(key, str) and key:
-            out.write(f"{key}\t{r.get('id', '')}\n")
+            # Third cell: is this a held kind's item that is owed a
+            # correction? THE MARK DECIDES, NOT THE PROSE (review 6ff3210e,
+            # N2): an item carrying `publish_withdrawn` for the hold as it
+            # stands IS corrected — its text quotes the hold's own why,
+            # which may itself name the door — and one marked for a hold
+            # that has since changed is corrected once more, so it never
+            # quotes a reason the tree no longer gives. Only an item with
+            # no mark at all is judged by whether it names the publish.
+            c, mark = corrections.get(key), md.get("publish_withdrawn")
+            if c is None:
+                owed = False
+            elif isinstance(mark, dict):
+                owed = any(mark.get(k) != c["hold"][k] for k in ("source", "why", "lifts"))
+            else:
+                owed = any("boss workflow publish" in str(md.get(k) or "") for k in ("resolve", "description"))
+            out.write(f"{key}\t{r.get('id', '')}\t{'correct' if owed else '-'}\n")
 print(len(data), total)
 PY
 )
@@ -468,6 +719,80 @@ PY
     [ "$rows" -gt 0 ] || { open_read="the open list stopped at $offset of $total"; break; }
 done
 [ -z "$open_read" ] || finish "$STATES; nothing filed — $open_read, so a filing could duplicate an open item"
+
+# ---------------------------------------------------------------------------
+# An open item for a HELD kind that still names the publish: correct it.
+# ---------------------------------------------------------------------------
+# Through the metadata MERGE door (PATCH /api/jobs/{id}/metadata — top-level
+# keys overwrite, the rest of the packet is untouched), never a job PUT.
+# What the item said before is not kept on the item: the audit log holds
+# the write, and a withdrawn remedy left readable beside the new one is
+# still a remedy somebody can follow.
+#
+# A CORRECTION IS COUNTED BY ITS EFFECT, NOT BY THE DOOR'S ANSWER (review
+# 6ff3210e, N1). The door answers 204 with no body; the first cut of this
+# loop counted only 200 — an answer the door never gives — so in
+# production every correction that landed would have been recorded "NOT
+# corrected". And any 2xx is still a claim. So the item is READ BACK:
+# corrected means it now carries the mark for this hold and the remedy
+# this converge wrote. The PATCH's code is reported either way.
+corrected=0; uncorrected=0
+while IFS=$'\t' read -r key open_id owed; do
+    [ "$owed" = "correct" ] || continue
+    python3 - "$work/corrections.json" "$key" "$ACTOR" "$HEAD_SHA" > "$work/patch.json" <<'PY' || continue
+import json, sys
+c = json.load(open(sys.argv[1])).get(sys.argv[2])
+if c is None:
+    sys.exit(1)          # not a held kind's item: left exactly as it is
+actor, head = sys.argv[3], sys.argv[4]
+side = f"\n\nWhich side is ahead: {c['side']}." if c["side"] else ""
+body = {
+    "resolve": c["command"],
+    "description": (f"{c['detail']}{side}\n\nResolve with: {c['command']}\n\n"
+                    f"CORRECTED by the cluster converge's last phase at {head[:12]} (infra/forge/registry-drift.sh, "
+                    f"backlog c6bd9f18): this item was filed with a remedy that named the hand publish, and "
+                    f"{c['kind']} is held out of the publish, so the converge withdrew that remedy. The audit log "
+                    "holds what it said before."),
+    "publish_withdrawn": dict(c["hold"], converged_head=head, by=actor),
+    # The side this converge measured — or null, which DELETES the key at
+    # the merge door: a kind that no longer disagrees must not keep the
+    # old item's "tree ahead" beside a text that says the registries agree.
+    "side": c["side"],
+}
+print(json.dumps(body))
+PY
+    # A 204 writes no body, so neither file may hold the last item's.
+    : > "$work/patched.json"; : > "$work/readback.json"
+    code=$(api PATCH "/api/jobs/$open_id/metadata" "$work/patched.json" "$work/patch.json")
+    rcode=$(api GET "/api/jobs/$open_id" "$work/readback.json")
+    saw=$(python3 - "$work/corrections.json" "$key" "$work/readback.json" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))[sys.argv[2]]
+try:
+    md = json.load(open(sys.argv[3])).get("metadata") or {}
+except Exception:
+    print("could not be read as a packet"); sys.exit(0)
+mark = md.get("publish_withdrawn")
+if not isinstance(mark, dict) or any(mark.get(k) != c["hold"][k] for k in ("source", "why", "lifts")):
+    print("carries no publish_withdrawn mark for this hold")
+elif md.get("resolve") != c["command"]:
+    print("carries the mark but not the remedy this converge wrote")
+else:
+    print("ok")
+PY
+) || saw="could not be judged"
+    if [ "$rcode" = "200" ] && [ "$saw" = "ok" ]; then
+        echo "$NAME: $key — open item ${open_id:0:8} for a held kind corrected through the metadata door (PATCH answered HTTP $code; read back: no publish — the hold, why, and what lifts it, and the mark)"
+        corrected=$((corrected + 1))
+    else
+        echo "$NAME: $key — open item ${open_id:0:8} for a held kind was NOT corrected: PATCH /api/jobs/$open_id/metadata answered HTTP $code ($(head -c 300 "$work/patched.json" 2>/dev/null)), and the item read back (HTTP $rcode) ${saw:-could not be judged}" >&2
+        uncorrected=$((uncorrected + 1))
+    fi
+done < "$work/open.tsv"
+CORRECTIONS=""
+[ "$corrected" -eq 0 ] || CORRECTIONS="; corrected $corrected open item(s) for held kinds"
+[ "$uncorrected" -eq 0 ] || CORRECTIONS="$CORRECTIONS; NOT corrected $uncorrected open item(s) for held kinds (the journal says what each read back)"
+[ "$N" -gt 0 ] || finish "$STATES; nothing to file$CORRECTIONS"
 
 # ---------------------------------------------------------------------------
 # File what is not already open.
@@ -506,10 +831,10 @@ PY
         echo "$NAME: $key — filed ${id:0:8}"
         filed=$((filed + 1))
         # The next candidate with the same key (none today) sees it open.
-        printf '%s\t%s\n' "$key" "$id" >> "$work/open.tsv"
+        printf '%s\t%s\t-\n' "$key" "$id" >> "$work/open.tsv"
     else
         echo "$NAME: $key — NOT filed, POST /api/jobs answered HTTP $code: $(head -c 300 "$work/created.json" 2>/dev/null)" >&2
         refused=$((refused + 1))
     fi
 done
-finish "$STATES; filed $filed, already open $already, not filed $refused"
+finish "$STATES; filed $filed, already open $already, not filed $refused$CORRECTIONS"

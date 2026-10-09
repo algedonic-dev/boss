@@ -1,0 +1,63 @@
+# Read every daily check of the build node's trim, and alarm when the
+# trim failed, went a day without a success, moved no counter, or is
+# declared and not there — or when the check itself could not read.
+#
+# THE GAP (backlog 33e62de8). check-node-trim-daily files the read-only
+# check every day, and its ops-request closes `answered` whenever the
+# verb RAN — a failed trim and a CANNOT ANSWER included. A closed packet
+# nobody opens is the failed trim unread, one layer up.
+#
+# THE READER. `ops.judge` in WATCH mode (no then_verb / then_host /
+# then_args), as watch-check-longhorn-drain-policy-daily: nothing is
+# filed on a run whose `when` holds, and ONE urgent alarm, keyed
+# for_request, is filed for a run that FAILED (exit 1 — the API dark, a
+# list unread, an answer that is not this cluster's: "could not read",
+# which is neither a failed trim nor a healthy one), was REFUSED by the
+# runner, printed no verdict, or carries a verdict `when` is false over.
+# The alarm carries the verdict line — which names the Job and the
+# reason token — and the head of the check's output, where the CAUSE,
+# EVENT and COUNTERS lines are.
+#
+# THE VERDICT is the check's last line, read out of the script by
+# crates/core/boss-testing/tests/node_trim_check_sh.rs:
+# `READ — state <s>, missing <0|1>, hours <h>, failed <0|1>, unmoved
+# <0|1>, last_success <t>, job <j>, outcome <o>, reason <r>, devices <n>,
+# moved <m>`. THE THRESHOLDS ARE HERE, in `when`, and nowhere in the
+# script:
+#   hours < 26     the last success (or, never having succeeded, the
+#                  CronJob's creation) is under 26 hours old: one daily
+#                  run plus its thirty-minute deadline and the hour a
+#                  late start is allowed, with slack. Asked for as
+#                  "about 26 hours" on the item.
+#   failed = 0     the newest FINISHED Job did not fail.
+#   unmoved = 0    it is not a success whose discard counters stood
+#                  still or could not be read (review F2: the fstrim byte
+#                  count is not evidence; the counters are).
+#   missing = 0    it is not a CronJob the tree declares and the cluster
+#                  does not hold.
+# A CronJob the tree does not declare yet prints `state not-yet` with
+# every number 0, so `when` holds and nothing alarms: this rule may land
+# before or after the trim does. The predicate compares only integers; a
+# word compared inside a string inside a TOML string is one lexer too
+# many. The pattern avoids the em-dash (`.` spans it) and a backslash:
+# the arg crosses TOML's lexer and then boss-expr's.
+[[rule]]
+name = "watch-check-node-trim-daily"
+why = """
+A CROSS-PROTOCOL READER no Workflow consequence can express: the
+ops-request protocol closes a request when its verb has run, and
+`jobs.job.closed` carries neither the exit nor the output. Asked for on
+backlog 33e62de8 (review 8b1981da F1): a failed, stuck or missing node
+trim was read by nothing, and the gates slowed twice before anyone
+looked at the drive. ops.judge already reads a closed request's exit and
+verdict line and files a for_request-keyed alarm; this rule runs it as a
+watch, with no follow-on, so a trim that failed or went a day without a
+success is an urgent packet naming the cause rather than a closed one.
+Redelivery-safe: the request carries `judged` once read, and an open
+alarm with the same for_request is reused.
+"""
+on_event = "jobs.job.closed"
+when = 'kind = "ops-request" AND (outcome = "answered" OR outcome = "refused")'
+[[rule.do]]
+handler = "ops.judge"
+args = { verb = '"check-node-trim"', verdict_pattern = '"^check-node-trim: READ . state (?P<state>[a-z-]+), missing (?P<missing>[0-9]+), hours (?P<hours>[0-9]+), failed (?P<failed>[0-9]+), unmoved (?P<unmoved>[0-9]+), last_success (?P<last_success>[0-9A-Za-z:-]+), job (?P<job>[a-z0-9-]+), outcome (?P<outcome>[a-z]+), reason (?P<reason>[A-Za-z0-9-]+), devices (?P<devices>[0-9]+), moved (?P<moved>[0-9]+)$"', when = '"missing = 0 AND failed = 0 AND unmoved = 0 AND hours < 26"' }

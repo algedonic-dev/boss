@@ -54,8 +54,9 @@ that does not parse, a key outside the three, a state outside the two, a
 missing or empty `why`, a held file with no `lifts` naming an id, a file for
 a kind the bundle does not author, a `released` for a row that declares no
 writer or executor (it releases nothing — residue), any entry that is neither
-README.md nor <kind>.toml, and a row file that does not parse (whether it
-declares a writer cannot be told). One problem and the answer is exit 1 with
+README.md nor <kind>.toml, a holds path that exists and is not a directory
+(a regular file, a dangling link), and a row file that does not parse (whether
+it declares a writer cannot be told). One problem and the answer is exit 1 with
 no rows; publish-drift.sh then refuses the whole run, in both modes.
 
 USAGE
@@ -146,6 +147,14 @@ def main(argv):
 
     # The declarations.
     declared_state = {}
+    # Only a path that does not exist at all is "no declared holds". A
+    # regular file there, or a link that leads nowhere, used to fall
+    # through this `isdir` with no else and read the same way — every
+    # declared hold gone, exit 0 (review 72485f08 of car ca5d0218, F2).
+    if os.path.lexists(holds_dir) and not os.path.isdir(holds_dir):
+        problems.append(
+            f"{HOLDS_REL} is not a directory (a regular file, or a link that leads nowhere), so the declared holds cannot be read — which is not the same as none being declared"
+        )
     if os.path.isdir(holds_dir):
         for name in sorted(os.listdir(holds_dir)):
             rel = f"{HOLDS_REL}/{name}"

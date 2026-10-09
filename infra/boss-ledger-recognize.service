@@ -23,6 +23,18 @@ Environment=BOSS_LEDGER_RULESET=2
 # alone, so a tick over an empty revenue_schedules table read exactly
 # like one that recognized a year.
 Environment=BOSS_RUN_SUMMARY_FILE=/run/boss-ledger-recognize.summary.json
+# THE TOKEN'S HEADER FILE NEVER OUTLIVES A RUN (backlog df38075a, F1;
+# the second car, which took the class and not the six units the item
+# named). The wrap pair on the Exec lines below presents the machine
+# token, and infra/lib/secret-header.sh makes its 0600 header file in
+# $RUNTIME_DIRECTORY when a unit declares one: /run/boss-ledger-recognize,
+# tmpfs, 0700, this unit's account's, removed by systemd when this
+# oneshot stops whatever ended it. Without it the file was made in the
+# host's shared /tmp, where a killed run left it. The reasoning is in
+# infra/forge/estate-observe-units.service; the pin that walks every
+# unit is a_killed_sender_leaves_no_header_behind.rs.
+RuntimeDirectory=boss-ledger-recognize
+RuntimeDirectoryMode=0700
 ExecStartPre=-/opt/boss/infra/boss-maintenance-wrap.sh maintenance-ledger-recognize "Revenue-recognition run"
 ExecStart=/usr/local/bin/boss-ledger-recognize --config /etc/boss-ledger-api.toml
 ExecStopPost=-/opt/boss/infra/boss-step.sh maintenance-ledger-recognize run

@@ -37,6 +37,22 @@
 //! A roster that cannot answer keeps the human-shaped id (the same
 //! grace owner resolution extends) so a people-api blip never locks a
 //! person out of the one step that needs them.
+//!
+//! AND THE CALLER IS THAT PERSON — BY PASSKEY (David, 2026-10-07, item
+//! 570c66e9: "human-only step completion should use passkey for
+//! enforcement"). Everything above judges an ID, and the machine door
+//! believes whatever id a caller asserts: review 3f7b70bc measured
+//! `emp-ghost` and `emp-david`, with no presence, writing a human-only
+//! step. So the declaration raises the step's required assurance to
+//! presence (`http::steps::judge_assurance`) and its completion is
+//! judged with the passkey beside the roster
+//! (`http::steps::judge_completion`): with sign-off roles, on live
+//! passkey stamps each by a person — after which any actor may send the
+//! completion ("I stamp the instructions so the step no longer requires
+//! human completion"); with none, on the completer's own verifying
+//! ticket, the completer being a person. The roster check is added to,
+//! not swapped for; [`PASSKEY_RULE`] and [`WAYS_OUT`] are what a caller
+//! without a passkey is told.
 
 use serde_json::Value;
 
@@ -166,9 +182,10 @@ pub fn refusal_body(
 /// in-memory API 2026-09-24: an agent's `{"status":"completed"}` on an
 /// unassigned human-only step answered 204 and stamped the agent as
 /// `completed_by`.
-pub const COMPLETION_RULE: &str = "metadata.human_only = true: only an active employee may \
-                                   complete or skip this step; automations and agent sessions \
-                                   are refused, whoever holds it";
+pub const COMPLETION_RULE: &str = "metadata.human_only = true: only an active employee \
+                                   completes this step, on their passkey; automations and \
+                                   agent sessions are refused, whoever holds it, and the step \
+                                   is not skipped";
 
 /// The completion refusal: names the step, the actor that signed the
 /// write, which test it failed, and the rule.
@@ -190,6 +207,55 @@ pub fn completion_refusal_body(
         "hint": "a person completes this step: a holder of its authority_role, signed in \
                  as themselves — the declaration is the protocol's, so an agent that \
                  finished the work leaves the flip to them",
+    })
+}
+
+/// The sentence a refusal for want of a PASSKEY carries as its `rule`
+/// (David, 2026-10-07: "human-only step completion should use passkey
+/// for enforcement"). The roster says an id is a person's; it cannot say
+/// the caller is that person, because the machine door takes the id on
+/// the caller's word. A passkey can.
+pub const PASSKEY_RULE: &str = "metadata.human_only = true: this step leaves its open states \
+                                only on a passkey — the proof that a person, and not a caller \
+                                asserting a person's id, acted on its current content. The \
+                                roster check stays beside it";
+
+/// The two ways out of that refusal, in the order a reader can act on
+/// them: now, and by changing the protocol.
+pub const WAYS_OUT: [&str; 2] = [
+    "complete it from a surface that runs the passkey ceremony, signed in as yourself: the \
+     web step surface asks for one tap and sends the ticket with the completion (POST \
+     /api/auth/passkey/assert/begin, then .../finish, through the gateway). `boss step \
+     complete` and every machine caller carry no passkey and cannot complete this step",
+    "give the step a sign-off role in its Workflow row (sign_offs_required), so a person \
+     stamps it by passkey at POST .../sign-offs and any actor that may update the step — a \
+     machine included — may then send the completion with no second ceremony",
+];
+
+/// The refusal for a human-only step whose STAMP is not a person's: the
+/// stamp carries the completion in the completer's place, so the roster
+/// question is asked of its authority.
+pub fn stamp_refusal_body(
+    step_id: &str,
+    step_title: &str,
+    role: &str,
+    authority_id: &str,
+    stamped_at: chrono::DateTime<chrono::Utc>,
+    why: &NotAPerson,
+) -> Value {
+    serde_json::json!({
+        "error": "human-only step refuses a sign-off stamp that is not a person's",
+        "step_id": step_id,
+        "step_title": step_title,
+        "role": role,
+        "authority_id": authority_id,
+        "stamped_at": stamped_at,
+        "why": why.to_string(),
+        "human_only": true,
+        "rule": PASSKEY_RULE,
+        "hint": "a human_only step with sign-off roles completes on its passkey stamps, \
+                 and each must be by an active employee: have a person holding the role \
+                 sign it again",
     })
 }
 

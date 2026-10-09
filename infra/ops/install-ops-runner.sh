@@ -100,9 +100,31 @@ fi
 
 HOST="${1:?usage: install-ops-runner.sh <estate node id>}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="$(cd "$HERE/../.." && pwd)"
+# INSTALL_OPS_RUNNER_REPO: the tree the runner's ExecStart names when it
+# is NOT the one this installer runs from. The forge's installer sets it
+# while it runs from root's tree and the runner's verbs still work on the
+# checkout (infra/forge/install.sh says why; backlog a604a35b). Unset or
+# empty, as on boss-gcp, it is the tree this file is in.
+REPO="${INSTALL_OPS_RUNNER_REPO:-$(cd "$HERE/../.." && pwd)}"
 ETC="${INSTALL_ETC:-/etc/systemd/system}"
 SYSTEMCTL="${INSTALL_SYSTEMCTL:-systemctl}"
+
+# WHICH MACHINE THIS IS, BEFORE THE UNIT PAIR (backlog 62b09c57, N7;
+# infra/lib/host-check.sh carries the incident and the rule). This file
+# is told the node it installs for, so it asks about that node: with a
+# seam below left at the host's default, this machine must hold the
+# address infra/estate/estate.toml declares for $HOST, or the exit is 78
+# and nothing is installed, removed or reloaded. Its two callers ask
+# first and name the same seams; it asks again because the forge's
+# converge also starts it directly, and so does a hand. `--in-role`
+# above writes nothing and is asked nothing.
+# shellcheck source=infra/lib/host-check.sh
+. "$HERE/../lib/host-check.sh" 2>/dev/null \
+    || { echo "install-ops-runner: REFUSED — $HERE/../lib/host-check.sh cannot be read, so which machine this is cannot be established; nothing was written" >&2; exit 78; }
+host_seam INSTALL_ETC /etc/systemd/system
+host_seam INSTALL_SYSTEMCTL systemctl
+host_seam BOSS_OPS_RUNNER_RETIRED
+host_check "$HOST" install-ops-runner
 
 refuse() { # <what failed>
     echo "install-ops-runner: FAILED — $1" >&2
@@ -334,7 +356,7 @@ fi
 # above. sor_require exits by itself; `refuse` puts the verdict on the
 # packet first.
 # shellcheck source=infra/lib/sor.sh
-. "$REPO/infra/lib/sor.sh"
+. "$HERE/../lib/sor.sh"
 [ -n "${BOSS_JOBS_URL:-}" ] \
     || refuse "no system of record: ${BOSS_SOR_ENV:-/etc/boss/sor.env} carries no BOSS_JOBS_URL (the converge renders it from infra/estate/estate.toml)"
 JOBS_URL="$BOSS_JOBS_URL"

@@ -1,0 +1,12 @@
+# automation:observe-codebase — not in the role-report tally read
+# 2026-10-07T02:13Z (that tally is held in memory and starts again with the
+# pod, so absence there is not absence of the caller); registered from the
+# tree, where every_script_sender_signs_as_a_registered_automation found it.
+# Signs as platform-admin today: infra/codebase-observe/observe-codebase.sh.
+# AT THE ROLE IT SIGNS, for the reason on cluster-watchdog.toml: it posts an
+# estate observation (POST /api/estate/observation).
+
+[[automation]]
+id = "automation:observe-codebase"
+role = "platform-admin"
+description = 'Observes the codebase and posts the observation to the estate registry (infra/codebase-observe/observe-codebase.sh).'

@@ -6,7 +6,12 @@
 //! silent exemption. A gate the launcher recorded as skipped is excused
 //! only while its port refuses a connection and the log holds nothing
 //! from it; a record that cannot be read excuses nothing (backlog
-//! 93e0814a, `boss_core::gate_window::LaunchRoster`).
+//! 93e0814a, `boss_core::gate_window::LaunchRoster`). And an excuse holds
+//! only for hours watched under the selection that makes it: every gated
+//! process states the generation of its launch record with its start,
+//! and a window whose hours span two of them — or that this reader's own
+//! record does not digest to — is not clean and names both and the
+//! instant (design 3cc6152a, backlog 14fe115c; `judged_generations`).
 
 use std::sync::Arc;
 
@@ -50,12 +55,16 @@ pub trait LiveTallies: Send + Sync {
 }
 
 /// The variable the launcher exports with the path of the record it
-/// wrote (`services-launcher.sh`). Read once, at construction.
-pub const LAUNCH_RECORD_ENV: &str = "BOSS_LAUNCH_RECORD";
+/// wrote (`services-launcher.sh`). Read once, at construction. The one
+/// spelling every gated process reads its own roster stamp through.
+pub const LAUNCH_RECORD_ENV: &str = boss_core::gate_window::LAUNCH_RECORD_ENV;
 
 /// Existing stamped machine client, at the registry's local ports.
 pub struct LocalTallies {
     http: machine_token::Client,
+    /// Every service given, gated or not: each mounts an actor-role
+    /// report, so the `actor-role` window requires each (backlog
+    /// e0bdba74). The machine gate's window requires the gated ones.
     services: Vec<(String, String)>,
     /// `Some` only on the production path: `Ok(path)` of the launcher's
     /// record, or why no path is known. `None` (explicit test rosters)
@@ -102,7 +111,6 @@ impl LocalTallies {
         Self::new(
             http,
             boss_ports::all()
-                .filter(|s| boss_core::machine_gate::is_gated(s.name))
                 .map(|s| (s.name.to_string(), boss_ports::url(s.name)))
                 .collect(),
         )
@@ -123,14 +131,30 @@ impl LocalTallies {
 impl LiveTallies for LocalTallies {
     fn required_services(&self, gate: Gate) -> Vec<String> {
         match gate {
-            Gate::MachineGate => self.services.iter().map(|(name, _)| name.clone()).collect(),
+            Gate::MachineGate => self
+                .services
+                .iter()
+                .filter(|(name, _)| boss_core::machine_gate::is_gated(name))
+                .map(|(name, _)| name.clone())
+                .collect(),
             Gate::PolicyCheck => vec!["policy".into()],
+            // Every port in the registry serves a report
+            // (`role_service::report_path`; the pin
+            // `every_registered_service_has_a_production_role_report_owner`
+            // holds each binary to it).
+            Gate::ActorRole => self.services.iter().map(|(name, _)| name.clone()).collect(),
         }
     }
 
     fn roster(&self, gate: Gate) -> LaunchRoster {
         let all = self.required_services(gate);
-        let (Gate::MachineGate, Some(record)) = (gate, &self.launch_record) else {
+        // A service the launcher did not start mounts no machine gate
+        // and no actor-role report: the record excuses it from either
+        // window on the same checks. The generation rule is the machine
+        // gate's alone (`join_selected`): only its starts state a
+        // roster stamp, so an actor-role window names no generation.
+        let (Gate::MachineGate | Gate::ActorRole, Some(record)) = (gate, &self.launch_record)
+        else {
             return LaunchRoster::all_required(all);
         };
         let gated: Vec<(String, Vec<String>)> = all
@@ -140,12 +164,15 @@ impl LiveTallies for LocalTallies {
                 (service, binaries)
             })
             .collect();
-        // Read on every request: the file is small, and a record that
+        // Read on every request: the file is small (and the read is
+        // bounded), and a record that
         // disappears or changes under a running pod must be seen.
-        let text = record.clone().and_then(|path| {
-            std::fs::read_to_string(&path)
-                .map_err(|e| format!("the launch record {} is unreadable: {e}", path.display()))
-        });
+        // Through the one bounded reader every gated process stamps
+        // from, so a reader and a process cannot disagree about what
+        // the file holds.
+        let text = record
+            .clone()
+            .and_then(|path| boss_core::gate_window::read_launch_record_file(&path));
         launch_roster(&gated, text.as_deref().map_err(Clone::clone))
     }
 
@@ -189,8 +216,9 @@ impl LiveTallies for LocalTallies {
             ));
         }
         let path = match gate {
-            Gate::MachineGate => boss_core::machine_gate::MISSES_PATH,
-            Gate::PolicyCheck => POLICY_REFUSALS_PATH,
+            Gate::MachineGate => boss_core::machine_gate::MISSES_PATH.to_string(),
+            Gate::PolicyCheck => POLICY_REFUSALS_PATH.to_string(),
+            Gate::ActorRole => boss_policy_client::role_service::report_path(service),
         };
         let url = format!("{}{path}", targets[0].trim_end_matches('/'));
         let actor = serde_json::to_string(&User::service("events"))

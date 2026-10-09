@@ -515,6 +515,51 @@ fn the_launch_record_excuses_exactly_what_the_launcher_skips() {
     }
 }
 
+/// Backlog e0bdba74: the actor-role window's roster is EVERY row of the
+/// port registry — each mounts a report, the ungated gateway included —
+/// read from the same record. A row the record did not decide would be
+/// a roster error on every read, so the record must name them all, and
+/// excuse for this window exactly what it excuses for the machine
+/// gate's.
+#[test]
+fn the_launch_record_decides_every_row_the_actor_role_window_requires() {
+    let every: Vec<(String, Vec<String>)> = boss_ports::all()
+        .map(|s| (s.name.to_string(), boss_ports::launcher_binaries(s.name)))
+        .collect();
+    assert!(
+        every.len() > gated().len(),
+        "the gateway mounts no machine gate"
+    );
+    let root = scratch_dir("launcher-record-every-row");
+    let acme = tenant(&root, "acme", &[]);
+    let (rc, text) = record(
+        &[
+            ("BOSS_TENANT_DIR", &acme.display().to_string()),
+            ("BOSS_SIM_ENABLED", "false"),
+        ],
+        &root.join("bin"),
+        &[],
+    );
+    assert_eq!(rc, 0, "{text}");
+    let roster = boss_core::gate_window::launch_roster(&every, Ok(&text));
+    assert!(roster.errors.is_empty(), "{:?}\n{text}", roster.errors);
+    assert!(roster.required.iter().any(|s| s == "gateway"), "{text}");
+    let excused = |roster: &boss_core::gate_window::LaunchRoster| {
+        let mut out: Vec<String> = roster
+            .not_launched
+            .iter()
+            .map(|n| n.service.clone())
+            .collect();
+        out.sort();
+        out
+    };
+    assert_eq!(
+        excused(&roster),
+        excused(&boss_core::gate_window::launch_roster(&gated(), Ok(&text))),
+        "{text}"
+    );
+}
+
 #[test]
 fn a_started_service_is_required_whatever_else_the_record_excuses() {
     // The playground shape: every module on, the sim running. Nothing

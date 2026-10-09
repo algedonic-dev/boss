@@ -22,6 +22,24 @@ FILES = ("cpu.max", "cpuset.cpus.effective", "cpu.stat", "cpu.pressure",
 IDENTITY = ("GATE_RUN_JOB_ID", "BOSS_AGENT_RUN", "BOSS_GATE_SOURCE_HEAD", "POD_NAME",
             "POD_UID", "NODE_NAME", "NATIVE_JOB_NAME", "NATIVE_JOB_UID")
 RESOURCES = ("GATE_CPU_REQUEST", "GATE_CPU_LIMIT", "GATE_MEMORY_REQUEST", "GATE_MEMORY_LIMIT")
+# THE GATE POSTGRES DATA VOLUME (backlog 9cd74fd5). gate-runner.yaml keeps it
+# in memory with a sizeLimit and mounts it read-only where this variable says,
+# so every receipt carries how full it got. Readings go to a side journal
+# beside the samples: the receipt's byte bound drops the samples first
+# (measured 2026-10-07: 40 of 40 receipts carried none of their ~220), so a
+# number that has to reach the receipt is a summary of its own.
+PGDATA_ENV = "BOSS_GATE_PGDATA"
+PGDATA_BYTES = 256 * 1024
+PGDATA_SERIES = 16
+# At this share of its size the receipt marks the volume `full`. EVIDENCE,
+# NEVER A VERDICT (review bc011e92): a reading over a threshold says nothing
+# about WHICH check failed or why, and a car whose own tests fill the
+# database earned its red. The mark is there for the person reading a red.
+PGDATA_FULL = 0.95
+# What the watcher says about itself, read back onto the receipt: one line
+# when it starts, one for its first failed reading, one if it dies. Never a
+# line per reading.
+WATCH_BYTES = 4096
 
 
 def text(value, bound=RAW_BYTES):
@@ -200,6 +218,224 @@ def append(path, row):
     print("gate-runtime-evidence: " + encoded)
 
 
+def pgdata_journal(path):
+    return path.with_suffix(path.suffix + ".pgdata")
+
+
+def note_pgdata(path, label):
+    """One statvfs of the data volume, appended; False when none is declared.
+
+    A statvfs of a tmpfs is its pages in use, which is what the pod's memory
+    is charged for. It reads no file of the database: the directory is 0700
+    to the postgres uid, and the gate container is not that uid.
+    """
+    mount = os.environ.get(PGDATA_ENV)
+    if not mount:
+        return False
+    row = {"label": label[:200], "at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    try:
+        stat = os.statvfs(mount)
+        row.update(used_bytes=(stat.f_blocks - stat.f_bfree) * stat.f_frsize,
+                   capacity_bytes=stat.f_blocks * stat.f_frsize)
+    except OSError as error:
+        row["error"] = str(error)[:200]
+    side = pgdata_journal(path)
+    encoded = (json.dumps(row, separators=(",", ":")) + "\n").encode()
+    # One O_APPEND write per reading, so the watcher and a check boundary
+    # never interleave inside a line. A full side journal stops taking
+    # readings and the report says so; it never drops the earlier ones.
+    # A reading that cannot be WRITTEN costs that reading and is said on
+    # stderr; it never fails the sample it rides beside.
+    try:
+        if (side.stat().st_size if side.exists() else 0) + len(encoded) > PGDATA_BYTES:
+            return True
+        descriptor = os.open(side, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            os.write(descriptor, encoded)
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        print("gate-runtime-evidence: data volume reading not recorded: " + str(error)[:200], file=sys.stderr)
+    return True
+
+
+def watch_log(path):
+    return path.with_suffix(path.suffix + ".watch")
+
+
+def last_reading_failed(path):
+    """The OS's words when the newest reading could not be taken, else None."""
+    try:
+        with pgdata_journal(path).open("rb") as stream:
+            stream.seek(max(0, stream.seek(0, os.SEEK_END) - RAW_BYTES))
+            row = json.loads(stream.read().splitlines()[-1])
+        return row.get("error") if isinstance(row, dict) else None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def watch(path, interval, ticks):
+    """Read the data volume between check boundaries until the parent is gone.
+
+    The test check is ONE boundary pair thirty minutes apart, and scratch
+    databases are dropped again, so the boundaries alone can miss the peak.
+    Ends by itself: on its tick bound, or within a second of its parent's
+    exit (the gate image has no `kill`, and nothing should need one).
+
+    IT IS HEARD (review bc011e92, F5). run.sh starts it in the background
+    with its output inherited, and it moves its own stdout and stderr onto
+    the side file the report reads back, so the receipt tells a watcher
+    that never started from one that started and died, in the watcher's own
+    words. Three lines at most: the start, the FIRST failed reading, and a
+    death. A collector that predates this action says so on the pod log,
+    once, because nothing redirected it.
+    """
+    side = os.open(watch_log(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    os.dup2(side, 1)
+    os.dup2(side, 2)
+    os.close(side)
+    mount = os.environ.get(PGDATA_ENV)
+    if not mount:
+        print("gate-runtime-evidence: watcher not started: " + PGDATA_ENV + " is unset", flush=True)
+        return
+    print("gate-runtime-evidence: watcher started: pid %d, every %gs, %s"
+          % (os.getpid(), interval, mount[:200]), flush=True)
+    parent = os.getppid()
+    done, said_failure = 0, False
+    while ticks is None or done < ticks:
+        note_pgdata(path, "watch")
+        failure = None if said_failure else last_reading_failed(path)
+        if failure:
+            said_failure = True
+            print("gate-runtime-evidence: watcher reading %d failed (said once; every failed "
+                  "reading is counted in pgdata.errors): %s" % (done + 1, str(failure)[:200]), flush=True)
+        done += 1
+        waited = 0.0
+        while waited < interval:
+            time.sleep(min(1.0, interval - waited))
+            waited += 1.0
+            if os.getppid() != parent:
+                return
+        if os.getppid() != parent:
+            return
+
+
+def pgdata_report(path):
+    """The data volume's peak over every reading; absent is never a zero."""
+    side = pgdata_journal(path)
+    try:
+        with side.open("rb") as stream:
+            raw = stream.read(PGDATA_BYTES + 1)
+    except OSError:
+        return {"state": "unavailable", "watcher": watcher_report(path),
+                "reason": "no reading of the gate Postgres data volume: " + PGDATA_ENV
+                          + " was unset for every sample (a runner manifest older than the volume)"}
+    valid, errors, first_error = [], 0, None
+    for line in raw[:PGDATA_BYTES].splitlines():
+        try:
+            row = json.loads(line)
+        except (ValueError, RecursionError):
+            row = None
+        used, capacity = (row.get("used_bytes"), row.get("capacity_bytes")) if isinstance(row, dict) else (None, None)
+        if (type(used) is int and type(capacity) is int and 0 <= used and 0 < capacity
+                and text(row.get("label"), 200) and text(row.get("at"), 100)):
+            valid.append((row["label"], row["at"], used, capacity))
+            continue
+        errors += 1
+        if first_error is None:
+            # A reading that could not be TAKEN carries the OS's own words.
+            said = row.get("error") if isinstance(row, dict) else None
+            first_error = said[:200] if text(said) else "malformed reading"
+    watcher = watcher_report(path)
+    if not valid:
+        return {"state": "unavailable", "errors": errors, "watcher": watcher,
+                "reason": "the gate Postgres data volume could not be read: "
+                          + (first_error or "no valid reading")}
+    peak = max(valid, key=lambda row: row[2])
+    watched = sum(1 for row in valid if row[0] == "watch")
+    capacity = valid[-1][3]
+    stride = max(1, -(-len(valid) // PGDATA_SERIES))
+    output = {"state": "measured" if watched else "partial",
+              "method": "statvfs of the data volume's mount (tmpfs pages in use) at every check "
+                        "boundary and from the runner's watcher between them",
+              "mount": os.environ.get(PGDATA_ENV), "capacity_bytes": capacity,
+              "peak_bytes": peak[2], "peak_label": peak[0], "peak_at": peak[1],
+              "last_bytes": valid[-1][2], "readings": len(valid), "watch_readings": watched,
+              "errors": errors, "full": peak[2] >= PGDATA_FULL * peak[3],
+              "watcher": watcher,
+              "series": [[row[1], row[2]] for row in valid[::stride]][:PGDATA_SERIES]}
+    if not watched:
+        # WHY it is partial, in the watcher's own words when it had any.
+        output["note"] = ("check boundaries only: the peak is a lower bound, the test check is "
+                          "one boundary pair. " + (
+                              "The watcher started and recorded no reading; it said: "
+                              + " | ".join(watcher["said"]) if watcher["state"] == "started"
+                              else "No watcher started: " + watcher["reason"]))
+    if len(raw) + 256 > PGDATA_BYTES:
+        output.update(state="partial", truncated="side journal byte bound reached; later readings were not taken")
+    return output
+
+
+def watcher_report(path):
+    """Whether run.sh's watcher started, and what it said; bounded."""
+    try:
+        with watch_log(path).open("rb") as stream:
+            raw = stream.read(WATCH_BYTES + 1)
+    except OSError:
+        return {"state": "not started",
+                "reason": "the watcher left no file (" + watch_log(path).name + "): run.sh did not "
+                          "start it, or its collector predates the watch action (a runner script "
+                          "older than the volume; the pod log then carries its refusal)"}
+    said = [line[:300] for line in raw[:WATCH_BYTES].decode("utf-8", errors="replace").splitlines() if line.strip()]
+    started = any("watcher started:" in line for line in said)
+    output = {"state": "started" if started else "not started", "said": said[:8]}
+    if not started:
+        output["reason"] = "the watcher's file holds no start line"
+    if len(raw) > WATCH_BYTES or len(said) > 8:
+        output["truncated"] = True
+    return output
+
+
+def integer(reading_):
+    raw = reading_.get("raw", "").strip() if reading_.get("state") == "measured" else ""
+    return int(raw) if raw.isdigit() else None
+
+
+def oom_kills(row):
+    source = row["files"]["memory.events"]
+    if source.get("state") != "measured":
+        return None
+    for line in source["raw"].splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "oom_kill" and parts[1].isdigit():
+            return int(parts[1])
+    return None
+
+
+def memory_report(rows):
+    """The gate container's memory over EVERY sample, before any is dropped.
+
+    Its own cgroup only: the postgres sidecar's, where the data volume's
+    pages are charged, is not visible from this container - the data volume
+    reading above is that number.
+    """
+    peaks = [value for value in (integer(row["files"]["memory.peak"]) for row in rows) if value is not None]
+    if not peaks:
+        return {"state": "unavailable", "reason": "no sample read the cgroup's memory.peak"}
+    output = {"state": "measured", "peak_bytes": max(peaks), "limit_bytes": None, "oom_kill": None,
+              "method": "cgroup v2 memory.peak (file cache included) and the memory.events "
+                        "oom_kill delta of the gate container, first to last sample; evidence "
+                        "only, it changes no verdict"}
+    limit = rows[-1]["resources"]["GATE_MEMORY_LIMIT"]
+    if limit.get("state") == "configured":
+        output["limit_bytes"] = limit["value"]
+    first, last = oom_kills(rows[0]), oom_kills(rows[-1])
+    if (len(rows) > 1 and first is not None and last is not None and last >= first
+            and known_lifetime(rows[0]) and rows[0]["lifetime"] == rows[-1]["lifetime"]):
+        output["oom_kill"] = last - first
+    return output
+
+
 def report(path):
     rows, errors, intervals, omitted_rows, invalid_rows = [], [], [], 0, 0
     previous = None
@@ -239,6 +475,9 @@ def report(path):
               "invalid_rows": invalid_rows,
               "omitted_rows": omitted_rows,
               "samples": kept, "intervals": intervals,
+              # Summaries over EVERY row and reading, computed before the
+              # reductions below, which keep neither.
+              "pgdata": pgdata_report(path), "memory": memory_report(rows),
               "browser": {"state": "unavailable", "reason": "no observed browser runtime record"},
               "browser_policy": {"state": "unavailable", "reason": "no resolved browser configuration"}}
     # The runner copies raw bytes independently of verdict before cleanup;
@@ -372,6 +611,10 @@ if __name__ == "__main__":
     action, path = sys.argv[1], Path(sys.argv[2])
     if action == "sample":
         append(path, sample(sys.argv[3]))
+        note_pgdata(path, sys.argv[3])
+    elif action == "watch":
+        watch(path, float(sys.argv[3]) if len(sys.argv) > 3 else 15.0,
+              int(sys.argv[4]) if len(sys.argv) > 4 else None)
     elif action == "report":
         print(json.dumps(report(path), separators=(",", ":")))
     elif action == "browser":
@@ -383,6 +626,15 @@ if __name__ == "__main__":
         body = json.loads(receipt.read_text())
         if not isinstance(body, dict):
             raise SystemExit("receipt is not an object; original preserved")
+        # EVIDENCE BESIDE THE VERDICT, NEVER INSTEAD OF IT (review bc011e92,
+        # F1). gate.sh wrote the verdict from the checks; this adds what the
+        # run's own resources did (runtime_evidence.pgdata.full,
+        # runtime_evidence.memory.oom_kill) and touches nothing else. A full
+        # volume or a kill beside a red is CO-OCCURRENCE: this collector does
+        # not know which check failed or why, a car whose own tests fill the
+        # database or eat the gate's memory earned its red, and `refused` is
+        # relaunched without bound and strikes nobody. Pinned by
+        # gate_pgdata_evidence.rs.
         body["runtime_evidence"] = report(path)
         temporary = receipt.with_suffix(receipt.suffix + ".runtime-tmp")
         temporary.write_text(json.dumps(body, separators=(",", ":")))

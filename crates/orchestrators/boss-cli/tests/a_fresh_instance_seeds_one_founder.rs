@@ -352,8 +352,19 @@ async fn operator_baseline(
     tokio::task::spawn_blocking(move || {
         // A FIXED source holding no token, never the process's live one
         // (backlog 2ee29275, F2): a failing test prints what it sent.
+        //
+        // NO DEADLINE OF THE TEST'S OWN (backlog ec131700). These cases ask
+        // what the seed leaves in the roster, never how fast the door
+        // answers, and the fifteen seconds this client carried made each a
+        // test of the runner: on a gate whose test check ran 422 s against
+        // 13 s on the dev pod, two cases read "operation timed out" from a
+        // people door that was up (gate-run bd136c2e, 2026-10-06).
+        // Reproduced by holding the door's first answer for sixteen
+        // seconds: red at fifteen, green here. The answer is the condition
+        // waited on — `timeout(None)` because reqwest's blocking client
+        // otherwise brings thirty seconds of its own.
         let client = boss_core::machine_token::BlockingClient::build_with_source(
-            reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(15)),
+            reqwest::blocking::Client::builder().timeout(None),
             Arc::new(boss_core::machine_token::Source::fixed(None)),
         )
         .expect("a blocking client");

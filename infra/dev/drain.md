@@ -70,7 +70,16 @@ than building it again.
 
 Do the post-land acts the memory entry lists as owed: `boss fold` for
 answered designs whose fold car landed, `boss workflow publish <name>`
-for protocol rows a car changed, and `boss prove <car> --from-car` for
+for protocol rows a car changed — NEVER for a kind that is HELD: run
+`python3 infra/gcp/workflow-holds.py <checkout>` first, on a checkout
+whose HEAD is the `origin/main` that carries the landing (`git fetch
+origin`, then compare; `/work/boss` is fast-forwarded hourly, so until
+it has caught up it answers for the tree before the car and you publish
+nothing yet). A kind the reader prints as `held` (by a file under
+`infra/platform/workflow-holds/`, or by default because its row declares
+a `writer` or an `executor`) goes live only at a person's deliberate
+publish, never a draining session's; if that reader exits non-zero,
+publish nothing and say so — and `boss prove <car> --from-car` for
 landed cars the SHED names. Record each in the memory entry.
 
 ## 6. Never

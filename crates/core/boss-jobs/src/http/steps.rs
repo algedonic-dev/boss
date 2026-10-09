@@ -622,6 +622,12 @@ pub(super) struct Assured {
     /// cannot check is a forgery or a fault, and either one said aloud
     /// beats a stamp quietly downgraded to Session.
     pub unverified: bool,
+    /// The request carried an `x-boss-presence` header at all — what the
+    /// completion's record says of it, whatever it was worth.
+    pub presented: bool,
+    /// The step declares `human_only`, which is what raised `required`
+    /// to presence when the step itself asked for less.
+    pub human_only: bool,
 }
 
 impl Assured {
@@ -644,28 +650,44 @@ impl Assured {
             )
                 .into_response();
         }
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "step requires stronger assurance than this request carries",
-                "required": self.required,
-                "produced": self.produced,
-                "detail": format!(
-                    "this step requires proof of presence — a passkey assertion bound \
-                     to the step's shape hash.{}",
-                    self.detail
-                ),
-            })),
-        )
-            .into_response()
+        let mut body = serde_json::json!({
+            "error": "step requires stronger assurance than this request carries",
+            "required": self.required,
+            "produced": self.produced,
+            "detail": format!(
+                "this step requires proof of presence — a passkey assertion bound \
+                 to the step's shape hash.{}",
+                self.detail
+            ),
+        });
+        // A HUMAN-ONLY STEP SAYS SO, AND SAYS HOW (David, 2026-10-07).
+        // This is the answer `boss step complete` and every machine
+        // caller now meet on such a step, so it names the declaration,
+        // why a passkey, and both ways out — a refusal that only said
+        // "presence" would send the reader to find out why a step that
+        // never declared presence asks for it.
+        if self.human_only
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert("human_only".into(), serde_json::Value::Bool(true));
+            obj.insert("rule".into(), crate::human_only::PASSKEY_RULE.into());
+            obj.insert(
+                "ways_out".into(),
+                serde_json::json!(crate::human_only::WAYS_OUT),
+            );
+        }
+        (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
     }
 }
 
 /// What the presence-content refusal in `update_step` tells its caller
 /// (backlog c0b56fd9).
 const PRESENCE_CONTENT_HINT: &str = "write the content first through the merge door \
-     (PATCH .../metadata), run the passkey ceremony over the step as it then stands, and \
-     complete with {\"status\":\"completed\"} alone and the ticket that ceremony issued. \
+     (PATCH .../metadata), have every required role sign the step as it then stands \
+     (POST .../sign-offs, each on a passkey ceremony), and complete with \
+     {\"status\":\"completed\"} alone: the stamps carry the completion, and it needs no \
+     ticket of its own (design 1ce67f7e). Only a presence step that names no sign-off role \
+     carries a ceremony's ticket on the completing request. \
      A presence-assured step is not skipped: leave it open, or cancel the packet.";
 
 /// What the completion-date refusals in `update_step` and `add_step` tell
@@ -688,7 +710,25 @@ pub(super) fn judge_assurance(
     use boss_core::presence::{HEADER, PresenceTicket, now_epoch};
     // The step's own requirement wins when it is stronger than the
     // kind's floor; a Workflow may raise, never lower.
-    let required = step.assurance_required.unwrap_or_default().max(floor);
+    //
+    // AND `human_only` RAISES IT TO PRESENCE (David, 2026-10-07: "human-
+    // only step completion should use passkey for enforcement"). The
+    // declaration was enforced by the roster alone, on the id a caller
+    // ASSERTS — and the machine door believes any id, so every holder of
+    // the machine token could complete or stamp a human-only step as any
+    // employee (review 3f7b70bc measured emp-ghost and emp-david, with no
+    // presence, writing one). A passkey is the one proof of a person this
+    // service can check, so a step reserved for a person asks for it —
+    // here, in the one function both doors read their requirement from,
+    // so the stamp and the completion cannot disagree about it. The
+    // roster check stays beside it (`judge_completion`).
+    let human_only = crate::human_only::declared(&step.metadata);
+    let declared = step.assurance_required.unwrap_or_default().max(floor);
+    let required = if human_only {
+        declared.max(boss_core::job::Assurance::Presence)
+    } else {
+        declared
+    };
     let shape = boss_core::job::step_shape_hash(&step.title, &step.metadata);
     // Absent → no claim. Present → it verifies against the key, or it is
     // refused; there is no third reading of a header anyone at the
@@ -739,6 +779,228 @@ pub(super) fn judge_assurance(
         presence_nonce,
         detail,
         unverified,
+        presented: claim.is_some(),
+        human_only,
+    }
+}
+
+/// What a request that leaves the open states was assured BY — the
+/// answer of [`judge_completion`], and what the completion's marker
+/// event records of it.
+pub(super) struct CompletionAssured {
+    pub required: boss_core::job::Assurance,
+    /// `assured` on the `jobs.step.completed` marker, for a step that
+    /// requires more than a session; `None` for one that does not.
+    pub record: Option<serde_json::Value>,
+}
+
+/// THE ONE JUDGEMENT OF A COMPLETION'S ASSURANCE (design 1ce67f7e,
+/// decided 2026-10-07; backlog 570c66e9). Every request that moves a
+/// step out of its open states is judged here and nowhere else: the
+/// status PUT and `POST .../complete-if` both run
+/// `update_step_with_condition`, which calls this once (CLAUDE.md §9a —
+/// two doors that judged separately are two doors that will disagree).
+///
+/// WHAT IT REPLACED. The completion was judged on the request's own
+/// ticket alone ([`judge_assurance`]), and the stamps the step already
+/// held were never consulted — so a step a passkey had just stamped
+/// refused a bare completion 422, and the surfaces kept the stamp's
+/// ticket client-side to send it a second time (`presenceTicketHeld`,
+/// sign-off.js, b568044a): a credential held between two requests, a
+/// two-minute race, and a failure whenever the stamp and the completion
+/// happened on different surfaces. On the live registry all eight steps
+/// that require presence also declare sign-off roles, so that second
+/// proof was redundant in every case there was.
+///
+/// THE RULE, in the order it is judged:
+///
+/// 1. A header that does not verify is refused, whatever else is true
+///    of the step. A claim this service cannot check is a forgery or a
+///    fault; it is never ignored because the stamps would have sufficed.
+/// 2. A step that requires only a session is assured by one.
+/// 3. A presence step that declares sign-off roles completes on its
+///    STAMPS: every required role holds a live stamp a passkey produced
+///    over the step's current shape, inside the declared age
+///    (`Step::stamped_presence`,
+///    `boss_core::job::PRESENCE_STAMP_COMPLETES_FOR_HOURS`). The request
+///    then needs a session only, and may come from any actor the
+///    step-update policy admits — David's answer on `completer`: "think
+///    about an admin grabbing 5 sign-offs". A ticket on the request is
+///    not an alternative to a missing stamp: the roles are who approves,
+///    and the completer's passkey is not theirs.
+/// 4. A presence step with NO roles keeps the rule it had: the request
+///    carries a verifying ticket for this step, shape and actor, because
+///    that completion is the only act there is.
+///
+/// A HUMAN-ONLY STEP IS THE SAME JUDGEMENT WITH A PERSON IN IT (David,
+/// 2026-10-07, item 570c66e9 `human_only_by_passkey_20261007`).
+/// `judge_assurance` has already raised its requirement to presence, so
+/// rules 3 and 4 apply to it whether or not it declared presence, and
+/// the roster check that was the whole enforcement stays beside the
+/// passkey — added to, not swapped for:
+///
+/// - rule 3 (roles): every stamp that carries it is BY A PERSON
+///   (`human_only::person_check` on the stamp's authority). Who sends
+///   the completion is then free — his second sentence: "I stamp the
+///   instructions so the step no longer requires human completion".
+/// - rule 4 (no roles): the actor sending the completion is a person,
+///   and the ticket is theirs. Asked BEFORE the ticket, so an automation
+///   is told it is not a person (403, as it always was) rather than sent
+///   to run a ceremony it has no passkey for.
+///
+/// The completer's roster check used to stand alone above this call
+/// (adac8fa4). It lives here now so the two arms cannot drift: with
+/// roles it moved from the completer to the signers; without, it stayed
+/// on the completer.
+///
+/// Read off `step` as STORED, never the body laid over it: the caller
+/// refuses a completing write that moves anything the stamps signed.
+/// The clock is the port the sign-off door stamps with, read only when a
+/// stamp's age is actually in question.
+pub(super) async fn judge_completion(
+    ticket: Assured,
+    step: &boss_core::job::Step,
+    job_id: &boss_core::job::JobId,
+    clock: &Arc<dyn boss_clock_client::ClockClient>,
+    roster: Option<&dyn crate::owner_resolution::RosterLookup>,
+    actor_id: &str,
+) -> Result<CompletionAssured, Response> {
+    use boss_core::job::{Assurance, PRESENCE_STAMP_COMPLETES_FOR_HOURS, StampedPresence};
+    if ticket.unverified {
+        return Err(ticket.refusal());
+    }
+    let required = ticket.required;
+    if required < Assurance::Presence {
+        return Ok(CompletionAssured {
+            required,
+            record: None,
+        });
+    }
+    let now = if step.sign_offs_required.is_empty() {
+        // Not read: `stamped_presence` answers NoRoles before any date.
+        chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
+    } else {
+        boss_clock_client::now_from(clock).await
+    };
+    match step.stamped_presence(now) {
+        StampedPresence::NoRoles => {
+            if ticket.human_only
+                && let Err(why) = crate::human_only::person_check(roster, actor_id).await
+            {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(crate::human_only::completion_refusal_body(
+                        &step.id.to_string(),
+                        &step.title,
+                        step.metadata.get("authority_role").and_then(|v| v.as_str()),
+                        actor_id,
+                        &why,
+                    )),
+                )
+                    .into_response());
+            }
+            if ticket.falls_short() {
+                return Err(ticket.refusal());
+            }
+            let mut record = serde_json::json!({
+                "required": required,
+                "by": "ticket",
+                "ticket_presented": ticket.presented,
+                "presence_nonce": ticket.presence_nonce,
+            });
+            if ticket.human_only {
+                record["human_only"] = true.into();
+                record["person"] = actor_id.into();
+            }
+            Ok(CompletionAssured {
+                required,
+                record: Some(record),
+            })
+        }
+        StampedPresence::Carried(stamps) => {
+            if ticket.human_only {
+                for st in &stamps {
+                    if let Err(why) =
+                        crate::human_only::person_check(roster, &st.authority_id).await
+                    {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            Json(crate::human_only::stamp_refusal_body(
+                                &step.id.to_string(),
+                                &step.title,
+                                &st.role,
+                                &st.authority_id,
+                                st.stamped_at,
+                                &why,
+                            )),
+                        )
+                            .into_response());
+                    }
+                }
+            }
+            let mut record = serde_json::json!({
+                "required": required,
+                "by": "stamps",
+                "ticket_presented": ticket.presented,
+                "judged_at": now,
+                "stamps": stamps
+                    .iter()
+                    .map(|st| serde_json::json!({
+                        "role": st.role,
+                        "authority_id": st.authority_id,
+                        "stamped_at": st.stamped_at,
+                        "presence_nonce": st.presence_nonce,
+                    }))
+                    .collect::<Vec<_>>(),
+            });
+            if ticket.human_only {
+                record["human_only"] = true.into();
+            }
+            Ok(CompletionAssured {
+                required,
+                record: Some(record),
+            })
+        }
+        StampedPresence::Owed(owed) => {
+            let sentences = owed
+                .iter()
+                .map(|o| o.sentence())
+                .collect::<Vec<_>>()
+                .join("; ");
+            let roles: Vec<&str> = owed.iter().map(|o| o.role.as_str()).collect();
+            Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "this step completes on its sign-off stamps, and they do not \
+                              carry it",
+                    "completes_on": "stamps",
+                    "human_only": ticket.human_only,
+                    "assurance_required": required,
+                    // The key the sign-offs-incomplete 409 names its
+                    // roles under, so a surface offers these signatures
+                    // again by the reading it already has.
+                    "missing_or_stale_roles": roles,
+                    "owed": owed,
+                    "max_stamp_age_hours": PRESENCE_STAMP_COMPLETES_FOR_HOURS,
+                    "detail": format!(
+                        "this step {} and completes on its sign-off stamps: \
+                         every required role holds a live passkey stamp over the current \
+                         content, none older than {PRESENCE_STAMP_COMPLETES_FOR_HOURS} hours. \
+                         Here: {sentences}. Have each role named sign again at POST \
+                         /api/jobs/{job_id}/steps/{}/sign-offs with a fresh passkey ceremony \
+                         over the step as it stands; the completion itself then carries no \
+                         ticket, and any actor that may update the step can send it.",
+                        if ticket.human_only {
+                            "is human_only (a person's passkey is the proof)"
+                        } else {
+                            "requires presence"
+                        },
+                        step.id
+                    ),
+                })),
+            )
+                .into_response())
+        }
     }
 }
 
@@ -1498,39 +1760,23 @@ async fn update_step_with_condition<R: JobsRepository + 'static, B: EventBus + '
     // completing by another name.
     let is_leaving_open = !matches!(old.status, StepStatus::Completed | StepStatus::Skipped)
         && matches!(step.status, StepStatus::Completed | StepStatus::Skipped);
-    // A HUMAN-ONLY STEP IS COMPLETED BY A PERSON (backlog adac8fa4). The
-    // assignment and claim checks above guard who may HOLD the step; an
-    // unheld one could still be flipped by any caller the policy lets
-    // write steps, and on the in-memory API an agent's bare
-    // `{"status":"completed"}` answered 204 and stamped the agent as
-    // `completed_by`. Every completion path in the estate — the UI, the
-    // merge door followed by this PUT, `boss step complete`, a
-    // dispatcher handler — lands here, so this is the one boundary.
+    // A HUMAN-ONLY STEP IS COMPLETED ON A PERSON'S PASSKEY (backlog
+    // adac8fa4; David 2026-10-07). The assignment and claim checks above
+    // guard who may HOLD the step; an unheld one could still be flipped
+    // by any caller the policy lets write steps, and on the in-memory API
+    // an agent's bare `{"status":"completed"}` answered 204 and stamped
+    // the agent as `completed_by`. Every completion path in the estate —
+    // the UI, the merge door followed by this PUT, `boss step complete`,
+    // a dispatcher handler — lands here, so this is the one boundary.
     //
-    // Judged on the actor that SIGNED the write, not on the one the
-    // event will name: an automation's body `completed_by` proxy (the
-    // sim's attribution, below) names a person who did not make this
-    // call, and the declaration's whole claim is that a person did.
-    // Read from `old.metadata`, the protocol's materialised row, never
-    // from the body (the change refusal above keeps them equal). The
-    // same scope as the assurance guard: a skip satisfies `steps.x.done`
-    // exactly as a completion does.
-    if is_leaving_open
-        && crate::human_only::declared(&old.metadata)
-        && let Err(why) = crate::human_only::person_check(state.roster.as_deref(), &user.id).await
-    {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(crate::human_only::completion_refusal_body(
-                &step_id.to_string(),
-                &old.title,
-                old.metadata.get("authority_role").and_then(|v| v.as_str()),
-                &user.id,
-                &why,
-            )),
-        )
-            .into_response();
-    }
+    // The roster check that stood here judged the id that SIGNED the
+    // write — an id the machine door takes on the caller's word. It is
+    // now one part of `judge_completion` below, beside the passkey that
+    // proves the id: on the completer where the step names no sign-off
+    // role, on each signer where it does. Read from `old.metadata`, the
+    // protocol's materialised row, never from the body. The same scope
+    // as the assurance guard: a skip satisfies `steps.x.done` exactly as
+    // a completion does.
     // ...AND ITS RECORD IS WRITTEN BY A PERSON (backlog 50f012ed): a PUT
     // that stops short of completing must not carry the person's fields
     // past the check above either. The merge door's rule, on the same
@@ -1557,6 +1803,13 @@ async fn update_step_with_condition<R: JobsRepository + 'static, B: EventBus + '
                 .into_response();
         }
     }
+    // HOW THIS COMPLETION WAS ASSURED, for the record (design 1ce67f7e).
+    // Nothing recorded it: a presence step completed on a ticket and one
+    // completed on its stamps left the same row and the same events, so
+    // "was a passkey proof on that request, or did it stand on the
+    // stamps" could only be believed. It rides the `jobs.step.completed`
+    // marker below, for a step that requires more than a session.
+    let mut completion_assured: Option<serde_json::Value> = None;
     if is_leaving_open {
         let floor = state
             .step_registry
@@ -1564,10 +1817,24 @@ async fn update_step_with_condition<R: JobsRepository + 'static, B: EventBus + '
             .map(|t| t.assurance_floor)
             .unwrap_or_default();
         let key = super::presence::key_for(state.presence_key.as_deref(), &headers).await;
-        let assured = judge_assurance(floor, &old, &step_id_str, &user.id, &headers, key);
-        if assured.falls_short() {
-            return assured.refusal();
-        }
+        // The request's own ticket, then the one judgement of what the
+        // completion stands on — that ticket, or the stamps the step
+        // already holds (design 1ce67f7e; `judge_completion`).
+        let ticket = judge_assurance(floor, &old, &step_id_str, &user.id, &headers, key);
+        let assured = match judge_completion(
+            ticket,
+            &old,
+            &job_id,
+            &state.clock,
+            state.roster.as_deref(),
+            &user.id,
+        )
+        .await
+        {
+            Ok(assured) => assured,
+            Err(refusal) => return refusal,
+        };
+        completion_assured = assured.record.clone();
         // THE CONTENT JUDGED IS THE CONTENT COMPLETED (backlog c0b56fd9,
         // review of car 5b30ccf9). A ticket binds the step's shape hash,
         // and the judgement above reads `old` — so a PUT that changed
@@ -1599,6 +1866,13 @@ async fn update_step_with_condition<R: JobsRepository + 'static, B: EventBus + '
         // passkey saw. Those two ride the same refusal, named in
         // `refused_fields`. (The date is the server's on every
         // completion — refused near the top, stamped at the flip.)
+        //
+        // AND ALL OF IT HOLDS FOR A COMPLETION THAT STANDS ON STAMPS
+        // (design 1ce67f7e). The stamps bind the same hash a ticket did,
+        // so the same write is refused for the same reason: the bytes
+        // completed are the bytes every role signed. Keyed on what the
+        // step REQUIRES, never on how this request was assured, so the
+        // refusal cannot be walked round by choosing the other proof.
         if assured.required >= boss_core::job::Assurance::Presence {
             let judged = boss_core::job::step_shape_hash(&old.title, &old.metadata);
             let completing = boss_core::job::step_shape_hash(&step.title, &step.metadata);
@@ -2221,13 +2495,20 @@ async fn update_step_with_condition<R: JobsRepository + 'static, B: EventBus + '
     // Marker events for downstream consumers — informational
     // duplicates of state already in STEP_UPDATED. Rebuild ignores.
     if old.status != StepStatus::Completed && step.status == StepStatus::Completed {
-        step_events.push(stamp.event(
-            events::STEP_COMPLETED,
-            serde_json::json!({
-                "job_id": job_id.to_string(),
-                "step_id": step_id.to_string(),
-            }),
-        ));
+        let mut completed = serde_json::json!({
+            "job_id": job_id.to_string(),
+            "step_id": step_id.to_string(),
+        });
+        // NOT a duplicate of row state, unlike the rest of this marker:
+        // what the completion's assurance stood on — the request's
+        // ticket, or the stamps named here — is a fact of this request
+        // that no column holds (design 1ce67f7e). Present only for a
+        // step that requires more than a session; the rebuild reads
+        // nothing from it.
+        if let (Some(assured), Some(payload)) = (&completion_assured, completed.as_object_mut()) {
+            payload.insert("assured".into(), assured.clone());
+        }
+        step_events.push(stamp.event(events::STEP_COMPLETED, completed));
 
         // Dispatcher routing: rules in infra/dispatcher/rules/
         // listen on `step.done.<kind>` so each StepType's side
@@ -4436,9 +4717,13 @@ pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus 
         return (StatusCode::FORBIDDEN, reason).into_response();
     }
 
-    // ASSURANCE — the SAME judgement the ordinary step write makes, so
-    // the answer cannot depend on which door the caller used (§9a,
-    // backlog 148549c5).
+    // ASSURANCE — the request's own ticket, read by the ONE function
+    // that reads one (`judge_assurance`; §9a, backlog 148549c5). WRITING
+    // a presence stamp takes a verifying ticket, always: this door is
+    // where the proof a completion later stands on is made, so nothing
+    // here is relaxed by design 1ce67f7e. What that design changed is
+    // what COMPLETING needs (`judge_completion`), which reads the stamps
+    // this door wrote.
     let floor = state
         .step_registry
         .get(&step.kind)
@@ -4452,14 +4737,33 @@ pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus 
         return assured.refusal();
     }
     let shape = step.shape_hash();
+    let now = boss_clock_client::now_from(&state.clock).await;
     // Idempotent only over a LIVE stamp (`Step::live_stamps`, design
     // 87329a13): a dead stamp on this same shape — the content left and
     // came back — is not a signature of it, and answering "already
     // signed" would leave the approver no way to sign it at all.
-    if step.live_stamps().any(|st| st.role == role) {
+    //
+    // AND, ON AN OPEN PRESENCE STEP, ONLY OVER A STAMP THAT CARRIES THE
+    // ROLE (design 1ce67f7e), for that same reason. A completion now
+    // stands on the stamps, and refuses one past its age or one a
+    // session wrote before a re-pin raised the step to presence — asking
+    // for a fresh signature. "Already signed" to that request would make
+    // the refusal unanswerable. The fresh stamp is written beside the
+    // old one, on this request's own verified ticket, and the newest
+    // datable one carries the role (`Step::presence_stamp_of`).
+    //
+    // A FINISHED step is left exactly as it was: its stamps are its
+    // record, and the ops runner reads an approve step's `stamped_at` —
+    // an approval that aged out unrun is not renewed onto it here.
+    let open = !matches!(step.status, StepStatus::Completed | StepStatus::Skipped);
+    let signed = if open && assured.required >= boss_core::job::Assurance::Presence {
+        step.presence_stamp_of(&role, now).is_ok()
+    } else {
+        step.live_stamps().any(|st| st.role == role)
+    };
+    if signed {
         return Json(step).into_response(); // idempotent re-stamp
     }
-    let now = boss_clock_client::now_from(&state.clock).await;
     let stamp = boss_core::job::SignOffStamp {
         authority_id: user.id.clone(),
         role: role.clone(),

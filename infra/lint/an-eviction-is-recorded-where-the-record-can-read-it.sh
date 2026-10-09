@@ -52,6 +52,14 @@ fail() { echo "$name: FAIL — $*" >&2; exit 1; }
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
+# NO MACHINE TOKEN IN REACH of the script this runs (backlog 066a7613).
+# The observer sources the estate's token reader when its pod holds one,
+# and a lint's answer must not depend on what the box it runs on holds
+# (a-lint-sources-a-header-lib-only-hermetic.sh; the 2026-10-01 incident).
+# The token states are a-manifest-sender-presents-the-machine-token.sh's.
+mkdir -p "$tmp/no-machine-token"
+export BOSS_MACHINE_TOKEN_DIR="$tmp/no-machine-token" BOSS_SOR_ENV="$tmp/no-sor.env" BOSS_OBSERVE_READER="$tmp/no-reader.sh"
+unset BOSS_JOBS_URL BOSS_MACHINE_TOKEN_HOSTS RUNTIME_DIRECTORY
 
 # ----- 6: the grant, read from the same file -------------------------
 # Split the manifest into its YAML documents and find the one granting

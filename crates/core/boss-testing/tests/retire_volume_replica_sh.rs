@@ -199,6 +199,26 @@ echo "stub: unexpected kubectl call: $*" >&2
 exit 2
 "#;
 
+/// THE SCRIPT'S CLOCK, on its PATH (backlog ec131700). The write counts its
+/// settle and its read-back in seconds between `date -u +%s` reads and
+/// waits with `sleep`. Left to the runner, three seconds of read-back were
+/// spent by one slow snapshot and correct code read red (10 runs of 10 at
+/// five copies of this binary on the dev pod, 2026-10-07). So the clock is
+/// a file only `sleep` moves: a bound of N seconds polled every second is
+/// N+1 reads on any runner, and no test waits a real second for it. Each
+/// stub refuses a call it does not know, so a second clock read added to
+/// the script cannot fall through to the runner's unseen.
+const CLOCK_DATE: &str = r#"#!/bin/sh
+[ "$*" = "-u +%s" ] || { echo "stub date: unexpected call: $*" >&2; exit 2; }
+cat "$STUB_STATE/clock"
+"#;
+const CLOCK_SLEEP: &str = r#"#!/bin/sh
+case "${1:-}" in ''|*[!0-9]*) echo "stub sleep: unexpected call: $*" >&2; exit 2 ;; esac
+[ $# -eq 1 ] || { echo "stub sleep: unexpected call: $*" >&2; exit 2; }
+now=$(cat "$STUB_STATE/clock") || exit 2
+echo $((now + $1)) > "$STUB_STATE/clock"
+"#;
+
 fn needs_tools() {
     for tool in ["jq", "sha256sum"] {
         let ok = Command::new(tool)
@@ -340,7 +360,10 @@ impl Longhorn {
         std::fs::create_dir_all(dir.join("bin")).expect("bin");
         std::fs::create_dir_all(dir.join("state")).expect("state");
         write_exec(&dir.join("bin/sudo"), STUB);
+        write_exec(&dir.join("bin/date"), CLOCK_DATE);
+        write_exec(&dir.join("bin/sleep"), CLOCK_SLEEP);
         let l = Longhorn { dir };
+        l.state("clock", "1759341600\n");
         l.volume(volume(4));
         l.replicas(Self::four());
         l.nodes(estate(None));
@@ -1271,6 +1294,56 @@ fn a_replica_whose_finalizer_never_clears_is_not_the_effect() {
         l.writes()
     );
     assert!(effect_lines(&out).is_empty(), "{out}");
+    // The bound is counted on the script's own clock, which only its
+    // sleeps move (backlog ec131700): a read-back of 3s polled every 1s is
+    // exactly four reads, at 0, 1, 2 and 3 — on any runner.
+    assert!(out.contains("NOT proven after 3s"), "{out}");
+    let calls = l.calls();
+    let after_delete = calls
+        .iter()
+        .skip_while(|c| !c.starts_with("delete "))
+        .filter(|c| c.starts_with("get replicas.longhorn.io"))
+        .count();
+    assert_eq!(after_delete, 4, "four reads of the replicas: {calls:?}");
+}
+
+/// THE SCRIPT'S CLOCK IS THE TEST'S (backlog ec131700). The read-back here
+/// is three seconds, and until 2026-10-07 they were the runner's: on a
+/// loaded box one snapshot (four door calls, each a chain of jq children)
+/// outlasted them, so the script gave up on its FIRST read — the replica
+/// still terminating — and correct code was recorded red. Measured on the
+/// dev pod with five copies of this binary at once: 10 runs of 10 red, six
+/// to eight tests each; gate-run cd896fd2 was lost to it on a car that
+/// touched none of this. So the door stalls for longer than the whole
+/// read-back, once, right after the delete, and the retirement is still
+/// read back: a slow runner spends none of the script's seconds.
+#[test]
+fn a_door_that_answers_slowly_spends_none_of_the_read_back() {
+    let l = Longhorn::new("rvr-slow-door");
+    let (_, hash) = l.plan();
+    let read_marker = "if [ -n \"${STUB_FORBIDDEN:-}\" ]; then";
+    // By its own PATH: `sleep` on the script's PATH is the test's clock.
+    let stall = format!(
+        "if [ \"$1\" = get ] && [ \"$2\" = replicas.longhorn.io ] && [ -f \"$S/stall-once\" ]; then\n    rm \"$S/stall-once\"; PATH=/usr/bin:/bin sleep 4\nfi\n{read_marker}"
+    );
+    let delete_marker = "    echo \"replica.longhorn.io \\\"$r\\\" deleted\"; exit 0 ;;";
+    assert!(STUB.contains(read_marker) && STUB.contains(delete_marker));
+    write_exec(
+        &l.dir.join("bin/sudo"),
+        &STUB.replace(read_marker, &stall).replace(
+            delete_marker,
+            &format!("    : > \"$S/stall-once\"\n{delete_marker}"),
+        ),
+    );
+    let o = l.run(&[VOL, REP, &hash], &[]);
+    let out = text(&o);
+    assert!(
+        !l.dir.join("state/stall-once").exists(),
+        "the door stalled: {out}"
+    );
+    assert!(o.status.success(), "{out}");
+    assert_eq!(l.replicas_now(), the_three(), "{out}");
+    assert_eq!(effect_lines(&out).len(), 1, "{out}");
 }
 
 #[test]

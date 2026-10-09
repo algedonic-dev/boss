@@ -24,7 +24,7 @@ use std::process::{Command, Stdio};
 const HELPER: &str = "infra/boss-api-curl.sh";
 const LIB: &str = "infra/lib/curl-through-a-roll.sh";
 const DOCKERFILE: &str = "infra/oss-quickstart/Dockerfile";
-const CRAWL: &str = "infra/cluster/manifests/boss-playground-crawl.yaml";
+const SHEET: &str = "infra/cluster/manifests/boss-recovery-sheet.yaml";
 const OBSERVER: &str = "infra/cluster/manifests/boss-estate-observe.yaml";
 
 struct Stubs {
@@ -219,8 +219,11 @@ fn a_helper_without_its_lib_refuses_before_curl() {
 /// ONE DEFINITION, AND EVERY PLACE THE HELPER RUNS CARRIES IT. The
 /// helper sources the lib from `lib/` beside its real location: in the
 /// checkout that is `infra/lib/`; in the boss image the Dockerfile must
-/// put it at `/usr/local/bin/lib/`; and the playground crawl copies the
+/// put it at `/usr/local/bin/lib/`; and the recovery sheet copies the
 /// helper out of that image into `/tools/`, so it must copy `lib/` too.
+/// (The playground crawl copied it the same way until backlog 37742794,
+/// 2026-10-07: its packet writes now run in a container of the boss
+/// image itself, where the Dockerfile's COPY is the whole story.)
 /// The gate never builds the image, so this is where a missing COPY is
 /// caught (the launcher's same failure bricked production, 2026-09-05).
 #[test]
@@ -257,10 +260,10 @@ fn every_place_the_helper_runs_carries_the_one_definition() {
          the helper refuses without it"
     );
 
-    let crawl = read(CRAWL);
+    let sheet = read(SHEET);
     assert!(
-        crawl.contains(&format!("- {bin_dir}/lib\n")) && crawl.contains("- -r\n"),
-        "{CRAWL}: the tools init container copies {bin_dir}/lib (recursively) beside the helper"
+        sheet.contains(&format!("- {bin_dir}/lib\n")) && sheet.contains("- -r\n"),
+        "{SHEET}: the tools init container copies {bin_dir}/lib (recursively) beside the helper"
     );
 }
 

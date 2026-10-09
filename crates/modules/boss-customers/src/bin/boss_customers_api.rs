@@ -84,9 +84,7 @@ async fn main() -> Result<()> {
         )),
         roles.clone(),
         mode.clone(),
-        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
-            boss_policy_client::role_service::REPORT_CAPACITY,
-        )),
+        boss_events::role_tally::durable("customers", mode.clone(), Some(&pool)),
     );
     let app = customers_http_router(router(state), wiring.inventory);
 

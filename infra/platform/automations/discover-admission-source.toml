@@ -1,0 +1,11 @@
+# automation:discover-admission-source — not in the role-report tally read
+# 2026-10-07T02:13Z (that tally is held in memory and starts again with the
+# pod, so absence there is not absence of the caller); registered from the
+# tree, where every_script_sender_signs_as_a_registered_automation found it.
+# Signs as audit-readonly today: infra/forge/discover-admission-source.sh,
+# with sor_reader_header.
+
+[[automation]]
+id = "automation:discover-admission-source"
+role = "audit-readonly"
+description = 'The discover-admission-source ops verb reading the estate nodes (infra/forge/discover-admission-source.sh). Reads only.'

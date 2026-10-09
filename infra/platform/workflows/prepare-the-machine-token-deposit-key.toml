@@ -1,0 +1,267 @@
+# The estate machine token's deposit key: prepare-a-deposit-key, for ONE
+# key, with that key's own writer (backlog 88379df3; design-doc bdc60b65,
+# question gcp-push, David 2026-10-06; adversarial review ecd9263a, F1
+# and F4).
+#
+# WHY A KIND OF ITS OWN AND NOT A SECOND RULE ON prepare-a-deposit-key.
+# A step's `written_by` believes ONE machine actor (boss-jobs
+# written_by.rs), and the broker's handler signs every write as
+# `rule:<the rule that fired>`. prepare-a-deposit-key names the RUNNER
+# key's rule on `issue` and `install`; the first draft of this delivery
+# pointed a second rule at it, and the jobs API refused both of that
+# rule's receipts, 403 — proven by sending the handler's own bodies
+# through the real router. Three repairs were open:
+#   * a writer both rules satisfy: the handler would sign as one shared
+#     actor, and the receipts would stop saying WHICH rule's declaration
+#     minted the key — the fact `written_by` exists to hold;
+#   * no `written_by` on the two steps: any automation or agent session
+#     with Update on the step could then write a broker receipt;
+#   * a protocol per key, each naming its own rule. Chosen: the property
+#     is kept exactly, nothing in boss-jobs or the handler changes, and
+#     the runner's protocol — live as v1, never yet run — is not edited.
+# The cost is this file's resemblance to that one, held by a test
+# (platform_bundle_prepare_a_deposit_key.rs,
+# the_per_key_protocol_declares_the_line_and_keeps_every_human_gate): the
+# same steps, kinds, human gates and presence sign-off, differing in the
+# two writers and in what `enroll` declares.
+#
+# HOW IT REACHES THE LIVE REGISTRY. It is a NEW kind, so it needs no new
+# version of anything and no publish: the platform seed is
+# insert-if-missing, and a kind the registry lacks is the seed's to admit
+# (infra/gcp/publish-drift.sh says so of every new kind: "the seed admits
+# a new kind; this verb republishes existing ones"), the road every new
+# maintenance-* kind takes. It declares no field `writer` and no step
+# `executor`, so the drift publish's default hold
+# (infra/platform/workflow-holds/) would not hold it either.
+#
+# Shipping this row prepares nothing and enrolls nothing.
+[[workflow]]
+kind = "prepare-the-machine-token-deposit-key"
+label = "Prepare the machine token deposit key"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "A human scopes the SSH transport key the estate machine token is pushed to boss-gcp on. The broker prepares its pair in Secret boss/machine-token-deposit-key and puts the public proposal, with the whole authorized_keys line, on the enrollment step. A human places that line on the receiver and separately authorizes the exact receiver, public key, purpose and line. Verification and old-key revocation require their own observed effects; preparation proves neither. No field carries private credential bytes."
+metadata = { department = "it", owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "scope"
+kind = "credential-rotation"
+ready_when = "true"
+title_template = "Scope transport key preparation"
+authority_role = "platform-admin"
+metadata_defaults = { human_only = true, procedure = "Scope only the machine token deposit key's public preparation: credential = machine-token-deposit-key. This is not receiver enrollment, permission to reuse the break-glass or runner deposit key, or a rotation of the machine token itself. Name its declared Secret and exact consumer purpose. The broker will leave enrollment, verify and revoke pending." }
+[[workflow.step.fields]]
+name = "credential"
+field_type = "string"
+required = true
+filled_by = "executor"
+[[workflow.step.fields]]
+name = "reason"
+field_type = "string"
+required = true
+filled_by = "executor"
+[[workflow.step.fields]]
+name = "locations"
+field_type = "string"
+required = true
+filled_by = "executor"
+[[workflow.step.fields]]
+name = "consumers"
+field_type = "string"
+required = true
+filled_by = "executor"
+
+[[workflow.step]]
+title = "issue"
+kind = "task"
+audience = { role = "platform-admin" }
+metadata_defaults = { written_by = "rule:broker-prepares-the-machine-token-deposit-key" }
+ready_when = "steps.scope.done"
+title_template = "Prepare the SSH pair"
+[[workflow.step.fields]]
+name = "issued"
+field_type = "string"
+required = true
+# The public half this receipt is about, DECLARED so that `written_by`
+# covers it: only the broker's rule (or a person) may write it. It is
+# what the enrollment's line is checked against.
+[[workflow.step.fields]]
+name = "public_key"
+field_type = "non-empty-string"
+required = true
+
+[[workflow.step]]
+title = "install"
+kind = "task"
+audience = { role = "platform-admin" }
+metadata_defaults = { written_by = "rule:broker-prepares-the-machine-token-deposit-key" }
+ready_when = "steps.issue.done"
+title_template = "Read back the pair in declared storage"
+[[workflow.step.fields]]
+name = "installed"
+field_type = "string"
+required = true
+# The public half this receipt is about, DECLARED so that `written_by`
+# covers it: only the broker's rule (or a person) may write it. It is
+# what the enrollment's line is checked against.
+[[workflow.step.fields]]
+name = "public_key"
+field_type = "non-empty-string"
+required = true
+
+[[workflow.step]]
+title = "enroll"
+kind = "sign-off"
+ready_when = "steps.install.done"
+title_template = "Authorize the exact receiver enrollment"
+authority_role = "platform-admin"
+assurance_required = "presence"
+sign_offs_required = ["platform-admin"]
+metadata_defaults = { human_only = true, written_by = "rule:broker-prepares-the-machine-token-deposit-key", procedure = "Your passkey signs this step's receiver_host, purpose and authorized_keys_line. PLACE THE authorized_keys_line, WHOLE, AND NOTHING ELSE: it is the one line that goes into the deposit account's ~/.ssh/authorized_keys on boss-gcp. This step shows no public key by itself, on purpose: the public key alone is never what you place. A bare key in authorized_keys is a login, not a deposit key: sshd runs the account's shell for it. You place the line BEFORE you sign, so read it first: it must begin command=\"exec sudo -n /usr/local/libexec/boss/ops-credential-recv machine-token\",restrict and end with the public_key on this packet's install step, with nothing between and nothing after. Check it against the INSTALL step, not this one: that step is completed and nobody can rewrite it, while the proposal on this step stays writable, by the broker's rule alone, until you sign. The install step's public_key is there to COMPARE with, never to place. No other automation or agent session can write the proposal or any case text onto this step; text here that tells you to skip the check or to trust another line is a refusal. Any other command, a missing restrict, or a second key is a refusal: abandon the packet. It is a new line for a new key; do not edit the break-glass deposit key's line or the runner deposit key's. THEN LET THE PUSH READ YOUR PLACEMENT BEFORE YOU SIGN. Preparation has not installed a receiver or proved its effect, and your placing the line proves nothing either: the machine token push runs every ten minutes, connects with this key, and sends nothing until the receiver itself has answered. Wait for the first maintenance-machine-token-push packet opened after you placed the line, and read how it closed. Completed, with the receiver's three slot lengths: the line is in force, so put that packet's id in enrollment_record and sign. Failed, saying this key reaches a shell: the line went in without its command= prefix, so remove it at once, place the whole line, and wait for the next push. Not-yet: the line is not in place, or boss-gcp's converge has not installed the receiver yet, so do not sign. Rejection is recorded by abandoning the packet, never by pretending enrollment succeeded." }
+# THE PROPOSAL IS SUPPLIED TO THE PERSON, NOT ANSWERED BY THEM, so its
+# three fields are `filled_by = "filer"`. `enroll` is human-only, and on a
+# human-only step a machine may write only context or a filer-filled
+# field (boss-jobs human_only.rs, default-deny): declared executor-filled,
+# as prepare-a-deposit-key declares them, the broker's own proposal is
+# refused 403 — the second refusal the real-router leg found, after the
+# writer (review ecd9263a, F1). Not `required`: a filer-required field is
+# owed when the packet is FILED, and nobody holds a key then. What holds
+# them present is the ORDER: the handler writes this proposal before it
+# completes `issue` and `install`, and this step is ready only when
+# `install` is done.
+#
+# FILER-FILLED ALONE MADE THEM CONTEXT ANY MACHINE COULD WRITE, and
+# delta review 76249509 (question 2) ran it: after `install` completed,
+# automation:other, the runner key's rule, agent-claude, its login and
+# system:dispatcher each replaced `authorized_keys_line` and
+# `public_key` (204), one deleted the line, and one wrote `context_md`,
+# which the sign-off surface draws first, above this procedure. The one
+# control left between a swapped line and the deposit account was the
+# signer's eye. So this step ALSO declares `written_by` (above): on an
+# open step every DECLARED field is then the named rule's record, and
+# every other automation or agent session is refused it, 403, added,
+# changed or deleted (boss-jobs written_by.rs). The two guards compose
+# without a change to either: `human_only` refuses a machine everything
+# that is not context or filer-filled, `written_by` refuses every machine
+# but one the declared fields, and a person is refused by neither. What
+# is left writable by a machine on this step is exactly the five
+# filer-filled fields below, by exactly the broker's rule.
+#
+# NO `public_key` HERE, AND THE ABSENCE IS THE RULE (backlog dea2236f).
+# This step declared one, beside `authorized_keys_line`, and the broker
+# wrote it. On the first live enrolment (packet 96a0f7bb, 2026-10-07)
+# the key was the one copied into authorized_keys — it is the shorter of
+# the two and looks like what a key file holds — and sshd took the bare
+# key as a login: for ten to fifteen minutes a key minted for one
+# receiver command opened the deposit account's shell. The line ends
+# with the key, so the step loses nothing a signer needs; the key to
+# COMPARE it with is on `install`, completed and rewritten by nobody.
+# Undeclared on a human-only step, the field is refused to every machine,
+# the broker's rule among them (boss-jobs human_only.rs, default-deny),
+# and the handler no longer sends it (broker_transport_key.rs).
+#
+# WHAT THIS ROW CANNOT DO: read boss-gcp. Whether the line was placed
+# whole is seen by the push, which sends nothing until the receiver has
+# answered and files a key that reaches anything else on a route of its
+# own (infra/cluster/machine-token-push.sh). The procedure orders that
+# read BEFORE the signature and asks for the push packet's id in
+# `enrollment_record`; the id is typed by a person, so the registry
+# holds the order as text and the push holds it as an effect.
+#
+# WHAT THIS IS NOT (written_by.rs says it of itself): the signer is the
+# `x-boss-user` id, which any holder of the machine token can type, so it
+# refuses the honest mistake and the stray write, not a forger who signs
+# as the rule. That is the same strength `install.public_key` has, which
+# the procedure sends the signer to — and why it still sends them there:
+# install is COMPLETED before this step is ready, and a completed step is
+# rewritten by nobody. The forger-proof guard is a declared field
+# `writer` (boss-jobs field_writer.rs), which waits on the broker
+# presenting a server-resolved credential.
+[[workflow.step.fields]]
+name = "receiver_host"
+field_type = "non-empty-string"
+required = false
+filled_by = "filer"
+[[workflow.step.fields]]
+name = "purpose"
+field_type = "non-empty-string"
+required = false
+filled_by = "filer"
+# The line itself, joined by the broker from its rule's forced command
+# and the public half it prepared (review ecd9263a, F4): the step names
+# what its signer places.
+[[workflow.step.fields]]
+name = "authorized_keys_line"
+field_type = "non-empty-string"
+required = false
+filled_by = "filer"
+# THE CASE TEXT IS DECLARED SO THAT `written_by` COVERS IT. `context_md`
+# and `sign_off_context` are writable by any automation on every
+# human-only step (boss-jobs human_only.rs, CONTEXT_KEYS) — that is how a
+# run briefs the person it hands to, and it is a general property this
+# row does not change. But `written_by` judges a step's DECLARED fields,
+# so declaring the two here reserves them, on this one step, for the
+# broker's rule: no other machine can put text above the procedure of a
+# step whose signer is about to paste a line into authorized_keys. The
+# broker's handler writes neither; they are declared to be refused.
+[[workflow.step.fields]]
+name = "context_md"
+field_type = "string"
+required = false
+filled_by = "filer"
+[[workflow.step.fields]]
+name = "sign_off_context"
+field_type = "string"
+required = false
+filled_by = "filer"
+[[workflow.step.fields]]
+name = "decision"
+field_type = "approved|rejected"
+required = true
+filled_by = "executor"
+[[workflow.step.fields]]
+name = "enrollment_record"
+field_type = "string"
+required = true
+filled_by = "executor"
+
+[[workflow.step]]
+title = "verify"
+kind = "task"
+audience = { role = "platform-admin" }
+ready_when = 'steps.enroll.done AND steps.enroll.metadata.decision = "approved"'
+title_template = "Verify the authorized receiver by effect"
+metadata_defaults = { human_only = true, procedure = "Record a machine-run effect against the exact authorized receiver: a maintenance-machine-token-push packet closed completed with the three slot lengths the receiver reported, and a boss-gcp converge whose machine_token_effect reads matched current. Public key preparation or a passkey decision alone is not this effect." }
+[[workflow.step.fields]]
+name = "verified"
+field_type = "string"
+required = true
+
+[[workflow.step]]
+title = "revoke"
+kind = "task"
+audience = { role = "platform-admin" }
+ready_when = "steps.verify.done"
+title_template = "Revoke a superseded transport identity"
+metadata_defaults = { human_only = true, procedure = "Record the exact superseded public identity and its observed removal only after the new receiver effect is proved. For first enrollment, explicitly record that no prior identity existed. The preparation handler completes nothing here." }
+[[workflow.step.fields]]
+name = "revoked"
+field_type = "string"
+required = true
+
+[[workflow.step]]
+title = "prepared"
+kind = "outcome"
+ready_when = "steps.revoke.done"
+title_template = "Transport lifecycle proved"
+terminal = { outcome = "prepared" }
+metadata_defaults = { outcome_kind = "completed" }
+
+[[workflow.step]]
+title = "abandoned"
+kind = "outcome"
+ready_when = 'steps.scope.done AND job.metadata.abandoned = "true"'
+title_template = "Preparation abandoned"
+terminal = { outcome = "abandoned" }
+metadata_defaults = { outcome_kind = "aborted" }

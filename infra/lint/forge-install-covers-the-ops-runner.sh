@@ -38,6 +38,25 @@ chmod +x "$tmp/bin/systemctl"
 # installer reported the pod's address instead of the file's. The
 # expected answer is read off the file below, never the environment.
 export INSTALL_SOR_ENV="$tmp/sor.env" BOSS_SOR_ENV="$tmp/sor.env"
+# EVERY SEAM THE INSTALLER JUDGES IS NAMED, or it refuses (backlog
+# 62b09c57, N7; infra/lib/host-check.sh). Until that check this lint
+# named four seams and left two at the machine's own: on every gate the
+# installer asked the real package manager for the journal door wherever
+# its socket unit was absent, and would have removed a real ops-runner
+# retirement marker. A stub that only records (in a log of its own: the
+# systemctl log below is read for what was reloaded), an empty unit
+# library so the door reads as it does on a machine without the package,
+# and a marker path of this run's own — exported once, so no run below
+# can forget.
+cat >"$tmp/bin/apt-get" <<STUB
+#!/usr/bin/env bash
+echo "apt-get \$*" >>"$tmp/apt-get.log"
+exit 0
+STUB
+chmod +x "$tmp/bin/apt-get"
+mkdir -p "$tmp/unit-lib"
+export INSTALL_APT_GET="$tmp/bin/apt-get" INSTALL_UNIT_LIB="$tmp/unit-lib"
+export BOSS_OPS_RUNNER_RETIRED="$tmp/ops-runner.retired"
 
 if ! STUB_LOG="$tmp/systemctl.log" INSTALL_ETC="$tmp/etc" INSTALL_SYSTEMCTL="$tmp/bin/systemctl" INSTALL_KUBECTL=0 \
     bash "$installer" >"$tmp/out" 2>&1; then

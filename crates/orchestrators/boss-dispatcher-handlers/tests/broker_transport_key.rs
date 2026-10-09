@@ -401,12 +401,23 @@ async fn invoke_preparation(
     store: Arc<Memory>,
     issuer: Arc<dyn KeyIssuer>,
 ) -> Result<(), String> {
+    invoke_preparation_with(api, store, issuer, &[]).await
+}
+
+/// The runner rule's five args, plus whatever a second transport's rule
+/// row adds (`purpose`, `forced_command`; backlog 88379df3).
+async fn invoke_preparation_with(
+    api: &NativeApi,
+    store: Arc<Memory>,
+    issuer: Arc<dyn KeyIssuer>,
+    extra: &[(&str, &str)],
+) -> Result<(), String> {
     use boss_dispatcher::rules::{
         expr::Value,
         handler::{Handler, InvocationContext},
     };
     use boss_dispatcher_handlers::handlers::broker_transport_key::CredentialPrepareSshDeposit;
-    let args = vec![
+    let mut args = vec![
         ("secret_namespace".into(), Value::String("boss".into())),
         (
             "secret_name".into(),
@@ -422,6 +433,9 @@ async fn invoke_preparation(
         ),
         ("receiver_host".into(), Value::String("boss-gcp".into())),
     ];
+    for (name, value) in extra {
+        args.push(((*name).into(), Value::String((*value).into())));
+    }
     CredentialPrepareSshDeposit::new(&api.url, store, issuer).invoke(&args, &InvocationContext {
         rule_name: preparation_rule_name(),
         triggering_event_id: "event-id".into(), triggering_topic: "step.done.credential-rotation".into(),
@@ -528,6 +542,112 @@ async fn the_handler_records_public_preparation_only_and_replay_does_not_remint(
     assert_eq!(*api.completions.lock().unwrap(), ["issue-id", "install-id"]);
 }
 
+/// A SECOND TRANSPORT NAMES ITS OWN PURPOSE AND ITS OWN FORCED COMMAND
+/// (backlog 88379df3; David, design-doc bdc60b65 question gcp-push). The
+/// handler said `ops-runner credential deposit` whatever its rule row
+/// declared, so a key prepared to carry the estate machine token to
+/// boss-gcp would have put the runner's purpose under David's passkey.
+/// The rule row's `purpose` reaches the enroll step and both receipts,
+/// and its `forced_command` reaches the enroll step joined to the public
+/// key the broker prepared — the one authorized_keys line he is asked to
+/// sign, never a line he assembles. A rule that names neither says what
+/// the runner's always said, and carries no line.
+#[tokio::test]
+async fn a_rule_row_names_the_purpose_and_the_forced_command_the_enrollment_signs() {
+    let forced = "exec sudo -n /usr/local/libexec/boss/ops-credential-recv machine-token";
+    let api = native_api(preparation_packet()).await;
+    invoke_preparation_with(
+        &api,
+        Arc::new(Memory::default()),
+        Arc::new(Issuer(Mutex::new(0))),
+        &[
+            ("purpose", "estate machine token deposit"),
+            ("forced_command", forced),
+        ],
+    )
+    .await
+    .unwrap();
+    {
+        let writes = api.writes.lock().unwrap();
+        let enroll = writes
+            .iter()
+            .find(|(path, _)| path.ends_with("/steps/enroll-id/metadata"))
+            .map(|(_, body)| body.clone())
+            .expect("the enrollment proposal is written");
+        assert_eq!(enroll["purpose"], "estate machine token deposit");
+        assert_eq!(
+            enroll["authorized_keys_line"],
+            format!("command=\"{forced}\",restrict ssh-ed25519 public-test-only"),
+            "the step carries the whole line, the forced command and the prepared public key"
+        );
+        // AND NO BARE KEY BESIDE IT (backlog dea2236f; packet 96a0f7bb,
+        // 2026-10-07): the bare key was the easier of the two to copy
+        // into authorized_keys, and there it is a login, not a deposit
+        // key. The public half stays on the two machine receipts, which
+        // is where the procedure sends the signer to compare.
+        assert!(
+            enroll.get("public_key").is_none(),
+            "a step that carries the line to place carries no bare key: {enroll}"
+        );
+        for step in ["issue-id", "install-id"] {
+            let receipt = writes
+                .iter()
+                .find(|(path, _)| path.ends_with(&format!("/steps/{step}/metadata")))
+                .map(|(_, body)| body.clone())
+                .expect("the machine receipts are written");
+            assert_eq!(receipt["purpose"], "estate machine token deposit");
+        }
+        assert!(
+            !serde_json::to_string(&*writes)
+                .unwrap()
+                .contains("ops-runner credential deposit"),
+            "the runner's purpose must not ride a second transport's packet"
+        );
+    }
+
+    // The runner's own row, which names neither, is unchanged.
+    let api = native_api(preparation_packet()).await;
+    invoke_preparation(
+        &api,
+        Arc::new(Memory::default()),
+        Arc::new(Issuer(Mutex::new(0))),
+    )
+    .await
+    .unwrap();
+    let enroll = api
+        .writes
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(path, _)| path.ends_with("/steps/enroll-id/metadata"))
+        .map(|(_, body)| body.clone())
+        .unwrap();
+    assert_eq!(enroll["purpose"], "ops-runner credential deposit");
+    assert!(enroll.get("authorized_keys_line").is_none());
+
+    // A forced command that could close its own quoting, or carry a
+    // second line, is refused before anything is minted.
+    for hostile in [
+        "true\",restrict ssh-ed25519 AAAA attacker\ncommand=\"x",
+        "true\" ssh-ed25519 AAAA attacker",
+        "exec sudo -n /x\nssh-ed25519 AAAA attacker",
+        "a\\\"b",
+        "",
+    ] {
+        let api = native_api(preparation_packet()).await;
+        let issuer = Arc::new(Issuer(Mutex::new(0)));
+        let refused = invoke_preparation_with(
+            &api,
+            Arc::new(Memory::default()),
+            issuer.clone(),
+            &[("forced_command", hostile)],
+        )
+        .await;
+        assert!(refused.is_err(), "accepted forced_command {hostile:?}");
+        assert_eq!(*issuer.0.lock().unwrap(), 0, "minted for {hostile:?}");
+    }
+}
+
 struct Issuer(Mutex<usize>);
 #[async_trait]
 impl KeyIssuer for Issuer {
@@ -551,7 +671,11 @@ const JOB: &str = "1d31a6a5-1c9e-47bb-bff2-b0421e6960b7";
 fn preparation_packet() -> serde_json::Value {
     serde_json::json!({
         "id": JOB, "kind": "prepare-a-deposit-key", "status": "open", "partition": "real",
-        "subject": {"kind": "custom", "id": "runner-deposit-key"},
+        // As the jobs API serves it (boss_core::job::Subject). This
+        // fixture spelled it `{"kind": …}`, the handler's own private
+        // mirror, which is how a handler that could read no real packet
+        // kept 25 green tests (delta review 76249509, B1).
+        "subject": {"subject_kind": "custom", "id": "runner-deposit-key"},
         "steps": [
             {"id": "scope-id", "spec_slug": "scope", "kind": "credential-rotation",
              "status": "completed", "completed_by": "emp-david",

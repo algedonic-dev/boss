@@ -56,7 +56,13 @@ export function describeWriteFailure(status: number, bodyText: string): string {
       const rec = parsed as Record<string, unknown>;
       const roles = rec['missing_or_stale_roles'];
       if (Array.isArray(roles) && roles.length > 0) {
-        return `sign-offs outstanding: ${roles.join(', ')}`;
+        // A presence step whose stamps do not carry its completion says
+        // WHY beside the roles — a signature past its age reads the same
+        // as one never given without it (design 1ce67f7e).
+        const why = rec['detail'];
+        return typeof why === 'string' && why.trim()
+          ? `sign-offs outstanding: ${roles.join(', ')} — ${clip(why.trim())}`
+          : `sign-offs outstanding: ${roles.join(', ')}`;
       }
       for (const key of ['error', 'message', 'detail']) {
         const v = rec[key];
@@ -247,13 +253,14 @@ export type StepPutBody = Readonly<Record<string, unknown>> & { readonly metadat
 /// this is the half that holds for a body built as `unknown` or cast.
 ///
 /// `presenceTicket` is the ticket a passkey ceremony on THIS step just
-/// issued, handed over by the surface that ran it (backlog b568044a,
-/// 2026-09-25). The jobs API judges a presence-gated step again on the
-/// request that completes it, from that request's own header, so a
-/// completion sent bare after a presence stamp answered 422 and the step
-/// stayed ready. This function mints nothing and widens nothing: the
+/// issued, handed over by the surface that ran it for this one request.
+/// Only a presence step that names NO sign-off role needs it: a step
+/// that names roles completes on the live passkey stamps it holds, and
+/// its completion is sent bare (design 1ce67f7e, 2026-10-07 — until then
+/// every presence completion carried the stamp's ticket, backlog
+/// b568044a). This function mints nothing and widens nothing: the
 /// gateway verifies the ticket and the jobs API re-checks its step,
-/// person, shape and expiry on this PUT exactly as on the stamp.
+/// person, shape and expiry on this PUT.
 export async function putStep(
   jobId: string,
   stepId: string,

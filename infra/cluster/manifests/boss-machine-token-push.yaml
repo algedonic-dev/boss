@@ -1,0 +1,149 @@
+# boss-machine-token-push — every ten minutes, the cluster pushes the
+# estate machine token's three slots to boss-gcp (design-doc bdc60b65,
+# question gcp-push, David 2026-10-06; backlog 88379df3, part of urgent
+# 2710c8fc). The script is infra/cluster/machine-token-push.sh, in the
+# image as /usr/local/bin/boss-machine-token-push; it carries the
+# reasoning. This file is what the Job may touch.
+#
+# WHY A SIBLING OF boss-break-glass-deposit AND NOT A LINE IN IT. That
+# Job runs once a day, which equals the token's 1440-minute drain: a
+# rotation would have no margin. It verifies a credential by six server
+# dry-runs before it ships, which is not a thing to do 144 times a day.
+# And its key is forced to the receiver's `kubeconfig` purpose, which
+# this tree refuses to widen. Coupling the two would make the token's
+# delivery wait on the break-glass credential's health, and the reverse.
+#
+# WHAT THIS JOB HOLDS — the whole of it:
+#   * Secret boss-machine-token, mounted read-only at
+#     /etc/boss/machine-token. THE ONE NEW MOUNT David accepted for this
+#     delivery. It is both the payload (the three slots) and what this
+#     Job's own chore pair stamps its packet writes with, as every chore
+#     here does. the_machine_gate_reports_and_refuses_nothing.rs lists
+#     this manifest among the token's holders, with this reason.
+#   * Secret machine-token-deposit-key, mounted read-only at /keys: the
+#     transport pair the credential broker prepares
+#     (infra/dispatcher/rules/broker-prepares-the-machine-token-deposit-key.toml).
+#     The converge creates it EMPTY from that rule; it is declared
+#     nowhere in this directory, like every broker-written Secret.
+#     `optional`, so the Job starts on an empty Secret and says `not yet`.
+#   * ConfigMap break-glass-deposit-known-hosts, read-only: boss-gcp's
+#     pinned host key and the deposit account, the SAME pin and account
+#     the break-glass deposit uses — one host, one pin (CLAUDE.md §9a).
+#
+# WHAT IT DOES NOT HOLD: any Role. It has no ServiceAccount of its own
+# and mounts no API token (automountServiceAccountToken: false) — it
+# reads no Secret through the API, mints nothing and patches nothing. A
+# pod reads the Secrets it mounts and no others.
+#
+# NOT YET IS AN ENDING. Until the key's prepare-the-machine-token-deposit-key packet is
+# scoped there is no key, and until David has placed its line on
+# boss-gcp ssh is refused; the script exits 75 both times, naming which,
+# and BOSS_CHORE_NOT_YET_ON_75 records `not-yet` — a packet that says
+# what is owed and files nothing. A refusal is a RED line and a failed
+# Job, filed once per route by
+# file-backlog-items-on-machine-token-push-red.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: boss-machine-token-push
+  namespace: boss
+  labels: {app.kubernetes.io/part-of: boss, boss.dev/purpose: machine-token-push, boss-chore: "true"}
+spec:
+  # Every ten minutes: 144 pushes inside the token's 1440-minute drain
+  # (the_machine_token_drain_outlasts_every_cronjob.rs reads this line).
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid
+  # A run the scheduler could not start in time is dropped, not stacked:
+  # the next one carries the same three slots.
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Nothing a retry changes: the next run is ten minutes away.
+      backoffLimit: 0
+      # The push is bounded at 60 s inside the script (BOSS_PUSH_TIMEOUT_S)
+      # and the chore pair's two writes at their own; this ends only what
+      # is wedged, and the pod's memory scratch goes with it.
+      activeDeadlineSeconds: 240
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          labels: {app.kubernetes.io/part-of: boss, boss.dev/purpose: machine-token-push}
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1500
+            runAsGroup: 1500
+            # The Secret volumes below are projected root:1500 because of
+            # this — the group read their 0440 files depend on.
+            fsGroup: 1500
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            # The converge pins boss-chore=true CronJobs by this name.
+            - name: chore
+              image: 10.20.0.15:3000/david/boss:latest
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities: {drop: ["ALL"]}
+              # Through boss-chore.sh, so every run leaves a
+              # maintenance-machine-token-push packet carrying what it
+              # read and what the receiver answered — slot lengths, never
+              # a value. The packet is best-effort; the Job's own status
+              # is the check's.
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  /usr/local/bin/boss-chore.sh maintenance-machine-token-push "Machine token push to the configured receiver" -- /usr/local/bin/boss-machine-token-push
+              env:
+                # 75 is `not yet` — no key prepared, or a key boss-gcp
+                # does not accept yet — and closes the packet so, not
+                # failed.
+                - name: BOSS_CHORE_NOT_YET_ON_75
+                  value: "1"
+                - name: BOSS_JOBS_URL
+                  value: http://boss-jobs-internal.boss.svc.cluster.local:7900
+                # The hosts its packet writes may carry the estate machine
+                # token to, besides loopback: this namespace's Services, by
+                # suffix (backlog 2ee29275). boss-gcp is NOT one of them:
+                # the token reaches it on ssh's stdin, never in a header.
+                - name: BOSS_MACHINE_TOKEN_HOSTS
+                  value: ".boss.svc.cluster.local"
+                # The deposit account at boss-gcp, the one the break-glass
+                # deposit names — deployment-owned, never defaulted.
+                - name: BOSS_PUSH_TARGET
+                  valueFrom:
+                    configMapKeyRef: {name: break-glass-deposit-known-hosts, key: target}
+                # Scratch — the key's private copy, ssh's output, and the
+                # chore pair's 0600 header files — is this pod's own
+                # MEMORY, gone with the pod however it ends (review
+                # a92c0b94 F1).
+                - name: TMPDIR
+                  value: /work
+              resources:
+                requests: {cpu: 20m, memory: 32Mi}
+                limits: {memory: 128Mi}
+              volumeMounts:
+                - {name: machine-token, mountPath: /etc/boss/machine-token, readOnly: true}
+                - {name: deposit-key, mountPath: /keys, readOnly: true}
+                - {name: known-hosts, mountPath: /known, readOnly: true}
+                - {name: work, mountPath: /work}
+          volumes:
+            # The estate machine token, Secret boss-machine-token, whole —
+            # the broker writes it (design 6805c764 car 4). Optional: until
+            # its first mint the directory is empty and the script says
+            # `not yet`. 0440 + the pod's fsGroup 1500.
+            - name: machine-token
+              secret: {secretName: boss-machine-token, optional: true, defaultMode: 0440}
+            # The broker-prepared transport pair. 0440, group 1500; the
+            # script copies the private half to a 0600 file of its own in
+            # /work before ssh reads it.
+            - name: deposit-key
+              secret: {secretName: machine-token-deposit-key, optional: true, defaultMode: 0440}
+            - name: known-hosts
+              configMap: {name: break-glass-deposit-known-hosts, defaultMode: 0o444}
+            - name: work
+              emptyDir: {medium: Memory, sizeLimit: 16Mi}

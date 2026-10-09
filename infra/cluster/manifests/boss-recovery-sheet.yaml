@@ -160,6 +160,27 @@ spec:
                 - name: BOSS_JOBS_URL
                   value: http://boss-jobs-internal.boss.svc.cluster.local:7900
                 - {name: BOSS_ACTOR, value: "automation:recovery-sheet"}
+                # THE MACHINE TOKEN (backlog 37742794; David's answer to
+                # design-doc c8502e17, `crawl-and-sheet`, 2026-10-07:
+                # "the recovery sheet holds the token by a read-only
+                # mount (tree text only)"). Every request this pod sends
+                # went out bare — the wrap pair's and the CLI's own, on
+                # the jobs port and the content port: 8 would-refuse
+                # facts a day, and under enforce a paper way back in
+                # that silently stops being checked. Both senders
+                # already stamp when there is something to read: the
+                # helpers through lib/secret-header.sh, which the
+                # `tools` init container copies beside them from the
+                # boss image, and the CLI through boss-core's client.
+                # Each reads the mount below at its default directory
+                # and stamps loopback and the hosts named here.
+                - name: BOSS_MACHINE_TOKEN_HOSTS
+                  value: ".boss.svc.cluster.local"
+                # Where the shell reader writes the 0600 header file it
+                # hands curl: the memory volume below, never the
+                # writable layer a killed run leaves on the node's disk.
+                - name: RUNTIME_DIRECTORY
+                  value: /run/boss-secret-header
               resources:
                 # One headless Chromium printing a few pages; a bounded
                 # Job dies alone if it is wrong.
@@ -169,7 +190,22 @@ spec:
                 - {name: tools, mountPath: /tools, readOnly: true}
                 - {name: work, mountPath: /work}
                 - {name: forge-token, mountPath: /etc/forge, readOnly: true}
+                - {name: machine-token, mountPath: /etc/boss/machine-token, readOnly: true}
+                - {name: secret-header, mountPath: /run/boss-secret-header}
           volumes:
+            # THE GRANT: the estate machine token, Secret
+            # boss-machine-token — boss-dev's copy, which the broker
+            # writes beside prod's — whole, so a rotation reaches the
+            # mount. Optional: an unfilled Secret is an empty directory
+            # and the check sends no token, which every gate in `report`
+            # admits. 0440 with the pod's fsGroup 1500, which is how the
+            # check's uid 65534 reads it. On the `check` container only;
+            # the init container copies files and needs none.
+            - name: machine-token
+              secret: {secretName: boss-machine-token, optional: true, defaultMode: 0440}
+            # The header file's directory: memory, gone with the pod.
+            - name: secret-header
+              emptyDir: {medium: Memory, sizeLimit: 1Mi}
             - name: tools
               emptyDir: {}
             # The clone; gone with the pod.

@@ -114,6 +114,18 @@ async function installIncidentReviewMocks(
   await page.route('**/plugins/incident-review.js', (r) =>
     r.fulfill({ contentType: 'application/javascript', body: opts.plugin ?? PLUGIN }),
   );
+  // The passkey ceremony the bundle shares with sign-off.js (item
+  // 570c66e9): it adds this file's script tag and registers its mount
+  // once it has run, so every test below goes through that loader.
+  await page.route('**/plugins/passkey-ceremony.js', (r) =>
+    r.fulfill({
+      contentType: 'application/javascript',
+      body: readFileSync(
+        new URL('../../../../infra/step-plugins/passkey-ceremony.js', import.meta.url),
+        'utf8',
+      ),
+    }),
+  );
 }
 
 /// THE PLUGIN'S OWN END OF WORK, OBSERVED — not a clock (backlog

@@ -31,7 +31,14 @@ created, and so is v4 (gate_max_concurrent back to 3 on 2026-09-30,
 backlog 461159e7, until w-1's second NVMe, 52ea56ac, holds four 160Gi
 gate workspaces), and so is v5 (gate_max_concurrent 4 again, backlog
 e6dc7331, once the workspace sat on that disk and a gate's ephemeral
-request came down to 40Gi on a measurement).
+request came down to 40Gi on a measurement), and so is v7
+(gate_max_concurrent 3 again on 2026-10-07, backlog 17f6170c: four car
+gates plus the train gate on the untrimmed gate drive took 75+ minutes
+against a 42-minute median, one gate was IO-stalled 43 percent of its
+wall time, and gate-run bd136c2e failed on loopback deadline tests its
+car does not touch; back to 4 when a loaded measurement after the trim
+says so). v6 between them moved `consist_budget_secs` 60 to 120
+(backlog 0491b7d6).
 
 **One row is the whole policy** — the `workflows` shape, not the
 `cadence_rules` shape. A Job pins one workflow version; a train pins

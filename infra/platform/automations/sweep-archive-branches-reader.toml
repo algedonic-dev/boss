@@ -1,0 +1,12 @@
+# automation:sweep-archive-branches-reader — not in the role-report tally
+# read 2026-10-07T02:13Z (that tally is held in memory and starts again with
+# the pod, so absence there is not absence of the caller); registered from
+# the tree, where every_script_sender_signs_as_a_registered_automation found
+# it.
+# Signs as audit-readonly today: infra/forge/sweep-archive-branches.sh
+# (READER_USER, through boss-sor-read).
+
+[[automation]]
+id = "automation:sweep-archive-branches-reader"
+role = "audit-readonly"
+description = 'The archive-branch sweep reading the open cars, the open trains and its decision packet before it deletes a branch on the forge (infra/forge/sweep-archive-branches.sh). Reads only.'

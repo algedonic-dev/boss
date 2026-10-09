@@ -43,10 +43,12 @@
 //!     instance from BOSS_E2E_BASE_URL and nothing else, and the crawl
 //!     spec reads the mocked roster rather than its own copy;
 //!   * the kind file exists with the chore shape and the CronJob runs
-//!     it through boss-chore.sh, in boss-dev, in the boss-ci image, with
-//!     the helpers copied in from the boss image, the read credential
-//!     mounted, the playground's gateway as the target and prod's jobs
-//!     door as the record — every name derived from instances.toml;
+//!     it through boss-chore.sh, in boss-dev — the crawl in the boss-ci
+//!     image with the read credential mounted and the playground's
+//!     gateway as the target, the wrapper in a second container of the
+//!     boss image with prod's jobs door as the record (backlog 37742794:
+//!     the container that runs the browser holds no token and no helper)
+//!     — every name derived from instances.toml;
 //!   * the roster classifies the manifest `pipeline`, and the
 //!     cadence-silence sweep expects a packet daily.
 
@@ -277,12 +279,15 @@ fn the_cronjob_runs_the_crawl_through_the_chore_wrapper_against_the_playground()
         "{MANIFEST}: the chore runs in the pipeline's namespace, where the forge read credential is"
     );
     // Code lines only: the header names the wrapper in prose.
-    let chore = yaml
+    let code: Vec<&str> = yaml
         .lines()
         .map(str::trim)
         .filter(|l| !l.starts_with('#'))
-        .find(|l| l.contains("boss-chore.sh "))
-        .unwrap_or_else(|| panic!("{MANIFEST} runs its check through boss-chore.sh"));
+        .collect();
+    let chore = code
+        .iter()
+        .find(|l| l.contains("/usr/local/bin/boss-chore.sh "))
+        .unwrap_or_else(|| panic!("{MANIFEST} runs its check through the image's boss-chore.sh"));
     assert!(
         chore.split_whitespace().any(|w| w == KIND) && chore.contains(" -- "),
         "{MANIFEST}: boss-chore.sh <kind> \"<title>\" -- <check>: {chore}"
@@ -320,18 +325,14 @@ fn the_cronjob_runs_the_crawl_through_the_chore_wrapper_against_the_playground()
         2,
         "{MANIFEST}: two containers, two images: {images:?}"
     );
-    for helper in [
-        "boss-chore.sh",
-        "boss-maintenance-wrap.sh",
-        "boss-step.sh",
-        "boss-api-curl.sh",
-    ] {
-        assert!(
-            yaml.contains(&format!("/usr/local/bin/{helper}")),
-            "{MANIFEST}: the init container copies {helper} from the boss image — the wrapper \
-             resolves its helpers next to itself"
-        );
-    }
+    // No init container copies the helpers any longer: the container
+    // that records RUNS the boss image, where the Dockerfile puts the
+    // wrapper beside its helpers (a_chore_records_ok_and_failed.rs pins
+    // that COPY), and the container that crawls holds none of them.
+    assert!(
+        !code.iter().any(|l| l.starts_with("initContainers:")),
+        "{MANIFEST}: no init container — nothing is copied in beside the browser"
+    );
 
     // Targets: crawl the playground's gateway, record on prod's jobs door.
     assert!(

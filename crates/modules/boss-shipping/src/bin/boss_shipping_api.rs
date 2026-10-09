@@ -120,9 +120,7 @@ async fn main() -> Result<()> {
         )),
         roles.clone(),
         mode.clone(),
-        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
-            boss_policy_client::role_service::REPORT_CAPACITY,
-        )),
+        boss_events::role_tally::durable("shipping", mode.clone(), Some(&pool)),
     );
     let app = shipping_http_router(router(state), wiring.inventory);
     // Sim-origin middleware: extract x-sim-origin header and set the

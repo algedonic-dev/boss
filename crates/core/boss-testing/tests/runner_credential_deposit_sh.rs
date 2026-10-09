@@ -354,16 +354,22 @@ impl Case {
     }
 
     fn run_as(&self, node: &str) -> (i32, String) {
+        self.run_at(node, &format!("http://127.0.0.1:{}", self.api.port))
+    }
+
+    /// The pass with `BOSS_JOBS_URL` spelled as the case gives it, and no
+    /// host list anywhere: loopback is the only host the rule admits.
+    fn run_at(&self, node: &str, jobs_url: &str) -> (i32, String) {
         let out = Command::new("bash")
             .arg(repo_root().join(SCRIPT))
             .args(["--rule", &repo_root().join(RULE).display().to_string()])
             .args(["--dest", &self.dest.display().to_string()])
             .env("BOSS_DEPOSIT_KUBECTL", &self.kubectl)
             .env("STUB_SECRETS", &self.secrets)
-            .env(
-                "BOSS_JOBS_URL",
-                format!("http://127.0.0.1:{}", self.api.port),
-            )
+            .env("BOSS_JOBS_URL", jobs_url)
+            .env_remove("BOSS_MACHINE_TOKEN_HOSTS")
+            .env("BOSS_SOR_ENV", self.root.join("no-sor.env"))
+            .env("BOSS_MACHINE_TOKEN_DIR", self.root.join("no-machine-token"))
             .env("BOSS_RUN_SUMMARY_FILE", &self.summary)
             .env("BOSS_NODE_ID", node)
             .env("BOSS_API_RETRY_DEADLINE", "0")
@@ -825,6 +831,91 @@ fn a_first_value_the_door_has_not_seen_is_not_yet_only_inside_kubelets_bound() {
     let (rc, out) = c.run();
     assert_eq!(rc, 1, "{out}");
     assert_eq!(c.file(), None);
+}
+
+/// THE CREDENTIAL IS PRESENTED ONLY TO A HOST THE MACHINE TOKEN'S RULE
+/// ADMITS (backlog 50708d76, F2 of review 927f8602). `whoami` made the
+/// credential's header with plain `secret_header`, which judges no host,
+/// while the machine token four lines above it was judged — the shape car
+/// 025640e3 repaired in the ops runner. It asks `machine_token_admits`
+/// first now.
+///
+/// Read by EFFECT, with the real curl, from what the stub API received.
+/// Both spellings reach the stub on loopback and neither is a host the
+/// rule reads as one: `127.1` is the short IPv4 curl expands and the rule
+/// withholds, and the bare `127.0.0.1:<port>` has no leading scheme (F1 —
+/// curl guesses http). THE CONTROL IS IN THE SAME PASS: the rotation
+/// packet's read, which carries no credential, arrives — so "no whoami"
+/// is the credential withheld, not a URL that reached nothing.
+#[test]
+fn the_credential_is_never_presented_to_a_host_the_machine_token_rule_does_not_admit() {
+    for (tag, spelled) in [("short-quad", "http://127.1"), ("no-scheme", "127.0.0.1")] {
+        // Staged and not yet held: the install's proof is the first
+        // presentation, and it does not happen.
+        let c = Case::new(&format!("off-estate-install-{tag}"));
+        c.staged_for(JOB);
+        c.held(OLD);
+        c.api.resolves(OLD, "forge", "current");
+        c.api.resolves(NEW, "forge", "next");
+        c.api.awaiting(JOB, 3600);
+        let url = format!("{spelled}:{}", c.api.port);
+        let (rc, out) = c.run_at("forge", &url);
+        let requests = c.api.state.lock().unwrap().requests.clone();
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.path == format!("/api/jobs/{JOB}")),
+            "[{tag}] the control: the packet read reaches the stub at {url}: {requests:?}\n{out}"
+        );
+        assert!(
+            c.api.whoamis() == 0 && requests.iter().all(|r| !r.runner_credential_presented),
+            "[{tag}] the runner credential left for a host the machine token's rule does not \
+             admit: {requests:?}\n{out}"
+        );
+        assert_eq!(rc, 1, "[{tag}] a value that cannot be proved is red: {out}");
+        assert_eq!(
+            c.file().as_deref(),
+            Some(OLD),
+            "[{tag}] the held file is kept"
+        );
+        let action = c.summary("runner_credential_action");
+        assert!(
+            action.starts_with("not installed")
+                && action.contains("NOT presented")
+                && action.contains("BOSS_MACHINE_TOKEN_HOSTS"),
+            "[{tag}] the summary says what was withheld and by which rule: {action}"
+        );
+        assert!(c.api.writes().is_empty(), "[{tag}]");
+
+        // Already held: the delivery record's presentation does not
+        // happen either, and nothing is recorded.
+        let c = Case::new(&format!("off-estate-delivery-{tag}"));
+        c.staged_for(JOB);
+        c.held(NEW);
+        c.api.resolves(NEW, "forge", "next");
+        c.api.awaiting(JOB, 3600);
+        let url = format!("{spelled}:{}", c.api.port);
+        let (rc, out) = c.run_at("forge", &url);
+        let requests = c.api.state.lock().unwrap().requests.clone();
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.path == format!("/api/jobs/{JOB}")),
+            "[{tag}] the control: {requests:?}\n{out}"
+        );
+        assert!(
+            c.api.whoamis() == 0 && requests.iter().all(|r| !r.runner_credential_presented),
+            "[{tag}] the held credential left for a host the rule does not admit: \
+             {requests:?}\n{out}"
+        );
+        assert_eq!(rc, 1, "[{tag}] {out}");
+        let delivery = c.summary("runner_credential_delivery");
+        assert!(
+            delivery.starts_with("not recorded") && delivery.contains("NOT presented"),
+            "[{tag}] {delivery}"
+        );
+        assert!(c.api.writes().is_empty(), "[{tag}]");
+    }
 }
 
 #[test]

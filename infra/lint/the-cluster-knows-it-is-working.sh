@@ -27,9 +27,9 @@ expect down  ""      2683908 2 wait   "bind source path does not exist"   # blin
 expect up    ""      2683908 5 ok     "bind source path does not exist"   # the API answers: blind is the run's failure, not an outage
 # Its packet is visibility, never a precondition: both hooks must be
 # prefixed `-` so systemd runs the watchdog whatever the API says.
-grep -qE '^ExecStartPre=-/home/david/boss/infra/boss-maintenance-wrap.sh maintenance-cluster-watchdog' "$unit" || fail "the watchdog's packet hook is missing or is not best-effort (needs the - prefix)"
-grep -qE '^ExecStopPost=-/home/david/boss/infra/boss-step.sh maintenance-cluster-watchdog' "$unit" || fail "the watchdog's completion hook is missing or is not best-effort (needs the - prefix)"
-grep -qE '^ExecStart(Pre|Post)?=/home/david/boss/infra/(boss-maintenance-wrap|boss-step)' "$unit" && fail "a packet hook on the watchdog is a hard precondition — it would deadlock on the API it watches"
-grep -q '^ExecStart=/home/david/boss/infra/forge/cluster-watchdog.sh' "$unit" || fail "the unit does not run the watchdog"
+grep -qE '^ExecStartPre=-/var/lib/boss/tree/current/infra/boss-maintenance-wrap.sh maintenance-cluster-watchdog' "$unit" || fail "the watchdog's packet hook is missing or is not best-effort (needs the - prefix)"
+grep -qE '^ExecStopPost=-/var/lib/boss/tree/current/infra/boss-step.sh maintenance-cluster-watchdog' "$unit" || fail "the watchdog's completion hook is missing or is not best-effort (needs the - prefix)"
+grep -qE '^ExecStart(Pre|Post)?=/var/lib/boss/tree/current/infra/(boss-maintenance-wrap|boss-step)' "$unit" && fail "a packet hook on the watchdog is a hard precondition — it would deadlock on the API it watches"
+grep -q '^ExecStart=/var/lib/boss/tree/current/infra/forge/cluster-watchdog.sh' "$unit" || fail "the unit does not run the watchdog"
 echo "the-cluster-knows-it-is-working: self-test ok — ok/wait/roll-to-stamp/hands decided as designed (11 cases, 4 of them blind); its packet hooks are best-effort, never a precondition"
 exit 0

@@ -101,7 +101,7 @@ async fn every_bundled_policy_is_publishable_at_its_declared_version() {
             served.gate_max_concurrent,
             served.consist_budget_secs
         ),
-        (6, 40, 4, 120),
+        (7, 40, 3, 120),
         "the row the conductor reads is the row the bundle declares"
     );
 }

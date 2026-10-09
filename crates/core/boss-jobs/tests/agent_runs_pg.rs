@@ -210,6 +210,89 @@ async fn the_database_holds_a_run_that_reported_no_tokens_as_null() {
     assert_eq!(held.usd_micros, None, "no tokens is no price");
 }
 
+/// TODAY'S FAILING ORDER, in the schema (backlog b5a3a174): a run's row
+/// written before its report holds no count, and the report that
+/// carries the count takes its place — once — as a second fact on the
+/// log that a rebuild replays to the SAME row. Until this the row was
+/// insert-once whatever it held, and 21 of the 56 rows of 2026-10-08
+/// refused the report that priced them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_report_replaces_a_row_that_held_no_count_once_and_a_rebuild_agrees() {
+    let db = TestDb::new().await;
+    let log = PgAgentRuns::new(db.pool.clone());
+
+    let first = log
+        .record_run(&a_run("run-late-report", TokenUsage::Unreported), &filer())
+        .await
+        .expect("a run with no count is a record of the run");
+    assert!(first.recorded && !first.replaced);
+    assert_eq!(first.run.usd_micros, None, "no count is no price, not $0");
+
+    let report = a_run(
+        "run-late-report",
+        TokenUsage::Split {
+            input: 128_683,
+            output: 14_299,
+        },
+    );
+    let second = log.record_run(&report, &filer()).await.expect("records");
+    assert!(second.recorded && second.replaced, "the report did its job");
+    assert_eq!(second.run.run.tokens, report.tokens);
+    assert_eq!(second.run.usd_micros, Some(1_000_890));
+    assert_eq!(second.run.pricing_basis(), Some(PricingBasis::Split));
+    assert_eq!(
+        second.run.run.detail["replaced"]["recorded_at"],
+        serde_json::json!(first.run.recorded_at),
+        "the row names the placeholder it replaced"
+    );
+    assert_eq!(second.run.run.detail["host"], "dev-pod");
+
+    // ONCE. A third report, with another count, collapses onto the row.
+    let third = log
+        .record_run(
+            &a_run("run-late-report", TokenUsage::TotalOnly { total: 7 }),
+            &filer(),
+        )
+        .await
+        .expect("collapses");
+    assert!(!third.recorded && !third.replaced);
+    assert_eq!(third.run, second.run);
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_runs")
+        .fetch_one(&db.pool)
+        .await
+        .expect("counts");
+    assert_eq!(rows, 1, "one run, one row");
+    let events: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM event_outbox WHERE kind = 'agents.run.recorded'")
+            .fetch_one(&db.pool)
+            .await
+            .expect("counts");
+    assert_eq!(events, 2, "the placeholder and the record that replaced it");
+
+    // DETERMINISM: relay both facts and rebuild — the row is the live
+    // one, price and provenance included, not the placeholder the first
+    // event alone would leave behind.
+    sqlx::query(
+        "INSERT INTO audit_log (event_id, kind, source, timestamp, payload) \
+         SELECT event_id, kind, source, timestamp, payload FROM event_outbox \
+         WHERE kind = 'agents.run.recorded' ORDER BY id",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("relay the events");
+    let report = rebuild_agent_runs(&db.pool).await.expect("rebuilds");
+    assert_eq!(report.runs_inserted, 1);
+    assert_eq!(report.runs_replaced, 1);
+    let rebuilt = log
+        .list_runs(&RunFilter::default())
+        .await
+        .expect("lists")
+        .pop()
+        .expect("the rebuilt row");
+    assert_eq!(rebuilt, second.run, "a rebuild lands on the live row");
+}
+
 /// THE OTHER SIDE OF THE CUTOVER. The 13 rows written before
 /// 20260919194503 carry `total_tokens = 0` for "the harness printed no
 /// usage line", distinguishable only by a companion

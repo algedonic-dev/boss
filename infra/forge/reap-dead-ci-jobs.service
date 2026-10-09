@@ -16,6 +16,18 @@ Type=oneshot
 User=root
 # Job visibility. The forge host has no /opt/boss — it runs from
 # this checkout, which is where the installed units already point.
-ExecStartPre=-/home/david/boss/infra/boss-maintenance-wrap.sh maintenance-reap-ci-jobs "Reap dead CI jobs"
-ExecStart=/home/david/boss/infra/forge/reap-dead-ci-jobs.sh
-ExecStopPost=-/home/david/boss/infra/boss-step.sh maintenance-reap-ci-jobs run
+# THE TOKEN'S HEADER FILE NEVER OUTLIVES A RUN (backlog df38075a, F1;
+# the second car, which took the class and not the six units the item
+# named). The wrap pair on the Exec lines below presents the machine
+# token, and infra/lib/secret-header.sh makes its 0600 header file in
+# $RUNTIME_DIRECTORY when a unit declares one: /run/reap-dead-ci-jobs,
+# tmpfs, 0700, this unit's account's, removed by systemd when this
+# oneshot stops whatever ended it. Without it the file was made in the
+# host's shared /tmp, where a killed run left it. The reasoning is in
+# infra/forge/estate-observe-units.service; the pin that walks every
+# unit is a_killed_sender_leaves_no_header_behind.rs.
+RuntimeDirectory=reap-dead-ci-jobs
+RuntimeDirectoryMode=0700
+ExecStartPre=-/var/lib/boss/tree/current/infra/boss-maintenance-wrap.sh maintenance-reap-ci-jobs "Reap dead CI jobs"
+ExecStart=/var/lib/boss/tree/current/infra/forge/reap-dead-ci-jobs.sh
+ExecStopPost=-/var/lib/boss/tree/current/infra/boss-step.sh maintenance-reap-ci-jobs run

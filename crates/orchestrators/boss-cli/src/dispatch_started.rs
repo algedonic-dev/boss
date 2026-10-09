@@ -51,6 +51,26 @@ fn receipt(job: &Value, run: &str, actor: &str, owned: Option<&str>) -> Result<V
     Ok(json!({"schema":1,"run":run,"actor":actor}))
 }
 
+/// The id of the open run's `building` step when it is READY and
+/// nominated to `actor` — the one state [`started_at`] claims from.
+fn own_ready_nomination(job: &Value, actor: &str) -> Option<String> {
+    let job = job.get("data").unwrap_or(job);
+    if job.get("kind").and_then(Value::as_str) != Some("agent-run")
+        || job.get("status").and_then(Value::as_str) != Some("open")
+    {
+        return None;
+    }
+    crate::envelope::steps(job)
+        .into_iter()
+        .find(|s| s.get("spec_slug").and_then(Value::as_str) == Some("building"))
+        .filter(|s| {
+            s.get("status").and_then(Value::as_str) == Some("ready")
+                && s.get("assignee_id").and_then(Value::as_str) == Some(actor)
+        })
+        .and_then(|s| s.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
 pub(crate) async fn started_at(
     http: &boss_core::machine_token::Client,
     base: &str,
@@ -103,9 +123,43 @@ pub(crate) async fn started_at(
         )
         .await
     };
-    let before = api(reqwest::Method::GET, None)
+    let mut before = api(reqwest::Method::GET, None)
         .await?
         .context("own run read returned no body")?;
+    // THE WORKER TAKES ITS OWN NOMINATION (backlog 2f7b8c00, 2026-10-07).
+    // Nothing in the protocol claimed a run's Building: dispatch claims
+    // the SOURCE step, the dispatcher service nominates Building, and the
+    // step then sat READY — so this verb refused every worker that had
+    // not claimed by hand (every Claude subagent that day; Codex sessions
+    // claimed by hand first). The claim door is the one act that makes a
+    // nomination a holding, it compares the signer against the nominee,
+    // and it is asked only for a step already nominated to THIS actor: an
+    // unassigned Building is one the door would grant to anyone, so it is
+    // left for the refusal below.
+    if owned == Some(run)
+        && let Some(sid) = own_ready_nomination(&before, registered)
+    {
+        // NO WRITE BEFORE A REFUSAL (review f7f0b689, N5): a run that
+        // declares no worker receipt is refused below whatever its step
+        // is, so it is refused HERE, before the claim would have left
+        // the step ACTIVE behind that refusal.
+        if expectation(before.get("data").unwrap_or(&before)).is_none() {
+            bail!("this legacy or unmarked run declares no worker receipt");
+        }
+        crate::gate::api_at_signed(
+            http,
+            base,
+            reqwest::Method::POST,
+            &format!("/api/jobs/{run}/steps/{sid}/claim"),
+            None,
+            crate::identity::Signature::As(actor.to_string()),
+        )
+        .await
+        .context("claiming this run's own building step")?;
+        before = api(reqwest::Method::GET, None)
+            .await?
+            .context("own run read returned no body")?;
+    }
     let expected = receipt(&before, run, registered, owned)?;
     let before = before.get("data").unwrap_or(&before);
     match before.get("metadata").and_then(|m| m.get(RECEIPT_KEY)) {
@@ -393,6 +447,166 @@ mod tests {
                 .is_err()
             );
             assert!(state.lock().unwrap().1.is_empty());
+        }
+    }
+
+    /// The claim door as the jobs API answers it for a READY step: the
+    /// caller's own nomination becomes ACTIVE, anyone else's is a 409
+    /// naming the holder. The stub records who asked.
+    async fn stub_with_claim(
+        holder: &str,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<(Value, Vec<Value>)>>,
+    ) {
+        use axum::{Json, routing::post};
+        let (base, state) = stub(false, false).await;
+        {
+            let mut s = state.lock().unwrap();
+            s.0["steps"][0]["id"] = json!("s-building");
+            s.0["steps"][0]["status"] = json!("ready");
+            s.0["steps"][0]["assignee_id"] = json!(holder);
+        }
+        let claims = state.clone();
+        let app = axum::Router::new()
+            .route(
+                "/api/jobs/own-run/steps/s-building/claim",
+                post(move |headers: axum::http::HeaderMap| {
+                    let claims = claims.clone();
+                    async move {
+                        let signer = headers
+                            .get("x-boss-user")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| serde_json::from_str::<Value>(v).ok())
+                            .map(|v| v["id"].clone())
+                            .unwrap_or(Value::Null);
+                        let mut s = claims.lock().unwrap();
+                        s.1.push(json!({"claim_by": signer}));
+                        // The login door: an alias signs as its registered id.
+                        if s.0["steps"][0]["assignee_id"] == "agent-codex"
+                            && signer == "codex@algedonic.dev"
+                        {
+                            s.0["steps"][0]["status"] = json!("active");
+                            (axum::http::StatusCode::OK, Json(json!({"status":"active"})))
+                        } else {
+                            (
+                                axum::http::StatusCode::CONFLICT,
+                                Json(
+                                    json!({"error":"held","holder":s.0["steps"][0]["assignee_id"]}),
+                                ),
+                            )
+                        }
+                    }
+                }),
+            )
+            .fallback(move |req: axum::extract::Request| {
+                let base = base.clone();
+                async move {
+                    let client = reqwest::Client::new();
+                    let url = format!("{base}{}", req.uri().path());
+                    let method = req.method().clone();
+                    let body = axum::body::to_bytes(req.into_body(), 1 << 20)
+                        .await
+                        .unwrap();
+                    let answer = client
+                        .request(method, url)
+                        .header("content-type", "application/json")
+                        .body(body)
+                        .send()
+                        .await
+                        .unwrap();
+                    let status =
+                        axum::http::StatusCode::from_u16(answer.status().as_u16()).unwrap();
+                    (status, answer.bytes().await.unwrap())
+                }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}"), state)
+    }
+
+    /// THE SHARED CAUSE (backlog 2f7b8c00, run f7c7891b, 2026-10-07).
+    /// Every Claude subagent that day had `--started` refused "requires
+    /// this actor's active assigned building step": its Building was
+    /// READY and nominated to it, and nothing in the protocol claims a
+    /// run's Building — Codex sessions did it by hand. The verb now takes
+    /// its own nomination through the claim door first.
+    #[tokio::test]
+    async fn started_claims_its_own_ready_nomination_before_the_receipt() {
+        let (base, state) = stub_with_claim("agent-codex").await;
+        let client = crate::gate::machine_client().unwrap();
+        started_at(
+            &client,
+            &base,
+            "own-run",
+            "codex@algedonic.dev",
+            Some("own-run"),
+        )
+        .await
+        .expect("a ready step nominated to the caller is claimed, then acknowledged");
+        let s = state.lock().unwrap();
+        assert_eq!(s.0["steps"][0]["status"], "active");
+        assert_eq!(
+            s.1,
+            vec![
+                json!({"claim_by":"codex@algedonic.dev"}),
+                json!({"worker_started":{"schema":1,"run":"own-run","actor":"agent-codex"}}),
+            ],
+            "one claim signed by the caller, then the one receipt"
+        );
+    }
+
+    /// NO WRITE BEFORE A REFUSAL (review f7f0b689, N5). A legacy run
+    /// declares no worker receipt, so `--started` refuses it — and it
+    /// used to claim the step first, leaving it ACTIVE behind a refusal.
+    #[tokio::test]
+    async fn a_run_that_declares_no_worker_receipt_is_refused_before_any_claim() {
+        let (base, state) = stub_with_claim("agent-codex").await;
+        state.lock().unwrap().0["steps"][0]["metadata"] = json!({});
+        let client = crate::gate::machine_client().unwrap();
+        let refused = started_at(
+            &client,
+            &base,
+            "own-run",
+            "codex@algedonic.dev",
+            Some("own-run"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains("declares no worker receipt"), "{refused}");
+        let s = state.lock().unwrap();
+        assert!(s.1.is_empty(), "no claim and no receipt: {:?}", s.1);
+        assert_eq!(s.0["steps"][0]["status"], "ready");
+    }
+
+    /// The claim is the caller's own or it is not made: a Building
+    /// nominated to another actor, or to nobody, is reported and no claim
+    /// and no receipt is sent. The door would refuse the first anyway;
+    /// the second it would GRANT, and a worker that takes an unassigned
+    /// run is the identity slip this verb exists to refuse.
+    #[tokio::test]
+    async fn started_never_claims_a_building_step_nominated_to_someone_else_or_to_nobody() {
+        let client = crate::gate::machine_client().unwrap();
+        for holder in [json!("agent-claude"), Value::Null] {
+            let (base, state) = stub_with_claim("agent-claude").await;
+            state.lock().unwrap().0["steps"][0]["assignee_id"] = holder;
+            let refused = started_at(
+                &client,
+                &base,
+                "own-run",
+                "codex@algedonic.dev",
+                Some("own-run"),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(
+                refused.contains("active assigned building step"),
+                "{refused}"
+            );
+            assert!(state.lock().unwrap().1.is_empty(), "no claim, no receipt");
         }
     }
 }

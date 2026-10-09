@@ -130,7 +130,21 @@ mod tests {
     /// the rules from.
     #[tokio::test]
     async fn the_rules_read_is_signed_as_its_viewer() {
-        let rules = ReqwestDispatcherRules::new(dispatcher().await);
+        // NO DEADLINE OF THE TEST'S OWN, and no live token (backlog
+        // ec131700). `new` builds on `http_client::base`, whose five-second
+        // timeout is a production bound against a stuck sibling; here it
+        // made this a test of the runner. On a gate whose volume had
+        // stalled (gate-run 9684b44f, 2026-10-06) this thread — the stub
+        // and the client both — stood still past it, and reqwest polls its
+        // timer before the response it already holds, so the read came back
+        // "the dispatcher did not answer" from a dispatcher that had.
+        // Reproduced by holding the stub's handler for six seconds: red
+        // through `new`, green here. The response is the condition.
+        let rules = ReqwestDispatcherRules {
+            base_url: dispatcher().await,
+            http: boss_core::machine_token::Client::unstamped(reqwest::Client::builder())
+                .expect("a client"),
+        };
         let read = rules.enforced_rules(&viewer()).await;
         assert_eq!(
             read,

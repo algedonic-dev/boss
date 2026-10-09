@@ -61,6 +61,22 @@
 # if it does, the run stays open and counted on the shop floor for a
 # hand, which is a truer record than an absence.
 #
+# THE RUN STILL ENDS WITH A COST ROW, AND THE ROW SAYS IT HAS NO PRICE
+# (v3, backlog b5a3a174, 2026-10-08). A run that ended here had no
+# `agent_runs` row at all, so the cost record simply did not hold it —
+# or, when a launch-time placeholder had been posted for it, held it at
+# zero tokens and $0, which reads as a cost. The `post_*` args post the
+# run's record BEFORE the completion, the way the landing rule does:
+# `run_id` the packet's own, the agent `building` was placed with, the
+# model the packet declared, started when the packet opened, finished at
+# this tick, `outcome = success` (the work shipped — see the terminal
+# above), and NO COUNT: `total_tokens` is an explicit null, which the
+# door stores as unknown and prices at nothing, with `detail.unpriced`
+# saying why. A report that arrives after this replaces the row, once,
+# because a row that holds no count is a placeholder for a cost and not
+# a cost (`boss_jobs::agent_runs::port::replaces`). The died and refused
+# endings still post nothing; that is backlog 4f45f5ec.
+#
 # NO RECLAIM FOLLOWS THIS ONE, BY CONSTRUCTION. The step the run was
 # executing is already completed: `reported` cannot even open unless
 # `building` closed `gated` (the gate went green and the car merged,
@@ -91,10 +107,12 @@ one of six concurrent slots until an operator noticed, while the
 slowest genuine handback took 1.15h. It adds no routing: one firing
 completes `reported` with `handback = absent` on every run whose
 report never came, and the protocol's own `unreported` terminal closes
-it.
+it. It posts the run's `agent_runs` record first, holding no count and
+saying so (b5a3a174): a run that never reported was either missing from
+the cost record or, on 21 of the 56 rows of 2026-10-08, in it at $0.
 """
-version = 2
+version = 3
 schedule = { cadence = "hourly", anchor_date = "2026-09-22" }
 [[rule.do]]
 handler = "jobs.age_out_step"
-args = { kind = "\"agent-run\"", step = "\"reported\"", hours = "\"2\"", unless_job_holds = "\"report\"", done_metadata = '"{\"handback\": \"absent\", \"summary\": \"No handback was recorded. This line is the clock rule agent-run-ends-unreported-when-the-handback-never-arrives, not the agent: the run built, its work is evidenced on `building`, and nothing reported within the bound, so the slot it held was released and the run ends `unreported`. See `aged_out` beside this for the silence measured.\"}"' }
+args = { kind = "\"agent-run\"", step = "\"reported\"", hours = "\"2\"", unless_job_holds = "\"report\"", done_metadata = '"{\"handback\": \"absent\", \"summary\": \"No handback was recorded. This line is the clock rule agent-run-ends-unreported-when-the-handback-never-arrives, not the agent: the run built, its work is evidenced on `building`, and nothing reported within the bound, so the slot it held was released and the run ends `unreported`. See `aged_out` beside this for the silence measured.\"}"', post_to = "\"/api/agent-runs\"", post_id_key = "\"run_id\"", post_at_key = "\"finished_at\"", post_fields = '"{\"outcome\": \"success\", \"total_tokens\": null, \"tool_calls\": 0, \"detail\": {\"unpriced\": \"never reported: no handback arrived within the bound, so nothing metered this run and it has no price. This row is the clock rule agent-run-ends-unreported-when-the-handback-never-arrives, not the agent; a report that arrives later replaces it, once.\"}}"', post_fill = '"{\"actor_id\": {\"step\": \"building\", \"from\": [\"/assignee_id\"]}, \"model\": {\"from\": [\"/metadata/model\"]}, \"started_at\": {\"from\": [\"/metadata/opened_at\"]}, \"job_id\": {\"from\": [\"/metadata/packet\"]}, \"branch\": {\"step\": \"building\", \"from\": [\"/metadata/gate_run/branch\", \"/metadata/car/branch\"]}}"' }

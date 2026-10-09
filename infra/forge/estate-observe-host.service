@@ -81,8 +81,8 @@ LimitCORE=0
 # BOSS_JOBS_URL and JOBS_API come from /etc/boss/sor.env (EnvironmentFile=
 # above), rendered by install.sh from infra/estate/estate.toml; the
 # helpers refuse without one, and every Exec line reads the same file.
-ExecStartPre=-/home/david/boss/infra/boss-maintenance-wrap.sh maintenance-estate-observe-host "estate host observation (forge)"
-ExecStart=/home/david/boss/infra/estate/observe-host.sh
+ExecStartPre=-/var/lib/boss/tree/current/infra/boss-maintenance-wrap.sh maintenance-estate-observe-host "estate host observation (forge)"
+ExecStart=/var/lib/boss/tree/current/infra/estate/observe-host.sh
 # Each CLUSTER node's kubelet filesystem, read here through the Talos API
 # with the talosconfig this host holds (backlog eeac3d56): the in-cluster
 # observer used to read it through the kubelet as `get nodes/proxy`,
@@ -95,7 +95,7 @@ ExecStart=/home/david/boss/infra/estate/observe-host.sh
 # blind-class alarm reads it. systemd runs no later line after a failed
 # one, so while the host observation cannot post (the record is dark)
 # this is not read either — and it could not have posted.
-ExecStart=-/home/david/boss/infra/estate/observe-nodefs.sh
+ExecStart=-/var/lib/boss/tree/current/infra/estate/observe-nodefs.sh
 # Every instance volume's filesystem — each PersistentVolumeClaim in the
 # instance namespaces, capacity and free, from the kubelet's volume
 # stats through the admin kubeconfig (backlog 21ee3b4e, incident
@@ -104,5 +104,5 @@ ExecStart=-/home/david/boss/infra/estate/observe-nodefs.sh
 # forge's own reading never waits on it, and a claim that cannot be read
 # is recorded unread, not a failed unit. Five nodes' summaries are
 # bounded at 20s each, inside the ten minutes above.
-ExecStart=-/home/david/boss/infra/estate/observe-volumes.sh
-ExecStopPost=-/home/david/boss/infra/boss-step.sh maintenance-estate-observe-host run
+ExecStart=-/var/lib/boss/tree/current/infra/estate/observe-volumes.sh
+ExecStopPost=-/var/lib/boss/tree/current/infra/boss-step.sh maintenance-estate-observe-host run

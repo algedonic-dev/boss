@@ -243,20 +243,61 @@ impl World {
     async fn record_as(&self, text: &str, actor: &str) -> std::process::Output {
         let path = self.root.path().join("native.jsonl");
         std::fs::write(&path, text).unwrap();
-        tokio::process::Command::new(env!("CARGO_BIN_EXE_boss"))
-            .args(["roster", "record", "--call-id", CALL, "--transcript"])
-            .arg(path)
-            .env("BOSS_JOBS_URL", &self.base)
-            .env("BOSS_ACTOR", actor)
-            .env(
-                "BOSS_MACHINE_TOKEN_DIR",
-                self.root.path().join("empty-token"),
-            )
-            .kill_on_drop(true)
-            .output()
-            .await
-            .unwrap()
+        let started = std::time::Instant::now();
+        loop {
+            let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_boss"))
+                .args(["roster", "record", "--call-id", CALL, "--transcript"])
+                .arg(&path)
+                .env("BOSS_JOBS_URL", &self.base)
+                .env("BOSS_ACTOR", actor)
+                .env(
+                    "BOSS_MACHINE_TOKEN_DIR",
+                    self.root.path().join("empty-token"),
+                )
+                .kill_on_drop(true)
+                .output()
+                .await
+                .unwrap();
+            if !starved(&out) {
+                return out;
+            }
+            assert!(
+                started.elapsed() < HANG_GUARD,
+                "every record for {HANG_GUARD:?} timed out against a stub in this process; \
+                 the last: {out:?}"
+            );
+        }
     }
+}
+
+/// How long a record may go on being replayed before a test calls the
+/// runner HUNG. Never a measure of speed (backlog ec131700; the same guard
+/// and the same reasoning as `dispatched_execution.rs`).
+const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// THE VERB'S TIMEOUT IS NOT A VERDICT ON THE VERB (backlog ec131700).
+/// `boss roster record` bounds each request at ten seconds, a production
+/// bound against a stuck jobs door, and here it is a real child process on
+/// a real socket: there is no clock for a test to hold. So every case in
+/// this file was also a test of the runner. On gate-run 8857fd0c
+/// (2026-10-07, three gates running, this target 85 s against under one
+/// second on the dev pod) the first POST read "operation timed out" from
+/// the stub this file serves, on a car that touches nothing here. Worse
+/// than the red: the cases that assert a REFUSAL pass on that same timeout,
+/// for a reason that is not the refusal.
+///
+/// A record that timed out is therefore run again, and the outcome judged
+/// is the first one the verb reached on its own terms. That leans on the
+/// verb's contract and on nothing else: an equal replay is idempotent, and
+/// a record cut short resumes from what the door holds. Reproduced by
+/// holding the stub's first answer for eleven seconds: red before, green
+/// here on the second run. Measured the same day, the whole file one case
+/// at a time with the stub's Nth request held eleven seconds, for 12
+/// positions before the request was handled and 25 after its write had
+/// landed: 9 of 9 every time. Only this one error is replayed; a refusal,
+/// a conflict and a failed read-back all return at once, as before.
+fn starved(out: &std::process::Output) -> bool {
+    !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("operation timed out")
 }
 
 #[tokio::test]

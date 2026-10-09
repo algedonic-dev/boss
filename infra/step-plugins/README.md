@@ -51,6 +51,18 @@ A bundle exposes a single contract:
 })();
 ```
 
+One file here is NOT a plugin: `passkey-ceremony.js` registers no step
+kind and no `step_plugins` row names it. It is the one copy of the
+passkey ceremony — how what a passkey signs is drawn, the check that it
+was drawn, begin/finish, and the one-tap-one-retry answer to a 422
+`{required: "presence"}` — shared by the bundles that ask a passkey of
+their reader (`sign-off.js`, `incident-review.js`). A bundle is a classic
+script and cannot import, so one that needs it adds
+`/plugins/passkey-ceremony.js` as a script tag and registers its mount
+only once that has run (`withPasskey`, at the foot of each). A step that
+is `human_only`, or that requires presence, completes only on a passkey:
+a new bundle for such a step uses this file rather than a copy of it.
+
 That's the whole API. There is no `save`/`done`/`cancel` helper:
 to persist, you `fetch` yourself, through two doors, then call
 `onUpdate()`. The keys your surface owns go to the step merge door,

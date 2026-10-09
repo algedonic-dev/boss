@@ -157,6 +157,20 @@ case "$DEST" in
     *) refuse "--dest '$DEST' is not an absolute path" ;;
 esac
 
+# WHICH MACHINE THIS IS, BEFORE ANYTHING IS READ OR WRITTEN (backlog
+# 62b09c57, N7; infra/lib/host-check.sh carries the incident and the
+# rule). Aimed at the directory every caller on the forge reads, this
+# deposits the estate's machine token: the machine must hold the address
+# the estate declares for the forge, or the exit is 78 and nothing is
+# read from the cluster or written here. Aimed anywhere else it is a
+# test's directory and no identity is asked. Before the summary library
+# is sourced, so a refusal is this script's own line and never a field
+# on its caller's packet.
+# shellcheck source=infra/lib/host-check.sh
+. "$INFRA/lib/host-check.sh"
+host_path --dest "$DEST" /etc/boss/machine-token
+host_check forge "$ME"
+
 # --- 1. the declaration: the broker rule -------------------------------
 [ -r "$RULE" ] || refuse "cannot read the broker rule $RULE"
 HANDLER_LINE="$(grep -m1 '^handler = ' "$RULE")" || [ $? -eq 1 ] || refuse "cannot read $RULE"

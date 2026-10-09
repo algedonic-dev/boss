@@ -51,6 +51,22 @@ TimeoutStartSec=10min
 # on 2026-09-11 that was enough to support a wrong conclusion about what
 # the converge had installed — see infra/run-summary.sh.
 Environment=BOSS_RUN_SUMMARY_FILE=/run/boss-gcp-converge.summary.json
+# THE MACHINE TOKEN'S HEADER NEVER OUTLIVES ITS RUN (review a92c0b94 F1;
+# backlog 88379df3). Since the token is pushed to this host, this unit's
+# stamped calls — its wrap pair and the converge's own effect check
+# (infra/estate/machine-token-effect.sh) — hand curl the token in a 0600
+# header file, and infra/lib/secret-header.sh makes that file in
+# $RUNTIME_DIRECTORY when a unit declares one: tmpfs under /run, 0700,
+# removed by systemd when this oneshot stops WHATEVER the exit — after
+# the SIGKILL the ceiling above sends second too — and cleared by a power
+# loss. Without it the file lived under the host's shared /tmp, where a
+# run killed mid-request left it until tmp cleanup. The same shape as
+# forge-converge.service (359a811c). RuntimeDirectory= creates no mount
+# namespace, so this unit still installs the host it runs on; and a tick
+# of the new script under an older copy of this unit simply falls back
+# to /tmp once, then installs this line.
+RuntimeDirectory=boss-gcp-converge
+RuntimeDirectoryMode=0700
 # WHICH NODE THIS IS in the estate registry, so the converge can read
 # its own roles off /api/estate/nodes (infra/estate/roles.toml maps them
 # to units). This unit file lives under infra/gcp/ and installs on this

@@ -307,9 +307,7 @@ pub async fn serve(bind: String, telemetry: SharedTelemetry, seeds: PathBuf) -> 
         )),
         roles.clone(),
         mode.clone(),
-        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
-            boss_policy_client::role_service::REPORT_CAPACITY,
-        )),
+        boss_policy_client::role_service::unrecorded_tally("sim-control", mode.clone()),
     );
     let app = control_http_router(state, wiring.inventory);
     let listener = tokio::net::TcpListener::bind(&bind).await?;

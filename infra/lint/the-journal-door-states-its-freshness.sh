@@ -142,6 +142,7 @@ install_run() {
     STUB_LOG="$1" INSTALL_ETC="$tmp/etc" INSTALL_SYSTEMCTL="$tmp/bin/systemctl" \
         INSTALL_APT_GET="$tmp/bin/apt-get" INSTALL_UNIT_LIB="$2" INSTALL_KUBECTL=0 \
         INSTALL_SOR_ENV="$tmp/sor.env" \
+        BOSS_OPS_RUNNER_RETIRED="$tmp/ops-runner.retired" \
         bash "$installer" >"$tmp/install-out" 2>&1
 }
 

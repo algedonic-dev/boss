@@ -407,9 +407,10 @@ describe('putStep', () => {
     expect((seenInit?.headers as Record<string, string>)['x-presence-ticket']).toBeUndefined();
   });
 
-  // Backlog b568044a: a presence-gated completion is judged on its own
-  // request, so the caller that ran the ceremony hands its ticket over
-  // and the PUT carries it in the header the gateway verifies.
+  // A presence step that names no sign-off role is judged on its own
+  // completing request (design 1ce67f7e keeps that rule for it), so the
+  // caller that ran the ceremony hands its ticket over and the PUT
+  // carries it in the header the gateway verifies.
   test('carries a presence ticket it is handed, in x-presence-ticket', async () => {
     let seenInit: RequestInit | undefined;
     stubFetch(async (_url, init) => {

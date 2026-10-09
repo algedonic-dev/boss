@@ -74,6 +74,7 @@ EXEMPT=(
     "boss.yaml	holds THREE workloads with three different answers: the SoR postgres StatefulSet (the gate-runner car had to read /proc to establish postgres runs as 999), the nats StatefulSet, and the SoR app Deployment whose strategy is Recreate — so any roll of it is a full outage of :7900. Carries fsGroup: 1500 today, which is the volume half of the answer and not the user half. One car each, measured."
     "boss-backup.yaml	the documented trap: its gcs-key is defaultMode 0400 and is read as root, so runAsNonRoot breaks the offsite leg and reports it as a gcloud auth failure (its retired ship-key was the first instance, backlog a05835da). Also carries a postgres container and a google/cloud-sdk container, each with its own uid answer."
     "boss-estate-observe.yaml	alpine/k8s, uid unmeasured — and a separate car is holding this file, so declaring it here would collide rather than land."
+    "boss-node-maintenance.yaml	NOT a car owed, and the one entry that is a decision: its uid IS declared — runAsUser 0, runAsNonRoot false — because FITRIM is checked against the EFFECTIVE capability set and a non-root uid does not get capabilities.add into it (backlog 17f6170c). This lint asserts runAsNonRoot: true, which that pod cannot state; the_privileged_namespace_holds_one_workload.rs holds its whole securityContext, field for field, instead."
 )
 
 # Non-vacuity floor. Seven BOSS-image chore CronJobs are declared as of

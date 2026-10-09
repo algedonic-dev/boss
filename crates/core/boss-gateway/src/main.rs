@@ -271,9 +271,7 @@ async fn main() -> Result<()> {
         )),
         roles.clone(),
         mode.clone(),
-        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
-            boss_policy_client::role_service::REPORT_CAPACITY,
-        )),
+        boss_policy_client::role_service::unrecorded_tally("gateway", mode.clone()),
     );
     let app = gateway_http_router(
         build_router(local_auth_state.clone(), &public_reads),

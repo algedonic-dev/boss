@@ -13,7 +13,18 @@ Description=BOSS forge: the cluster watchdog — knows the cluster is working fr
 # derivation from that host (backlog 5222163e, 2026-09-18).
 EnvironmentFile=/etc/boss/sor.env
 Type=oneshot
-User=david
+# ROOT, FROM ROOT'S TREE (backlog a604a35b; decided by David as position
+# B on that packet, 2026-10-07). This unit ran as david out of
+# /home/david/boss, and reached the admin kubeconfig through a
+# passwordless `sudo docker` — so the loop that can roll the cluster was
+# one edit of a file its own account owns away from running anything.
+# It needs nothing an account has: the kubeconfig David places is root's
+# (ops-credentials.sh reads it through the system docker daemon, with or
+# without sudo), and its state is its own. As root it can also READ the
+# estate machine token, so the wrap pair, the watchdog's alerts and the
+# door observer below are stamped (infra/lib/secret-header.sh) where they
+# were sent tokenless since the deposit landed.
+User=root
 # A oneshot's start timeout is infinity by default, so a read a
 # half-dead API server never answered held this unit activating and the
 # timer skipped every tick behind it (backlog cf321ffd). It covers
@@ -29,25 +40,79 @@ User=david
 # and raced that alert (review of 8f50d314, M1). A test derives this
 # sum from the files that set each bound and holds this line above it.
 TimeoutStartSec=15min
+# THE TOKEN'S HEADER FILE NEVER OUTLIVES A RUN (backlog df38075a, F1 of
+# review a92c0b94). The wrap pair, the watchdog's alert and the door
+# observer's post present the machine token, and the 0600 header file
+# infra/lib/secret-header.sh hands curl is made in $RUNTIME_DIRECTORY
+# when a unit declares one: /run/cluster-watchdog, tmpfs, 0700 and
+# root's because User= is (david's until backlog a604a35b), removed by
+# systemd when this oneshot stops
+# whatever ended it — the 15-minute kill above ends in a SIGKILL for
+# whatever lingers, and that runs no EXIT trap. Both ExecStart lines
+# share it; it is there through ExecStopPost and gone after it. The
+# reader falls back to
+# /tmp if the directory is missing, so this is never what stops the
+# watchdog. RuntimeDirectory= makes no mount namespace.
+RuntimeDirectory=cluster-watchdog
+RuntimeDirectoryMode=0700
 # The admin kubeconfig is NOT named here: the watchdog reads the one
 # David places under /etc/boss-ops through ops-credentials.sh's helper
 # (backlog fb444bbb). This line used to point it at /home/david/kc.yaml,
 # a second copy nothing checked.
+#
+# THE ONE PATH UNDER A HOME, AND IT IS READ AS DATA, NEVER RUN. The stamp
+# is written by the cluster converge (cluster-deploy-runner.service),
+# which still runs as david until its build moves off his rootless
+# docker daemon; the watchdog reads it to know which build to roll to.
+# So root reads a file another account writes: cluster-watchdog.sh takes
+# it only when it is exactly a build name (seven hex) and never prints
+# what it found otherwise, so a name planted there to be read through
+# reaches neither the patch nor the journal. It names a tag of the image
+# repository that account already pushes, which is no new power.
 Environment=BOSS_FORGE_LAST_BUILT=/home/david/.boss-last-built
-Environment=WATCHDOG_STATE=/home/david/.boss-watchdog-dark
-Environment=WATCHDOG_BLIND_STATE=/home/david/.boss-watchdog-blind
+# EVERYTHING THIS UNIT KEEPS IS ROOT'S, UNDER ONE DIRECTORY systemd
+# makes before every start (so no tick can find it missing): the dark
+# count, the blind marker, and the three directories it replays from.
+# install.sh carries the count and the marker across from the old home,
+# once (it says how, and why only those two).
+StateDirectory=boss/watchdog
+StateDirectoryMode=0700
+Environment=WATCHDOG_STATE=/var/lib/boss/watchdog/dark
+Environment=WATCHDOG_BLIND_STATE=/var/lib/boss/watchdog/blind
 # What the run leaves its packet — `cluster_read`, whether it could read
 # the cluster and so could act — merged onto the run step by the
-# ExecStopPost hook. Under
-# $HOME because this unit runs as david and /run is root's.
-Environment=BOSS_RUN_SUMMARY_FILE=/home/david/.boss-cluster-watchdog.summary.json
+# ExecStopPost hook. Under /run, like every other root unit's.
+Environment=BOSS_RUN_SUMMARY_FILE=/run/cluster-watchdog.summary.json
 Environment=WATCHDOG_DARK_LIMIT=3
+# THE THREE DIRECTORIES THIS UNIT REPLAYS FROM ARE ITS OWN AND ROOT'S
+# (backlog dda26693; review acab446c F8a; moved from the old user's home
+# by a604a35b). Kept alerts, the door observer's unposted readings and
+# its dark-since state are written by this unit and read back by this
+# unit, and each used to default to a name under /var/tmp — sticky,
+# world-writable, and made by the first run that has something to keep —
+# where the account car probes run as (boss-probe) could make one first
+# and plant a body: alert_replay POSTs every *.json there as a
+# platform-admin automation actor, the door replay POSTs to the estate
+# door, and a planted state file becomes a door's dark_since. Now that
+# this unit presents the machine token, a planted body would also ride a
+# credential; under a 0700 root directory nobody but root can make a
+# name. THE CLUSTER CONVERGE NO LONGER SHARES THE ALERT SPOOL: it runs as
+# david and keeps what it could not file in its own, and replays that
+# itself (cluster-deploy-lib.sh replay_kept_alerts) — root never replays
+# a file another account wrote. NOT CARRIED ACROSS: an alert or a reading
+# still waiting in the old home at the tick that moves this is not read
+# by root; a kept alert there is filed by the cluster converge's replay,
+# and a door dark at that tick restarts its dark-since. The journal has
+# every alert the moment it was raised.
+Environment=ALERT_SPOOL=/var/lib/boss/watchdog/alert-spool
+Environment=DOOR_SPOOL_DIR=/var/lib/boss/watchdog/door-spool
+Environment=DOOR_STATE_DIR=/var/lib/boss/watchdog/door-state
 # The estate id the wrap stamps on the packet and boss-step records on
 # the run step, rather than whatever the machine calls itself (backlog
 # 79f7678b, 2026-09-26).
 Environment=HOST_ID=forge
-ExecStartPre=-/home/david/boss/infra/boss-maintenance-wrap.sh maintenance-cluster-watchdog "Cluster watchdog"
-ExecStart=/home/david/boss/infra/forge/cluster-watchdog.sh
+ExecStartPre=-/var/lib/boss/tree/current/infra/boss-maintenance-wrap.sh maintenance-cluster-watchdog "Cluster watchdog"
+ExecStart=/var/lib/boss/tree/current/infra/forge/cluster-watchdog.sh
 # The dev pod's ssh doors, probed from here — outside the pod they open
 # onto (backlog e6406701; incident 55d001b0: both doors dark ~36h and a
 # person found it). SECOND, so the loop that acts never waits on a
@@ -57,5 +122,5 @@ ExecStart=/home/david/boss/infra/forge/cluster-watchdog.sh
 # dark) the door goes unread; that shows as a gap in the door series
 # once the record answers, never as a reading that was not taken. The
 # door list and its band are infra/estate/doors.toml.
-ExecStart=-/home/david/boss/infra/estate/observe-door.sh
-ExecStopPost=-/home/david/boss/infra/boss-step.sh maintenance-cluster-watchdog run
+ExecStart=-/var/lib/boss/tree/current/infra/estate/observe-door.sh
+ExecStopPost=-/var/lib/boss/tree/current/infra/boss-step.sh maintenance-cluster-watchdog run

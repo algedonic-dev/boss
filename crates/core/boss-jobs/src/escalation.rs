@@ -538,7 +538,16 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let http = client(Duration::from_secs(5)).expect("the client builds");
+        // NO DEADLINE OF THE TEST'S OWN (backlog ec131700). This asks who
+        // the send is signed as, never how fast a stub answers, and a
+        // five-second request timeout made it a test of the runner: on a
+        // gate whose volume had stalled (gate-run 9684b44f, 2026-10-06)
+        // this thread — which runs the stub and the client both — stood
+        // still past it, and reqwest polls its timer before the response
+        // it already holds, so correct code read "error sending request".
+        // Reproduced by holding the stub's handler for six seconds: red at
+        // five, green here. The response is the condition waited on.
+        let http = client(Duration::MAX).expect("the client builds");
         send_signal(&http, &base, "emp-ceo", "subj", "body", "job-1")
             .await
             .expect("the stub accepts the signal");

@@ -559,6 +559,38 @@ spec:
         # fsGroup, as runner-credential above: the boss uid reads.
         - name: machine-token
           secret: {secretName: boss-machine-token, optional: true, defaultMode: 0440}
+        # THE PROBE-READER CREDENTIAL'S SLOTS (design b35c22b4; backlog
+        # d26515c5): Secret boss-probe-reader, slots `current`, `next` and
+        # `previous`, the SECOND set every service's gate reads
+        # (boss_core::machine_gate, DEFAULT_READER_DIR). A value in one
+        # of them is admitted for GET and HEAD only, as
+        # automation:run-car-probe-reader at audit-readonly, and refused
+        # 403 on anything else in every mode — it is what a recorded car
+        # probe reads the system of record with once the gate enforces
+        # (row C of decision b08725c2), through the door `boss prove`
+        # holds for the probe's lifetime.
+        #
+        # ONE MOUNT IS EVERY GATED PORT: every service runs in this one
+        # container and reads this one directory, and that door vouches
+        # per port — a port whose gate did not read it would answer the
+        # probe 502. Pinned by crates/core/boss-testing/tests/
+        # the_probe_reader_is_mounted_where_every_gate_reads_it.rs.
+        #
+        # NOTHING IS REFUSED BY THIS MOUNT, and nothing is granted: the
+        # same container already mounts the estate token above, which
+        # reads AND writes. `optional` because the Secret does not exist
+        # until a broker rule declares it (the converge then creates it
+        # empty, cluster-deploy-lib.sh ensure_declared_secrets) and holds
+        # no value until the broker's first rotation: absent or unfilled
+        # it is an empty directory, an empty slot set, and every caller
+        # answered exactly as before — and the system of record must
+        # boot without it (DR rule 62dac114). Whole, never `items:` or a
+        # `subPath`, which kubelet never refreshes. 0440 + the pod
+        # fsGroup, as machine-token above. A playground renders this
+        # volume too and nothing fills it there: the broker's grant is
+        # in namespace boss alone.
+        - name: probe-reader
+          secret: {secretName: boss-probe-reader, optional: true, defaultMode: 0440}
         # The gate's mode, the boss-machine-gate ConfigMap above. The
         # whole ConfigMap as a directory, for the same refresh; optional,
         # because a missing mode file reads as `off` — a gate that
@@ -928,6 +960,11 @@ spec:
             # crates/core/boss-testing/tests/the_machine_gate_reports_and_refuses_nothing.rs.
             - {name: machine-token, mountPath: /etc/boss/machine-token, readOnly: true}
             - {name: machine-gate, mountPath: /etc/boss/machine-gate, readOnly: true}
+            # The probe-reader credential's slots (the probe-reader
+            # volume above), at machine_gate::DEFAULT_READER_DIR — the
+            # one directory every service's gate in this container reads,
+            # so no env var names a second path.
+            - {name: probe-reader, mountPath: /etc/boss/probe-reader, readOnly: true}
 ---
 apiVersion: v1
 kind: Service

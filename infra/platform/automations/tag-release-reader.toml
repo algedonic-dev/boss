@@ -1,0 +1,11 @@
+# automation:tag-release-reader — not in the role-report tally read
+# 2026-10-07T02:13Z (that tally is held in memory and starts again with the
+# pod, so absence there is not absence of the caller); registered from the
+# tree, where every_script_sender_signs_as_a_registered_automation found it.
+# Signs as audit-readonly today: infra/forge/tag-release.sh (READER_USER,
+# through boss-sor-read).
+
+[[automation]]
+id = "automation:tag-release-reader"
+role = "audit-readonly"
+description = 'The release tagger reading the closed trains to find the merge it tags (infra/forge/tag-release.sh). Reads only.'

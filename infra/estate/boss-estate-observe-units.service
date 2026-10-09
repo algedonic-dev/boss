@@ -15,6 +15,17 @@ After=network-online.target
 [Service]
 EnvironmentFile=/etc/boss/sor.env
 Type=oneshot
+# THE TOKEN'S HEADER FILE NEVER OUTLIVES A RUN (backlog df38075a, F1 of
+# review a92c0b94). No User=: a system unit under /etc/systemd/system
+# (infra/gcp/install-units.sh), so this runs as root. The wrap pair and
+# the observer's post present the machine token boss-gcp has held since
+# train #980; the 0600 header file infra/lib/secret-header.sh hands curl
+# is made in $RUNTIME_DIRECTORY when a unit declares one —
+# /run/boss-estate-observe-units, tmpfs, 0700, root's — and systemd
+# removes it when this oneshot stops whatever ended it. Without it the
+# file sat in the host's shared /tmp, where a killed tick left it.
+RuntimeDirectory=boss-estate-observe-units
+RuntimeDirectoryMode=0700
 Environment=HOST_ID=boss-gcp
 # NO UNITS= LINE, ON PURPOSE — the roster is DERIVED.
 #

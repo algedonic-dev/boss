@@ -1,0 +1,15 @@
+# automation:machine-token-deposit — not in the role-report tally read
+# 2026-10-07T02:13Z (that tally is held in memory and starts again with the
+# pod, so absence there is not absence of the caller); registered from the
+# tree, where every_script_sender_signs_as_a_registered_automation found it.
+# Signs as platform-admin today: infra/forge/machine-token-deposit.sh.
+# NARROWER THAN IT SIGNS. Its one request is GET /api/machine-gate/accepts,
+# to verify the token it deposited by effect; it writes nothing to the
+# system of record. UNMEASURED: no observation shows which policy resource
+# that read is judged under, so the read role is the narrowest fit and the
+# tally is where a would-deny for it shows before the resolver enforces.
+
+[[automation]]
+id = "automation:machine-token-deposit"
+role = "audit-readonly"
+description = 'The estate machine-token deposit on the forge asking the jobs machine gate which slot its token matches (infra/forge/machine-token-deposit.sh). Reads only.'

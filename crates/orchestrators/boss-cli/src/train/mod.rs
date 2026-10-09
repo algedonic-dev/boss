@@ -85,6 +85,7 @@ use crate::host_readiness;
 // module (consolidation H1, 2026-09-18). Every item keeps its path:
 // `crate::train::X` resolves through the re-exports below.
 mod boarding;
+mod carried_verdict;
 mod cars;
 mod conductor;
 mod consist;
@@ -102,6 +103,7 @@ mod sweep;
 mod verdicts;
 
 pub(crate) use boarding::*;
+pub(crate) use carried_verdict::*;
 pub(crate) use cars::*;
 use conductor::*;
 pub(crate) use consist::*;

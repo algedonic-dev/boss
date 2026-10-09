@@ -122,7 +122,7 @@ use crate::train::rows;
 /// (backlog 461159e7, CLAUDE.md §9a — collapsed rather than pinned):
 /// until 2026-09-30 this was a second literal `4` that no test held to
 /// `COMPILED_GATE_MAX_CONCURRENT`, although this comment said one did.
-/// The value, and why it is four again since policy v5, lives there.
+/// The value, and why it is three again since policy v7, lives there.
 const DEFAULT_MAX_CONCURRENT: usize = crate::delivery_policy::COMPILED_GATE_MAX_CONCURRENT as usize;
 
 /// The placeholders the runner manifest carries.
@@ -1143,6 +1143,87 @@ pub(crate) fn render_job(
     job_document(&filled)
 }
 
+/// The variable a gate Job is handed the instance's edit level in: the
+/// edit-level door's own answer, as JSON, read ONCE by the launcher.
+/// `infra/lint/a-car-stays-under-the-edit-level.sh` judges it and makes
+/// no request (backlog 934ccad1).
+pub(crate) const EDIT_LEVEL_ENV: &str = "BOSS_EDIT_LEVEL_ANSWER";
+
+/// The manifest line the handed variable is rendered after: the gate
+/// container's carrier variable. A manifest without it is from a branch
+/// cut before the runner stopped writing — its lint reads the door
+/// itself and would not look at a handed answer — so nothing is handed.
+const CARRIER_ENV_LINE: &str = "- {name: GATE_VERDICT_CARRIER, value: pod-log}";
+
+/// PURE: the rendered Job with the edit-level door's answer handed to
+/// its gate container — or the Job unchanged when there is nothing to
+/// hand, or nowhere to hand it.
+///
+/// WHY THE LAUNCHER READS IT. The gate pod runs a car's branch and holds
+/// no machine token (design c395e62c), so the lint's own read of
+/// `/api/tenant/edit-level` was a tokenless request from every gate —
+/// refused, and the gate with it, once the machine door enforces. The
+/// launcher holds the token and runs no branch code.
+///
+/// NOT A PLACEHOLDER, deliberately. A `$GATE_…` token in the manifest
+/// is refused by every `boss` that does not know it
+/// ([`check_placeholders`]), and the manifest is the launcher's TREE
+/// while `boss` is the cluster's binary: the car that added the token
+/// could never have been gated by the binary it was landing over. An
+/// env line added here needs nothing of the manifest but the line it
+/// follows.
+///
+/// ONLY THE DOOR'S OWN SHAPE is handed — an object stating `edit_level`
+/// (a tier name, or null for "declares none"). Anything else is not
+/// handed, and the lint then says so and reads the door itself.
+pub(crate) fn hand_edit_level(job: &str, answer: Option<&Value>) -> String {
+    let Some(answer) = answer.filter(|a| a.is_object() && a.get("edit_level").is_some()) else {
+        return job.to_string();
+    };
+    // A YAML single-quoted scalar: everything is literal but the quote,
+    // which is doubled. Compact JSON has no line break to fold.
+    let value = answer.to_string().replace('\'', "''");
+    let mut handed = false;
+    let mut out = String::with_capacity(job.len() + value.len() + 80);
+    for line in job.split_inclusive('\n') {
+        out.push_str(line);
+        if !handed && line.trim() == CARRIER_ENV_LINE {
+            let indent = &line[..line.len() - line.trim_start().len()];
+            if !line.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "{indent}- {{name: {EDIT_LEVEL_ENV}, value: '{value}'}}\n"
+            ));
+            handed = true;
+        }
+    }
+    out
+}
+
+/// The edit-level door's answer, for [`hand_edit_level`]. NEVER FATAL
+/// and never a guess: a door that cannot be read hands nothing, the
+/// launch goes on, and the lint in the pod says no level was handed.
+pub(crate) async fn edit_level_answer(http: &boss_core::machine_token::Client) -> Option<Value> {
+    match api(
+        http,
+        reqwest::Method::GET,
+        crate::dispatch::EDIT_LEVEL_PATH,
+        None,
+    )
+    .await
+    {
+        Ok(answer) => answer,
+        Err(e) => {
+            eprintln!(
+                "boss gate: the instance's edit level could not be read to hand to the gate \
+                 ({e:#}) — none is handed; the gate's own lint will say so"
+            );
+            None
+        }
+    }
+}
+
 /// The body that files a gate-run packet.
 ///
 /// PURE, AND TESTED, BECAUSE THE API IS PICKIER THAN IT LOOKS. This
@@ -1338,7 +1419,9 @@ impl ParkIntent {
     /// bare name — can record a FALSE GREEN, and warn anyway only
     /// because the text cannot tell them from the correct probes that
     /// share their shape. Their wording says so, since that is what a
-    /// reader decides on.
+    /// reader decides on. A seventh joined them on that same footing
+    /// (ce72aea9): a caller cleared by counting the machine gate's logged
+    /// facts alone, which this door admitted nine times in three days.
     pub fn probe_warnings(&self) -> Vec<String> {
         match &self.probe {
             None => Vec::new(),
@@ -1429,8 +1512,9 @@ impl ParkIntent {
         {
             anyhow::bail!(
                 "--park-probe invokes `{tool}`, which the FORGE HOST does not have.\n\n\
-                 A recorded probe does not run here. It runs on the forge host, as david, \
-                 in /home/david/boss, when this car's train arrives \
+                 A recorded probe does not run here. It runs on the forge host, as the \
+                 low-privilege account boss-probe, in a read-only view of the converged \
+                 checkout, when this car's train arrives \
                  (boss prove --from-car --unattended, run by the ops-runner) — a machine \
                  outside the cluster with no \
                  kubeconfig. Measured 2026-09-09 (f9304366): the first two cars ever to \
@@ -1449,7 +1533,8 @@ impl ParkIntent {
             anyhow::bail!(
                 "--park-probe runs `{verb}`, and a recorded probe does not move: the door \
                  places it in the converged checkout of main.\n\n\
-                 It runs on the forge host, as david, with cwd already that checkout \
+                 It runs on the forge host, as the low-privilege account boss-probe, with \
+                 cwd already a read-only view of that checkout \
                  (boss prove --from-car --unattended) — not on this pod, whose checkout \
                  paths the forge does not have. Measured 2026-09-22 (4bb6797c): two cars \
                  recorded `cd /work/boss && git show HEAD:… | grep -q …`, both claims \
@@ -3176,9 +3261,46 @@ pub(crate) async fn api_at_signed(
     }
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("{service} {method} {path} -> {status}: {}", body.trim());
+        bail!(
+            "{service} {method} {path} -> {status}: {}{}",
+            body.trim(),
+            ways_out(&body)
+        );
     }
     success_answer(&service, &method, path, status, &body)
+}
+
+/// The ways out a refusal names, one to a line under the body.
+///
+/// A refusal that lists `ways_out` is one the reader can only act on by
+/// reading them — the jobs API's answer to a `human_only` step completed
+/// without a passkey, which is what `boss step complete` meets on such a
+/// step since 2026-10-07 (item 570c66e9): no CLI carries a passkey. They
+/// sat inside one line of JSON, after the detail; they are printed again
+/// where a person at a terminal will see them. Empty for every other
+/// body, so no other refusal reads differently.
+fn ways_out(body: &str) -> String {
+    let Ok(parsed) = serde_json::from_str::<Value>(body) else {
+        return String::new();
+    };
+    let ways: Vec<&str> = parsed
+        .get("ways_out")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if ways.is_empty() {
+        return String::new();
+    }
+    let head = if parsed.get("human_only") == Some(&Value::Bool(true)) {
+        "this step is human_only: it completes only on a passkey, which no CLI carries"
+    } else {
+        "the refusal names its ways out"
+    };
+    let mut text = format!("\n\n{head}. Ways out:");
+    for (i, way) in ways.iter().enumerate() {
+        text.push_str(&format!("\n  {}. {way}", i + 1));
+    }
+    text
 }
 
 /// A redirect's target as a refusal may name it: `scheme://host[:port]`,
@@ -4381,6 +4503,11 @@ pub async fn run(
         bail!("{why}");
     }
 
+    // The instance's edit level, read here by the holder of the token
+    // and handed to the Job, so the pod that runs the branch makes no
+    // request for it (backlog 934ccad1).
+    let job = hand_edit_level(&job, edit_level_answer(&http).await.as_ref());
+
     let mut child = kubectl(namespace)
         .args(["create", "-f", "-"])
         .stdin(Stdio::piped())
@@ -4603,6 +4730,39 @@ pub(crate) fn silent_packet_verdict(job_finished: bool, job_failed: bool) -> Opt
          the reporting call is what went missing."
             .to_string(),
     )
+}
+
+/// How long after its Job finished a verdict-carrying gate's packet may
+/// stay silent before the wait says so (backlog 934ccad1).
+///
+/// A runner of the pod-log layout writes nothing to the system of
+/// record: the conductor records its verdict from the pod log on its next
+/// reconcile, about two minutes apart, and a reconcile can be minutes
+/// late behind a train it is merging or a jobs API that is rolling. So a
+/// finished Job with a silent packet is the NORMAL state for a while —
+/// where under the old layout, whose runner reported before it exited,
+/// it meant the report was lost. Fifteen minutes is several reconciles
+/// and still far short of a gate.
+pub(crate) const RECORDER_TOLERANCE: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// What a silent packet means once a verdict-CARRYING Job has finished:
+/// `None` while the conductor may still be on its way, and after
+/// [`RECORDER_TOLERANCE`] the reason the wait stops — which is about the
+/// recorder, never about the branch.
+pub(crate) fn carried_silence(finished_for: std::time::Duration) -> Option<String> {
+    if finished_for < RECORDER_TOLERANCE {
+        return None;
+    }
+    Some(format!(
+        "the gate Job finished over {} min ago and the conductor has not recorded its verdict.\n  \
+         That is NOT a red gate. This runner writes nothing to the system of record: it \
+         leaves its receipt in its pod log (`kubectl logs job/<job> -c gate` — the \
+         `gate-runner: receipt` line and the `receipt-end` trailer after it, kept for a day) \
+         and the conductor's reconcile records it. Read the conductor's journal for this \
+         gate-run (`kubectl -n boss-dev logs deploy/boss-conductor`), and the packet again \
+         later: the verdict is recorded for as long as the Job exists.",
+        RECORDER_TOLERANCE.as_secs() / 60
+    ))
 }
 
 /// The verdict recorded on THIS packet, or `None` while it is silent.
@@ -4846,6 +5006,12 @@ async fn wait_for_verdict(
     // Observed on 2026-08-30: the SoR dropped mid-gate, this poller
     // died, and the gate it was watching went green on its own.
     let mut absent_since: Option<std::time::Instant> = None;
+    // When this wait first saw a verdict-carrying Job finished with its
+    // packet still silent (934ccad1) — the conductor's turn, timed.
+    let mut carried_since: Option<std::time::Instant> = None;
+    // The conductor's note that it cannot read the gate Jobs, as last
+    // printed here (backlog 06ae925a): said when it appears or changes.
+    let mut recorder_blocked: Option<String> = None;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         let fetched = match api(
@@ -4915,8 +5081,35 @@ async fn wait_for_verdict(
         // The packet is silent. Before sleeping again, find out whether
         // anything is still coming — an unbounded wait on a dead Job is
         // how this hung forever.
-        let (finished, failed) = job_state(namespace, job_name);
-        if let Some(why) = silent_packet_verdict(finished, failed) {
+        let state = job_state(namespace, job_name);
+        // THE RECORDER MAY BE THE ONE THAT IS STUCK. A conductor that
+        // cannot read the gate Jobs says so on this packet; for a day it
+        // said so only in its own pod log, and every waiter here timed
+        // out blaming the gate (backlog 06ae925a).
+        let blocked = crate::train::recorder_blocked_line(&job);
+        if blocked.is_some() && blocked != recorder_blocked {
+            eprintln!("boss gate: {}", blocked.as_deref().unwrap_or_default());
+        }
+        recorder_blocked = blocked;
+        if state.carrier && state.finished {
+            // THE CONDUCTOR'S TURN. This runner left its verdict in its
+            // pod log and wrote nothing; the conductor records it. Said
+            // once, then waited out — the old reading ("the Job finished
+            // and the packet never reported") ended the wait here on
+            // every gate of the new layout.
+            if carried_since.is_none() {
+                eprintln!(
+                    "boss gate: the gate Job has finished; the conductor records its verdict \
+                     from the pod log on its next reconcile (about two minutes) — still waiting"
+                );
+            }
+            let since = *carried_since.get_or_insert_with(std::time::Instant::now);
+            if let Some(why) = carried_silence(since.elapsed()) {
+                bail!("{why}\n  Job: {job_name} (namespace {namespace}), packet: {packet}");
+            }
+            continue;
+        }
+        if let Some(why) = silent_packet_verdict(state.finished, state.failed) {
             bail!("{why}\n  Job: {job_name} (namespace {namespace}), packet: {packet}");
         }
         // A POD THAT NEVER STARTS IS A REFUSAL, WITHIN MINUTES. The Job
@@ -5249,24 +5442,50 @@ async fn record_gated_head(http: &boss_core::machine_token::Client, packet: &str
 /// Is the gate Job finished, and did it fail? `(false, _)` when the state
 /// cannot be read — an unreadable Job is not evidence of anything, and
 /// must not end the wait.
-fn job_state(namespace: &str, job_name: &str) -> (bool, bool) {
+fn job_state(namespace: &str, job_name: &str) -> JobState {
     let out = kubectl(namespace)
-        .args([
-            "get",
-            job_name,
-            "-o",
-            "jsonpath={.status.succeeded} {.status.failed}",
-        ])
+        .args(["get", job_name, "-o", "json"])
         .output();
-    let Ok(o) = out else { return (false, false) };
+    let Ok(o) = out else {
+        return JobState::default();
+    };
     if !o.status.success() {
-        return (false, false);
+        return JobState::default();
     }
-    let t = String::from_utf8_lossy(&o.stdout);
-    let mut it = t.split_whitespace();
-    let succeeded: i32 = it.next().unwrap_or("0").parse().unwrap_or(0);
-    let failed: i32 = it.next().unwrap_or("0").parse().unwrap_or(0);
-    (succeeded > 0 || failed > 0, failed > 0)
+    serde_json::from_slice::<Value>(&o.stdout)
+        .map(|j| job_state_from_json(&j))
+        .unwrap_or_default()
+}
+
+/// What `--wait` reads off its gate Job: whether it has finished, how,
+/// and whether its runner is of the layout that leaves its verdict in
+/// the pod log for the conductor to record (backlog 934ccad1). A Job
+/// that cannot be read is the default — still running, old layout —
+/// which only ever keeps the wait waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct JobState {
+    pub finished: bool,
+    pub failed: bool,
+    pub carrier: bool,
+}
+
+/// PURE: `kubectl get job/<name> -o json`, as [`JobState`].
+///
+/// JSON, not the two-column jsonpath this replaced: an unset
+/// `.status.succeeded` printed as nothing, so a FAILED Job's `1` was
+/// read as the first column and the wait called a dead runner finished.
+pub(crate) fn job_state_from_json(job: &Value) -> JobState {
+    let count = |p: &str| job.pointer(p).and_then(Value::as_i64).unwrap_or(0);
+    let (succeeded, failed) = (count("/status/succeeded"), count("/status/failed"));
+    JobState {
+        finished: succeeded > 0 || failed > 0,
+        failed: failed > 0,
+        carrier: job
+            .pointer("/metadata/labels")
+            .and_then(|l| l.get(crate::train::CARRIER_LABEL))
+            .and_then(Value::as_str)
+            == Some(crate::train::CARRIER_POD_LOG),
+    }
 }
 
 /// Which of these Jobs are still running?
@@ -5332,6 +5551,31 @@ fn job_names(table: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the operator meets first on a human-only step: the jobs
+    /// API's refusal, with its two ways out printed one to a line.
+    #[test]
+    fn a_human_only_refusal_prints_its_ways_out_under_the_body() {
+        let body = json!({
+            "error": "step requires stronger assurance than this request carries",
+            "required": "presence",
+            "human_only": true,
+            "ways_out": ["complete it from a surface", "give the step a sign-off role"],
+        })
+        .to_string();
+        let said = ways_out(&body);
+        assert!(said.contains("human_only"), "{said}");
+        assert!(said.contains("passkey"), "{said}");
+        assert!(said.contains("\n  1. complete it from a surface"), "{said}");
+        assert!(
+            said.contains("\n  2. give the step a sign-off role"),
+            "{said}"
+        );
+        // Every other refusal reads exactly as it did.
+        assert_eq!(ways_out(r#"{"error":"sign-offs incomplete"}"#), "");
+        assert_eq!(ways_out("step not found"), "");
+        assert_eq!(ways_out(r#"{"ways_out":[]}"#), "");
+    }
 
     /// Backlog b24e29cb item 1. The conductor settles an orphan with no
     /// atomic claim on the packet, so a reused packet can be closed
@@ -6446,6 +6690,61 @@ mod tests {
                 .into(),
         );
         p.require_complete().expect("epochs compare");
+    }
+
+    /// ONE FACT PER CALLER PER PROCESS, SAID WHERE THE PROBE IS TYPED
+    /// (backlog ce72aea9). Unlike the shape below it this one fails OPEN,
+    /// and it is still a warning: the text of an absence claim and of a
+    /// presence claim over the same facts is the same text.
+    #[test]
+    fn a_park_probe_that_clears_a_caller_from_the_gate_log_alone_is_warned_about() {
+        // Car f636c71b's first window read, as gate-run 6715ffbd admitted
+        // it at this door without a word (backlog ce72aea9).
+        let log = r#"bad=$(boss-sor-read "/api/events/gate-window?gate=machine-gate&hours=$hours" | jq -r --argjson cut "$cut" '
+  def epoch: sub("\\.[0-9]+"; "") | fromdateiso8601;
+  if (.log_error == null) and ((.log.dirty | type) == "array") then
+    [ .log.dirty[] | select(.kind == "machine_gate.would_refuse")
+      | select(.payload.key.user == "automation:discover-admission-source")
+      | select((.at | epoch) > $cut) ] | length
+  else empty end')
+case ${bad:-empty} in empty|*[!0-9]*) echo 'not yet: the machine-gate window could not be read'; exit 75;; esac
+if [ "$bad" -gt 0 ]; then echo "FAILED: $bad would-refuse fact(s)"; exit 1; fi
+"#;
+        let mut p = park_full();
+        p.probe = Some(log.into());
+        p.expect = Some("claim:ok".into());
+        assert!(
+            p.require_complete().is_ok(),
+            "a warning must not become a refusal: {:?}",
+            p.require_complete()
+        );
+        let said = p.probe_warnings();
+        assert!(
+            said.iter().any(|w| w.starts_with(
+                "boss gate: --park-probe THIS PROBE CLEARS A CALLER FROM THE GATE LOG ALONE"
+            )),
+            "{said:?}"
+        );
+        // The probe the same-head re-gate (ac6706d3) carried — the live
+        // tally's rows read under the log — is admitted in silence.
+        let mut fixed = park_full();
+        fixed.probe = Some(format!(
+            "{log}{}",
+            r#"live=$(boss-sor-read "/api/events/gate-window?gate=machine-gate&hours=$hours" | jq -r --argjson cut "$cut" '
+  def epoch: sub("\\.[0-9]+"; "") | fromdateiso8601;
+  ([ .live[]? | select(.service == "jobs") ] | first) as $j
+  | if $j == null or $j.error != null or (($j.snapshot.rows | type) != "array") or (($j.snapshot.overflow // 0) != 0) then "unreadable"
+    else ([ $j.snapshot.rows[] | select(.user == "automation:discover-admission-source" and .presented == "none") | select((.last_seen | epoch) > $cut) ] | length | tostring) end')
+case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally could not be read whole'; exit 75;; esac
+if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
+"#
+        ));
+        fixed.expect = Some("claim:ok".into());
+        assert!(
+            fixed.probe_warnings().is_empty(),
+            "{:?}",
+            fixed.probe_warnings()
+        );
     }
 
     /// THE SHAPE THAT COULD NOT PASS, NAMED AT THE DOOR THAT ADMITTED IT
@@ -8877,6 +9176,181 @@ kind: Job\n\
     fn a_running_job_does_not_end_the_wait() {
         assert!(silent_packet_verdict(false, false).is_none());
         assert!(silent_packet_verdict(false, true).is_none());
+    }
+
+    /// THE LAUNCHER HANDS THE EDIT LEVEL TO THE JOB (backlog 934ccad1): the
+    /// door's answer, whole, as one env line of the gate container in the
+    /// manifest THIS TREE SHIPS — and nothing where there is nothing to
+    /// hand or nowhere to hand it.
+    #[test]
+    fn the_edit_level_is_handed_to_the_gate_container_of_the_shipped_manifest() {
+        let manifest = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../infra/gate-runner/gate-runner.yaml"),
+        )
+        .expect("the shipped manifest");
+        let job = render_job(&manifest, "feat/x", "pkt", "--auto").expect("renders");
+        let none = json!({"edit_level": null, "manifest": "/opt/boss/tenant/seeds/tenant.toml"});
+        let handed = hand_edit_level(&job, Some(&none));
+        let line = handed
+            .lines()
+            .find(|l| l.contains(EDIT_LEVEL_ENV))
+            .expect("the shipped manifest has the line the answer is handed after");
+        assert_eq!(
+            line.trim(),
+            r#"- {name: BOSS_EDIT_LEVEL_ANSWER, value: '{"edit_level":null,"manifest":"/opt/boss/tenant/seeds/tenant.toml"}'}"#
+        );
+        // In the gate container's env list: directly after the carrier
+        // variable, at its indent, and exactly once.
+        let lines: Vec<&str> = handed.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.contains(EDIT_LEVEL_ENV))
+            .unwrap();
+        assert_eq!(lines[at - 1].trim(), CARRIER_ENV_LINE);
+        assert_eq!(
+            line.len() - line.trim_start().len(),
+            lines[at - 1].len() - lines[at - 1].trim_start().len()
+        );
+        assert_eq!(handed.matches(EDIT_LEVEL_ENV).count(), 1);
+        // Nothing else moved.
+        assert_eq!(
+            handed.replace(&format!("{line}\n"), ""),
+            job,
+            "handing the level changed more than its own line"
+        );
+        // A quote in the answer cannot close the scalar.
+        let quoted = hand_edit_level(&job, Some(&json!({"edit_level": "da'ta"})));
+        assert!(
+            quoted.contains(r#"value: '{"edit_level":"da''ta"}'}"#),
+            "{quoted}"
+        );
+        // Nothing to hand, or not the door's shape: the Job as rendered.
+        for not in [None, Some(json!("data")), Some(json!({"error": "denied"}))] {
+            assert_eq!(hand_edit_level(&job, not.as_ref()), job);
+        }
+        // Nowhere to hand it: a manifest from before the carrier.
+        let old = job.replace(CARRIER_ENV_LINE, "");
+        assert_eq!(hand_edit_level(&old, Some(&none)), old);
+    }
+
+    /// Both launchers hand it, on the Job they are about to create — held
+    /// in the source, because each call sits between a packet filed on a
+    /// live API and a `kubectl create`.
+    #[test]
+    fn both_launchers_hand_the_edit_level_to_the_job_they_create() {
+        let gate = include_str!("gate.rs");
+        let run = &gate[gate.find("pub async fn run(").expect("run")..];
+        let handed = run
+            .find("let job = hand_edit_level(&job, edit_level_answer(&http).await.as_ref());")
+            .expect("boss gate hands the edit level to its Job");
+        let create = run
+            .find(".args([\"create\", \"-f\", \"-\"])")
+            .expect("boss gate creates its Job");
+        assert!(handed < create, "handed after the Job was created");
+        let conductor = include_str!("train/conductor.rs");
+        let launch = &conductor[conductor
+            .find("async fn launch_gate(")
+            .expect("the conductor's launch")..];
+        let launch = &launch[..launch.find("\n    }\n").expect("its end")];
+        let read = launch
+            .find(".api(Method::GET, crate::dispatch::EDIT_LEVEL_PATH, None)")
+            .expect("the conductor reads the edit-level door");
+        let handed = launch
+            .find("let job = crate::gate::hand_edit_level(&job, edit_level.as_ref());")
+            .expect("the conductor hands the edit level to its Job");
+        let create = launch
+            .find(".args([\"create\", \"-f\", \"-\"])")
+            .expect("the conductor creates its Job");
+        assert!(read < handed && handed < create);
+    }
+
+    /// THE CONDUCTOR'S TURN IS NOT A LOST REPORT (backlog 934ccad1). A
+    /// runner of the pod-log layout writes nothing, so its Job finishes
+    /// BEFORE its packet has a verdict — every time. The wait keeps
+    /// waiting for the recorder, and only after the tolerance says so,
+    /// as a statement about the recorder and never about the branch.
+    #[test]
+    fn a_finished_carrier_job_with_a_silent_packet_waits_for_the_conductor() {
+        use std::time::Duration;
+        assert!(carried_silence(Duration::ZERO).is_none());
+        assert!(carried_silence(RECORDER_TOLERANCE - Duration::from_secs(1)).is_none());
+        let why = carried_silence(RECORDER_TOLERANCE).expect("the tolerance ends the wait");
+        assert!(
+            why.contains("NOT a red gate") && why.contains("conductor"),
+            "{why}"
+        );
+        assert!(
+            RECORDER_TOLERANCE >= Duration::from_secs(600),
+            "several reconciles, or a late one ends every wait"
+        );
+    }
+
+    /// The Job as `--wait` reads it: finished or not, failed or not, and
+    /// which layout — the launcher's label, under its one value.
+    #[test]
+    fn the_wait_reads_the_jobs_end_and_its_layout() {
+        let job = |labels: Value, status: Value| {
+            job_state_from_json(&json!({"metadata": {"labels": labels}, "status": status}))
+        };
+        let carrier = json!({"boss.dev/packet": "p", "boss.dev/verdict-carrier": "pod-log"});
+        assert_eq!(
+            job(carrier.clone(), json!({"active": 1})),
+            JobState {
+                finished: false,
+                failed: false,
+                carrier: true
+            }
+        );
+        // A FAILED Job with `succeeded` unset: the shape the two-column
+        // jsonpath read as "finished, not failed".
+        assert_eq!(
+            job(carrier.clone(), json!({"failed": 1})),
+            JobState {
+                finished: true,
+                failed: true,
+                carrier: true
+            }
+        );
+        assert_eq!(
+            job(json!({"boss.dev/packet": "p"}), json!({"succeeded": 1})),
+            JobState {
+                finished: true,
+                failed: false,
+                carrier: false
+            }
+        );
+        for other in ["true", "", "pod-logs"] {
+            assert!(
+                !job(json!({"boss.dev/verdict-carrier": other}), json!({})).carrier,
+                "`{other}` is not the pod-log layout"
+            );
+        }
+        assert_eq!(job_state_from_json(&json!({})), JobState::default());
+    }
+
+    /// The wait's loop asks the layout BEFORE it reads a finished Job as
+    /// a lost report — held in the source, because the loop sleeps thirty
+    /// seconds a turn and talks to a cluster.
+    #[test]
+    fn the_wait_asks_the_layout_before_it_calls_a_finished_job_silent() {
+        let src = include_str!("gate.rs");
+        let body = &src[src
+            .find("async fn wait_for_verdict(")
+            .expect("wait_for_verdict")..];
+        let body = &body[..body.find("\n}\n").expect("its end")];
+        let carried = body
+            .find("if state.carrier && state.finished {")
+            .expect("the carrier arm");
+        let silent = body
+            .find("silent_packet_verdict(state.finished, state.failed)")
+            .expect("the old-layout arm");
+        assert!(carried < silent, "the old-layout reading runs first");
+        let arm = &body[carried..silent];
+        assert!(
+            arm.contains("carried_silence(since.elapsed())") && arm.contains("continue;"),
+            "the carrier arm must wait, and never fall through to the old reading"
+        );
     }
 
     /// THE FEEDBACK'S CASE (cf0021ae): the pod died, the Job says failed,

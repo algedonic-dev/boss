@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# preflight: serial — reads the edit level off the live jobs API through lib/sor-read.sh; one reader of the record per pre-flight
+# preflight: serial — reads the edit level off the live jobs API through lib/sor-read.sh when no launcher handed it in; one reader of the record per pre-flight
 #
 # a-car-stays-under-the-edit-level — the gate half of the hosting door
 # (a479faf7; design 01c3cc3f "Tiers are one registry, read three
@@ -56,6 +56,27 @@
 # 5xx, a level the map does not know — or git could not answer. Never
 # a verdict on a guess: the gate turns 3 into a refusal receipt, not a
 # red, and `--quick` warns.
+#
+# HANDED IN, WHERE A LAUNCHER HOLDS IT (backlog 934ccad1; design
+# bdc60b65, question gate-verdict). A gate Job runs a car's branch, so
+# it holds no machine token (design c395e62c) and this read was the one
+# request such a pod still made (277 would-refuse facts in 72 h,
+# 2026-10-06) - refused, and every gate with it, the day the machine door
+# enforces. So the launcher, which holds the token and runs no branch
+# code (`boss gate`; the conductor for a train's gate and the dock's
+# re-gate), reads the door ONCE and hands its answer to the Job as
+# BOSS_EDIT_LEVEL_ANSWER: the door's own JSON object, whole, so this
+# file judges a handed answer exactly as it judges a read one. Handed,
+# no request is made. A handed answer that is not that object is CANNOT
+# ANSWER (exit 3), never a level guessed.
+#
+# NOT HANDED, it says so and reads the door itself, as it always did:
+# the dev pod's pre-flight, a hand run, and a gate launched by a `boss`
+# from before this landed (the launcher is the cluster's binary, this
+# file is the branch's) have no launcher's answer. Under an enforcing
+# door that read is refused in a pod with no token, and the refusal is
+# this lint's exit 3 - so the fallback can only ever cost a request,
+# never pass a car.
 #
 # NO ESTATE. `BOSS_ESTATE=none` (the public mirror's workflow, and only
 # it) says there is no instance, so no level to read: the paths are
@@ -128,12 +149,22 @@ fi
 # ---------------------------------------------------------------------------
 # The level, off the instance.
 # ---------------------------------------------------------------------------
-command -v curl >/dev/null 2>&1 || skip "curl is not on this box"
 command -v jq >/dev/null 2>&1 || skip "jq is not on this box"
 
 body=$(mktemp) || exit 1
 trap 'rm -f "$body"' EXIT
-code=$(lint_sor_read "$LINT" "the jobs API" "$URL" "$body")
+if [ -n "${BOSS_EDIT_LEVEL_ANSWER:-}" ]; then
+    # The launcher's answer: judged below exactly as a read one is.
+    printf '%s' "$BOSS_EDIT_LEVEL_ANSWER" > "$body"
+    code=200
+    ANSWERED="the launcher's BOSS_EDIT_LEVEL_ANSWER"
+    echo "$LINT: the edit level was handed in by this run's launcher (BOSS_EDIT_LEVEL_ANSWER) — no request to the instance"
+else
+    echo "$LINT: no edit level was handed in (BOSS_EDIT_LEVEL_ANSWER is unset — a pre-flight, a hand run, or a launcher from before backlog 934ccad1) — reading $URL"
+    command -v curl >/dev/null 2>&1 || skip "curl is not on this box"
+    code=$(lint_sor_read "$LINT" "the jobs API" "$URL" "$body")
+    ANSWERED="$URL"
+fi
 case "$code" in
     200) ;;
     404)
@@ -147,7 +178,7 @@ case "$code" in
 esac
 
 level=$(jq -r 'if type == "object" and has("edit_level") then (.edit_level // "") else error("not an edit-level answer") end' "$body" 2>/dev/null) \
-    || skip "$URL answered something other than an edit-level object"
+    || skip "$ANSWERED answered something other than an edit-level object"
 if [ -z "$level" ]; then
     echo "$LINT: no edit level — the instance's manifest declares none ($(jq -r '.manifest // "no manifest"' "$body")), so nothing is enforced"
     echo "$LINT: clean"

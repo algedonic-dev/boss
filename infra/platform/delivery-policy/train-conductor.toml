@@ -78,6 +78,26 @@
 # The larger option (conductor cpu 4 plus a parallel runner, ~20-25 s)
 # stays open on that packet.
 #
+# Version 7 (backlog 17f6170c, 2026-10-07, David: bays go 4 to 3 for
+# now): gate_max_concurrent 4 -> 3, bumped from the LIVE newest (v6,
+# read off /api/delivery/policy/train-conductor at 2026-10-07 00:3xZ).
+# v5 took four on the grounds that four "has never been measured with
+# the I/O split across two" disks. Measured 2026-10-06/07 on w-1: four
+# car gates plus the train gate took 75+ minutes each against a
+# 42-minute median; one gate, 81 minutes in, had been stalled on IO for
+# 43 percent of its wall time (io.pressure some 2097 s) at 1.3 cores
+# mean; and gate-run bd136c2e failed on three loopback deadline tests
+# its car does not touch (targets that take 10-13 s took 106 and
+# 422 s). The gate volume (/var/mnt/gate, the Kingston NV3 fitted
+# 2026-09-30) is xfs mounted without discard and has never been
+# trimmed while every gate reflink-copies a 78 GB seed onto it and
+# deletes its workspace. Three is the bound until the drive is fixed:
+# back to four when a LOADED measurement after the trim says so,
+# recorded on that packet, never because the trim merely ran. The
+# gate's 40Gi request is untouched, so the disk arithmetic v5 pinned
+# (a_gate_requests_what_the_new_layout_uses_and_the_bays_fit) only
+# gets easier: 4 x 40 + 154 = 314 of 789 GiB.
+#
 # The compiled fallback in delivery_policy.rs is held equal to this
 # file by `the_bundle_equals_the_compiled_fallback` (boss-cli): the
 # conductor runs on these numbers whether or not the registry answers,
@@ -88,7 +108,7 @@
 
 [[delivery_policy]]
 name = "train-conductor"
-version = 6
+version = 7
 status = "active"
 # THE HOLD: red trains a car may be released from before boarding
 # leaves it behind until a human looks.
@@ -110,6 +130,7 @@ blip_cause_budget = 80
 # must show before boarding assembles a consist.
 ci_host_floor_gb = 40
 # How many gates `boss gate` admits at once before it refuses — the
-# number the CLI obeys and the number the yard draws as slots. Four
-# since v5, the workspace on w-1's second NVMe (see the header).
-gate_max_concurrent = 4
+# number the CLI obeys and the number the yard draws as slots. Three
+# since v7, until the untrimmed gate drive is fixed and four is
+# measured under load (see the header).
+gate_max_concurrent = 3

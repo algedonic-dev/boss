@@ -1084,9 +1084,7 @@ async fn main() -> Result<()> {
         policy,
         roles.clone(),
         mode.clone(),
-        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
-            boss_policy_client::role_service::REPORT_CAPACITY,
-        )),
+        boss_events::role_tally::durable("dispatcher", mode.clone(), Some(&pool)),
     );
     let policy = wiring.policy;
 

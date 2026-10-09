@@ -144,6 +144,16 @@ for a in "$@"; do
     case "$a" in http://*|https://*) url="$a" ;; esac
     prev="$a"
 done
+# Every request, with whether a `-H @file` it was handed holds the
+# machine token's header (backlog 44b2087e).
+tok=no; prev=""
+for a in "$@"; do
+    if [ "$prev" = -H ]; then
+        case "$a" in @*) if grep -q '^x-boss-machine-token: ' "${{a#@}}" 2>/dev/null; then tok=yes; fi ;; esac
+    fi
+    prev="$a"
+done
+printf '%s %s token=%s\n' "$method" "$url" "$tok" >> '{log}.calls'
 if [ "$method" != GET ]; then
     printf '%s %s\n' "$method" "$url" >> '{writes}'
     case "$data" in @*) cat "${{data#@}}" >> '{writes}'; echo >> '{writes}' ;; esac
@@ -238,6 +248,17 @@ exit 22
 
     fn log(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// Every request the stub received, one line each: `<method> <url>
+    /// token=<yes|no>` — `yes` when a header file it was handed holds the
+    /// machine token's header.
+    fn calls(&self) -> Vec<String> {
+        std::fs::read_to_string(format!("{}.calls", self.log.display()))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     /// The `code_scanning` reading the verb PATCHed onto the packet.
@@ -441,6 +462,127 @@ fn a_completed_prs_checks_and_alerts_are_read_onto_the_packet_and_the_step_compl
 }
 
 /// How many times a run asked GitHub for the head's check-runs.
+/// EVERY REQUEST TO THE SYSTEM OF RECORD CARRIES THE MACHINE TOKEN, AND
+/// NONE TO GITHUB DOES (backlog 44b2087e, 2026-10-07). The verb called
+/// the reader and handed curl its file on six requests; the seventh, the
+/// read of the open publish packet, went out with `x-boss-user` alone,
+/// and the shared pr-state pass's first read did the same. Measured
+/// live: 6 tokenless `GET /api/jobs` from this verb between 17:30Z and
+/// 18:00Z, every 15 minutes while a publish PR stands open — callers the
+/// jobs gate would refuse under `enforce`. Read here from what the stub
+/// RECEIVED, request by request: a complete reading sends reads, a
+/// packet PATCH, a step merge and a step PUT to the system of record,
+/// and check-run and annotation reads to GitHub.
+///
+/// The token is presented, never required: with no token on the host
+/// the same run sends the same requests, exits the same, and none
+/// carries a header.
+#[test]
+fn every_request_to_the_record_carries_the_machine_token_and_none_to_github() {
+    let token = "stub-machine-token-44b2087e";
+    let go = |case: &str, with_token: bool| -> (i32, Vec<String>) {
+        let run = Run::new(case, open_pr_done());
+        run.route_pr239_complete();
+        let mount = run.root.join("machine-token");
+        std::fs::create_dir_all(&mount).unwrap();
+        if with_token {
+            write_file(&mount.join("current"), &format!("{token}\n"));
+        }
+        let mount = mount.display().to_string();
+        let no_env = run.root.join("no-sor.env").display().to_string();
+        let (code, text) = run.go(
+            &[],
+            &[
+                ("BOSS_MACHINE_TOKEN_DIR", mount.as_str()),
+                ("BOSS_MACHINE_TOKEN_HOSTS", "jobs.invalid"),
+                ("BOSS_SOR_ENV", no_env.as_str()),
+            ],
+        );
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            !text.contains(token),
+            "the token is in the verb's output: {text}"
+        );
+        assert!(
+            !run.log().contains(token),
+            "the token is in curl's argv:\n{}",
+            run.log()
+        );
+        (code, run.calls())
+    };
+
+    let (_, calls) = go("token-every-request", true);
+    let to_record: Vec<&String> = calls
+        .iter()
+        .filter(|l| l.contains("://jobs.invalid/"))
+        .collect();
+    let to_github: Vec<&String> = calls
+        .iter()
+        .filter(|l| l.contains("://api.github.invalid/"))
+        .collect();
+    assert_eq!(
+        to_record.len() + to_github.len(),
+        calls.len(),
+        "a request went somewhere this case does not know:\n{}",
+        calls.join("\n")
+    );
+    assert!(
+        to_record
+            .iter()
+            .any(|l| l.starts_with("GET ") && l.contains("status=open&limit=20&full=true")),
+        "the stub never received the open-packet read:\n{}",
+        calls.join("\n")
+    );
+    assert!(
+        to_record.iter().filter(|l| l.starts_with("GET ")).count() >= 2
+            && to_record.iter().any(|l| l.starts_with("PATCH "))
+            && to_record.iter().any(|l| l.starts_with("PUT ")),
+        "a complete reading reads twice and writes; this run did less:\n{}",
+        calls.join("\n")
+    );
+    let bare: Vec<&&String> = to_record
+        .iter()
+        .filter(|l| !l.ends_with(" token=yes"))
+        .collect();
+    assert!(
+        bare.is_empty(),
+        "these requests reached the system of record without the machine token while the host \
+         holds one:\n{}\nall requests:\n{}",
+        bare.iter()
+            .map(|l| format!("  {l}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        calls.join("\n")
+    );
+    assert!(
+        !to_github.is_empty(),
+        "no request reached GitHub:\n{}",
+        calls.join("\n")
+    );
+    assert!(
+        to_github.iter().all(|l| l.ends_with(" token=no")),
+        "the estate machine token left the estate, to GitHub:\n{}",
+        calls.join("\n")
+    );
+
+    let (_, without) = go("token-every-request-absent", false);
+    let strip = |v: &[String]| -> Vec<String> {
+        v.iter()
+            .map(|l| l.rsplit_once(" token=").unwrap().0.to_string())
+            .collect()
+    };
+    assert_eq!(
+        strip(&without),
+        strip(&calls),
+        "a host with no token sends exactly the same requests"
+    );
+    assert!(
+        without.iter().all(|l| l.ends_with(" token=no")),
+        "no token on the host, and a request carried a header anyway:\n{}",
+        without.join("\n")
+    );
+}
+
 fn check_run_reads(run: &Run) -> usize {
     run.log()
         .matches(&format!("/commits/{HEAD}/check-runs"))

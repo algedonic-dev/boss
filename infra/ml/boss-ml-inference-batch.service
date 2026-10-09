@@ -39,7 +39,12 @@ User=boss
 # the path. User=boss cannot write /run itself, so the file lives in the
 # unit's own RuntimeDirectory, which systemd removes only after
 # ExecStopPost has run.
+#
+# 0700 since backlog df38075a (F1, second car): the wrap pair's machine
+# token header file is made in this directory too, and systemd's default
+# is 0755. Every reader of the summary is this unit's own Exec line.
 RuntimeDirectory=boss-ml-inference-batch
+RuntimeDirectoryMode=0700
 Environment=BOSS_RUN_SUMMARY_FILE=/run/boss-ml-inference-batch/summary.json
 ExecStartPre=-/opt/boss/infra/boss-maintenance-wrap.sh maintenance-ml-inference-batch "ML inference batch"
 ExecStart=/opt/boss/infra/ml/run-inference-batch.sh

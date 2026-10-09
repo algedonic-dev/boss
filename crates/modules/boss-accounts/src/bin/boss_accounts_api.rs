@@ -117,9 +117,7 @@ async fn main() -> Result<()> {
         )),
         roles.clone(),
         mode.clone(),
-        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
-            boss_policy_client::role_service::REPORT_CAPACITY,
-        )),
+        boss_events::role_tally::durable("accounts", mode.clone(), Some(&pool)),
     );
 
     // Compose the six routers under one app. Mirrors the boss-people-api

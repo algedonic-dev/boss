@@ -215,6 +215,39 @@ CLI_INSTALLER="${BOSS_GCP_CONVERGE_CLI_INSTALLER:-$REPO/infra/estate/install-cli
 . "${BOSS_GCP_CONVERGE_INFRA:-$(dirname "$0")}/run-summary.sh"
 run_summary_reset
 
+# WHICH MACHINE THIS IS, BEFORE THE FIRST WRITE (backlog 62b09c57, N7).
+# Everything below moves a checkout and writes /etc on the machine it
+# runs on, and until this line nothing asked which machine that was: on
+# 2026-10-07 the forge's twin of this loop ran for 1.5 s as root on the
+# dev pod, out of a fixture tree with one seam forgotten, and installed
+# the forge onto it (infra/lib/host-check.sh carries the account and the
+# rule). Each line names one place this run would touch the machine's
+# own system; with every one redirected the run is a test and proceeds,
+# and with any one real the machine must hold the address
+# infra/estate/estate.toml declares for boss-gcp, or this exits 78 with
+# nothing fetched, moved or written — and says so on its packet
+# (`host_check`), which the summary reset just above made room for.
+#
+# The installer (install-units.sh) and the credential receiver's
+# installer ask for themselves; the journal cap, the CLI step and the
+# cluster-operator's Talos client are named here, because those files
+# are shared or installed as copies and this is the one caller that
+# knows the host. Sourced BEFORE the fast-forward, like the summary
+# library: the merge below rewrites these bytes.
+# shellcheck source=infra/lib/host-check.sh
+. "${BOSS_GCP_CONVERGE_INFRA:-$(dirname "$0")/..}/lib/host-check.sh"
+host_seam BOSS_GCP_REPO_DIR /opt/boss
+host_seam BOSS_GCP_CONVERGE_SOR_ENV /etc/boss/sor.env
+host_seam BOSS_JOURNALD_CONF_DIR
+host_seam BOSS_JOURNALD_SYSTEMCTL
+host_seam INSTALL_TALOSCTL 1
+if [ -z "${BOSS_GCP_CONVERGE_CLI_INSTALLER:-}" ]; then
+    host_seam BOSS_CLI_STORE
+    host_seam BOSS_CLI_LINK
+fi
+host_check boss-gcp boss-gcp-converge
+[ -z "$HOST_CHECK_VERDICT" ] || echo "boss-gcp-converge: host check — $HOST_CHECK_VERDICT"
+
 # A BUSY TREE IS REFUSED, NEVER CLOBBERED. The retired deploy hop this
 # replaces (boss-cli train.rs `deploy`) read exactly these two facts and
 # declined — "deploy tree busy (branch=…, dirty=…)" — rather than
@@ -337,6 +370,27 @@ if has_role cluster-operator; then
         run_summary_field ops_credential_receiver "failed (exit $rrc) — see this tick's journal"
     fi
 fi
+
+# IS THIS HOST'S STAMPED CALL ADMITTED? (design-doc bdc60b65, question
+# gcp-push; backlog 88379df3). The estate machine token is pushed here
+# every ten minutes by the cluster's boss-machine-token-push CronJob,
+# through the receiver the block above installs; the push proves the
+# slots arrived, and THIS proves what they are worth — the gate's own
+# answer to a read stamped by the reader every caller on this host uses
+# (infra/estate/machine-token-effect.sh). It lands on this run's packet
+# as `machine_token_effect`. A reading, never a precondition: it exits 0
+# whatever it finds, a missing script (a checkout from before it) costs
+# one line, and no unit below waits on it — a host with no token is a
+# host whose callers send without one.
+#
+# ITS TIME IS BOUNDED AS WELL AS ITS EXIT (adversarial review 9a1e289b of
+# the forge's deposit, B1: an exit that is not carried is half of owing
+# nothing — a wait in here is this converge's wait). The script bounds
+# its one read at 15 s; this stops the whole of it at 60, records that,
+# and goes on.
+effect_rc=0
+timeout -k 5 "${BOSS_GCP_EFFECT_BOUND_S:-60}" bash "${BOSS_GCP_CONVERGE_INFRA:-$(dirname "$0")/..}/estate/machine-token-effect.sh" || effect_rc=$?
+[ "$effect_rc" -eq 0 ] || run_summary_field machine_token_effect "UNVERIFIED: the effect check did not run (status $effect_rc)"
 
 log="$(mktemp -t boss-gcp-converge-install.XXXXXX)"
 rc=0

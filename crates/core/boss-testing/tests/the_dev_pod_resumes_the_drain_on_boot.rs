@@ -394,3 +394,43 @@ fn the_drain_prompt_names_its_verbs_and_cannot_be_read_as_a_flag() {
         assert!(p.contains(needle), "drain.md no longer names `{needle}`");
     }
 }
+
+/// The drain's post-land acts name `boss workflow publish` for a row a
+/// car changed — and the hand publish is the ONE door a hold does not
+/// bind (infra/platform/workflow-holds/README.md). A session resuming
+/// cold from this prompt after the signer car lands would have published
+/// a refusal row with no human decision (review 8d088b41 of car 052016d7,
+/// finding F3). So the paragraph that names the publish carries the
+/// exception, and says how to tell: the tree's one reader of the holds.
+#[test]
+fn the_drain_never_publishes_a_held_kind() {
+    let p = drain_prompt();
+    let at = p
+        .find("boss workflow publish")
+        .expect("drain.md names the publish among its post-land acts");
+    let paragraph = p[at..].split("\n\n").next().unwrap();
+    for needle in [
+        "HELD",
+        "NEVER",
+        "infra/gcp/workflow-holds.py",
+        // A reader that cannot answer is not a reader that says "open"
+        // (review 6ff3210e, N4: this clause could be deleted unnoticed).
+        "exits non-zero",
+        "publish nothing",
+        // And the tree it is asked of is one that carries the landing:
+        // /work/boss is fast-forwarded hourly and answers for the tree
+        // BEFORE the car for up to an hour (same review, N6).
+        "origin/main",
+    ] {
+        assert!(
+            paragraph.contains(needle),
+            "the paragraph that names the publish must carry `{needle}` — a held kind is never \
+             published by a draining session, and the reader is how to tell:\n{paragraph}"
+        );
+    }
+    assert_eq!(
+        p.matches("boss workflow publish").count(),
+        1,
+        "a second place naming the publish needs the same exception"
+    );
+}

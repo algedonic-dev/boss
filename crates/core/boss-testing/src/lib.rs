@@ -7,6 +7,8 @@
 //! - `RecordingEventBus` that captures published events for verification
 //! - Custom assertion functions designed for agent-friendly failure messages
 //! - `scratch_dir` for a fixture root this process and uid own outright
+//! - `dark_port`, a loopback port that refuses every connect and that no
+//!   other test can be handed while it is held
 //! - `git_config_isolated`, the one way a test closes every channel git
 //!   reads `safe.directory` from, so a host's `[safe] directory = *`
 //!   cannot switch off an ownership refusal the test depends on
@@ -25,11 +27,13 @@
 pub mod adapter_suite;
 pub mod announce;
 pub mod assertions;
+pub mod dark_port;
 pub mod feed;
 pub mod git;
 pub mod kubectl_secret_stub;
 pub mod leaked_policy;
 pub mod ops_runner_stub;
+pub mod passkey;
 pub mod production_source;
 pub mod rbac;
 pub mod recording_bus;
@@ -40,6 +44,7 @@ pub mod test_db;
 pub mod tree;
 
 pub use assertions::*;
+pub use dark_port::{DarkPort, dark_port};
 pub use feed::feed_stdin;
 pub use git::git_config_isolated;
 pub use recording_bus::RecordingEventBus;

@@ -1,0 +1,32 @@
+-- 20261008003755-a-refused-policy-write-is-on-the-log.sql — a write the
+-- policy doors refuse states so on the log (backlog 0028804f; review
+-- 1a73d5ce, F2).
+--
+-- Until this car a refused policy write left nothing behind: the 409 of
+-- the lockout guard, of the service-read guard (which keeps the one rule
+-- every service's policy check is answered on) and of the override
+-- door's own refusals went back to the caller and nowhere else — no log
+-- line, no event, and no `policy_rule_audit` row, which records only
+-- writes that committed. The policy service now states, through its
+-- outbox:
+--
+--   * `policy.write.refused` — door, target_kind (rule | override),
+--     target, caller, role, status (409 | 503), the refusal's own text
+--     and overflow: a (door, target, caller, status) at its FIRST
+--     sighting in a process, never one per request ("No per-request
+--     events", docs/architecture-decisions.md); the first sighting past
+--     the process's key cap carries overflow true and later new ones are
+--     log lines only. Stated only for an answer given after the caller's
+--     policy authority was judged, so a caller with none (403) writes
+--     nothing here.
+--
+-- Declared in the car that first emits it: an emitted-but-undeclared
+-- kind is the defect the audit integrity check exists to catch. Held
+-- equal to `boss_policy::refusals::POLICY_WRITE_REFUSED` by boss-policy's
+-- `the_refused_policy_write_kind_is_registered`. It is not under
+-- `policy.check.`, whose rows are the policy check's gate evidence and
+-- are held to `boss_core::gate_evidence::KINDS`. No ref-check rule: a
+-- refused write references no row it could be checked against.
+INSERT INTO event_kinds (kind_pattern, source, description, suffix_domain) VALUES
+  ('policy.write.refused', 'policy', 'A policy write a door refused 409 or 503 after judging its caller''s authority, at its first sighting in this process (names the door, the rule or override, the caller and role, the status, the refusal''s text, and whether it is the first sighting past the key cap)', NULL)
+ON CONFLICT (kind_pattern) DO NOTHING;

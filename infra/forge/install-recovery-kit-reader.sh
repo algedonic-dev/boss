@@ -23,8 +23,13 @@
 #     breaks sudo for the whole host. `env_reset` is the default and is
 #     spelled anyway: the reader's test seams are environment variables,
 #     and this line is what guarantees none of them crosses sudo.
-#     <user> is the owner of the checkout this runs from (the forge
-#     user, whose key the tunnel's machines use), or INSTALL_KIT_USER.
+#     <user> is the forge user, whose key the tunnel's machines use:
+#     INSTALL_KIT_USER, which install.sh sets by name when it runs from
+#     root's tree (backlog ebfd2f46 — that tree is root's, and its owner
+#     is no answer), else the owner of the checkout this runs from. It
+#     is REFUSED unless it is a plain account name, is not root, is an
+#     account this host has, and is not uid 0 by another name: a rule
+#     for a name nobody holds is granted to whoever is later given it.
 #
 # THE FORCED-COMMAND KEY is the narrower door, and it is DAVID's to
 # place, because authorizing a key is a signed act, not a converge's:
@@ -41,6 +46,7 @@
 #
 # ENV (the scratch run the test drives): INSTALL_KIT_LIBEXEC,
 # INSTALL_KIT_SUDOERS_DIR, INSTALL_VISUDO, INSTALL_KIT_USER,
+# INSTALL_KIT_GETENT (the passwd lookup; default getent),
 # INSTALL_KIT_OWNER (root:root; empty skips chown for a non-root test).
 #
 # EXIT 0 installed; 1 a step failed, named — the caller carries the code
@@ -53,6 +59,7 @@ REPO="$(cd "$HERE/../.." && pwd)"
 LIBEXEC="${INSTALL_KIT_LIBEXEC:-/usr/local/libexec/boss}"
 SUDOERS_DIR="${INSTALL_KIT_SUDOERS_DIR:-/etc/sudoers.d}"
 VISUDO="${INSTALL_VISUDO:-visudo}"
+GETENT="${INSTALL_KIT_GETENT:-getent}"
 OWNER="${INSTALL_KIT_OWNER-root:root}"
 USER_NAME="${INSTALL_KIT_USER:-$(stat -c %U "$REPO")}"
 READER="/usr/local/libexec/boss/recovery-kit-read"
@@ -64,7 +71,20 @@ ME="install-recovery-kit-reader"
 fail() { echo "$ME: FAILED — $*" >&2; exit 1; }
 
 [[ "$USER_NAME" =~ ^[a-z_][a-z0-9_-]*$ ]] || fail "the kit user '$USER_NAME' is not an account name sudoers can carry safely"
-[ "$USER_NAME" != "root" ] || fail "the checkout is root's — the rule would grant root to root; name the forge user with INSTALL_KIT_USER"
+[ "$USER_NAME" != "root" ] || fail "the kit user is root (named, or the owner of $REPO) — the rule would grant root to root; name the forge user with INSTALL_KIT_USER"
+# The account must be one this host has, and not uid 0 under a second
+# name. A lookup that could not run is not "no such account" and is said
+# as itself (getent answers 2 for a name it does not hold); either way
+# nothing is installed for a user this did not find.
+lookup_rc=0
+entry="$("$GETENT" passwd "$USER_NAME" 2>/dev/null)" || lookup_rc=$?
+[ "$lookup_rc" -eq 0 ] || [ "$lookup_rc" -eq 2 ] \
+    || fail "could not look up the account '$USER_NAME' ($GETENT passwd exited $lookup_rc) — nothing is installed for a user this host was not asked about"
+IFS=: read -r entry_name _ entry_uid _ <<< "$entry"
+[ "$lookup_rc" -eq 0 ] && [ "$entry_name" = "$USER_NAME" ] \
+    || fail "there is no account '$USER_NAME' on this host — a rule for a name nobody holds would be granted to whoever is later given it"
+[[ "$entry_uid" =~ ^[0-9]+$ ]] && [ "$entry_uid" -ne 0 ] \
+    || fail "the kit user '$USER_NAME' is uid ${entry_uid:-unknown} — the rule would grant root to root under another name"
 
 install -d -m 0755 "$LIBEXEC" || fail "cannot create $LIBEXEC"
 install -m 0755 "$HERE/recovery-kit-read.sh" "$LIBEXEC/recovery-kit-read" || fail "cannot install the reader"

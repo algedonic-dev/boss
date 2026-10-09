@@ -204,7 +204,25 @@ case "$in_role" in
 esac
 
 # --- bound 4: another host still declares ops-runner ---------------------------
-if ! curl -fsS --max-time 15 -H "x-boss-user: $(sor_reader_header "automation:$ME")" \
+# The machine token, PRESENTED and never required (design 6805c764;
+# backlog 44b2087e): this read and the queue read below went out with
+# x-boss-user alone. One header per URL, because the reader decides the
+# host where it is called and BOSS_ESTATE_NODES_URL may name another.
+# Made in the script's own shell, after the trap above. No token on the
+# host, no lib in this checkout, or a header file that could not be
+# written: the variable is empty and the read is the one it was.
+# The identity and the URL stay on consecutive lines: that pair is what
+# every_estate_read_is_signed.rs reads as this door's evidence.
+NODES_MT_HDR=""
+MT_HDR=""
+if [ -r "$REPO/infra/lib/secret-header.sh" ]; then
+    # shellcheck source=infra/lib/secret-header.sh
+    . "$REPO/infra/lib/secret-header.sh"
+    machine_token_header NODES_MT_HDR "${BOSS_ESTATE_NODES_URL:-$BASE/api/estate/nodes}" || NODES_MT_HDR=""
+    machine_token_header MT_HDR "$BASE" || MT_HDR=""
+fi
+if ! curl -fsS --max-time 15 ${NODES_MT_HDR:+-H "$NODES_MT_HDR"} \
+        -H "x-boss-user: $(sor_reader_header "automation:$ME")" \
         "${BOSS_ESTATE_NODES_URL:-$BASE/api/estate/nodes}" > "$TMP/nodes.json" 2> "$TMP/nodes.err"; then
     refuse "the estate registry did not answer the read for the other runners: $(head -c 500 "$TMP/nodes.err" | tr '\n' ' ') — whether $HOST is the last door cannot be evaluated. Nothing was stopped."
 fi
@@ -238,7 +256,8 @@ BOSS_USER="{\"id\":\"$ACTOR\",\"role\":\"platform-admin\",\"access_tier\":\"oper
 host_doc=$(jq -rn --arg h "$HOST" '{host: $h} | tojson | @uri') \
     || refuse "could not encode the host filter. Nothing was stopped."
 QUEUE_URL="$BASE/api/jobs?kind=ops-request&status=open&metadata=$host_doc&limit=1000"
-if ! curl -fsS --max-time 15 -H "x-boss-user: $BOSS_USER" "$QUEUE_URL" > "$TMP/queue.json" 2> "$TMP/queue.err"; then
+if ! curl -fsS --max-time 15 -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} \
+        "$QUEUE_URL" > "$TMP/queue.json" 2> "$TMP/queue.err"; then
     refuse "the system of record did not answer the queue read ($QUEUE_URL): $(head -c 500 "$TMP/queue.err" | tr '\n' ' ') — whether another request waits on $HOST cannot be evaluated. Nothing was stopped."
 fi
 jq_doc_file "$TMP/queue.json" \

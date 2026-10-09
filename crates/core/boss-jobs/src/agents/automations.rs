@@ -36,6 +36,16 @@
 //! the process that signs declares the prefix it signs for, and
 //! [`row_of_record`] answers a family member with that row.
 //!
+//! READERS HOLD THE READ ROLE (2026-10-07). The first rows came from the
+//! audit log, a list of who wrote. The resolver's tally then named the
+//! machine READERS — converge and observer reads, the probe's reader —
+//! as callers with no row; they are rows now, at `audit-readonly`, and
+//! three scripts that assert `platform-admin` for a single read hold the
+//! read role too (the bundle's README names them). A rule still needs no
+//! row: the resolver answers a family member from its signer's
+//! `signs_for` through the same [`boss_core::role_of_record::is_family_member`]
+//! that [`row_of_record`] uses.
+//!
 //! The rows are DATA: the platform bundle `infra/platform/automations/`,
 //! one file per row, published at every start by
 //! `boss-platform-workflow-seed` insert-if-absent (the instance is the
@@ -249,7 +259,7 @@ pub fn row_of_record<'a>(rows: &'a [AutomationActor], actor: &str) -> Option<&'a
             .filter(|a| {
                 a.signs_for
                     .as_deref()
-                    .is_some_and(|p| actor.starts_with(p) && actor.len() > p.len())
+                    .is_some_and(|p| boss_core::role_of_record::is_family_member(p, actor))
             })
             .max_by_key(|a| a.signs_for.as_ref().map_or(0, String::len))
     })

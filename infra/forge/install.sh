@@ -19,8 +19,11 @@
 # in the tree could tell the difference, and nothing was going to.
 #
 # WHERE IT RUNS. On the forge host (infra/estate/estate.toml
-# `forge_host`), from its checkout at /home/david/boss, which is where
-# the installed units already point:
+# `forge_host`), unattended, from root's own tree at
+# /var/lib/boss/tree/current — which is where the installed units point
+# since backlog a604a35b (see ROOT RUNS THIS FROM ITS OWN TREE below).
+# By hand it is still started from the checkout, and hands itself over
+# to the tree's copy:
 #
 #   ssh <forge> 'cd /home/david/boss && git fetch forgejo main \
 #     && git checkout -qf FETCH_HEAD && sudo infra/forge/install.sh'
@@ -140,9 +143,121 @@ esac
 ETC="${INSTALL_ETC:-/etc/systemd/system}"
 SYSTEMCTL="${INSTALL_SYSTEMCTL:-systemctl}"
 
+# WHICH MACHINE THIS IS, BEFORE ANYTHING IS WRITTEN (backlog 62b09c57,
+# N7). "Overridable so the installer can be exercised into a scratch
+# directory" was true of two knobs and assumed of the rest: a run that
+# named INSTALL_ETC and forgot another still rendered /etc/boss/sor.env,
+# asked the package manager for the journal door and downloaded kubectl,
+# on whatever machine it was started on — the lint that drives this file
+# on every gate among them, and on 2026-10-07 the dev pod, which a
+# fixture's converge installed the forge onto for 1.5 s (review aa901496;
+# infra/lib/host-check.sh carries the account and the rule).
+#
+# So EVERY seam is named here, once, ahead of the first write. With each
+# one redirected this is a scratch run and is asked nothing. With any one
+# left at the host's own default, this machine must hold the address
+# infra/estate/estate.toml declares for the forge — or the run exits 78,
+# naming the seams, having written nothing. A seam that only matters when
+# a step is switched on is named under that switch; the probe account
+# (probe-account.sh), the tree (root-tree.sh) and the ops runner's
+# installer ask for themselves as well, because each is also started by
+# hand. Adding a write to this file means adding its line here, and
+# host_check_sh.rs refuses an INSTALL_* name this block does not judge.
+#
+# A FIRST INSTALL on a forge the estate does not declare yet:
+#   sudo BOSS_FIRST_INSTALL_AS=forge infra/forge/install.sh
+# said out loud on the run's own lines and its packet, never assumed.
+# shellcheck source=infra/lib/host-check.sh
+. "${HERE}/../lib/host-check.sh"
+host_seam INSTALL_ETC /etc/systemd/system
+host_seam INSTALL_SYSTEMCTL systemctl
+host_seam INSTALL_SOR_ENV /etc/boss/sor.env
+host_seam INSTALL_KUBECTL 1
+host_seam INSTALL_APT_GET
+host_seam BOSS_OPS_RUNNER_RETIRED
+if [ -n "${INSTALL_ROOT_TREE:-}" ]; then
+    host_seam BOSS_ROOT_TREE /var/lib/boss/tree
+    host_seam INSTALL_TREE_LIBEXEC /usr/local/libexec/boss
+    host_seam INSTALL_WATCHDOG_STATE /var/lib/boss/watchdog
+fi
+if [ -n "${BOSS_CONVERGE_HOLD:-}" ]; then
+    host_seam BOSS_CONVERGE_HOLD_LEGACY
+fi
+if [ -n "${INSTALL_KIT_LIBEXEC:-}" ]; then
+    host_seam INSTALL_KIT_SUDOERS_DIR
+fi
+case ",${BOSS_NODE_ROLES:-}," in
+    *,cluster-operator,*)
+        host_seam INSTALL_TALOSCTL 1
+        if [ "${INSTALL_CLI:-1}" = "1" ] && [ -n "${BOSS_CONVERGE_SHA:-}" ]; then
+            host_seam BOSS_CLI_STORE
+            host_seam BOSS_CLI_LINK
+        fi
+        ;;
+esac
+host_check forge install.sh
+[ -z "$HOST_CHECK_VERDICT" ] || echo "install.sh: host check — $HOST_CHECK_VERDICT"
+
 if [ "$ETC" = "/etc/systemd/system" ] && [ "$(id -u)" -ne 0 ]; then
     echo "install.sh: needs root to write /etc/systemd/system — re-run with sudo." >&2
     exit 1
+fi
+
+# ROOT RUNS THIS FROM ITS OWN TREE, OR BRINGS THE TREE AND STARTS AGAIN
+# (backlog a604a35b; decided by David on design-doc c98c79aa, question
+# root-tree, and as position B, 2026-10-07). The units this file installs
+# execute from /var/lib/boss/tree/current — a tree root fetched from the
+# forge's own repository (infra/forge/root-tree.sh carries the reasoning)
+# — and no longer from the checkout this host's owner can write. So does
+# this file: started from anywhere else it refreshes the tree and execs
+# the copy there, once.
+#
+# THAT IS THE BOOTSTRAP, AND IT IS THE OLD UNIT THAT RUNS IT. On the tick
+# this lands, the installed forge-converge.service still starts the
+# checkout's forge-converge.sh — a snapshot taken before its own checkout,
+# so the script of the commit BEFORE this one — and that calls this file
+# from the checkout. Here it makes the tree and hands over; the units the
+# tree's copy installs point at the tree, and the next tick starts there.
+# A hand `sudo infra/forge/install.sh` from the checkout takes the same
+# road.
+#
+# WITH NO TREE, THE UNITS ARE HELD AND EVERYTHING ELSE CONVERGES. A
+# refresh that failed leaves nothing to exec, and this copy carries on
+# from where it stands; the gate ahead of the unit loop then finds the
+# units' commands absent and installs NO unit file, so every unit —
+# the watchdog first among them — keeps running as it was installed.
+# A scratch run (the lints, INSTALL_ETC elsewhere) manages no tree
+# unless it names seams of its own.
+TREE_ROOT="${BOSS_ROOT_TREE:-/var/lib/boss/tree}"
+TREE_LIBEXEC="${INSTALL_TREE_LIBEXEC:-/usr/local/libexec/boss}"
+tree_managed=0
+if [ "$ETC" = "/etc/systemd/system" ] || [ -n "${INSTALL_ROOT_TREE:-}" ]; then
+    tree_managed=1
+fi
+in_tree=0
+if [ "$tree_managed" -eq 1 ]; then
+    # Each read that can fail has its own name: no generations directory
+    # is "not in the tree", a refresh that failed is said on its line and
+    # judged by what `path` then answers, and `path` exiting 1 is "no
+    # tree" — none is an empty answer taken for a pass.
+    no_gen="" refresh_rc=0 no_tree=""
+    tree_gen="$(cd "$TREE_ROOT/gen" 2>/dev/null && pwd -P)" || no_gen=1
+    if [ -z "$no_gen" ]; then
+        case "$(pwd -P)/" in
+            "$tree_gen"/*) in_tree=1 ;;
+        esac
+    fi
+    if [ "$in_tree" -eq 0 ] && [ -z "${BOSS_INSTALL_FROM_TREE:-}" ]; then
+        tree_line="$(BOSS_ROOT_TREE="$TREE_ROOT" bash "${HERE}/root-tree.sh" refresh 2>&1)" || refresh_rc=$?
+        printf '%s\n' "$tree_line"
+        [ "$refresh_rc" -eq 0 ] || echo "install.sh: the tree's refresh exited $refresh_rc — the tree as it stands is what runs, if one stands" >&2
+        tree_now="$(BOSS_ROOT_TREE="$TREE_ROOT" bash "${HERE}/root-tree.sh" path 2>/dev/null)" || no_tree=1
+        if [ -z "$no_tree" ] && [ -n "$tree_now" ] && [ -x "$tree_now/infra/forge/install.sh" ]; then
+            echo "install.sh: started from ${HERE}, which is not root's tree — running $tree_now/infra/forge/install.sh instead"
+            BOSS_INSTALL_FROM_TREE=1 exec "$tree_now/infra/forge/install.sh" "$@"
+        fi
+        echo "install.sh: root's tree at $TREE_ROOT is not there to run from (the line above says why) — carrying on from ${HERE}; the units are HELD as installed" >&2
+    fi
 fi
 
 # THE CONVERGE HOLD'S DIRECTORY, BEFORE ANYTHING ELSE (backlog d94d287e).
@@ -186,6 +301,98 @@ export BOSS_SOR_ENV="$SOR_ENV"
 . "${HERE}/../lib/sor.sh"
 sor_require BOSS_JOBS_URL BOSS_FORGE_JOURNAL_URL
 
+# THE CONVERGE'S LAUNCHER, a root-owned copy outside every tree
+# (backlog a604a35b): what forge-converge.service starts, and the thing
+# that keeps the converge able to bring in its own fix when a generation
+# cannot (forge-converge-launch.sh says how). Renamed into place, so the
+# unit never starts half a file. BEFORE the gate below, which looks for
+# it; a copy that could not be made holds the units.
+if [ "$tree_managed" -eq 1 ]; then
+    install -d -m 0755 -- "$TREE_LIBEXEC" \
+        && install -m 0755 -- "${HERE}/forge-converge-launch.sh" "$TREE_LIBEXEC/.forge-converge-launch.new" \
+        && mv -f -- "$TREE_LIBEXEC/.forge-converge-launch.new" "$TREE_LIBEXEC/forge-converge-launch" \
+        || echo "install.sh: could not install $TREE_LIBEXEC/forge-converge-launch" >&2
+fi
+
+# NO UNIT IS INSTALLED WHOSE COMMAND IS NOT THERE (backlog a604a35b).
+# Every absolute path a unit's Exec line names must be an executable
+# file NOW, read through the names the unit itself uses — the tree's
+# `current`, the launcher — or NO unit file is replaced on this run. One
+# rule covers a tree that could not be fetched, a generation that lacks a
+# script, and a launcher that did not install; and it is all-or-nothing
+# on purpose: the installed set is one commit's or another's, never half
+# of each. The units already installed keep running from wherever they
+# point; this run goes red at its end and says which command was missing,
+# and the next tick asks again. The two roots are read through their
+# seams, so a test never looks in /var/lib or /usr/local.
+units_held=""
+if [ "$tree_managed" -eq 1 ]; then
+    for u in "${UNITS[@]}"; do
+        [ -f "${HERE}/${u}.service" ] || continue
+        while IFS= read -r cmd; do
+            case "$cmd" in
+                /var/lib/boss/tree/*) at="$TREE_ROOT/${cmd#/var/lib/boss/tree/}" ;;
+                /usr/local/libexec/boss/*) at="$TREE_LIBEXEC/${cmd#/usr/local/libexec/boss/}" ;;
+                # The two units still on the checkout (the cluster
+                # converge and the disk sweep; no_unattended_unit_
+                # runs_from_a_home.rs carries the roster and why).
+                /home/david/boss/*) at="${BOSS_FORGE_REPO_DIR:-/home/david/boss}/${cmd#/home/david/boss/}" ;;
+                /*) at="$cmd" ;;
+                *) continue ;;
+            esac
+            [ -f "$at" ] && [ -x "$at" ] || units_held="$units_held ${u}.service:$cmd"
+        done < <(sed -n -E 's/^Exec(StartPre|Start|StartPost|Stop|StopPost)=[-@:+!]*([^[:space:]]+).*/\2/p' "${HERE}/${u}.service")
+    done
+    if [ -n "$units_held" ]; then
+        echo "install.sh: UNITS HELD — no unit file is replaced on this run, because a command a unit names is not an executable file:$units_held. Every unit keeps running as it is installed." >&2
+        run_summary_field units_held "$(printf '%s' "$units_held" | cut -c1-900)"
+    fi
+fi
+
+# THE WATCHDOG'S STATE, CARRIED ONCE TO ROOT'S DIRECTORY (backlog
+# a604a35b). cluster-watchdog.service runs as root from this car and
+# keeps its dark count and its blind marker under /var/lib/boss/watchdog
+# (its StateDirectory=) instead of its old user's home. Two values are
+# worth carrying, because losing either has a cost in the middle of an
+# outage: the DARK COUNT (lost, a rollback waits up to three more
+# checks) and the BLIND MARKER (lost, a second urgent "watchdog blind"
+# alert is filed). Each is read from the old home as DATA from another
+# account — bounded, one line, and carried only when it is exactly a
+# count or exactly a timestamp; anything else is dropped and never
+# printed, so a name planted there to be read through cannot put a
+# secret in this journal. ONCE: the marker records that the carry ran,
+# and nothing reads the old home again. NOT CARRIED: kept alerts and the
+# door observer's unposted readings and dark-since (the unit says why).
+# Before the unit files, so the first root tick finds its count.
+if [ "$tree_managed" -eq 1 ] && [ -z "$units_held" ]; then
+    wd_new="${INSTALL_WATCHDOG_STATE:-/var/lib/boss/watchdog}"
+    wd_old="${INSTALL_WATCHDOG_OLD_HOME:-/home/david}"
+    if install -d -m 0700 -- "$wd_new" && [ ! -e "$wd_new/.carried" ]; then
+        carried=""
+        while IFS=: read -r name file; do
+            [ -e "$wd_new/$name" ] && continue
+            [ -f "$wd_old/$file" ] && [ ! -L "$wd_old/$file" ] || continue
+            unread=""
+            val="$(timeout 5 head -c 64 -- "$wd_old/$file" 2>/dev/null | awk 'NR == 1')" || unread=1
+            case "$name" in
+                dark) shape='^[0-9]{1,6}$' ;;
+                *) shape='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' ;;
+            esac
+            if [ -z "$unread" ] && [[ "$val" =~ $shape ]]; then
+                printf '%s\n' "$val" >"$wd_new/$name" && carried="$carried $name"
+            else
+                echo "install.sh: the watchdog's old $file does not hold what it should — not carried (and not printed)" >&2
+            fi
+        done <<'CARRY'
+dark:.boss-watchdog-dark
+blind:.boss-watchdog-blind
+CARRY
+        date -u +%Y-%m-%dT%H:%M:%SZ >"$wd_new/.carried"
+        echo "install.sh: the watchdog's state moved to $wd_new; carried from $wd_old:${carried:- nothing (no count and no blind marker stood there)}"
+        run_summary_field watchdog_state "moved to $wd_new; carried:${carried:- nothing}"
+    fi
+fi
+
 installed=0
 for u in "${UNITS[@]}"; do
     for ext in service timer; do
@@ -194,7 +401,7 @@ for u in "${UNITS[@]}"; do
             echo "install.sh: ${u}.${ext} is listed here but missing from ${HERE}" >&2
             exit 1
         fi
-        install -m 0644 "$src" "${ETC}/${u}.${ext}"
+        [ -n "$units_held" ] || install -m 0644 "$src" "${ETC}/${u}.${ext}"
     done
     installed=$((installed + 1))
 done
@@ -346,8 +553,20 @@ done
 # of letting `set -e` act here: a runner that did not install deserves a
 # red unit and a packet on the `failed` terminal, but not at the price of
 # leaving every timer below installed-and-not-enabled.
+#
+# THE RUNNER STILL EXECUTES THE CHECKOUT, AND THAT IS SAID HERE BECAUSE IT
+# IS THE ROAD THIS CAR LEAVES OPEN (backlog a604a35b, stage 2 of design
+# c98c79aa). The installer points the runner's ExecStart at the tree it
+# is itself run from, and run from root's tree that would move every verb
+# script there at once — while the publish, merge and tag verbs still
+# take "the repository I am in" to be a git checkout with a forge remote.
+# Separating where a verb's code runs from the checkout it works on is
+# that stage's car. Until it lands the runner is installed from the tree
+# (its unit pair) and pointed at the checkout (its ExecStart), by name.
 ops_runner_rc=0
-INSTALL_ETC="$ETC" INSTALL_SYSTEMCTL="$SYSTEMCTL" \
+ops_runner_repo=""
+[ "$in_tree" -eq 0 ] || ops_runner_repo="${BOSS_FORGE_REPO_DIR:-/home/david/boss}"
+INSTALL_ETC="$ETC" INSTALL_SYSTEMCTL="$SYSTEMCTL" INSTALL_OPS_RUNNER_REPO="$ops_runner_repo" \
     bash "${HERE}/../ops/install-ops-runner.sh" forge || ops_runner_rc=$?
 installed=$((installed + 1))
 
@@ -357,10 +576,65 @@ installed=$((installed + 1))
 # into a tree its grantee can edit. Carried, not fatal, like the ops
 # runner's. A scratch run (the lints) leaves /usr/local and /etc/sudoers.d
 # alone unless it names a directory of its own.
+#
+# IN ROOT'S TREE THE GRANTEE IS NAMED HERE (backlog ebfd2f46). The kit
+# installer read the rule's user off the owner of the tree it runs from,
+# which was the forge user's checkout until root's tree (a604a35b) and
+# is root's generation since: from 2026-10-08 00:32Z it refused "the
+# checkout is root's" on every tick and this converge exited 1 for that
+# alone. The name is the one forge-converge.sh runs the checkout's git
+# as — BOSS_FORGE_REPO_OWNER, the same default, held equal by
+# root_tree_sh.rs — because the tree carries it and no account on this
+# host can write the tree: it moves by a merge to the forge's main.
+# NOT `stat` of the checkout: what that answers is decided by whoever
+# can replace a name in the checkout's parent directory, and it would
+# make the grantee of a sudo rule a fact read out of a home.
 kit_reader_rc=0
+kit_user="${INSTALL_KIT_USER:-}"
+[ "$in_tree" -eq 0 ] || [ -n "$kit_user" ] || kit_user="${BOSS_FORGE_REPO_OWNER:-david}"
 if [ "$ETC" = "/etc/systemd/system" ] || [ -n "${INSTALL_KIT_LIBEXEC:-}" ]; then
-    bash "${HERE}/install-recovery-kit-reader.sh" || kit_reader_rc=$?
-    [ "$kit_reader_rc" -eq 0 ] || run_summary_field recovery_kit_reader "install failed (exit $kit_reader_rc) — see the journal"
+    INSTALL_KIT_USER="$kit_user" bash "${HERE}/install-recovery-kit-reader.sh" || kit_reader_rc=$?
+    if [ "$kit_reader_rc" -ne 0 ]; then
+        run_summary_field recovery_kit_reader "install failed (exit $kit_reader_rc) — see the journal"
+    else
+        # WHO HOLDS THE RULE, READ BACK OFF THE RULE. The packet that
+        # reported this step failing could not say whether an earlier
+        # rule still stood ("presumably", ebfd2f46): the file is root's
+        # 0440 and the only account of it was a journal line. So the
+        # grantee goes on the packet, read from what was placed rather
+        # than from what this run meant to place.
+        kit_rule="${INSTALL_KIT_SUDOERS_DIR:-/etc/sudoers.d}/boss-recovery-kit"
+        kit_unread=""
+        kit_grantee="$(sed -n 's/^\([^ #]*\) ALL=(root) NOPASSWD: .*$/\1/p' "$kit_rule" 2>/dev/null)" || kit_unread=1
+        if [ -n "$kit_unread" ] || [ -z "$kit_grantee" ]; then
+            run_summary_field recovery_kit_reader "installed, but no grantee could be read back from $kit_rule"
+        else
+            run_summary_field recovery_kit_reader "installed; the rule grants the reader to: $kit_grantee"
+        fi
+    fi
+fi
+
+# THE ACCOUNT A CAR'S RECORDED PROBE RUNS AS (backlog 703358ce; decided
+# by David on design-doc bdc60b65, question probe-user). Until this step
+# probes ran as the checkout's owner, who reaches root on this host by
+# two roads (review 9a1e289b). infra/forge/probe-account.sh `ensure` is
+# the one definition: it makes `boss-probe` and a root-owned read-only
+# view of this checkout for it to read, verifies both by effect, and
+# writes the drop-in that points the ops runner's probes at them and at
+# the marker a tick writes only when the account verifies then.
+# AFTER the ops runner's installer, whose drop-in directory it writes
+# beside, and BEFORE the daemon-reload that makes the drop-in live.
+# Adding an account is a root change to the host, so it goes through the
+# door root changes already use — this converge — and like the steps
+# above its failure is carried: a host where the account cannot be made
+# keeps every unit, and NO PROBE RUNS THERE until it verifies — never a
+# fallback to the checkout's owner (decided by David on design-doc
+# c98c79aa, question `fallback`) — with a red converge that says so and
+# repairs it on a later tick. A scratch run (the lints) makes no account
+# unless it names seams of its own.
+probe_account_rc=0
+if [ "$ETC" = "/etc/systemd/system" ] || [ -n "${INSTALL_PROBE_LIBEXEC:-}" ]; then
+    INSTALL_ETC="$ETC" bash "${HERE}/probe-account.sh" ensure || probe_account_rc=$?
 fi
 
 "$SYSTEMCTL" daemon-reload
@@ -383,10 +657,21 @@ done
 # why every failure in it is non-fatal.
 JOURNAL_DOOR_URL="$BOSS_FORGE_JOURNAL_URL" bash "${HERE}/../journal-door-ensure.sh"
 
-echo "install.sh: ${installed} unit pair(s) installed and enabled"
-run_summary_field units_installed "$installed"
-run_summary_field units_skipped 0
-run_summary_field summary "installed $installed unit pair(s) and enabled their timers"
+# A HELD RUN SAYS HELD, HERE TOO (review 5f3736a2, F7). This line used to
+# read "9 unit pair(s) installed and enabled" on a run that had replaced
+# no unit file — the success line, and the `summary` a reader of the
+# packet sees first, for work that was not done.
+if [ -n "$units_held" ]; then
+    echo "install.sh: HELD — 0 unit files replaced (the $((installed - 1)) forge unit pairs are as they were installed); their timers were enabled as they stand" >&2
+    run_summary_field units_installed 0
+    run_summary_field units_skipped "$((installed - 1))"
+    run_summary_field summary "HELD: no unit file replaced — a command a unit names is not there (units_held); everything else converged"
+else
+    echo "install.sh: ${installed} unit pair(s) installed and enabled"
+    run_summary_field units_installed "$installed"
+    run_summary_field units_skipped 0
+    run_summary_field summary "installed $installed unit pair(s) and enabled their timers"
+fi
 if [ "$ops_runner_rc" -ne 0 ]; then
     echo "install.sh: the ops-request runner did NOT install (exit $ops_runner_rc) — it named" >&2
     echo "    what failed above, and the run summary carries it. Every other unit converged;" >&2
@@ -402,6 +687,12 @@ if [ "$cli_rc" -ne 0 ]; then
     echo "    Every unit converged; /usr/local/bin/boss is whatever the previous converge confirmed." >&2
     exit "$cli_rc"
 fi
+# Held units: named above and on the packet (`units_held`).
+if [ -n "$units_held" ]; then
+    echo "install.sh: the units were HELD (a command one names is not there:$units_held) — every unit runs as it was" >&2
+    echo "    installed; everything else converged. The next tick asks again." >&2
+    exit 1
+fi
 # The hold's prepare, the same way: its refusal is above, in its own words.
 if [ "$kit_reader_rc" -ne 0 ]; then
     echo "install.sh: the recovery kit's reader did NOT install (exit $kit_reader_rc) — it named what failed" >&2
@@ -412,4 +703,11 @@ if [ "$hold_rc" -ne 0 ]; then
     echo "install.sh: the converge hold's directory was NOT prepared (exit $hold_rc) — converge-hold.sh said why above." >&2
     echo "    Every unit converged; a hold-converge refuses loudly until the directory is root's." >&2
     exit "$hold_rc"
+fi
+# The probe account's, last: probe-account.sh named what failed above and
+# on the packet (`probe_account`).
+if [ "$probe_account_rc" -ne 0 ]; then
+    echo "install.sh: the probe account did NOT verify (exit $probe_account_rc) — probe-account.sh said why above." >&2
+    echo "    Every unit converged; no probe runs on this host until it does (\`probe_account\` on the packet)." >&2
+    exit "$probe_account_rc"
 fi

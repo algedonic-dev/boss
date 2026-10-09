@@ -1367,7 +1367,16 @@ scope_self_test() {
     # "unmapped" has to be a fact about the tree, not a fact about which
     # paths nobody got round to listing.
     _case "other infra implies no crate" "" \
-        "infra/forge/locomotive.sh"
+        "infra/forge/registry-login.lib.sh"
+    # locomotive.sh left the case above on 2026-10-07 because the answer
+    # for it CHANGED, correctly (backlog 44b2087e): boss-testing's
+    # every_shell_identity_sender_presents_the_machine_token.rs now judges
+    # every command that runs curl in every shell file under infra/, and
+    # names the locomotive's forge-API request in its roster of sends
+    # that must not carry the estate token — so editing that line can
+    # redden boss-testing. The same holds for every file that roster
+    # names. registry-login.lib.sh runs no curl and no crate names it.
+    #
     # cluster-watchdog.sh left the case above on 2026-09-25 because the
     # answer for it CHANGED, correctly (design 6805c764, car 1):
     # boss-testing's every_service_mounts_the_machine_gate.rs reads it to
@@ -2807,7 +2816,23 @@ a tree-wide pin that reports no result is refused"
     exit 0
 fi
 
+# --- handed edit level (begin) ---
+# THE HANDED EDIT LEVEL IS THE PRE-FLIGHT'S, AND NOBODY ELSE'S (backlog
+# 934ccad1). A gate's launcher hands the instance's edit level to the
+# pod as BOSS_EDIT_LEVEL_ANSWER, for one reader: the pre-flight lint
+# a-car-stays-under-the-edit-level. Left exported it reaches every
+# check this script runs - the test suites among them, which run that
+# same lint against stub registries and would be answered by the pod
+# instead of by their stub (the class gate-run 5d576fba went red on,
+# through the runner's own variable). So it is taken out of this
+# script's environment here, before any check runs, and put back for
+# the pre-flight alone (`local -x`, the first line of run_preflight).
+GATE_EDIT_LEVEL_HANDED="${BOSS_EDIT_LEVEL_ANSWER:-}"
+unset BOSS_EDIT_LEVEL_ANSWER
+# --- handed edit level (end) ---
+
 run_preflight() {
+    if [ -n "$GATE_EDIT_LEVEL_HANDED" ]; then local -x BOSS_EDIT_LEVEL_ANSWER="$GATE_EDIT_LEVEL_HANDED"; fi
     roster_loop_self_test
     check_stdin_self_test
     gate_git_reads_self_test

@@ -20,7 +20,6 @@ use boss_policy::{PgPolicy, default_rules};
 use boss_policy_client::role_reader::{
     HttpRoleReader, MonotonicRoleSnapshotClock, MountedReportMode, SnapshotRoleReader,
 };
-use boss_policy_client::role_reporting::ReportTally;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -45,6 +44,8 @@ async fn main() -> Result<()> {
     // (design 21946380).
     let recorder: Arc<dyn boss_core::port::EventRecorder> =
         Arc::new(boss_events::outbox::PgOutboxRecorder::new(pool.clone()));
+    // The actor-role report's outbox and its window's log (e0bdba74).
+    let role_pool = pool.clone();
     let repo: Arc<PgPolicy> = Arc::new(PgPolicy::new(pool));
 
     // Reconcile the default rules (per D8). Insert rules that don't
@@ -64,6 +65,18 @@ async fn main() -> Result<()> {
         total = defaults.len(),
         "reconciled default policy rules"
     );
+    // The one rule every service's policy check is answered on (backlog
+    // 0028804f). Reconcile inserted it if it was missing and refreshed it
+    // if bootstrap owned it; an operator-owned row it preserved, and the
+    // rule doors now refuse to leave one narrowed. So anything found here
+    // is residue or a hand edit: SAID, with the request that restores it,
+    // never repaired and never a reason not to start — a boot that
+    // refuses takes the policy service, and every door behind it, down.
+    match boss_policy::service_read::found(repo.as_ref()).await {
+        Ok(None) => {}
+        Ok(Some(report)) => tracing::error!("{report}"),
+        Err(e) => warn!(%e, "could not read the service read rule at boot; starting anyway"),
+    }
 
     let role_mode = Arc::new(MountedReportMode::mount());
     let roles = Arc::new(SnapshotRoleReader::new(
@@ -101,12 +114,14 @@ async fn main() -> Result<()> {
         sources,
         roles.clone(),
         role_mode.clone(),
-        Arc::new(ReportTally::new(
-            boss_policy_client::role_service::REPORT_CAPACITY,
-        )),
+        boss_events::role_tally::durable("policy", role_mode.clone(), Some(&role_pool)),
         std::time::Duration::from_millis(100),
     )
     .merge(coverage);
+    // A write a policy door refuses is said on the log line AND as a
+    // `policy.write.refused` event through the outbox (review 1a73d5ce
+    // F2): until backlog 0028804f a refused attempt left no trace at all.
+    let app = boss_policy::refusals::recorded(app, Arc::clone(&recorder));
 
     // Default port pulled from boss_ports — single source of truth
     // shared with the config generator + every BOSS_POLICY_URL

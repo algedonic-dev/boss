@@ -1,0 +1,43 @@
+# The registry row of the transport key the estate machine token rides to
+# boss-gcp on (design-doc bdc60b65, question gcp-push, David 2026-10-06;
+# backlog 88379df3). A registry row is INSTANCE DATA: nothing in this
+# tree publishes it, and the converge does not read this file. It is here
+# so the row the broker's handler will demand is written once, reviewed
+# with the car that needs it, and held equal to the rule by a test
+# (machine_token_push_sh.rs) — `credential.prepare.ssh-deposit` refuses
+# to mint unless GET /api/credentials/machine-token-deposit-key answers
+# this id, this kind and this storage_location.
+#
+# AFTER THIS CAR LANDS, in this order, by the operator:
+#   1. Publish the row: add the [[credential]] block below, unchanged, to
+#      the instance repository's seeds/credentials.toml and run
+#      `boss tenant publish` there (the registry's one door,
+#      POST /api/credentials/batch; a row already present is kept).
+#   2. File the packet:
+#        boss job file --kind prepare-the-machine-token-deposit-key \
+#          --subject-id machine-token-deposit-key \
+#          --title 'Prepare the machine token deposit key for boss-gcp'
+#   3. David completes its `scope` step (human only), naming
+#      credential = machine-token-deposit-key. The rule
+#      broker-prepares-the-machine-token-deposit-key then mints the pair
+#      into Secret boss/machine-token-deposit-key and writes the public
+#      key, the receiver host, the purpose and the whole
+#      authorized_keys_line onto the `enroll` step — his presence
+#      sign-off, after he has placed that one line on boss-gcp.
+# Until step 3's enrollment, the boss-machine-token-push CronJob closes
+# `not-yet`, naming which of these is missing.
+#
+# No value is ever a field here: the registry holds locations.
+[[credential]]
+id = "machine-token-deposit-key"
+kind = "ssh-transport-key"
+issuer = "the credential broker (credential.prepare.ssh-deposit: an RSA pair generated in the dispatcher, never on disk)"
+principal = "the boss-machine-token-push CronJob, as the account boss-gcp's deposit line names; it may run one forced command, the machine-token receiver"
+scopes = ["boss-gcp: exec sudo -n /usr/local/libexec/boss/ops-credential-recv machine-token"]
+storage_location = "Secret boss/machine-token-deposit-key"
+consumers = [
+  { kind = "secret-mount", location = "CronJob boss/boss-machine-token-push, /keys (read-only)" },
+  { kind = "authorized-keys", location = "boss-gcp, the deposit account's ~/.ssh/authorized_keys: the forced-command line on the prepare-the-machine-token-deposit-key packet's enroll step" },
+]
+rotation_policy = "on-demand"
+notes = "Transport only: it carries the estate machine token's three slots to boss-gcp and can read nothing. Preparing it is not enrolling it; the enroll step is a presence sign-off. Not the break-glass deposit key and not the runner deposit key, each of which keeps its own forced command."

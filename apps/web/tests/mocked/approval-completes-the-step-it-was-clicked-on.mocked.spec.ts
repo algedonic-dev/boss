@@ -138,8 +138,11 @@ async function twoApprovals(page: Page, presence: boolean, hold: Hold = {}): Pro
       step.sign_offs = [{ role: 'platform-admin', authority_id: EMP.id, shape_hash: 'h' }];
       return json(r, step);
     }
-    if (presence && !ticket) {
-      return json(r, { error: 'presence', required: 'presence', produced: 'session' }, 422);
+    // A presence step completes on its stamps (design 1ce67f7e): bare,
+    // once the role is signed; refused, naming the role, while it is not.
+    if (presence && step.sign_offs.length === 0) {
+      return json(r, { error: 'stamps', completes_on: 'stamps',
+        missing_or_stale_roles: ['platform-admin'] }, 422);
     }
     step.status = 'completed';
     return json(r, step);
@@ -223,7 +226,7 @@ test('control: a begin held and let go with the step still shown asks the passke
   await expect.poll(() => seen.writes.filter((w) => w.method === 'PUT').length).toBe(1);
   expect((await passkey(page)).asked).toBe(1);
   expect(seen.writes.map((w) => `${w.method} ${w.step}${w.path} ${w.ticket ?? '-'}`)).toEqual([
-    'PATCH s1/metadata -', 'POST s1/sign-offs -', 'POST s1/sign-offs ticket-1', 'PUT s1 ticket-1',
+    'PATCH s1/metadata -', 'POST s1/sign-offs -', 'POST s1/sign-offs ticket-1', 'PUT s1 -',
   ]);
 });
 

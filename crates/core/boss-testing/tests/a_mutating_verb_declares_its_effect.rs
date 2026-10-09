@@ -62,6 +62,22 @@ const EFFECT_UNREAD: &[&str] = &["publish-github-pr"];
 /// is also checked against its own `FAILED — ` and `REFUSED — ` lines
 /// (see the test).
 const NOT_EFFECTS: &[(&str, &str)] = &[
+    // trim-build-node (backlog 30a6bf39), at the head as the entries
+    // below are: the bounds holding and the create's answer (a Job made
+    // is not a trim run), and a trim that succeeded whose Job could not
+    // be read back gone.
+    (
+        "trim-build-node",
+        "trim-build-node: every bound holds — CronJob boss-node-trim on the server is the one this checkout declares (image reg/david/alpine-k8s:1.33.3@sha256:00, deadline 1800s), binding node-maintenance-holds-one-workload denies, no trim in flight. Creating Job boss-node-trim-manual-20261008010000 from it.",
+    ),
+    (
+        "trim-build-node",
+        "trim-build-node: created Job boss-node-trim-manual-20261008010000 (uid 6f1e9b99-0000-4000-8000-000000000000)",
+    ),
+    (
+        "trim-build-node",
+        "trim-build-node: FAILED — the trim itself SUCCEEDED (Job boss-node-trim-manual-20261008010000 completed, pod exit 0, both mounts trimmed, closing OK) — but Job boss-node-trim-manual-20261008010000 was NOT proven removed — read it: kubectl -n boss-node-maintenance get job boss-node-trim-manual-20261008010000",
+    ),
     // expand-instance-volume (backlog ebbb923f), at the head beside the
     // drain-policy car's: the plan-still-holds line, the API server's
     // acceptance of the patch (what a verb reading kubectl's exit code

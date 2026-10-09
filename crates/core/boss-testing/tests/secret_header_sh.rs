@@ -639,6 +639,129 @@ fn the_token_rides_only_to_an_estate_host_the_way_boss_core_decides() {
     }
 }
 
+/// A URL THAT DOES NOT BEGIN WITH `http://` OR `https://` IS WITHHELD,
+/// WHATEVER IT HOLDS LATER (backlog 50708d76, F1 of review 927f8602).
+/// `machine_token_host` stripped `${1#*://}` — up to the first `://`
+/// ANYWHERE — so a URL with no scheme that held `://` further on was
+/// judged by the host after it, while curl guesses http and connects to
+/// the FIRST host. The first six rows are the reviewer's, each measured
+/// against curl 7.88.1 through a loopback stub with the list naming
+/// `sor.invalid`: every one read ADMIT and curl delivered the header to
+/// `evil.invalid`. Reaching them takes a base URL with no scheme, which
+/// no managed host renders, so the exposure is a hand-set or mistyped
+/// `BOSS_JOBS_URL` — the hand run this rule exists for.
+///
+/// The rule now reads an authority only after a leading `http://` or
+/// `https://`, and anything else has NO host: withheld, and said without
+/// one byte of the URL (its first word may be a path, a query or a
+/// userinfo). boss-core withholds every one of these rows too —
+/// `Url::parse` refuses a relative URL and finds no host behind a scheme
+/// that is really `host:port` — and the first nine are held equal to it.
+/// The last three are a NAMED difference, the safe way round: core would
+/// admit a loopback or listed host behind any scheme, and its clients can
+/// only speak http(s); the lib withholds, because curl speaks twenty.
+#[test]
+fn a_url_with_no_leading_http_scheme_is_withheld_whatever_it_holds_later() {
+    const PATH: &str = "/api/jobs?state=q-secret";
+    let list = "sor.invalid";
+    // (base, held equal to boss-core)
+    let cases = [
+        ("evil.invalid/x://sor.invalid", true),
+        ("evil.invalid/x://127.0.0.1", true),
+        ("evil.invalid:80/x://sor.invalid:7900", true),
+        ("evil.invalid?x=://sor.invalid", true),
+        ("evil.invalid#://sor.invalid", true),
+        ("user@evil.invalid/://localhost", true),
+        ("sor.invalid:7900", true),
+        ("127.0.0.1:7900", true),
+        ("localhost", true),
+        ("ftp://127.0.0.1", false),
+        ("ws://sor.invalid:7900", false),
+        ("evil.invalid://sor.invalid", false),
+    ];
+    for shell in SHELLS {
+        let f = Fixture::new(&format!("mt-no-scheme-{shell}"));
+        let dir = token_dir(&f, SECRET);
+        // The control, on the same fixture: the rule still stamps.
+        for base in ["http://sor.invalid:7900", "HTTPS://Sor.Invalid"] {
+            let _ = std::fs::remove_file(f.root.join("headers.txt"));
+            let url = format!("{base}{PATH}");
+            let r = f.run(
+                shell,
+                "set -eu\n\
+                 machine_token_header MT_HDR \"$URL\"\n\
+                 curl ${MT_HDR:+-H \"$MT_HDR\"} \"$URL\"\n",
+                &[
+                    ("BOSS_MACHINE_TOKEN_DIR", dir.to_str().unwrap()),
+                    ("BOSS_MACHINE_TOKEN_HOSTS", list),
+                    ("URL", &url),
+                ],
+            );
+            assert_eq!(r.code, 0, "{shell} {base}: {}", r.stderr);
+            assert!(
+                f.read("headers.txt").contains(SECRET),
+                "{shell} {base}: a listed host behind a leading scheme is stamped"
+            );
+        }
+        for (base, as_core) in cases {
+            let _ = std::fs::remove_file(f.root.join("headers.txt"));
+            let _ = std::fs::remove_file(f.root.join("judged.txt"));
+            let url = format!("{base}{PATH}");
+            let r = f.run(
+                shell,
+                "set -eu\n\
+                 machine_token_header MT_HDR \"$URL\"\n\
+                 machine_gate_value_header GV_HDR \"$URL\" fake-held-value 2>/dev/null\n\
+                 if machine_token_admits \"$URL\"; then a=admit; else a=withhold; fi\n\
+                 printf '%s [%s] [%s]\\n' \"$a\" \"$GV_HDR\" \"$(machine_token_host \"$URL\")\" > \"$STUB_DIR/judged.txt\"\n\
+                 curl ${MT_HDR:+-H \"$MT_HDR\"} \"$URL\"\n",
+                &[
+                    ("BOSS_MACHINE_TOKEN_DIR", dir.to_str().unwrap()),
+                    ("BOSS_MACHINE_TOKEN_HOSTS", list),
+                    ("URL", &url),
+                ],
+            );
+            assert_eq!(r.code, 0, "{shell} {base}: {}", r.stderr);
+            assert!(
+                !f.read("headers.txt").contains(SECRET),
+                "{shell} {base}: stamped by a host curl does not connect to"
+            );
+            assert_eq!(
+                f.read("judged.txt"),
+                "withhold [] []\n",
+                "{shell} {base}: the judgement alone, the value door and the host read agree"
+            );
+            if as_core {
+                assert!(
+                    !boss_core::machine_token::Hosts::parse(list).allows_url(&url),
+                    "{base}: boss-core admits a URL the lib withholds — the row is no longer equal"
+                );
+            }
+            assert!(
+                r.stderr.contains("machine token withheld")
+                    && r.stderr.contains("does not begin with http:// or https://"),
+                "{shell} {base}: withheld says why: {}",
+                r.stderr
+            );
+            for never in [
+                "evil",
+                "sor.invalid",
+                "user@",
+                "q-secret",
+                "/api/jobs",
+                "/x",
+                SECRET,
+            ] {
+                assert!(
+                    !r.stderr.contains(never),
+                    "{shell} {base}: never {never}: {}",
+                    r.stderr
+                );
+            }
+        }
+    }
+}
+
 /// UNSET, the list is the rendered sor.env's `BOSS_MACHINE_TOKEN_HOSTS=`
 /// line — what boss-core's `Hosts::from_env` falls back to, for a script
 /// run by hand that inherits no unit's `EnvironmentFile=` — unless the

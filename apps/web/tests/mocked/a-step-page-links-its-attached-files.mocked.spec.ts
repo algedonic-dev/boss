@@ -122,9 +122,24 @@ test('a step a plugin renders lists its attached file too', async ({ page }) => 
       contentType: 'application/javascript',
       body: readFileSync(new URL('../../../../infra/step-plugins/sign-off.js', import.meta.url), 'utf8'),
     }));
+  // The bundle loads the passkey ceremony it shares with
+  // incident-review.js by adding its script tag, and registers once that
+  // has run — so this is that loader, through the real host.
+  let ceremonyLoads = 0;
+  await page.route('**/plugins/passkey-ceremony.js', (r) => {
+    ceremonyLoads += 1;
+    return r.fulfill({
+      contentType: 'application/javascript',
+      body: readFileSync(
+        new URL('../../../../infra/step-plugins/passkey-ceremony.js', import.meta.url),
+        'utf8',
+      ),
+    });
+  });
   await mountPage(page, `/jobs/${JOB_ID}/steps/${STEP_ID}`, { root: '.step-focus' });
   // The plugin drew its surface, and the list stands beside it.
   await expect(page.getByRole('button', { name: 'Approve', exact: true })).toBeVisible();
+  expect(ceremonyLoads).toBe(1);
   await expectThePdfLinked(page);
 });
 

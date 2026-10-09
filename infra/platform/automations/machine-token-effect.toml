@@ -1,0 +1,19 @@
+# automation:machine-token-effect — in no role-report tally: its script
+# lands with this row (backlog 88379df3, the boss-gcp push), so it has
+# never called. Registered from the tree, where
+# every_script_sender_signs_as_a_registered_automation found it the moment
+# this car met train 977 — each car green alone, the pair red assembled.
+# Signs as platform-admin today: infra/estate/machine-token-effect.sh.
+# NARROWER THAN IT SIGNS, exactly as its forge twin machine-token-deposit
+# is: its one request is GET /api/machine-gate/accepts, to state by effect
+# which slot the token boss-gcp was pushed matches; it writes nothing to
+# the system of record. UNMEASURED: no observation shows which policy
+# resource that read is judged under, so the read role is the narrowest
+# fit and the tally is where a would-deny for it shows before the resolver
+# enforces. A refused read stops nothing: the script reports UNVERIFIED on
+# the converge packet and the converge goes on.
+
+[[automation]]
+id = "automation:machine-token-effect"
+role = "audit-readonly"
+description = 'The estate machine-token effect check on boss-gcp asking the jobs machine gate which slot the pushed token matches (infra/estate/machine-token-effect.sh, run by boss-gcp-converge). Reads only.'

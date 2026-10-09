@@ -177,6 +177,9 @@ fn app() -> (Router, Arc<InMemoryJobs>) {
     let state = JobsApiState {
         kind_registry: Some(kinds as Arc<dyn WorkflowRegistry>),
         roster: Some(Arc::new(FixedRoster)),
+        presence_key: Some(Arc::new(boss_jobs::http::PresenceKey::fixed(
+            boss_testing::passkey::TEST_GATEWAY_KEY.to_vec(),
+        ))),
         ..JobsApiState::minimal(
             jobs.clone(),
             bus,
@@ -960,21 +963,46 @@ async fn the_merge_door_is_unchanged_on_a_step_that_is_not_human_only() {
     assert!(status.is_success(), "{status} {text}");
 }
 
-/// The person the step is reserved for completes it, and the record
-/// names them.
+/// The person the step is reserved for completes it ON THEIR PASSKEY,
+/// and the record names them. Their asserted id alone no longer does
+/// (David, 2026-10-07, item 570c66e9): the machine door believes any id
+/// a caller asserts, so the roster could say only that the id is a
+/// person's, never that the caller is that person.
 #[tokio::test]
 async fn an_employee_completes_a_human_only_step() {
     let (app, jobs) = app();
     let job = file(&app, &jobs, "rotation", serde_json::json!({})).await;
     let kill = step_by_slug(&jobs, &job, "kill").await;
 
-    let (status, _, text) = put_step(
+    let (status, body, text) = put_step(
         &app,
         &kill,
         &user(DAVID, "platform-admin"),
         serde_json::json!({ "status": "completed" }),
     )
     .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{text}");
+    assert_eq!(body["human_only"], true, "{text}");
+    assert_eq!(body["required"], "presence", "{text}");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/jobs/{}/steps/{}", kill.job_id, kill.id))
+                .header("content-type", "application/json")
+                .header("x-boss-user", user(DAVID, "platform-admin"))
+                .header(
+                    boss_testing::passkey::PRESENCE_HEADER,
+                    boss_testing::passkey::passkey_ticket(&kill, DAVID),
+                )
+                .body(Body::from(r#"{"status":"completed"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, _, text) = read(resp).await;
     assert!(status.is_success(), "{status} {text}");
     let stored = jobs.get_step(&kill.id).await.unwrap().unwrap();
     assert_eq!(stored.status, boss_core::job::StepStatus::Completed);

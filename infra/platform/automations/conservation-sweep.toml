@@ -1,0 +1,11 @@
+# automation:conservation-sweep — not in the role-report tally read
+# 2026-10-07T02:13Z (that tally is held in memory and starts again with the
+# pod, so absence there is not absence of the caller); registered from the
+# tree, where every_script_sender_signs_as_a_registered_automation found it.
+# Signs as audit-readonly today: infra/lint/conservation-invariants.sh
+# (LEDGER_READER).
+
+[[automation]]
+id = "automation:conservation-sweep"
+role = "audit-readonly"
+description = 'The conservation-invariants check reading the ledger balance sheet (infra/lint/conservation-invariants.sh). Reads only.'

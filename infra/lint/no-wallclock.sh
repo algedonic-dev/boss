@@ -136,6 +136,15 @@ ALLOWED_PREFIXES=(
   # flip's clean window and the lapsed-grant alarm read, never an
   # audit_log row.
   "crates/core/boss-policy/src/check_mode.rs"
+  # The actor-role report's tally (design abf9eeae; backlog e0bdba74):
+  # the third of that shape — when it began, when each shape was first
+  # and last seen, and the instant its 72-hour window is read at, in
+  # process and bounded, answered on each service's
+  # /actor-role-reports. It runs in every service, the clock's own
+  # included, so it cannot wait on the clock port to say when. The
+  # facts it states are stamped by EventStamp like every record; the
+  # `since` they carry is the tally's own start, a payload field.
+  "crates/core/boss-policy-client/src/role_reporting.rs"
   # Diagnostic CLI — checkpoint timestamps in operator output.
   "crates/core/boss-events/src/bin/boss_audit_integrity_check.rs"
   # Deprecated clock helpers, pre-Clock-as-service. The module

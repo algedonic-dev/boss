@@ -12,6 +12,40 @@ pub const SNAPSHOT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs
 pub const REFRESH_CADENCE: std::time::Duration = std::time::Duration::from_secs(10);
 pub const REPORT_CAPACITY: usize = 512;
 
+/// Where `service` (a `boss-ports` name) answers its actor-role report
+/// — the path its binary mounts [`assemble`]'s inventory at, and the one
+/// the gate-window reader asks for the `actor-role` window (backlog
+/// e0bdba74). Each binary spells its own path as a literal; the pin
+/// `every_registered_service_has_a_production_role_report_owner` in
+/// boss-testing holds every one of them equal to this.
+pub fn report_path(service: &str) -> String {
+    match service {
+        // The simulator's API lives under its own prefix, and the sim
+        // daemon's control port has none.
+        "simulator" => "/simulator/api/actor-role-reports".into(),
+        "sim-control" => "/actor-role-reports".into(),
+        _ => format!("/api/{service}/actor-role-reports"),
+    }
+}
+
+/// The tally of a binary with no database to record through — the
+/// simulator, the sim daemon's control port, and (until it is given
+/// one, a follow-up to backlog e0bdba74) the gateway. It counts and
+/// follows the mode like any other, states nothing on the log, and its
+/// answer says so: `evidence.recorder` false, never a durable window.
+/// A binary with a database calls `boss_events::role_tally::durable`.
+pub fn unrecorded_tally(service: &str, mode: Arc<dyn ReportModeSource>) -> Arc<ReportTally> {
+    Arc::new(ReportTally::recording(
+        REPORT_CAPACITY,
+        mode,
+        boss_core::gate_evidence::Evidence::none(
+            boss_core::gate_evidence::Gate::ActorRole,
+            service,
+        ),
+    ))
+    .watched()
+}
+
 pub struct RoleReportWiring {
     pub policy: Arc<dyn PolicyClient>,
     pub guards: Arc<RoleGuardReporter>,

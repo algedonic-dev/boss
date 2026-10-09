@@ -539,6 +539,74 @@ fn refuses_an_ingress_missing_a_declared_hostname() {
     assert_eq!(c.etc_listing(), before);
 }
 
+/// THE HAND-OVER READ PRESENTS THE MACHINE TOKEN, AND THE PLAN IS THE
+/// SAME PLAN (design 6805c764; backlog 44b2087e). The verb's one read of
+/// the system of record went out with `x-boss-user` alone. It now hands
+/// curl the header file the one shell reader made — presented, never
+/// required: with no token on the host the dry run says what it said,
+/// and with one it says the same and the read carries the slot's value
+/// as a 0600 file, in no argv.
+#[test]
+fn the_hand_over_read_presents_the_machine_token_and_the_plan_is_the_same_plan() {
+    const MACHINE: &str = "synthetic-machine-fixture";
+    let go = |name: &str, slot: bool| -> (String, String) {
+        let c = Case::new(name);
+        // The harness's stub, recording first any header FILE it is handed.
+        let stub = std::fs::read_to_string(c.bin.join("curl")).unwrap().replacen(
+            "#!/bin/sh\n",
+            "#!/bin/sh\n\
+             q=; for a in \"$@\"; do if [ \"$q\" = -H ]; then case \"$a\" in @*) { stat -c 'mode=%a' \"${a#@}\"; cat \"${a#@}\"; } >> \"$STUB_HEADER_LOG\" ;; esac; fi; q=\"$a\"; done\n",
+            1,
+        );
+        write_exec(&c.bin.join("curl"), &stub);
+        let mount = c.root.join("mount");
+        std::fs::create_dir_all(&mount).unwrap();
+        if slot {
+            write_file(&mount.join("current"), &format!("{MACHINE}\n"));
+        }
+        let headers = c.root.join("headers.log");
+        let (rc, text) = c.run_env(
+            &["--dry-run"],
+            &[
+                ("BOSS_MACHINE_TOKEN_DIR", mount.display().to_string()),
+                ("BOSS_MACHINE_TOKEN_HOSTS", "sor.invalid".to_string()),
+                (
+                    "BOSS_SOR_ENV",
+                    c.root.join("no-sor.env").display().to_string(),
+                ),
+                ("STUB_HEADER_LOG", headers.display().to_string()),
+            ],
+        );
+        assert_eq!(rc, 0, "{name}: the dry run did not exit 0:\n{text}");
+        let argv = std::fs::read_to_string(c.root.join("curl.log")).unwrap_or_default();
+        assert_eq!(argv.lines().count(), 1, "{name}: one read: {argv}");
+        assert!(
+            !argv.contains(MACHINE) && !text.contains(MACHINE),
+            "{name}: the machine token is in argv or on the verb's output"
+        );
+        // The plan names this case's scratch paths and prints the second
+        // it ran in and the ages of the fixture's converges, so the two
+        // runs are compared with the paths named alike and every digit
+        // masked: what the plan SAYS, not when it said it. (Compared raw,
+        // this failed whenever the two runs straddled a second.)
+        let said: String = text
+            .replace(&c.root.display().to_string(), "<host>")
+            .chars()
+            .map(|ch| if ch.is_ascii_digit() { '0' } else { ch })
+            .collect();
+        (said, std::fs::read_to_string(&headers).unwrap_or_default())
+    };
+    let (without, none) = go("token-absent", false);
+    assert_eq!(none, "", "no token, and a header file was handed over");
+    let (with, carried) = go("token-present", true);
+    assert_eq!(with, without, "a token changes nothing the plan says");
+    assert_eq!(
+        carried,
+        format!("mode=600\nx-boss-machine-token: {MACHINE}\n"),
+        "the read carries the token, as a 0600 header file holding the slot's value"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The plan, the run, the record.
 // ---------------------------------------------------------------------------

@@ -505,6 +505,22 @@ mod tests {
                 .is_none(),
             "a stamp through a gateway carries no machine token (backlog 2ee29275)"
         );
+        // NO DEADLINE OF THE TEST'S OWN (backlog ec131700). `new` carries
+        // thirty seconds, a production bound against a stuck jobs door;
+        // sent through it, this was also a test of the runner. On gate-run
+        // 34031e7c (2026-10-07, two other gates beside it) the first POST
+        // read "operation timed out" from a stub in this same process, on
+        // a car that touches nothing here. Reproduced by holding the
+        // stub's first answer for thirty-one seconds: red through `new`,
+        // green here. `new` is still what is judged above, for the token,
+        // and it still supplies the base; the sends below ask who the
+        // stamp is signed as and what a refusal reads like, so the answer
+        // is the condition waited on: the same unstamped client, no timer.
+        let http = HttpStamps {
+            base: http.base,
+            client: boss_core::machine_token::Client::unstamped(reqwest::Client::builder())
+                .unwrap(),
+        };
         let line = stamp_after_publish(&http, &new_stamp(&["departments"]), "agent-claude")
             .await
             .unwrap();

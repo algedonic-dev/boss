@@ -64,7 +64,19 @@ post_observation() {
     if command -v machine_token_header >/dev/null 2>&1; then
         machine_token_header OBSERVE_MT_HDR "$JOBS_API" || OBSERVE_MT_HDR=""
     fi
+    # A TIME BOUND (backlog df38075a, F1 of review a92c0b94). This curl
+    # had none, and every observer unit is a oneshot, whose start timeout
+    # systemd leaves OFF unless the unit sets one: a system of record
+    # that accepts and never answers held the tick, the timer behind it,
+    # and the token's header file for as long as it liked. Curl exit 28
+    # is "failed" to every caller, so the reading is spooled as for any
+    # other outage. Whole seconds; a value that is not a number is not
+    # handed to curl, and nor is 0, which curl reads as no bound at all.
+    case "${OBSERVE_POST_MAX_TIME:-}" in
+        '' | *[!0-9]* | 0*) OBSERVE_POST_MAX_TIME=60 ;;
+    esac
     resp=$(printf '%s' "$1" | curl -s -w '\n%{http_code}' \
+      --connect-timeout 10 --max-time "$OBSERVE_POST_MAX_TIME" \
       -X POST -H 'content-type: application/json' \
       ${OBSERVE_MT_HDR:+-H "$OBSERVE_MT_HDR"} \
       -H 'x-boss-user: {"id":"automation:estate-observer-host","role":"platform-admin","access_tier":"operator"}' \

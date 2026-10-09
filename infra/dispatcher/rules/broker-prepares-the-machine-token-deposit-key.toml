@@ -1,0 +1,71 @@
+# ---------------------------------------------------------------------
+# The credential broker prepares the SSH key the estate machine token
+# rides to boss-gcp on (design-doc bdc60b65, question gcp-push, David
+# 2026-10-06; backlog 88379df3, part of urgent 2710c8fc).
+#
+# boss-gcp is the one estate host that can read no Secret, so the token
+# is PUSHED to it: the boss-machine-token-push CronJob pipes the three
+# slots over ssh to a forced-command receiver
+# (infra/gcp/ops-credential-recv.sh, purpose `machine-token`). That
+# needs a key boss-gcp accepts for exactly that command, and enrolling a
+# key on a host is a human's signed act. The protocol for it is
+# prepare-the-machine-token-deposit-key — prepare-a-deposit-key for this
+# one key: a human scopes it, THIS rule's handler mints the pair into the
+# one named Secret and writes the public proposal onto the packet's
+# `enroll` step, and a presence sign-off authorizes it.
+#
+# ITS OWN PROTOCOL KIND, because a step's `written_by` believes one
+# machine actor and prepare-a-deposit-key names the runner key's rule on
+# `issue` and `install`: pointed there, this rule's two receipts were
+# refused 403 by the jobs API (adversarial review ecd9263a, F1). The
+# per-key row names THIS rule; platform_bundle_prepare_a_deposit_key.rs
+# sends the handler's own bodies through the real router as this rule.
+#
+# NOT THE BREAK-GLASS KEY, AND NOT THE RUNNER'S. The break-glass deposit
+# key is forced to `ops-credential-recv kubeconfig` and stays so: one key
+# carries one forced command, and widening it is refused in two places in
+# this tree (the enroll step's procedure; infra/gcp/
+# runner-credential-enrollment.template). The runner's transport is
+# `runner-deposit-key`, with its own receiver. This is a third key with a
+# third exact purpose.
+#
+# WHAT THE ROW DECLARES — data, not code:
+#   secret_namespace / secret_name   where the pair lives. The converge
+#       creates the Secret EMPTY from this line (cluster-deploy-lib.sh
+#       broker_secrets); the broker may get and patch it by name
+#       (boss-credential-broker.yaml) and can create nothing.
+#   credential_id    the registry row the handler reads before it mints.
+#       Registry rows are instance data: after this lands, the operator
+#       publishes the row infra/gcp/machine-token-deposit-declaration.toml
+#       carries, then files the packet. Until then the handler refuses,
+#       naming the row.
+#   purpose          what the passkey signs the key FOR, on the enroll
+#       step and both machine receipts.
+#   forced_command   the one command the key may run. The handler joins
+#       it to the public half as `command="…",restrict <key>` and puts
+#       the WHOLE line on the enroll step as `authorized_keys_line`, so
+#       the line David authorizes is the line he places and nobody
+#       assembles it. machine_token_push_sh.rs holds this text equal to
+#       the receiver installer's and the sender's.
+[[rule]]
+name = "broker-prepares-the-machine-token-deposit-key"
+why = """
+EXTERNAL GLUE, the census class for reactions whose effect lives outside
+the system: the handler writes one k8s Secret, which no Workflow
+definition can address. The prepare-the-machine-token-deposit-key
+protocol row declares
+the ORDER (human scope -> issue -> install -> human enroll -> verify ->
+revoke); this rule is the machine executor of issue and install for ONE
+transport key, and its args are that key's declaration. It adds no
+routing: it advances the very packet that fired it, completes neither
+the enrollment nor anything after it, and spawns nothing. The same
+handler as broker-prepares-the-runner-deposit-key (1e50e66b), on a
+protocol of the same shape that names this rule as the writer of its two
+receipts; the estate machine token's own rotation is
+broker-rotates-the-machine-token and is not touched here.
+"""
+on_event = "step.done.credential-rotation"
+when = 'subject_id = "machine-token-deposit-key"'
+[[rule.do]]
+handler = "credential.prepare.ssh-deposit"
+args = { secret_namespace = "\"boss\"", secret_name = "\"machine-token-deposit-key\"", credential_id = "\"machine-token-deposit-key\"", protocol_kind = "\"prepare-the-machine-token-deposit-key\"", receiver_host = "\"boss-gcp\"", purpose = "\"estate machine token deposit\"", forced_command = "\"exec sudo -n /usr/local/libexec/boss/ops-credential-recv machine-token\"" }

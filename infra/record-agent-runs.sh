@@ -100,13 +100,28 @@ BOSS_USER="{\"id\":\"$FILER\",\"role\":\"platform-admin\",\"access_tier\":\"oper
 API_CURL="$(dirname "$0")/boss-api-curl.sh"
 [ -x "$API_CURL" ] || API_CURL=boss-api-curl.sh
 
+# The machine token, PRESENTED and never required (design 6805c764;
+# backlog 44b2087e): both arms of api() went out with x-boss-user alone.
+# Made here, in the script's own shell, because api() runs inside $(…).
+# No token on this host, a copy with no lib/ beside it, or a header file
+# that could not be written: MT_HDR is empty and the records are filed
+# exactly as before.
+MT_HDR=""
+SECRET_LIB="$(cd "$(dirname "$0")" && pwd)/lib/secret-header.sh"
+if [ -r "$SECRET_LIB" ]; then
+    # shellcheck source=infra/lib/secret-header.sh
+    . "$SECRET_LIB"
+    machine_token_header MT_HDR "$BASE" || MT_HDR=""
+fi
+
 api() {
     local method="$1" path="$2" body="${3:-}"
     if [ -n "$body" ]; then
         "$API_CURL" -fsS -X "$method" -H "x-boss-user: $BOSS_USER" \
+            ${MT_HDR:+-H "$MT_HDR"} \
             -H 'content-type: application/json' --data-binary "$body" "$BASE$path"
     else
-        "$API_CURL" -fsS -H "x-boss-user: $BOSS_USER" "$BASE$path"
+        "$API_CURL" -fsS -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} "$BASE$path"
     fi
 }
 

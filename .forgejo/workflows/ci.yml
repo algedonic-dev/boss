@@ -423,80 +423,42 @@ jobs:
   # gate-run's verdict are green (boss-cli train_gate.rs). What stays
   # here is what needs the forge: the image build, the locomotive's
   # host checks, and the web suite.
-  # THE RECLAIM FOLLOWS THE BUILD.
   #
-  # The disk this run just filled is reclaimed when this run ENDS, not at
-  # the next hourly tick. Measured on the forge, 2026-09-11 (backlog
-  # 0357e0eb): six observations fifteen minutes apart read 89, 100, 99,
-  # 60, 92, 98 GB free of 227. The locomotive refuses to START below 70
-  # (BOSS_CI_MIN_FREE_GB), so the 04:03 trough was ten gigabytes under the
-  # door — and that refusal happens BEFORE any check runs, so it says
-  # nothing about a branch while striking every car aboard. Four clean
-  # cars lost five departures to it on 2026-08-22 and a day went to
-  # holding on 2026-09-05.
+  # NO JOB HERE WRITES TO THE SYSTEM OF RECORD (backlog 37742794; David's
+  # answer to design-doc c8502e17, `ci-reclaim`, 2026-10-07). Until then a
+  # `reclaim` job ended every run by measuring the runner's disk and, below
+  # the sweep's floor, POSTing an ops-request for the `reclaim-disk` verb —
+  # signed `automation:ci-disk-reclaim`, asserting platform-admin, from a
+  # container that had just checked out and run a train BRANCH. A CI job
+  # runs branch code, so it may not hold the estate machine token (decision
+  # c395e62c), and without one that POST is a request every machine gate
+  # records as one it would refuse — and refuses, the day the door
+  # enforces. It is named as deliberately refused, and rather than leave a
+  # request in the tree whose designed answer is a refusal, the job and its
+  # script (infra/forge/request-reclaim-disk.sh) are gone.
   #
-  # Both floors are individually right; the CADENCE is the defect. The
-  # fill is event-driven (this job's own train built and pulled a
-  # per-train boss-ci:<sha> image into the system docker daemon); the
-  # reclaim was timer-driven (disk-floor-sweep.timer, hourly, defending
-  # 100GB — deliberately above the locomotive's 70 so a floor buys
-  # headroom). A dip bigger than that 30GB gap inside one interval walks
-  # through it.
   #
-  # ONLY THE TRIGGER WAS MISSING, and it lives HERE rather than in a new
-  # systemd unit on the host: this file IS the definition the runner
-  # reads, so the trigger cannot land uninstalled the way host units on
-  # this box have. The script files an ops-request for the allowlisted,
-  # bounded `reclaim-disk` verb (infra/ops/verbs/reclaim-disk.json) and the forge's
-  # ops-runner — already installed, ~1-minute poll — runs the same
-  # disk-floor-sweep.sh the timer runs. Same posture as the `converge`
-  # verb's merge fast path: an ACCELERATOR only. The hourly timer owes
-  # nothing to the system of record and stays the independent floor, so a
-  # request that cannot be filed costs latency, never a reclaim.
+  # THE RECLAIM STILL RUNS, on the host's clock. That job never reclaimed
+  # anything itself — it holds no docker socket, on purpose (see the top
+  # of this file) — it asked the forge to run
+  # infra/forge/disk-floor-sweep.sh sooner than its hourly timer would,
+  # and its own header called itself an accelerator: "a request this
+  # script cannot file costs LATENCY, never a missed reclaim". Under
+  # enforce every one of its requests would have been refused, so the
+  # hourly timer alone is the state the decision already chose; deleting
+  # the job makes that the state today, where it can be watched. The
+  # timer defends 100 GB and the locomotive refuses below 40.
   #
-  # always(), AND THAT IS THE POINT. A RED train built the same image. A
-  # locomotive DISK REFUSAL skips fast/test/web entirely and is the
-  # self-healing case — the door refused for want of disk, and this is
-  # what frees it before the next boarding. The one thing gated is
-  # build-image: its image is this job's container, so without it there is
-  # nothing to run in. continue-on-error plus a script that exits 0 on
-  # every path, because an accelerator that reds a train causes the exact
-  # strike it exists to prevent.
-  reclaim:
-    runs-on: docker
-    needs: [build-image, locomotive, web]
-    if: ${{ always() && needs.build-image.result == 'success' }}
-    continue-on-error: true
-    container:
-      image: 10.20.0.15:3000/david/boss-ci:${{ github.sha }}
-    env:
-      # PINNED INLINE, the boss-estate-observe-host idiom: a CI job
-      # inherits no systemd drop-in, and the script refuses to guess
-      # (defaulting to 127.0.0.1 is how weeks of maintenance packets
-      # landed on a non-authoritative instance, 2026-08-17).
-      BOSS_JOBS_URL: http://10.20.0.34:7900
-    steps:
-      - name: Check out from the forge, not github.com
-        # actions/checkout is a JavaScript action the runner pulls from
-        # github.com before the job starts; the runner's container DNS
-        # has no redundancy (see build-image's retry note), so one
-        # dropped lookup there reds the whole train with no car at fault
-        # — d9a34560. The repo is on the forge at a LAN IP, so a git
-        # clone by IP resolves no name. github.token is the job's own
-        # repo-scoped credential, the same one locomotive passes below.
-        env:
-          FORGE_TOKEN: ${{ github.token }}
-        run: |
-          set -eu
-          git init -q .
-          git remote add origin \
-            "http://x-access-token:${FORGE_TOKEN}@10.20.0.15:3000/${GITHUB_REPOSITORY}.git"
-          git fetch -q --depth=1 origin "${GITHUB_REF}"
-          git checkout -q --force FETCH_HEAD
-
-      - name: Ask the forge to reclaim disk now this run is done
-        # Measures free space the way locomotive.sh does — `df -Pk` on the
-        # workspace's own filesystem — and files nothing at all when the
-        # host is above the floor the sweep's unit defends, so a healthy
-        # pipeline puts no packets on the board.
-        run: bash infra/forge/request-reclaim-disk.sh
+  # WHAT IS LOST, said plainly: the reclaim no longer follows the build
+  # within a minute. If the 60 GB between those two floors stops being
+  # enough for an hour of trains (backlog 0357e0eb read 99 GB free and
+  # then 60, fifteen minutes apart, on 2026-09-11, against the 30 GB
+  # margin of that day),
+  # the repair is the timer's cadence, on the host — never a write from
+  # here.
+  #
+  # AND THE RECORD of each reclaim — free space before and after, what
+  # the per-train image pass freed, how the run ended — is on the sweep's
+  # own maintenance-disk-floor-sweep packet, written by the host that did
+  # the work. Pinned by
+  # crates/core/boss-testing/tests/the_reclaim_follows_the_build.rs.

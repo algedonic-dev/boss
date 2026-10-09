@@ -215,16 +215,20 @@ describe('completeWithPresence answers a presence refusal once', () => {
     return seen;
   };
 
-  test('a held ticket the server honours completes with no ceremony', async () => {
-    const seen = server((t) => t === 'held');
-    const res = await completeWithPresence('job-1', 'step-1', SHOWN, ON_SCREEN, 'held');
+  // Design 1ce67f7e: a step that names sign-off roles completes on the
+  // live passkey stamps it holds. The surface used to hand this function
+  // the stamp's ticket to send again (`heldTicket`, b568044a); the first
+  // attempt now goes bare, and the server that reads the stamps takes it.
+  test('a step its stamps carry completes on the bare PUT: no ticket, no ceremony', async () => {
+    const seen = server((t) => t === null);
+    const res = await completeWithPresence('job-1', 'step-1', SHOWN, ON_SCREEN);
     expect(res.kind).toBe('ok');
-    expect(seen.puts).toEqual(['held']);
+    expect(seen.puts).toEqual([null]);
     expect(seen.begins).toEqual([]);
     expect(seen.bodies).toEqual([{ status: 'completed' }]);
   });
 
-  test('no ticket held (a reload after the stamp): one ceremony on the shown step, one retry', async () => {
+  test('a presence step with no sign-off role: one ceremony on the shown step, one retry', async () => {
     withPasskey();
     const seen = server((t) => t === 'fresh-1');
     const res = await completeWithPresence('job-1', 'step-1', SHOWN, ON_SCREEN);
@@ -233,13 +237,34 @@ describe('completeWithPresence answers a presence refusal once', () => {
     expect(seen.begins).toEqual([{ job_id: 'job-1', step_id: 'step-1', shown: SHOWN }]);
   });
 
-  test('a held ticket past its life: one fresh ceremony, and the retry carries the fresh ticket', async () => {
-    withPasskey();
-    const seen = server((t) => t === 'fresh-1');
-    const res = await completeWithPresence('job-1', 'step-1', SHOWN, ON_SCREEN, 'expired');
-    expect(res.kind).toBe('ok');
-    expect(seen.puts).toEqual(['expired', 'fresh-1']);
-    expect(seen.begins.length).toBe(1);
+  // The server's refusal of a step whose stamps do NOT carry it names
+  // the roles and why, and carries no `required: "presence"`: a ticket on
+  // the completion would not help, so no ceremony is run for one.
+  test('stamps that do not carry the step: the roles and the reason, and no ceremony', async () => {
+    const seen = { begins: 0, puts: [] as (string | null)[] };
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes('/assert/')) {
+        seen.begins += 1;
+        return new Response(JSON.stringify(BEGIN), { status: 200 });
+      }
+      seen.puts.push(new Headers(init?.headers).get('x-presence-ticket'));
+      return new Response(
+        JSON.stringify({
+          error: 'this step completes on its sign-off stamps, and they do not carry it',
+          completes_on: 'stamps',
+          missing_or_stale_roles: ['platform-admin'],
+          detail: 'role platform-admin was signed by emp-david more than 72 hours ago',
+        }),
+        { status: 422 },
+      );
+    }) as unknown as typeof fetch;
+    const res = await completeWithPresence('job-1', 'step-1', SHOWN, ON_SCREEN);
+    expect(res).toEqual({
+      kind: 'failed',
+      error:
+        'sign-offs outstanding: platform-admin — role platform-admin was signed by emp-david more than 72 hours ago',
+    });
+    expect(seen).toEqual({ begins: 0, puts: [null] });
   });
 
   test('refused again after the fresh tap: failed, named, and never a second ceremony', async () => {
@@ -552,7 +577,7 @@ describe('a ceremony whose step leaves the screen mid-flight signs nothing', () 
       handed = (opts as { signal?: AbortSignal } | undefined)?.signal;
       return Promise.resolve(credential());
     });
-    const res = await completeWithPresence('job-1', 'step-1', SHOWN, ON_SCREEN, undefined, gesture.signal);
+    const res = await completeWithPresence('job-1', 'step-1', SHOWN, ON_SCREEN, gesture.signal);
     expect(res.kind).toBe('ok');
     expect(handed).toBe(gesture.signal);
   });

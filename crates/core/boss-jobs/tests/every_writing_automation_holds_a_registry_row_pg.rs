@@ -45,14 +45,33 @@ async fn the_bundle_lands_once_at_the_role_its_callers_assert_and_a_narrowed_row
         want.sort_by(|a, b| a.id.as_bytes().cmp(b.id.as_bytes()));
         want
     });
-    // Changes no one: every row carries the role its caller sends
-    // today, which on 2026-10-01 is platform-admin for every one.
+    // Widens no one. On 2026-10-01 every row carried platform-admin, the
+    // role each writer sends. The readers registered on 2026-10-07 (the
+    // converge and observer reads, the probe's reader, the sweeps' train
+    // read) hold the read role, so the bundle now spells two roles and no
+    // third: a row at any other role is a grant somebody has to argue
+    // for in its own change, never a default.
     let other: Vec<_> = rows
         .iter()
-        .filter(|a| a.role != "platform-admin")
+        .filter(|a| a.role != "platform-admin" && a.role != "audit-readonly")
         .map(|a| (&a.id, &a.role))
         .collect();
-    assert!(other.is_empty(), "car 1 narrows no one: {other:?}");
+    assert!(
+        other.is_empty(),
+        "a row holds a role the bundle has never spelled: {other:?}"
+    );
+    // The family rows stay with their signers, where car 1 put them.
+    let families: Vec<_> = rows
+        .iter()
+        .filter_map(|a| a.signs_for.as_deref().map(|p| (a.id.as_str(), p)))
+        .collect();
+    assert_eq!(
+        families,
+        [
+            ("automation:dispatcher", "automation:rule:"),
+            ("automation:ops-runner", "automation:ops-runner:")
+        ]
+    );
 
     // One fact per inserted row, on the outbox with the row.
     let staged: Vec<(String, serde_json::Value)> =
@@ -65,7 +84,9 @@ async fn the_bundle_lands_once_at_the_role_its_callers_assert_and_a_narrowed_row
     assert!(
         staged.iter().all(|(source, p)| source == "jobs"
             && p["declared_by"] == "automation:platform-workflow-seed"
-            && p["role"] == "platform-admin"),
+            && declared
+                .iter()
+                .any(|d| p["id"] == d.id.as_str() && p["role"] == d.role.as_str())),
         "{staged:?}"
     );
 

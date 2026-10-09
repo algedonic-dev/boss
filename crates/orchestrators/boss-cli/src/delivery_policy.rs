@@ -147,7 +147,15 @@ pub(crate) const COMPILED_CI_HOST_FLOOR_GB: i64 = 40;
 /// `a_gate_requests_what_the_new_layout_uses_and_the_bays_fit`. Four
 /// itself has never been measured with the I/O split across two disks,
 /// so a day of gate duration at four comes before five is considered.
-pub(crate) const COMPILED_GATE_MAX_CONCURRENT: i64 = 4;
+///
+/// THREE since policy v7 (backlog 17f6170c, 2026-10-07): that
+/// measurement came back. Four car gates plus the train gate took 75+
+/// minutes against a 42-minute median, one gate was IO-stalled 43
+/// percent of its wall time, and gate-run bd136c2e failed on loopback
+/// deadline tests its car does not touch — on a gate drive that had
+/// never been trimmed. Four returns when a loaded measurement after
+/// the trim says so.
+pub(crate) const COMPILED_GATE_MAX_CONCURRENT: i64 = 3;
 
 // WHICH LINTS THE CONSIST CHECK LEAVES OUT IS NOT POLICY ANY MORE. It
 // was, from 2026-08-24 to 2026-09-18 (`consist_excluded_lints` on the
@@ -339,10 +347,11 @@ mod tests {
              a FULL gate build that now runs in-cluster"
         );
         assert_eq!(
-            p.gate_max_concurrent, 4,
-            "gate.rs DEFAULT_MAX_CONCURRENT — policy v5 (backlog e6dc7331, \
-             2026-09-30): four bays, now that a gate's workspace is on w-1's \
-             second NVMe and its ephemeral request is 40Gi"
+            p.gate_max_concurrent, 3,
+            "gate.rs DEFAULT_MAX_CONCURRENT — policy v7 (backlog 17f6170c, \
+             2026-10-07): three bays until the untrimmed gate drive is fixed; \
+             four car gates plus the train gate took 75+ minutes against a \
+             42-minute median"
         );
         assert_eq!(
             p.version, NO_VERSION,

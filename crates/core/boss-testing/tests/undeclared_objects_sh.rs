@@ -1457,6 +1457,45 @@ fn a_generate_name_template_declares_its_kind_and_the_objects_that_carry_its_lab
     assert!(all.contains("declares no Job in `boss`"), "{all}");
 }
 
+/// A TEMPLATE'S OBJECTS OUTLIVE AN EDIT TO ITS LABELS (backlog 934ccad1).
+/// The gate Job template gained the literal label
+/// `boss.dev/verdict-carrier=pod-log`, and a selector made of every
+/// literal label then matched none of the 76 gate Jobs already live —
+/// each kept a day — nor any Job a branch cut before the edit stamps
+/// afterwards: the pre-flight listed all 76 as objects no manifest
+/// declares. `app` says which template stamped an object, so it is the
+/// selector; a Job from before the edit and one from after are both the
+/// template's, and the hand-made Job is still the one finding.
+#[test]
+fn a_templates_objects_stay_declared_when_it_gains_a_literal_label() {
+    let c = Case::new("gate-template-relabelled", &[]);
+    std::fs::write(
+        c.tree.join("infra/gate-runner/gate-runner.yaml"),
+        r#"{"kind":"Job","metadata":{"generateName":"gate-$GATE_NAME_HINT-","namespace":"boss-dev","labels":{"app":"gate-runner","boss.dev/packet":"$GATE_RUN_JOB_ID","boss.dev/verdict-carrier":"pod-log"}}}"#,
+    )
+    .unwrap();
+    c.add_live_labelled(
+        "Job",
+        "boss-dev",
+        "gate-before-the-edit",
+        "app=gate-runner,boss.dev/packet=p-1",
+    );
+    c.add_live_labelled(
+        "Job",
+        "boss-dev",
+        "gate-after-the-edit",
+        "app=gate-runner,boss.dev/packet=p-2,boss.dev/verdict-carrier=pod-log",
+    );
+    c.add_live("Job", "boss-dev", "seed-dir-probe-2", "");
+    let (rc, stdout, all) = c.run(&["--list"]);
+    assert_eq!(rc, 0, "{all}");
+    assert_eq!(
+        stdout.trim(),
+        "Job\tboss-dev\tseed-dir-probe-2",
+        "a Job the template stamped before it gained a label is still the template's:\n{all}"
+    );
+}
+
 /// A template whose labels are ALL placeholders can match nothing it
 /// stamped, so claiming its kind would make every live object of it a
 /// finding. It declares nothing, as a nameless document did before.

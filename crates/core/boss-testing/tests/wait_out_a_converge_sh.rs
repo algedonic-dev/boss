@@ -182,6 +182,142 @@ fn quiet_night() -> String {
     ])
 }
 
+/// THE CONVERGE READ PRESENTS THE MACHINE TOKEN, AND IS NEVER STOPPED BY
+/// IT (design 6805c764; backlog 44b2087e). The read went out with
+/// `x-boss-user` alone. The guard now asks the one shell reader for a
+/// header file and hands it to its door — and, because it "never fails
+/// the check", every state of the mount must leave the verdict, the exit
+/// and the request exactly what they were:
+///
+///   absent     no slot (the playground crawl's pod, today)
+///   present    a slot, the system of record on the host list
+///   off-host   a slot, the system of record NOT on the host list
+///   line-break a slot no header can carry
+///
+/// The door here records the header FILE it was handed (the guard's own
+/// door logs argv, and the token must never be in argv).
+#[test]
+fn the_converge_read_presents_the_machine_token_and_is_never_stopped_by_it() {
+    const TOKEN: &str = "synthetic-machine-fixture";
+    let go = |tag: &str, slot: Option<&str>, hosts: &str| -> (Run, String, String, Vec<String>) {
+        let root = scratch_dir(&format!("wait-out-a-converge-token-{tag}"));
+        let mount = root.join("mount");
+        create_dir(&mount);
+        if let Some(value) = slot {
+            write_file(&mount.join("current"), value);
+        }
+        let tmp = root.join("tmp");
+        create_dir(&tmp);
+        let headers = root.join("headers.txt");
+        let argv = root.join("argv.txt");
+        write_file(&root.join("answer.json"), &quiet_night());
+        let door = root.join("header-door.sh");
+        write_exec(
+            &door,
+            &format!(
+                "#!/usr/bin/env bash\n\
+                 echo \"$*\" >> '{argv}'\n\
+                 prev=\n\
+                 for a in \"$@\"; do\n\
+                 if [ \"$prev\" = -H ]; then case \"$a\" in @*) {{ stat -c 'mode=%a' \"${{a#@}}\"; cat \"${{a#@}}\"; }} >> '{headers}' ;; esac; fi\n\
+                 prev=\"$a\"\n\
+                 done\n\
+                 cat '{root}/answer.json'\n",
+                argv = argv.display(),
+                headers = headers.display(),
+                root = root.display(),
+            ),
+        );
+        let (mount_s, tmp_s, door_s, no_env) = (
+            mount.display().to_string(),
+            tmp.display().to_string(),
+            door.display().to_string(),
+            root.join("no-sor.env").display().to_string(),
+        );
+        let r = run_guard(
+            &format!("token-{tag}"),
+            &[Some(quiet_night())],
+            &[
+                ("BOSS_API_CURL", door_s.as_str()),
+                ("BOSS_MACHINE_TOKEN_DIR", mount_s.as_str()),
+                ("BOSS_MACHINE_TOKEN_HOSTS", hosts),
+                ("BOSS_SOR_ENV", no_env.as_str()),
+                ("TMPDIR", tmp_s.as_str()),
+            ],
+        );
+        let left = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        (
+            r,
+            std::fs::read_to_string(&headers).unwrap_or_default(),
+            std::fs::read_to_string(&argv).unwrap_or_default(),
+            left,
+        )
+    };
+
+    let (absent, absent_headers, absent_argv, _) = go("absent", None, "jobs.test");
+    assert_eq!(absent.rc, 0, "{}\n{}", absent.stdout, absent.stderr);
+    assert!(absent.stdout.contains("clear"), "{}", absent.stdout);
+    assert_eq!(
+        absent_headers, "",
+        "no token, and a header file was handed over"
+    );
+    assert_eq!(absent_argv.lines().count(), 1, "one read: {absent_argv}");
+
+    let fixture = format!("{TOKEN}\n");
+    let broken = format!("{TOKEN}\nsecond-line\n");
+    for (tag, slot, hosts, carries) in [
+        ("present", fixture.as_str(), "jobs.test", true),
+        ("off-host", fixture.as_str(), "elsewhere.test", false),
+        ("line-break", broken.as_str(), "jobs.test", false),
+    ] {
+        let (r, headers, argv, left) = go(tag, Some(slot), hosts);
+        assert_eq!(
+            r.rc, 0,
+            "{tag}: the guard exits 0 on every path\n{}\n{}",
+            r.stdout, r.stderr
+        );
+        assert_eq!(
+            r.stdout, absent.stdout,
+            "{tag}: the verdict is the one a host with no token reads"
+        );
+        assert_eq!(
+            argv.lines().count(),
+            1,
+            "{tag}: the read still goes out, once: {argv}"
+        );
+        assert!(
+            !argv.contains(TOKEN) && !r.stdout.contains(TOKEN) && !r.stderr.contains(TOKEN),
+            "{tag}: the token is in argv or on the guard's output:\n{argv}\n{}\n{}",
+            r.stdout,
+            r.stderr
+        );
+        if carries {
+            assert_eq!(
+                headers,
+                format!("mode=600\nx-boss-machine-token: {TOKEN}\n"),
+                "{tag}: the read carries the token, as a 0600 header file holding the slot's value"
+            );
+        } else {
+            assert_eq!(
+                headers, "",
+                "{tag}: this request must go out without the token"
+            );
+            assert!(
+                !r.stderr.is_empty(),
+                "{tag}: a token that is held and not sent is said on stderr, never silent"
+            );
+        }
+        assert!(
+            left.is_empty(),
+            "{tag}: the header directory outlived the guard: {left:?}"
+        );
+    }
+}
+
 #[test]
 fn a_quiet_cluster_is_clear_at_once() {
     let r = run_guard("quiet", &[Some(quiet_night())], &[]);
@@ -337,8 +473,13 @@ fn no_system_of_record_named_is_said_and_not_waited_on() {
     );
 }
 
-/// The crawl runs the guard after the clone (the guard is the tree's)
-/// and before the browser, through the chore wrapper's own API door.
+/// The guard runs before the browser — in the pod's `record` container,
+/// which holds the door, and the crawl's container waits for its word
+/// (backlog 37742794, 2026-10-07: the guard reads the record, so it left
+/// the container that runs bun and Playwright, which holds no token and
+/// names no jobs door). The order across the two containers: the guard,
+/// then the `go` file; and in the crawl, the clone, then the wait for
+/// `go`, then the suite.
 #[test]
 fn the_crawl_waits_out_a_converge_before_the_browser_starts() {
     let yaml = std::fs::read_to_string(repo_root().join(CRAWL)).expect("the crawl manifest");
@@ -353,17 +494,32 @@ fn the_crawl_waits_out_a_converge_before_the_browser_starts() {
             .unwrap_or_else(|| panic!("{CRAWL}: no code line carries {needle:?}"))
     };
     let clone = at("git clone --depth 1");
-    let guard = at("infra/wait-out-a-converge.sh");
+    let waits = at("while [ ! -e /go/go ]");
     let crawl = at("bun run test:live");
     assert!(
-        clone < guard && guard < crawl,
-        "{CRAWL}: clone, then wait out a converge, then crawl (lines {clone}, {guard}, {crawl})"
+        clone < waits && waits < crawl,
+        "{CRAWL}: in the crawl container — clone, then wait for go, then crawl (lines {clone}, {waits}, {crawl})"
+    );
+    let record = at("- name: record");
+    assert!(
+        crawl < record,
+        "{CRAWL}: the crawl container, then the record container"
+    );
+    let guard = at("\"$GUARD\" ||");
+    let go = at(": > \"$GO_DIR/go\"");
+    assert!(
+        record < guard && guard < go,
+        "{CRAWL}: in the record container — wait out a converge, THEN say go (lines {guard}, {go})"
     );
     assert!(
-        code[guard].contains("BOSS_API_CURL=/tools/boss-api-curl.sh"),
-        "{CRAWL}: the guard reads through the helper the init container copies — the roll \
-         posture every chore shares: {}",
-        code[guard]
+        code.contains(
+            &"export GUARD=\"${BOSS_CRAWL_GUARD:-/usr/local/bin/wait-out-a-converge.sh}\""
+        ),
+        "{CRAWL}: the guard is the image's copy of {GUARD}"
+    );
+    assert!(
+        code[record..].contains(&"- {name: BOSS_API_CURL, value: /usr/local/bin/boss-api-curl.sh}"),
+        "{CRAWL}: the guard reads through the image's own door — the roll posture every chore shares"
     );
     let path: PathBuf = repo_root().join(GUARD);
     assert!(path.is_file(), "{GUARD} exists");

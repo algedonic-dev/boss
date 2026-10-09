@@ -1,0 +1,72 @@
+# ---------------------------------------------------------------------
+# The credential broker mints and rotates the PROBE-READER credential
+# (design b35c22b4, "the shape of (d)", point 1; backlog d26515c5): the
+# value a recorded probe's reads are stamped with, which every machine
+# gate admits for GET and HEAD only and answers as
+# automation:run-car-probe-reader whatever the caller asserted. THIS
+# RULE ROW IS THE CREDENTIAL'S CONSUMER DECLARATION, the convention of
+# every broker rule: which Secret the gates mount, which slot set they
+# read it as, which registry row the phases land on, and how long the
+# old value must go unpresented before it is revoked. The registry row
+# proper is `boss-probe-reader` (kind machine-token) — INSTANCE data,
+# declared in the tenant directory's seeds/credentials.toml and landed
+# by `boss tenant publish`; until it exists the handler mints nothing
+# and says so on the packet's issue step (`issue_refused`).
+#
+# THE SAME HANDLER AS THE MACHINE TOKEN'S, by one argument and not a
+# second handler (b35c22b4): `gate_slots = "reader"`. A gate names a
+# value of this Secret `reader.next`, `reader.current`,
+# `reader.previous` — never the bare names it gives the estate token —
+# and `credential.rotate.self-issued` waits for exactly those. A gate
+# that names this credential's value by a BARE slot is saying the value
+# equals an estate machine token, which would hand probe text every
+# method under any identity: the handler refuses there, for a hand,
+# before anything is promoted (review 177b4976, N2).
+#
+# WHAT LANDING THIS RULE DOES, AND DOES NOT. It makes the converge
+# create boss/boss-probe-reader, EMPTY (cluster-deploy-lib.sh
+# broker_secrets reads `secret_namespace`/`secret_name` off every
+# credential.rotate.* rule), which the boss pod already mounts,
+# optional and read-only, at /etc/boss/probe-reader. An empty Secret is
+# an empty directory and reads as no reader slots at all. NOTHING IS
+# MINTED until a rotate-a-credential packet about this credential has
+# its SCOPE step completed by a person — this rule fires on that step
+# and on nothing else, and its clock twin only advances packets already
+# scoped. No gate mode moves; no caller is refused.
+#
+# ONE NAMESPACE. No `also_in_namespaces`: the gates that read this
+# Secret all run in the boss pod, and no boss-dev or playground copy
+# exists. The proving host's client file is delivered from this Secret
+# by a later car (a deposit on the forge, which reads `current`).
+#
+# THE DRAIN is the machine token's (b35c22b4: "the same drain"), pinned
+# equal by crates/core/boss-dispatcher/tests/probe_reader_rotation_rules.rs.
+# What it reads is this credential's own: `previous` is blanked only
+# after `drain_minutes` in which no gate's tally and no gate's facts on
+# the log show a `reader.previous` presentation. The one holder of the
+# old value is the proving host's client file between a promotion and
+# its next deposit. The tallies are opened with the estate token the
+# dispatcher's own mount holds — a gate's tally refuses a reader value
+# — and with no such token the revoke holds.
+#
+# `advance_rule` names this credential's clock rule, for the note every
+# deferral leaves on the packet.
+[[rule]]
+name = "broker-rotates-the-probe-reader"
+why = """
+EXTERNAL GLUE, the census class for reactions whose effect lives
+outside the system: the credential broker writes the k8s Secret store
+and reads every service port's machine gate, neither of which a
+Workflow definition can address. The rotate-a-credential protocol row
+declares the ORDER (issue -> install -> verify -> revoke); this rule is
+the machine executor for ONE credential, the probe reader, and its args
+are that credential's consumer declaration — the Secret, the slot set
+the gates read it as, the registry row, the drain window. It adds no
+routing: it advances the very packet that fired it and spawns nothing.
+Self-issued, by the machine token's handler (design b35c22b4).
+"""
+on_event = "step.done.credential-rotation"
+when = 'subject_id = "boss-probe-reader" OR metadata.credential = "boss-probe-reader"'
+[[rule.do]]
+handler = "credential.rotate.self-issued"
+args = { secret_namespace = "\"boss\"", secret_name = "\"boss-probe-reader\"", credential_id = "\"boss-probe-reader\"", gate_slots = "\"reader\"", advance_rule = "\"broker-advances-the-probe-reader-rotation\"", drain_minutes = "\"1440\"" }

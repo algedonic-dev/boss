@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gate-runner/run.sh — one gate, one Job, self-reporting.
+# gate-runner/run.sh — one gate, one Job, and a verdict it LEAVES.
 #
 # WHY THIS EXISTS. On 2026-08-22/23 gates ran as tmux trees inside the
 # boss-dev pod and died four different deaths, none their own fault:
@@ -10,16 +10,29 @@
 # Each death was reconstructed from journals after a human asked "how
 # are we looking". This script is the other shape: a Kubernetes Job
 # with its own clone, its own disk, a database sidecar, and a receipt
-# it reports to the gate-run packet itself — so the SoR knows the
-# verdict without anyone grepping a pod.
+# the gate-run packet ends up carrying — so the SoR knows the verdict
+# without anyone grepping a pod.
+#
+# WHO WRITES THAT RECEIPT TO THE PACKET (backlog 934ccad1; design
+# bdc60b65, question gate-verdict, decided 2026-10-06). Not this script,
+# once the manifest says so. This pod runs a car's branch, so it must
+# never hold the estate machine token (design c395e62c), and it used to
+# write its own verdict with none — refused, and every verdict lost, the
+# day the machine door enforces. Handed GATE_VERDICT_CARRIER=pod-log it
+# makes NO request to the jobs API: it leaves the receipt in its log and
+# the conductor records it (the "verdict carrier" block below). Handed
+# nothing — a manifest rendered from a branch cut before that landed,
+# whose Job carries no carrier label, so nobody would record for it — it
+# reports for itself exactly as before (the "report-back" block).
 #
 # Runs inside the boss-ci image (see gate-runner.yaml). Required env:
 #   GATE_BRANCH        branch to gate (fetched from the forge)
-#   GATE_RUN_JOB_ID    the gate-run packet this run reports to
+#   GATE_RUN_JOB_ID    the gate-run packet this run answers
 # Optional:
 #   GATE_MODE          "--auto" for scoped gates, empty for full
+#   GATE_VERDICT_CARRIER  "pod-log": leave the verdict, write nothing
 #   FORGE_URL          default http://10.20.0.15:3000/david/boss.git
-#   JOBS_API           default http://10.20.0.34:7900
+#   JOBS_API           default http://10.20.0.34:7900 (old layout only)
 set -euo pipefail
 
 FORGE_URL="${FORGE_URL:-http://10.20.0.15:3000/david/boss.git}"
@@ -336,9 +349,115 @@ retain_runtime_raw() {
 }
 # --- raw-runtime retention (end) ---
 
-# The run itself is guarded so ANY failure below still reports `lost`
+# --- verdict carrier (begin) ---
+# THE RUNNER LEAVES ITS VERDICT; IT DOES NOT WRITE IT (backlog 934ccad1;
+# design bdc60b65, question gate-verdict, decided 2026-10-06).
+#
+# THE CARRIER IS THIS POD'S OWN STDOUT, in two lines: the receipt whole
+# on one (`gate-runner: receipt <json>`), and on the next a trailer
+# stating the Job this pod belongs to, the verdict word, the payload's
+# byte count and its sha256. A reader of a log cannot tell a whole line
+# from a cut one; the trailer is how it can. Not the gate volume: every
+# gate mounts /gate-runs read-write, so a file there could be another
+# branch's work (5e77f216), where no other pod can write this stdout.
+#
+# AND THE TRAILER, AGAIN, IN THE TERMINATION MESSAGE. The kubelet keeps
+# what the container wrote to /dev/termination-log (4096 bytes - room
+# for the trailer, never for the receipt, which measured 65 KB at the
+# median) and publishes it only once the container has ENDED. The
+# conductor (boss-cli train/carried_verdict.rs, `named_frame`) records
+# nothing until then, and takes the frame that message names - not the
+# first frame in the log, which a line printed before this one used to
+# decide (review 7e5356f7). It is written here, at the frame, not at
+# exit: a container killed in the seed refresh after its checks all
+# passed still ended on its verdict (cf0021ae). Its tests lift this
+# block and read what it leaves, so the two cannot move apart.
+#
+# WHAT THIS DOES NOT BUY, SAID PLAINLY. The checks run in this container
+# under this uid, so branch code can write the log and that file as
+# this script does, and needs neither: infra/gate.sh is the branch's
+# own and can write a green receipt. The frame says WHOLE and WHICH
+# RUN, never HONEST.
+#
+# AND WHAT IT NARROWS, AND WHEN (review 47319ee7, S1) - the machine door
+# decides that, not this script:
+#   - before this layout, and today while the door only REPORTS: a gate
+#     pod, with no token, can PATCH and PUT the verdict step of ANY open
+#     gate-run, its own included;
+#   - with this layout and the door still reporting: exactly the same.
+#     This script stopped making those writes; nothing stops branch
+#     code in this pod from making them;
+#   - once the door ENFORCES: a tokenless pod's write is refused, so a
+#     gate pod can lie only about its own packet (the Job's label, which
+#     the launcher wrote and this pod cannot change), through its own
+#     frame. This layout is what makes enforcing survivable; enforcing
+#     is what narrows the forgery.
+#
+# ASKED OF THE MANIFEST, NOT ASSUMED. The script is the cluster's
+# ConfigMap and the manifest is the launcher's tree, so the two move
+# apart: a branch cut before the label landed renders a Job the
+# conductor does not read. Only GATE_VERDICT_CARRIER=pod-log - which the
+# manifest sets beside that label, one value, pinned together by
+# boss-testing's the_gate_runner_leaves_its_verdict_and_writes_nothing -
+# stops the report. Any other value is the old layout.
+GATE_VERDICT_CARRIER="${GATE_VERDICT_CARRIER:-}"
+GATE_TERMINATION_LOG="${GATE_TERMINATION_LOG:-/dev/termination-log}"
+# THE LAYOUT IS THIS SCRIPT'S TO KNOW, NOT ITS CHILDREN'S. The manifest
+# hands the variable to the container, so every process in the pod
+# inherited it - the branch's gate.sh, and every test that gate runs.
+# Gate-run 5d576fba went red on it: a test that lifts this very block
+# ran it as a carrier because the pod said so, and wrote a `lost`
+# trailer naming the real Job into the real termination message. The
+# two names are kept as shell variables and exported to nothing.
+export -n GATE_VERDICT_CARRIER GATE_TERMINATION_LOG
+carried() { [ "$GATE_VERDICT_CARRIER" = pod-log ]; }
+
+# The two lines, and - carried - the second of them as the termination
+# message. All builtins but the digest, so a 500 KB receipt never meets
+# the 128 KB one argv string may weigh (the old report's own ceiling).
+# A message that cannot be written is SAID and is not fatal: the frame
+# is already in the log, and the conductor settles a container that
+# ended with no message `lost`, by name.
+leave_verdict() { # <verdict> <one-line receipt>
+    local trailer
+    trailer=$(printf 'gate-runner: receipt-end v1 job=%s verdict=%s bytes=%s sha256=%s' \
+        "${NATIVE_JOB_NAME:-}" "$1" "$(printf '%s' "$2" | wc -c | tr -d ' ')" \
+        "$(printf '%s' "$2" | sha256sum | cut -d' ' -f1)")
+    echo "gate-runner: receipt $2"
+    echo "$trailer"
+    if carried; then
+        if ! { printf '%s\n' "$trailer" > "$GATE_TERMINATION_LOG"; } 2>/dev/null; then
+            echo "gate-runner: WARN: the termination message could not be written to $GATE_TERMINATION_LOG - the conductor reads the verdict it names, so this run will be settled lost; the receipt above is the copy"
+        fi
+    fi
+    return 0
+}
+
+# The receipt of a run that ended BEFORE its checks - it died, or it
+# refused to start - as the one-line object the frame carries: the
+# verdict word, the reason under the key its readers already read
+# (`refused_because` for a refusal, `error` for a death), and the head
+# when there was one.
+early_receipt() { # <verdict> <key> <why>
+    jq -nc --arg v "$1" --arg k "$2" --arg w "$3" --arg h "${HEAD_SHA:-}" \
+        '{verdict: $v, head: $h} + {($k): $w}' 2>/dev/null \
+        || printf '{"verdict":"%s"}' "$1"
+}
+
+# Such an end, delivered: left in the log when carried, reported by the
+# old layout. Never fatal - the run is ending either way.
+settle_early() { # <verdict> <the old layout's receipt> <the carried receipt>
+    if carried; then
+        leave_verdict "$1" "$3"
+    else
+        report "$1" "$2" || true
+    fi
+}
+# --- verdict carrier (end) ---
+
+# The run itself is guarded so ANY failure below still leaves `lost`
 # with the reason, rather than leaving the packet to go overdue.
-fail_lost() { retain_runtime_raw; report lost "runner died before a receipt: $1" || true; exit 1; }
+fail_lost() { retain_runtime_raw; settle_early lost "runner died before a receipt: $1" "$(early_receipt lost error "runner died before a receipt: $1")" || true; exit 1; }
 trap 'fail_lost "line $LINENO"' ERR
 
 # One job, one branch, one PRIVATE disk. /gate-target is a per-run
@@ -486,7 +605,8 @@ if ! GATE_DISK_REFUSAL=$(gate_disk_guard "${GATE_DISK:-}" /gate-runs /gate-seed 
     # gate.sh's disk floor and gate.rs's launch refusals write, so
     # train_gate::standing and `boss gate --wait` read the reason
     # rather than "no reason recorded".
-    report refused "$(jq -nc --arg w "gate disk: $GATE_DISK_REFUSAL" '{verdict:"refused",refused_because:$w}')" || true
+    GATE_DISK_RECEIPT=$(jq -nc --arg w "gate disk: $GATE_DISK_REFUSAL" '{verdict:"refused",refused_because:$w}')
+    settle_early refused "$GATE_DISK_RECEIPT" "$GATE_DISK_RECEIPT" || true
     exit 2
 fi
 # Only on the declared gate-volume layout, and only once the guard has
@@ -741,6 +861,31 @@ export BOSS_GATE_RUNTIME_EVIDENCE=/gate-target/runtime-evidence.jsonl
 export BOSS_GATE_SOURCE_HEAD="$HEAD_SHA"
 python3 infra/gate-runner/runtime-evidence.py sample "$BOSS_GATE_RUNTIME_EVIDENCE" runner-start \
     || { echo 'gate-runtime-evidence: runner-start collection failed'; printf '%s\n' runner-start >> "${BOSS_GATE_RUNTIME_EVIDENCE}.failed"; }
+# THE POSTGRES DATA VOLUME, READ BETWEEN CHECK BOUNDARIES (backlog
+# 9cd74fd5). The manifest keeps the sidecar's data directory in memory
+# with a sizeLimit and names its read-only mount in BOSS_GATE_PGDATA; the
+# collector reads how full it is at every sample. A sample is a check
+# boundary, the test check is ONE pair of them thirty minutes apart, and
+# scratch databases are dropped again — so the boundaries alone can miss
+# the peak the limit is judged by. This reads it every 15 s into the
+# evidence's side journal and the receipt carries the peak
+# (runtime_evidence.pgdata). It ends with this script, which is the
+# container: nothing waits for it and nothing signals it. A manifest
+# older than the volume sets no BOSS_GATE_PGDATA and starts nothing.
+#
+# IT IS NOT SILENCED (review bc011e92, F5; it was `> /dev/null 2>&1`, so
+# a watcher that died read exactly like one never started). Its output is
+# INHERITED here, and the collector moves its own stdout and stderr onto
+# ${BOSS_GATE_RUNTIME_EVIDENCE}.watch as its first act: one line when it
+# starts, one for its first failed reading, one if it dies - never a line
+# per reading - and the receipt carries them as
+# runtime_evidence.pgdata.watcher. What reaches THIS log is only what
+# happens before that: python failing to start, or a branch whose
+# collector predates `watch` saying "unknown runtime evidence action",
+# once.
+if [ -n "${BOSS_GATE_PGDATA:-}" ]; then
+    python3 infra/gate-runner/runtime-evidence.py watch "$BOSS_GATE_RUNTIME_EVIDENCE" 15 &
+fi
 echo "gate-runner: building ${CARGO_BUILD_JOBS}-wide (cgroup quota), tests 2-wide"
 
 # THIS IS A LOADED GATE, SAID TO THE WEB SUITES (backlog ebb750cd). On
@@ -1761,6 +1906,17 @@ write(entries, replay, excerpts, contexts)
 PY
 # --- failure detail (end) ---
 
+# THE WORD FOLLOWS THE RECEIPT, AGAIN (review 7e5356f7, N1). The block
+# above can REWRITE the receipt to a refusal - every failed check failed
+# for want of the network - after VERDICT was taken from it, so the step
+# said `failed` over a receipt saying `refused`: the two-sources shape
+# c67bdbae was filed about, re-made one block later. `boss gate --wait`
+# and auto-park read the word, the strike rule and the yard read the
+# receipt. One reading: if the receipt now refuses, so does the word.
+if [ -s "$RECEIPT" ] && [ "$(jq -r '.verdict // empty' "$RECEIPT" 2>/dev/null || true)" = refused ]; then
+    VERDICT=refused
+fi
+
 # --- receipt summary (begin) ---
 # THE PACKET KEEPS THE WHOLE RECEIPT.
 #
@@ -1825,10 +1981,29 @@ PY
 # be recovered by mounting the disk in a throwaway pod. The pod log
 # is the third copy, it costs one line, and `kubectl logs` reaches
 # it without mounting anything.
-echo "gate-runner: receipt $SUMMARY"
+# --- verdict delivery (begin) ---
+# THE RECEIPT LINE AND ITS TRAILER, in the log of every layout (the
+# "verdict carrier" block above says what they are and who reads them),
+# and - carried - nothing else: the conductor records this verdict on
+# the packet, and this pod makes no request. A runner handed no carrier
+# reports for itself, as it always did.
+#
+# `runtime_evidence` is stated on the carried receipt when the merge
+# above left none - the default the report used to add on its way out,
+# so "nobody collected it" and "nobody wrote the field" stay different.
+# A receipt jq cannot read is left exactly as it is.
+if carried; then
+    SUMMARY=$(printf '%s' "$SUMMARY" | jq -c 'if type == "object" and (has("runtime_evidence") | not) then . + {runtime_evidence: {state: "unavailable", collection_errors: ["runner ended before source collector was available"]}} else . end' 2>/dev/null || printf '%s' "$SUMMARY")
+fi
+leave_verdict "$VERDICT" "$SUMMARY"
 
 REPORTED=0
-if report "$VERDICT" "$SUMMARY"; then
+if carried; then
+    # DELIVERED, by this layout's meaning: the verdict is where its
+    # recorder reads it. Nothing below this line can lose it.
+    REPORTED=1
+    echo "gate-runner: verdict $VERDICT left in this log for the conductor to record on packet $GATE_RUN_JOB_ID - this runner writes nothing to the system of record"
+elif report "$VERDICT" "$SUMMARY"; then
     REPORTED=1
 else
     # THE OLD FALLBACK CLAIMED AN ALARM THAT CANNOT ALWAYS FIRE.
@@ -1901,6 +2076,7 @@ PY
             ;;
     esac
 fi
+# --- verdict delivery (end) ---
 
 # WHY THE FAILING OUTPUT IS REPLAYED TO STDOUT. gate.log is written to
 # /gate-target, which only the gate container mounts — not the postgres
@@ -1937,7 +2113,12 @@ fi
 
 # REFRESH THE SEED — the housekeeping that keeps parallel gates warm.
 # Runs AFTER the verdict is reported (a refresh must never delay a
-# `--wait`), and only from a run whose target is worth inheriting:
+# `--wait`), and only from a run whose target is worth inheriting.
+# (CARRIED, IT DOES DELAY ONE, and that is the price of the layout: the
+# conductor reads the verdict only once this container has ended, so a
+# green waits out its refresh before the packet says so. The verdict is
+# already safe - the frame and the termination message were written
+# above - only later.)
 #
 #   - GREEN only. A red run's target is usually fine (test failures
 #     still compile), but a compile-error red would seed broken

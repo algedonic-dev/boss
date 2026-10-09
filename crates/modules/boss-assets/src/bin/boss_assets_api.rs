@@ -207,9 +207,7 @@ async fn run_server<R: AssetsRepository + 'static>(
         policy,
         roles.clone(),
         mode.clone(),
-        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
-            boss_policy_client::role_service::REPORT_CAPACITY,
-        )),
+        boss_events::role_tally::durable("assets", mode.clone(), Some(&pool)),
     );
     let policy = wiring.policy;
 

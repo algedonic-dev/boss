@@ -191,6 +191,11 @@ const NOT_READERS: &[(&str, &str)] = &[
         "infra/lint/an-eviction-is-recorded-where-the-record-can-read-it.sh",
         "a stub curl's case arm: the lint PLAYS the registry to the observer it tests",
     ),
+    (
+        "infra/lint/a-manifest-sender-presents-the-machine-token.sh",
+        "names the read only to assert the observer it runs under a stub curl SENT it — \
+         the lint plays the registry and reads nothing (backlog 066a7613)",
+    ),
 ];
 
 /// Whether `line` names one of [`READS`] — `/api/estate/nodes/batch`,

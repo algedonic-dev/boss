@@ -194,7 +194,7 @@ fn the_forge_converge_still_installs_the_hosts_units() {
     assert!(
         directives(&read("infra/forge/forge-converge.sh"))
             .iter()
-            .any(|l| l.contains("\"$REPO/infra/forge/install.sh\"")),
+            .any(|l| l.contains("\"$RUN_FROM/forge/install.sh\"")),
         "forge-converge.sh no longer runs install.sh; re-read whether a mount namespace is \
          still refused for a reason, and update this pin and the unit's comment together"
     );

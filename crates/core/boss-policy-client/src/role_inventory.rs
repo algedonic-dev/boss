@@ -49,7 +49,9 @@ async fn read(State(state): State<Arc<Inventory>>, CurrentUser(user): CurrentUse
             "service": state.service,
             "mode": state.mode.mode(),
             "snapshot": state.roles.snapshot_status(),
-            "report": state.tally.snapshot()
+            // The tally with its window read from the log: a restart
+            // empties the counts and not the window (backlog e0bdba74).
+            "report": state.tally.durable_snapshot().await
         }))
         .into_response(),
         Ok(_) => (

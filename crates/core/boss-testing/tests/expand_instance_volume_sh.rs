@@ -802,6 +802,10 @@ fn largest_fit_refuses_ambiguous_malformed_overflow_and_unread_inputs_without_a_
             "null-document" => c.put(&format!("pvc-{NS}-{PVC}.json"), Value::Null),
             "empty-read" => env.push(("STUB_EMPTY", "settings.longhorn.io")),
             "forbidden" => env.push(("STUB_FORBIDDEN", "1")),
+            // No growth now asks the decisive-move read (design ada8f698;
+            // tests/a_tight_claim_proposes_one_decisive_replica_move.rs),
+            // which cannot answer here — this cluster serves none of the
+            // move's settings — and so still proposes nothing.
             "no-growth" => {
                 nodes[0]["status"]["diskStatus"]["default-disk-w-2"]["storageScheduled"] =
                     json!(100 * GIB);

@@ -26,7 +26,7 @@ use std::path::PathBuf;
 /// tests), so this adds no dependency. Where `/proc` is absent (macOS),
 /// the fallback is a value no real uid takes — and there `temp_dir()`
 /// is already per-user, so nothing is shared to collide on.
-fn current_uid() -> u32 {
+pub(crate) fn current_uid() -> u32 {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata("/proc/self")
         .map(|m| m.uid())

@@ -74,6 +74,18 @@ LimitCORE=0
 # on a host that has no file yet the wrap refuses (exit 78) and the
 # converge must run anyway — the packet is visibility, never a
 # precondition (CLAUDE.md §Diagnosis; boss-gcp-converge is the same).
-ExecStartPre=-/home/david/boss/infra/boss-maintenance-wrap.sh maintenance-forge-converge "Forge host converges on its own units"
-ExecStart=/home/david/boss/infra/forge/forge-converge.sh
-ExecStopPost=-/home/david/boss/infra/boss-step.sh maintenance-forge-converge run
+ExecStartPre=-/var/lib/boss/tree/current/infra/boss-maintenance-wrap.sh maintenance-forge-converge "Forge host converges on its own units"
+# WHAT THIS UNIT STARTS IS THE LAUNCHER, NOT A TREE (backlog a604a35b).
+# Root's converge runs from the tree root fetched from the forge's own
+# repository (/var/lib/boss/tree, infra/forge/root-tree.sh) and no longer
+# from /home/david/boss, a checkout its owner can write. The converge is
+# also the thing that MOVES that tree, so which generation's script a
+# tick runs is decided by a root-owned copy outside it: the newest
+# generation, or — when that one has run twice without showing it can
+# bring in the next — the last one that did. infra/forge/
+# forge-converge-launch.sh is that file and carries the rule; install.sh
+# puts it here and installs this unit only once it is there. The wrap
+# and the step ride `-`, so a tree that is briefly not there costs this
+# run its packet and never its start.
+ExecStart=/usr/local/libexec/boss/forge-converge-launch
+ExecStopPost=-/var/lib/boss/tree/current/infra/boss-step.sh maintenance-forge-converge run

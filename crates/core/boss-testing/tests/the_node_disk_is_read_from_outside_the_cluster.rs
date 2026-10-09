@@ -347,10 +347,10 @@ fn the_forge_runs_it_after_its_own_host_reading_and_best_effort() {
     assert_eq!(
         starts,
         vec![
-            "ExecStart=/home/david/boss/infra/estate/observe-host.sh",
-            "ExecStart=-/home/david/boss/infra/estate/observe-nodefs.sh",
+            "ExecStart=/var/lib/boss/tree/current/infra/estate/observe-host.sh",
+            "ExecStart=-/var/lib/boss/tree/current/infra/estate/observe-nodefs.sh",
             // The instance volumes (backlog 21ee3b4e), best-effort too.
-            "ExecStart=-/home/david/boss/infra/estate/observe-volumes.sh",
+            "ExecStart=-/var/lib/boss/tree/current/infra/estate/observe-volumes.sh",
         ],
         "the forge's own reading first (the boarding check reads it), then the cluster's \
          nodefs and the instance volumes, best-effort, so a cluster read never fails the \

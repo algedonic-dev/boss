@@ -296,7 +296,7 @@ prose = "Give the jump the bastion's own ssh user if it differs from your laptop
 [[road.line]]
 label = "On the forge, open the workspace when both ssh doors are dark"
 command = "sudo docker run --rm -it --network host -v {ops}/kubeconfig:/kc:ro {image} kubectl --kubeconfig=/kc -n {namespace} exec -it deploy/{deployment} -c {container} -- {attach}"
-with = { image = { file = "infra/cluster/manifests/boss-estate-observe.yaml", pattern = 'image: (alpine/k8s:\S+)$' }, ops = { file = "infra/estate/install-cluster-operator.sh", pattern = '^BOSS_OPS_DIR="\$\{BOSS_OPS_DIR:-([^}]+)\}"$' }, namespace = { file = "infra/cluster/manifests/boss-dev.yaml", pattern = '^kind: Deployment\nmetadata:\n  name: \S+\n  namespace: (\S+)$' }, deployment = { file = "infra/cluster/manifests/boss-dev.yaml", pattern = '^kind: Deployment\nmetadata:\n  name: (\S+)$' }, container = { file = "infra/cluster/manifests/boss-dev.yaml", pattern = '^      containers:\n        - name: (\S+)$' }, attach = { file = "infra/cluster/manifests/boss-dev.yaml", pattern = "cat > (\\S+) <<'LS'$" } }
+with = { image = { file = "infra/forge/cluster-deploy-runner.sh", pattern = '^K="sudo docker run .* (alpine/k8s:\S+) kubectl ' }, ops = { file = "infra/estate/install-cluster-operator.sh", pattern = '^BOSS_OPS_DIR="\$\{BOSS_OPS_DIR:-([^}]+)\}"$' }, namespace = { file = "infra/cluster/manifests/boss-dev.yaml", pattern = '^kind: Deployment\nmetadata:\n  name: \S+\n  namespace: (\S+)$' }, deployment = { file = "infra/cluster/manifests/boss-dev.yaml", pattern = '^kind: Deployment\nmetadata:\n  name: (\S+)$' }, container = { file = "infra/cluster/manifests/boss-dev.yaml", pattern = '^      containers:\n        - name: (\S+)$' }, attach = { file = "infra/cluster/manifests/boss-dev.yaml", pattern = "cat > (\\S+) <<'LS'$" } }
 
 [[road.line]]
 prose = "The forge has no kubectl of its own and the kubeconfig is root's alone, so the line above runs it under sudo inside the kubectl image the estate already uses."
@@ -328,7 +328,7 @@ prose = "Roll to a NAMED last-known-good build, read from the stamp above, never
 [[road.line]]
 label = "If the break-glass policy refuses a roll it should allow, delete its binding, on the forge (its named rollback, design b08725c2)"
 command = "sudo docker run --rm --network host -v {ops}/kubeconfig:/kc:ro {image} kubectl --kubeconfig=/kc delete validatingadmissionpolicybinding {binding}"
-with = { image = { file = "infra/cluster/manifests/boss-estate-observe.yaml", pattern = 'image: (alpine/k8s:\S+)$' }, ops = { file = "infra/estate/install-cluster-operator.sh", pattern = '^BOSS_OPS_DIR="\$\{BOSS_OPS_DIR:-([^}]+)\}"$' }, binding = { file = "infra/cluster/break-glass-deposit.sh", pattern = '^POLICY_BINDING="\$\{BOSS_DEPOSIT_POLICY_BINDING:-([^}]+)\}"$' } }
+with = { image = { file = "infra/forge/cluster-deploy-runner.sh", pattern = '^K="sudo docker run .* (alpine/k8s:\S+) kubectl ' }, ops = { file = "infra/estate/install-cluster-operator.sh", pattern = '^BOSS_OPS_DIR="\$\{BOSS_OPS_DIR:-([^}]+)\}"$' }, binding = { file = "infra/cluster/break-glass-deposit.sh", pattern = '^POLICY_BINDING="\$\{BOSS_DEPOSIT_POLICY_BINDING:-([^}]+)\}"$' } }
 
 [[road.line]]
 label = "The kit item that is the admin kubeconfig"
@@ -342,6 +342,92 @@ with = { placed = { file = "infra/forge/recovery-kit-README.txt", pattern = '^  
 
 [[road.line]]
 prose = "Delete the binding only when the policy refuses a roll you need. A policy with no binding judges nothing, so the bastion's credential can again rewrite a pod template and read what it names. The next converge binds it again, and the daily deposit check files a red while it is gone; to keep it gone past the next train, a revert car moves it back to reporting."
+
+# THE POLICY CHECK'S WAY BACK (review 4bbb0f93 finding F2; row D of
+# design b08725c2, backlog b8e75382). Row D's named rollback is one word
+# in a ConfigMap, patched by hand over the kube road, and until this road
+# it was on no sheet: the only rollback the paper printed was an image
+# roll, which does not undo a ConfigMap word. Every value in the three
+# commands is read: the ConfigMap, the key and the payload from the line
+# boss.yaml carries beside the key (the manifest's own pin holds that line
+# to that ConfigMap and that key), each namespace from the instance list.
+#
+# FOLDED FROM ITS REVIEW (45ae95c1, 2026-10-06). The kubectl image is read
+# from the line that runs kubectl ON THE FORGE (cluster-deploy-runner.sh),
+# not from the estate observer's manifest: a queued car moves that manifest
+# line to a mirror ref by digest, and with both on main the whole sheet
+# stopped rendering. The hold is printed as the command it is run by, its
+# checkout read from the unit that runs the converge the hold stops: it is
+# the one step whose omission silently undoes the patch. The rehearsal
+# flag is spelled, and kubectl's own answer is on the paper because with
+# the system of record dark it is the only sign there is.
+[[road]]
+id = "policy-check-rollback"
+title = "The policy check refuses what it should answer — set its mode word back"
+
+[[road.line]]
+prose = "Use this when doors answer that policy is unreachable while the policy service itself is up, after the policy check was set to refuse. An image roll does not help: the mode is one word in a ConfigMap, not part of any build. Setting the word back stops the refusals without restarting anything. It passes no policy check, and needs neither the system of record nor the forge's git."
+
+[[road.line]]
+label = "The word the policy service reads is mounted at"
+file = "crates/core/boss-policy/src/check_mode.rs"
+pattern = '^pub const DEFAULT_MODE_FILE: &str = "([^"]+)";$'
+
+[[road.line]]
+label = "On the forge, the operating instance"
+command = "sudo docker run --rm --network host -v {ops}/kubeconfig:/kc:ro {image} kubectl --kubeconfig=/kc -n {namespace} patch configmap {configmap} --type merge -p {patch}"
+with = { image = { file = "infra/forge/cluster-deploy-runner.sh", pattern = '^K="sudo docker run .* (alpine/k8s:\S+) kubectl ' }, ops = { file = "infra/estate/install-cluster-operator.sh", pattern = '^BOSS_OPS_DIR="\$\{BOSS_OPS_DIR:-([^}]+)\}"$' }, namespace = { file = "infra/cluster/instances.toml", key = "prod.namespace" }, configmap = { file = "infra/cluster/manifests/boss.yaml", pattern = '^#   kubectl -n \S+ patch configmap (\S+) --type merge -p \S+$' }, patch = { file = "infra/cluster/manifests/boss.yaml", pattern = '^#   kubectl -n \S+ patch configmap \S+ --type merge -p (\S+)$' } }
+
+[[road.line]]
+label = "On the forge, the playground"
+command = "sudo docker run --rm --network host -v {ops}/kubeconfig:/kc:ro {image} kubectl --kubeconfig=/kc -n {namespace} patch configmap {configmap} --type merge -p {patch}"
+with = { image = { file = "infra/forge/cluster-deploy-runner.sh", pattern = '^K="sudo docker run .* (alpine/k8s:\S+) kubectl ' }, ops = { file = "infra/estate/install-cluster-operator.sh", pattern = '^BOSS_OPS_DIR="\$\{BOSS_OPS_DIR:-([^}]+)\}"$' }, namespace = { file = "infra/cluster/instances.toml", key = "playground.namespace" }, configmap = { file = "infra/cluster/manifests/boss.yaml", pattern = '^#   kubectl -n \S+ patch configmap (\S+) --type merge -p \S+$' }, patch = { file = "infra/cluster/manifests/boss.yaml", pattern = '^#   kubectl -n \S+ patch configmap \S+ --type merge -p (\S+)$' } }
+
+[[road.line]]
+prose = "To rehearse either line without changing anything, add --dry-run=server at its end. A rehearsal that sets the word the ConfigMap already holds proves the credential and the typing, not the change. If the real patch answers no change, the word already said report: the refusals have another cause and this road is not the way back."
+
+[[road.line]]
+label = "kubectl answers each patch with a line that begins (with the system of record dark, this line is the only sign you get)"
+command = "configmap/{configmap} patched"
+with = { configmap = { file = "infra/cluster/manifests/boss.yaml", pattern = '^#   kubectl -n \S+ patch configmap (\S+) --type merge -p \S+$' } }
+
+[[road.line]]
+label = "Then, within about a minute, this read answers mode report, when the system of record is up to ask"
+file = "crates/core/boss-policy/src/check_mode.rs"
+pattern = '^pub const REFUSALS_PATH: &str = "([^"]+)";$'
+
+[[road.line]]
+label = "That read is answered by the service the read doors name"
+file = "infra/forge/probe-bin/sor-routes.sh"
+pattern = '^ +/api/policy\|/api/policy/\*\) +service=(\S+) ;;$'
+
+[[road.line]]
+prose = "The trap: the next converge of a changed main applies the manifest again and sets the word back to refuse. So hold the converge, as root on the forge, until a revert car has landed; the revert must restore the manifest line and its test together. Skip the hold and the patch is undone without a word."
+
+[[road.line]]
+label = "Then hold the converge, on the forge, from its converged checkout"
+command = "sudo bash {checkout}/{script} hold 'policy check set back by hand, no converge until the revert lands'"
+with = { checkout = { file = "infra/forge/cluster-deploy-runner.service", pattern = '^ExecStart=(\S+)/infra/forge/cluster-deploy-runner\.sh$' }, script = { file = "infra/forge/converge-hold.sh" } }
+
+[[road.line]]
+prose = "It is held only when that line answers HELD with your reason; it prints that after reading the hold back. Any other answer means the converge is not held."
+
+[[road.line]]
+label = "Lift the hold once the revert car is on main"
+command = "sudo bash {checkout}/{script} release"
+with = { checkout = { file = "infra/forge/cluster-deploy-runner.service", pattern = '^ExecStart=(\S+)/infra/forge/cluster-deploy-runner\.sh$' }, script = { file = "infra/forge/converge-hold.sh" } }
+
+[[road.line]]
+label = "The same hold through the ops door, when the system of record answers"
+file = "infra/ops/verbs/hold-converge.json"
+
+[[road.line]]
+label = "With the forge dark, the operating instance from any home-network host with a kubectl client, the kit's admin kubeconfig placed where its README's step 2 says"
+command = "sudo kubectl --kubeconfig={placed} -n {namespace} patch configmap {configmap} --type merge -p {patch}"
+with = { placed = { file = "infra/forge/recovery-kit-README.txt", pattern = '^   and kubectl\) as \S+ and (\S+),$' }, namespace = { file = "infra/cluster/instances.toml", key = "prod.namespace" }, configmap = { file = "infra/cluster/manifests/boss.yaml", pattern = '^#   kubectl -n \S+ patch configmap (\S+) --type merge -p \S+$' }, patch = { file = "infra/cluster/manifests/boss.yaml", pattern = '^#   kubectl -n \S+ patch configmap \S+ --type merge -p (\S+)$' } }
+
+[[road.line]]
+not_tree_held = "whether this patch has ever been run. No packet records it, and the session that wrote this road could not read the ConfigMap. Rehearse it with --dry-run=server before the day it is needed."
 
 [[road]]
 id = "bastion-cluster-credential"

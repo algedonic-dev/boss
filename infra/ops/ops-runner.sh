@@ -328,12 +328,23 @@ fi
 # before, sending none. A file that cannot be one header is said here and
 # the pass goes on without it: the credential adds identity, and until a
 # protocol declares a writer, identity is all it adds.
+#
+# AND IT LEAVES ONLY FOR A HOST THE MACHINE TOKEN MAY LEAVE FOR (backlog
+# 7369b078, F1 of review 9c484ca8). Its header was made whatever $BASE
+# held, and since 44b2087e it rides on the queue read of every pass: a
+# BOSS_JOBS_URL pointed off the estate got no machine token and did get
+# this. The host is judged FIRST, by the library's own rule
+# (machine_token_admits — loopback or BOSS_MACHINE_TOKEN_HOSTS), so off
+# the estate the file is not read at all; said below, and the pass goes
+# on, as for every other reason it is not presented.
 RUNNER_CREDENTIAL_FILE="${BOSS_RUNNER_CREDENTIAL_FILE:-/etc/boss/ops-runner.credential}"
 RC_HDR=""
 if [ -e "$RUNNER_CREDENTIAL_FILE" ]; then
     rc_value=""
     rc_why=""
-    if [ ! -r "$RUNNER_CREDENTIAL_FILE" ]; then
+    if ! machine_token_admits "$BASE"; then
+        rc_why="the system of record's host '$(machine_token_host "$BASE")' is not loopback and not in BOSS_MACHINE_TOKEN_HOSTS"
+    elif [ ! -r "$RUNNER_CREDENTIAL_FILE" ]; then
         rc_why="this runner cannot read it"
     elif ! rc_value=$(cat "$RUNNER_CREDENTIAL_FILE" 2>"$workdir/rc-err"); then
         rc_value=""
@@ -1040,9 +1051,24 @@ verify_approval() {
 # execute step METADATA (the plan, the decision, the stamp's shape, the
 # exit it merges into), and the list's default is going slim — step
 # metadata only when asked (backlog 9b473d4a; a_listed_packet_carries_its_steps.rs).
+#
+# THE READ CARRIES THE MACHINE TOKEN, as every write below does
+# (backlog 44b2087e). It did not: the seven writes handed curl MT_HDR and
+# this read, the one request a pass ALWAYS sends, went out with
+# x-boss-user alone — 77 tokenless GET /api/jobs in 44 minutes on
+# 2026-10-07, each a caller the jobs gate would refuse under `enforce`,
+# which would have stopped every runner at its first line. MT_HDR is
+# empty on a host that holds no token, and the read is then exactly the
+# one it was. The runner credential rides beside it, as on every write:
+# the door's rule is that every request carrying the machine token
+# carries the credential (design f623e425 Q1; ops_runner_sh.rs holds the
+# two counts equal), and the jobs API's credential door never refuses —
+# on a read it resolves the caller and no handler asks for it
+# (crates/core/boss-jobs/src/runner_credential.rs).
 host_doc=$(jq -rn --arg h "$HOST_ID" '{host: $h} | tojson | @uri')
 QUEUE_PAGE=1000
 if ! jobs_json=$(curl -fsS -H "x-boss-user: $BOSS_USER" \
+        ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
         "$BASE/api/jobs?kind=ops-request&status=open&metadata=$host_doc&limit=$QUEUE_PAGE&full=true" 2>&1); then
     echo "ops-runner: jobs-api unreachable at $BASE — $jobs_json" >&2
     exit 1

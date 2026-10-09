@@ -75,7 +75,9 @@ impl StrandWindows {
 /// AGE BASIS, in preference order — every one of them dates the
 /// VERDICT, never the gate's start:
 ///   1. the verdict step's own `completed_at` column, which the jobs
-///      API stamps on every completion (`automation:gate-runner`);
+///      API stamps on every completion, whoever recorded it (the
+///      conductor, for a runner that leaves its verdict in its pod log;
+///      `automation:gate-runner`, for one that still reports);
 ///   2. the same key inside the step's `metadata`, honoured for free in
 ///      case a runner ever writes one there;
 ///   3. the run's `metadata.closed_at` — the outcome rule closes the

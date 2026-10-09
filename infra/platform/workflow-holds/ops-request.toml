@@ -1,0 +1,63 @@
+# The signer half of row E is RELEASED to the unattended publish roads
+# (design 09618594, question `signer`, David 2026-10-06; backlog
+# 6c9183de). The row still declares a writer, so the default would hold
+# it; this file is the declaration that hands it back, on the record,
+# and says on what evidence to every reader: publish-drift's table
+# (which names a released kind on every run), the publish-workflow
+# verb, and the hand publish's own lines.
+#
+# It said `held` from the car that declared the writer (3616120a) until
+# 2026-10-07, and named what would lift it: David's publish and its
+# positive control holding, then a car. Both held that day; `why` below
+# carries the packets and the times, each read back from the system of
+# record by the car that wrote this.
+#
+# WHAT RELEASED MEANS HERE, since the word is wider than the evidence:
+#
+#   - It published nothing. On the day of the release the live row and
+#     the tree's row compared equal under publish-workflow.sh's own
+#     comparator, so both roads answer "nothing to publish" for this
+#     kind until the tree's row changes again.
+#   - EQUAL SAYS NOTHING ABOUT A WRITER OR AN EXECUTOR. That comparator
+#     reads a field as its name, type and required, and a step without
+#     its executor (backlog aa28f921 is the item for that). So
+#     "released and equal" does not by itself certify that the live row
+#     reserves `decision` and `comment` to the signer: a live row that
+#     lost only its writers would read equal too. What certifies it is
+#     a direct read of the live row's writers — made on the day of the
+#     release, and made again by this car's recorded probe.
+#   - From then on a change to infra/platform/workflows/ops-request.toml
+#     that the comparator can see goes live by either unattended road,
+#     like any other kind's.
+#   - A ROLLBACK NO LONGER STICKS BY ITSELF. Republishing the no-writer
+#     row by hand leaves the tree ahead of live, and two roads put the
+#     signer row back:
+#       * publish-drift --for-real, which a rule files only after a
+#         check that refused nothing. On 2026-10-07 no check was clean
+#         (ops-request 1728043e answered `refused 10`, ten unrelated
+#         kinds, as did every check read that day), so this road
+#         would have left a rollback standing — by accident, and only
+#         until those ten are settled.
+#       * `publish-workflow ops-request`, the one-kind verb. It waits
+#         for no check and declares no approval, so anyone who may file
+#         an ops-request can put the signer row back at once.
+#     A deliberate rollback therefore re-holds FIRST: a car puts `held`
+#     back here, and only then is the old row republished by hand.
+#     Without that car the rollback can be undone by any such filer.
+#
+# THE RUNNER HALF IS NOT RELEASED BY THIS. Row E's other half will
+# declare `runner:ops` on this same row, and the item still owes an
+# executor rule on `execute`. Either is a second refusal, never
+# published by hand and never controlled, and this reader cannot tell
+# one refusal on a row from another: a `released` file hands back the
+# whole row. So the car that carries the runner half puts `held` back
+# here, with its own why and its own lifts, IN THE SAME CAR as the
+# declaration. A pin stands behind that sentence:
+# crates/core/boss-testing/tests/publish_drift_sh.rs
+# (`the_shipped_signer_row_is_released_by_declaration_and_only_its_signer_half`)
+# asks infra/gcp/workflow-holds.py's own `refusal_declarations` what the
+# parsed row declares and goes red unless it is exactly `decision` and
+# `comment` on `approve`, each reserved to the signer — so no spelling
+# of a writer or an executor that this reader would honour gets past it.
+drift_publish = "released"
+why = '''Released on 2026-10-07 by the car backlog 6c9183de named as the lift (design 09618594, question signer), for the signer half only. David published this row by hand as ops-request v10 at 2026-10-07T16:21:39Z, and read back it is active with the approve step's decision and comment both reserved to the signer. The negative control held: a machine-door PATCH of comment, then of decision, onto the approve step of control request ef9e591c each answered 409 and wrote nothing (recorded on 6c9183de as publish_day_20261007). The positive control held: ef9e591c was filed under v10 at 16:22:24Z, David approved it by passkey (decided 16:24:23Z, the approve step completed under his own id at 16:24:28Z), and the runner executed and answered at 16:25:33Z, exit 0. No rollback was needed. The live row and the tree's row compare equal, so this release publishes nothing; later edits to the row ride the unattended roads like any other kind's. Equal says nothing about a writer or an executor, which the comparator does not compare (backlog aa28f921): the signer reservation rests on the direct read of the live writers above, not on that word. What it gives up: a hand rollback to the no-writer row no longer stays rolled back. The one-kind publish-workflow verb needs no approval and puts the signer row back at once for anyone who may file an ops-request; the drift publish does the same after its next clean check, of which there was none on 2026-10-07 (ten unrelated kinds refused). A deliberate rollback re-holds in a car first. What it does not cover: the runner half of row E. The car that declares runner:ops or an executor on this row puts drift_publish = "held" back in that same car.'''

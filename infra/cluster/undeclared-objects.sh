@@ -32,7 +32,7 @@
 # complete enough to compare against, so a (kind, namespace) pair is IN
 # SCOPE when
 #   * the namespace is one the tree OWNS — $DIR declares a `Namespace`
-#     object for it (today: boss, boss-dev); and
+#     object for it (today: boss, boss-dev, boss-node-maintenance); and
 #   * $DIR declares at least one object of that kind in it — or a
 #     generateName TEMPLATE of that kind names it (the gate Job), in
 #     which case a live object carrying the template's literal labels
@@ -383,9 +383,23 @@ for d in docs:
         # Only LITERAL labels can select what it stamped; a `$PLACEHOLDER`
         # is filled per launch. No literal label, no template.
         if kind and not name and md.get("generateName"):
+            #
+            # THE `app` LABEL, WHEN THERE IS ONE, IS THE WHOLE SELECTOR
+            # (backlog 934ccad1). A template's objects outlive an edit to
+            # it: the gate Job gained the literal label
+            # boss.dev/verdict-carrier=pod-log, and a selector made of
+            # EVERY literal label then matched none of the 76 gate Jobs
+            # already live (kept a day each), nor any Job a branch cut
+            # before that edit stamps afterwards - all of them reported
+            # undeclared, on a template that still declares them. `app`
+            # says which template stamped an object; the other literal
+            # labels say how that version of it was laid out.
             labels = md.get("labels") or {}
-            sel = ",".join(f"{k}={v}" for k, v in sorted(labels.items())
-                           if "$" not in k and "$" not in str(v))
+            literal = {k: v for k, v in labels.items()
+                       if "$" not in k and "$" not in str(v)}
+            if "app" in literal:
+                literal = {"app": literal["app"]}
+            sel = ",".join(f"{k}={v}" for k, v in sorted(literal.items()))
             if sel:
                 print(f"{kind}\t{ns}\t{sel}\t{src}")
         continue

@@ -55,9 +55,25 @@
 //!   probe traffic. It never reads the tally: that stays the estate
 //!   token's.
 //!
-//! No manifest mounts the directory yet, and an absent one is an empty
-//! set that matches nothing, so mounting this code changes no caller's
-//! answer: the Secret, its mounts and the broker's rule are the next car.
+//! The directory is the `boss-probe-reader` Secret, mounted on the one
+//! pod that runs every service (boss.yaml; pinned by boss-testing's
+//! `the_probe_reader_is_mounted_where_every_gate_reads_it`). Absent or
+//! unfilled it is an empty set that matches nothing, so until the
+//! broker's first rotation no caller's answer changes.
+//!
+//! TWO HAZARDS OF A SECOND CREDENTIAL, both from review 177b4976:
+//!
+//! * a reader slot holding an ESTATE slot's value is the estate token —
+//!   the estate set wins the match — so every announcement of a reading
+//!   says each such pair at ERROR, by slot name ([`Reading::shared`]);
+//! * MORE THAN ONE `x-boss-machine-token` value is no accepted token.
+//!   Only the first used to be judged, so a door that appended its
+//!   credential behind a caller's own header was judged by the caller's.
+//!   Now no slot is matched against any of them: the request is a
+//!   mismatch, which `off` admits, `report` admits and tallies, and
+//!   `enforce` refuses — and when one of the values is a probe reader's,
+//!   it is refused 400 in every mode, because that credential's scope is
+//!   applied only when it is presented alone.
 //!
 //! EXEMPT: OPTIONS (CORS preflight never carries the header), and the
 //! exact health paths a binary declares at mount — GET only, never a
@@ -74,7 +90,11 @@
 //!
 //! TWO ROUTES on every gated binary, both behind the gate itself:
 //! `GET /api/machine-gate/accepts` answers `{mode, matched, degraded}`
-//! for the header presented; `GET /api/machine-gate/misses` answers the
+//! for the header presented — and a value presented THERE that matches
+//! no slot is an ask, answered `none`, tallied as `asked` and stated as
+//! `machine_gate.asked`, which `enforce_refuses` does not count (`asks`;
+//! backlog 89fc511e), so a rotation asking ahead of kubelet is on the
+//! record and dirties no window; `GET /api/machine-gate/misses` answers the
 //! tally, and ONLY to a caller presenting an accepted token in every
 //! mode — a caller's address is a record, and `report` admits everyone
 //! else.
@@ -114,8 +134,8 @@ pub const MAX_MODE_BYTES: u64 = 4096;
 pub use crate::machine_token::{DEFAULT_TOKEN_DIR, TOKEN_DIR_ENV};
 /// The directory holding the probe-reader credential's `current`,
 /// `next` and `previous` slots (design b35c22b4) — the
-/// `boss-probe-reader` Secret's mount, once a manifest mounts it. Absent
-/// is an empty slot set, which matches nothing.
+/// `boss-probe-reader` Secret's mount in boss.yaml. Absent, or mounted
+/// and unfilled, is an empty slot set, which matches nothing.
 pub const READER_DIR_ENV: &str = "BOSS_MACHINE_GATE_READER_DIR";
 pub const DEFAULT_READER_DIR: &str = "/etc/boss/probe-reader";
 
@@ -172,6 +192,13 @@ fn percent_decode(path: &str) -> String {
 /// How many distinct miss keys one process holds. Past it, a new key is
 /// counted in `overflow` rather than stored: a caller spraying routes
 /// must not grow a service's memory without bound.
+///
+/// An ASK ([`Presented::Asked`]) is held to this bound too, but in room
+/// of its own: as many asked keys again, and none of these (backlog
+/// d653e090). An ask is a clean row, so while it shared this room a
+/// tally could be filled with rows that dirty nothing, and every miss
+/// after that named no caller. One process therefore holds at most
+/// twice this many rows.
 pub const MAX_TALLY_KEYS: usize = 1024;
 
 /// How many of those keys one SOURCE may hold (see [`source_of`]). Past
@@ -184,7 +211,9 @@ pub const MAX_TALLY_KEYS: usize = 1024;
 /// every machine-token revoke while that number was above zero. A
 /// sixteenth of the tally each means it takes sixteen full sources
 /// before anyone else's miss goes unnamed. A `previous` and a loopback
-/// caller are not held to it (`held_to_a_share`, review ebc7b1cc).
+/// caller are not held to it (`held_to_a_share`, review ebc7b1cc). A
+/// source's ASKS are held to a share of this size of their own, so 64
+/// asks leave its misses their names (backlog d653e090, N2).
 pub const MAX_KEYS_PER_SOURCE: usize = MAX_TALLY_KEYS / 16;
 
 /// How often the mounted files are re-read. Kubelet refreshes a mounted
@@ -374,8 +403,8 @@ pub struct Reading {
     pub mode: Mode,
     pub slots: Slots,
     /// The probe-reader credential's slots (design b35c22b4): a match
-    /// reads as the probe reader, GET and HEAD only. Empty until a
-    /// manifest mounts its Secret.
+    /// reads as the probe reader, GET and HEAD only. Empty until the
+    /// broker fills the mounted Secret.
     pub reader: Slots,
     /// Set when the mode file held a word that is not a mode, or exists
     /// and could not be read; either reads as `report`, announced at
@@ -396,6 +425,20 @@ impl Reading {
     /// This reading with `reader` as its probe-reader slots.
     pub fn with_reader(self, reader: Slots) -> Self {
         Reading { reader, ..self }
+    }
+
+    /// Each `(reader slot, estate slot)` pair holding ONE value — names,
+    /// never the value. It should always be empty: the estate token wins
+    /// a value in both sets ([`Matched::of`]), so a probe-reader
+    /// credential filled from the estate token is the estate token, and
+    /// whoever is handed it writes as anyone (review 177b4976, N2). The
+    /// gate says a pair at ERROR whenever it announces a reading.
+    pub fn shared(&self) -> Vec<(Slot, Slot)> {
+        self.reader
+            .entries()
+            .into_iter()
+            .filter_map(|(slot, value)| Some((slot, self.slots.matched(Some(value?))?)))
+            .collect()
     }
 
     /// `enforce` with no token to enforce: admitted as `report`, loudly.
@@ -747,6 +790,13 @@ pub enum Presented {
     ReaderNext,
     #[serde(rename = "reader.previous")]
     ReaderPrevious,
+    /// One non-empty value no slot holds, on a GET of the accepts route:
+    /// an ask ([`asks`]; backlog 89fc511e). Named and counted like any
+    /// key, held to its source's share, and NOT a caller shape `enforce`
+    /// refuses — so a rotation asking ahead of kubelet is on the record
+    /// and dirties no window. Its rows and its share are room of their
+    /// own, apart from every other presentation's (backlog d653e090).
+    Asked,
 }
 
 impl Presented {
@@ -759,6 +809,7 @@ impl Presented {
             Presented::ReaderCurrent => "reader.current",
             Presented::ReaderNext => "reader.next",
             Presented::ReaderPrevious => "reader.previous",
+            Presented::Asked => "asked",
         }
     }
 
@@ -776,7 +827,11 @@ impl Presented {
     /// 21946380)? Only no token and a mismatch. The estate `previous` is
     /// admitted in every mode; a probe-reader read is admitted in every
     /// mode and a probe-reader write is refused in every mode (design
-    /// b35c22b4), so a mode move changes nothing for any of them.
+    /// b35c22b4), so a mode move changes nothing for any of them. An ask
+    /// is not one either, though `enforce` answers it 401: the window
+    /// asks which CALLERS enforcing would break, and an asker's question
+    /// is answered `none` either way — its real requests, on every other
+    /// route, are judged as they always were (backlog 89fc511e).
     pub fn enforce_refuses(self) -> bool {
         matches!(self, Presented::None | Presented::Mismatch)
     }
@@ -805,7 +860,7 @@ pub struct MissKey {
 
 /// One source's requests past its own share of the tally, by what they
 /// presented. At most [`MAX_TALLY_KEYS`] / [`MAX_KEYS_PER_SOURCE`]
-/// sources can fill a share, times the five presentations a share holds
+/// sources can fill a share of asks and as many a share of the rest
 /// (`none`, `mismatch`, and the three `reader.*`), so this list is
 /// bounded without a bound of its own.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -836,14 +891,21 @@ pub struct MissRow {
 
 struct Tally {
     rows: HashMap<MissKey, (u64, DateTime<Utc>, DateTime<Utc>)>,
-    /// How many of `rows` each source holds under its share (a
-    /// `previous` or a loopback key counts against none). Bounded by
-    /// `rows`: a source is here only while it holds such a key.
-    per_source: HashMap<String, usize>,
+    /// How many of `rows` are asks, which hold [`MAX_TALLY_KEYS`] of
+    /// their own and none of the keys a miss is named in (backlog
+    /// d653e090).
+    asked: usize,
+    /// How many of `rows` each source holds under a share (a `previous`
+    /// or a loopback key counts against none) — its asks (`true`) and
+    /// everything else it sent (`false`) each against a share of their
+    /// own. Bounded by `rows`: a source is here only while it holds
+    /// such a key.
+    per_source: HashMap<(String, bool), usize>,
     /// Requests past their source's share, by source and presentation:
     /// count, first seen, last seen. Only a source holding a full share
     /// reaches it, so at most MAX_TALLY_KEYS / MAX_KEYS_PER_SOURCE
-    /// sources, times the five presentations a share applies to.
+    /// sources for the asks and as many for the rest, times the
+    /// presentations each share applies to.
     source_overflow: HashMap<(String, Presented), (u64, DateTime<Utc>, DateTime<Utc>)>,
     overflow: u64,
     /// When this tally began: the gate's mount, or the last time it
@@ -855,6 +917,7 @@ impl Tally {
     fn starting(since: DateTime<Utc>) -> Self {
         Tally {
             rows: HashMap::new(),
+            asked: 0,
             per_source: HashMap::new(),
             source_overflow: HashMap::new(),
             overflow: 0,
@@ -873,12 +936,14 @@ pub struct Misses {
     pub rows: Vec<MissRow>,
     /// Requests whose key arrived after [`MAX_TALLY_KEYS`] were held that
     /// no one source's share took: what this counts cannot be attributed
-    /// to one caller, and may include a `previous`.
+    /// to one caller, and may include a `previous`. Asks are held apart
+    /// (backlog d653e090): an ask is counted here only once that many
+    /// ASKED keys are held, and takes no key from anything else.
     pub overflow: u64,
     /// Requests whose key arrived after their own source already held
     /// [`MAX_KEYS_PER_SOURCE`] keys, by source and by what they presented
-    /// (`none`, `mismatch`, or a `reader.*`: only the estate `previous`
-    /// is always keyed, review 177b4976), with when
+    /// (`none`, `mismatch`, `asked`, or a `reader.*`: only the estate
+    /// `previous` is always keyed, review 177b4976), with when
     /// (backlog 93bcf490; review ebc7b1cc). Absent from a gate built
     /// before it, which counted all of these in `overflow` instead.
     #[serde(default)]
@@ -1134,6 +1199,21 @@ impl MachineGate {
         let r = self.reading();
         let slots = format!("{:?}", r.slots.present());
         let reader = format!("{:?}", r.reader.present());
+        // Review 177b4976, N2, said beside the reading and in every
+        // mode: the pair by slot NAME, never a value or a hash of one.
+        for (reader_slot, estate_slot) in r.shared() {
+            tracing::error!(
+                service = %self.service,
+                mode = r.mode.name(),
+                "{what}: probe-reader slot `{}` holds the SAME value as estate `{}` — the estate \
+                 token wins the match, so whoever presents the reader credential is admitted as \
+                 the estate token: every method, any asserted identity. The reader Secret must \
+                 never be filled from the estate token; rotate the reader credential (design \
+                 b35c22b4)",
+                Presented::reader(reader_slot).name(),
+                estate_slot.name(),
+            );
+        }
         if let Some(e) = &r.mode_error {
             tracing::error!(service = %self.service, mode = r.mode.name(), %slots, %reader, "{what}: {e}");
         } else if r.degraded() {
@@ -1174,9 +1254,11 @@ impl MachineGate {
         // would-refuse: its reads are admitted and its writes refused in
         // every mode, so `enforce` changes nothing for it and it ends no
         // clean window — but it is on the log, as `previous` is, for the
-        // reader's own rotation to drain on.
+        // reader's own rotation to drain on. An ask is its own fact too
+        // ([`asks`]): named, and no caller `enforce` would break.
         let fact = match presented {
             Presented::Previous => Fact::PreviousPresented,
+            Presented::Asked => Fact::Asked,
             p if p.is_reader() => Fact::ReaderPresented,
             _ if reading.mode == Mode::Enforce && !reading.degraded() => Fact::Refused,
             _ => Fact::WouldRefuse,
@@ -1214,8 +1296,20 @@ impl MachineGate {
         // source sends is counted under its name even once the tally is
         // full, so `overflow` holds only what no one source can be
         // charged with (backlog 93bcf490).
+        //
+        // AN ASK HOLDS ROOM OF ITS OWN, in both bounds (backlog d653e090,
+        // review 02e21a45 N1 and N2). It is a clean row, and while it
+        // took a key a miss is named in, sixteen LAN addresses' asks —
+        // or one in-pod caller's — filled the tally with rows that dirty
+        // nothing, and every real miss after that was only a number; one
+        // source's 64 asks likewise left its own later misses named by
+        // source alone. So a source's asks are counted against a share
+        // of their own, and all asks against MAX_TALLY_KEYS of their
+        // own: no ask can cost a miss its name.
+        let asking = presented == Presented::Asked;
         let shared = held_to_a_share(ip, presented);
-        if shared && tally.per_source.get(&source).copied().unwrap_or(0) >= MAX_KEYS_PER_SOURCE {
+        let share = (source.clone(), asking);
+        if shared && tally.per_source.get(&share).copied().unwrap_or(0) >= MAX_KEYS_PER_SOURCE {
             let n = tally
                 .source_overflow
                 .entry((source.clone(), presented))
@@ -1226,11 +1320,14 @@ impl MachineGate {
             // two facts) for a source however long it sends.
             if n.0 == 1 {
                 // Past its share, a probe reader is still named by what it
-                // presented: a reader fact, which dirties nothing. Only an
-                // overflow of what `enforce` refuses is a tally overflow.
+                // presented: a reader fact, which dirties nothing — and
+                // an asker by its ask. Only an overflow of what `enforce`
+                // refuses is a tally overflow.
                 self.evidence.emit(
                     if presented.enforce_refuses() {
                         Fact::TallyOverflowed
+                    } else if presented == Presented::Asked {
+                        Fact::Asked
                     } else {
                         Fact::ReaderPresented
                     },
@@ -1254,7 +1351,15 @@ impl MachineGate {
             }
             return;
         }
-        if tally.rows.len() >= MAX_TALLY_KEYS {
+        // An ask no key can name is STILL an overflow, and still ends a
+        // clean window: it has its own room, not a way to go uncounted
+        // that reads clean. The fact says what the first one presented.
+        let held = if asking {
+            tally.asked
+        } else {
+            tally.rows.len() - tally.asked
+        };
+        if held >= MAX_TALLY_KEYS {
             tally.overflow += 1;
             if tally.overflow == 1 {
                 self.evidence.emit(
@@ -1263,10 +1368,12 @@ impl MachineGate {
                         "mode": mode,
                         "recording_since": since,
                         "scope": "tally",
+                        "presented": presented,
                     }),
                 );
                 tracing::warn!(
                     service = %self.service,
+                    presented = presented.name(),
                     "machine gate tally is full ({MAX_TALLY_KEYS} keys); further new keys \
                      no one source's share can take are counted as overflow, which names no \
                      caller"
@@ -1276,8 +1383,9 @@ impl MachineGate {
         }
         // Once per new key, so a restart loses the counts but never the
         // fact that this caller missed. A probe-reader READ is the
-        // traffic the credential exists for, so it is INFO; a reader
-        // write was refused, and is said at WARN like a miss.
+        // traffic the credential exists for, so it is INFO, and so is
+        // an ask; a reader write was refused, and is said at WARN like
+        // a miss.
         if presented.is_reader() && key.method != REFUSED_WRITE {
             tracing::info!(
                 service = %self.service,
@@ -1295,6 +1403,18 @@ impl MachineGate {
                 route = %key.route,
                 presented = presented.name(),
                 "machine gate: a WRITE under the probe-reader credential, refused"
+            );
+        } else if presented == Presented::Asked {
+            // The question the accepts route exists for — a rotation asks
+            // it on every port, by design — so INFO, and named: a peer
+            // testing a value it should not hold reads the same here.
+            tracing::info!(
+                service = %self.service,
+                peer = %key.peer,
+                user = %key.user,
+                route = %key.route,
+                presented = presented.name(),
+                "machine gate: an ask about a value no slot holds"
             );
         } else {
             tracing::warn!(
@@ -1319,8 +1439,11 @@ impl MachineGate {
             }),
         );
         tally.rows.insert(key, (1, now, now));
+        if asking {
+            tally.asked += 1;
+        }
         if shared {
-            *tally.per_source.entry(source).or_insert(0) += 1;
+            *tally.per_source.entry(share).or_insert(0) += 1;
         }
     }
 
@@ -1467,10 +1590,104 @@ impl Matched {
 #[derive(Clone, Copy, Debug)]
 struct ReaderMatched(Slot);
 
+/// The value a request presents, for the slot match. `None` when it
+/// sends no `x-boss-machine-token` — and when it sends MORE THAN ONE,
+/// which is no accepted token at all ([`sent_several`]): no slot is
+/// matched against any of them.
 fn presented_token(headers: &HeaderMap) -> Option<&str> {
+    if sent_several(headers) {
+        return None;
+    }
     headers
         .get(machine_token::HEADER)
         .and_then(|v| v.to_str().ok())
+}
+
+/// Does the request carry more than one `x-boss-machine-token` value?
+/// The gate used to judge the first and never look at the rest (review
+/// 177b4976, N1), so a door that appended its credential behind a
+/// caller's own header was judged by the caller's. Every stamping client
+/// in the tree sends exactly one, so more than one is a mismatch: `off`
+/// admits it, `report` admits and tallies it, `enforce` refuses it.
+fn sent_several(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(machine_token::HEADER)
+        .iter()
+        .nth(1)
+        .is_some()
+}
+
+/// Is this request an ASK — a GET of the accepts route itself? That
+/// route has one header and it is the value asked about: there is no
+/// second credential the asker authenticates with, so the gate cannot
+/// tell "I send this" from "would you take this" except by the route.
+/// A non-empty value that matches no slot there is the question the
+/// route exists to answer (`matched: none`). It is tallied and stated
+/// on the log as [`Presented::Asked`] — one row and one
+/// `machine_gate.asked` per asker, naming peer and asserted user — and
+/// it is NOT a caller shape `enforce` refuses, so it ends no clean
+/// window (backlog 89fc511e, review f09db7f0 F3). Until then a
+/// rotation's scope firing, which stages a value and asks every gate
+/// about it about a minute before kubelet projects the Secret, left
+/// `would_refuse` from `automation:dispatcher` on every gated port —
+/// and the estate token rotates on a schedule, so no 72-hour window the
+/// enforce order waits on could stay clean.
+///
+/// NAMED, NOT ERASED (review 0c0e3f01, B1). The first cut of this
+/// recorded nothing, which made the accepts route the one place a wrong
+/// value could be tried — a stale host file, a value out of a
+/// transcript — with no trace on any port. Every other way to learn
+/// whether a value is accepted leaves a row and a fact; so does this
+/// one, under a name that does not hold the enforce order hostage to
+/// the rotation it waits behind. Its first sighting is INFO, not the
+/// WARN of a miss: it is the traffic the route exists for.
+///
+/// NARROW ON PURPOSE, and each edge is pinned by
+/// `a_wrong_token_is_still_tallied_everywhere_an_ask_is_not`:
+///
+/// * the route the ROUTER matched, never a reading of the path — a
+///   spelling that merely resembles it reaches no accepts handler, and
+///   [`is_gate_route`]'s fuzzy match exists to refuse, not to excuse;
+/// * GET only; and only for exactly one NON-EMPTY value that matched
+///   nothing — no value is a caller that sent none, an empty one asks
+///   about nothing and is the mismatch it was, several are a mismatch,
+///   and a value in `previous` or a reader slot is still the fact a
+///   drain reads (the caller checks the value; this checks the route);
+/// * it changes what a request is COUNTED AS, never what is admitted:
+///   `enforce` answers the ask 401 exactly as before;
+/// * an asker is held to its source's share like any unvouched caller
+///   ([`held_to_a_share`]), and past it is counted under its source —
+///   as `asked`, never as a tally overflow, which would dirty a window;
+/// * that holds for the SOURCE's share only (review 02e21a45, N1). Asks
+///   are bounded together as well, at [`MAX_TALLY_KEYS`] of their own,
+///   and an ask past that which no source's share takes — a seventeenth
+///   LAN source, or an in-pod caller, which no share holds — IS a tally
+///   overflow and does end a clean window. What it can no longer do is
+///   take a key a miss would have been named in (backlog d653e090).
+///
+/// A value of whitespace alone asks about nothing, like the empty one
+/// (the same review, N4): a wire parser trims it to empty before the
+/// gate reads it, and the in-tree router must not read it otherwise.
+fn asks(req: &Request) -> bool {
+    *req.method() == Method::GET
+        && req
+            .extensions()
+            .get::<MatchedPath>()
+            .is_some_and(|matched| matched.as_str() == ACCEPTS_PATH)
+}
+
+/// Among several values, is one the probe reader's and not the estate's?
+/// Then the request is refused in every mode ([`machine_gate`]).
+fn several_hold_a_reader_value(r: &Reading, headers: &HeaderMap) -> bool {
+    sent_several(headers)
+        && headers
+            .get_all(machine_token::HEADER)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            // Every value is judged, none short-circuited, so timing
+            // does not say which position held a reader's.
+            .map(|v| matches!(Matched::of(r, Some(v)), Some(Matched::Reader(_))))
+            .fold(false, |any, hit| any | hit)
 }
 
 /// The source a peer address counts against for [`MAX_KEYS_PER_SOURCE`]:
@@ -1574,6 +1791,30 @@ pub async fn machine_gate(
     next: Next,
 ) -> Response {
     let reading = gate.reading();
+    let several = sent_several(req.headers());
+    // A probe-reader value beside any other value reaches no handler, in
+    // EVERY mode and for every method (review 177b4976, N1). Its scope —
+    // GET and HEAD, as the probe reader — is applied only when it is the
+    // one value presented; beside another, the request is not one this
+    // gate can scope, and admitting it by the mode would hand `off` and
+    // `report` a reader-holding request under whatever identity it
+    // asserted. Tallied as the mismatch it is.
+    if several_hold_a_reader_value(&reading, req.headers()) {
+        if reading.mode != Mode::Off {
+            gate.record(&req, Presented::Mismatch);
+        }
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "machine gate ({}): more than one `{}` value, one of them the probe-reader \
+                 credential — that credential is presented alone, replacing any other, and is \
+                 refused beside one in every mode (design b35c22b4)",
+                gate.service,
+                machine_token::HEADER,
+            ),
+        )
+            .into_response();
+    }
     let provided = presented_token(req.headers());
     // The reader's scope comes FIRST and holds in every mode, health and
     // OPTIONS included: a probe-reader value reads, and never writes,
@@ -1589,7 +1830,17 @@ pub async fn machine_gate(
     match (matched, provided) {
         (Some(Slot::Previous), _) => gate.record(&req, Presented::Previous),
         (Some(_), _) => {}
+        // More than one value presents no value to match, and is a
+        // mismatch rather than a caller that sent nothing (N1).
+        (None, None) if several => gate.record(&req, Presented::Mismatch),
         (None, None) => gate.record(&req, Presented::None),
+        // An ask is NAMED, as `asked`, and is no caller shape `enforce`
+        // refuses — and, below, `enforce` still answers it 401 like any
+        // other unmatched value ([`asks`]). An empty value asks about
+        // nothing and stays the mismatch it always was.
+        (None, Some(value)) if !value.trim().is_empty() && asks(&req) => {
+            gate.record(&req, Presented::Asked)
+        }
         (None, Some(_)) => gate.record(&req, Presented::Mismatch),
     }
     if matched.is_some() || reading.mode == Mode::Report {
@@ -1610,7 +1861,9 @@ pub async fn machine_gate(
              accepted machine token (design 6805c764); this caller sent {}",
             gate.service,
             machine_token::HEADER,
-            if provided.is_some() {
+            if several {
+                "more than one token value, which is no accepted token"
+            } else if provided.is_some() {
                 "a token that does not match"
             } else {
                 "no token"
@@ -1695,7 +1948,30 @@ pub fn mount(
     health: &[&str],
     recorder: Option<Arc<dyn EventRecorder>>,
 ) -> IntoMakeServiceWithConnectInfo<Router, SocketAddr> {
-    let files = MountedFiles::from_env();
+    mount_launched(
+        router,
+        service,
+        health,
+        recorder,
+        MountedFiles::from_env(),
+        std::env::var(crate::gate_window::LAUNCH_RECORD_ENV).ok(),
+    )
+}
+
+/// [`mount`] with what it reads from the environment handed in: the
+/// mounted files and the path of the launcher's record. Everything
+/// `mount` does is here, so a test holds the whole of it — the roster
+/// stamp reaching the first `recording_began` included (review
+/// 6858ef1d, N1: with the stamp stated inline in `mount`, removing the
+/// call passed every test).
+pub fn mount_launched(
+    router: Router,
+    service: &str,
+    health: &[&str],
+    recorder: Option<Arc<dyn EventRecorder>>,
+    files: MountedFiles,
+    launch_record: Option<String>,
+) -> IntoMakeServiceWithConnectInfo<Router, SocketAddr> {
     let evidence = match recorder {
         Some(r) => Evidence::spawn(EvidenceGate::MachineGate, service, r),
         None => {
@@ -1707,6 +1983,19 @@ pub fn mount(
             Evidence::none(EvidenceGate::MachineGate, service)
         }
     };
+    // Which selection this process was launched under, stated with its
+    // start (design 3cc6152a; backlog 14fe115c). A process that cannot
+    // read its launch record states why and starts all the same: the
+    // window then cannot be read clean, which is loud and safe, while a
+    // gate that refused to mount would take its service down over an
+    // observability file.
+    // The read is bounded and refuses anything but a regular file
+    // (`read_launch_record_file`), so it cannot hang this boot either.
+    let record = crate::gate_window::read_launch_record(launch_record);
+    evidence.state_roster(crate::gate_window::roster_stamp(
+        record.as_deref().map_err(Clone::clone),
+        crate::startup::build_commit(),
+    ));
     let gate =
         Arc::new(MachineGate::new(service, health, files.read_blocking()).with_evidence(evidence));
     gate.announce("machine gate mounted");
@@ -2067,6 +2356,256 @@ mod tests {
         let (_, body) = call(&g, "GET", ACCEPTS_PATH, Some("cur-value")).await;
         let a: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(a["matched"], "current");
+    }
+
+    /// Review 177b4976, N2: a reader slot holding an estate slot's value
+    /// is named, by slot and never by value, so the gate can say it at
+    /// ERROR. The estate token still wins the match (the test above);
+    /// this is how anyone learns the reader credential was filled from
+    /// it, which would hand every probe the estate's writes.
+    #[test]
+    fn a_reader_slot_holding_an_estate_value_is_named_by_slot() {
+        let distinct = Reading::new(Mode::Report, slots()).with_reader(reader());
+        assert!(distinct.shared().is_empty());
+        assert!(Reading::new(Mode::Report, slots()).shared().is_empty());
+        assert!(
+            Reading::new(Mode::Report, Slots::default())
+                .with_reader(reader())
+                .shared()
+                .is_empty()
+        );
+
+        let shared = Reading::new(Mode::Off, slots()).with_reader(Slots::new(
+            Some("prev-value".into()),
+            Some("rd-nxt".into()),
+            Some("cur-value".into()),
+        ));
+        assert_eq!(
+            shared.shared(),
+            vec![
+                (Slot::Current, Slot::Previous),
+                (Slot::Previous, Slot::Current)
+            ],
+            "(reader slot, estate slot) for each pair holding one value"
+        );
+    }
+
+    /// What one closure logs, as text, at every level — a subscriber
+    /// for this thread and this call only.
+    fn logged(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = sink
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// N2, said: at the mount and at every changed reading the gate
+    /// says a shared value at ERROR, naming both slots and no value —
+    /// in every mode, `off` included, because the hazard is the
+    /// credential's and not a window's. Distinct sets say nothing.
+    #[test]
+    fn a_shared_reader_and_estate_value_is_said_at_error() {
+        for mode in [Mode::Off, Mode::Report, Mode::Enforce] {
+            let shared = Slots::new(Some("next-value".into()), None, None);
+            let g = MachineGate::new(
+                "things",
+                &[HEALTH],
+                Reading::new(mode, slots()).with_reader(shared),
+            );
+            let out = logged(|| g.announce("machine gate mounted"));
+            let line = out
+                .lines()
+                .find(|l| l.contains("ERROR") && l.contains("reader.current"))
+                .unwrap_or_else(|| panic!("{mode:?}: an ERROR naming reader.current: {out}"));
+            assert!(
+                line.contains("estate `next`") && line.contains("things"),
+                "{line}"
+            );
+            assert!(!out.contains("next-value"), "never a value: {out}");
+
+            // The same hazard arriving later, by a re-read.
+            let g = MachineGate::new("things", &[HEALTH], Reading::new(mode, slots()));
+            let next = Reading::new(mode, slots()).with_reader(Slots::new(
+                None,
+                None,
+                Some("cur-value".into()),
+            ));
+            let out = logged(|| g.observe(next));
+            assert!(
+                out.lines().any(|l| l.contains("ERROR")
+                    && l.contains("reader.previous")
+                    && l.contains("estate `current`")),
+                "{mode:?}: {out}"
+            );
+            assert!(!out.contains("cur-value"), "never a value: {out}");
+        }
+        let g = MachineGate::new(
+            "things",
+            &[HEALTH],
+            Reading::new(Mode::Report, slots()).with_reader(reader()),
+        );
+        let out = logged(|| g.announce("machine gate mounted"));
+        assert!(!out.contains("ERROR"), "distinct sets are no error: {out}");
+    }
+
+    /// Review 177b4976, N1: the gate used to judge only the FIRST
+    /// `x-boss-machine-token` value, so what a second one held was never
+    /// looked at. More than one value is no accepted token at all — a
+    /// mismatch, judged as every mismatch is in each mode — whichever
+    /// order they come in and even when each alone is the estate's.
+    #[tokio::test]
+    async fn more_than_one_token_value_is_no_accepted_token() {
+        let second = |v: &'static str| [(machine_token::HEADER, v)];
+        for (first, also) in [
+            ("cur-value", "cur-value"),
+            ("cur-value", "guess"),
+            ("guess", "cur-value"),
+            ("next-value", "prev-value"),
+        ] {
+            let g = gate_with_reader(Mode::Enforce);
+            let (s, body) = call_with(&g, "PUT", WHOAMI, Some(first), &second(also)).await;
+            assert_eq!(s, StatusCode::UNAUTHORIZED, "{first} + {also}");
+            assert!(body.contains("more than one"), "{body}");
+            assert!(!body.contains(first) && !body.contains(also), "{body}");
+            let (s, body) = call_with(&g, "GET", ACCEPTS_PATH, Some(first), &second(also)).await;
+            assert_eq!(s, StatusCode::UNAUTHORIZED, "{body}");
+            let rows = g.misses().rows;
+            assert!(
+                !rows.is_empty() && rows.iter().all(|r| r.key.presented == Presented::Mismatch),
+                "{rows:?}"
+            );
+
+            // `report` admits it, as it admits every mismatch, and the
+            // window names the caller; accepts answers `none`, and the
+            // tally is not read with it.
+            let g = gate_with_reader(Mode::Report);
+            let (s, _) = call_with(&g, "PUT", WHOAMI, Some(first), &second(also)).await;
+            assert_eq!(s, StatusCode::OK, "{first} + {also}");
+            assert_eq!(g.misses().rows[0].key.presented, Presented::Mismatch);
+            let (_, body) = call_with(&g, "GET", ACCEPTS_PATH, Some(first), &second(also)).await;
+            let a: Accepts = serde_json::from_str(&body).unwrap();
+            assert_eq!(a.matched, "none", "{first} + {also}");
+            let (s, _) = call_with(&g, "GET", MISSES_PATH, Some(first), &second(also)).await;
+            assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+            // `off` admits everything and records nothing, as before.
+            let g = gate_with_reader(Mode::Off);
+            let (s, _) = call_with(&g, "PUT", WHOAMI, Some(first), &second(also)).await;
+            assert_eq!(s, StatusCode::OK);
+            assert!(g.misses().rows.is_empty());
+        }
+    }
+
+    /// N1, the reader's half: a probe-reader value beside any other is
+    /// refused 400 in EVERY mode, reads included, in either order. The
+    /// reader's scope is a property of the credential and not of a
+    /// window, so a door that appended it after a caller's own header
+    /// (instead of replacing that header) reaches no handler — before
+    /// this, `[guess, reader]` with an asserted platform-admin was
+    /// answered 200 in `off` and `report`, as that admin.
+    #[tokio::test]
+    async fn a_reader_value_beside_another_is_refused_in_every_mode() {
+        for mode in [Mode::Off, Mode::Report, Mode::Enforce] {
+            for (first, also) in [
+                ("guess", "rd-cur"),
+                ("rd-cur", "guess"),
+                ("rd-nxt", "rd-nxt"),
+                ("rd-prv", "cur-value"),
+                ("cur-value", "rd-cur"),
+            ] {
+                for method in ["GET", "HEAD", "PUT", "POST"] {
+                    let g = gate_with_reader(mode);
+                    let (s, body) = call_with(
+                        &g,
+                        method,
+                        WHOAMI,
+                        Some(first),
+                        &[(machine_token::HEADER, also)],
+                    )
+                    .await;
+                    assert_eq!(
+                        s,
+                        StatusCode::BAD_REQUEST,
+                        "{mode:?} {method} {first} + {also}"
+                    );
+                    assert!(
+                        !body.contains(first) && !body.contains(also) && !body.contains("agent-"),
+                        "no value and no handler output: {body}"
+                    );
+                }
+            }
+            // Health is exempt for a GET without a token; it is no way
+            // round this either.
+            let g = gate_with_reader(mode);
+            let (s, _) = call_with(
+                &g,
+                "GET",
+                HEALTH,
+                Some("guess"),
+                &[(machine_token::HEADER, "rd-cur")],
+            )
+            .await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{mode:?}");
+        }
+    }
+
+    /// Every service's gate reads the probe-reader directory: `mount`
+    /// takes its paths from the environment, and that reading always
+    /// names a reader directory — the default, which the manifest
+    /// mounts — so no binary can mount a gate that reads none.
+    #[test]
+    fn the_paths_every_mount_reads_name_a_reader_directory() {
+        assert!(MountedFiles::from_env().reader_dir.is_some());
+    }
+
+    /// What the mount car lands before any credential exists: an
+    /// optional Secret volume that is absent or unfilled is an EMPTY
+    /// directory. Its reading is the very reading of a gate with no
+    /// reader directory at all — equal, slot for slot and mode for mode —
+    /// so the mount alone changes no caller's answer.
+    #[test]
+    fn an_empty_mounted_reader_directory_is_the_reading_without_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "boss-core-machine-gate-empty-reader-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let tokens = dir.join("tokens");
+        let readers = dir.join("reader");
+        std::fs::create_dir_all(&tokens).unwrap();
+        std::fs::create_dir_all(&readers).unwrap();
+        std::fs::write(tokens.join("current"), "cur-value\n").unwrap();
+        for mode in ["off", "report", "enforce"] {
+            std::fs::write(dir.join("mode"), mode).unwrap();
+            let without = MountedFiles::new(dir.join("mode"), &tokens);
+            let with = without.clone().with_reader_dir(&readers);
+            assert_eq!(with.read_blocking(), without.read_blocking(), "{mode}");
+            assert!(with.read_blocking().shared().is_empty());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The accepts route names a reader match `reader.<slot>` — what the
@@ -2455,6 +2994,481 @@ mod tests {
             assert_eq!(a["degraded"], false);
             assert!(!body.contains("value"), "{body}");
         }
+    }
+
+    /// A gate that states its facts where the test can read them, with
+    /// both slot sets mounted.
+    fn stating(
+        mode: Mode,
+    ) -> (
+        Arc<MachineGate>,
+        tokio::sync::mpsc::Receiver<crate::event::Event>,
+    ) {
+        let (evidence, rx) = Evidence::channel(EvidenceGate::MachineGate, "things");
+        let reading = Reading::new(mode, slots()).with_reader(reader());
+        let g = MachineGate::new("things", &[HEALTH], reading).with_evidence(evidence);
+        (Arc::new(g), rx)
+    }
+
+    /// Backlog 89fc511e (review f09db7f0, F3). A rotation stages a value
+    /// and asks every gate about it about a minute before kubelet
+    /// projects the Secret; the gate answered `none` and tallied the ASK
+    /// as a caller presenting a mismatch, so one rotation left a
+    /// `would_refuse` on every gated port and no 72-hour window stayed
+    /// clean.
+    ///
+    /// The first cut of the fix recorded NOTHING for an ask, which made
+    /// this route the one place a wrong value could be tried and leave no
+    /// trace (review 0c0e3f01, B1: 500 wrong values, zero rows). An ask
+    /// is NAMED — one row and one fact per caller, `asked`, however many
+    /// values it tries — and is no caller shape `enforce` refuses: the
+    /// tally stays clean, in `report` and in `enforce`, where the ask is
+    /// still answered 401.
+    #[tokio::test]
+    async fn an_ask_about_a_value_no_slot_holds_is_named_and_dirties_nothing() {
+        const ASKS: u64 = 500;
+        for path in [
+            ACCEPTS_PATH,
+            "/api/machine-gate/accepts?about=a-staged-value",
+        ] {
+            for mode in [Mode::Report, Mode::Enforce] {
+                let what = format!("{path} in {mode:?}");
+                let (g, mut rx) = stating(mode);
+                for i in 0..ASKS {
+                    let wrong = format!("a-wrong-guess-{i}");
+                    let (s, body) = call(&g, "GET", path, Some(&wrong)).await;
+                    if mode == Mode::Report {
+                        assert_eq!(s, StatusCode::OK, "{what}");
+                        let a: Accepts = serde_json::from_str(&body).unwrap();
+                        assert_eq!((a.matched.as_str(), a.mode), ("none", Mode::Report));
+                    } else {
+                        assert_eq!(s, StatusCode::UNAUTHORIZED, "{what}: enforce admits no ask");
+                        assert!(body.contains("does not match"), "{body}");
+                    }
+                    assert!(!body.contains(&wrong), "never a value: {body}");
+                }
+                // The value a slot does hold is answered as it always was.
+                let (s, body) = call(&g, "GET", path, Some("cur-value")).await;
+                assert_eq!(s, StatusCode::OK, "{what}");
+                let a: Accepts = serde_json::from_str(&body).unwrap();
+                assert_eq!(a.matched, "current", "{what}");
+
+                let m = g.misses();
+                assert_eq!(
+                    m.rows.len(),
+                    1,
+                    "{what}: one row names the asker: {:?}",
+                    m.rows
+                );
+                assert_eq!(
+                    m.rows[0].key,
+                    MissKey {
+                        peer: "10.20.0.7".into(),
+                        user: "agent-seeder".into(),
+                        method: "GET".into(),
+                        route: ACCEPTS_PATH.into(),
+                        presented: Presented::Asked,
+                    },
+                    "{what}"
+                );
+                assert_eq!(m.rows[0].count, ASKS, "{what}: every ask is counted");
+                assert!(m.not_clean.is_empty(), "{what}: {:?}", m.not_clean);
+                assert!(m.source_overflow.is_empty() && m.overflow == 0, "{what}");
+
+                let facts = stated(&mut rx);
+                assert_eq!(kinds(&facts), vec!["recording_began", "asked"], "{what}");
+                assert_eq!(facts[1].payload["key"]["peer"], "10.20.0.7");
+                assert_eq!(facts[1].payload["key"]["user"], "agent-seeder");
+                assert_eq!(facts[1].payload["key"]["route"], ACCEPTS_PATH);
+                assert_eq!(facts[1].payload["key"]["presented"], "asked");
+                assert_eq!(facts[1].payload["mode"], serde_json::json!(mode));
+                assert!(
+                    !facts.iter().any(|e| EvidenceGate::MachineGate
+                        .fact_of(&e.kind)
+                        .is_some_and(Fact::dirties)),
+                    "{what}: no fact that ends a clean window"
+                );
+            }
+        }
+    }
+
+    /// The two definitions the clean window is read through: an ask is
+    /// spelled `asked` on the wire, is nothing `enforce` refuses and no
+    /// probe-reader presentation, and its fact — the machine gate's only —
+    /// dirties nothing.
+    #[test]
+    fn an_ask_is_spelled_asked_and_is_nothing_enforce_refuses() {
+        assert_eq!(Presented::Asked.name(), "asked");
+        assert_eq!(
+            serde_json::to_string(&Presented::Asked).unwrap(),
+            r#""asked""#
+        );
+        assert_eq!(
+            serde_json::from_str::<Presented>(r#""asked""#).unwrap(),
+            Presented::Asked
+        );
+        assert!(!Presented::Asked.enforce_refuses());
+        assert!(!Presented::Asked.is_reader());
+        assert!(!Fact::Asked.dirties());
+        assert_eq!(
+            EvidenceGate::MachineGate.kind(Fact::Asked),
+            "machine_gate.asked"
+        );
+        assert_eq!(
+            EvidenceGate::MachineGate.fact_of("machine_gate.asked"),
+            Some(Fact::Asked)
+        );
+        assert_eq!(
+            EvidenceGate::PolicyCheck.fact_of("policy.check.asked"),
+            None
+        );
+    }
+
+    /// One GET of the accepts route from `peer`, asserting `user`.
+    async fn ask_as(gate: &Arc<MachineGate>, peer: [u8; 4], user: &str, value: &str) {
+        let mut req = axum::http::Request::builder()
+            .method("GET")
+            .uri(ACCEPTS_PATH)
+            .header("x-boss-user", format!(r#"{{"id":"{user}"}}"#))
+            .header(machine_token::HEADER, value)
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from((peer, 51234))));
+        app(gate).oneshot(req).await.unwrap();
+    }
+
+    /// An asker is held to its source's share like any caller nothing
+    /// vouches for: asserting a new `x-boss-user` per ask cannot grow the
+    /// tally past the share, what it sends beyond is counted under its
+    /// source as `asked` — and neither the rows nor the spill is a tally
+    /// overflow or a reader fact, so a noisy asker dirties nothing either.
+    #[tokio::test]
+    async fn an_asker_past_its_share_is_counted_by_source_and_dirties_nothing() {
+        let (g, mut rx) = stating(Mode::Report);
+        for i in 0..MAX_KEYS_PER_SOURCE + 3 {
+            ask_as(&g, [10, 20, 0, 66], &format!("asker-{i}"), "a-wrong-guess").await;
+        }
+        let m = g.misses();
+        assert_eq!(m.rows.len(), MAX_KEYS_PER_SOURCE, "{:?}", m.rows.len());
+        assert!(m.rows.iter().all(|r| r.key.presented == Presented::Asked));
+        assert_eq!(m.overflow, 0);
+        assert_eq!(m.source_overflow.len(), 1, "{:?}", m.source_overflow);
+        let spilled = &m.source_overflow[0];
+        assert_eq!(
+            (spilled.source.as_str(), spilled.presented, spilled.count),
+            ("10.20.0.66", Presented::Asked, 3)
+        );
+        assert!(m.not_clean.is_empty(), "{:?}", m.not_clean);
+        let facts = stated(&mut rx);
+        let mut want = vec!["recording_began".to_string()];
+        want.extend(std::iter::repeat_n(
+            "asked".to_string(),
+            MAX_KEYS_PER_SOURCE + 1,
+        ));
+        assert_eq!(kinds(&facts), want, "one per key, and one for the spill");
+        let spill = facts.last().unwrap();
+        assert_eq!(spill.payload["scope"], "source");
+        assert_eq!(spill.payload["source"], "10.20.0.66");
+        assert_eq!(spill.payload["presented"], "asked");
+    }
+
+    /// Backlog d653e090 (review 02e21a45 of car 176d5c9d, N1; its probe
+    /// RV2-Q3c). An ask is a CLEAN row, and it took a key of the same
+    /// 1,024 a miss is named in: sixteen LAN addresses asking under 64
+    /// asserted users each — or one in-pod caller, which no share holds —
+    /// filled the tally with rows that dirty nothing, and after that
+    /// every real miss was a number in `overflow`, naming no caller.
+    /// Before 176d5c9d each filling row was itself dirty and named. An
+    /// ask now takes none of that room: after either fill, a caller
+    /// `enforce` would refuse and a host still on `previous` are each a
+    /// row, by address and user, and nothing overflowed.
+    #[tokio::test]
+    async fn asks_take_none_of_the_room_a_miss_is_named_in() {
+        let lan = |g: &MachineGate| {
+            for s in 0..(MAX_TALLY_KEYS / MAX_KEYS_PER_SOURCE) {
+                for i in 0..MAX_KEYS_PER_SOURCE {
+                    g.record(&from(v4(1, s as u8), &format!("ask-{i}")), Presented::Asked);
+                }
+            }
+        };
+        let in_pod = |g: &MachineGate| {
+            let peer: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+            for i in 0..MAX_TALLY_KEYS {
+                g.record(&from(peer, &format!("ask-{i}")), Presented::Asked);
+            }
+        };
+        let fills: [(&str, &dyn Fn(&MachineGate)); 2] = [
+            ("sixteen LAN sources", &lan),
+            ("one in-pod caller", &in_pod),
+        ];
+        for (what, fill) in fills {
+            let (g, mut rx) = stating(Mode::Report);
+            fill(&g);
+            let m = g.misses();
+            assert_eq!(m.rows.len(), MAX_TALLY_KEYS, "{what}: the fill");
+            assert!(m.not_clean.is_empty(), "{what}: {:?}", m.not_clean);
+
+            g.record(&from(v4(0, 30), "a-tokenless-caller"), Presented::None);
+            g.record(
+                &from(v4(0, 31), "automation:forge-converge"),
+                Presented::Previous,
+            );
+            let m = g.misses();
+            assert_eq!(m.overflow, 0, "{what}: a miss is never only a number");
+            let named = |peer: &str, user: &str, presented| {
+                m.rows.iter().any(|r| {
+                    r.key.peer == peer && r.key.user == user && r.key.presented == presented
+                })
+            };
+            assert!(
+                named("10.20.0.30", "a-tokenless-caller", Presented::None),
+                "{what}: the caller `enforce` refuses is a row"
+            );
+            assert!(
+                named(
+                    "10.20.0.31",
+                    "automation:forge-converge",
+                    Presented::Previous
+                ),
+                "{what}: the host still on `previous` is a row"
+            );
+            assert_eq!(
+                m.not_clean,
+                vec!["1 caller shape(s), 1 request(s), that `enforce` refuses".to_string()],
+                "{what}: dirty by the miss, and by its name"
+            );
+            let facts = kinds(&stated(&mut rx));
+            assert!(
+                !facts.iter().any(|k| k == "tally_overflowed"),
+                "{what}: nothing overflowed"
+            );
+            assert_eq!(
+                &facts[facts.len() - 2..],
+                ["would_refuse", "previous_presented"],
+                "{what}: each is a fact on the log"
+            );
+        }
+    }
+
+    /// The same review, N2: a source's asks spent the share its misses
+    /// are named in, so after 64 asks under 64 asserted users that
+    /// source's later real misses were named by source and presentation
+    /// only. Its asks are now counted against a share of their own.
+    #[tokio::test]
+    async fn a_sources_asks_spend_none_of_the_share_its_misses_are_named_in() {
+        let g = gate(Mode::Report, slots());
+        let host = v4(0, 66);
+        for i in 0..(MAX_KEYS_PER_SOURCE + 3) {
+            g.record(&from(host, &format!("ask-{i}")), Presented::Asked);
+        }
+        for i in 0..5 {
+            g.record(&from(host, &format!("miss-{i}")), Presented::None);
+        }
+        let m = g.misses();
+        let missed: Vec<&str> = m
+            .rows
+            .iter()
+            .filter(|r| r.key.presented == Presented::None)
+            .map(|r| r.key.user.as_str())
+            .collect();
+        assert_eq!(
+            missed,
+            vec!["miss-0", "miss-1", "miss-2", "miss-3", "miss-4"],
+            "each miss keyed by its user"
+        );
+        assert_eq!(
+            counts(&m),
+            vec![("10.20.0.66".to_string(), Presented::Asked, 3)],
+            "only the asks past the ask share are counted by source"
+        );
+        // And the other way: a source's misses spend none of its asks'.
+        let g = gate(Mode::Report, slots());
+        for i in 0..(MAX_KEYS_PER_SOURCE + 3) {
+            g.record(&from(host, &format!("miss-{i}")), Presented::None);
+        }
+        g.record(&from(host, "automation:dispatcher"), Presented::Asked);
+        let m = g.misses();
+        assert!(
+            m.rows
+                .iter()
+                .any(|r| r.key.presented == Presented::Asked
+                    && r.key.user == "automation:dispatcher"),
+            "the asker is keyed by its user"
+        );
+        assert_eq!(
+            counts(&m),
+            vec![("10.20.0.66".to_string(), Presented::None, 3)]
+        );
+    }
+
+    /// WHAT d653e090 DID NOT CHANGE, held so the next car cannot change
+    /// it by accident: an ask no key can name — past every asked key and
+    /// past no one source's share — is still a tally overflow, still one
+    /// `tally_overflowed` on the log, and the tally is still not clean
+    /// until it restarts. Asks have room of their own; they were not
+    /// given a way to go uncounted that reads clean. Whether such an ask
+    /// SHOULD end a clean window is the platform owner's decision, left
+    /// open on that item.
+    #[tokio::test]
+    async fn an_ask_no_key_can_name_is_still_a_tally_overflow() {
+        let (g, mut rx) = stating(Mode::Report);
+        let peer: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        for i in 0..MAX_TALLY_KEYS {
+            g.record(&from(peer, &format!("ask-{i}")), Presented::Asked);
+        }
+        assert!(g.misses().not_clean.is_empty());
+        g.record(&from(v4(0, 30), "one-more-asker"), Presented::Asked);
+        g.record(&from(v4(0, 31), "and-another"), Presented::Asked);
+        let m = g.misses();
+        assert_eq!(m.rows.len(), MAX_TALLY_KEYS);
+        assert_eq!(m.overflow, 2);
+        assert_eq!(m.not_clean.len(), 1, "{:?}", m.not_clean);
+        assert!(
+            m.not_clean[0].starts_with("overflow 2:"),
+            "{:?}",
+            m.not_clean
+        );
+        let facts = stated(&mut rx);
+        let overflowed: Vec<&crate::event::Event> = facts
+            .iter()
+            .filter(|e| e.kind == "machine_gate.tally_overflowed")
+            .collect();
+        assert_eq!(overflowed.len(), 1, "stated once");
+        assert_eq!(overflowed[0].payload["scope"], "tally");
+        assert_eq!(overflowed[0].payload["presented"], "asked");
+    }
+
+    /// An ask's first sighting is said at INFO: it is the traffic the
+    /// route exists for, as a probe-reader read is, and the WARN "a
+    /// request without an accepted current/next token" would page on
+    /// every rotation.
+    #[test]
+    fn an_asks_first_sighting_is_said_at_info() {
+        let g = MachineGate::new("things", &[HEALTH], Reading::new(Mode::Report, slots()));
+        let out = logged(|| g.record(&from(v4(0, 7), "automation:dispatcher"), Presented::Asked));
+        let line = out
+            .lines()
+            .find(|l| l.contains("an ask about a value no slot holds"))
+            .unwrap_or_else(|| panic!("a line naming the ask: {out}"));
+        assert!(line.contains("INFO"), "{line}");
+        assert!(
+            line.contains("10.20.0.7") && line.contains("automation:dispatcher"),
+            "the asker is named: {line}"
+        );
+        assert!(!out.contains("WARN"), "{out}");
+        assert!(!out.contains("without an accepted"), "{out}");
+    }
+
+    /// What 89fc511e must NOT loosen: only a GET of the accepts route
+    /// itself, carrying exactly one value that matches no slot, is an
+    /// ask. Every other request without an accepted token is the caller
+    /// shape it always was — one row, one fact, and a 401 under
+    /// `enforce` — including on the gate's other route, on the accepts
+    /// route by another method, with no value or several, and on any
+    /// path that merely resembles it.
+    #[tokio::test]
+    async fn a_wrong_token_is_still_tallied_everywhere_an_ask_is_not() {
+        const GUESS: Option<&str> = Some("guess");
+        let second: &[(&str, &str)] = &[(machine_token::HEADER, "another-guess")];
+        let cases: [(&str, &str, Option<&str>, &[(&str, &str)], Presented); 15] = [
+            ("GET", WHOAMI, GUESS, &[], Presented::Mismatch),
+            (
+                "GET",
+                "/api/things/accepts",
+                GUESS,
+                &[],
+                Presented::Mismatch,
+            ),
+            ("GET", MISSES_PATH, GUESS, &[], Presented::Mismatch),
+            ("GET", ACCEPTS_PATH, None, &[], Presented::None),
+            ("GET", ACCEPTS_PATH, GUESS, second, Presented::Mismatch),
+            // One EMPTY value asks about nothing: the mismatch it was
+            // before this car (review 0c0e3f01, N1).
+            ("GET", ACCEPTS_PATH, Some(""), &[], Presented::Mismatch),
+            // And so does one of whitespace alone (backlog d653e090, N4):
+            // a wire parser trims it to the empty value above, and the
+            // in-tree router, which does not, must not read it otherwise.
+            ("GET", ACCEPTS_PATH, Some(" "), &[], Presented::Mismatch),
+            ("GET", ACCEPTS_PATH, Some(" \t "), &[], Presented::Mismatch),
+            ("HEAD", ACCEPTS_PATH, GUESS, &[], Presented::Mismatch),
+            ("POST", ACCEPTS_PATH, GUESS, &[], Presented::Mismatch),
+            ("PUT", ACCEPTS_PATH, GUESS, &[], Presented::Mismatch),
+            (
+                "GET",
+                "/api/machine-gate/accepts/",
+                GUESS,
+                &[],
+                Presented::Mismatch,
+            ),
+            (
+                "GET",
+                "/api/machine-gate/accepts/x",
+                GUESS,
+                &[],
+                Presented::Mismatch,
+            ),
+            (
+                "GET",
+                "//api/machine-gate/accepts",
+                GUESS,
+                &[],
+                Presented::Mismatch,
+            ),
+            (
+                "GET",
+                "/API/Machine-Gate/Accepts",
+                GUESS,
+                &[],
+                Presented::Mismatch,
+            ),
+        ];
+        for (method, path, token, extra, presented) in cases {
+            let what = format!("{method} {path} {token:?} +{}", extra.len());
+            for (mode, fact) in [(Mode::Report, "would_refuse"), (Mode::Enforce, "refused")] {
+                let (g, mut rx) = stating(mode);
+                let (s, _) = call_with(&g, method, path, token, extra).await;
+                if mode == Mode::Enforce {
+                    assert_eq!(s, StatusCode::UNAUTHORIZED, "{what}");
+                }
+                let m = g.misses();
+                assert_eq!(m.rows.len(), 1, "{what} in {mode:?}: {:?}", m.rows);
+                assert_eq!(m.rows[0].key.presented, presented, "{what} in {mode:?}");
+                assert_eq!(m.not_clean.len(), 1, "{what}: {:?}", m.not_clean);
+                assert_eq!(
+                    kinds(&stated(&mut rx)),
+                    vec!["recording_began", fact],
+                    "{what} in {mode:?}"
+                );
+            }
+        }
+    }
+
+    /// An ask about a value a slot DOES hold is tallied as it always was:
+    /// the estate `previous` and each reader slot are the facts a drain
+    /// reads, and this car changes nothing a rotation drains on.
+    #[tokio::test]
+    async fn an_ask_that_matches_a_drained_slot_is_counted_as_before() {
+        for (token, presented, fact) in [
+            ("prev-value", Presented::Previous, "previous_presented"),
+            ("rd-prv", Presented::ReaderPrevious, "reader_presented"),
+            ("rd-nxt", Presented::ReaderNext, "reader_presented"),
+        ] {
+            let (g, mut rx) = stating(Mode::Report);
+            let (s, _) = call(&g, "GET", ACCEPTS_PATH, Some(token)).await;
+            assert_eq!(s, StatusCode::OK);
+            let m = g.misses();
+            assert_eq!(m.rows.len(), 1, "{token}: {:?}", m.rows);
+            assert_eq!(m.rows[0].key.presented, presented);
+            assert_eq!(m.rows[0].key.route, ACCEPTS_PATH);
+            assert_eq!(kinds(&stated(&mut rx)), vec!["recording_began", fact]);
+        }
+        // `current` and `next` were never a row, asked about or sent.
+        let (g, _rx) = stating(Mode::Report);
+        for token in ["cur-value", "next-value"] {
+            call(&g, "GET", ACCEPTS_PATH, Some(token)).await;
+        }
+        assert!(g.misses().rows.is_empty());
     }
 
     #[tokio::test]
@@ -3339,5 +4353,70 @@ mod tests {
         let m = g.misses();
         assert_eq!(m.evidence.unstated, 3);
         assert!(m.not_clean[0].contains("3 fact(s)"), "{:?}", m.not_clean);
+    }
+
+    /// Review 6858ef1d, N1: what `mount` states. The mounted gate's
+    /// FIRST fact on the log is its start, and it carries the generation
+    /// of the record the process was launched under; a process handed no
+    /// record, or one it cannot read, still mounts and states why.
+    #[tokio::test]
+    async fn a_mounted_gate_states_its_launch_roster_with_its_start() {
+        use crate::gate_window::{ROSTER_FIELD, roster_generation};
+        struct Took(Mutex<Vec<crate::event::Event>>);
+        #[async_trait::async_trait]
+        impl EventRecorder for Took {
+            async fn record(&self, event: &crate::event::Event) -> Result<(), String> {
+                self.0.lock().unwrap().push(event.clone());
+                Ok(())
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "boss-core-machine-gate-mount-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let tokens = dir.join("tokens");
+        std::fs::create_dir_all(&tokens).unwrap();
+        let record =
+            "boss-launch-record v1\nstart boss-things-api\nskip boss-other-api off\nend 2\n";
+        std::fs::write(dir.join("record"), record).unwrap();
+        let at = |name: &str| Some(dir.join(name).to_string_lossy().to_string());
+        let mut stamps = Vec::new();
+        for launch_record in [at("record"), None, at("absent"), at("tokens")] {
+            let took = Arc::new(Took(Mutex::new(Vec::new())));
+            let _served = mount_launched(
+                Router::new(),
+                "things",
+                &[],
+                Some(Arc::clone(&took) as Arc<dyn EventRecorder>),
+                MountedFiles::new(dir.join("mode"), &tokens),
+                launch_record,
+            );
+            let mut first = None;
+            for _ in 0..1000 {
+                first = took.0.lock().unwrap().first().cloned();
+                if first.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let first = first.expect("the mounted gate states its start within ten seconds");
+            assert_eq!(first.kind, "machine_gate.recording_began");
+            stamps.push(first.payload[ROSTER_FIELD].clone());
+        }
+        assert_eq!(
+            stamps[0]["generation"],
+            roster_generation(record).unwrap(),
+            "{}",
+            stamps[0]
+        );
+        for (stamp, why) in stamps[1..].iter().zip([
+            "BOSS_LAUNCH_RECORD is unset",
+            "is unreadable",
+            "is not a regular file",
+        ]) {
+            assert!(stamp.get("generation").is_none(), "{stamp}");
+            assert!(stamp["error"].as_str().unwrap().contains(why), "{stamp}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

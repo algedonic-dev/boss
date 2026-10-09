@@ -26,7 +26,13 @@
 //!      `BOSS_MACHINE_TOKEN_HOSTS` are other names and pass;
 //!   2. any `secret_header` call that writes the `x-boss-machine-token`
 //!      header by hand, outside the lib: the header comes from
-//!      `machine_token_header`, which reads the mount and checks the host.
+//!      `machine_token_header`, which reads the mount and checks the host;
+//!   3. any live line that names `machine_gate_value_header` — the lib's
+//!      second writer, for a value its CALLER holds — outside the roster
+//!      of one below (adversarial review 4d39f4dc, B1). Without this the
+//!      first two rules had a door around them: read the estate token by
+//!      hand, hand it to that function, and this pin stayed green. The
+//!      roster excuses rule 3 alone; rules 1 and 2 still judge that file.
 //!
 //! EXEMPT, each for its reason: the lib itself (the one place the header
 //! is written), applied migrations (history, never edited —
@@ -54,6 +60,20 @@ const EXEMPT_DIRS: &[(&str, &str)] = &[(
     "infra/postgres/schema",
     "applied migrations are history (migrations-append-only.sh)",
 )];
+
+/// THE ONE CALLER OF `machine_gate_value_header` (adversarial review
+/// 4d39f4dc, B1). That function writes the machine-token header for a
+/// value its CALLER holds, so it is a door around rule 1 and rule 2 for
+/// anyone who may call it: read the estate token by hand, pass it in.
+/// A roster of one, each entry with why it cannot read a mount instead.
+const VALUE_DOOR_CALLERS: &[(&str, &str)] = &[(
+    "infra/forge/probe-reader-deposit.sh",
+    "it asks every gate what it makes of the probe reader's `current` slot BEFORE that value \
+     is written anywhere a reader could find it, so there is no mount to read: the value is \
+     the Secret's, in a variable, and never the estate token (the script refuses any rule \
+     that does not declare gate_slots = \"reader\")",
+)];
+const VALUE_DOOR: &str = "machine_gate_value_header";
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -88,6 +108,12 @@ fn names_the_env_var(line: &str) -> bool {
 
 fn writes_the_header_by_hand(line: &str) -> bool {
     line.contains("secret_header ") && line.to_ascii_lowercase().contains("x-boss-machine-token:")
+}
+
+/// Does `line` name the value door at all? Any mention on a live line —
+/// a call, an alias, a `command -v` — is the caller's to answer for.
+fn calls_the_value_door(line: &str) -> bool {
+    line.contains(VALUE_DOOR)
 }
 
 fn negative_fixture_data(path: &str, line: &str) -> bool {
@@ -165,6 +191,14 @@ fn offenders(root: &Path) -> Vec<String> {
                     n + 1,
                     line.trim()
                 ));
+            } else if calls_the_value_door(line)
+                && !VALUE_DOOR_CALLERS.iter().any(|(f, _)| *f == rel)
+            {
+                out.push(format!(
+                    "{rel}:{}: calls the value door, which only its rostered caller may: {}",
+                    n + 1,
+                    line.trim()
+                ));
             }
         }
     }
@@ -205,6 +239,75 @@ fn the_matchers_see_what_they_name_and_nothing_longer() {
         "machine_token_header MT_HDR \"$BASE\""
     ));
     assert!(is_comment("  # BOSS_MACHINE_TOKEN was read here"));
+    assert!(calls_the_value_door(
+        "machine_gate_value_header MT_HDR \"$BASE\" \"$TOK\""
+    ));
+    assert!(calls_the_value_door(
+        "if ! machine_gate_value_header H \"$U\" \"$V\" 2>\"$E\"; then"
+    ));
+    assert!(calls_the_value_door("alias mgvh=machine_gate_value_header"));
+    assert!(!calls_the_value_door(
+        "machine_token_header MT_HDR \"$BASE\""
+    ));
+}
+
+/// THE VALUE DOOR HAS ONE CALLER (adversarial review 4d39f4dc, B1).
+/// The reviewer's fixture, handed to the scan and never executed: a
+/// script under infra/forge that reads the estate token's slot by hand,
+/// and one that takes it from a variable of another name, each passing
+/// it to `machine_gate_value_header`. Before the third rule both went
+/// through this pin green, so a second sender could take the estate
+/// token from anywhere. The same call in the one rostered file passes,
+/// and a comment that names the function is not a call.
+#[test]
+fn a_second_caller_of_the_value_door_is_refused() {
+    let root = boss_testing::scratch_dir("value-door-second-caller");
+    let forge = root.join("infra/forge");
+    std::fs::create_dir_all(&forge).unwrap();
+    // Never executed: a data file the scan reads, written as one.
+    boss_testing::write_file(
+        &forge.join("hand-read-sender.sh"),
+        "# machine_gate_value_header is the lib's, and this comment is not a call\n\
+         TOK=\"$(cat /etc/boss/machine-token/current)\"\n\
+         machine_gate_value_header MT_HDR \"$BASE\" \"$TOK\"\n\
+         if ! machine_gate_value_header OTHER_HDR \"$BASE\" \"$SOME_OTHER_NAME\"; then exit 1; fi\n",
+    );
+    let found = offenders(&root);
+    assert_eq!(
+        found.len(),
+        2,
+        "each call outside the roster is an offender, and the comment is not: {found:?}"
+    );
+    assert!(
+        found
+            .iter()
+            .all(|l| l.starts_with("infra/forge/hand-read-sender.sh:")
+                && l.contains("calls the value door")),
+        "{found:?}"
+    );
+    // The rostered caller, with the very same line, passes — and only for
+    // this rule: a hand-written header in it is still refused.
+    let (rostered, _) = VALUE_DOOR_CALLERS[0];
+    boss_testing::write_file(
+        &root.join(rostered),
+        "machine_gate_value_header READER_HDR \"$SCHEME://$HOST\" \"$V\"\n",
+    );
+    std::fs::remove_file(forge.join("hand-read-sender.sh")).unwrap();
+    assert!(offenders(&root).is_empty(), "{:?}", offenders(&root));
+    boss_testing::write_file(
+        &root.join(rostered),
+        "secret_header READER_HDR \"x-boss-machine-token: $V\"\ntoken=\"$BOSS_MACHINE_TOKEN\"\n",
+    );
+    assert_eq!(
+        offenders(&root).len(),
+        2,
+        "the roster excuses the value door alone, never the two older rules"
+    );
+    assert_eq!(
+        VALUE_DOOR_CALLERS.len(),
+        1,
+        "the value door has ONE caller; a second is a decision made here, with its reason"
+    );
 }
 
 /// Every exemption names a file that exists — a stale exemption is a
@@ -217,5 +320,14 @@ fn every_exemption_names_a_file_that_exists() {
     }
     for (d, why) in EXEMPT_DIRS {
         assert!(root.join(d).is_dir(), "{d} ({why}) is gone — drop it");
+    }
+    for (f, why) in VALUE_DOOR_CALLERS {
+        assert!(root.join(f).is_file(), "{f} ({why}) is gone — drop it");
+        let text = std::fs::read_to_string(root.join(f)).unwrap();
+        assert!(
+            text.lines()
+                .any(|l| !is_comment(l) && l.contains(VALUE_DOOR)),
+            "{f} no longer calls {VALUE_DOOR} — drop it from the roster"
+        );
     }
 }

@@ -1,0 +1,11 @@
+# automation:forge-converge — the role-report tally (GET
+# /api/jobs/actor-role-reports), read 2026-10-07T02:13Z: 8 observations, all
+# read estate.
+# Signs as audit-readonly today: infra/forge/forge-converge.sh hands its
+# name to infra/estate/node-roles.sh, which signs the read with
+# sor_reader_header.
+
+[[automation]]
+id = "automation:forge-converge"
+role = "audit-readonly"
+description = 'The forge host converge reading which roles the estate registry gives its node (infra/forge/forge-converge.sh, through infra/estate/node-roles.sh). Reads only.'

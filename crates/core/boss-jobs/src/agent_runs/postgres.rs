@@ -14,8 +14,8 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
 use super::port::{
-    AgentRunError, AgentRunLog, RecordedRun, RegisteredAgent, admit, resolve_model, validate,
-    validate_profile, validate_window,
+    AgentRunError, AgentRunLog, RecordedRun, RegisteredAgent, admit, replacement, replaces,
+    resolve_model, validate, validate_profile, validate_window,
 };
 use super::profile::{RunProfile, WorkProfile};
 use super::types::{
@@ -176,6 +176,50 @@ fn agent_row(row: &sqlx::postgres::PgRow) -> Result<RegisteredAgent, AgentRunErr
     })
 }
 
+/// Insert one priced run, or do nothing when `run_id` is already held —
+/// `true` when the row went in. `recorded_at` is the event's instant,
+/// so the row and the record agree. Called twice by the recorder: for
+/// the report, and again for a record that replaces a placeholder.
+async fn insert_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run: &NewAgentRun,
+    priced: &Option<(u64, String)>,
+    budget: &BudgetDecision,
+    recorded_at: DateTime<Utc>,
+) -> Result<bool, AgentRunError> {
+    let n = |v: Option<u64>| v.map(|v| i64::try_from(v).unwrap_or(i64::MAX));
+    Ok(sqlx::query(&insert_run_sql())
+        .bind(&run.run_id)
+        .bind(run.actor_id.to_string())
+        .bind(run.model.as_deref())
+        .bind(run.started_at)
+        .bind(run.finished_at)
+        .bind(run.outcome.as_str())
+        .bind(run.error.as_deref())
+        // The total when the run has one, NULL when it reported none;
+        // the split goes in beside it only when it was measured. The
+        // table's CHECKs refuse a pair that disagrees and a split with
+        // no total, and the derivation here is why neither can happen.
+        .bind(n(run.tokens.total()))
+        .bind(n(run.tokens.input()))
+        .bind(n(run.tokens.output()))
+        .bind(i32::try_from(run.tool_calls).unwrap_or(i32::MAX))
+        .bind(n(priced.as_ref().map(|(m, _)| *m)))
+        .bind(priced.as_ref().map(|(_, model)| model.as_str()))
+        .bind(run.job_id)
+        .bind(run.branch.as_deref())
+        .bind(&run.detail)
+        .bind(serde_json::to_value(budget).unwrap_or_default())
+        .bind(recorded_at)
+        .bind(n(run.tokens.cache_read()))
+        .bind(n(run.tokens.cache_write()))
+        .execute(&mut **tx)
+        .await
+        .map_err(storage)?
+        .rows_affected()
+        == 1)
+}
+
 /// The rate card's columns, spelled once: the recorder reads the card
 /// inside its transaction and the read endpoint reads it outside one,
 /// and a list that lived twice would drift the next time a column is
@@ -285,63 +329,8 @@ impl AgentRunLog for PgAgentRuns {
         let budget = admit(agent.as_ref(), measure_load(&prior, run));
 
         let event = super::events::run_recorded_event(recorded_by, run, &priced, &budget);
-
-        let inserted = sqlx::query(&insert_run_sql())
-            .bind(&run.run_id)
-            .bind(run.actor_id.to_string())
-            .bind(run.model.as_deref())
-            .bind(run.started_at)
-            .bind(run.finished_at)
-            .bind(run.outcome.as_str())
-            .bind(run.error.as_deref())
-            // The total when the run has one, NULL when it reported
-            // none; the split goes in beside it only when it was
-            // measured. The table's CHECKs refuse a pair that
-            // disagrees and a split with no total, and the derivation
-            // here is why neither can happen.
-            .bind(
-                run.tokens
-                    .total()
-                    .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
-            )
-            .bind(
-                run.tokens
-                    .input()
-                    .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
-            )
-            .bind(
-                run.tokens
-                    .output()
-                    .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
-            )
-            .bind(i32::try_from(run.tool_calls).unwrap_or(i32::MAX))
-            .bind(
-                priced
-                    .as_ref()
-                    .map(|(m, _)| i64::try_from(*m).unwrap_or(i64::MAX)),
-            )
-            .bind(priced.as_ref().map(|(_, model)| model.as_str()))
-            .bind(run.job_id)
-            .bind(run.branch.as_deref())
-            .bind(&run.detail)
-            .bind(serde_json::to_value(&budget).unwrap_or_default())
-            // The event's instant, so the row and the record agree.
-            .bind(event.timestamp)
-            .bind(
-                run.tokens
-                    .cache_read()
-                    .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
-            )
-            .bind(
-                run.tokens
-                    .cache_write()
-                    .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
-            )
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?
-            .rows_affected()
-            == 1;
+        let mut inserted = insert_row(&mut tx, run, &priced, &budget, event.timestamp).await?;
+        let mut replaced = false;
 
         if inserted {
             // Only a real insert records a fact. A collapsed retry
@@ -351,6 +340,49 @@ impl AgentRunLog for PgAgentRuns {
             boss_events::outbox::record_event_in_tx(&mut tx, &event)
                 .await
                 .map_err(AgentRunError::Storage)?;
+        } else {
+            // THE HELD ROW, LOCKED (backlog b5a3a174). One that carries
+            // no count is a placeholder, and a record carrying one takes
+            // its place — `replaces` is the whole rule and the reason it
+            // can happen only once. `FOR UPDATE` makes two reports
+            // racing for one placeholder take turns: the second reads a
+            // row that holds a count and collapses onto it. The TABLE,
+            // not the read view — a lock belongs to a row, and the
+            // view's one reinterpretation (a pre-cutover zero read as no
+            // count) lands on the same side of the rule either way.
+            let held = sqlx::query(&format!(
+                "SELECT {RUN_COLUMNS} FROM agent_runs WHERE run_id = $1 FOR UPDATE"
+            ))
+            .bind(&run.run_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(storage)?;
+            let held = row_to_run(&held)?;
+            if replaces(&held, run) {
+                let run = &replacement(&held, run);
+                // Its own fact, on the same kind: the payload is the
+                // whole run as it now stands and names what it replaced,
+                // so the rebuilder supersedes the row instead of
+                // collapsing onto the placeholder's.
+                let event = super::events::run_recorded_event(recorded_by, run, &priced, &budget);
+                sqlx::query("DELETE FROM agent_runs WHERE run_id = $1")
+                    .bind(&run.run_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(storage)?;
+                inserted = insert_row(&mut tx, run, &priced, &budget, event.timestamp).await?;
+                if !inserted {
+                    return Err(AgentRunError::Storage(format!(
+                        "run {:?} could not take its placeholder's place: the row was deleted \
+                         under a lock and the insert still found one",
+                        run.run_id
+                    )));
+                }
+                boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                    .await
+                    .map_err(AgentRunError::Storage)?;
+                replaced = true;
+            }
         }
 
         let row = sqlx::query(&format!(
@@ -366,6 +398,7 @@ impl AgentRunLog for PgAgentRuns {
 
         Ok(RecordedRun {
             recorded: inserted,
+            replaced,
             run: recorded,
         })
     }

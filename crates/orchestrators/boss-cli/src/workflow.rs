@@ -262,10 +262,26 @@ pub(crate) fn drift_hold(kind: &str, reader_ok: bool, stdout: &str, stderr: &str
             said.join("; ")
         });
     }
-    stdout
+    // Every line is a whole `held` or `released` row, or the answer is
+    // not one this verb can read — for ANY kind, since the row a broken
+    // line belonged to is unknown (review 6ff3210e, N3). The other two
+    // readers of this output refuse the same shape.
+    let rows: Vec<Vec<&str>> = stdout
         .lines()
-        .map(|l| l.split('\t').collect::<Vec<_>>())
-        .find(|c| c.len() >= 5 && c[0] == "held" && c[1] == kind)
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.split('\t').collect())
+        .collect();
+    if let Some(odd) = rows
+        .iter()
+        .find(|c| !(c.len() == 5 && (c[0] == "held" || c[0] == "released")))
+    {
+        return DriftHold::Unreadable(format!(
+            "the hold reader answered a line that is neither a held nor a released row: {}",
+            odd.join("\t")
+        ));
+    }
+    rows.into_iter()
+        .find(|c| c[0] == "held" && c[1] == kind)
         .map(|c| DriftHold::Held(c[2].to_string(), c[3].to_string(), c[4].to_string()))
         .unwrap_or(DriftHold::Open)
 }
@@ -295,11 +311,21 @@ fn holds_checkout(path: &std::path::Path) -> Option<std::path::PathBuf> {
 /// directory that is not a checkout — which the caller says rather than
 /// reading as "not held".
 fn read_drift_hold(kind: &str, path: &std::path::Path) -> Option<DriftHold> {
-    let repo = holds_checkout(path)?;
+    drift_hold_in(&holds_checkout(path)?, kind)
+}
+
+/// The same question asked of a checkout the caller already holds — for
+/// any other voice that would name this verb as a remedy (`boss
+/// dispatch`'s refusal, backlog c6bd9f18). `None` when `repo` does not
+/// carry the reader: not read, which is never "not held".
+pub(crate) fn drift_hold_in(repo: &std::path::Path, kind: &str) -> Option<DriftHold> {
+    if !repo.join(HOLDS_READER).is_file() {
+        return None;
+    }
     Some(
         match std::process::Command::new("python3")
             .arg(repo.join(HOLDS_READER))
-            .arg(&repo)
+            .arg(repo)
             .output()
         {
             Ok(out) => drift_hold(
@@ -521,6 +547,34 @@ mod tests {
         );
         let said = drift_hold_lines("ops-request", None).join("\n");
         assert!(said.contains("was NOT read"), "{said}");
+    }
+
+    /// A reader that exits 0 with a line that is neither a whole `held`
+    /// nor a whole `released` row did not finish its answer — a newline
+    /// inside a writer value splits a held row in two (review 72485f08,
+    /// F3). `registry-drift.sh` and the protocols lint read that as holds
+    /// that cannot be read; this read it as `Open`, and `boss dispatch`'s
+    /// refusal would then have named the publish for the very kind the
+    /// broken row held (review 6ff3210e, N3). Half an answer is no answer,
+    /// for every kind.
+    #[test]
+    fn an_answer_the_reader_did_not_finish_is_unreadable_never_open() {
+        let split = "held\tops-request\tby default: step approve field decision declares writer sig\nner\tturns on a refusal\tbacklog 6c9183de\n";
+        let unknown =
+            "held\tpr-train\tdeclared in x\ta reason\tbacklog 6c9183de\nparked\tops-request\n";
+        for (answer, said) in [(split, "declares writer sig"), (unknown, "parked")] {
+            for kind in ["ops-request", "pr-train", "backlog-item"] {
+                match drift_hold(kind, true, answer, "") {
+                    DriftHold::Unreadable(why) => assert!(
+                        why.contains(said),
+                        "the line that could not be read is quoted: {why}"
+                    ),
+                    other => panic!("{kind}: expected unreadable, got {other:?}"),
+                }
+            }
+        }
+        // Blank lines are not an answer either way.
+        assert_eq!(drift_hold("pr-train", true, "\n\n", ""), DriftHold::Open);
     }
 
     /// The same question asked of the REAL reader over a planted

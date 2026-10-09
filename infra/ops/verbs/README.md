@@ -344,17 +344,38 @@ read-only discovery verb. It returns one JSON proposal with `verb`,
 explicit `args`, `plan` and `plan_sha256`. The largest whole-GiB size
 must fit every assigned replica's disk, counting replicas sharing a
 disk, satisfy current physical headroom, and remain within the existing
-2x and 100GiB bounds. Missing or ambiguous facts refuse; no growth
-refuses without choosing a replica to move.
+2x and 100GiB bounds. Missing or ambiguous facts refuse.
 
 The proposal is neither approval nor execution. A later request freezes
 its explicit namespace, PVC and size; the existing
 `plan-an-instance-volume-expansion` renders that exact plan for David's
 passkey, and `expand-instance-volume` requires its signed hash. Live
 physical space can change a new discovery result, but admissible changes
-leave the already resolved explicit-size plan hash unchanged. Automatic
-alarm-to-request filing, unique replica selection and declared-capacity
-drift are still separate partial work under backlog 53c8cb72.
+leave the already resolved explicit-size plan hash unchanged.
+
+**When no growth fits** (design `ada8f698`, option A — David,
+2026-10-07). At the script's ceiling the read refuses: no replica move
+changes a ceiling. Otherwise a replica disk is what binds, and the read
+asks `move-volume-replica.sh --plan-decisive` whether *exactly one*
+replica move would free the volume. A replica is eligible only when the
+existing move plan's own bounds hold for the volume and for every disk
+the new replica can land on, and every *remaining* replica disk admits
+the projected growth by that plan's ledger and live sums. One eligible
+replica is proposed — `verb` `plan-a-volume-replica-move`, `args`
+`[volume, replica]`, `target` `[namespace, pvc]`, that replica's ordinary
+move plan and its hash. None, or several, refuse naming every candidate;
+nothing ranks, and listing order never chooses. It also refuses when no
+replica disk is short (a move frees nothing) and when the volume holds
+more replicas than the retirement floor of 3 (retiring is then as
+admissible as moving, and that choice is a person's).
+
+The verb that owns the discovery declares the fallback beside it:
+`"no_growth_plan_verb": "plan-a-volume-replica-move"` in its
+`discovery_remedies` entry. From such a proposal the dispatcher files
+**only that read-only plan request**, with the proposal and its byte
+receipt as provenance, and says so on the finding's open alarm. It never
+files `move-volume-replica`: that request is a person's to file, and
+David's passkey signs its plan.
 
 ## Remedies — the machine files the request, the human signs the plan
 

@@ -6,6 +6,11 @@
 //! re-pricing an old run against today's card would make a rebuild
 //! change history. `recorded_at` comes from the audit row's own
 //! timestamp, which is the instant the live write bound into the row.
+//!
+//! A run is usually one event. It is two when its first record held no
+//! count and a later one replaced it (`super::port::replaces`): the
+//! second names what it replaced in `detail`, and replays as a
+//! replacement, in log order, so the rebuilt row is the live one.
 
 use boss_events::replay::{Applied, replay_projection};
 use sqlx::PgPool;
@@ -25,7 +30,11 @@ pub enum RebuildError {
 pub struct RebuildReport {
     pub events_processed: u64,
     pub events_skipped: u64,
+    /// Rows the rebuilt table holds: one per run, however many events
+    /// recorded it.
     pub runs_inserted: u64,
+    /// Placeholder rows a later record of the same run replaced.
+    pub runs_replaced: u64,
 }
 
 /// Drop every `agent_runs` row and replay `agents.run.recorded` in
@@ -57,6 +66,23 @@ pub async fn rebuild_agent_runs(pool: &PgPool) -> Result<RebuildReport, RebuildE
                     return Ok(Applied::Skipped);
                 }
             };
+            // A record that REPLACED a placeholder (backlog b5a3a174)
+            // says so in its own payload, and replays as it was applied:
+            // the row the earlier event put here goes, and this one
+            // takes its place. Without this the insert below would
+            // collapse onto the placeholder — `DO NOTHING` — and a
+            // rebuilt table would price the run at nothing while the
+            // live one priced it in full.
+            if super::port::is_replacement(&run.run) {
+                let gone = sqlx::query("DELETE FROM agent_runs WHERE run_id = $1")
+                    .bind(&run.run.run_id)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .rows_affected();
+                report.runs_replaced += gone;
+                report.runs_inserted -= gone.min(report.runs_inserted);
+            }
             insert_run(&mut *conn, &run).await.map_err(|e| e.to_string())?;
             report.runs_inserted += 1;
             Ok(Applied::Yes)

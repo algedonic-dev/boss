@@ -11,6 +11,10 @@
 # JSON proposal carries the resolved EXPLICIT size and the existing plan.
 # It is not approval or execution; a later request freezes those arguments,
 # and the ordinary write still requires the hash David's passkey signed.
+# When NO growth fits and a replica disk is what binds, it asks
+# move-volume-replica.sh --plan-decisive the one further question (design
+# ada8f698, option A): would exactly one replica move free the volume? That
+# script answers with its own existing plan for that replica, or refuses.
 #
 # WHY IT EXISTS (backlog ebbb923f, incident d3c0a67c, David 2026-10-01).
 # The system of record's database volume, boss/pgdata-postgres-0, filled,
@@ -239,11 +243,7 @@ read_obj() {
         esac
         [ "$1" != pvc ] || ns="$NS"
         [ "$1" != storageclass ] || ns=""
-        jq_doc_file "$WORK/$file" && jq -e -s --arg name "$2" --arg ns "$ns" --arg kind "$kind" '
-            length == 1 and (.[0] | type == "object"
-                and .kind == $kind
-                and .metadata.name == $name
-                and ($ns == "" or .metadata.namespace == $ns))' "$WORK/$file" >/dev/null 2>&1 \
+        lh_one_object "$WORK/$file" "$kind" "$2" "$ns" \
             || unread "$* is not exactly one object with the requested identity"
     fi
 }
@@ -263,13 +263,7 @@ read_list() {
             nodes.longhorn.io) kind=Node ;;
             *) unread "discovery does not know the typed list $1" ;;
         esac
-        jq_doc_file "$WORK/$2" && jq -e -s --arg ns "$LH" --arg kind "$kind" '
-            length == 1 and (.[0] | type == "object" and (.items | type == "array")
-                and (.kind == "List" or .kind == ($kind + "List"))
-                and ((.metadata.continue // "") == "")
-                and all(.items[]; .kind == $kind and .metadata.namespace == $ns
-                    and (.metadata.name | type == "string" and length > 0))
-                and ([.items[].metadata.name] | length == (unique | length)))' "$WORK/$2" >/dev/null 2>&1 \
+        lh_whole_list "$WORK/$2" "$kind" "$LH" \
             || unread "$1 is not exactly one complete list with unique named objects"
     fi
 }
@@ -284,35 +278,9 @@ discovery_inputs() {
         --slurpfile r "$WORK/replicas.json" --slurpfile n "$WORK/lhnodes.json" \
         --slurpfile o "$WORK/overprov.json" --slurpfile m "$WORK/minavail.json" \
         "$JQ_BYTES$LONGHORN_LEDGER_JQ"'
-        def uint:
-            (type == "number" or (type == "string" and test("^[0-9]+$")))
-            and (try (tonumber | . >= 0 and . <= 9007199254740991 and . == floor) catch false);
-        def safe: type == "number" and . >= 0 and . <= 9007199254740991 and . == floor;
-        ($o[0].value | uint) and ($m[0].value | uint)
-        and ($m[0].value | tonumber <= 100)
-        and ($v[0].spec.size | uint)
-        and all([$p[0].spec.resources.requests.storage, $p[0].status.capacity.storage][];
-            type == "string" and (bytes | safe))
-        and all($r[0].items[]; (.spec.volumeName | type == "string"))
-        and all($r[0].items[] | select(.spec.volumeName == $vol);
-            (.spec.nodeID | type == "string")
-            and (.spec.nodeID == "" or (.spec.diskID | type == "string" and length > 0)))
-        and all($n[0].items[]; (.status.diskStatus | type == "object"))
-        and all($n[0].items[]; . as $N
-            | all(.status.diskStatus | to_entries[]; . as $D
-                | all([$D.value.storageMaximum, $D.value.storageScheduled,
-                    $D.value.storageAvailable, $N.spec.disks[$D.key].storageReserved][]; uint)))
-        and ([ $n[0].items[].status.diskStatus[] | .diskUUID ]
-            | all(.[]; type == "string" and length > 0)
-              and length == (unique | length))
-        and all($r[0].items[] | select(.spec.volumeName == $vol and .spec.nodeID != "");
-            . as $R | [$n[0].items[] | select(.metadata.name == $R.spec.nodeID)
-                | .status.diskStatus[] | select(.diskUUID == $R.spec.diskID)] | length == 1)
-        and (lh_disks($n[0].items) | all(.[];
-            all([.max, .reserved, .scheduled, .available][]; uint)
-            and .reserved <= .max and .available <= .max
-            and ((.max - .reserved) * ($o[0].value | tonumber) | safe)
-            and (.max * ($m[0].value | tonumber) | safe)))' >/dev/null 2>&1 \
+        all([$p[0].spec.resources.requests.storage, $p[0].status.capacity.storage][];
+            type == "string" and (bytes | lh_safe))
+        and lh_exact_inputs($vol; $v[0]; $r[0].items; $n[0].items; $o[0].value; $m[0].value)' >/dev/null 2>&1 \
         || unread "largest-fit discovery needs complete unique identities and nonnegative exact integer sizes, disk fields and settings; no proposal can be inferred"
 }
 
@@ -486,8 +454,24 @@ render() {
         case "$WANT_GIB" in '' | *[!0-9]*) unread "largest-fit size is not a nonnegative whole GiB" ;; esac
         WANT_B=$((WANT_GIB * GIB))
         SIZE="${WANT_GIB}Gi"
-        [ "$WANT_B" -gt "$cap_b" ] \
-            || refuse "no whole-GiB growth fits $NS/$PVC at $CUR_CAP; largest fit is $SIZE — no replica is selected or moved by discovery"
+        if [ "$WANT_B" -le "$cap_b" ]; then
+            # NO GROWTH FITS. A bound no replica's placement decides —
+            # the ceiling — refuses here, without asking about a move
+            # (design ada8f698: "Growth blocked only by the 100Gi ceiling
+            # or another non-placement bound must refuse without movement").
+            [ "$((CEILING_GIB * GIB))" -gt "$cap_b" ] \
+                || refuse "no whole-GiB growth fits $NS/$PVC at $CUR_CAP: it is at the ceiling ${CEILING_GIB}Gi (CEILING_GIB in infra/forge/expand-instance-volume.sh), and no replica move would change that — no replica is selected or moved by discovery"
+            # Otherwise a replica disk is what binds, and the one further
+            # question discovery may ask is whether EXACTLY ONE replica
+            # move would free the volume (option A, David 2026-10-07).
+            # The move script owns that judgement and every bound on it;
+            # it reads the cluster again, proposes its existing plan for
+            # that one replica, or refuses saying which fact was missing.
+            # Its answer and its exit code are this run's.
+            echo "$ME: no whole-GiB growth fits $NS/$PVC at $CUR_CAP; largest fit is $SIZE — asking move-volume-replica.sh --plan-decisive whether exactly one replica move would free $VOL to grow; discovery moves nothing" >&2
+            bash "$HERE/move-volume-replica.sh" --plan-decisive "$VOL" "$NS" "$PVC"
+            exit $?
+        fi
         facts > "$f" || unread "the resolved explicit size could not be judged: $(tr '\n' ' ' < "$WORK/facts.err")"
     fi
     jq -r --arg me "$ME" '.physical[] | "\($me): live, not signed (re-checked when the write re-renders): \(.)"' "$f" >&2

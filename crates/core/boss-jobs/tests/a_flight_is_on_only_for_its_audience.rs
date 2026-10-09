@@ -94,6 +94,11 @@ fn app_with_guard(
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let state = JobsApiState {
         role_guards: guard,
+        // The gateway's key: `decide` and `widen` are human-only, and a
+        // human-only step completes on a passkey (item 570c66e9).
+        presence_key: Some(Arc::new(boss_jobs::http::PresenceKey::fixed(
+            boss_testing::passkey::TEST_GATEWAY_KEY.to_vec(),
+        ))),
         kind_registry: Some(kinds as Arc<dyn WorkflowRegistry>),
         ..JobsApiState::minimal(
             jobs.clone(),
@@ -162,7 +167,10 @@ async fn step(jobs: &InMemoryJobs, job: &Job, slug: &str) -> Step {
 
 /// Complete `slug` as `who`: `fields` through the step's metadata merge
 /// door, then the status alone through the step PUT, which refuses any
-/// metadata body since e39a9d2a.
+/// metadata body since e39a9d2a. The PUT carries `who`'s passkey ticket
+/// over the step as the merge left it — what the web surface sends — so
+/// the flight's human-only steps complete; a step that asks for no
+/// passkey ignores it.
 async fn complete(
     app: &Router,
     jobs: &InMemoryJobs,
@@ -173,21 +181,29 @@ async fn complete(
 ) {
     let s = step(jobs, job, slug).await;
     let uri = format!("/api/jobs/{}/steps/{}", s.job_id, s.id);
+    let person = serde_json::from_str::<Value>(who).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     for (method, uri, body) in [
         ("PATCH", format!("{uri}/metadata"), fields),
         ("PUT", uri.clone(), json!({"status": "completed"})),
     ] {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("x-boss-user", who);
+        if method == "PUT" {
+            let merged = step(jobs, job, slug).await;
+            req = req.header(
+                boss_testing::passkey::PRESENCE_HEADER,
+                boss_testing::passkey::passkey_ticket(&merged, &person),
+            );
+        }
         let resp = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri(uri)
-                    .header("content-type", "application/json")
-                    .header("x-boss-user", who)
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
+            .oneshot(req.body(Body::from(body.to_string())).unwrap())
             .await
             .unwrap();
         let (status, body) = read(resp).await;

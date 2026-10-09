@@ -64,3 +64,7 @@ required-features = ["postgres"]
 [[test]]
 name = "the_policy_adapters_agree_pg"
 required-features = ["postgres"]
+
+[[test]]
+name = "the_service_read_is_kept_and_a_refusal_is_on_the_log_pg"
+required-features = ["postgres"]

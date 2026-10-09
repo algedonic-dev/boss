@@ -1,0 +1,333 @@
+# boss-node-maintenance — the one workload in the ONE namespace that
+# admits a pod with a node capability: a daily trim of the build node's
+# two filesystems (backlog 17f6170c; David 2026-10-07: a scheduled trim
+# lives in a dedicated privileged namespace).
+#
+# THE NAMESPACE IS NOT DECLARED HERE. It is declared, labelled
+# `privileged` and BOUNDED in boss-node-maintenance-admission.yaml,
+# beside the ValidatingAdmissionPolicy that admits into it only the
+# objects below (backlog 8eac4893). Two reasons, both that file's: the
+# label that grants the admission sits in the file that bounds it, and
+# the converge applies every file carrying a Namespace document first —
+# so the policy is always written before this CronJob, and this file
+# must never carry one (the admission pin refuses it).
+#
+# WHY A TRIM. Talos mounts both of w-1's xfs filesystems without
+# `discard` and runs no periodic trim
+# (infra/cluster/talos/patches/w-1.yaml declares neither). Every gate
+# reflink-copies a 78 GB seed onto the gate volume and deletes its
+# workspace, so the drive under it — a Kingston NV3 fitted 2026-09-30 —
+# had churned for a week with the controller never told which blocks
+# were free. Measured 2026-10-06/07: 699 discards on that drive since
+# boot and 0 on the install disk, ever; write await 495 ms under five
+# gates; one gate stalled on IO for 43 percent of its wall time; gates
+# of 75+ minutes against a 42-minute median.
+#
+# WHY A NAMESPACE OF ITS OWN. FITRIM needs CAP_SYS_ADMIN and a file
+# descriptor on the filesystem. Every other namespace here enforces
+# `baseline` (boss.yaml labels `boss`; boss-dev takes the Talos
+# default), which refuses both the capability and a hostPath. Labelling
+# an existing namespace `privileged` would hand that admission to every
+# workload already in it — the boss pod and its credential broker, or
+# the gates, which run branch code. So the admission is its own
+# namespace, holding nothing else: no Secret, no ServiceAccount beyond
+# the control plane's `default`, no Role, no Service.
+#
+# EVERY CHANGE TO THIS FILE is a credentials-area car and waits for an
+# adversarial review. That sentence is read by the park hold (boss-cli,
+# mutating_verb.rs): it is what holds this file by name.
+#
+# PODSECURITY `privileged` ADMITS ANYTHING, so the namespace label is
+# not the control. THE BOUND IS AT ADMISSION, in
+# boss-node-maintenance-admission.yaml: a ValidatingAdmissionPolicy
+# (`node-maintenance-holds-one-workload`, Deny) that admits into this
+# namespace only this CronJob, a Job and a Pod whose pod spec IS the one
+# below — the digest, the script byte for byte, the two read-only
+# hostPath directories, one added capability — and the deny-all
+# NetworkPolicy; every other kind, exec and attach are refused. The API
+# server judges the decoded object, whoever sent it and however a file
+# spelled it. It landed first (train #987) and is pinned by
+# the_node_maintenance_namespace_is_bounded_at_admission.rs, which
+# evaluates the policy against THIS file's CronJob: the digest, the
+# script and every pod setting are written in both files, and a change
+# to either alone is a red gate. So moving the digest or the script is
+# ONE car changing both (that file's header gives the order).
+#
+# BESIDE IT, a pin that reads LINES,
+# crates/core/boss-testing/tests/the_privileged_namespace_holds_one_workload.rs:
+#   - every line of this file that is not a comment — the two documents
+#     and the inline script, byte for byte — must equal a copy the pin
+#     carries, so a second object, a third mount, a token,
+#     `privileged: true` or one more line of script written as a line is
+#     a red gate naming it; and the Namespace document in the admission
+#     file must equal the pin's copy too, the `privileged` line included;
+#   - no other yaml under infra/ may carry, as text on a line that is
+#     not a comment, the namespace's name, `hostPath`, `privileged`, a
+#     host namespace or `SYS_ADMIN` — the admission file alone excepted,
+#     by name, because a policy has to spell what it bounds;
+#   - and, so that a line is what kubectl reads too, no yaml under
+#     infra/ may carry a line break other than LF, and no other yaml may
+#     use the spellings that let a scalar differ from its line: a tag, a
+#     double-quoted scalar continued by a backslash, an explicit key, a
+#     quoted scalar or a flow collection left open across lines.
+# infra/lint/no-manifest-mounts-a-hostpath.sh admits a hostPath only in
+# a namespace the tree labels privileged, refuses one everywhere else,
+# and refuses the same line breaks.
+#
+# WHAT THE LINE PIN IS NOT. It is a line-based reading of YAML, plus
+# review — not a YAML reader, and not the cluster. Two reviews each
+# found spellings kubectl decodes and a line scan does not (16efea28,
+# 9b05cc55), and a third could not finish the question; each spelling
+# found is refused by a named test, and the refusals are a net with a
+# known shape, not a proof. That is why the bound is the admission
+# policy above and not this net: the net is the early, local reading of
+# a diff, the policy is what holds. What the policy does NOT bound is in
+# its own header (when the pod runs, cluster-admin, and what the
+# admitted pod can do). The pod's own narrowing, the seccomp profile, is
+# still owed (item fb2f849f).
+#
+# WHAT THIS POD IS, IN PLAIN WORDS: ITS IMAGE AND ITS SCRIPT ARE ROOT ON
+# w-1. The settings below keep an ACCIDENT small. They do not hold
+# hostile code. With CAP_SYS_ADMIN and no user namespace, the runtime's
+# default seccomp profile lets the pod call mount, so hostile code in
+# its image or its script could remount its two read-only directories
+# read-write — a write path into the seed every gate copies and executes
+# from — or reach host root (a fresh procfs and kernel.core_pattern is
+# one known way; SELinux on w-1 is on but not enforcing, so it does not
+# confine this). The read-only root filesystem, the absent token and the
+# deny-all NetworkPolicy do not bound that. Reasoned from kernel and
+# runtime behaviour by the car's reviewer (run 16efea28); nothing was
+# run to show it. THE REAL CONTROLS ARE THREE: the image pinned by
+# digest, the script fixed here and pinned byte for byte, and a review
+# of any change to either. The narrower pod is OWED, not built by this
+# car: a Talos `machine.seccompProfiles` Localhost profile on w-1 that
+# denies the mount family, pivot_root, setns, unshare, bpf, ptrace and
+# perf_event_open and filters ioctl to FITRIM. It needs a machine-config
+# apply, which this car does not make; it is filed as its own item.
+#
+# WHAT THE POD MAY TOUCH, AND WHAT IT MAY NOT.
+#   - `capabilities: add [SYS_ADMIN], drop [ALL]`, NOT `privileged:
+#     true`. A privileged container gets every capability, every host
+#     device node and no seccomp filter; this one gets the single
+#     capability the ioctl checks, no device node, and the runtime's
+#     default seccomp profile. That is narrower by construction and, per
+#     the paragraph above, not a boundary: CAP_SYS_ADMIN is what the
+#     kernel asks for, no narrower capability exists for FITRIM, and the
+#     default profile does not take mount away from its holder.
+#   - uid 0, declared: the kernel reads the EFFECTIVE capability set,
+#     and a non-root uid does not get `capabilities.add` into it.
+#   - `allowPrivilegeEscalation` is OMITTED, on purpose. Kubernetes
+#     documents the field as always true for a container that holds
+#     CAP_SYS_ADMIN. The API server is believed to refuse `false` beside
+#     the capability only when it is spelled CAP_SYS_ADMIN, which this
+#     file does not write — a reviewer's recollection, not verified on
+#     this server — so the manifest is accepted either way, and omitting
+#     the field removes the question. It costs nothing: `drop [ALL]`
+#     leaves a one-capability bounding set, so no exec of any binary in
+#     the image can come out holding a second.
+#   - Two hostPath mounts, read-only, each an existing directory ON the
+#     filesystem to trim rather than the filesystem's root. FITRIM acts
+#     on the whole filesystem a descriptor belongs to, so any directory
+#     of it serves, and the narrowest one that already exists is used:
+#       /var/mnt/gate/seed    the gate volume (the warm seed the gate
+#                             runner mounts as subPath `seed`)
+#       /var/local/gate-seed  EPHEMERAL — /var, the install disk — whose
+#                             directory w-1's Talos config creates and
+#                             binds into the kubelet
+#     Mounting /var itself would put every Longhorn replica on the node
+#     (the dev pod's /work among them), containerd's store and every
+#     pod's volumes in front of a root process; mounting /var/mnt/gate
+#     would add every running gate's workspace. What the two do hold
+#     is build output: the warm cargo target the last green gate near
+#     tip refreshed (a gated branch's, not only main's), and the seed
+#     directory that preceded it. Neither holds a credential; the first
+#     is what every gate copies and then executes, which is why a write
+#     path into it matters (above). `type: Directory`: a path that is
+#     absent keeps the pod from starting rather than being created.
+#     NOT MEASURED: with `drop [ALL]` uid 0 has no DAC override, so each
+#     directory must be root-owned or other-readable and -searchable, or
+#     the first run fails "Permission denied".
+#   - No ServiceAccount token, no Secret, no ConfigMap, no env, no host
+#     PID, network or IPC namespace, a read-only root filesystem, and a
+#     NetworkPolicy that denies the namespace all traffic both ways: the
+#     pod has nothing to say to the network and nothing to say it with.
+#   - The image is pinned by DIGEST. It is the mirrored kubectl image the
+#     estate already carries (infra/forge/mirror-base-images.sh), read
+#     from the forge registry on 2026-10-07: Alpine 3.22.1, BusyBox
+#     1.37.0, whose applets include `fstrim` (sbin/fstrim) — no package
+#     is installed at run time. A tag can be re-pushed; a digest cannot,
+#     and this is the one pod in the estate where that difference is a
+#     node. The registry serves it to an anonymous pull, so the
+#     namespace holds no pull Secret either.
+#
+# WHEN. Daily at 12:40 UTC (05:40 Pacific in summer). Measured over the
+# 500 newest gate-runs (2026-10-01..07) and 500 newest trains
+# (2026-09-19..10-06): no hour of the day is free of gates, and the
+# trough is 08:00-12:59 UTC — 12 to 19 launches an hour across the
+# week, on three or four days of seven, against 20 to 34 through the
+# rest of the day. A trim can stall writes on a busy drive, so it runs
+# where the fewest gates are, not under a lock against them: a lock
+# would need the gates' claim or the jobs API, and this pod is given
+# neither. Daily, not weekly: the gates free several hundred GB a day,
+# so a week's backlog is the whole drive again, and a small trim every
+# day is a short one. `startingDeadlineSeconds` keeps a missed run from
+# starting late, in the working day.
+#
+# WHAT IT SAYS, AND WHO READS IT — THE OPEN HALF. The pod prints, and
+# writes to its termination message, the bytes `fstrim -v` reports per
+# mount, each NVMe's discard counters before and after, and one closing
+# `node-trim: OK` or `node-trim: RED` line; any failure fails the Job.
+# It files NO packet: that takes the machine token and a door to the
+# jobs API, and the pod that holds a node capability must not also hold
+# a credential on the system of record. So its record is the Job's own
+# status and that message, kept for the last three runs of each kind —
+# and NOTHING ALARMS when it fails or stops. That reader is owed on
+# 17f6170c as its own car (an unprivileged reader in `boss` that files
+# the daily packet and joins the cadence silence roster, or the forge
+# reading the discard counters through the Talos API it already holds);
+# infra/lint/timers-leave-a-packet.sh names this CronJob as exempt with
+# that sentence, so the debt is written where the rule is.
+#
+# PINNED TO THE BUILD NODE by the label the estate declares it by
+# (infra/estate/estate.toml: w-1, boss.dev/purpose=build), the key the
+# gate runner and the dev pod already select on. The two paths are
+# w-1's; on any other node the pod would not start.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all
+  namespace: boss-node-maintenance
+  labels:
+    app.kubernetes.io/part-of: boss
+    boss.dev/purpose: node-maintenance
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: boss-node-trim
+  namespace: boss-node-maintenance
+  labels:
+    app.kubernetes.io/part-of: boss
+    boss.dev/purpose: node-maintenance
+spec:
+  schedule: "40 12 * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 1800
+      template:
+        metadata:
+          labels:
+            app: boss-node-trim
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          enableServiceLinks: false
+          hostNetwork: false
+          hostPID: false
+          hostIPC: false
+          nodeSelector:
+            boss.dev/purpose: build
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: trim
+              image: 10.20.0.15:3000/david/alpine-k8s:1.33.3@sha256:cdeda0da2cd6896023cc5f96505bc94a699a989dff2bfc3e2008ab92eab1e93a
+              securityContext:
+                privileged: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+                  add:
+                    - SYS_ADMIN
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 16Mi
+                limits:
+                  cpu: 500m
+                  memory: 64Mi
+              volumeMounts:
+                - name: gate
+                  mountPath: /trim/gate
+                  readOnly: true
+                - name: ephemeral
+                  mountPath: /trim/ephemeral
+                  readOnly: true
+              command:
+                - /bin/sh
+                - -c
+              args:
+                - |
+                  set -u
+                  # The four paths are parameters only so the pin can RUN
+                  # this text (inline shell nothing executes is untested
+                  # shell); the pod sets no env, so it gets the defaults.
+                  GATE="${TRIM_GATE:-/trim/gate}"
+                  EPHEMERAL="${TRIM_EPHEMERAL:-/trim/ephemeral}"
+                  OUT="${TRIM_TERMINATION_LOG:-/dev/termination-log}"
+                  SYS="${TRIM_SYS_BLOCK:-/sys/block}"
+                  # Every line goes to the log AND the termination message,
+                  # so the result is on the pod's status as well as in a
+                  # log that needs a second grant to read.
+                  say() {
+                    echo "node-trim: $*"
+                    echo "node-trim: $*" >>"$OUT" 2>/dev/null || true
+                  }
+                  # The EFFECT, beside the claim: each NVMe's completed
+                  # discards and discarded sectors (fields 12 and 14 of
+                  # its stat), before and after.
+                  counters() {
+                    for s in "$SYS"/nvme*/stat; do
+                      [ -r "$s" ] || continue
+                      say "$1 ${s%/stat}: $(awk '{print "discards=" $12 " sectors=" $14}' "$s")"
+                    done
+                    return 0
+                  }
+                  # A gate volume that is not mounted leaves its directory
+                  # on EPHEMERAL: then both paths are one filesystem and
+                  # the drive this exists for would go untrimmed in
+                  # silence. Refuse, by name.
+                  gd=$(stat -c %d "$GATE") || { say "RED cannot stat $GATE"; exit 1; }
+                  ed=$(stat -c %d "$EPHEMERAL") || { say "RED cannot stat $EPHEMERAL"; exit 1; }
+                  if [ "$gd" = "$ed" ]; then
+                    say "RED $GATE and $EPHEMERAL are one filesystem (device $gd): the gate volume is not mounted, nothing trimmed"
+                    exit 1
+                  fi
+                  counters before
+                  rc=0
+                  for m in "$GATE" "$EPHEMERAL"; do
+                    if out=$(fstrim -v "$m" 2>&1); then
+                      say "$out"
+                    else
+                      say "RED fstrim $m failed: $out"
+                      rc=1
+                    fi
+                  done
+                  counters after
+                  if [ "$rc" -eq 0 ]; then say "OK"; else say "RED"; fi
+                  exit "$rc"
+          volumes:
+            - name: gate
+              hostPath:
+                path: /var/mnt/gate/seed
+                type: Directory
+            - name: ephemeral
+              hostPath:
+                path: /var/local/gate-seed
+                type: Directory

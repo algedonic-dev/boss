@@ -42,7 +42,9 @@ import datetime
 import json
 import os
 import sqlite3
+import subprocess
 import sys
+import urllib.error
 import urllib.request
 
 try:
@@ -206,6 +208,85 @@ READER = json.dumps({
 }, separators=(",", ":"))
 
 
+# THE MACHINE TOKEN, PRESENTED AND NEVER REQUIRED (design 6805c764; backlog
+# 44b2087e; df38075a F2; 7369b078 F3). The registry read is the one request
+# this audit sends to a gated service port, and until 2026-10-08 it carried
+# the identity above and nothing else, so every machine gate would have
+# recorded it as a caller to refuse — and no pin saw it, because every
+# sender pin read shell.
+#
+# ONE READER, NOT A SECOND ONE. Where the token is read, which slot shapes
+# are refused and which hosts may be sent it are decided in
+# infra/lib/secret-header.sh (`machine_token_header`), row for row what
+# boss-core decides. Writing those rules again here would be a third copy
+# to drift (CLAUDE.md 9a), so this runs that function as a child and reads
+# the header LINE it made off the child's stdout. What the child is handed
+# is the library's path and the URL: the value is never in an argv, never
+# in an environment, never in a file this process writes. The child's own
+# 0600 header file lives for the few milliseconds between its two lines
+# and is removed by its EXIT trap before this process sends anything; under
+# the unit it is made in the unit's RuntimeDirectory, which systemd removes
+# whatever killed the run. The header's NAME is not spelled here either:
+# it comes back with the value.
+#
+# NEVER A REASON TO STOP. No mount, a blank slot, a slot the reader
+# refuses, a host off the list, no library beside this file, a child that
+# will not start or hangs: the read goes out exactly as it did before, and
+# the reader (or this function) says why on stderr, without the value.
+SECRET_LIB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          os.pardir, "lib", "secret-header.sh")
+# sh -c <this> forge-token-audit <library> <url>
+TOKEN_READER = (
+    '[ -r "$1" ] || exit 0\n'
+    '. "$1" || exit 0\n'
+    'machine_token_header H "$2" || exit 0\n'
+    '[ -z "$H" ] || cat -- "${H#@}"\n'
+)
+
+
+def machine_token_headers(url):
+    """The header to add to a request to `url`, as {name: value}, or {}."""
+    def without(why):
+        # Lengths and reasons only. Never the child's output, and never an
+        # exception's own text: TimeoutExpired carries what the child wrote.
+        print("forge-token-audit: %s; the registry read goes out without "
+              "the machine token" % why, file=sys.stderr)
+        return {}
+
+    try:
+        done = subprocess.run(
+            ["/bin/sh", "-c", TOKEN_READER, "forge-token-audit", SECRET_LIB, url],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, timeout=10, check=False)
+    except subprocess.TimeoutExpired:
+        return without("the machine token's reader did not answer in 10 s")
+    except OSError as e:
+        return without("the machine token's reader could not be run (%s)"
+                       % type(e).__name__)
+    line = done.stdout.decode("latin-1")
+    if line.endswith("\n"):
+        line = line[:-1]
+    if not line:
+        return {}  # no token for this request; the reader has said why, if there is a why
+    name, sep, value = line.partition(": ")
+    # One header, of printable ASCII with no space: what a token is (the
+    # deposit takes one base64url word), and all http.client can be handed
+    # without an error that quotes the value back.
+    if (not sep or not name or not value
+            or any(not 33 <= ord(c) <= 126 for c in name + value)):
+        return without("the machine token's reader answered %d byte(s) that are "
+                       "not one header of printable ASCII" % len(done.stdout))
+    return {name: value}
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A 3xx is an answer, not an instruction. urllib follows one by default
+    and sends the same headers to wherever it points; the reader judged ONE
+    host, and curl — every other stamped sender — follows none without -L."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def load_registry(registry_json, registry_url):
     """Return (rows, limit_message). rows is None when the registry was not
     read; limit_message says why when a configured source failed. Neither
@@ -220,9 +301,11 @@ def load_registry(registry_json, registry_url):
             return None, "cannot read registry fixture %s: %s" % (registry_json, e)
     if registry_url:
         url = registry_url.rstrip("/") + "/api/credentials"
-        req = urllib.request.Request(url, headers={"x-boss-user": READER})
+        headers = {"x-boss-user": READER}
+        headers.update(machine_token_headers(url))
+        req = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.build_opener(_NoRedirect).open(req, timeout=10) as resp:
                 return json.loads(resp.read().decode("utf-8")), None
         except (OSError, ValueError) as e:
             # URLError (and its HTTPError subclass) are OSErrors; a

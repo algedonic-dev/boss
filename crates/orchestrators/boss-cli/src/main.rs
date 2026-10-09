@@ -20,6 +20,9 @@ mod delivery_policy;
 mod design;
 mod dispatch;
 mod dispatch_hook;
+mod dispatch_launch;
+#[cfg(test)]
+mod dispatch_report_orders;
 mod dispatch_started;
 mod disprove;
 mod dock_preview;
@@ -34,6 +37,7 @@ mod freshness;
 mod gate;
 mod gemini_execution;
 mod git_auth;
+mod harness;
 mod host_readiness;
 mod identity;
 mod inspect;
@@ -52,6 +56,7 @@ mod own_temp;
 mod owner;
 mod park;
 mod prior_work;
+mod probe_door_check;
 mod probe_reader;
 mod prose;
 mod prove;
@@ -195,6 +200,20 @@ enum Commands {
         /// 1..=65535.
         port: String,
     },
+    /// As root: does the reader door's socket hand-over hold ON THIS
+    /// HOST? The `probe-door-check` ops verb's one definition (backlog
+    /// e65dde24).
+    ///
+    /// Makes a scratch directory, plants the link an attacker would,
+    /// hands a socket to the probe account the way `boss prove
+    /// --unattended` does, and reports BY EFFECT: what the link points
+    /// at is still root's; the account connects and cannot plant,
+    /// replace, remove or rename; another account cannot connect. Reads
+    /// no credential and no token, changes nothing outside its scratch
+    /// directory, and removes that. Exit 0 every effect held; 1 one did
+    /// not, named; 2 it could not be checked here (not root, or a root
+    /// that cannot chown) — which is never a pass.
+    ProbeDoorCheck,
     /// Launch a gate for a branch — files or reuses the gate-run
     /// packet, renders the runner Job, and creates it.
     ///
@@ -367,8 +386,9 @@ enum Commands {
         /// --from-car`, or by the arrival rule once the car lands — in
         /// exactly the shape `boss prove` records. Needs --park-expect.
         ///
-        /// WHERE IT RUNS: on the FORGE HOST, as david, in the converged
-        /// checkout (/home/david/boss), with the forge's tools — NOT on
+        /// WHERE IT RUNS: on the FORGE HOST, as the low-privilege account
+        /// boss-probe, in a read-only view of the converged checkout,
+        /// with the forge's tools — NOT on
         /// the machine you are typing on. The forge is outside the
         /// cluster and holds no kubeconfig, so a `kubectl` probe is
         /// correct from the dev pod and unrunnable there (f9304366).
@@ -609,8 +629,10 @@ enum Commands {
     /// where they came from (89d1572c).
     Dispatch {
         /// After reading the whole START: record the declared own-run
-        /// worker receipt. Requires BOSS_AGENT_RUN and your ACTIVE building
-        /// assignment; carries no timestamp, never creates/reassigns a run.
+        /// worker receipt. Requires BOSS_AGENT_RUN and your own building
+        /// assignment: a READY step nominated to you is claimed first (it
+        /// becomes ACTIVE), one nominated to anyone else or to nobody is
+        /// refused. Carries no timestamp, never creates/reassigns a run.
         #[arg(long, conflicts_with_all=["report","from_hook","next","step","model","budget","effort","force"])]
         started: bool,
         /// The hook's door (design 511fa7d4 car 2b): read a Claude Code
@@ -712,6 +734,52 @@ enum Commands {
         /// and say what the rest is in the run's summary.
         #[arg(long, conflicts_with_all = ["report", "next", "from_hook"])]
         force: bool,
+        /// START the harness the step's model names, instead of only
+        /// printing the prompt (backlog 2f7b8c00). The agents registry
+        /// row whose default_model is the model names the actor, and the
+        /// file under infra/platform/harnesses/ that signs as it says
+        /// how it is started. The run is filed under that actor, its
+        /// building step is placed with it, and the process gets a new
+        /// locked worktree, the prompt on stdin, a process group of its
+        /// own, and a CLEARED environment holding the file's pass list,
+        /// that actor as BOSS_ACTOR, the run as BOSS_AGENT_RUN and — when
+        /// the file says home = "own" — an empty HOME made for the
+        /// launch. THIS IS NOT ISOLATION: the process runs as your Unix
+        /// account, so every file you can read (your real home by its
+        /// path, the machine token, another harness's login) it can
+        /// read, and it signs as that actor because it is told to, not
+        /// because anything stops it signing as you. Only a separate
+        /// account would. STOPPING THIS VERB STOPS THE PROCESS: Ctrl-C,
+        /// TERM or HUP stops the launched group and ends the run `died`,
+        /// and a verb that is killed outright takes the one process it
+        /// spawned with it (a parent-death signal) — but not what that
+        /// process started, and it then writes nothing, so the run stays
+        /// `running` until the silence clock ends it. The pid and process
+        /// group are on the run (launch.pid, launch.pgid) and in
+        /// <launch-dir>/pid from the moment the process exists; stop a
+        /// leftover by hand with `kill -TERM -<pgid>`. Start it where
+        /// nothing stops the verb before --launch-minutes. The verb
+        /// stays until the process exits,
+        /// judges it on that exit, stops its whole process group, and
+        /// records what it saw on the run as `launch` — the model its
+        /// transcript names beside the one declared. A process that
+        /// cannot start, exits non-zero, outlives --launch-minutes or
+        /// prints no completed turn ends the run `died`. Refused, before
+        /// anything is claimed, for a harness its own coordinator
+        /// starts, a harness that signs as you, a profile the harness
+        /// declares no sandbox for, and a checkout whose
+        /// infra/platform/harnesses is not origin/main's.
+        #[arg(long, requires = "launch_dir", conflicts_with_all = ["report", "next", "from_hook", "started"])]
+        launch: bool,
+        /// With --launch: a directory that does NOT exist yet. It gets
+        /// the worktree, the prompt, the process's whole stdout and
+        /// stderr, its last message and the receipt.
+        #[arg(long, requires = "launch")]
+        launch_dir: Option<std::path::PathBuf>,
+        /// With --launch: minutes the process may run before it is
+        /// stopped and the run ended `died`.
+        #[arg(long, requires = "launch", default_value_t = 30)]
+        launch_minutes: u64,
     },
     /// Where the IT department's work comes from — the input-channel
     /// mix (user-feedback vs monitoring/error-discovery), the algedonic
@@ -1849,6 +1917,7 @@ async fn main() -> Result<()> {
             dry_run,
         } => ops_request::run(host, verb, args, wait, dry_run).await,
         Commands::Reach { ip, port } => reach::run(&ip, &port),
+        Commands::ProbeDoorCheck => std::process::exit(probe_door_check::run()),
         Commands::Cadence { action } => match action {
             CadenceAction::Retire { name } => cadence::retire(&name).await,
             CadenceAction::Publish { file } => cadence::publish(&file).await,
@@ -1943,6 +2012,9 @@ async fn main() -> Result<()> {
             tenant_branch,
             tenant_sha,
             force,
+            launch,
+            launch_dir,
+            launch_minutes,
             ..
         } => {
             let packet = packet.expect("clap requires a packet without --next");
@@ -1976,7 +2048,22 @@ async fn main() -> Result<()> {
                 )
                 .await
             } else {
-                dispatch::run(packet, step, model, budget, effort, force).await
+                let launch = match (launch, launch_dir) {
+                    (true, Some(dir)) => {
+                        if launch_minutes == 0 {
+                            anyhow::bail!("--launch-minutes must be at least 1");
+                        }
+                        Some(dispatch_launch::Request {
+                            dir,
+                            bound: std::time::Duration::from_secs(launch_minutes * 60),
+                            search_path: std::env::var_os("PATH"),
+                            grace: dispatch_launch::GRACE,
+                            heed_stops: true,
+                        })
+                    }
+                    _ => None,
+                };
+                dispatch::run(packet, step, model, budget, effort, force, launch).await
             }
         }
         Commands::Channels {

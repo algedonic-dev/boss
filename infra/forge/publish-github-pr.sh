@@ -752,7 +752,10 @@ if [ "${1:-}" = "--measure" ]; then
     #    it is held — unlike a publish, which needs open-pr ready. One
     #    mirror, one open packet (the daily rule's guard), so the first
     #    open one is the one.
+    #    Every read in this script carries the machine token as its
+    #    writes do (backlog 44b2087e): four of them did not.
     if ! curl -fsS -H "x-boss-user: $BOSS_USER" \
+            ${MT_HDR:+-H "$MT_HDR"} \
             "$BASE/api/jobs?kind=publish-to-github&status=open&limit=20" > "$workdir/jobs" 2>"$workdir/err"; then
         fail "jobs API unreachable at $BASE — $(cat "$workdir/err")"
     fi
@@ -868,6 +871,7 @@ take_publish_lock refuse BOSS_PUBLISH_LOCK_WAIT
 #    the step this run is for — open-pr for a publish, merge for --merge —
 #    must be ready or active: a rule fired on readiness.
 if ! curl -fsS -H "x-boss-user: $BOSS_USER" \
+        ${MT_HDR:+-H "$MT_HDR"} \
         "$BASE/api/jobs?kind=publish-to-github&status=open&limit=20&full=true" > "$workdir/jobs" 2> "$workdir/err"; then
     fail "jobs API unreachable at $BASE — $(cat "$workdir/err")"
 fi
@@ -882,7 +886,8 @@ SETTLE_CONTAINED=0
 if [ "$MODE" = merge ]; then
     [[ ${OPS_REQUEST_ID:-} =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
         || refuse "OPS_REQUEST_ID ('${OPS_REQUEST_ID:0:40}') names no ops-request, so which publish this merge was filed for cannot be read; nothing was merged"
-    curl -fsS -H "x-boss-user: $BOSS_USER" "$BASE/api/jobs/$OPS_REQUEST_ID" > "$workdir/request" 2> "$workdir/err" \
+    curl -fsS -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} \
+            "$BASE/api/jobs/$OPS_REQUEST_ID" > "$workdir/request" 2> "$workdir/err" \
         || fail "reading request ${OPS_REQUEST_ID:0:8} from $BASE failed — $(head -c 300 "$workdir/err" | tr '\n' ' '); nothing was merged"
     for_publish=$(jq -r '(if type == "object" and has("data") then .data else . end)
         | .metadata.for_publish // empty | strings' "$workdir/request" 2>/dev/null) \
@@ -1896,6 +1901,7 @@ fi
 # filter — a PR or branch only an unread packet recorded is KEPT, and
 # the run says how many packets it did not read.
 curl -fsS -H "x-boss-user: $BOSS_USER" \
+        ${MT_HDR:+-H "$MT_HDR"} \
         "$BASE/api/jobs?kind=publish-to-github&limit=60&full=true" > "$workdir/published" 2>"$workdir/err" \
     || fail "jobs API unreachable at $BASE while reading which packets recorded which PRs — $(cat "$workdir/err"); the PR is open at $pr_url, nothing older was closed and nothing pruned; open-pr on ${job_id:0:8} stays ready"
 jq_doc_file "$workdir/published" \

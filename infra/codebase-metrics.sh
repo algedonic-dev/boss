@@ -688,7 +688,9 @@ api() { # <method> <path> [body]
         rm -f "$bodyfile"
         return $rc
     else
-        "$API_CURL" -fsS -H "x-boss-user: $BOSS_USER" "$BOSS_JOBS_URL$path"
+        # A read carries the token as a write does (backlog 44b2087e).
+        "$API_CURL" -fsS -H "x-boss-user: $BOSS_USER" \
+            ${MT_HDR:+-H "$MT_HDR"} "$BOSS_JOBS_URL$path"
     fi
 }
 

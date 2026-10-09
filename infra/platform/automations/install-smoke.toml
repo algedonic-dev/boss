@@ -1,0 +1,14 @@
+# automation:install-smoke — not in the role-report tally read
+# 2026-10-07T02:13Z (that tally is held in memory and starts again with the
+# pod, so absence there is not absence of the caller); registered from the
+# tree, where every_script_sender_signs_as_a_registered_automation found it.
+# Signs as platform-admin today: infra/install-smoke/nightly.sh.
+# AT THE ROLE IT SIGNS, for the reason on cluster-watchdog.toml: it files a
+# packet (POST /api/jobs). UNCLEAR whether the smoke-tester role would fit;
+# nothing observed says what that role is granted, so it is not guessed
+# here.
+
+[[automation]]
+id = "automation:install-smoke"
+role = "platform-admin"
+description = 'The nightly install smoke: reads the active platform-admins and files a packet when the install fails (infra/install-smoke/nightly.sh).'

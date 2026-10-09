@@ -279,6 +279,20 @@ fn the_secrets_are_derived_from_the_broker_rules_and_nothing_else() {
              {ns}/boss-machine-token, {why}, once: {got:?}"
         );
     }
+    // The probe-reader credential (design b35c22b4, backlog d26515c5):
+    // its two rules are what make the Secret the boss pod already mounts
+    // at /etc/boss/probe-reader come to exist — empty, in the boss
+    // namespace and no other.
+    let reader: Vec<&&str> = got
+        .iter()
+        .filter(|l| l.ends_with("\tboss-probe-reader"))
+        .collect();
+    assert_eq!(
+        reader,
+        vec![&"boss\tboss-probe-reader"],
+        "broker-rotates-the-probe-reader and its advance twin declare boss/boss-probe-reader, \
+         once, and no copy in another namespace: {got:?}"
+    );
     for line in &got {
         let (ns, name) = line.split_once('\t').expect("ns<TAB>name");
         assert!(

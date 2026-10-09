@@ -15,7 +15,7 @@ use boss_nats::NatsEventBus;
 use boss_policy_client::role_reader::{
     HttpRoleReader, MonotonicRoleSnapshotClock, MountedReportMode, SnapshotRoleReader,
 };
-use boss_policy_client::role_reporting::{ReportTally, ReportingPolicyClient};
+use boss_policy_client::role_reporting::ReportingPolicyClient;
 use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -310,6 +310,7 @@ async fn main() -> Result<()> {
             cancel_rx,
             &cfg.http_bind,
             boss_events::outbox::PgOutboxRecorder::shared(&pool),
+            &pool,
         )
         .await;
     }
@@ -360,6 +361,9 @@ async fn run_server<R: JobsRepository + 'static>(
     cancel_rx: watch::Receiver<bool>,
     http_bind: &str,
     gate_recorder: Arc<dyn boss_core::port::EventRecorder>,
+    // The actor-role report states its facts through this pool's outbox
+    // and reads its window back from this pool's audit_log (e0bdba74).
+    role_pool: &sqlx::PgPool,
 ) -> Result<()> {
     // Start axum HTTP server.
     let step_registry = Arc::new(boss_jobs::step_registry::StepRegistry::v1());
@@ -398,9 +402,7 @@ async fn run_server<R: JobsRepository + 'static>(
         std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
         boss_policy_client::User::service("jobs"),
     )?);
-    let role_tally = Arc::new(ReportTally::new(
-        boss_policy_client::role_service::REPORT_CAPACITY,
-    ));
+    let role_tally = boss_events::role_tally::durable("jobs", role_mode.clone(), Some(role_pool));
     let policy: Arc<dyn boss_policy_client::PolicyClient> =
         Arc::new(ReportingPolicyClient::with_mode_source(
             original_policy.clone(),
@@ -648,7 +650,20 @@ async fn run_server<R: JobsRepository + 'static>(
     // this layer must stay OUTSIDE that one. An address no alias maps
     // is admitted and counted (`actor.login.unresolved`) while the
     // migration window is open; the refusal is the next car.
-    let door = Arc::new(boss_jobs::agents::LoginDoor::new(agents, door_publisher));
+    //
+    // THE ROW'S ROLE (backlog 4e51bf23): while the `agent-role` word
+    // says `enforce`, a registered agent's role and tier are its
+    // registry row's and what it asserted is dropped. The word is one
+    // more key of the boss-machine-gate ConfigMap this pod mounts whole;
+    // no key is `off`, which is what this door did before.
+    // The mount and the closure over it are the door's own
+    // (`judging_rows_by_the_mounted_word`), which one test runs
+    // (tests/the_login_door_mounts_the_agent_role_word_the_pod_mounts.rs);
+    // this file's one call is held as text, since no test runs a binary.
+    let door = Arc::new(
+        boss_jobs::agents::LoginDoor::new(agents, door_publisher)
+            .judging_rows_by_the_mounted_word(),
+    );
     let app = app.layer(axum::middleware::from_fn_with_state(
         door,
         boss_jobs::agents::resolve_login,

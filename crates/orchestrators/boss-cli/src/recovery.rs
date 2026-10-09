@@ -2313,6 +2313,179 @@ mod tests {
         assert!(at("cluster-admin") < at("bastion-cluster-credential"));
     }
 
+    /// THE POLICY CHECK'S WAY BACK IS ON THE PAPER (review 4bbb0f93, F2;
+    /// row D of design b08725c2, backlog b8e75382). Its named rollback is
+    /// one word in a ConfigMap, patched by hand over the kube road — and
+    /// until this road the sheet's only rollback was an image roll, which
+    /// does not undo a ConfigMap word: at 3 a.m. the paper led to a
+    /// command that changed nothing. The road prints the patch WHOLE, once
+    /// per instance and once for a day the forge is dark, every value read
+    /// — the ConfigMap, the key and the payload from the line boss.yaml
+    /// carries beside the key (which the manifest's own pin holds to that
+    /// ConfigMap and that key), each namespace from the instance list.
+    #[test]
+    fn the_policy_check_rollback_is_a_road_with_the_patch_whole_for_each_instance() {
+        let r = tree_sheet();
+        let back = road(&r, "policy-check-rollback");
+        let text = |label: &str| match fact(back, label) {
+            Value::Text(t) => t.clone(),
+            other => panic!("{label}: a command is one line, got {other:?}"),
+        };
+        let patch = |ns: &str| {
+            format!(
+                "-n {ns} patch configmap boss-machine-gate --type merge -p \
+                 '{{\"data\":{{\"policy-check\":\"report\"}}}}'"
+            )
+        };
+        let door = "sudo docker run --rm --network host -v /etc/boss-ops/kubeconfig:/kc:ro ";
+        for (label, ns) in [
+            ("On the forge, the operating instance", "boss"),
+            ("On the forge, the playground", "boss-playground"),
+        ] {
+            let line = text(label);
+            assert!(line.starts_with(door), "{label}: {line}");
+            assert!(
+                line.ends_with(&format!(" kubectl --kubeconfig=/kc {}", patch(ns))),
+                "{label}: {line}"
+            );
+        }
+        assert_eq!(
+            text("With the forge dark"),
+            format!(
+                "sudo kubectl --kubeconfig=/etc/boss-ops/kubeconfig {}",
+                patch("boss")
+            )
+        );
+        // The word it sets is a key the manifest really carries.
+        let manifest = std::fs::read_to_string(
+            boss_testing::repo_root().join("infra/cluster/manifests/boss.yaml"),
+        )
+        .expect("boss.yaml");
+        assert!(
+            manifest.lines().any(|l| l.starts_with("  policy-check: ")),
+            "boss.yaml carries the key the patch sets"
+        );
+        // THE HOLD IS A COMMAND, NOT A FILE (review 45ae95c1, F2). It is
+        // the one step whose omission silently undoes the patch at the
+        // next converge, and it was the only step the reader had to
+        // compose: the road printed the script's path and left `sudo`,
+        // the checkout and the verb to memory. The checkout is read from
+        // the unit that runs the converge the hold stops.
+        let hold = "sudo bash /home/david/boss/infra/forge/converge-hold.sh";
+        assert_eq!(
+            text("Then hold the converge"),
+            format!(
+                "{hold} hold 'policy check set back by hand, no converge until the revert lands'"
+            )
+        );
+        assert_eq!(text("Lift the hold"), format!("{hold} release"));
+        let source = |label: &str| {
+            back.lines
+                .iter()
+                .find_map(|l| match l {
+                    LineOut::Fact {
+                        label: l, source, ..
+                    } if l.starts_with(label) => Some(source.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("fact {label:?}"))
+        };
+        assert!(
+            source("Then hold the converge")
+                .contains("checkout=infra/forge/cluster-deploy-runner.service#"),
+            "the checkout is the converge unit's own: {}",
+            source("Then hold the converge")
+        );
+        // THE IMAGE IS READ WHERE THE FORGE RUNS KUBECTL (F1, blocking).
+        // Both forge lines read it from the estate observer's manifest,
+        // a line the estate-observer car moves to a mirror ref by digest:
+        // with both cars on main the WHOLE sheet stopped rendering, and
+        // neither car's own gate could see it.
+        for label in [
+            "On the forge, the operating instance",
+            "On the forge, the playground",
+        ] {
+            let from = source(label);
+            assert!(
+                from.contains("image=infra/forge/cluster-deploy-runner.sh#"),
+                "{label}: {from}"
+            );
+            assert!(
+                !from.contains("boss-estate-observe.yaml"),
+                "{label}: {from}"
+            );
+        }
+        // SUCCESS WITH THE SYSTEM OF RECORD DARK (F4): kubectl's own line
+        // is the first sign, and the read names the service that answers.
+        assert_eq!(
+            text("kubectl answers each patch"),
+            "configmap/boss-machine-gate patched"
+        );
+        assert_eq!(
+            text("Then, within about a minute"),
+            "/api/policy/check/refusals"
+        );
+        assert_eq!(text("That read is answered by the service"), "policy");
+        let prose: String = back
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                LineOut::Prose(p) => Some(p.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(prose.contains("next converge"), "{prose}");
+        assert!(prose.contains("image roll"), "{prose}");
+        // The rehearsal flag is spelled as typed, not described (F3).
+        assert!(prose.contains("--dry-run=server"), "{prose}");
+        // What an unchanged word means on the real patch (5e37d885, N2).
+        assert!(prose.contains("no change"), "{prose}");
+        assert!(prose.contains("HELD"), "{prose}");
+        // It needs the admin credential, so it reads after that road.
+        let at = |id: &str| r.roads.iter().position(|x| x.id == id).unwrap();
+        assert!(at("cluster-admin") < at("policy-check-rollback"));
+    }
+
+    /// THE ROLLBACK ROAD'S IMAGE READ IS PINNED TO ITS LINE (review
+    /// 45ae95c1, F1). Moving the line the forge runs kubectl by fails the
+    /// sheet naming this road and that file; and the estate observer's
+    /// manifest — whose image line the estate-observer car moved — is no
+    /// file this road reads.
+    #[test]
+    fn the_policy_check_rollback_reads_its_image_from_the_line_that_runs_kubectl_on_the_forge() {
+        let runner = "infra/forge/cluster-deploy-runner.sh";
+        let dir = copied_tree("recovery-rollback-image-moved");
+        let path = dir.join(runner);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("\nK=\"sudo docker run "),
+            "{runner} runs kubectl as K"
+        );
+        write_file(
+            &path,
+            &text.replace("\nK=\"sudo docker run ", "\nKC=\"sudo docker run "),
+        );
+        let problems = load(&dir).expect_err("a moved image line must fail the sheet");
+        assert!(
+            problems.iter().any(|p| p.contains("policy-check-rollback")
+                && p.contains(runner)
+                && p.contains("matches nothing")),
+            "{problems:?}"
+        );
+        let observer = "infra/cluster/manifests/boss-estate-observe.yaml";
+        // Asserted on the road's OWN file set, not by rewriting a copy of
+        // the manifest (delta review 5e37d885, N1): that form stood only
+        // while some other road still read the manifest, and went red on
+        // the tree that holds the observer car.
+        let r = tree_sheet();
+        let files = &road(&r, "policy-check-rollback").files;
+        assert!(
+            !files.contains(observer),
+            "the rollback road does not read the observer's manifest: {files:?}"
+        );
+    }
+
     /// Section 5: the break-glass road's dependencies are DERIVED — the
     /// Access application on the whole host, the in-cluster connector,
     /// the plain-HTTP LAN address — and the dev door's too.

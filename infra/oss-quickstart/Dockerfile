@@ -433,11 +433,26 @@ COPY infra/lib/curl-through-a-roll.sh /usr/local/bin/lib/curl-through-a-roll.sh
 # crates/core/boss-testing/tests/secret_header_sh.rs pins this line.
 COPY infra/lib/secret-header.sh /usr/local/bin/lib/secret-header.sh
 COPY infra/lib/jq.sh /usr/local/bin/lib/jq.sh
+# The converge guard the playground crawl's `record` container runs
+# before it tells the browser to start (backlog 37742794): the guard
+# reads the record, so it runs where the machine token is, and that
+# container runs this image rather than a clone. Beside the curl door
+# and lib/ it resolves next to itself. The manifest names this path and
+# says so when an older image has no file there;
+# crates/core/boss-testing/tests/the_playground_crawl_record_takes_its_result_as_data.rs
+# pins the pair.
+COPY infra/wait-out-a-converge.sh /usr/local/bin/wait-out-a-converge.sh
 # The break-glass deposit CronJob's one script (backlog 7336cb5f): it
 # runs as the manifest's `command`, so the name here is the name there;
 # crates/core/boss-testing/tests/break_glass_deposit_sh.rs pins the two
 # equal, because the gate never builds the image.
 COPY infra/cluster/break-glass-deposit.sh /usr/local/bin/boss-break-glass-deposit
+# The machine token push CronJob's one script (backlog 88379df3): the
+# same arrangement — the name here is the name in
+# infra/cluster/manifests/boss-machine-token-push.yaml, and
+# crates/core/boss-testing/tests/machine_token_push_sh.rs pins the two
+# equal, because the gate never builds the image.
+COPY infra/cluster/machine-token-push.sh /usr/local/bin/boss-machine-token-push
 # The platform's conservation-invariant sweep and the helper it sources,
 # for the hourly boss-conservation-invariants CronJob (H12, backlog
 # 236529aa) — the brewery's own sweep rides in with `COPY examples`

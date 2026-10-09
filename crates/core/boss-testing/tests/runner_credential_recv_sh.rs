@@ -606,6 +606,138 @@ fn an_unresolved_transport_value_never_replaces_the_installed_file() {
     assert!(!String::from_utf8_lossy(&output.stdout).contains("fake-sensitive-input"));
 }
 
+/// THE TRANSPORT'S VALUE IS PRESENTED ONLY TO A HOST THE MACHINE TOKEN'S
+/// RULE ADMITS (backlog 50708d76, F2 of review 927f8602). The receiver
+/// made the credential's header with plain `secret_header`, which judges
+/// no host, at both of its presentations; it asks `machine_token_admits`
+/// first now, and a host outside the rule is a refusal with the installed
+/// file unchanged.
+///
+/// Read by EFFECT with the real curl: a loopback listener that either
+/// spelling reaches — `127.1`, which curl expands and the rule withholds,
+/// and a bare `127.0.0.1:<port>`, which has no leading scheme (F1) — must
+/// see NO connection. The control is the same listener and the same input
+/// spelled `http://127.0.0.1:<port>`: the connection arrives carrying the
+/// header, so the silence above is the judgement and not the fixture.
+#[test]
+fn a_transport_value_is_never_presented_to_a_host_the_machine_token_rule_does_not_admit() {
+    use std::io::{BufRead, BufReader};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let root = scratch_dir("off-estate-runner-deposit");
+    let destination = root.join("credential");
+    write_file(&destination, "fake-existing-host-value");
+    let input = serde_json::json!({"version":1,"host":"boss-gcp","credential_id":"ops-runner-credential-boss-gcp","job_id":"00000000-0000-4000-8000-000000000001","attempt":"00000000-0000-4000-8000-000000000002","secret_uid":"00000000-0000-4000-8000-000000000003","value":"fake-sensitive-input-000000000000000000"});
+    let receive = |jobs_url: String| {
+        let mut child = Command::new("bash")
+            .arg(repo_root().join("infra/gcp/runner-credential-recv.sh"))
+            .env("BOSS_RUNNER_CREDENTIAL_FILE", &destination)
+            .env("BOSS_JOBS_URL", jobs_url)
+            .env("BOSS_MACHINE_TOKEN_DIR", root.join("no-machine-token"))
+            .env_remove("BOSS_MACHINE_TOKEN_HOSTS")
+            .env("BOSS_SOR_ENV", root.join("no-sor.env"))
+            .env("BOSS_API_RETRY_DEADLINE", "0")
+            .env_remove("http_proxy")
+            .env_remove("HTTP_PROXY")
+            .env_remove("ALL_PROXY")
+            .env_remove("all_proxy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        feed_stdin(&mut child, input.to_string().as_bytes());
+        child.wait_with_output().unwrap()
+    };
+
+    // A connection that does arrive is counted and closed at once, so a
+    // receiver that presents fails this test rather than hanging it.
+    listener.set_nonblocking(true).unwrap();
+    let arrived = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher = {
+        let (arrived, done) = (arrived.clone(), done.clone());
+        std::thread::spawn(move || {
+            use std::sync::atomic::Ordering::SeqCst;
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        arrived.fetch_add(1, SeqCst);
+                        drop(stream);
+                    }
+                    Err(_) if done.load(SeqCst) => return listener,
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+        })
+    };
+    let mut withheld = Vec::new();
+    for spelled in [format!("http://127.1:{port}"), format!("127.0.0.1:{port}")] {
+        withheld.push((spelled.clone(), receive(spelled)));
+    }
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    let listener = watcher.join().unwrap();
+    for (spelled, output) in withheld {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            arrived.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "[{spelled}] the receiver connected, to present a credential to a host the machine \
+             token's rule does not admit:\n{stderr}"
+        );
+        assert_eq!(output.status.code(), Some(65), "[{spelled}] {stderr}");
+        assert!(
+            stderr.contains("NOT presented") && stderr.contains("BOSS_MACHINE_TOKEN_HOSTS"),
+            "[{spelled}] the refusal names the rule: {stderr}"
+        );
+        assert!(!stderr.contains("fake-sensitive-input"), "{stderr}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("fake-sensitive-input"));
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "fake-existing-host-value",
+            "[{spelled}] the installed credential is unchanged"
+        );
+    }
+
+    // The control: the same listener, the same input, a host the rule
+    // admits — the presentation arrives.
+    listener.set_nonblocking(false).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut presented = false;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if line
+                .to_ascii_lowercase()
+                .starts_with("x-boss-runner-credential:")
+            {
+                presented = line.contains("fake-sensitive-input");
+            }
+        }
+        let body = "{\"resolved\":false}";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+        presented
+    });
+    let output = receive(format!("http://127.0.0.1:{port}"));
+    assert!(
+        server.join().unwrap(),
+        "the control: an admitted host is presented the credential"
+    );
+    assert_eq!(output.status.code(), Some(65));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("NOT presented"));
+}
+
 #[test]
 fn resolver_host_attempt_uid_and_rotation_must_match_the_transport_exactly() {
     use std::io::{BufRead, BufReader};

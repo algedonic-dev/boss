@@ -821,7 +821,7 @@ fn the_units_start_budget_covers_every_bound_it_contains() {
     let ops = read("infra/estate/ops-credentials.sh");
     let curl = read("infra/boss-api-curl.sh");
     assert!(
-        unit.contains("\nExecStartPre=-/home/david/boss/infra/boss-maintenance-wrap.sh "),
+        unit.contains("\nExecStartPre=-/var/lib/boss/tree/current/infra/boss-maintenance-wrap.sh "),
         "the budget below counts the wrap; if it went, recount"
     );
     let wrap = num_after(&curl, "${BOSS_API_RETRY_DEADLINE:-");
@@ -843,5 +843,112 @@ fn the_units_start_budget_covers_every_bound_it_contains() {
          (wrap {wrap} + health {health} + pull {pull} + read {read_t} + patch {patch} \
          + rollout {rollout} + door {door}) and the failing rollback's alert needs room",
         minutes * 60
+    );
+}
+
+/// THE STAMP IS ANOTHER ACCOUNT'S FILE, READ AS DATA (backlog a604a35b).
+/// The watchdog runs as root; the stamp is written by the cluster
+/// converge as the checkout's owner, who can repoint the name at
+/// anything root can read. In the dark, past the limit, with the read
+/// working: a stamp that is not a build name rolls NOTHING, the run asks
+/// for hands, and the bytes found reach neither the journal, the patch,
+/// the packet nor the alert that is kept.
+#[test]
+fn a_stamp_that_is_not_a_build_name_rolls_nothing_and_is_never_printed() {
+    for (tag, body) in [
+        ("words", "SECRET-LOOKING-BYTES-not-a-build\n"),
+        ("long-hex", "0123456789abcdef0123456789abcdef01234567\n"),
+        ("injection", "abc1234\",\"x\":\"y\n"),
+    ] {
+        let f = Forge::new(&format!("watchdog-stamp-{tag}"));
+        write_file(&f.dir.join("stamp"), body);
+        let o = f.run_with(
+            "infra/forge/cluster-watchdog.sh",
+            "answer",
+            &[],
+            &dark_past_the_limit(),
+        );
+        let t = text(&o);
+        assert_eq!(
+            o.status.code(),
+            Some(1),
+            "{tag}: hands needed is a failed run: {t}"
+        );
+        let argv = f.argv();
+        assert!(
+            !argv.contains(" patch deploy boss "),
+            "{tag}: nothing may be rolled to a stamp that is not a build name: {argv}"
+        );
+        let first = body.lines().next().unwrap();
+        let alerts = f.spooled().join("\n");
+        for (place, said) in [
+            ("the journal", &t),
+            ("the kubectl argv", &argv),
+            ("the kept alert", &alerts),
+        ] {
+            assert!(
+                !said.contains(first),
+                "{tag}: the stamp's bytes reached {place}: {said}"
+            );
+        }
+        assert!(t.contains("does not hold a build name"), "{tag}: {t}");
+        assert!(
+            f.summary()["stamp"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("UNUSABLE"),
+            "{tag}: {}",
+            f.summary()
+        );
+    }
+}
+
+/// THE STAMP'S PATH IS NOT OPENED UNLESS IT IS A FILE OF ITS OWN (review
+/// 5f3736a2, F6). The name is another account's to make: a symlink made
+/// root open whatever it pointed at — a device node, a secret — and a
+/// FIFO cost each tick its read bound. A symlink to a file holding a
+/// perfectly good build name is the sharpest case, because the shape
+/// check passes it: it must roll nothing all the same. So must a
+/// directory standing at the name.
+#[test]
+fn a_stamp_that_is_not_a_regular_file_of_its_own_is_never_opened() {
+    let f = Forge::new("watchdog-stamp-symlink");
+    std::fs::remove_file(f.dir.join("stamp")).unwrap();
+    write_file(&f.dir.join("elsewhere"), "def5678\n");
+    std::os::unix::fs::symlink(f.dir.join("elsewhere"), f.dir.join("stamp")).unwrap();
+    let o = f.run_with(
+        "infra/forge/cluster-watchdog.sh",
+        "answer",
+        &[],
+        &dark_past_the_limit(),
+    );
+    let t = text(&o);
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "a symlinked stamp is no stamp — hands: {t}"
+    );
+    assert!(
+        !f.argv().contains(" patch deploy boss "),
+        "the watchdog rolled to what a symlink pointed at: {}",
+        f.argv()
+    );
+    assert!(!t.contains("def5678"), "{t}");
+    assert!(t.contains("is not a regular file of its own"), "{t}");
+
+    let d = Forge::new("watchdog-stamp-directory");
+    std::fs::remove_file(d.dir.join("stamp")).unwrap();
+    std::fs::create_dir(d.dir.join("stamp")).unwrap();
+    let o = d.run_with(
+        "infra/forge/cluster-watchdog.sh",
+        "answer",
+        &[],
+        &dark_past_the_limit(),
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    assert!(
+        text(&o).contains("is not a regular file of its own"),
+        "{}",
+        text(&o)
     );
 }

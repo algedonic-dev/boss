@@ -166,11 +166,25 @@ No ssh from the pod. Three doors, all read-only:
   `--check` validates with no network), and `run-car-probe <car-uuid>`
   (the machine half of `boss prove`: runs the probe a landed car
   recorded at park time — `boss gate --park-probe/--park-expect` — as
-  david, never root, and completes the car's `proven` step with the
-  proof record or stamps `proof_attempt`; filed per car by the
-  dispatcher when its train arrives). **The probe was written on the
-  dev pod and runs HERE**, in `/home/david/boss` with this host's
-  tools: no kubectl, no kubeconfig, the cluster only over HTTP. A
+  `boss-probe`, never root and never david, and completes the car's
+  `proven` step with the proof record or stamps `proof_attempt`; filed
+  per car by the dispatcher when its train arrives). **The probe was
+  written on the dev pod and runs HERE**, in `/var/lib/boss/probe-view`
+  — a root-owned, read-only clone that follows `/home/david/boss` on
+  every runner tick — with this host's tools: no kubectl, no kubeconfig,
+  the cluster only over HTTP. `boss-probe` has no sudo, no docker and no
+  group but its own; `infra/forge/probe-account.sh` makes it on every
+  converge and verifies it again ahead of every runner tick. **If it
+  does not verify, no probe runs on this host** — never as david — and
+  each car records did-not-run with the cause, retried hourly; the
+  converge packet says why under `probe_account` (`STOPPED: …`) and the
+  next converge repairs what it can (decision c98c79aa). `boss ops
+  forge probe-account-controls` runs the controls that prove the
+  account on this host (backlog 703358ce). `boss ops forge
+  probe-door-check` checks, as root and by what it then finds on disk,
+  that the reader door's socket hand-over to that account holds on this
+  host — it reads no credential, and it is run BEFORE any reader
+  credential is deposited here (backlog e65dde24). A
   probe that needs a tool this host lacks is refused at `boss gate`
   against `infra/forge/host-absent-tools.txt`; one that slips through
   is recorded as `proof_attempt.unrunnable` with the tool named and
@@ -497,6 +511,158 @@ started now ends on that packet: `converge_failed: <stage> (exit N)`
 on the request's metadata, beside the maintenance packet's
 *Maintenance failed*. A request whose run was already active when it
 arrived is answered by the next run, usually `converged: <sha>`.
+
+### 9. Root's tree does not move, or a generation cannot converge
+
+Since backlog a604a35b root runs the forge converge, the backup, the CI
+reaper, both observers and the cluster watchdog from
+`/var/lib/boss/tree/current` — a tree root fetched from the forge's own
+repository (`infra/forge/root-tree.sh`) — and not from
+`/home/david/boss`. The cluster converge, the disk sweep and the ops
+runner's verbs still run from the checkout; each is a row of
+`no_unattended_unit_runs_from_a_home.rs` or said in `install.sh`.
+
+What to read, all through existing doors:
+
+- `boss ops forge root-tree-status` — the commits `current`, `previous`
+  and `good` name, the tree's owner and mode, the uid that owns the
+  forge's repository, and the owner and mode of the compose file (and
+  its directory) that path is derived from. **Read those uids against
+  the checkout owner's in the first hour**: an account that owns the
+  repository can advance `refs/heads/main` in it without a PR, and an
+  account that can write the compose file chooses which repository root
+  fetches. Either one being the checkout owner's means that account
+  still decides what root runs.
+- The newest `maintenance-forge-converge` packet: `root_tree` is the
+  refresh's own last line (`current moved a -> b`, `current is at … already`,
+  or `FAILED:` / `REFUSED:` with `current stays at …`), `runs_from` is
+  the generation the rest of that run executed from, `units_held` names
+  a command a unit needed that was not there (and `summary` then starts
+  `HELD`).
+- `boss ops forge journal-tail forge-converge` — every run from the new
+  unit starts with one `forge-converge-launch:` line. `running current
+  (…) — it is the good generation` is the steady state. **Root is still
+  running the checkout's converge** when that line reads `running the
+  checkout's copy at /home/david/boss/… — BOOTSTRAP`, or when a run has
+  no `forge-converge-launch:` line at all (the old unit is still the
+  one loaded).
+- `boss ops forge unit-status cluster-watchdog` (and `forge-converge`) —
+  what systemd LOADED and last ran: the `Loaded:` path, and the
+  `Process:` lines with the command each Exec line actually started.
+  `unit-cat` prints the files on disk, which is not the same thing
+  between an install and its daemon-reload; when the two differ
+  `unit-cat` carries systemd's own `changed on disk` warning.
+
+The three ways it shows:
+
+- **`REFUSED: … NOT a descendant`** (exit 3, the run red). The forge's
+  main rewound or was replaced — the 2026-09-25 shape. The tree stays
+  where it was and every unit keeps running that commit. Read both
+  commits; if the new one is the truth, as root on the host:
+  `/var/lib/boss/tree/current/infra/forge/root-tree.sh refresh --accept-rewind <full sha>`.
+- **`FAILED: fetching …`**. The forge's repository could not be read as
+  its owner. The tree stays; nothing new installs until it can. The
+  line carries git's own words.
+- **A generation that cannot converge.** The launcher gives the newest
+  generation two tries; after that every other tick runs the last
+  generation that completed a refresh (`good`), whose own refresh fetches
+  the fix once main carries it. So the repair is a car, as for any other
+  defect. `current … has run N time(s) without marking itself good` in
+  the journal is the symptom.
+
+**Going back, in this order.** The target is always a NAMED commit:
+the revert of the car on forge main. Write its full sha down first
+(`git ls-remote` of the forge, or the merged PR); every step below is
+checked against it.
+
+1. **Merge the revert. That alone is the rollback.** The tree accepts
+   the revert as a generation (it carries the converge and the
+   installer, which is all a generation needs). On the tick that fetches
+   it, the car's converge runs that generation's installer — the
+   pre-car one — which puts every pre-car unit file back; the next tick
+   is the old unit running the checkout's converge. One thing the
+   pre-car installer gets wrong from where it stands: it points the ops
+   runner's ExecStart at `/var/lib/boss/tree/gen/<revert>/infra/ops/ops-runner.sh`,
+   an export with no `.git`, where the publish, merge and tag verbs
+   fail. The car's converge names the checkout again in the same run
+   (`ops_runner_repointed` on that packet), so that start line stands
+   for the seconds between two daemon-reloads, not for a tick; a runner
+   tick that lands in them runs from the export once.
+2. **Only if the tree's converge cannot run at all** (no
+   `forge-converge-launch:` line reaches `install.sh`, tick after tick,
+   with the revert already on main): as root on the host, with the
+   checkout AT THE REVERT — `git -C /home/david/boss rev-parse HEAD`
+   prints the sha you wrote down; the cluster converge checks it out a
+   minute or two after the merge — run
+   `/home/david/boss/infra/forge/install.sh`. **Without the revert on
+   main a hand install is undone at the next tick**: the unit it
+   reinstalls runs the checkout's converge, which fetches main, checks
+   it out, and runs the car's installer — which brings the tree and
+   cuts over again. A hand install from an older checkout is not a
+   rollback; it is ten minutes.
+3. **What to hold meanwhile.** `boss ops forge hold-converge <reason>` holds the
+   CLUSTER converge: main is not built or rolled while the host's own
+   repair loop is in question, and `release-converge` lifts it. It does
+   not stop `forge-converge`, which has no hold; for the hand path
+   alone, stop its timer first (`systemctl stop forge-converge.timer`,
+   as root) and start it again after the install.
+4. **Reading that it worked.** `unit-status forge-converge`: `Loaded:`
+   and the `Process:` line name `/home/david/boss/infra/forge/forge-converge.sh`.
+   `journal-tail forge-converge`: the newest run has no
+   `forge-converge-launch:` line. The newest `maintenance-forge-converge`
+   packet carries `converge_sha` = the revert and no `root_tree` field.
+   `unit-cat boss-ops-runner`: the drop-in's ExecStart is
+   `/home/david/boss/infra/ops/ops-runner.sh`. `/var/lib/boss/tree` is
+   left in place and unused.
+
+Before any generation has ever been `good`, the launcher also runs the
+checkout's copy every other tick, so a first cutover that cannot run
+from the tree keeps converging the old way without any of the above.
+
+### A converge that refuses its own host
+
+Since backlog 62b09c57 every script that installs or converges a host
+as root asks which machine it is on first (`infra/lib/host-check.sh`:
+the converge, `install.sh`, `root-tree.sh refresh`, the probe account's
+`ensure`, the two deposits and the ops runner's installer here;
+`boss-gcp-converge.sh`, `install-units.sh` and the credential
+receiver's installer on boss-gcp). On the host the answer is one line
+of the run's packet — `host_check: forge: this machine holds <address>,
+which …/estate.toml declares for it` — and nothing else changes.
+
+It refuses when this machine does not hold an address `infra/estate/
+estate.toml` declares for the node: the forge's `[[node]]` row, or for
+boss-gcp its line under `[host_identity]` (the WireGuard hub address;
+its row carries the translated public one, which no interface holds).
+That is what stops a fixture or a mistaken shell installing a host onto
+another machine, as happened to the dev pod on 2026-10-07. It can also
+be WRONG ABOUT THE HOST — a forge rebuilt at another address, a hub
+address that moved, an estate edit that landed ahead of the machine —
+and then:
+
+- **What it looks like.** `maintenance-forge-converge` (or
+  `maintenance-boss-gcp-converge`) fails every tick with exit status 78,
+  and its packet's `host_check` reads `REFUSED: this machine is not the
+  estate's <node> — it holds [...] and … declares [...] for <node>`.
+  Both lists are in that line: the fault is whichever one is wrong.
+  Nothing was fetched, installed or deposited on that tick, and the
+  units already installed keep running as they were.
+- **Why a merge does not fix it by itself.** A refused converge fetches
+  nothing, so a corrected `estate.toml` on main does not reach the host
+  on its own. The loop stays stopped until one run is let through.
+- **Letting one run through, as root on the host, once.** On the forge:
+  `BOSS_FIRST_INSTALL_AS=forge /usr/local/libexec/boss/forge-converge-launch`.
+  On boss-gcp: `BOSS_FIRST_INSTALL_AS=boss-gcp /opt/boss/infra/gcp/boss-gcp-converge.sh`.
+  The variable is honoured only for the node the script installs, is
+  printed on the run's first lines as `HOST CHECK OVERRIDDEN`, and that
+  run converges the host on main — including the corrected estate file,
+  so the next unattended tick passes on its own. If main does not carry
+  the correction yet, the next tick refuses again: the override is one
+  run, never a setting.
+- **A first install on a new host** is the same variable, for the same
+  reason: `sudo BOSS_FIRST_INSTALL_AS=forge infra/forge/install.sh`
+  from the checkout. A forge rebuilt AT the declared address needs
+  nothing.
 
 ## Residue (measured 2026-09-05)
 

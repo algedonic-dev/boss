@@ -287,12 +287,48 @@ pub(crate) fn pinned_skew_refusal(job: &Value, step: &Value, row: &Value) -> Opt
 
 /// The refusal a step with no block gets: it names the fix, in the
 /// row's own syntax.
-pub(crate) fn no_block_refusal(kind: &str, slug: &str) -> String {
+///
+/// The fix used to end in `boss workflow publish {kind}` for every kind —
+/// the one door a hold does not bind, named by a machine for a kind that
+/// may be held out of the publish (review 8d088b41 of car 052016d7,
+/// finding F4). So the publish is named ONLY when the tree's holds were
+/// read and say the kind is open; held, unreadable and not read each
+/// name the row and say why no publish follows.
+pub(crate) fn no_block_refusal_in(repo: &Path, kind: &str, slug: &str) -> String {
+    no_block_refusal(
+        kind,
+        slug,
+        crate::workflow::drift_hold_in(repo, kind).as_ref(),
+    )
+}
+
+/// [`no_block_refusal_in`]'s wording, over an answer already in hand.
+pub(crate) fn no_block_refusal(
+    kind: &str,
+    slug: &str,
+    hold: Option<&crate::workflow::DriftHold>,
+) -> String {
+    use crate::workflow::DriftHold;
+    let then = match hold {
+        Some(DriftHold::Open) => format!(", then `boss workflow publish {kind}`)"),
+        Some(DriftHold::Held(source, why, lifts)) => format!(
+            ") — and no publish from here: {kind} is HELD out of the publish ({source}): {why} \
+             A held row goes live at a person's deliberate publish; what lifts the hold: {lifts}"
+        ),
+        Some(DriftHold::Unreadable(said)) => format!(
+            ") — and no publish is named here: whether {kind} is held out of the publish could \
+             not be read ({said})"
+        ),
+        None => format!(
+            ") — and no publish is named here: whether {kind} is held out of the publish was not \
+             read (this checkout carries no infra/gcp/workflow-holds.py)"
+        ),
+    };
     format!(
         "step `{slug}` of {kind} declares no agent block, so nothing says which model, at \
          what effort, under what spend — add `agent = {{ profile = \"builder\", model = \
          \"opus-5[1m]\", budget_usd = 5, effort = \"high\" }}` to that step in its Workflow \
-         row (infra/platform/workflows/{kind}.toml, then `boss workflow publish {kind}`)"
+         row (infra/platform/workflows/{kind}.toml{then}"
     )
 }
 
@@ -1161,6 +1197,13 @@ pub(crate) struct Dispatched {
     /// `None` when the lane would not read, and the hook then leaves
     /// the call's own.
     pub isolation: Option<Isolation>,
+    /// Who the run's `building` step was placed with, when this dispatch
+    /// placed it (backlog 2f7b8c00).
+    pub building_assignee: Option<String>,
+    /// The settings the run was filed with.
+    pub settings: Settings,
+    /// The launch planned for it, when one was asked for.
+    pub plan: Option<Box<crate::dispatch_launch::Plan>>,
 }
 
 /// The cars that name this packet as the item they build — narrowed at
@@ -1328,6 +1371,33 @@ pub(crate) async fn dispatch_at(
     repo: &Path,
     packet_ref: &str,
     step_slug: Option<&str>,
+    station: Option<&str>,
+    over: &Overrides,
+    force: bool,
+    actor: &str,
+    owner: &str,
+    host: &str,
+    source: BriefSource<'_>,
+) -> Result<Dispatched> {
+    dispatch_to(
+        http, base, repo, packet_ref, step_slug, station, over, force, actor, owner, host, source,
+        None,
+    )
+    .await
+}
+
+/// [`dispatch_at`], and — when `launch` is given — for the harness the
+/// step's model names rather than for the dispatching actor's own
+/// (backlog 2f7b8c00; `crate::dispatch_launch`). The launch is PLANNED
+/// here, before the claim, and the run is filed under the harness's
+/// actor; starting the process is the caller's next act.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dispatch_to(
+    http: &boss_core::machine_token::Client,
+    base: &str,
+    repo: &Path,
+    packet_ref: &str,
+    step_slug: Option<&str>,
     // The station the claim PULLS FROM, when this dispatch came out
     // of a queue (`--next`). Named on the claim, so the door checks
     // membership and capability against the queue the work was taken
@@ -1343,6 +1413,7 @@ pub(crate) async fn dispatch_at(
     owner: &str,
     host: &str,
     source: BriefSource<'_>,
+    launch: Option<&crate::dispatch_launch::Request>,
 ) -> Result<Dispatched> {
     use reqwest::Method;
 
@@ -1472,7 +1543,7 @@ pub(crate) async fn dispatch_at(
                 let why = row
                     .as_ref()
                     .and_then(|r| pinned_skew_refusal(&job, step, r))
-                    .unwrap_or_else(|| no_block_refusal(&kind, &slug));
+                    .unwrap_or_else(|| no_block_refusal_in(repo, &kind, &slug));
                 anyhow::anyhow!("{why}")
             })?;
             (block, row)
@@ -1504,6 +1575,20 @@ pub(crate) async fn dispatch_at(
         profile: venue.profile.clone(),
         ..settings
     };
+
+    // THE LAUNCH IS PLANNED BEFORE THE CLAIM (2f7b8c00): which harness
+    // runs this model, whether `boss` can start it, whether it has a
+    // sandbox for this profile, whether its executable is here. Each is
+    // a refusal while nothing is claimed or filed.
+    let plan = match launch {
+        Some(request) => Some(Box::new(
+            crate::dispatch_launch::plan_at(http, base, repo, actor, &settings, request).await?,
+        )),
+        None => None,
+    };
+    // WHO THE RUN SIGNS AS: the harness's own actor when one is launched
+    // for it, else the actor running this verb, as before.
+    let run_agent = plan.as_ref().map_or(actor, |p| p.harness.actor.as_str());
 
     // CLAIM FIRST. A step someone else holds is a refusal naming the
     // holder, and it must come before anything is filed. The ONE door:
@@ -1565,7 +1650,13 @@ pub(crate) async fn dispatch_at(
         BriefSource::Handed { prompt, .. } => prompt.to_string(),
     };
 
-    let mut body = run_body(&id, &title, &slug, actor, &settings, host, &brief, owner);
+    let mut body = run_body(
+        &id, &title, &slug, run_agent, &settings, host, &brief, owner,
+    );
+    if let Some(p) = &plan {
+        body["metadata"]["harness"] = json!(p.harness.id);
+        body["metadata"]["dispatched_by"] = json!(actor);
+    }
     // A TENANT RUN SAYS SO ON ITS OWN PACKET (6a34e9bc): the repo and the
     // ref it branched from, as the instance declares them. `--report`
     // reads `tenant_repo` to know the run lands on a copied check rather
@@ -1637,6 +1728,62 @@ pub(crate) async fn dispatch_at(
         .context("the briefed step has no id")?
         .to_string();
 
+    // THE RUN'S BUILDING BELONGS TO THE RUN'S AGENT (2f7b8c00). Placed
+    // now, while `building` is still PENDING behind `briefed`, so it is
+    // born placed and no lane of the dispatcher service picks for it.
+    let nominee = match &plan {
+        Some(p) => Some(p.harness.actor.clone()),
+        // A miss is SAID (review f7f0b689, N4): the outcome is the old
+        // one, the dispatcher service nominating, and a session that
+        // then finds its Building with another actor is owed the reason.
+        None => {
+            let named = crate::dispatch_launch::agents_at(http, base, actor)
+                .await
+                .map_err(|e| format!("the agents registry could not be read ({e:#})"))
+                .and_then(|agents| {
+                    resolve_agent(&agents, actor).ok_or_else(|| {
+                        format!("the agents registry names no single row for {actor}")
+                    })
+                });
+            match named {
+                Ok(id) => Some(id),
+                Err(why) => {
+                    eprintln!(
+                        "boss dispatch: run {}'s building step is not placed by this verb — \
+                         {why}; the dispatcher service nominates it, as before",
+                        &run_id[..8.min(run_id.len())]
+                    );
+                    None
+                }
+            }
+        }
+    };
+    let building_assignee = match nominee {
+        Some(nominee) => {
+            match nominate_building(&api_at, &run_id, &run, &nominee).await {
+                Ok(()) => Some(nominee),
+                // A launch must not start a process whose run is not its
+                // own; a printed prompt goes on as it always did.
+                Err(e) if plan.is_some() => {
+                    return Err(e.context(format!(
+                        "run {} is filed and `{slug}` is claimed, and its building step could \
+                         not be placed with {nominee} — nothing was launched",
+                        &run_id[..8.min(run_id.len())]
+                    )));
+                }
+                Err(e) => {
+                    eprintln!(
+                        "boss dispatch: run {}'s building step was not placed with {nominee} \
+                         ({e:#}) — the dispatcher service nominates it, as before",
+                        &run_id[..8.min(run_id.len())]
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
     // Read, never fatal: a lane that will not read has already been
     // refused by the rendered brief, and a handed prompt's dispatch is
     // not stopped over a control the caller can still set by hand.
@@ -1644,7 +1791,7 @@ pub(crate) async fn dispatch_at(
     let mut prompt = format!("{brief}\n{}", run_section(&run_id, &settings, isolation));
     if crate::dispatch_started::expectation(&run).is_some() {
         prompt.push_str(&format!(
-            "\nWorker receipt: after reading this ENTIRE START, and once your own run's building step is ACTIVE and assigned to your running actor, run `BOSS_AGENT_RUN={run_id} boss dispatch {run_id} --started`. This records the own-run receipt through the audited metadata merge door. It carries no timestamp and claims neither physical execution nor delivery. A coordinator claim, host or session cannot substitute; if your assignment is not ACTIVE, report that blocker to the coordinator. Only this newly admitted declaration opts in; never repin an older run to add it.\n"
+            "\nWorker receipt: after reading this ENTIRE START, run `BOSS_AGENT_RUN={run_id} boss dispatch {run_id} --started`. When your own run's building step is READY and assigned to your running actor, the command first takes it through the claim door, which makes it ACTIVE; it then records the own-run receipt through the audited metadata merge door. It carries no timestamp and claims neither physical execution nor delivery. A coordinator claim, host or session cannot substitute; if the command refuses because the step is assigned to another actor or to nobody, report that blocker to the coordinator and claim nothing. Only this newly admitted declaration opts in; never repin an older run to add it.\n"
         ));
     }
     if matches!(source, BriefSource::Rendered) {
@@ -1713,7 +1860,7 @@ pub(crate) async fn dispatch_at(
     .context("completing the run's briefed step")?;
     eprintln!(
         "boss dispatch: run {} open for `{slug}` on {} — {} bytes of prompt printed, \
-         building as {actor} on {host}",
+         building as {run_agent} on {host}",
         &run_id[..8.min(run_id.len())],
         &id[..8],
         prompt.len()
@@ -1723,7 +1870,86 @@ pub(crate) async fn dispatch_at(
         prompt,
         subagent_type: definition_in(repo, &settings),
         isolation,
+        building_assignee,
+        settings,
+        plan,
     })
+}
+
+/// Place a run's `building` step with `nominee` through the step PUT's
+/// assignee-only body, and read it back.
+///
+/// WHY THE VERB DOES IT (backlog 2f7b8c00; the item's notes of
+/// 2026-10-04). `agent-run`'s Building declares an authority role and no
+/// model, so the dispatcher service's capability pick cannot see it and
+/// its env-executor lane nominated EVERY run's Building to the one
+/// configured executor, whoever the run belonged to: each Codex run
+/// opened assigned to agent-claude and needed a hand's assignee PUT. The
+/// env lane is right for the other model-less steps that depend on it
+/// and is left alone; what was wrong is that a run's Building reached it
+/// at all. A step that arrives with an assignee is never re-routed
+/// (`born_placed` in the dispatcher), and a PENDING step may be placed,
+/// so the run's own `agent` is written here before `briefed` completes
+/// and opens it. The id is the REGISTERED one: the step PUT stores the
+/// body as spelled, and the claim compares against the registered id.
+///
+/// A Building already open and placed elsewhere is left as it is — that
+/// is a nomination someone made, and moving it is `boss step nominate`'s
+/// act, with a reason.
+async fn nominate_building<F, Fut>(
+    api_at: &F,
+    run_id: &str,
+    run: &Value,
+    nominee: &str,
+) -> Result<()>
+where
+    F: Fn(reqwest::Method, String, Option<Value>) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Value>>>,
+{
+    let building = |job: &Value| {
+        crate::envelope::steps(job)
+            .into_iter()
+            .find(|s| s.get("spec_slug").and_then(Value::as_str) == Some(BUILDING_SLUG))
+            .cloned()
+    };
+    let step =
+        building(run).with_context(|| format!("run {run_id} has no `{BUILDING_SLUG}` step"))?;
+    let holder = |s: &Value| {
+        s.get("assignee_id")
+            .and_then(Value::as_str)
+            .filter(|h| !h.trim().is_empty())
+            .map(str::to_string)
+    };
+    if holder(&step).as_deref() == Some(nominee) {
+        return Ok(());
+    }
+    let status = step.get("status").and_then(Value::as_str).unwrap_or("?");
+    if status != "pending" {
+        bail!(
+            "`{BUILDING_SLUG}` is already {status} and held by {}",
+            holder(&step).unwrap_or_else(|| "nobody".into())
+        );
+    }
+    let sid = step
+        .get("id")
+        .and_then(Value::as_str)
+        .context("the building step has no id")?;
+    api_at(
+        reqwest::Method::PUT,
+        format!("/api/jobs/{run_id}/steps/{sid}"),
+        Some(json!({ "assignee_id": nominee })),
+    )
+    .await?;
+    let after = api_at(reqwest::Method::GET, format!("/api/jobs/{run_id}"), None)
+        .await?
+        .context("the run read returned no body")?;
+    match building(&after).as_ref().and_then(holder) {
+        Some(h) if h == nominee => Ok(()),
+        other => bail!(
+            "the assignment answered success and `{BUILDING_SLUG}` reads back held by {}",
+            other.unwrap_or_else(|| "nobody".into())
+        ),
+    }
 }
 
 /// Is this refused write the step race — the one refusal a status-only
@@ -2059,6 +2285,30 @@ pub(crate) fn report_patch(r: &Report) -> Value {
     Value::Object(md)
 }
 
+/// The run packet key the report writes [`model_observed`] under.
+pub(crate) const MODEL_OBSERVED_KEY: &str = "model_observed";
+
+/// The declared model and the observed one, as two facts and a sentence.
+/// `observed` is what the metered transcript's billed turns name, and
+/// `null` when the run was not metered or its transcript names none —
+/// it has no other source, so a declaration can never arrive in it.
+pub(crate) fn model_observed(run: &Value, r: &Report) -> Value {
+    let declared = run
+        .pointer("/metadata/model")
+        .and_then(Value::as_str)
+        .unwrap_or("nothing");
+    let observed = r.meter.as_ref().and_then(|m| m.models.recorded());
+    let why = match &r.meter {
+        None => "the run was not metered: no transcript was read",
+        Some(_) => "its transcript names no model on a billed turn of this run",
+    };
+    json!({
+        "declared": declared,
+        "observed": observed,
+        "says": crate::dispatch_launch::model_line(declared, observed.as_deref(), Some(why)),
+    })
+}
+
 /// The `reported` completion's fields, for the step merge door: the
 /// step's three declared fields (`summary` required; `spend_usd` and
 /// `tokens` are string fields on the row) and nothing else — the door
@@ -2082,15 +2332,21 @@ pub(crate) fn reported_writes(r: &Report) -> Value {
 /// name its CPU, and the refusal says how to register one.
 pub(crate) fn resolve_agent(agents: &[Value], login: &str) -> Option<String> {
     let id_of = |a: &Value| a.get("id").and_then(Value::as_str).map(str::to_string);
-    agents
-        .iter()
-        .find(|a| {
-            id_of(a).as_deref() == Some(login)
-                || a.get("aliases")
-                    .and_then(Value::as_array)
-                    .is_some_and(|al| al.iter().any(|x| x.as_str() == Some(login)))
-        })
-        .and_then(id_of)
+    // EXACTLY ONE (review f7f0b689, N3). This took the first row an alias
+    // matched, so one alias on two rows resolved to whichever sorted
+    // first and a run's Building was placed with it. Two rows naming one
+    // login name nobody; `--started` already demanded one.
+    let mut named = agents.iter().filter(|a| {
+        id_of(a).as_deref() == Some(login)
+            || a.get("aliases")
+                .and_then(Value::as_array)
+                .is_some_and(|al| al.iter().any(|x| x.as_str() == Some(login)))
+    });
+    let first = named.next()?;
+    match named.next() {
+        Some(_) => None,
+        None => id_of(first),
+    }
 }
 
 /// The step whose `result` says which terminal the run reached.
@@ -2347,6 +2603,94 @@ pub(crate) async fn transcript_slice_at(
     ))
 }
 
+/// Where a run's transcript is, as the record says it: the path its
+/// launcher wrote (`launch.transcript`), and the layout of the harness
+/// its `agent` signs for. The second is `Err` with the reason when the
+/// run, the registry or the roster cannot name one.
+pub(crate) async fn transcript_source_at(
+    http: &boss_core::machine_token::Client,
+    base: &str,
+    actor: &str,
+    run_id: &str,
+    // This process's environment, read at the CLI boundary.
+    env: &(dyn Fn(&str) -> Option<std::ffi::OsString> + Sync),
+) -> (
+    Option<std::path::PathBuf>,
+    std::result::Result<crate::transcript_usage::Layout, String>,
+) {
+    let run = crate::gate::api_at_signed(
+        http,
+        base,
+        reqwest::Method::GET,
+        &format!("/api/jobs/{run_id}"),
+        None,
+        crate::identity::Signature::As(actor.to_string()),
+    )
+    .await
+    .ok()
+    .flatten();
+    let recorded = run
+        .as_ref()
+        .and_then(|r| {
+            r.pointer(&format!(
+                "/metadata/{}/transcript",
+                crate::dispatch_launch::RECEIPT_KEY
+            ))
+        })
+        .and_then(Value::as_str)
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from);
+    let layout = async {
+        let agent = run
+            .as_ref()
+            .and_then(|r| r.pointer("/metadata/agent"))
+            .and_then(Value::as_str)
+            .ok_or("the run names no agent, so no harness is named for its transcript")?
+            .to_string();
+        let agents = crate::dispatch_launch::agents_at(http, base, actor)
+            .await
+            .map_err(|e| format!("the agents registry could not be read ({e:#})"))?;
+        let id = resolve_agent(&agents, &agent)
+            .ok_or_else(|| format!("no agents registry row names {agent}"))?;
+        let harnesses =
+            crate::harness::read_for_the_verb(crate::brief::repo_root().ok().as_deref())
+                .map_err(|e| format!("{e:#}"))?;
+        let harness = harnesses.iter().find(|h| h.actor == id).ok_or_else(|| {
+            format!(
+                "no file under {} signs as {id}, so nothing says where its transcripts land",
+                crate::harness::DIR
+            )
+        })?;
+        crate::transcript_usage::Layout::of(harness, env).ok_or_else(|| {
+            format!(
+                "neither {} nor HOME is set, so harness {}'s transcripts cannot be found",
+                harness.transcript.home_env, harness.id
+            )
+        })
+    }
+    .await;
+    // BELIEVED ONLY UNDER THE HARNESS'S OWN HOME (review f7f0b689, N7).
+    // The path comes from packet metadata, which any hand with the
+    // metadata door can write; the run marker already keeps another
+    // file's turns out of the count, and this keeps the read itself
+    // inside the one directory a transcript of this run can be in.
+    let recorded = recorded.filter(|path| {
+        let inside = layout.as_ref().is_ok_and(|l| {
+            let home = std::fs::canonicalize(&l.home).unwrap_or_else(|_| l.home.clone());
+            std::fs::canonicalize(path).is_ok_and(|real| real.starts_with(&home))
+        });
+        if !inside {
+            eprintln!(
+                "boss dispatch: the run's recorded transcript {} is not under its harness's \
+                 transcript home — not read; the search is used instead",
+                path.display()
+            );
+        }
+        inside
+    });
+    (recorded, layout)
+}
+
 /// The `agent_runs` record for a run packet: keyed on the run's own id
 /// (idempotent), the CPU as its registered id, the model its transcript
 /// was billed as (else the one its metadata declared) and the packet
@@ -2444,6 +2788,12 @@ pub(crate) fn run_record(
             // The model the step's agent block asked for; `model` is
             // the one that ran, when the transcript said (6bb85880).
             "declared_model": declared,
+            // What the transcript named, or null: NEVER the declaration
+            // (backlog 2f7b8c00 — 86 Codex runs read `opus-5[1m]` in the
+            // `model` column above, which falls back to the declaration
+            // for an unmetered run so the card can still price a typed
+            // count; this key does not fall back).
+            "observed_model": r.meter.as_ref().and_then(|m| m.models.recorded()),
             "reported_spend_usd": r.spend_usd,
             // No `tokens_reported` flag: the column says it now. The
             // flag existed because a zero could not, and keeping both
@@ -2611,7 +2961,15 @@ fn price_phrase(
 /// hour earlier and of nothing the caller had done, and the split went
 /// nowhere in silence (backlog b4fd594e).
 ///
-/// Two second reports, two different facts, so two answers:
+/// A row that holds NO count is the exception (backlog b5a3a174): it
+/// prices nothing, so the door lets the first report carrying a count
+/// replace it — `recorded: true, replaced: true` — and this says so. On
+/// 2026-10-08 every run landed on such a row a minute before its own
+/// report, and each report was refused below with its real usage in
+/// hand: 21 of the day's 56 rows read no count or $0.
+///
+/// Against a row that holds a count, two second reports, two different
+/// facts, so two answers:
 ///   - the SAME count is a retry, which is what the idempotent
 ///     `run_id` is for — stated, not refused, and carrying no advice,
 ///     because nothing the caller can send would move the row;
@@ -2645,6 +3003,21 @@ pub(crate) fn record_line(
     if out.and_then(|o| o.get("recorded")).and_then(Value::as_bool) != Some(false) {
         let mut line =
             format!("boss dispatch: agent_runs holds run {short} for {actor_id} {phrase}");
+        // THE ROW THIS REPORT REPLACED (backlog b5a3a174): the run had
+        // landed before its report, on a row holding no count, and the
+        // door let this one take its place. Said, because the caller
+        // should know the record held something else a moment ago.
+        if out.and_then(|o| o.get("replaced")).and_then(Value::as_bool) == Some(true) {
+            let was = row
+                .and_then(|v| v.pointer("/detail/replaced/recorded_at"))
+                .and_then(Value::as_str)
+                .unwrap_or("earlier");
+            line.push_str(&format!(
+                ". This report REPLACED the row recorded {was}, which held no count: the run \
+                 ended before its report arrived. The row it replaced is kept on this one as \
+                 `detail.replaced`, and a row that holds a count is not replaced again"
+            ));
+        }
         match basis {
             Some(PricingBasis::Metered) => {}
             // Already metered; the phrase names the missing row.
@@ -2921,6 +3294,17 @@ pub(crate) async fn report_with_receipt_at(
     // — the landing found `report`, posted nothing, and closed the step.
     // One write, and the landing sees both or neither.
     let mut patch = report_patch(report);
+    // WHICH MODEL RAN, said beside which was asked for (backlog
+    // 2f7b8c00): the transcript's word or `null`, never the declaration
+    // copied across — and said out loud, because 86 Codex runs recorded
+    // the declared default as though it had run.
+    let observed_model = model_observed(&run, report);
+    eprintln!(
+        "boss dispatch: run {} — {}",
+        &run_id[..8.min(run_id.len())],
+        observed_model["says"].as_str().unwrap_or_default()
+    );
+    patch[MODEL_OBSERVED_KEY] = observed_model;
     if let Some(r) = &receipt {
         patch[TENANT_RECEIPT_KEY] = r.clone();
     }
@@ -3166,13 +3550,25 @@ pub async fn report(
     let since = std::time::SystemTime::now()
         .checked_sub(week)
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    let root = crate::transcript_usage::projects_root();
+    // WHERE TO LOOK (backlog 2f7b8c00): the run's own agent names its
+    // harness, and the harness's file names its transcript layout; a
+    // launched run's receipt names the file outright. Every miss is a
+    // sentence, and the report goes on unmetered saying it.
+    let (recorded, layout) = transcript_source_at(&http, &base, &actor, &run_id, &|name| {
+        std::env::var_os(name)
+    })
+    .await;
     // WHICH TURNS (backlog 4f74727b): only the run's own slice of the
     // file, bounded by its start and the reports already metered from
     // the same file — one agent can run a batch of runs into one
     // transcript, and each report used to count it from line 1.
-    let located =
-        crate::transcript_usage::locate(transcript.as_deref(), root.as_deref(), &run_id, since);
+    let located = crate::transcript_usage::locate(
+        transcript.as_deref(),
+        recorded.as_deref(),
+        layout.as_ref().map_err(String::as_str),
+        &run_id,
+        since,
+    );
     let metered = match located {
         Err(why) => Err(why),
         Ok(path) => match transcript_slice_at(&http, &base, &actor, &run_id, &path, now).await {
@@ -3265,6 +3661,9 @@ pub async fn run(
     budget: Option<f64>,
     effort: Option<String>,
     force: bool,
+    // `--launch`: start the harness the step's model names, in the
+    // directory given, and stay until it ends (`crate::dispatch_launch`).
+    launch: Option<crate::dispatch_launch::Request>,
 ) -> Result<()> {
     let base = crate::gate::resolve_jobs_base(None)?;
     let repo = crate::brief::repo_root()?;
@@ -3283,8 +3682,13 @@ pub async fn run(
     {
         bail!("--budget must be a positive number of dollars, got {b}");
     }
-    dispatch_at(
-        &crate::gate::machine_client()?,
+    if launch.is_some() {
+        crate::dispatch_launch::roster_is_mains(&repo)
+            .map_err(|e| anyhow::anyhow!("boss dispatch --launch: {e}"))?;
+    }
+    let http = crate::gate::machine_client()?;
+    let dispatched = dispatch_to(
+        &http,
         &base,
         &repo,
         &packet_ref,
@@ -3296,8 +3700,24 @@ pub async fn run(
         &owner,
         &host,
         BriefSource::Rendered,
+        launch.as_ref(),
     )
     .await?;
+    if let (Some(plan), Some(request)) = (&dispatched.plan, &launch) {
+        crate::dispatch_launch::run_at(
+            &http,
+            &base,
+            &repo,
+            &actor,
+            &dispatched.run_id,
+            &dispatched.prompt,
+            &dispatched.settings,
+            plan,
+            request,
+            &|name| std::env::var_os(name),
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -3668,13 +4088,107 @@ mod tests {
 
     #[test]
     fn the_refusal_names_the_fix_in_the_rows_own_syntax() {
-        let why = no_block_refusal("backlog-item", "build");
+        use crate::workflow::DriftHold;
+        let why = no_block_refusal("backlog-item", "build", Some(&DriftHold::Open));
         assert!(why.contains("agent = {"), "{why}");
         assert!(
             why.contains("infra/platform/workflows/backlog-item.toml"),
             "{why}"
         );
         assert!(why.contains("boss workflow publish backlog-item"), "{why}");
+    }
+
+    /// The refusal's fix ends in the hand publish, the one door a hold
+    /// does not bind (review 8d088b41 of car 052016d7, finding F4). So it
+    /// names the publish ONLY when the tree's holds were read and say the
+    /// kind is open: held, unreadable and not-read each name the row and
+    /// no publish.
+    #[test]
+    fn the_refusal_names_no_publish_unless_the_kind_is_known_to_be_open() {
+        use crate::workflow::DriftHold;
+        let held = DriftHold::Held(
+            "by default: step approve field decision declares writer signer".into(),
+            "a refusal goes live at a deliberate publish".into(),
+            "backlog 6c9183de".into(),
+        );
+        let why = no_block_refusal("ops-request", "approve", Some(&held));
+        assert!(
+            why.contains("infra/platform/workflows/ops-request.toml"),
+            "{why}"
+        );
+        assert!(!why.contains("boss workflow publish"), "{why}");
+        for needle in [
+            "HELD",
+            "declares writer signer",
+            "a refusal goes live at a deliberate publish",
+            "backlog 6c9183de",
+        ] {
+            assert!(why.contains(needle), "`{needle}` in: {why}");
+        }
+        let unreadable = DriftHold::Unreadable("the holds path is not a directory".into());
+        for (hold, needle) in [
+            (Some(&unreadable), "the holds path is not a directory"),
+            (None, "was not read"),
+        ] {
+            let why = no_block_refusal("ops-request", "approve", hold);
+            assert!(!why.contains("boss workflow publish"), "{why}");
+            assert!(why.contains(needle), "`{needle}` in: {why}");
+        }
+    }
+
+    /// And the refusal a dispatch actually prints ASKS THE TREE: the
+    /// wording above was tested while nothing showed it was ever handed
+    /// the reader's answer (review 6ff3210e, N4 — a call site passing
+    /// `Open` passed every test). `no_block_refusal_in` is what the call
+    /// site runs; here it is run over three planted checkouts, each with
+    /// a reader of its own.
+    #[test]
+    fn the_refusal_a_dispatch_prints_is_worded_from_the_trees_own_reader() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: needs python3");
+            return;
+        }
+        let checkout = |case: &str, reader: Option<&str>| {
+            let root = boss_testing::scratch_dir(&format!("dispatch-refusal-{case}"));
+            std::fs::create_dir_all(root.join("infra/gcp")).unwrap();
+            if let Some(body) = reader {
+                boss_testing::write_file(&root.join("infra/gcp/workflow-holds.py"), body);
+            }
+            root
+        };
+        let held = checkout(
+            "held",
+            Some(
+                "print('held\\tops-request\\tdeclared in a file\\tturns on a refusal\\tbacklog 6c9183de')\n",
+            ),
+        );
+        let why = no_block_refusal_in(&held, "ops-request", "approve");
+        assert!(
+            why.contains("HELD") && why.contains("turns on a refusal"),
+            "{why}"
+        );
+        assert!(!why.contains("boss workflow publish"), "{why}");
+        // The same tree, a kind it does not hold: the fix is named whole.
+        let why = no_block_refusal_in(&held, "backlog-item", "build");
+        assert!(why.contains("boss workflow publish backlog-item"), "{why}");
+
+        let broken = checkout("broken", Some("import sys\nsys.exit(3)\n"));
+        let why = no_block_refusal_in(&broken, "backlog-item", "build");
+        assert!(
+            !why.contains("boss workflow publish") && why.contains("could not be read"),
+            "{why}"
+        );
+
+        let bare = checkout("bare", None);
+        let why = no_block_refusal_in(&bare, "backlog-item", "build");
+        assert!(
+            !why.contains("boss workflow publish") && why.contains("was not read"),
+            "{why}"
+        );
     }
 
     #[test]
@@ -4483,6 +4997,42 @@ mod tests {
         );
     }
 
+    /// THE ROW THAT HELD NO COUNT (backlog b5a3a174): the door answers
+    /// `replaced: true` when this report took a placeholder's place,
+    /// and the verb says so — a line, not a refusal — naming when the
+    /// row it replaced was recorded.
+    #[test]
+    fn a_report_that_replaced_a_row_holding_no_count_says_so_and_is_not_a_refusal() {
+        let out = json!({
+            "recorded": true, "replaced": true,
+            "run": {
+                "run_id": "ca00400b", "usd_micros": 4_200_000,
+                "input_tokens": 740_000, "output_tokens": 21_000,
+                "recorded_at": "2026-10-08T15:27:30Z",
+                "detail": { "replaced": { "recorded_at": "2026-10-08T15:26:14Z",
+                                          "total_tokens": null, "usd_micros": null } },
+            },
+        });
+        let r = Report {
+            summary: "handback".into(),
+            spend_usd: None,
+            meter: None,
+            tokens: Some(Tokens::Split {
+                input: 740_000,
+                output: 21_000,
+            }),
+        };
+        let line = record_line("ca00400b", "agent-claude", Some(&out), &r)
+            .expect("a report that priced the run is not a refusal");
+        assert!(line.contains("$4.2000"), "the figure it now holds: {line}");
+        assert!(line.contains("REPLACED"), "{line}");
+        assert!(
+            line.contains("2026-10-08T15:26:14Z"),
+            "the row it replaced: {line}"
+        );
+        assert!(line.contains("held no count"), "{line}");
+    }
+
     /// The benign half of the same answer. A retry after a failed
     /// report carries the SAME count — that is what the idempotent
     /// `run_id` is for — so it is not a refusal; it is a statement
@@ -4628,17 +5178,17 @@ mod tests {
 // is observed, not assumed.
 // ---------------------------------------------------------------------
 #[cfg(test)]
-mod wire_tests {
+pub(crate) mod wire_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    const PACKET: &str = "39d0b528-ff69-4cb8-ba82-408b641da66c";
-    const RUN: &str = "5b1d2c3e-0000-4000-8000-000000000001";
+    pub(crate) const PACKET: &str = "39d0b528-ff69-4cb8-ba82-408b641da66c";
+    pub(crate) const RUN: &str = "5b1d2c3e-0000-4000-8000-000000000001";
 
     #[derive(Clone)]
-    struct Log {
+    pub(crate) struct Log {
         /// Every request: (method, path, body).
-        calls: Arc<Mutex<Vec<(String, String, Value)>>>,
+        pub(crate) calls: Arc<Mutex<Vec<(String, String, Value)>>>,
     }
 
     /// One request as the stub reads it: method, path (query stripped),
@@ -4858,7 +5408,275 @@ mod wire_tests {
         .await
     }
 
-    fn repo() -> std::path::PathBuf {
+    /// The live agents registry as read 2026-10-07 (`boss-api GET
+    /// /api/agents`): two rows, Codex's with no role.
+    pub(crate) fn live_agents() -> Value {
+        json!({ "total": 2, "data": [
+            { "id": "agent-claude", "display_name": "Claude (engineering)", "default_model": "opus-5[1m]",
+              "role": "engineering-agent", "aliases": ["claude@algedonic.dev"] },
+            { "id": "agent-codex", "display_name": "Codex (engineering)", "default_model": "gpt-6.1-sol",
+              "role": null, "aliases": ["codex@algedonic.dev"] },
+        ]})
+    }
+
+    /// A jobs API that KEEPS what it is sent (backlog 2f7b8c00): the
+    /// agents registry, the packet, and a run whose steps hold their
+    /// assignee, status and merged fields and whose metadata merges —
+    /// so a test reads the run the way an operator would, after the
+    /// fact. `building` is born PENDING and opens when `briefed`
+    /// completes, as the agent-run row orders them.
+    pub(crate) async fn keeping_stub(
+        packet: Value,
+        row: Value,
+        agents: Value,
+    ) -> (String, Log, Arc<Mutex<Option<Value>>>) {
+        let run: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let held = run.clone();
+        let (base, log) = serve(move |method, path, target, body| {
+            let run_step = format!("/api/jobs/{RUN}/steps/");
+            match (method, path) {
+                ("GET", "/api/agents") => ("200 OK", agents.to_string()),
+                ("GET", p) if p == format!("/api/jobs/{PACKET}") => ("200 OK", packet.to_string()),
+                ("GET", "/api/tenant/edit-level") => {
+                    ("200 OK", json!({ "edit_level": null }).to_string())
+                }
+                ("GET", "/api/jobs") => ("200 OK", json!({ "data": [], "total": 0 }).to_string()),
+                ("GET", "/api/workflows/backlog-item") => ("200 OK", row.to_string()),
+                ("POST", p) if p.starts_with(&format!("/api/jobs/{PACKET}/")) && p.ends_with("/claim") => {
+                    ("200 OK", json!({ "status": "active" }).to_string())
+                }
+                // The run's own claim door: a READY step becomes ACTIVE.
+                // (Who may is the door's judgement and is tested where
+                // the signer is visible, in `dispatch_started`.)
+                ("POST", p) if p.starts_with(&run_step) && p.ends_with("/claim") => {
+                    let sid = p[run_step.len()..].trim_end_matches("/claim").to_string();
+                    let mut guard = held.lock().unwrap();
+                    let step = guard.as_mut().and_then(|filed| {
+                        filed["steps"]
+                            .as_array_mut()?
+                            .iter_mut()
+                            .find(|s| s["id"] == sid.as_str() && s["status"] == "ready")
+                    });
+                    match step {
+                        Some(step) => {
+                            step["status"] = json!("active");
+                            ("200 OK", json!({ "status": "active" }).to_string())
+                        }
+                        None => ("409 Conflict", json!({ "error": "not claimable" }).to_string()),
+                    }
+                }
+                ("PATCH", p) if p.starts_with(&format!("/api/jobs/{PACKET}/steps/")) => {
+                    ("204 No Content", String::new())
+                }
+                ("POST", "/api/jobs") => {
+                    let mut filed = body.clone();
+                    filed["id"] = json!(RUN);
+                    filed["steps"] = json!([
+                        { "id": "run-claimed", "spec_slug": "claimed", "status": "completed", "metadata": {} },
+                        { "id": "run-briefed", "spec_slug": "briefed", "status": "ready",
+                          "metadata": { "authority_role": "platform-admin" } },
+                        { "id": "run-building", "spec_slug": "building", "status": "pending",
+                          "metadata": { "authority_role": "platform-admin",
+                                        "worker_start_expectation": { "schema": 1, "minutes": 15 } } },
+                    ]);
+                    *held.lock().unwrap() = Some(filed);
+                    ("201 Created", json!({ "id": RUN }).to_string())
+                }
+                ("GET", p) if p == format!("/api/jobs/{RUN}") => match held.lock().unwrap().clone() {
+                    Some(r) => ("200 OK", r.to_string()),
+                    None => ("404 Not Found", "no such job".into()),
+                },
+                ("PATCH", p) if p == format!("/api/jobs/{RUN}/metadata") => {
+                    if let Some(filed) = held.lock().unwrap().as_mut()
+                        && let (Some(md), Some(sent)) =
+                            (filed["metadata"].as_object_mut(), body.as_object())
+                    {
+                        for (k, v) in sent {
+                            md.insert(k.clone(), v.clone());
+                        }
+                    }
+                    ("204 No Content", String::new())
+                }
+                ("PATCH", p) if p.starts_with(&run_step) => {
+                    stub_merge(&held, RUN, p, body);
+                    ("204 No Content", String::new())
+                }
+                ("PUT", p) if p.starts_with(&run_step) => {
+                    if body.get("metadata").is_some() {
+                        return run_step_put(body);
+                    }
+                    let sid = &p[run_step.len()..];
+                    if let Some(filed) = held.lock().unwrap().as_mut()
+                        && let Some(steps) = filed["steps"].as_array_mut()
+                    {
+                        for step in steps.iter_mut().filter(|s| s["id"] == sid) {
+                            for key in ["assignee_id", "status"] {
+                                if let Some(v) = body.get(key) {
+                                    step[key] = v.clone();
+                                }
+                            }
+                        }
+                        // `building` opens when `briefed` is done.
+                        if sid == "run-briefed" && body["status"] == "completed" {
+                            for step in steps.iter_mut().filter(|s| s["id"] == "run-building") {
+                                step["status"] = json!("ready");
+                            }
+                        }
+                    }
+                    ("204 No Content", String::new())
+                }
+                _ => ("404 Not Found", format!("unstubbed {method} {target}")),
+            }
+        })
+        .await;
+        (base, log, run)
+    }
+
+    /// THE NOMINATION (backlog 2f7b8c00). Measured 2026-10-04 on three
+    /// fresh Codex runs and again on this car's own run (f7c7891b): the
+    /// run's Building opened READY and assigned by the dispatcher
+    /// service's env-executor lane, whoever the run's `agent` was. The
+    /// verb now places it with the run's own agent — the REGISTERED id
+    /// of the dispatching login — while it is still pending, so it is
+    /// born placed.
+    #[tokio::test]
+    async fn a_runs_building_is_placed_with_the_runs_own_agent_before_it_opens() {
+        for (login, registered) in [
+            ("codex@algedonic.dev", "agent-codex"),
+            ("claude@algedonic.dev", "agent-claude"),
+        ] {
+            let (base, log, run) =
+                keeping_stub(packet_without_projection(), row_with_block(), live_agents()).await;
+            dispatch_at(
+                &crate::gate::machine_client().unwrap(),
+                &base,
+                &repo(),
+                PACKET,
+                None,
+                None,
+                &Overrides::default(),
+                false,
+                login,
+                "emp-david",
+                "boss-dev-0",
+                BriefSource::Handed {
+                    prompt: "p",
+                    session: None,
+                },
+            )
+            .await
+            .unwrap();
+            let run = run.lock().unwrap().clone().unwrap();
+            assert_eq!(run["steps"][2]["assignee_id"], registered, "{login}");
+            assert_eq!(run["steps"][2]["status"], "ready");
+            assert_eq!(run["metadata"]["agent"], login, "the run signs as before");
+            let calls = log.calls.lock().unwrap();
+            let at = |want: &dyn Fn(&(String, String, Value)) -> bool| {
+                calls.iter().position(want).expect("the call was made")
+            };
+            let placed = at(&|(m, p, b)| {
+                m == "PUT" && p.ends_with("/steps/run-building") && b["assignee_id"] == registered
+            });
+            let opened = at(&|(m, p, b)| {
+                m == "PUT" && p.ends_with("/steps/run-briefed") && b["status"] == "completed"
+            });
+            assert!(
+                placed < opened,
+                "placed while pending, before `briefed` opens it"
+            );
+        }
+    }
+
+    /// ONE ALIAS ON TWO ROWS NAMES NOBODY (review f7f0b689, N3). The
+    /// resolver took the first row an alias matched, so a dispatch placed
+    /// the run's Building with whichever row sorted first.
+    #[tokio::test]
+    async fn an_alias_two_rows_carry_places_the_building_with_neither() {
+        let mut agents = live_agents();
+        agents["total"] = json!(3);
+        agents["data"].as_array_mut().unwrap().insert(
+            0,
+            json!({ "id": "agent-other", "default_model": "opus-5[1m]",
+                    "aliases": ["claude@algedonic.dev"] }),
+        );
+        assert_eq!(
+            resolve_agent(agents["data"].as_array().unwrap(), "claude@algedonic.dev"),
+            None
+        );
+        assert_eq!(
+            resolve_agent(agents["data"].as_array().unwrap(), "codex@algedonic.dev").as_deref(),
+            Some("agent-codex")
+        );
+        let (base, log, run) =
+            keeping_stub(packet_without_projection(), row_with_block(), agents).await;
+        dispatch_at(
+            &crate::gate::machine_client().unwrap(),
+            &base,
+            &repo(),
+            PACKET,
+            None,
+            None,
+            &Overrides::default(),
+            false,
+            "claude@algedonic.dev",
+            "emp-david",
+            "boss-dev-0",
+            BriefSource::Handed {
+                prompt: "p",
+                session: None,
+            },
+        )
+        .await
+        .expect("the dispatch is not stopped");
+        let run = run.lock().unwrap().clone().unwrap();
+        assert!(
+            run["steps"][2].get("assignee_id").is_none(),
+            "placed with nobody"
+        );
+        assert!(
+            !log.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(m, _, b)| m == "PUT" && b.get("assignee_id").is_some())
+        );
+    }
+
+    /// A registry that cannot be read, or that names no row for the
+    /// dispatching actor, changes nothing: no assignment is sent and the
+    /// dispatch goes on, as it did before this rule.
+    #[tokio::test]
+    async fn an_unreadable_registry_leaves_the_nomination_to_the_dispatcher_service() {
+        let (base, log) = stub(packet_without_projection(), row_with_block(), false).await;
+        dispatch_at(
+            &crate::gate::machine_client().unwrap(),
+            &base,
+            &repo(),
+            PACKET,
+            None,
+            None,
+            &Overrides::default(),
+            false,
+            "claude@algedonic.dev",
+            "emp-david",
+            "boss-dev-0",
+            BriefSource::Handed {
+                prompt: "p",
+                session: None,
+            },
+        )
+        .await
+        .expect("the dispatch is not stopped");
+        assert!(
+            !log.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(m, _, b)| m == "PUT" && b.get("assignee_id").is_some())
+        );
+    }
+
+    pub(crate) fn repo() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../..")
             .canonicalize()
@@ -4867,7 +5685,7 @@ mod wire_tests {
 
     /// A packet materialised BEFORE its row declared the block — no
     /// projection on the step — the case this very packet was.
-    fn packet_without_projection() -> Value {
+    pub(crate) fn packet_without_projection() -> Value {
         json!({
             "id": PACKET,
             "kind": "backlog-item",
@@ -4884,7 +5702,7 @@ mod wire_tests {
         })
     }
 
-    fn row_with_block() -> Value {
+    pub(crate) fn row_with_block() -> Value {
         json!({
             "kind": "backlog-item",
             "version": 7,
@@ -4993,6 +5811,12 @@ mod wire_tests {
                     format!("/api/jobs/{PACKET}/steps/s-build/metadata")
                 ),
                 ("GET".to_string(), format!("/api/jobs/{RUN}")),
+                // Who the run's Building belongs to (2f7b8c00): the
+                // registry is asked for the dispatching login's
+                // registered id while Building is still pending. This
+                // stub has no registry, so nothing is placed — the
+                // dispatcher service nominates, as before.
+                ("GET".to_string(), "/api/agents".to_string()),
                 // `briefed` completes as TWO writes (e39a9d2a): its
                 // field through the merge door, then the status alone.
                 (
@@ -5311,6 +6135,60 @@ mod wire_tests {
             .filter(|(m, _, _)| m != "GET")
             .count();
         assert_eq!(writes, 0, "nothing claimed, nothing filed");
+    }
+
+    /// THE SAME REFUSAL, in a checkout whose reader HOLDS the kind: the
+    /// dispatch itself asks the tree before it words the fix, so the
+    /// refusal a caller reads names the hold and no publish. The wording
+    /// was tested alone while a call site that handed it `Open` passed
+    /// everything (review 6ff3210e, N4).
+    #[tokio::test]
+    async fn a_step_with_no_block_on_a_held_kind_is_refused_without_naming_the_publish() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: needs python3");
+            return;
+        }
+        let checkout = boss_testing::scratch_dir("dispatch-refusal-held-kind");
+        std::fs::create_dir_all(checkout.join("infra/gcp")).unwrap();
+        boss_testing::write_file(
+            &checkout.join("infra/gcp/workflow-holds.py"),
+            "print('held\\tbacklog-item\\tdeclared in a file\\tturns on a refusal\\tbacklog 6c9183de')\n",
+        );
+        let row_without = json!({
+            "kind": "backlog-item",
+            "steps": [{ "title": "build", "kind": "task" }],
+        });
+        let (base, _log) = stub(packet_without_projection(), row_without, false).await;
+        let err = dispatch_at(
+            &crate::gate::machine_client().unwrap(),
+            &base,
+            &checkout,
+            PACKET,
+            None,
+            None,
+            &Overrides::default(),
+            false,
+            "claude@algedonic.dev",
+            "emp-david",
+            "h",
+            BriefSource::Rendered,
+        )
+        .await
+        .expect_err("refused");
+        let text = format!("{err:#}");
+        assert!(text.contains("declares no agent block"), "{text}");
+        assert!(
+            text.contains("HELD") && text.contains("turns on a refusal"),
+            "the refusal says the kind is held, in the reader's words: {text}"
+        );
+        assert!(
+            !text.contains("boss workflow publish"),
+            "and names no publish: {text}"
+        );
     }
 
     /// THE 09b354e7 CASE: a packet pinned to v2, whose step carries the

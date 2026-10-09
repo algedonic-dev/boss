@@ -4,4 +4,4 @@
 [[automation]]
 id = "automation:gate-runner"
 role = "platform-admin"
-description = 'The cluster gate Job: judges a branch and records its receipt on the gate-run packet (infra/gate-runner/run.sh).'
+description = 'The cluster gate Job: judges a branch and leaves its receipt in its pod log for the conductor to record on the gate-run packet; a runner whose manifest hands it no verdict carrier still records it itself (infra/gate-runner/run.sh).'

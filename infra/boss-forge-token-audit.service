@@ -27,6 +27,15 @@ Type=oneshot
 # open and loud. Exit 0 only when the forge matches the declaration AND
 # the credentials registry AND every declared consumer is identified.
 Environment=RUST_LOG=info
+# The registry read presents the machine token through the one shell
+# reader (infra/lib/secret-header.sh), which makes its 0600 header file
+# in this directory when the unit declares one: tmpfs under /run that
+# systemd removes when the unit stops, after a SIGKILL too, instead of
+# a directory in /tmp that only the next run would find (backlog
+# df38075a F1 gave the forge's four sender units the same line). The
+# wrap and the step closer on the Exec lines beside it use it as well.
+RuntimeDirectory=boss-forge-token-audit
+RuntimeDirectoryMode=0700
 ExecStartPre=-/opt/boss/infra/boss-maintenance-wrap.sh maintenance-forge-token-audit "Forge token audit"
 ExecStart=/usr/bin/python3 /opt/boss/infra/maintenance/forge-token-audit.py \
     --declaration /opt/boss/infra/platform/forge-tokens.toml \

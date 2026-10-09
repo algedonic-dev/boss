@@ -188,6 +188,47 @@ free_kb() { df -Pk / | awk 'NR==2 {print $4}'; }
 
 last_kb=$(free_kb)
 
+# THE RECORD OF A RECLAIM IS THIS RUN'S OWN PACKET (backlog 37742794;
+# David's answer to design-doc c8502e17, `ci-reclaim`, 2026-10-07).
+# Until then the reclaim that followed a build was recorded on an
+# ops-request a CI job filed — free space at the request, and the
+# sweep's output as the ops-runner's answer. A CI job runs branch code
+# and may not write to the system of record, so that request is gone,
+# and with it the only place a reclaim's EFFECT was written down: the
+# timer's own packet said `result=ok` and nothing else.
+#
+# So the run leaves what it did in $BOSS_RUN_SUMMARY_FILE, which its
+# unit declares once and boss-step.sh (ExecStopPost) merges onto the
+# `run` step and deletes: the floor, free space before and after, what
+# the hourly per-train image pass freed, and the line the run ended on.
+# From an EXIT trap, so a FLOOR UNMET run and one that died early are
+# recorded too — and set HERE, before anything below sources a library
+# that chains its own cleanup onto this shell's EXIT. Unset (a hand
+# run, the reclaim-disk verb, a test) it writes nothing; and nothing
+# about it can change how the sweep ends.
+START_KB=$last_kb
+CI_PRUNE_FREED_MIB=""
+SWEEP_OUTCOME="ended before any pass finished"
+write_summary() {
+    [ -n "${BOSS_RUN_SUMMARY_FILE:-}" ] || return 0
+    case ${START_KB:-empty} in empty | *[!0-9]*) return 0 ;; esac
+    # A `df` that fails here has its own name, and the two figures it
+    # would have given stay EMPTY on the record — never a zero.
+    local now_kb="" after="" freed="" df_failed=""
+    now_kb=$(free_kb 2>/dev/null) || df_failed=1
+    case ${df_failed:+empty}${now_kb:-empty} in
+        empty* | *[!0-9]*) ;;
+        *) after=$((now_kb / 1024 / 1024)); freed=$(((now_kb - START_KB) / 1024)) ;;
+    esac
+    jq -nc --arg floor "$FLOOR_GB" --arg before "$((START_KB / 1024 / 1024))" \
+        --arg after "$after" --arg freed "$freed" \
+        --arg ci "$CI_PRUNE_FREED_MIB" --arg outcome "$SWEEP_OUTCOME" \
+        '{floor_gb: $floor, free_gb_before: $before, free_gb_after: $after,
+          freed_mib: $freed, ci_image_prune_freed_mib: $ci, sweep_outcome: $outcome}' \
+        > "$BOSS_RUN_SUMMARY_FILE" 2>/dev/null || true
+}
+trap write_summary EXIT
+
 # (0) THE ROUTINE PASS — per-train CI images whose TRAIN IS DONE, plus
 # the age window for everything the record cannot vouch for, every hour,
 # floor or no floor. First because it is the gentlest remediation on the
@@ -213,7 +254,8 @@ prune_ci_images "$SYSTEM_DOCKER" "$SYSTEM_DOCKER_ROOT" "$CI_IMAGE_REPO" \
     "$CI_IMAGE_AGE_HOURS" "$CI_IMAGE_KEEP_NEWEST" disk-floor-sweep \
     "$LANDED_SHAS" || AGE_PRUNE_RC=$?
 age_kb=$(free_kb)
-echo "disk-floor-sweep: CI-image prune freed $(((age_kb - last_kb) / 1024))MiB on / (now $((age_kb / 1024 / 1024))GB free)"
+CI_PRUNE_FREED_MIB=$(((age_kb - last_kb) / 1024))
+echo "disk-floor-sweep: CI-image prune freed ${CI_PRUNE_FREED_MIB}MiB on / (now $((age_kb / 1024 / 1024))GB free)"
 last_kb=$age_kb
 
 # A PASS THAT COULD NOT LOOK IS NOT A CLEAN RUN. The unit goes red and
@@ -231,6 +273,7 @@ finish() { # $1 = the exit code the floor logic reached
 
 if [ $((last_kb / 1024 / 1024)) -ge "$FLOOR_GB" ]; then
     echo "disk-floor-sweep: $((last_kb / 1024 / 1024))GB free >= ${FLOOR_GB}GB floor — nothing to do"
+    SWEEP_OUTCOME="above the floor after the per-train image pass — nothing more to do"
     finish 0
 fi
 echo "disk-floor-sweep: $((last_kb / 1024 / 1024))GB free < ${FLOOR_GB}GB floor — reclaiming regenerable docker caches"
@@ -249,6 +292,7 @@ floor_met_after() { # step-name
 
 done_at() { # step-name
     echo "disk-floor-sweep: floor met after $1 — stopping"
+    SWEEP_OUTCOME="floor met after $1"
     finish 0
 }
 
@@ -343,4 +387,5 @@ echo "disk-floor-sweep: FLOOR UNMET — $((last_kb / 1024 / 1024))GB free < ${FL
 echo "disk-floor-sweep: this script will NOT touch volumes or non-docker paths on its own." >&2
 echo "disk-floor-sweep: likely culprits are NAMED volumes of dead CI jobs (reap-dead-ci-jobs)" >&2
 echo "disk-floor-sweep: or genuine growth — see locomotive.sh's remediation notes. A human decides next." >&2
+SWEEP_OUTCOME="FLOOR UNMET after every bounded remediation"
 exit 1

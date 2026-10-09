@@ -25,11 +25,35 @@ if [ -z "$url" ]; then
     [ -n "${BOSS_JOBS_URL:-}" ] || unavailable estate_unavailable
     url="$BOSS_JOBS_URL/api/estate/nodes"
 fi
+# The machine token, PRESENTED and never required (design 6805c764;
+# backlog 44b2087e): this read went out with x-boss-user alone, and the
+# jobs gate recorded it as a caller it would refuse. Asked of the one
+# shell reader here, in the script's own shell, because the read runs
+# inside $(…). No token, a host off the list, a slot no header can
+# carry, no lib beside this file, a header file that cannot be written:
+# each leaves MT_HDR empty and the read exactly the read it was. The
+# reader's own words are silenced like every helper's above — the ops
+# runner folds this verb's stderr into its receipt.
+MT_HDR=""
+SECRET_LIB="$HERE/../lib/secret-header.sh"
+if [ -r "$SECRET_LIB" ]; then
+    # shellcheck source=infra/lib/secret-header.sh
+    . "$SECRET_LIB" 2>/dev/null
+    machine_token_header MT_HDR "$url" 2>/dev/null || MT_HDR=""
+fi
 # Only estate registry data is transported on stdin. All Kubernetes and
 # sensitive Talos bytes stay in the bounded container process's pipes.
 registry="$(curl -sS --max-time 15 --max-filesize 1048576 \
+    ${MT_HDR:+-H "$MT_HDR"} \
     -H "x-boss-user: $(sor_reader_header 'automation:discover-admission-source')" \
     -w $'\n%{http_code}' "$url" 2>/dev/null)" || unavailable estate_unavailable
+# The header file has served its one request: remove it NOW rather than
+# at exit, so it does not sit beside a privileged container for the
+# fourteen minutes that may follow, and a verb killed in there leaves
+# nothing. (A read that failed has already exited through the reader's
+# own EXIT trap.)
+if declare -F secret_header_close >/dev/null; then secret_header_close 2>/dev/null; fi
+MT_HDR=""
 code="${registry##*$'\n'}"
 case "$code" in 200 | 000) ;; *) unavailable estate_http_unavailable ;; esac
 registry="${registry%$'\n'*}"

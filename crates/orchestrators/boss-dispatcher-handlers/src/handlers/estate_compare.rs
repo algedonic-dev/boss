@@ -3024,19 +3024,27 @@ mod tests {
 
     #[test]
     fn pvc_capacity_intent_compares_request_not_filesystem_and_keeps_namespaces_distinct() {
-        let mut prod = volume("boss", "pgdata-postgres-0", "pvc-a", 29.362, 20.0);
-        prod["requested"] = json!("30Gi");
+        // 40 GiB since ops-request b018a106 (2026-10-07): the first growth
+        // of this claim by BOSS's own verb, and the approve step David's
+        // passkey signed is the assignment the declaration now names. The
+        // design-review receipt it replaced (32e7cf87 Q1) assigned 30 GiB.
+        let mut prod = volume("boss", "pgdata-postgres-0", "pvc-a", 39.15, 30.0);
+        prod["requested"] = json!("40Gi");
         let mut playground = volume("boss-playground", "pgdata-postgres-0", "pvc-b", 20.0, 10.0);
         playground["requested"] = json!("20Gi");
         let body = compare_volumes(&volumes_observation(vec![prod, playground]));
         assert_eq!(body["volumes"][0]["capacity_intent"]["verdict"], "match");
         assert_eq!(
             body["volumes"][0]["capacity_intent"]["desired_bytes"],
-            30_i64 << 30
+            40_i64 << 30
         );
         assert_eq!(
             body["volumes"][0]["capacity_intent"]["assignment"]["packet"],
-            "32e7cf87-7d8e-4764-94a3-3b0cfa8548c4"
+            "b018a106-a324-4d7a-a2b3-755df63ff8a3"
+        );
+        assert_eq!(
+            body["volumes"][0]["capacity_intent"]["assignment"]["step"],
+            "0e8a8ae8-ce9b-48b0-bdf7-e06ea62bf13d"
         );
         assert_eq!(body["volumes"][0]["tight"], false);
         assert_eq!(body["volumes"][1]["capacity_intent"]["verdict"], "unknown");
@@ -3275,7 +3283,7 @@ mod tests {
         );
         assert_eq!(
             replayed["volumes"][0]["capacity_intent"]["assignment"]["packet"],
-            "32e7cf87-7d8e-4764-94a3-3b0cfa8548c4"
+            "b018a106-a324-4d7a-a2b3-755df63ff8a3"
         );
         assert_eq!(replayed["volumes"][0]["tight"], false);
     }

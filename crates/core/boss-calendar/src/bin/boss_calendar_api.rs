@@ -38,10 +38,11 @@ async fn main() -> Result<()> {
 
     info!(http_bind = %cfg.http_bind, "boss-calendar-api starting");
 
-    let (calendar, publisher, recorder): (
+    let (calendar, publisher, recorder, role_pool): (
         Arc<dyn CalendarClient>,
         Option<boss_core::publisher::DomainPublisher>,
         Arc<dyn boss_core::port::EventRecorder>,
+        sqlx::PgPool,
     ) = {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(10)
@@ -51,6 +52,8 @@ async fn main() -> Result<()> {
         let calendar: Arc<dyn CalendarClient> =
             Arc::new(boss_calendar::PgCalendar::new(pool.clone()));
         let recorder = boss_events::outbox::PgOutboxRecorder::shared(&pool);
+        // The actor-role report's outbox and its window's log (e0bdba74).
+        let role_pool = pool.clone();
         let publisher = match &cfg.nats_url {
             Some(url) => {
                 let bus = boss_nats::NatsEventBus::connect(url)
@@ -66,7 +69,7 @@ async fn main() -> Result<()> {
                 None
             }
         };
-        (calendar, publisher, recorder)
+        (calendar, publisher, recorder, role_pool)
     };
 
     let clock_url = std::env::var("BOSS_CLOCK_URL").unwrap_or_else(|_| boss_ports::url("clock"));
@@ -109,9 +112,7 @@ async fn main() -> Result<()> {
         policy,
         roles.clone(),
         mode.clone(),
-        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
-            boss_policy_client::role_service::REPORT_CAPACITY,
-        )),
+        boss_events::role_tally::durable("calendar", mode.clone(), Some(&role_pool)),
     );
     let policy = wiring.policy;
 

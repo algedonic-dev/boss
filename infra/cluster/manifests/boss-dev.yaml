@@ -892,6 +892,26 @@ spec:
             # alone.
             - {name: BOSS_WORK_FLOOR_GB, value: "6"}
             - {name: BOSS_WORKTREE_MAX_AGE_H, value: "48"}
+            # THE MACHINE TOKEN, FOR THIS CONTAINER'S OWN REQUESTS
+            # (backlog 37742794; David's answer to design-doc c8502e17,
+            # `reclaim-sidecar`, 2026-10-07). The pass records itself on
+            # a maintenance packet and asks the record which cars landed;
+            # with nothing mounted every one of those requests went out
+            # bare — 66 would-refuse facts in the 26 h to 2026-10-07
+            # 18:00Z, and the day the machine door enforces, a refused
+            # packet and a reclaim that can no longer tell a landed
+            # worktree from a live one. The Secret is mounted below at
+            # the reader's own default directory, so nothing names it —
+            # no BOSS_MACHINE_TOKEN_DIR, which the pin on the dev pod
+            # forbids in any container's environment. The reader stamps
+            # loopback and the hosts named here, and the pod's system of
+            # record (infra/dev/sor-url) is a Service name.
+            - {name: BOSS_MACHINE_TOKEN_HOSTS, value: ".boss.svc.cluster.local"}
+            # Where the reader writes the 0600 header file curl is
+            # handed: memory, and this container's alone (the volume
+            # below). /tmp here is the writable layer, where a file left
+            # by a killed pass stays on the node's disk.
+            - {name: RUNTIME_DIRECTORY, value: /run/boss-secret-header}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: {drop: ["ALL"]}
@@ -906,6 +926,24 @@ spec:
           volumeMounts:
             - {name: work, mountPath: /work}
             - {name: scratch, mountPath: /scratch}
+            # THE GRANT, AND ITS EDGE. The same Secret volume the `dev`
+            # container's doors read at /etc/boss-doors, mounted here
+            # read-only at the directory the shared reader
+            # (infra/lib/secret-header.sh machine_token_header) reads
+            # when nothing names another. THIS container only: the `dev`
+            # container, where agents and builders' tests run, gains no
+            # mount from this — its list is pinned whole, by a parsed
+            # read of this file, in
+            # every_in_cluster_sender_holds_the_machine_token_or_is_named.rs.
+            #
+            # WHAT THIS IS NOT. It is not a wall between the two
+            # containers: the sidecar runs /work/boss's script, a
+            # checkout the dev container writes, and the dev container
+            # already holds this token for its doors. The grant adds a
+            # sender that stamps; it adds no reader of the token the pod
+            # did not already have.
+            - {name: machine-token, mountPath: /etc/boss/machine-token, readOnly: true}
+            - {name: reclaim-secret-header, mountPath: /run/boss-secret-header}
       volumes:
         # THE READ TOKEN, and read is the whole point.
         #
@@ -967,9 +1005,15 @@ spec:
         # Whole, never items, so a rotation reaches the mount; optional,
         # because until the first mint it is empty and the doors send no
         # token, which every gate in `report` admits. 0440 + the pod's
-        # fsGroup 1500. Mounted at the doors' directory above.
+        # fsGroup 1500. Mounted at the doors' directory above, and in the
+        # `reclaim` sidecar at the reader's default (backlog 37742794).
         - name: machine-token
           secret: {secretName: boss-machine-token, optional: true, defaultMode: 0440}
+        # The reclaim sidecar's header file: memory, 1Mi, mounted in that
+        # container alone — a header file IS the token, and a memory
+        # emptyDir is gone when the pod stops, however it stopped.
+        - name: reclaim-secret-header
+          emptyDir: {medium: Memory, sizeLimit: 1Mi}
         - name: work
           persistentVolumeClaim: {claimName: boss-dev-work}
         - name: scratch

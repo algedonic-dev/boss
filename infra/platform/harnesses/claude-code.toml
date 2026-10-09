@@ -1,0 +1,25 @@
+# ---------------------------------------------------------------------------
+# claude-code — Claude Code's Agent tool, launched by the coordinator itself.
+#
+# The first harness, written down beside the second (backlog 2f7b8c00). Its
+# launch is not a process `boss` can start: the coordinator session calls its
+# own Agent tool with the prompt `boss dispatch` printed, and the PreToolUse
+# hook (`boss dispatch --from-hook`) names the effort definition and the
+# isolation on that call. So `launch = "host-tool"`, there is no argv, and
+# `boss dispatch --launch` on a model this harness runs is refused by this
+# row rather than by a branch in code.
+#
+# What the row still decides: who the run signs as, and where its transcript
+# lands — `--report` searches this layout for the run's own marker, the read
+# that used to be the only one (see codex-exec.toml for what that cost).
+# ---------------------------------------------------------------------------
+id = "claude-code"
+actor = "agent-claude"
+launch = "host-tool"
+
+# `$CLAUDE_CONFIG_DIR`, else `$HOME/.claude`.
+[transcript]
+adapter = "claude-subagent"
+home_env = "CLAUDE_CONFIG_DIR"
+home_default = ".claude"
+glob = "projects/*/*/subagents/agent-*.jsonl"

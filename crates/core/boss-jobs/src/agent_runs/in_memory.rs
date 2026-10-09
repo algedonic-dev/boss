@@ -21,8 +21,8 @@ use tokio::sync::RwLock;
 use chrono::{DateTime, Utc};
 
 use super::port::{
-    AgentRunError, AgentRunLog, RecordedRun, RegisteredAgent, admit, resolve_model, validate,
-    validate_profile, validate_window,
+    AgentRunError, AgentRunLog, RecordedRun, RegisteredAgent, admit, replacement, replaces,
+    resolve_model, validate, validate_profile, validate_window,
 };
 use super::profile::{RunProfile, WorkProfile};
 use super::types::{AgentRun, NewAgentRun, RateCardRow, RunFilter, measure_load, price_run};
@@ -91,12 +91,21 @@ impl AgentRunLog for InMemoryAgentRuns {
     ) -> Result<RecordedRun, AgentRunError> {
         validate(run)?;
         let mut guard = self.runs.write().await;
-        if let Some(held) = guard.get(&run.run_id) {
-            return Ok(RecordedRun {
-                recorded: false,
-                run: held.clone(),
-            });
-        }
+        // A held row collapses the report onto itself — unless it holds
+        // no count and this one does, in which case this record takes
+        // its place and says so (`replaces`, backlog b5a3a174).
+        let held = guard.get(&run.run_id).cloned();
+        let run = &match &held {
+            Some(held) if !replaces(held, run) => {
+                return Ok(RecordedRun {
+                    recorded: false,
+                    replaced: false,
+                    run: held.clone(),
+                });
+            }
+            Some(held) => replacement(held, run),
+            None => run.clone(),
+        };
         // Resolve the model ONCE and record the run with it set, so the
         // row, the event and the price all read the same word.
         let agent = match &run.actor_id {
@@ -127,6 +136,7 @@ impl AgentRunLog for InMemoryAgentRuns {
         self.events.write().await.push(event);
         Ok(RecordedRun {
             recorded: true,
+            replaced: held.is_some(),
             run: recorded,
         })
     }

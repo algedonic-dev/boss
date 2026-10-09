@@ -1,6 +1,16 @@
 //! Registry-declared argument discovery stays a native read request. Its
 //! complete byte receipt may propose explicit arguments, never authority.
 //! Both stages re-read the final mutation's existing admission guards.
+//!
+//! WHEN NO GROWTH FITS (design ada8f698, option A — David, 2026-10-07) the
+//! native read may answer with a different proposal: the one replica move
+//! after which the volume can grow, as the declared `no_growth_plan_verb`'s
+//! own plan. From that this files ONLY the read-only plan request and a
+//! note on the finding's open alarm — never the passkey-gated move, which
+//! stays a person's to file. A native refusal (two short disks, a
+//! destination that does not admit, an unhealthy volume, an unread
+//! cluster) is exit 78 or 1: it proposes nothing, and stays this
+//! handler's loud permanent error beside the alarm `estate.alarm` files.
 
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -12,11 +22,11 @@ use serde_json::{Value, json};
 
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 
-use super::common::{api_client, get_json, post_json};
+use super::common::{api_client, get_json, post_json, write_json};
 use super::estate_alarm::HARD_CLASSES;
 use super::ops_file_remedies::{
-    OpsFileRemedies, Remedy, cleared_since, declared_args, remedy_index, remedy_request_id,
-    verb_files,
+    OpsFileRemedies, Remedy, carries, cleared_since, declared_args, remedy_index,
+    remedy_request_id, verb_files,
 };
 
 #[derive(Clone, Debug)]
@@ -30,6 +40,20 @@ struct Discovery {
     inputs: Vec<Value>,
     outputs: Vec<Value>,
     plan_verb: String,
+    no_growth: Option<NoGrowth>,
+}
+
+/// What the discovery may propose INSTEAD when no growth fits (design
+/// ada8f698, option A): one read-only plan verb, named by the registry
+/// beside the discovery (`no_growth_plan_verb`), which exactly one
+/// passkey-gated verb names as its own plan. This handler files only the
+/// plan request; `mutation` is recorded so the reader knows which request
+/// is theirs to file.
+#[derive(Clone, Debug)]
+struct NoGrowth {
+    plan_verb: String,
+    outputs: Vec<Value>,
+    mutation: String,
 }
 
 fn fault(why: impl Into<String>) -> HandlerError {
@@ -60,8 +84,15 @@ fn index(files: &[(&str, &str)]) -> Result<Vec<Discovery>, HandlerError> {
             })?;
         let mut classes = BTreeSet::new();
         for entry in entries {
-            let object = entry.as_object().filter(|o| o.len() == 4)
-                .ok_or_else(|| fault(format!("{name}.json discovery entry must have exactly finding_class, scope, discovery_verb, arg_fields")))?;
+            let object = entry
+                .as_object()
+                .filter(|o| o.len() == 4 || (o.len() == 5 && o.contains_key("no_growth_plan_verb")))
+                .ok_or_else(|| {
+                    fault(format!(
+                        "{name}.json discovery entry must have exactly finding_class, scope, \
+                         discovery_verb, arg_fields and, optionally, no_growth_plan_verb"
+                    ))
+                })?;
             let scope = object
                 .get("scope")
                 .and_then(Value::as_str)
@@ -192,6 +223,100 @@ fn index(files: &[(&str, &str)]) -> Result<Vec<Discovery>, HandlerError> {
                     "{name}.json plan must take the mutation's exact unsigned params on the same host"
                 )));
             }
+            // THE NO-GROWTH FALLBACK (design ada8f698, option A). What it
+            // names must be a plan and nothing more: a read-only verb on
+            // the same host, which is not this mutation's own plan, and
+            // which exactly ONE passkey-gated verb with named approvers
+            // owns as its plan, taking that plan's words and then the
+            // signed hash. So a proposal filed from it can lead only to a
+            // request a person files and a passkey signs.
+            let no_growth = match object.get("no_growth_plan_verb") {
+                None => None,
+                Some(value) => {
+                    let fallback = value.as_str().filter(|v| *v != plan_verb).ok_or_else(|| {
+                        fault(format!(
+                            "{name}.json no_growth_plan_verb must name a plan verb other than its own"
+                        ))
+                    })?;
+                    let fallback_plan = rows
+                        .iter()
+                        .find(|(n, _)| *n == fallback)
+                        .map(|(_, s)| s)
+                        .ok_or_else(|| {
+                        fault(format!(
+                            "{name}.json no_growth_plan_verb {fallback} is not in the registry"
+                        ))
+                    })?;
+                    let outputs = fallback_plan
+                        .get("params")
+                        .and_then(Value::as_array)
+                        .filter(|a| !a.is_empty())
+                        .ok_or_else(|| {
+                            fault(format!(
+                                "{fallback}.json declares no words a proposal can fill"
+                            ))
+                        })?
+                        .clone();
+                    if fallback_plan.get("hosts") != spec.get("hosts")
+                        || !fallback_plan
+                            .get("about")
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| s.starts_with("READ-ONLY"))
+                        || fallback_plan
+                            .get("requires_approval")
+                            .is_some_and(|v| v != &json!(false))
+                    {
+                        return Err(fault(format!(
+                            "{name}.json no_growth_plan_verb {fallback} must be a same-host read-only plan"
+                        )));
+                    }
+                    let owners: Vec<&str> = rows
+                        .iter()
+                        .filter(|(_, s)| {
+                            s.get("plan_verb").and_then(Value::as_str) == Some(fallback)
+                        })
+                        .map(|(n, _)| *n)
+                        .collect();
+                    let [owner] = owners.as_slice() else {
+                        return Err(fault(format!(
+                            "{name}.json no_growth_plan_verb {fallback} must be the plan of exactly one verb, found {owners:?}"
+                        )));
+                    };
+                    let owner_spec = rows
+                        .iter()
+                        .find(|(n, _)| n == owner)
+                        .map(|(_, s)| s)
+                        .ok_or_else(|| fault("the owning verb left the registry"))?;
+                    let owner_params = owner_spec
+                        .get("params")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| fault(format!("{owner}.json has no params")))?;
+                    if owner_spec.get("requires_approval") != Some(&json!(true))
+                        || owner_spec.get("hosts") != spec.get("hosts")
+                        || !owner_spec
+                            .get("approvers")
+                            .and_then(Value::as_array)
+                            .is_some_and(|a| {
+                                !a.is_empty()
+                                    && a.iter().all(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+                            })
+                        || owner_params.len() != outputs.len() + 1
+                        || owner_params[..outputs.len()] != outputs[..]
+                        || owner_params.last().and_then(|p| p.get("name"))
+                            != Some(&json!("plan_sha256"))
+                    {
+                        return Err(fault(format!(
+                            "{name}.json no_growth_plan_verb {fallback} must be the plan of a same-host \
+                             passkey-gated verb with named approvers that takes its words and then the signed hash"
+                        )));
+                    }
+                    Some(NoGrowth {
+                        plan_verb: fallback.into(),
+                        outputs,
+                        mutation: (*owner).into(),
+                    })
+                }
+            };
             result.push(Discovery {
                 mutation: (*name).into(),
                 host: host.into(),
@@ -202,6 +327,7 @@ fn index(files: &[(&str, &str)]) -> Result<Vec<Discovery>, HandlerError> {
                 inputs,
                 outputs: params[..params.len() - 1].to_vec(),
                 plan_verb: plan_verb.into(),
+                no_growth,
             });
         }
     }
@@ -324,6 +450,20 @@ struct NativeProposal {
     args: Vec<String>,
     plan: String,
     plan_sha256: String,
+    /// Only a no-growth proposal carries it, and must: its `args` are a
+    /// volume and a replica, so the claim discovery was asked about is
+    /// conserved here instead of in the first words.
+    #[serde(default)]
+    target: Option<Vec<String>>,
+}
+
+/// The no-growth fallback this proposal answers under, if it names that
+/// fallback's plan verb.
+fn no_growth_of<'a>(declaration: &'a Discovery, proposal: &Value) -> Option<&'a NoGrowth> {
+    declaration
+        .no_growth
+        .as_ref()
+        .filter(|n| proposal["verb"] == n.plan_verb.as_str())
 }
 
 fn decoded_proposal(
@@ -364,22 +504,42 @@ fn decoded_proposal(
             "stdout is not one unambiguous complete JSON proposal: {e}"
         ))
     })?;
-    let proposal = json!({
+    let mut proposal = json!({
         "verb": native.verb, "args": native.args,
         "plan": native.plan, "plan_sha256": native.plan_sha256,
     });
-    let object = proposal
-        .as_object()
-        .filter(|o| o.len() == 4)
-        .ok_or_else(|| fault("proposal needs exactly verb, args, plan, plan_sha256"))?;
-    if object.get("verb").and_then(Value::as_str) != Some(declaration.plan_verb.as_str()) {
-        return Err(fault(
-            "proposal plan verb differs from its registry declaration",
-        ));
-    }
-    let args = declared_args(&proposal["args"], &declaration.outputs).map_err(fault)?;
-    if !args.starts_with(inputs) {
-        return Err(fault("proposal changes the discovery target"));
+    match (no_growth_of(declaration, &proposal), native.target) {
+        // The explicit-size proposal: its first words ARE the claim.
+        (None, None) => {
+            if proposal["verb"] != declaration.plan_verb.as_str() {
+                return Err(fault(
+                    "proposal plan verb differs from its registry declaration",
+                ));
+            }
+            let args = declared_args(&proposal["args"], &declaration.outputs).map_err(fault)?;
+            if !args.starts_with(inputs) {
+                return Err(fault("proposal changes the discovery target"));
+            }
+        }
+        (None, Some(_)) => {
+            return Err(fault(
+                "only a no-growth proposal carries a separate target; this one names another verb",
+            ));
+        }
+        // The no-growth proposal: the declared fallback plan's own words,
+        // and the claim discovery was asked about, conserved exactly.
+        (Some(fallback), Some(target)) => {
+            declared_args(&proposal["args"], &fallback.outputs).map_err(fault)?;
+            if target != inputs {
+                return Err(fault("proposal changes the discovery target"));
+            }
+            proposal["target"] = json!(target);
+        }
+        (Some(_), None) => {
+            return Err(fault(
+                "a no-growth proposal does not say which claim it answers",
+            ));
+        }
     }
     let plan = proposal["plan"]
         .as_str()
@@ -576,11 +736,15 @@ impl OpsDiscoveredRemedies {
             .as_i64()
             .filter(|n| *n > 0 && chrono::Duration::try_hours(*n).is_some())
             .ok_or_else(|| fault("discovery window is invalid"))?;
-        let final_target = target(
-            declaration,
-            finding,
-            declared_args(&proposal["args"], &declaration.outputs).map_err(fault)?,
-        );
+        // A no-growth proposal has no size to give the expansion: the
+        // final request's guards are read on the finding alone, exactly as
+        // the comparison read them before it asked.
+        let no_growth = no_growth_of(declaration, &proposal);
+        let final_args = match no_growth {
+            Some(_) => vec![],
+            None => declared_args(&proposal["args"], &declaration.outputs).map_err(fault)?,
+        };
+        let final_target = target(declaration, finding, final_args);
         let Some((mut body, _)) = self
             .handler
             .prepare_one(
@@ -621,6 +785,95 @@ impl OpsDiscoveredRemedies {
             return Err(fault(
                 "discovery episode identity is not its deterministic admission",
             ));
+        }
+        if let Some(fallback) = no_growth {
+            // NO GROWTH, ONE DECISIVE MOVE (design ada8f698, option A).
+            // The expansion request is NOT filed — there is no size to
+            // sign — and neither is the move: what is filed is the
+            // read-only plan the native read proposed, once per final
+            // episode, so the plan a person would sign is on the record
+            // beside the evidence that named it. Filing the passkey-gated
+            // move stays a person's act.
+            let plan_target = Remedy {
+                verb: fallback.plan_verb.clone(),
+                host: declaration.host.clone(),
+                findings: vec![finding.into()],
+                args: declared_args(&proposal["args"], &fallback.outputs).map_err(fault)?,
+                target: Some(format!("{finding}:no-growth-plan:{final_id}")),
+            };
+            let Some((mut plan_body, _)) = self
+                .handler
+                .prepare_one(&plan_target, &plan_target.findings, hours, now, ctx)
+                .await?
+            else {
+                return Ok(());
+            };
+            let metadata = plan_body["metadata"]
+                .as_object_mut()
+                .ok_or_else(|| fault("request metadata is not an object"))?;
+            metadata.remove("requires_approval");
+            metadata.insert(
+                "discovered_proposal".into(),
+                json!({
+                    "request": job_id, "step": step_id,
+                    "stdout": step["metadata"]["streams"]["stdout"],
+                    "comparison_event": link["comparison_event"], "proposal": proposal,
+                    "proposes": fallback.mutation,
+                }),
+            );
+            post_json(
+                &self.handler.client,
+                &format!("{}/api/jobs", self.handler.base()),
+                &plan_body,
+                &ctx.rule_name,
+            )
+            .await?;
+            // SAID ON THE ALARM, where the person deciding reads: which
+            // request holds the plan, and which verb is theirs to file.
+            // Deterministic, so a redelivery writes nothing new; and NOT
+            // FATAL, as the held note is not (backlog e5ff616f) — the plan
+            // request stands whether or not this lands.
+            let key = format!("remedy_proposed:{}", plan_target.subject());
+            let note = json!({
+                "verb": fallback.mutation, "plan_verb": fallback.plan_verb,
+                "host": declaration.host, "args": plan_target.args,
+                "plan_request": plan_body["id"], "plan_sha256": proposal["plan_sha256"],
+                "discovery": job_id,
+                "note": format!(
+                    "No growth fits this claim, and the native read found exactly one replica move \
+                     after which every remaining replica disk admits growth. Its plan is rendered \
+                     read-only by request {}; nothing was moved. To act on it, file {} on {} with \
+                     these words — it runs only on the plan a passkey signs.",
+                    plan_body["id"].as_str().unwrap_or("unknown"),
+                    fallback.mutation,
+                    declaration.host
+                ),
+            });
+            for alarm in alarms.iter().filter(|a| {
+                a["status"] == "open"
+                    && carries(a, &plan_target.findings)
+                    && a["metadata"].get(&key) != Some(&note)
+            }) {
+                let Some(id) = alarm["id"].as_str() else {
+                    continue;
+                };
+                if let Err(e) = write_json(
+                    &self.handler.client,
+                    reqwest::Method::PATCH,
+                    &format!("{}/api/jobs/{id}/metadata", self.handler.base()),
+                    &json!({ key.clone(): note }),
+                    &ctx.rule_name,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        alarm = %id,
+                        error = %e,
+                        "ops.discover_remedies: the proposed-move note on the alarm was not written — the plan request stands"
+                    );
+                }
+            }
+            return Ok(());
         }
         body["metadata"]["discovered_proposal"] = json!({
             "request": job_id, "step": step_id, "stdout": step["metadata"]["streams"]["stdout"],
@@ -716,6 +969,7 @@ mod tests {
         let reads = rows.clone();
         let writes = rows.clone();
         let objects = rows.clone();
+        let notes = rows.clone();
         let app = Router::new().route("/api/jobs",get(move |Query(query):Query<BTreeMap<String,String>>| {
             let rows = reads.clone(); async move {
                 let values: Vec<Value> = rows.lock().unwrap().values().filter(|row|
@@ -737,6 +991,19 @@ mod tests {
             }]}))}
         })).route("/api/jobs/{id}",get(move |Path(id):Path<String>| {
             let rows = objects.clone(); async move { Json(rows.lock().unwrap().get(&id).unwrap().clone()) }
+        })).route("/api/jobs/{id}/metadata",axum::routing::patch(move |Path(id):Path<String>, Json(body):Json<Value>| {
+            // The jobs API's merge door: top-level keys merged into metadata.
+            let rows = notes.clone(); async move {
+                let mut rows = rows.lock().unwrap();
+                let row = rows.get_mut(&id).unwrap();
+                if row["refuses_notes"] == true {
+                    return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+                }
+                for (key, value) in body.as_object().unwrap() {
+                    row["metadata"][key] = value.clone();
+                }
+                Ok(Json(json!({"id":id})))
+            }
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -910,18 +1177,322 @@ mod tests {
         );
     }
 
+    const VOLUME: &str = "pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56";
+    const FINDING: &str = "disk_tight:boss/pgdata-postgres-0";
+    const ALARM: &str = "a134b7ac-0000-4000-8000-000000000001";
+
+    /// What the native discovery answers when no growth fits and exactly
+    /// one replica move is decisive (design ada8f698, option A): the
+    /// existing move plan for that replica, and the claim it answers.
+    fn move_proposal() -> Value {
+        let plan = "plan: move-volume-replica\nA fixture plan, not a live placement claim.\n";
+        json!({"verb":"plan-a-volume-replica-move",
+            "args":[VOLUME, format!("{VOLUME}-r-ae04deab")],
+            "target":["boss","pgdata-postgres-0"],
+            "plan":plan,"plan_sha256":format!("{:x}",Sha256::digest(plan.as_bytes()))})
+    }
+    fn open_alarm() -> Value {
+        json!({"id":ALARM,"kind":"backlog-item","status":"open",
+            "metadata":{"estate_finding":FINDING}})
+    }
+    fn verbs_of(rows: &Rows) -> Vec<String> {
+        rows.lock()
+            .unwrap()
+            .values()
+            .filter(|r| r["kind"] == "ops-request")
+            .map(|r| r["metadata"]["verb"].as_str().unwrap().to_string())
+            .collect()
+    }
+
     #[tokio::test]
-    async fn failed_no_growth_and_partial_native_reads_never_file_an_approval() {
-        for mode in ["no-growth", "partial", "wrong-target"] {
+    async fn a_no_growth_proposal_files_only_the_read_only_move_plan_and_says_so_on_the_alarm() {
+        let (handler, rows, id, ctx) = requested().await;
+        rows.lock().unwrap().insert(ALARM.into(), open_alarm());
+        answer(&rows, &id, execute(&move_proposal()));
+        let completion = OpsDiscoveredRemedies { handler };
+        completion.complete(verb_files(), &ctx).await.unwrap();
+        // A redelivery finds the plan request and files nothing more.
+        completion.complete(verb_files(), &ctx).await.unwrap();
+        let mut verbs = verbs_of(&rows);
+        verbs.sort();
+        assert_eq!(
+            verbs,
+            [
+                "plan-a-volume-replica-move",
+                "plan-the-largest-instance-volume-expansion"
+            ],
+            "the discovery and ONE read-only plan request: never the move, never an expansion"
+        );
+        let rows = rows.lock().unwrap();
+        let plan = rows
+            .values()
+            .find(|r| r["metadata"]["verb"] == "plan-a-volume-replica-move")
+            .unwrap();
+        assert_eq!(plan["metadata"]["host"], "forge");
+        assert_eq!(plan["metadata"]["args"], move_proposal()["args"]);
+        assert!(
+            plan["metadata"].get("requires_approval").is_none(),
+            "a plan request asks for no approval and can run no write: {plan}"
+        );
+        assert!(plan.get("steps").is_none(), "filing authors no step");
+        let provenance = &plan["metadata"]["discovered_proposal"];
+        assert_eq!(provenance["proposal"], move_proposal());
+        assert_eq!(provenance["request"], id);
+        assert_eq!(provenance["step"], STEP);
+        assert_eq!(
+            provenance["stdout"], rows[&id]["steps"][0]["metadata"]["streams"]["stdout"],
+            "the native byte receipt is copied, not retyped"
+        );
+        assert_eq!(provenance["proposes"], "move-volume-replica");
+        // The reader of the alarm learns what was proposed and where.
+        let noted = rows[ALARM]["metadata"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(key, _)| key.starts_with("remedy_proposed:"))
+            .map(|(_, value)| value.clone())
+            .expect("the open alarm says a move was proposed");
+        assert_eq!(noted["plan_request"], plan["id"]);
+        assert_eq!(noted["verb"], "move-volume-replica");
+        assert_eq!(noted["args"], move_proposal()["args"]);
+        assert_eq!(noted["plan_sha256"], move_proposal()["plan_sha256"]);
+    }
+
+    #[test]
+    fn a_no_growth_proposal_must_conserve_the_claim_and_the_plan_verbs_declared_words() {
+        let d = declaration();
+        let inputs = vec!["boss".into(), "pgdata-postgres-0".into()];
+        assert_eq!(
+            decoded_proposal(&execute(&move_proposal()), &d, &inputs).unwrap(),
+            move_proposal()
+        );
+        let mut cases = Vec::new();
+        for (pointer, value) in [
+            // The claim it answers must be the claim discovery was asked.
+            ("/target", json!(["boss-playground", "pgdata-postgres-0"])),
+            ("/target", json!(["boss"])),
+            ("/target", json!([])),
+            ("/target", json!("boss/pgdata-postgres-0")),
+            // The words must be the plan verb's own: a volume, its replica.
+            ("/args", json!([VOLUME])),
+            ("/args", json!([VOLUME, "r-ae04deab"])),
+            (
+                "/args",
+                json!(["pgdata-postgres-0", format!("{VOLUME}-r-ae04deab")]),
+            ),
+            (
+                "/args",
+                json!([VOLUME, format!("{VOLUME}-r-ae04deab"), "0".repeat(64)]),
+            ),
+            // Never the mutation, nor any other verb.
+            ("/verb", json!("move-volume-replica")),
+            ("/verb", json!("plan-a-volume-replica-retirement")),
+            ("/plan_sha256", json!("0".repeat(64))),
+            ("/plan", json!("")),
+        ] {
+            let mut bad = move_proposal();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            cases.push(bad);
+        }
+        let mut untargeted = move_proposal();
+        untargeted.as_object_mut().unwrap().remove("target");
+        cases.push(untargeted);
+        let mut extra = move_proposal();
+        extra["authority"] = json!("approved");
+        cases.push(extra);
+        // An explicit-size proposal has no separate target to carry: its
+        // own first words are the claim.
+        let mut targeted_growth = proposal();
+        targeted_growth["target"] = json!(["boss", "pgdata-postgres-0"]);
+        cases.push(targeted_growth);
+        for bad in cases {
+            assert!(
+                decoded_proposal(&execute(&bad), &d, &inputs).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_final_guards_and_a_cleared_finding_stop_a_no_growth_plan_too() {
+        for row in [
+            incumbent("open", 200, false),
+            incumbent("closed", 1, false),
+            incumbent("closed", 200, true),
+        ] {
+            let (handler, rows, id, ctx) = requested().await;
+            answer(&rows, &id, execute(&move_proposal()));
+            rows.lock()
+                .unwrap()
+                .insert(row["id"].as_str().unwrap().into(), row);
+            OpsDiscoveredRemedies { handler }
+                .complete(verb_files(), &ctx)
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.lock().unwrap().len(),
+                2,
+                "an open, recent or declined expansion request answers the finding: no plan"
+            );
+        }
+        let latest = json!({"scope":"instance-volumes","findings":{"disk_tight":[]}});
+        let (handler, rows, id, ctx) = requested_with_comparison(latest).await;
+        answer(&rows, &id, execute(&move_proposal()));
+        OpsDiscoveredRemedies { handler }
+            .complete(verb_files(), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.lock().unwrap().len(),
+            1,
+            "a cleared finding needs none"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_alarm_note_that_cannot_be_written_does_not_unfile_the_plan() {
+        // The note is observability: this alarm's merge door answers 500,
+        // and the plan request still stands and the firing still succeeds.
+        let (handler, rows, id, ctx) = requested().await;
+        let mut alarm = open_alarm();
+        alarm["refuses_notes"] = json!(true);
+        rows.lock().unwrap().insert(ALARM.into(), alarm.clone());
+        answer(&rows, &id, execute(&move_proposal()));
+        let completion = OpsDiscoveredRemedies { handler };
+        completion.complete(verb_files(), &ctx).await.unwrap();
+        assert_eq!(verbs_of(&rows).len(), 2);
+        assert_eq!(rows.lock().unwrap()[ALARM], alarm, "nothing was written");
+    }
+
+    #[test]
+    fn the_no_growth_fallback_is_a_read_only_plan_one_passkey_verb_owns() {
+        let d = declaration();
+        let fallback = d.no_growth.expect("the registry declares the fallback");
+        assert_eq!(fallback.plan_verb, "plan-a-volume-replica-move");
+        assert_eq!(fallback.mutation, "move-volume-replica");
+        for (name, pointer, value) in [
+            // The mutation itself, or anything needing approval.
+            (
+                "expand-instance-volume",
+                "/discovery_remedies/0/no_growth_plan_verb",
+                json!("move-volume-replica"),
+            ),
+            // A verb the registry does not hold.
+            (
+                "expand-instance-volume",
+                "/discovery_remedies/0/no_growth_plan_verb",
+                json!("plan-nothing-at-all"),
+            ),
+            // The explicit-size plan is not its own fallback.
+            (
+                "expand-instance-volume",
+                "/discovery_remedies/0/no_growth_plan_verb",
+                json!("plan-an-instance-volume-expansion"),
+            ),
+            // A read-only verb no passkey-gated verb names as its plan.
+            (
+                "expand-instance-volume",
+                "/discovery_remedies/0/no_growth_plan_verb",
+                json!("pod-logs"),
+            ),
+            (
+                "expand-instance-volume",
+                "/discovery_remedies/0/no_growth_plan_verb",
+                json!(["plan-a-volume-replica-move"]),
+            ),
+            ("plan-a-volume-replica-move", "/about", json!("MUTATING")),
+            (
+                "plan-a-volume-replica-move",
+                "/requires_approval",
+                json!(true),
+            ),
+            ("plan-a-volume-replica-move", "/hosts", json!(["boss-gcp"])),
+            ("move-volume-replica", "/requires_approval", json!(false)),
+            ("move-volume-replica", "/approvers", json!([])),
+            ("move-volume-replica", "/params/2/name", json!("unsigned")),
+        ] {
+            let mut files: Vec<(String, String)> = verb_files()
+                .iter()
+                .map(|(name, text)| ((*name).into(), (*text).into()))
+                .collect();
+            let (_, text) = files.iter_mut().find(|(n, _)| n == name).unwrap();
+            let mut spec: Value = serde_json::from_str(text).unwrap();
+            if let Some(field) = spec.pointer_mut(pointer) {
+                *field = value;
+            } else {
+                spec["requires_approval"] = value;
+            }
+            *text = spec.to_string();
+            let borrowed: Vec<(&str, &str)> = files
+                .iter()
+                .map(|(n, s)| (n.as_str(), s.as_str()))
+                .collect();
+            assert!(index(&borrowed).is_err(), "{name}{pointer} must refuse");
+        }
+        // A fifth key of any other name is not a declaration this reads.
+        let mut files: Vec<(String, String)> = verb_files()
+            .iter()
+            .map(|(name, text)| ((*name).into(), (*text).into()))
+            .collect();
+        let (_, text) = files
+            .iter_mut()
+            .find(|(n, _)| n == "expand-instance-volume")
+            .unwrap();
+        let mut spec: Value = serde_json::from_str(text).unwrap();
+        let entry = spec["discovery_remedies"][0].as_object_mut().unwrap();
+        let verb = entry.remove("no_growth_plan_verb").unwrap();
+        entry.insert("also_files".into(), verb);
+        *text = spec.to_string();
+        let borrowed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(n, s)| (n.as_str(), s.as_str()))
+            .collect();
+        assert!(index(&borrowed).is_err());
+    }
+
+    /// DELIBERATELY CHANGED with the no-growth fallback (design ada8f698):
+    /// this test pinned "no growth never files", which is no longer the
+    /// whole truth — a no-growth ANSWER (exit 0, a typed move proposal)
+    /// now files a read-only plan request, tested above. What it still
+    /// pins, by its new name, is the other half: a native REFUSAL — every
+    /// exit-78 the decisive read gives (two short disks, a destination
+    /// that does not admit, an unhealthy volume, a ceiling) — a partial
+    /// byte record and a wrong target file NOTHING, of any verb, and the
+    /// failure stays loud as this handler's permanent error.
+    #[tokio::test]
+    async fn refused_no_growth_and_partial_native_reads_file_no_request_of_any_verb() {
+        for mode in [
+            "no-growth-refused",
+            "cannot-answer",
+            "partial",
+            "wrong-target",
+            "partial-move",
+            "wrong-move-target",
+        ] {
             let (handler, rows, id, ctx) = requested().await;
             let mut step = execute(&proposal());
             match mode {
-                "no-growth" => {
+                "no-growth-refused" => {
                     step["metadata"]["exit_code"] = json!("78");
-                    step["metadata"]["output"] =
-                        json!("REFUSED: no growth fits; no replica selected");
+                    step["metadata"]["streams"]["stdout"] = stream(b"");
+                    step["metadata"]["output"] = json!(
+                        "REFUSED — no replica move is proposed for boss/pgdata-postgres-0 — 2 replica disks are short"
+                    );
+                }
+                "cannot-answer" => {
+                    step["metadata"]["exit_code"] = json!("1");
+                    step["metadata"]["streams"]["stdout"] = stream(b"");
                 }
                 "partial" => step["metadata"]["streams"]["stdout"]["complete"] = json!(false),
+                "partial-move" => {
+                    step = execute(&move_proposal());
+                    step["metadata"]["streams"]["stdout"]["complete"] = json!(false);
+                }
+                "wrong-move-target" => {
+                    let mut p = move_proposal();
+                    p["target"][1] = json!("wrong");
+                    step = execute(&p);
+                }
                 _ => {
                     let mut p = proposal();
                     p["args"][1] = json!("wrong");

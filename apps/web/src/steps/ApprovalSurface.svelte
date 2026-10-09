@@ -184,12 +184,11 @@
         return;
       }
       const required = target.signOffsRequired;
-      // The ticket this gesture's own ceremony was issued, if one ran.
-      // The completion below carries it: the jobs API judges a
-      // presence-gated step again on the request that completes it, and
-      // a bare PUT after the presence stamp answered 422 (backlog
-      // b568044a). Same step, same person, same shape — nothing wider.
-      let presenceTicket: string | undefined;
+      // The ceremony's ticket rides the stamp it was run for and is not
+      // kept: the completion below is sent bare, because a step that
+      // names sign-off roles completes on the live passkey stamps it
+      // holds (design 1ce67f7e — this surface used to carry the ticket
+      // on to the completion, backlog b568044a).
       if (required.includes(role)) {
         let stamp = await fetch(`/api/jobs/${job}/steps/${target.id}/sign-offs`, {
           method: 'POST',
@@ -219,7 +218,6 @@
               },
               body: JSON.stringify({ role }),
             });
-            presenceTicket = ticket;
           } catch (e) {
             signError = e instanceof Error ? e.message : String(e);
             // The decision DID land — refresh so the surface renders
@@ -238,21 +236,21 @@
         }
       }
       if (d === 'approved' || d === 'rejected') {
-        // A completion refused for presence — no ticket after a reload,
-        // this gesture's ticket past its life, or a presence step whose
-        // sign-offs this user's role does not carry — is answered with
-        // ONE tap on the step as shown and ONE retry (backlog 3ce3c15f).
+        // Sent bare. A completion refused {required: "presence"} — a
+        // presence step that names no sign-off role, whose completion is
+        // its only act — is answered with ONE tap on the step as shown
+        // and ONE retry (backlog 3ce3c15f).
         const done = await completeWithPresence(
           job,
           target.id,
           { title: target.title, metadata: shownAfter(target.metadata, body.metadata) },
           shownNow,
-          presenceTicket,
           controller.signal,
         );
-        // 409 (stamps missing or stale) renders as the same
-        // "sign-offs outstanding: …" line as before — describeWriteFailure
-        // names the roles from the conflict body.
+        // Stamps missing, stale or past their age (409, or the 422 of a
+        // presence step whose stamps do not carry it) render as the same
+        // "sign-offs outstanding: …" line — describeWriteFailure names
+        // the roles from the refusal body, with the server's reason.
         if (done.kind === 'failed') signError = done.error;
       }
       onUpdate();

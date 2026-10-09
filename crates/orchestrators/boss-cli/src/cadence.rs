@@ -367,12 +367,16 @@ pub(crate) fn firing_id(rule: &str, window: DateTime<Utc>) -> String {
 /// the rule is due for that window and no firing for it is recorded
 /// yet. `dock_depth` is the parked-ready-car count when the tick
 /// probed it (`None` = not probed or probe failed — queue-depth
-/// rules hold rather than fire blind).
+/// rules hold rather than fire blind). `last_boarding` is when the newest
+/// train on record was opened (`read_last_boarding`), handed in only for
+/// a departing queue-depth rule whose last claim recorded no outcome;
+/// `None` everywhere else, and when that record could not be read.
 pub(crate) fn due_window(
     rule: &CadenceRule,
     now: DateTime<Utc>,
     last: Option<&LastFiring>,
     dock_depth: Option<u32>,
+    last_boarding: Option<DateTime<Utc>>,
 ) -> Option<DateTime<Utc>> {
     let window = match &rule.basis {
         Basis::Wall { every_minutes } => {
@@ -475,10 +479,34 @@ pub(crate) fn due_window(
             // recorded means the run is still in flight or was cut off
             // mid-verb, and re-firing under it would double-board. Only a
             // KNOWN boarded-nothing outcome opens the window early.
+            //
+            // WHAT IT IS HELD FROM (backlog a940e83b). A claim with no
+            // outcome says a verb STARTED, not that a train left, and the
+            // cooldown is "at most one boarding per cooldown". So where
+            // the last boarding on record is in hand, that claim holds
+            // from the BOARDING — the one it opened, or the one before it
+            // when it opened none — and not from its own claim time. Read
+            // from the claim, every landing cost the next car a second
+            // cooldown: the board that fires as the track clears is the
+            // one the landing's own converge cuts off
+            // (`needs_the_boarding_record`). Without the record the claim
+            // holds from itself, as it did before.
+            //
+            // TWIN, NOT YET MOVED: `boss_jobs::yard::boarding_hold` states
+            // "cooldown — M min left" from the depth rule's last claim
+            // alone. For a cut-off claim it now over-states the wait until
+            // this loop's next tick replaces the claim — a minute or two
+            // per landing, where it used to be right about a wrong half
+            // hour. The yard has no train openings in that function's
+            // inputs; handing it one is its own car.
             let last_did_no_work = last.is_some_and(|l| l.rc.is_some_and(|rc| rc != 0));
-            if let Some(last) = last
-                && !last_did_no_work
-                && now - last.fired_at < Duration::minutes(i64::from(*cooldown_minutes))
+            let held_from =
+                last.filter(|_| !last_did_no_work)
+                    .map(|l| match (l.rc, last_boarding) {
+                        (None, Some(boarding)) => boarding,
+                        _ => l.fired_at,
+                    });
+            if held_from.is_some_and(|t| now - t < Duration::minutes(i64::from(*cooldown_minutes)))
             {
                 return None;
             }
@@ -550,8 +578,9 @@ pub(crate) fn decide(
     dock_depth: Option<u32>,
     open_trains: Option<u32>,
     running: &[RunSnapshot],
+    last_boarding: Option<DateTime<Utc>>,
 ) -> Decision {
-    let Some(window) = due_window(rule, now, last, dock_depth) else {
+    let Some(window) = due_window(rule, now, last, dock_depth, last_boarding) else {
         return Decision::Hold;
     };
     if departs_a_train(&rule.verb) {
@@ -1129,6 +1158,153 @@ async fn probe_open_trains(http: &boss_core::machine_token::Client, base: &str) 
     Ok(track_holders(&listed))
 }
 
+/// What the loop learned about the last boarding on record, for one rule
+/// on one tick.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BoardingRead {
+    /// The rule's cooldown does not need it this tick: not a departing
+    /// queue-depth rule, its last claim has an outcome (or it never
+    /// fired), or this loop is itself still running that claim.
+    NotAsked,
+    /// The newest train on record was opened then.
+    At(DateTime<Utc>),
+    /// It could not be read, or no train is on record. The reason is the
+    /// journal's: the claim then holds its cooldown from its own claim
+    /// time, which is what every such claim did before a940e83b.
+    Unread(String),
+}
+
+impl BoardingRead {
+    /// What `due_window` is handed: a boarding only when one was READ.
+    /// An unread record is `None`, never an old date — an old date would
+    /// board on a record nobody read.
+    pub(crate) fn in_hand(&self) -> Option<DateTime<Utc>> {
+        match self {
+            BoardingRead::At(t) => Some(*t),
+            BoardingRead::NotAsked | BoardingRead::Unread(_) => None,
+        }
+    }
+
+    /// The journal line an unread record owes, naming the claim that now
+    /// holds from itself; nothing for a read that was made or not needed.
+    pub(crate) fn unread_line(&self, rule: &str, last: Option<&LastFiring>) -> Option<String> {
+        match (self, last) {
+            (BoardingRead::Unread(why), Some(l)) => Some(boarding_unread_line(rule, l, why)),
+            _ => None,
+        }
+    }
+}
+
+/// Does this rule's cooldown need the boarding record this tick?
+///
+/// THE DEFECT (backlog a940e83b, measured 2026-10-07). The cooldown was
+/// never kept in memory and never counted from process start: it is read
+/// every tick from the rule's last recorded firing, which a restart does
+/// not touch. What a restart DOES leave behind is a claim with no
+/// outcome. The track clears the minute a train merges, so the board
+/// fires within a tick of the merge and spends the next two or three
+/// minutes in its consist check; that same merge's converge rolls the
+/// conductor pod two to four minutes later, mid-board. The claim stands,
+/// its outcome is never written, and `due_window` read "no outcome" as
+/// "still in flight — hold a whole cooldown from the claim". Train 19:09
+/// merged 20:02:21Z, the pod restarted 20:05:40Z, and the next boarding
+/// was 20:36:30Z; train 22:22 merged 23:04:36Z, the claim
+/// `cadence:train-board-on-dock-depth:2026-10-07T23:05Z` still reads
+/// `rc: null`, the new pod logged "3 car(s) boardable" at 23:07Z, and
+/// nothing boarded for the half hour after it.
+///
+/// So only that case asks: a queue-depth rule whose verb departs a
+/// train, whose last claim has no outcome, and which this loop is not
+/// itself running (its own in-flight run is the per-rule guard's, and a
+/// read per tick for it would buy nothing).
+pub(crate) fn needs_the_boarding_record(
+    rule: &CadenceRule,
+    last: Option<&LastFiring>,
+    running: &[RunSnapshot],
+) -> bool {
+    matches!(rule.basis, Basis::QueueDepth { .. })
+        && departs_a_train(&rule.verb)
+        && last.is_some_and(|l| l.rc.is_none())
+        && !running.iter().any(|r| r.rule == rule.name)
+}
+
+/// When a train packet was opened: the `opened_at` column, else the
+/// metadata stamp of the same name.
+fn train_opened_at(train: &Value) -> Option<DateTime<Utc>> {
+    [
+        train.get("opened_at"),
+        train.get("metadata").and_then(|m| m.get("opened_at")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .find_map(|s| DateTime::parse_from_rfc3339(s).ok())
+    .map(|t| t.with_timezone(&Utc))
+}
+
+/// The pure half of the read: the newest opening among the rows of the
+/// list's first page. The list answers newest first (`list_jobs` orders
+/// by `opened_on` then `created_at`, pinned on both adapters), so the
+/// newest train is on any first page; the maximum is taken rather than
+/// row 0 because `created_at` is the database's clock and `opened_at`
+/// the boss-clock's, and this must not rest on the two agreeing. A row whose
+/// opening cannot be read makes the whole answer unread — a boarding that
+/// may be the newest must never be skipped, or the board leaves early.
+pub(crate) fn newest_boarding(trains: &[Value]) -> std::result::Result<DateTime<Utc>, String> {
+    let mut newest: Option<DateTime<Utc>> = None;
+    for t in trains {
+        let Some(at) = train_opened_at(t) else {
+            let id = t.get("id").and_then(Value::as_str).unwrap_or("?");
+            return Err(format!("train {id} carries no readable opened_at"));
+        };
+        newest = Some(newest.map_or(at, |n| n.max(at)));
+    }
+    newest.ok_or_else(|| "no train is on record".to_string())
+}
+
+/// Read the last boarding on record for a rule that needs it: the newest
+/// pr-train packet of ANY status — open, arrived or cancelled, each is a
+/// boarding that happened. The record already exists; nothing new is
+/// kept (a940e83b). Never an error: an unread record is an answer the
+/// caller journals and then holds on.
+pub(crate) async fn read_last_boarding(
+    http: &boss_core::machine_token::Client,
+    base: &str,
+    rule: &CadenceRule,
+    last: Option<&LastFiring>,
+    running: &[RunSnapshot],
+) -> BoardingRead {
+    if !needs_the_boarding_record(rule, last, running) {
+        return BoardingRead::NotAsked;
+    }
+    let listed = api(
+        http,
+        reqwest::Method::GET,
+        base,
+        "/api/jobs?kind=pr-train&limit=5",
+        None,
+    )
+    .await
+    .and_then(train::rows);
+    match listed {
+        Err(e) => BoardingRead::Unread(format!("{e:#}")),
+        Ok(rows) => match newest_boarding(&rows) {
+            Ok(at) => BoardingRead::At(at),
+            Err(why) => BoardingRead::Unread(why),
+        },
+    }
+}
+
+/// The journal line for a claim that falls back to its own claim time.
+pub(crate) fn boarding_unread_line(rule: &str, last: &LastFiring, why: &str) -> String {
+    format!(
+        "{rule}: claim {} recorded no outcome and the last boarding could not be read ({why}) — \
+         holding the cooldown from the claim itself ({}), never boarding on a record not read",
+        last.firing_id,
+        last.fired_at.format("%Y-%m-%dT%H:%M:%SZ")
+    )
+}
+
 /// The pure count behind the probe: the open trains that hold the track.
 pub(crate) fn track_holders(open_trains: &[Value]) -> u32 {
     let n = open_trains
@@ -1441,7 +1617,21 @@ async fn tick(
                 continue;
             }
         };
-        let window = match decide(rule, now, last.as_ref(), dock_depth, open_trains, &running) {
+        // A claim with no outcome is judged against the boarding ON
+        // RECORD, not against its own claim time (backlog a940e83b).
+        let boarding = read_last_boarding(http, base, rule, last.as_ref(), &running).await;
+        if let Some(line) = boarding.unread_line(&rule.name, last.as_ref()) {
+            log(line);
+        }
+        let window = match decide(
+            rule,
+            now,
+            last.as_ref(),
+            dock_depth,
+            open_trains,
+            &running,
+            boarding.in_hand(),
+        ) {
             Decision::Hold => continue,
             Decision::StillRunning(elapsed) => {
                 log(still_running_line(&rule.name, elapsed));
@@ -2180,7 +2370,7 @@ mod tests {
         // The following Friday, after the window: due.
         let friday = utc(2026, 9, 4, 6, 30, 0);
         assert_eq!(
-            due_window(&rule, friday, None, None),
+            due_window(&rule, friday, None, None, None),
             Some(utc(2026, 9, 4, 6, 10, 0)),
             "a weekly rule must fire on its anchor weekday"
         );
@@ -2188,7 +2378,7 @@ mod tests {
         // Friday, not today — and if that already fired, nothing is due.
         let thursday = utc(2026, 9, 3, 23, 0, 0);
         assert_eq!(
-            due_window(&rule, thursday, None, None),
+            due_window(&rule, thursday, None, None, None),
             Some(utc(2026, 8, 28, 6, 10, 0))
         );
     }
@@ -2200,7 +2390,7 @@ mod tests {
         let rule = cal_rule(Cadence::Weekly, (2026, 8, 28), 6, 10);
         let early = utc(2026, 9, 4, 5, 59, 0); // Friday, before 06:10
         assert_eq!(
-            due_window(&rule, early, None, None),
+            due_window(&rule, early, None, None, None),
             Some(utc(2026, 8, 28, 6, 10, 0))
         );
     }
@@ -2211,8 +2401,11 @@ mod tests {
     fn a_calendar_window_fires_once() {
         let rule = cal_rule(Cadence::Weekly, (2026, 8, 28), 6, 10);
         let now = utc(2026, 9, 4, 6, 30, 0);
-        let w = due_window(&rule, now, None, None).unwrap();
-        assert_eq!(due_window(&rule, now, Some(&fired(&rule, w)), None), None);
+        let w = due_window(&rule, now, None, None, None).unwrap();
+        assert_eq!(
+            due_window(&rule, now, Some(&fired(&rule, w)), None, None),
+            None
+        );
     }
 
     /// A rule anchored in the FUTURE has no elapsed window, and the
@@ -2222,7 +2415,7 @@ mod tests {
     fn a_future_anchor_is_not_due_and_terminates() {
         let rule = cal_rule(Cadence::Weekly, (2027, 1, 1), 6, 10);
         assert_eq!(
-            due_window(&rule, utc(2026, 9, 4, 12, 0, 0), None, None),
+            due_window(&rule, utc(2026, 9, 4, 12, 0, 0), None, None, None),
             None
         );
     }
@@ -2235,7 +2428,7 @@ mod tests {
         let rule = cal_rule(Cadence::Monthly, (2026, 1, 31), 6, 10);
         // April has 30 days: the fire lands on the 30th.
         assert_eq!(
-            due_window(&rule, utc(2026, 4, 30, 7, 0, 0), None, None),
+            due_window(&rule, utc(2026, 4, 30, 7, 0, 0), None, None, None),
             Some(utc(2026, 4, 30, 6, 10, 0))
         );
     }
@@ -2289,11 +2482,11 @@ mod tests {
         );
         let last = fired(&rule, previous);
         assert_eq!(
-            decide(&rule, next, Some(&last), None, None, &[]),
+            decide(&rule, next, Some(&last), None, None, &[], None),
             Decision::Fire(next)
         );
         assert_eq!(
-            due_window(&rule, next, Some(&fired(&rule, next)), None),
+            due_window(&rule, next, Some(&fired(&rule, next)), None, None),
             None
         );
         assert_eq!(
@@ -2303,7 +2496,8 @@ mod tests {
                 Some(&last),
                 None,
                 None,
-                &[running("train-reconcile", 67)]
+                &[running("train-reconcile", 67)],
+                None
             ),
             Decision::StillRunning(std::time::Duration::from_secs(67))
         );
@@ -2355,7 +2549,7 @@ mod tests {
         // 06:07 sits in the 06:00 bucket of the 10-minute grid.
         let now = utc(2026, 8, 12, 6, 7, 30);
         assert_eq!(
-            due_window(&rule, now, None, None),
+            due_window(&rule, now, None, None, None),
             Some(utc(2026, 8, 12, 6, 0, 0))
         );
     }
@@ -2368,7 +2562,7 @@ mod tests {
         // Re-evaluated later in the same bucket: idempotent, no re-fire.
         for min in [0u32, 3, 9] {
             let now = utc(2026, 8, 12, 6, min, 59);
-            assert_eq!(due_window(&rule, now, Some(&last), None), None);
+            assert_eq!(due_window(&rule, now, Some(&last), None, None), None);
         }
     }
 
@@ -2378,7 +2572,7 @@ mod tests {
         let last = fired(&rule, utc(2026, 8, 12, 6, 0, 0));
         let now = utc(2026, 8, 12, 6, 10, 0);
         assert_eq!(
-            due_window(&rule, now, Some(&last), None),
+            due_window(&rule, now, Some(&last), None, None),
             Some(utc(2026, 8, 12, 6, 10, 0))
         );
     }
@@ -2391,7 +2585,7 @@ mod tests {
         let now = utc(2026, 8, 12, 6, 47, 12);
         // Only the CURRENT bucket fires — no thundering backfill.
         assert_eq!(
-            due_window(&rule, now, Some(&last), None),
+            due_window(&rule, now, Some(&last), None, None),
             Some(utc(2026, 8, 12, 6, 40, 0))
         );
     }
@@ -2406,7 +2600,7 @@ mod tests {
         let last = fired(&rule, utc(2026, 8, 11, 18, 0, 0));
         let now = utc(2026, 8, 12, 19, 0, 0);
         assert_eq!(
-            due_window(&rule, now, Some(&last), None),
+            due_window(&rule, now, Some(&last), None, None),
             Some(utc(2026, 8, 12, 18, 0, 0))
         );
     }
@@ -2417,7 +2611,7 @@ mod tests {
         let last = fired(&rule, utc(2026, 8, 12, 6, 0, 0));
         // 17:59 — the most recent elapsed window is still 06:00.
         let now = utc(2026, 8, 12, 17, 59, 0);
-        assert_eq!(due_window(&rule, now, Some(&last), None), None);
+        assert_eq!(due_window(&rule, now, Some(&last), None, None), None);
     }
 
     #[test]
@@ -2427,19 +2621,19 @@ mod tests {
         // recent elapsed window — fire it (Persistent=true semantics).
         let now = utc(2026, 8, 12, 1, 0, 0);
         assert_eq!(
-            due_window(&rule, now, None, None),
+            due_window(&rule, now, None, None, None),
             Some(utc(2026, 8, 11, 18, 0, 0))
         );
         // ... and once recorded, 01:00 holds.
         let last = fired(&rule, utc(2026, 8, 11, 18, 0, 0));
-        assert_eq!(due_window(&rule, now, Some(&last), None), None);
+        assert_eq!(due_window(&rule, now, Some(&last), None, None), None);
     }
 
     #[test]
     fn clock_fires_exactly_at_the_window_instant() {
         let rule = clock_rule();
         let now = utc(2026, 8, 12, 6, 0, 0);
-        assert_eq!(due_window(&rule, now, None, None), Some(now));
+        assert_eq!(due_window(&rule, now, None, None, None), Some(now));
     }
 
     #[test]
@@ -2450,7 +2644,7 @@ mod tests {
             basis: Basis::Clock { at: vec![] },
         };
         assert_eq!(
-            due_window(&rule, utc(2026, 8, 12, 12, 0, 0), None, None),
+            due_window(&rule, utc(2026, 8, 12, 12, 0, 0), None, None, None),
             None
         );
     }
@@ -2463,13 +2657,13 @@ mod tests {
         let now = utc(2026, 8, 12, 12, 0, 30);
         // Below threshold: hold. At and above: fire (window = the
         // evaluation minute — the id is still deterministic per minute).
-        assert_eq!(due_window(&rule, now, None, Some(3)), None);
+        assert_eq!(due_window(&rule, now, None, Some(3), None), None);
         assert_eq!(
-            due_window(&rule, now, None, Some(4)),
+            due_window(&rule, now, None, Some(4), None),
             Some(utc(2026, 8, 12, 12, 0, 0))
         );
         assert_eq!(
-            due_window(&rule, now, None, Some(9)),
+            due_window(&rule, now, None, Some(9), None),
             Some(utc(2026, 8, 12, 12, 0, 0))
         );
     }
@@ -2480,12 +2674,24 @@ mod tests {
         let last = fired(&rule, utc(2026, 8, 12, 11, 0, 0));
         // 30 minutes after a firing, a deep dock still holds...
         assert_eq!(
-            due_window(&rule, utc(2026, 8, 12, 11, 30, 0), Some(&last), Some(8)),
+            due_window(
+                &rule,
+                utc(2026, 8, 12, 11, 30, 0),
+                Some(&last),
+                Some(8),
+                None
+            ),
             None
         );
         // ... and fires again once the cooldown has fully elapsed.
         assert_eq!(
-            due_window(&rule, utc(2026, 8, 12, 13, 0, 0), Some(&last), Some(8)),
+            due_window(
+                &rule,
+                utc(2026, 8, 12, 13, 0, 0),
+                Some(&last),
+                Some(8),
+                None
+            ),
             Some(utc(2026, 8, 12, 13, 0, 0))
         );
     }
@@ -2502,7 +2708,13 @@ mod tests {
         let failed = fired_rc(&rule, utc(2026, 8, 12, 11, 0, 0), Some(1));
         // 30 minutes after a FAILED firing, a deep dock fires again.
         assert_eq!(
-            due_window(&rule, utc(2026, 8, 12, 11, 30, 0), Some(&failed), Some(8)),
+            due_window(
+                &rule,
+                utc(2026, 8, 12, 11, 30, 0),
+                Some(&failed),
+                Some(8),
+                None
+            ),
             Some(utc(2026, 8, 12, 11, 30, 0)),
             "a firing that failed must not hold the window it never used"
         );
@@ -2512,6 +2724,10 @@ mod tests {
     /// cooldown on any non-success": a firing with NO recorded outcome is
     /// either still running or was cut off mid-verb. Re-firing under it
     /// would double-board. Only a KNOWN failure releases the window.
+    ///
+    /// Since a940e83b that is the reading only when the boarding record
+    /// is not in hand (`None`, as here): with it, the claim is judged
+    /// against the boarding it did or did not leave — the tests below.
     #[test]
     fn a_firing_still_in_flight_holds_the_cooldown() {
         let rule = depth_rule(4, 120);
@@ -2521,10 +2737,441 @@ mod tests {
                 &rule,
                 utc(2026, 8, 12, 11, 30, 0),
                 Some(&in_flight),
-                Some(8)
+                Some(8),
+                None
             ),
             None,
             "no recorded rc means unfinished, not failed — hold"
+        );
+    }
+
+    // -- a claim with no outcome, and the boarding on record (a940e83b) ----
+    //
+    // The loop's only memory is `running`, so a RESTARTED loop is one
+    // that evaluates with nothing in flight: every test below that says
+    // "restart" hands `decide` an empty slice and the records the system
+    // of record would hand a fresh process.
+
+    /// The restart of 2026-10-07 20:05:40Z, as the records held it: train
+    /// 19:09 was opened 19:12:03Z and merged 20:02:21Z, the board claimed
+    /// the minute after, and the converge of that same merge rolled the
+    /// pod mid-consist. One car had stood ready since 19:13:04Z. The loop
+    /// held it until 20:36:30Z, thirty minutes after a claim that boarded
+    /// nothing. Read against the boarding on record, the first tick of
+    /// the new pod boards.
+    #[test]
+    fn a_restart_long_after_the_last_boarding_boards_at_the_first_tick() {
+        let rule = depth_rule(1, 30);
+        let boarding = utc(2026, 10, 7, 19, 12, 3);
+        let cut_off = fired_rc(&rule, utc(2026, 10, 7, 20, 3, 0), None);
+        let first_tick = utc(2026, 10, 7, 20, 6, 10);
+        assert_eq!(
+            decide(
+                &rule,
+                first_tick,
+                Some(&cut_off),
+                Some(1),
+                Some(0),
+                &[],
+                Some(boarding)
+            ),
+            Decision::Fire(utc(2026, 10, 7, 20, 6, 0)),
+            "the last boarding is 54 minutes old: a claim that never recorded an outcome must \
+             not start a second cooldown from its own claim time"
+        );
+    }
+
+    /// The other side, and the reason the claim is not simply ignored: a
+    /// restart must not SHORTEN the cooldown either. A train opened at
+    /// 20:00 and cancelled at 20:15 clears the track; the board claims
+    /// 20:20 and the pod is rolled under it. The next boarding is due at
+    /// 20:30 — the last boarding plus the cooldown — not at 20:21 (the
+    /// cooldown forgotten) and not at 20:50 (counted again from the claim).
+    #[test]
+    fn a_loop_restarted_mid_cooldown_boards_at_the_last_boarding_plus_the_cooldown() {
+        let rule = depth_rule(1, 30);
+        let boarding = utc(2026, 10, 7, 20, 0, 0);
+        let cut_off = fired_rc(&rule, utc(2026, 10, 7, 20, 20, 0), None);
+        let at = |h, m, s| {
+            decide(
+                &rule,
+                utc(2026, 10, 7, h, m, s),
+                Some(&cut_off),
+                Some(2),
+                Some(0),
+                &[],
+                Some(boarding),
+            )
+        };
+        assert_eq!(at(20, 21, 0), Decision::Hold, "one minute after the claim");
+        assert_eq!(at(20, 29, 59), Decision::Hold, "a second short");
+        assert_eq!(
+            at(20, 30, 0),
+            Decision::Fire(utc(2026, 10, 7, 20, 30, 0)),
+            "last boarding + cooldown, to the second"
+        );
+        // A boarding a minute old holds whatever the claim says: the
+        // claim that opened it, cut off before its outcome, is the usual
+        // way to get here.
+        let just_boarded = utc(2026, 10, 7, 20, 20, 40);
+        assert_eq!(
+            decide(
+                &rule,
+                utc(2026, 10, 7, 20, 21, 40),
+                Some(&cut_off),
+                Some(2),
+                Some(0),
+                &[],
+                Some(just_boarded)
+            ),
+            Decision::Hold
+        );
+        assert_eq!(
+            decide(
+                &rule,
+                utc(2026, 10, 7, 20, 50, 40),
+                Some(&cut_off),
+                Some(2),
+                Some(0),
+                &[],
+                Some(just_boarded)
+            ),
+            Decision::Fire(utc(2026, 10, 7, 20, 50, 0))
+        );
+    }
+
+    /// The record could not be read: the claim holds from its own claim
+    /// time, exactly as before, and never boards on a record nobody read.
+    /// The line says which claim, why, and from when.
+    #[test]
+    fn an_unread_boarding_record_holds_the_cooldown_from_the_claim_and_says_so() {
+        let rule = depth_rule(1, 30);
+        let cut_off = fired_rc(&rule, utc(2026, 10, 7, 20, 3, 0), None);
+        let at = |m| {
+            decide(
+                &rule,
+                utc(2026, 10, 7, 20, m, 10),
+                Some(&cut_off),
+                Some(1),
+                Some(0),
+                &[],
+                None,
+            )
+        };
+        assert_eq!(at(6), Decision::Hold, "an unread record never boards early");
+        assert_eq!(at(32), Decision::Hold);
+        assert_eq!(at(33), Decision::Fire(utc(2026, 10, 7, 20, 33, 0)));
+        // What the tick hands on from a read that failed: no boarding,
+        // and a line. A read that was made, or not needed, owes no line.
+        let unread = BoardingRead::Unread("GET /api/jobs: HTTP 503".into());
+        assert_eq!(unread.in_hand(), None);
+        let seen = utc(2026, 10, 7, 19, 12, 3);
+        assert_eq!(BoardingRead::At(seen).in_hand(), Some(seen));
+        assert_eq!(BoardingRead::NotAsked.in_hand(), None);
+        for quiet in [BoardingRead::At(seen), BoardingRead::NotAsked] {
+            assert_eq!(quiet.unread_line(&rule.name, Some(&cut_off)), None);
+        }
+        let line = unread
+            .unread_line(&rule.name, Some(&cut_off))
+            .expect("an unread record is journalled");
+        for want in [
+            "train-board-on-dock-depth",
+            "cadence:train-board-on-dock-depth:2026-10-07T20:03Z",
+            "recorded no outcome",
+            "HTTP 503",
+            "holding the cooldown from the claim itself (2026-10-07T20:03:00Z)",
+        ] {
+            assert!(line.contains(want), "{want:?} missing from {line:?}");
+        }
+    }
+
+    /// A firing that DID record its outcome is judged as it always was:
+    /// the boarding record is not asked for, and handing one in changes
+    /// nothing. A productive board holds from its own firing, a failed or
+    /// idle one releases.
+    #[test]
+    fn a_firing_with_an_outcome_never_reads_the_boarding_record() {
+        let rule = depth_rule(1, 30);
+        let fired_at = utc(2026, 10, 7, 20, 0, 0);
+        let now = utc(2026, 10, 7, 20, 10, 0);
+        let old = Some(utc(2026, 10, 7, 12, 0, 0));
+        let recent = Some(utc(2026, 10, 7, 20, 9, 0));
+        let productive = fired_rc(&rule, fired_at, Some(0));
+        assert_eq!(
+            due_window(&rule, now, Some(&productive), Some(1), old),
+            None
+        );
+        let idle = fired_rc(&rule, fired_at, Some(IDLE_BOARD_RC));
+        assert_eq!(
+            due_window(&rule, now, Some(&idle), Some(1), recent),
+            Some(now)
+        );
+        assert_eq!(due_window(&rule, now, None, Some(1), recent), Some(now));
+        for last in [None, Some(&productive), Some(&idle)] {
+            assert!(!needs_the_boarding_record(&rule, last, &[]));
+        }
+    }
+
+    /// Which rules ask. Not by name: any queue-depth rule whose verb
+    /// departs a train, whose last claim has no outcome, and which this
+    /// loop is not itself still running.
+    #[test]
+    fn only_a_departing_queue_depth_rule_with_an_outcome_less_claim_asks() {
+        let board = depth_rule(1, 30);
+        let cut_off = fired_rc(&board, utc(2026, 10, 7, 20, 3, 0), None);
+        assert!(needs_the_boarding_record(&board, Some(&cut_off), &[]));
+        assert!(needs_the_boarding_record(
+            &board,
+            Some(&cut_off),
+            &[running("train-reconcile", 9)]
+        ));
+        assert!(
+            !needs_the_boarding_record(
+                &board,
+                Some(&cut_off),
+                &[running("train-board-on-dock-depth", 9)]
+            ),
+            "this loop's own in-flight board is the per-rule guard's"
+        );
+        let renamed = CadenceRule {
+            name: "some-other-depth-rule".into(),
+            verb: "run".into(),
+            ..board.clone()
+        };
+        assert!(needs_the_boarding_record(&renamed, Some(&cut_off), &[]));
+        let sweeps = CadenceRule {
+            verb: "refresh".into(),
+            ..board.clone()
+        };
+        assert!(
+            !needs_the_boarding_record(&sweeps, Some(&cut_off), &[]),
+            "a verb that departs no train leaves no boarding to read"
+        );
+        // ... and so keeps the claim-time hold it always had.
+        assert_eq!(
+            due_window(
+                &sweeps,
+                utc(2026, 10, 7, 20, 10, 0),
+                Some(&cut_off),
+                Some(1),
+                None
+            ),
+            None
+        );
+        for other in [wall_rule(2), clock_rule()] {
+            let l = fired_rc(&other, utc(2026, 10, 7, 20, 0, 0), None);
+            assert!(!needs_the_boarding_record(&other, Some(&l), &[]));
+        }
+    }
+
+    /// The newest opening on the page, whatever the page's order and
+    /// whatever the train's status; a row that cannot be read, or no row
+    /// at all, is unread rather than "long ago".
+    #[test]
+    fn the_newest_boarding_is_the_latest_opening_on_the_page() {
+        let trains = vec![
+            json!({"id": "t-arrived", "status": "closed",
+                   "opened_at": "2026-10-07T20:36:30.141264Z"}),
+            json!({"id": "t-open", "status": "open",
+                   "opened_at": "2026-10-07T22:24:45.096947Z"}),
+            json!({"id": "t-old", "status": "cancelled",
+                   "metadata": {"opened_at": "2026-10-07T19:12:03.501069646+00:00"}}),
+        ];
+        assert_eq!(
+            newest_boarding(&trains).map(|t| t.timestamp()),
+            Ok(utc(2026, 10, 7, 22, 24, 45).timestamp())
+        );
+        assert_eq!(
+            newest_boarding(&trains[2..]).map(|t| t.timestamp()),
+            Ok(utc(2026, 10, 7, 19, 12, 3).timestamp()),
+            "the metadata stamp, where the column is absent"
+        );
+        assert_eq!(
+            newest_boarding(&[]),
+            Err("no train is on record".to_string())
+        );
+        let mut with_unreadable = trains.clone();
+        with_unreadable.push(json!({"id": "t-blank", "opened_at": "yesterday"}));
+        let why = newest_boarding(&with_unreadable).unwrap_err();
+        assert!(why.contains("t-blank"), "{why}");
+    }
+
+    /// The read itself, against a jobs API: asked only when the rule
+    /// needs it, the newest train of any status, and a refusal or an
+    /// empty answer handed back as UNREAD with its reason.
+    #[tokio::test]
+    async fn the_last_boarding_is_read_from_the_newest_train_packet() {
+        use axum::extract::{Query, State};
+        use axum::http::StatusCode;
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::sync::Mutex;
+        #[derive(Clone, Default)]
+        struct Sor {
+            asked: Arc<Mutex<Vec<String>>>,
+            answer: Arc<Mutex<Option<Value>>>,
+        }
+        let sor = Sor::default();
+        let app = Router::new()
+            .route(
+                "/api/jobs",
+                get(
+                    |State(s): State<Sor>, Query(q): Query<BTreeMap<String, String>>| async move {
+                        s.asked.lock().unwrap().push(format!("{q:?}"));
+                        match s.answer.lock().unwrap().clone() {
+                            Some(v) => (StatusCode::OK, Json(v)),
+                            None => (StatusCode::FORBIDDEN, Json(json!({"error": "denied"}))),
+                        }
+                    },
+                ),
+            )
+            .with_state(sor.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let http = crate::gate::machine_client().unwrap();
+
+        let rule = depth_rule(1, 30);
+        let cut_off = fired_rc(&rule, utc(2026, 10, 7, 23, 5, 0), None);
+        let done = fired_rc(&rule, utc(2026, 10, 7, 23, 5, 0), Some(0));
+
+        // Not needed: no read is made at all.
+        for (last, running_now) in [
+            (None, vec![]),
+            (Some(&done), vec![]),
+            (Some(&cut_off), vec![running(&rule.name, 40)]),
+        ] {
+            assert_eq!(
+                read_last_boarding(&http, &base, &rule, last, &running_now).await,
+                BoardingRead::NotAsked
+            );
+        }
+        assert!(
+            sor.asked.lock().unwrap().is_empty(),
+            "no read when not needed"
+        );
+
+        // Refused: unread, with the reason.
+        match read_last_boarding(&http, &base, &rule, Some(&cut_off), &[]).await {
+            BoardingRead::Unread(why) => assert!(why.contains("403"), "{why}"),
+            other => panic!("a refused read is unread: {other:?}"),
+        }
+        let asked = sor.asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1, "one read, and a 4xx is not re-asked");
+        assert!(
+            asked[0].contains(r#""kind": "pr-train""#) && !asked[0].contains("status"),
+            "every train is a boarding — open, arrived or cancelled: {asked:?}"
+        );
+
+        // No train at all: unread, never "long ago".
+        *sor.answer.lock().unwrap() = Some(json!({"data": [], "total": 0}));
+        assert_eq!(
+            read_last_boarding(&http, &base, &rule, Some(&cut_off), &[]).await,
+            BoardingRead::Unread("no train is on record".into())
+        );
+
+        // The record: the newest opening, here a train that has arrived.
+        *sor.answer.lock().unwrap() = Some(json!({"total": 2, "data": [
+            {"id": "t2", "status": "closed", "opened_at": "2026-10-07T22:24:45.096947Z"},
+            {"id": "t1", "status": "closed", "opened_at": "2026-10-07T20:36:30.141264Z"},
+        ]}));
+        match read_last_boarding(&http, &base, &rule, Some(&cut_off), &[]).await {
+            BoardingRead::At(t) => {
+                assert_eq!(t.timestamp(), utc(2026, 10, 7, 22, 24, 45).timestamp());
+                // ... which is the reading under which the 23:07 pod boards.
+                assert_eq!(
+                    decide(
+                        &rule,
+                        utc(2026, 10, 7, 23, 7, 30),
+                        Some(&cut_off),
+                        Some(3),
+                        Some(0),
+                        &[],
+                        Some(t)
+                    ),
+                    Decision::Fire(utc(2026, 10, 7, 23, 7, 0))
+                );
+            }
+            other => panic!("the newest train's opening: {other:?}"),
+        }
+    }
+
+    /// Two loops at once (the old pod not yet gone, a hand-run
+    /// `boss train cadence --once`) never board twice, and reading the
+    /// boarding record takes none of that away. In one minute both compute
+    /// one firing id and the claim's primary key keeps one
+    /// (`a_window_claims_exactly_once`). A minute apart, loop B sees
+    /// loop A's claim with no outcome: once A's train is on record the
+    /// track holds B, and when it clears the cooldown runs from A's
+    /// boarding. In the seconds before A's train is on record B may fire,
+    /// and its board leaves at once on the conductor's lock, which A
+    /// holds for the whole of its boarding (`lock_wait_budget` gives a
+    /// board no wait; `board()` re-reads the track under that lock).
+    #[test]
+    fn two_loops_racing_do_not_board_twice() {
+        let rule = depth_rule(1, 30);
+        let minute = utc(2026, 10, 7, 20, 3, 0);
+        let (a_now, b_now) = (utc(2026, 10, 7, 20, 3, 4), utc(2026, 10, 7, 20, 3, 51));
+        let a = decide(&rule, a_now, None, Some(2), Some(0), &[], None);
+        let b = decide(&rule, b_now, None, Some(2), Some(0), &[], None);
+        assert_eq!((&a, &b), (&Decision::Fire(minute), &Decision::Fire(minute)));
+        assert_eq!(
+            firing_id(&rule.name, minute),
+            "cadence:train-board-on-dock-depth:2026-10-07T20:03Z",
+            "one id for both, so one claim"
+        );
+        // A claimed it and is boarding; B, a minute on, reads A's claim.
+        let a_claim = fired_rc(&rule, a_now, None);
+        let a_train_opened = utc(2026, 10, 7, 20, 5, 30);
+        // Held twice over: by the cooldown from A's boarding, and once
+        // that has run by A's train on the track.
+        let b_sees = |h, m| {
+            decide(
+                &rule,
+                utc(2026, 10, 7, h, m, 0),
+                Some(&a_claim),
+                Some(1),
+                Some(1),
+                &[],
+                Some(a_train_opened),
+            )
+        };
+        assert_eq!(b_sees(20, 6), Decision::Hold);
+        assert_eq!(b_sees(20, 36), Decision::TrackOccupied(1));
+        // A's train cancels at 20:15 and A never wrote an outcome: the
+        // cooldown still runs from A's boarding.
+        assert_eq!(
+            decide(
+                &rule,
+                utc(2026, 10, 7, 20, 16, 0),
+                Some(&a_claim),
+                Some(1),
+                Some(0),
+                &[],
+                Some(a_train_opened)
+            ),
+            Decision::Hold
+        );
+        // And the loop that owns the in-flight claim never reads the
+        // record or re-fires under itself.
+        let own = [running(&rule.name, 50)];
+        assert!(!needs_the_boarding_record(&rule, Some(&a_claim), &own));
+        assert_eq!(
+            decide(
+                &rule,
+                utc(2026, 10, 7, 20, 4, 4),
+                Some(&a_claim),
+                Some(2),
+                Some(0),
+                &own,
+                None
+            ),
+            Decision::Hold
+        );
+        // The backstop outside this loop, read from the code that keeps it.
+        assert_eq!(
+            train::lock_wait_budget(&train::Phase::Board),
+            std::time::Duration::ZERO
         );
     }
 
@@ -2624,7 +3271,13 @@ mod tests {
         let fired_at = utc(2026, 9, 6, 16, 19, 0);
         let idle = fired_rc(&rule, fired_at, Some(recorded_rc("board", 0, false)));
         assert_eq!(
-            due_window(&rule, utc(2026, 9, 6, 16, 29, 0), Some(&idle), Some(4)),
+            due_window(
+                &rule,
+                utc(2026, 9, 6, 16, 29, 0),
+                Some(&idle),
+                Some(4),
+                None
+            ),
             Some(utc(2026, 9, 6, 16, 29, 0)),
             "cars that park after an idle board must board next tick, not wait out the cooldown"
         );
@@ -2635,7 +3288,8 @@ mod tests {
                 &rule,
                 utc(2026, 9, 6, 16, 29, 0),
                 Some(&productive),
-                Some(4)
+                Some(4),
+                None
             ),
             None,
             "a board that boarded a car must still start the 45-minute cooldown"
@@ -2647,7 +3301,7 @@ mod tests {
         // Depth unknown (probe failed / not probed): hold, never fire.
         let rule = depth_rule(1, 1);
         assert_eq!(
-            due_window(&rule, utc(2026, 8, 12, 12, 0, 0), None, None),
+            due_window(&rule, utc(2026, 8, 12, 12, 0, 0), None, None, None),
             None
         );
     }
@@ -2750,7 +3404,8 @@ mod tests {
                 Some(&last),
                 None,
                 None,
-                &[]
+                &[],
+                None
             ),
             Decision::Fire(utc(2026, 8, 13, 10, 10, 0))
         );
@@ -2771,6 +3426,7 @@ mod tests {
                 None,
                 None,
                 &[running("train-reconcile", 612)],
+                None
             ),
             Decision::StillRunning(std::time::Duration::from_secs(612))
         );
@@ -2792,7 +3448,8 @@ mod tests {
                 None,
                 None,
                 Some(0),
-                &[running("train-reconcile", 1_800)]
+                &[running("train-reconcile", 1_800)],
+                None
             ),
             Decision::Fire(now)
         );
@@ -2809,7 +3466,7 @@ mod tests {
             vec![running("train-window", 300)],
         ] {
             assert_eq!(
-                decide(&rule, mid_bucket, Some(&last), None, None, &r),
+                decide(&rule, mid_bucket, Some(&last), None, None, &r, None),
                 Decision::Hold
             );
         }
@@ -2825,11 +3482,11 @@ mod tests {
         let rule = depth_rule(1, 45);
         let now = utc(2026, 9, 5, 8, 0, 0);
         assert_eq!(
-            decide(&rule, now, None, Some(3), Some(1), &[]),
+            decide(&rule, now, None, Some(3), Some(1), &[], None),
             Decision::TrackOccupied(1)
         );
         assert_eq!(
-            decide(&rule, now, None, Some(3), Some(0), &[]),
+            decide(&rule, now, None, Some(3), Some(0), &[], None),
             Decision::Fire(now),
             "the track clears the moment the previous train merges, or closes — arrived or cancelled alike"
         );
@@ -2840,7 +3497,15 @@ mod tests {
         // The probe failed: hold, exactly as a failed dock probe holds.
         let rule = depth_rule(1, 45);
         assert_eq!(
-            decide(&rule, utc(2026, 9, 5, 8, 0, 0), None, Some(3), None, &[]),
+            decide(
+                &rule,
+                utc(2026, 9, 5, 8, 0, 0),
+                None,
+                Some(3),
+                None,
+                &[],
+                None
+            ),
             Decision::TrackUnknown
         );
     }
@@ -2854,11 +3519,19 @@ mod tests {
         let rule = clock_rule(); // 06:00 and 18:00
         let window = utc(2026, 9, 5, 18, 0, 0);
         assert_eq!(
-            decide(&rule, window, None, None, Some(2), &[]),
+            decide(&rule, window, None, None, Some(2), &[], None),
             Decision::TrackOccupied(2)
         );
         assert_eq!(
-            decide(&rule, utc(2026, 9, 5, 18, 40, 0), None, None, Some(0), &[]),
+            decide(
+                &rule,
+                utc(2026, 9, 5, 18, 40, 0),
+                None,
+                None,
+                Some(0),
+                &[],
+                None
+            ),
             Decision::Fire(window),
             "the same 18:00 window fires once the track is clear"
         );
@@ -2871,11 +3544,11 @@ mod tests {
         let rule = wall_rule(10);
         let now = utc(2026, 9, 5, 8, 10, 0);
         assert_eq!(
-            decide(&rule, now, None, None, Some(1), &[]),
+            decide(&rule, now, None, None, Some(1), &[], None),
             Decision::Fire(now)
         );
         assert_eq!(
-            decide(&rule, now, None, None, None, &[]),
+            decide(&rule, now, None, None, None, &[], None),
             Decision::Fire(now),
             "an unread track is no reason to skip a reconcile"
         );
@@ -3309,7 +3982,7 @@ mod db_tests {
             },
         };
         let now = Utc.with_ymd_and_hms(2026, 8, 12, 6, 0, 30).unwrap();
-        let window = due_window(&rule, now, None, None).expect("window due");
+        let window = due_window(&rule, now, None, None, None).expect("window due");
         let id = firing_id(&rule.name, window);
 
         assert!(
@@ -3332,7 +4005,7 @@ mod db_tests {
             .unwrap();
         assert_eq!(last.firing_id, id);
         assert_eq!(last.fired_at, now);
-        assert_eq!(due_window(&rule, now, Some(&last), None), None);
+        assert_eq!(due_window(&rule, now, Some(&last), None, None), None);
 
         // The outcome merges into the claim's detail row.
         // So does a board's decision (backlog 96f02540), and the rule's
@@ -3487,7 +4160,7 @@ mod db_tests {
             basis: Basis::Wall { every_minutes: 10 },
         };
         let now = Utc.with_ymd_and_hms(2026, 8, 31, 6, 7, 0).unwrap();
-        let window = due_window(&rule, now, None, None).expect("window due");
+        let window = due_window(&rule, now, None, None, None).expect("window due");
         let id = firing_id(&rule.name, window);
         // The RED run of this test recorded the firing the way the
         // loop did at origin/main — through its own BOSS_POSTGRES_URL

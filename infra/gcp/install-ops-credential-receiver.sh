@@ -66,6 +66,19 @@ fail() { echo "$ME: FAILED — $*" >&2; exit 1; }
 [[ "$USER_NAME" =~ ^[a-z_][a-z0-9_-]*$ ]] || fail "the deposit account '$USER_NAME' is not an account name sudoers can carry safely"
 [ "$USER_NAME" != "root" ] || fail "the checkout is root's — the rule would grant root to root; name the deposit account with INSTALL_RECV_USER"
 
+# WHICH MACHINE THIS IS, BEFORE THE COPY AND THE SUDOERS RULE (backlog
+# 62b09c57, N7; infra/lib/host-check.sh). A root door and the rule that
+# grants it are the last two things to put on the wrong machine: with
+# either directory left at the host's default this machine must hold the
+# address the estate declares for boss-gcp, or the exit is 78 and neither
+# is written.
+# shellcheck source=infra/lib/host-check.sh
+. "$HERE/../lib/host-check.sh" 2>/dev/null \
+    || { echo "$ME: REFUSED — $HERE/../lib/host-check.sh cannot be read, so which machine this is cannot be established; nothing was written" >&2; exit 78; }
+host_seam INSTALL_RECV_LIBEXEC /usr/local/libexec/boss
+host_seam INSTALL_RECV_SUDOERS_DIR /etc/sudoers.d
+host_check boss-gcp "$ME"
+
 install -d -m 0755 "$LIBEXEC" || fail "cannot create $LIBEXEC"
 install -m 0755 "$HERE/ops-credential-recv.sh" "$LIBEXEC/ops-credential-recv" || fail "cannot install the receiver"
 if [ -n "$OWNER" ]; then
@@ -79,6 +92,12 @@ tmp="$(mktemp "${SUDOERS_DIR}/.boss-ops-credential-recv.XXXXXX")" || fail "canno
     echo "Defaults!$RECEIVER env_reset"
     echo "Defaults!$RECEIVER secure_path=\"$SECURE_PATH\""
     echo "$USER_NAME ALL=(root) NOPASSWD: $RECEIVER kubeconfig"
+    # The receiver's second purpose (backlog 88379df3; design-doc
+    # bdc60b65, gcp-push): the estate machine token's three slots, over a
+    # key of its own. A second LINE, never a wildcard: sudo matches the
+    # whole command line, so each key's forced command reaches its one
+    # argument and no other.
+    echo "$USER_NAME ALL=(root) NOPASSWD: $RECEIVER machine-token"
 } > "$tmp" || { rm -f "$tmp"; fail "cannot write $tmp"; }
 chmod 0440 "$tmp"
 if [ -n "$OWNER" ]; then chown "$OWNER" "$tmp" || { rm -f "$tmp"; fail "cannot chown $tmp"; }; fi
@@ -88,3 +107,12 @@ mv -f "$tmp" "$SUDOERS_DIR/boss-ops-credential-recv" || { rm -f "$tmp"; fail "ca
 echo "$ME: $LIBEXEC/ops-credential-recv installed; $SUDOERS_DIR/boss-ops-credential-recv grants it, for the kubeconfig only, to $USER_NAME"
 echo "$ME: the narrower door, for David to place in ~$USER_NAME/.ssh/authorized_keys with the deposit key the cluster minted:"
 echo "    command=\"exec sudo -n $RECEIVER kubeconfig\",restrict <the deposit key's public half>"
+# The machine token's key is a DIFFERENT key with a different line, and
+# its line reaches David on a packet, not from this output: the broker
+# writes it WITH the key onto the `enroll` step of the
+# prepare-the-machine-token-deposit-key packet for machine-token-deposit-key
+# (infra/dispatcher/rules/broker-prepares-the-machine-token-deposit-key.toml).
+# Printed here so the journal shows what this host is ready to accept;
+# machine_token_push_sh.rs holds this text equal to the rule's.
+echo "$ME: $SUDOERS_DIR/boss-ops-credential-recv also grants it for the machine token, over that token's own key; its line is on the enroll step of the prepare-the-machine-token-deposit-key packet for machine-token-deposit-key:"
+echo "    command=\"exec sudo -n $RECEIVER machine-token\",restrict <the machine token deposit key's public half>"

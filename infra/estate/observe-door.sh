@@ -38,13 +38,31 @@
 #
 # Env: JOBS_API (required to post; from /etc/boss/sor.env),
 #      DOORS_FILE (default: doors.toml beside this script),
-#      DOOR_STATE_DIR (default /var/tmp/boss-door-state — persists
-#      across reboots, writable by the unit's user),
-#      DOOR_SPOOL_DIR (default /var/tmp/boss-estate-spool-door — its
-#      own directory: the host observer's spool names files by
-#      observed_at, and two observers posting in one second must not
-#      overwrite each other's reading),
+#      DOOR_STATE_DIR (default $HOME/.boss-door-state — persists across
+#      reboots, the caller's own),
+#      DOOR_SPOOL_DIR (default $HOME/.boss-door-spool — its own
+#      directory: the host observer's spool names files by observed_at,
+#      and two observers posting in one second must not overwrite each
+#      other's reading),
 #      DOOR_TIMEOUT_S (default 5 — per probe).
+#
+# THE STATE AND THE SPOOL ARE THE CALLER'S OWN, NEVER A NAME UNDER
+# /var/tmp (backlog dda26693; review acab446c F8a). Both defaulted there
+# until 2026-10-07. /var/tmp is sticky and world-writable, and each
+# directory is made by the first run that needs it — a dark door, a
+# reading the record would not take — so on a healthy host neither may
+# exist. Any other account could then make it first and own it: the
+# forge runs car-written probe text as `boss-probe`, and a file planted
+# in the spool is POSTed by the next replay as this observer's own
+# reading, while one planted in the state directory becomes the
+# `dark_since` an alarm band is judged on. Writer and reader are the same
+# account (the watchdog unit's user), so the directories live in that
+# account's home, beside the watchdog's other state, where only it and
+# root can make a name: cluster-watchdog.service names both, and a run by
+# hand gets the same two from HOME. With neither there is nowhere of the
+# caller's own, and that is refused by name rather than guessed. Readings
+# still waiting in the old spool are not replayed, and a door dark at the
+# move restarts its dark-since: both show in the door series.
 #
 # `--print` probes and prints the observation instead of posting it.
 # `--declared` prints the parsed declaration and probes nothing — the
@@ -52,9 +70,9 @@
 set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOORS_FILE="${DOORS_FILE:-$here/doors.toml}"
-DOOR_STATE_DIR="${DOOR_STATE_DIR:-/var/tmp/boss-door-state}"
+DOOR_STATE_DIR="${DOOR_STATE_DIR:-${HOME:?observe-door: set DOOR_STATE_DIR — there is no HOME to keep the dark-since state under, and a shared temp directory is not a default}/.boss-door-state}"
 DOOR_TIMEOUT_S="${DOOR_TIMEOUT_S:-5}"
-SPOOL_DIR="${DOOR_SPOOL_DIR:-/var/tmp/boss-estate-spool-door}"
+SPOOL_DIR="${DOOR_SPOOL_DIR:-${HOME:?observe-door: set DOOR_SPOOL_DIR — there is no HOME to keep unposted readings under, and a shared temp directory is not a default}/.boss-door-spool}"
 # shellcheck source=/dev/null
 . "$here/observe-lib.sh"
 

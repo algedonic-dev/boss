@@ -252,6 +252,10 @@ cd "$(dirname "$0")/../.." || exit 1
 . infra/lint/lib/no-estate.sh || exit 3
 
 BUNDLE="infra/platform/workflows"
+# The kinds held out of the publish, and their one reader — asked before
+# this report names a publish for any drifting kind (backlog c6bd9f18).
+HOLDS_REL="infra/platform/workflow-holds"
+HOLDS_PY="infra/gcp/workflow-holds.py"
 TENANT_GLOB="examples/*/seeds/workflows.toml"
 REGISTRY_RS="crates/core/boss-jobs/src/registry.rs"
 SCHEMA_DIR="infra/postgres/schema"
@@ -1582,6 +1586,50 @@ if [ -n "$drift_lines" ]; then
         echo "      live: $lwin" >&2
     done
     echo "" >&2
+    # WHICH OF THEM MAY BE PUBLISHED, read before the command below is
+    # named (backlog c6bd9f18). A kind can be HELD out of every unattended
+    # publish — a row that turns on a refusal goes live at a deliberate
+    # publish (infra/platform/workflow-holds/README.md, backlog 083d240e)
+    # — and for a held kind the tree is ahead of live BY DESIGN. The
+    # command this report names is the one door a hold does not bind, and
+    # it used to be printed for every drifting kind, held or not (review
+    # 72485f08 of car ca5d0218, finding F1). The holds come from their one
+    # reader (§9a). A kind that is not held reads exactly as it did, and
+    # holds that cannot be read are not absent holds: then NO publish is
+    # advised at all, and the reason is said.
+    drift_kinds=$(printf '%s\n' "$drift_lines" | cut -f1 | LC_ALL=C sort -u)
+    holds_rc=0
+    if [ -f "$HOLDS_PY" ]; then
+        holds_out=$(python3 "$HOLDS_PY" . 2>&1) || holds_rc=$?
+    else
+        holds_rc=127
+        holds_out="this tree does not carry $HOLDS_PY"
+    fi
+    # A line the reader answers that is neither `held` nor `released` with
+    # its five cells is an answer this report does not know how to read.
+    if [ "$holds_rc" -eq 0 ] && [ -n "$holds_out" ]; then
+        strange=$(printf '%s\n' "$holds_out" | awk -F'\t' '!((NF == 5) && ($1 == "held" || $1 == "released"))')
+        [ -z "$strange" ] || { holds_rc=65; holds_out="$HOLDS_PY answered a line this report does not read: $strange"; }
+    fi
+    held_drift=""
+    open_drift="$drift_kinds"
+    if [ "$holds_rc" -eq 0 ]; then
+        held_drift=$(printf '%s\n' "$holds_out" | awk -F'\t' '$1 == "held" { print $2 }' | LC_ALL=C sort -u \
+            | LC_ALL=C comm -12 - <(printf '%s\n' "$drift_kinds"))
+        open_drift=$(LC_ALL=C comm -23 <(printf '%s\n' "$drift_kinds") <(printf '%s\n' "$held_drift") | LC_ALL=C sed '/^$/d')
+    fi
+    if [ "$holds_rc" -ne 0 ]; then
+        echo "  NO PUBLISH IS ADVISED HERE: the workflow holds could not be read" >&2
+        echo "  (exit $holds_rc), so whether a kind above is held out of the publish" >&2
+        echo "  cannot be told — and a hold that cannot be read is not a hold that" >&2
+        echo "  is absent. The reader said:" >&2
+        echo "" >&2
+        [ -n "$holds_out" ] || holds_out="$HOLDS_PY exited $holds_rc and said nothing"
+        printf '%s\n' "$holds_out" | sed 's/^problem\t//; s/^/    /' >&2
+        echo "" >&2
+        echo "  Repair $HOLDS_REL (or $HOLDS_PY) in a car and run this" >&2
+        echo "  again; what clears each kind is worded only once the holds read whole." >&2
+    elif [ -n "$open_drift" ]; then
     echo "  A description is what an operator reads to know what a protocol is" >&2
     echo "  for, so a stale one sends somebody looking for a surface that may" >&2
     echo "  not exist — which is exactly what design-doc-review's live v1 did" >&2
@@ -1590,6 +1638,10 @@ if [ -n "$drift_lines" ]; then
     echo "" >&2
     echo "    boss workflow publish <kind> $BUNDLE/<kind>.toml" >&2
     echo "" >&2
+    [ -z "$held_drift" ] || {
+        echo "  That command is for the kind(s) that are NOT held: $(printf '%s\n' $open_drift | tr '\n' ' ')" >&2
+        echo "" >&2
+    }
     echo "  In-flight packets are safe: publish adds a version, and every open" >&2
     echo "  Job stays pinned to the one it was admitted under." >&2
     echo "" >&2
@@ -1608,6 +1660,21 @@ if [ -n "$drift_lines" ]; then
     echo "  the proof field that makes proven a machine-run fact (0ccf23ec)." >&2
     echo "  FOLD the row into the file first: GET $URL/<kind>, write its steps" >&2
     echo "  and fields into $BUNDLE/<kind>.toml until this reads equal." >&2
+    fi
+    if [ -n "$held_drift" ]; then
+        [ -z "$open_drift" ] || echo "" >&2
+        echo "  HELD — nothing here asks for these to be published. A held row goes" >&2
+        echo "  live at a deliberate publish, a person's decision, and until then" >&2
+        echo "  the tree is ahead of live by design ($HOLDS_REL/README.md):" >&2
+        echo "" >&2
+        # awk on the tab, not `read`: IFS whitespace would fold an empty
+        # cell and show what lifts a hold as its why.
+        printf '%s\n' "$holds_out" | awk -F'\t' -v want="$held_drift" '
+            BEGIN { n = split(want, w, "\n"); for (i = 1; i <= n; i++) drifting[w[i]] = 1 }
+            $1 == "held" && ($2 in drifting) {
+                printf "    %s — %s\n      why: %s\n      what lifts it: %s\n", $2, $3, $4, $5
+            }' >&2
+    fi
 fi
 
 # A file that makes NO claim about a field is not drift — the row can

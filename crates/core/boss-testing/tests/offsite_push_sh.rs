@@ -1980,10 +1980,10 @@ fn the_forge_converge_runs_it_after_protecting_main() {
     let converge = std::fs::read_to_string(repo_root().join("infra/forge/forge-converge.sh"))
         .expect("forge-converge.sh");
     let protect = converge
-        .find(r#""$REPO/infra/forge/protect-main.sh""#)
+        .find(r#""$RUN_FROM/forge/protect-main.sh""#)
         .expect("protect-main runs");
     let offsite = converge
-        .find(r#""$REPO/infra/forge/offsite-push.sh""#)
+        .find(r#""$RUN_FROM/forge/offsite-push.sh""#)
         .expect("forge-converge.sh must run offsite-push.sh on every tick");
     assert!(offsite > protect, "after protect-main");
     assert!(

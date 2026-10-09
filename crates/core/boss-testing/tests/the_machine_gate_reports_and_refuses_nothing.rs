@@ -49,10 +49,16 @@
 //! it already holds a credential at least as strong, and the roster
 //! says so. The playground crawl (`bun install` from npm, then the
 //! tree's live suite) and the recovery sheet (a clone of main rendered
-//! in Chromium) hold nothing else and would hand the token to that
-//! code; they go on sending none, and the report window names them — a
-//! miss read on a packet is the design's way to find a caller, and
-//! enforcement cannot converge until each is decided.
+//! in Chromium) held nothing else and went on sending none until each
+//! was decided — a miss read on a packet is the design's way to find a
+//! caller. DECIDED 2026-10-07 (David, design-doc c8502e17; backlog
+//! 37742794): the recovery sheet holds it, read-only; the crawl's
+//! BROWSER container never does — its packet writes moved to a `record`
+//! container in the same pod, which holds the token and takes the
+//! crawl's result as data. This file's roster is per MANIFEST and cannot
+//! say which container of a pod holds; the per-container rule is
+//! every_in_cluster_sender_holds_the_machine_token_or_is_named.rs, which
+//! reads the parsed pod.
 //!
 //! TWO HOLDERS DO RUN SUCH CODE, and are on the roster anyway (review
 //! ef2da426 F2): the conductor runs the assembled train tree's gate.sh
@@ -67,10 +73,14 @@
 //! consist lints out of the token-holding container, or the risk
 //! accepted), recorded as `before_enforce` on backlog 2710c8fc.
 //!
-//! THE DEV POD'S COPY (backlog 1876bbdb, INFO-5) is mounted at the one
+//! THE DEV POD'S COPY (backlog 1876bbdb, INFO-5) is mounted, in the
+//! container agents run in, at the one
 //! directory `infra/dev/machine-token-dir` names — never boss-core's
 //! default, because builders run handler tests on that pod and every
-//! stamping client a test builds reads the default — and the pod names
+//! stamping client a test builds reads the default. The pod's `reclaim`
+//! sidecar, a separate container nobody runs tests in, mounts the same
+//! Secret once more at the default, where its chore helpers read it
+//! (backlog 37742794, David 2026-10-07) — and the pod names
 //! it to nobody: only the doors (`infra/dev/boss`, `infra/dev/boss-api`)
 //! read that file, and the CLI points the name at an EMPTY directory for
 //! every child that runs tree or car code (boss-cli src/door_env.rs) —
@@ -127,6 +137,21 @@ const HOLDERS: &[(&str, &str)] = &[
         "a chore through boss-chore.sh",
     ),
     (
+        "boss-estate-observe.yaml",
+        "the cluster observer posts the node observation and settles dead gate runners and \
+         dead hosts on the jobs API; it runs only its manifest's own text, in a mirrored image \
+         pinned by digest, with the reader copied from the boss image (David, design-doc \
+         bdc60b65 question `observer`, 2026-10-06; backlog 066a7613; held by \
+         infra/lint/a-manifest-sender-presents-the-machine-token.sh)",
+    ),
+    (
+        "boss-machine-token-push.yaml",
+        "it IS the token's delivery: every ten minutes it pushes the three slots to boss-gcp, \
+         the one estate host that can read no Secret (design-doc bdc60b65, gcp-push, David \
+         2026-10-06: one new mount), and its chore pair stamps its own packet writes; it runs \
+         only the image's script, holds no Role and mounts no API token",
+    ),
+    (
         "boss-conductor.yaml",
         "the train conductor writes the record all day through the boss CLI — and runs the \
          assembled train tree's gate.sh and lints as uid 1500, which reads the mount; bounded \
@@ -138,25 +163,31 @@ const HOLDERS: &[(&str, &str)] = &[
         "the dev pod's doors, boss-api and the boss shim — at the doors' own directory; the \
          session runs as uid 0 with bun install and build.rs, which can read it; bounded \
          because it already holds the forge write token, report grants nothing, and a rotation \
-         before enforce retires what was read (decision owed: before_enforce on 2710c8fc)",
+         before enforce retires what was read (decision owed: before_enforce on 2710c8fc). And \
+         the reclaim sidecar, at the default directory, for its maintenance packet and its \
+         reads of the record (David, design-doc c8502e17 `reclaim-sidecar`, 2026-10-07)",
+    ),
+    (
+        "boss-recovery-sheet.yaml",
+        "the daily paper check files and refreshes its print job through the chore pair and \
+         the boss CLI; it renders a clone of main and no branch (David, design-doc c8502e17 \
+         `crawl-and-sheet`, 2026-10-07; backlog 37742794)",
+    ),
+    (
+        "boss-playground-crawl.yaml",
+        "its `record` container alone, which runs the boss image and opens and closes the \
+         packet; the `crawl` container — bun install from npm and a browser — mounts nothing \
+         of it, held per container by \
+         every_in_cluster_sender_holds_the_machine_token_or_is_named.rs (David, design-doc \
+         c8502e17 `crawl-and-sheet`, 2026-10-07; backlog 37742794)",
     ),
 ];
 
 /// Manifests that must NOT mount it, and why.
-const NEVER: &[(&str, &str)] = &[
-    (
-        "boss-playground-crawl.yaml",
-        "runs `bun install` from npm and the tree's live suite in the chore's own container",
-    ),
-    (
-        "boss-recovery-sheet.yaml",
-        "renders a fresh clone of main in Chromium in the chore's own container",
-    ),
-    (
-        "gate-seed-local.yaml",
-        "the gate's seed: gates run every car's code before review",
-    ),
-];
+const NEVER: &[(&str, &str)] = &[(
+    "gate-seed-local.yaml",
+    "the gate's seed: gates run every car's code before review",
+)];
 
 fn manifests() -> BTreeMap<String, String> {
     let dir = repo_root().join(MANIFESTS);
@@ -450,13 +481,26 @@ fn the_token_is_mounted_whole_optional_and_where_each_holder_reads_it() {
             !m.is_empty(),
             "{name} declares the Secret volume and mounts it nowhere"
         );
-        let want = if name == "boss-dev.yaml" {
-            doors.as_str()
-        } else {
-            DEFAULT_TOKEN_DIR
-        };
+        // The dev pod mounts it twice, in two containers: the doors'
+        // directory in `dev`, the default in the `reclaim` sidecar.
+        // Which container holds which is read off the parsed pod in
+        // every_in_cluster_sender_holds_the_machine_token_or_is_named.rs;
+        // a line scan cannot tell containers apart, so here it is the
+        // two paths, once each.
+        if name == "boss-dev.yaml" {
+            let mut paths: Vec<&str> = m.iter().map(|(p, _)| *p).collect();
+            paths.sort();
+            let mut want = vec![doors.as_str(), DEFAULT_TOKEN_DIR];
+            want.sort();
+            assert_eq!(
+                paths, want,
+                "{name}: the doors' directory and the sidecar's default, once each"
+            );
+        }
         for (path, line) in &m {
-            assert_eq!(*path, want, "{name}: {line}");
+            if name != "boss-dev.yaml" {
+                assert_eq!(*path, DEFAULT_TOKEN_DIR, "{name}: {line}");
+            }
             assert!(
                 !line.contains("subPath"),
                 "{name}: a subPath is never refreshed"

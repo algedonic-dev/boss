@@ -656,10 +656,17 @@ fn the_gate_disk_guard_reports_refused_before_any_write() {
     let call = sh
         .find("gate_disk_guard \"${GATE_DISK:-}\" /gate-runs /gate-seed /gate-target /etc/hosts \"${POD_NAME:-}\"")
         .expect("run.sh runs the guard on its own mounts and its own pod name");
+    // Built on one line, delivered on the next: left in the pod log by a
+    // runner handed the carrier, reported by one that is not (backlog
+    // 934ccad1; `settle_early`, the verdict-carrier block).
     let refused = sh[call..]
-        .find("report refused")
+        .find("GATE_DISK_RECEIPT=$(jq -nc")
         .map(|i| i + call)
-        .expect("a refusal is reported as `refused`");
+        .expect("a refusal's receipt is built");
+    let settled = sh[refused..]
+        .find("settle_early refused \"$GATE_DISK_RECEIPT\" \"$GATE_DISK_RECEIPT\"")
+        .map(|i| i + refused)
+        .expect("a refusal is delivered as `refused`, the same receipt in either layout");
     // THE RECEIPT IS THE REFUSAL SHAPE, not prose (review 0b9c02f1, F1):
     // {"verdict":"refused","refused_because":...}, the shape gate.sh's
     // disk floor and gate.rs's launch refusals write, so
@@ -692,7 +699,7 @@ fn the_gate_disk_guard_reports_refused_before_any_write() {
         .find("sweep_dead_workspaces /gate-runs")
         .expect("the sweep");
     assert!(
-        refused < seed && call < sweep,
+        refused < settled && settled < seed && call < sweep,
         "the guard runs before the sweep and before the seed copy"
     );
 }

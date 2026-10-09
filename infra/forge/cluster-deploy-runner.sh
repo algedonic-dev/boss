@@ -110,6 +110,9 @@ trap _finish EXIT
 # uses, which is why they live in the lib and not in this file.
 . "$REPO/infra/forge/cluster-deploy-lib.sh"
 take_converge_requests "$REPO" || true
+# What an earlier tick's alert door kept, filed now (the lib says why
+# this is the converge's own job since backlog a604a35b).
+replay_kept_alerts || true
 # The image repo this converge pushes (REGISTRY), its stamp (STAMP_FILE
 # — the last build rolled and verified) and the quarantine stamp for a
 # head whose BOOT failed (FAILED_FILE — "proven unbootable; do not

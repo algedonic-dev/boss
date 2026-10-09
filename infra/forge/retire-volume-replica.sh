@@ -171,8 +171,11 @@ REP="$2"
 
 # The floor: unset is 3; set, it must be a whole number of 2 or more. An
 # empty value is refused rather than read as the default — a floor someone
-# meant to declare and did not is not a floor of 3.
-FLOOR="${BOSS_RETIRE_FLOOR-3}"
+# meant to declare and did not is not a floor of 3. The 3 is
+# infra/lib/longhorn-ledger.sh's LONGHORN_RETIRE_FLOOR, the one copy: the
+# decisive-move read (move-volume-replica.sh --plan-decisive) holds a
+# volume against the same number, and two 3s would drift.
+FLOOR="${BOSS_RETIRE_FLOOR-$LONGHORN_RETIRE_FLOOR}"
 case "${FLOOR:-empty}" in
     *[!0-9]*) refuse "BOSS_RETIRE_FLOOR must be a whole number of replicas, never below 2, got '$FLOOR'" ;;
 esac

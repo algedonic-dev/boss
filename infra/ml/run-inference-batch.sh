@@ -72,6 +72,30 @@ fi
 run_summary_field ml_api_url "$BASE"
 CURL="${BOSS_ML_CURL:-curl}"
 
+# The machine token, PRESENTED and never required (design 6805c764;
+# backlog 44b2087e). The seven POSTs below go to the record's `ml` port,
+# which is gated, and went out with nothing: the ml gate recorded
+# `POST /api/ml/models/{id}/infer-batch`, tokenless, at 02:30Z on each
+# of 2026-10-06, -07 and -08. Asked of the one shell reader here — in
+# the script's own shell, AFTER the trap above (the reader chains its
+# cleanup in front of it and hands it the same exit status), because
+# run_model's request runs inside $(…). No token, a slot this account
+# cannot read, a host off the list, no lib beside this file, a header
+# file that cannot be written: each leaves MT_HDR empty and the batch
+# exactly the batch it was. The unit runs as `boss`, which cannot read
+# the token directory today (it is root's, 0700), so until that account
+# can — the ownership question of backlog ca356c79 — this presents
+# nothing and the gate's own record says so. Under the unit the file is
+# made in its RuntimeDirectory, which systemd removes when the unit
+# stops, after a SIGKILL too.
+MT_HDR=""
+SECRET_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/secret-header.sh"
+if [ -r "$SECRET_LIB" ]; then
+  # shellcheck source=infra/lib/secret-header.sh
+  . "$SECRET_LIB"
+  machine_token_header MT_HDR "$BASE" || MT_HDR=""
+fi
+
 MODELS=(
   # Order matters: the churn-risk plugin must populate
   # ml_predictions BEFORE next-action-high-churn-risk reads them.
@@ -106,7 +130,7 @@ by_model='{}'
 run_model() {
   local id="$1" body written errors
   echo "==> infer-batch ${id}"
-  if ! body="$("${CURL}" -sSf -X POST "${BASE}/api/ml/models/${id}/infer-batch")"; then
+  if ! body="$("${CURL}" -sSf -X POST ${MT_HDR:+-H "$MT_HDR"} "${BASE}/api/ml/models/${id}/infer-batch")"; then
     echo
     echo "inference-batch: infer-batch FAILED for ${id}" >&2
     return 1

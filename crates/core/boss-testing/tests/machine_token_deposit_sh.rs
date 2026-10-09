@@ -1013,11 +1013,9 @@ const UNSTAMPED: &[(&str, &str)] = &[
         "fetches and checks out the owner's clone, builds with the owner's rootless docker \
          daemon and keeps its stamps under $HOME; it is the loop that deploys every fix",
     ),
-    (
-        "cluster-watchdog",
-        "reads the stamps the deploy runner leaves under the owner's $HOME and keeps its own \
-         dark and blind state there; it is the arm that acts when the record is dark",
-    ),
+    // cluster-watchdog left this roster with backlog a604a35b: it runs as
+    // root from root's tree, keeps its state under /var/lib/boss/watchdog,
+    // reads the deploy runner's stamp as data, and is stamped.
     (
         "disk-floor-sweep",
         "prunes the owner's rootless docker daemon; as root a cache-deleting sweep would hold \

@@ -1,0 +1,140 @@
+# ---------------------------------------------------------------------------
+# codex-exec — the Codex CLI, launched as a process by `boss dispatch --launch`.
+#
+# WHY A FILE (backlog 2f7b8c00, narrowed to Codex 2026-10-07). Measured that
+# day on origin/main f2b98222: nothing ran `codex exec`; 86 of the newest 200
+# agent-runs were Codex running as its own coordinator session, every one of
+# them recorded model opus-5[1m] (the step's declared default) and one carried
+# a token count. Which harness runs a model, how it is started, who it signs
+# as and where its transcript lands are facts about a DEPLOYMENT, so they are
+# a row here and no code names a harness (CLAUDE.md 9). The directory is the
+# roster: one file per harness, its `id` the file's stem.
+#
+# A CHANGE TO THIS FILE IS HELD FOR REVIEW (review f7f0b689, B1). It decides
+# what is executed, as which actor, under which sandbox and with which
+# environment, and the parser judges almost none of that. It holds `env` and
+# `transcript.home_env` — the two ways a variable reaches the process — to a
+# FLOOR by name: no identity, credential, other harness's session, agent
+# socket or code loader. The floor is NOT a safe-list: DATABASE_URL,
+# KUBECONFIG and NETRC pass it, and a secret under an innocent name passes
+# it. It judges nothing about `argv` or `sandbox` — no list of safe commands
+# would be true. The hold is the control; the floor is what it costs nothing
+# to refuse.
+# So every file under this directory is in the dock's hold predicate
+# (`mutating_verb::ALWAYS_DIRS`), and `--launch` reads the roster only from a
+# checkout whose copy is origin/main's.
+#
+# HOW A MODEL REACHES THIS FILE. The agents registry row whose `default_model`
+# is the step's model names an actor; the file whose `actor` is that row's id
+# is the harness. Two registry reads, no branch.
+#
+# `argv` is read from `codex exec --help` of codex-cli 0.159.3 on the dev pod
+# (2026-10-07), never from memory: `--json` prints events as JSONL,
+# `-m/--model`, `-c key=value` for the reasoning effort, `-s/--sandbox`,
+# `-o/--output-last-message <FILE>`, and `-` reads the prompt from stdin.
+# `--ignore-user-config` is that help's "Do not load `$CODEX_HOME/config.toml`;
+# auth still uses `CODEX_HOME`": the account's own Codex configuration does not
+# ride into a dispatched run (review N1). It rode the first live launch (run
+# cff223ac, 2026-10-08 00:50Z): the process started, declared and observed
+# model agreed, and a turn completed. That launch could not start its sandbox,
+# and this word was not why — the refusal was bwrap's own (see `sandbox`
+# below). Whether an account setting would have changed that was not tried.
+# The worktree is the process's cwd, so no `-C`.
+#
+# `env` is a PASS LIST: the launcher clears the environment and lets through
+# only these names when they are set, then adds BOSS_ACTOR (this file's actor)
+# and BOSS_AGENT_RUN itself. BOSS_JOBS_URL and BOSS_TREE are addresses, not
+# identity: the system of record and the checkout the `boss` shim reads.
+#
+# `home = "own"`: the process's HOME is an empty directory made for the launch,
+# and CODEX_HOME (this file's `transcript.home_env`) is set to the real Codex
+# directory, where the same help says its auth and config live. So the
+# account's actor file, the other harness's login and the git credential
+# helper are not under the HOME this process is given. On the first live
+# launch (cff223ac) the CLI started, finished a turn and wrote its transcript
+# with this key as it stands. It ran no command that day, so what a COMMAND
+# needs from the real HOME is still not established.
+#
+# WHAT THAT DOES NOT DO. The process runs as the same Unix account as the
+# session that launched it. Every file that account can read — the real home
+# by its path, the machine-token mount, the other harness's login — is still
+# reachable by a process that looks for it, and BOSS_ACTOR is a default it is
+# told to keep: the actor header is asserted and nothing authenticates it.
+# Only a separate uid closes that. Nothing here does.
+#
+# `sandbox` is per profile, and a profile with no row is refused at dispatch:
+# a builder lane needs a way to gate, which is its own car.
+#
+# BOTH ROWS ARE `danger-full-access`, AND NO SANDBOX HOLDS EITHER LANE HERE
+# (design 99a71246, option 1, decided by David 2026-10-08). The rows were
+# `read-only` until the first live launch, run cff223ac (2026-10-08 00:50Z,
+# recorded on backlog 2f7b8c00 as `codex_live_run_1_20261008`). Codex wraps
+# every command of a `read-only` run in bwrap, bwrap needs unprivileged user
+# namespaces, and the dev pod refuses them (`bwrap: No permissions to create
+# a new namespace`). So the run could execute NO command: its --started
+# receipt and its first repository read both failed, and it handed back
+# `Review refused: source access was blocked`. In this pod `read-only` is not
+# a tighter setting; it is one that cannot start.
+#
+# WHAT THE WORD COSTS. `codex exec --help` (0.159.3) gives three values:
+# read-only, workspace-write, danger-full-access. The last is no sandbox at
+# all. A Codex analyst or reviewer launched from this file is therefore
+# read-only BY INSTRUCTION ONLY — its profile's rules document tells it to
+# write nothing but its own run's records, and nothing stops a command that
+# does otherwise. That is what a Claude reviewer subagent already is in this
+# pod, and it is the paragraph above without its last defence: every file
+# the account can read or WRITE — the shared checkout, the other worktrees,
+# the real home, the machine-token mount — is in reach of any command the
+# model runs.
+#
+# THE REAL FIX IS STILL OWED (option 3 of the same design): launched agents
+# under a separate Unix account or in a pod of their own, where the boundary
+# is the kernel's and not a sentence. It belongs to the unattended-launch
+# item, backlog 167a877c. Until it lands, do not read these two rows as a
+# control, and do not add a third for a builder on their precedent.
+#
+# NOT MEASURED: no launch has run under `danger-full-access` from this file
+# yet. That the word starts in this pod is read off the hand-driven Codex
+# sessions here, whose own config carries `sandbox_mode = "danger-full-access"`
+# ($CODEX_HOME/config.toml, read 2026-10-08), not observed on a dispatched
+# run — and this file passes `--ignore-user-config`, so the two are not the
+# same launch.
+# ---------------------------------------------------------------------------
+id = "codex-exec"
+actor = "agent-codex"
+launch = "process"
+home = "own"
+argv = [
+  "codex", "exec", "--json", "--ignore-user-config",
+  "--model", "{model}",
+  "-c", "model_reasoning_effort=\"{effort}\"",
+  "--sandbox", "{sandbox}",
+  "--output-last-message", "{last_message}",
+  "-",
+]
+env = ["PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "SSL_CERT_FILE", "BOSS_JOBS_URL", "BOSS_TREE"]
+
+# No sandbox: read-only by instruction only (design 99a71246; see the header).
+[sandbox]
+analyst = "danger-full-access"
+reviewer = "danger-full-access"
+
+# The first stdout event that names the native runtime: its id is the tail of
+# the rollout's file name, which is how the transcript is found without a search.
+[started]
+event = "thread.started"
+key = "thread_id"
+
+# The one event that says a turn finished; a process that exits 0 without it
+# has not shown that it did anything.
+[completed]
+event = "turn.completed"
+
+# `$CODEX_HOME`, else `$HOME/.codex`. Layout read off the pod's own session
+# directory names (2026-10-06): sessions/YYYY/MM/DD/rollout-<stamp>-<thread>.jsonl
+[transcript]
+adapter = "codex-rollout"
+home_env = "CODEX_HOME"
+home_default = ".codex"
+glob = "sessions/*/*/*/rollout-*.jsonl"
+runtime_glob = "sessions/*/*/*/rollout-*-{runtime}.jsonl"

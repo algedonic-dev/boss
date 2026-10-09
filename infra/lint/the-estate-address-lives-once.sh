@@ -88,11 +88,14 @@ infra/cluster/manifests/boss-break-glass-operator.yaml	the admission policy's re
 infra/cluster/manifests/boss-conservation-invariants.yaml	CronJob image
 infra/cluster/manifests/boss-conductor.yaml	the conductor's image and BOSS_TRAIN_FORGE_URL — prod is the source instance; render-instance.sh substitutes only the instance keys
 infra/cluster/manifests/boss-dev.yaml	the dev pod's images and forge credential key; editing it rolls the pod
+infra/cluster/manifests/boss-estate-observe.yaml	CronJob images: the mirrored kubectl image by digest, and the boss image its token reader is copied from (backlog 066a7613)
 infra/cluster/manifests/boss-files-gc.yaml	CronJob image
 infra/cluster/manifests/boss-jobs-internal.yaml	THE MetalLB pin that defines the address; held equal to the source by the_estate_address_lives_once.rs
 infra/cluster/manifests/boss-ledger-recognize.yaml	CronJob image
 infra/cluster/manifests/boss-ledger-replay-check.yaml	CronJob image
+infra/cluster/manifests/boss-machine-token-push.yaml	CronJob image
 infra/cluster/manifests/boss-messages-events-purge.yaml	CronJob image
+infra/cluster/manifests/boss-node-maintenance.yaml	CronJob image, pinned by digest: the one pod with a node capability pulls exactly the mirrored image that was read (17f6170c)
 infra/cluster/manifests/boss-playground-crawl.yaml	CronJob images and the clone-by-IP a Job needs before it has a checkout or a host file (gate-runner.yaml + run.sh's shape)
 infra/cluster/manifests/boss-recovery-sheet.yaml	CronJob images and the clone-by-IP, as the crawl above
 infra/cluster/manifests/boss-search-reindex.yaml	CronJob image

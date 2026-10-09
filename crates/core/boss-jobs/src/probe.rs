@@ -53,7 +53,8 @@ use serde_json::Value;
 ///
 /// A `--park-probe` is written on the dev pod (kubectl, a kubeconfig,
 /// the cluster one hop away) and RUN on the forge
-/// (`boss prove --from-car --unattended`, as david, in /home/david/boss, when
+/// (`boss prove --from-car --unattended`, as the low-privilege account
+/// boss-probe, in a read-only view of the converged checkout, when
 /// the car's train arrives). Two machines. The forge is outside the
 /// cluster and holds no kubeconfig, so a probe that reaches for
 /// `kubectl` is correct and unrunnable — and its failure at arrival is
@@ -130,9 +131,10 @@ const CHANGES_DIRECTORY: [&str; 2] = ["cd", "pushd"];
 /// both came back from the forge as exit 1 with `cd: /work/boss: No
 /// such file or directory`, reading TROUBLED in the shed with both
 /// claims true in the converged tree. `/work/boss` is the DEV POD's
-/// checkout; the unattended door runs the probe on the forge, as david,
-/// with cwd ALREADY the converged checkout of main (`BOSS_PROBE_DIR`,
-/// default `/home/david/boss`). It is the same class as
+/// checkout; the unattended door runs the probe on the forge, as the
+/// account boss-probe, with cwd ALREADY a read-only view of the
+/// converged checkout of main (`BOSS_PROBE_DIR`, which the forge's
+/// drop-in sets to `/var/lib/boss/probe-view`). It is the same class as
 /// [`needs_absent_tool`] — a fact of the pod the forge does not have —
 /// and it is refused at the same door for the same reason: at gate
 /// time, on the builder's terminal, instead of hours later as an exit
@@ -1133,6 +1135,81 @@ fn page_size_token(probe: &str) -> Option<&str> {
             .unwrap_or(rest.len());
         (digits > 0).then(|| &probe[i..i + "limit=".len() + digits])
     })
+}
+
+/// The measured evidence for [`clears_a_caller_from_the_gate_log_alone`],
+/// in one copy, quoted by every door that says it (CLAUDE.md §9a).
+pub const GATE_LOG_ALONE_EVIDENCE: &str = "\
+Measured 2026-10-08 (ce72aea9, finding F1 of review d434e1b0): the machine gate states a \
+caller's FIRST request on the log and only counts the rest. Its tally is keyed by (peer, \
+user, method, route, presented); a request whose key already has a row adds one to that \
+row's count, moves its last_seen, and writes no fact. So the log holds one would-refuse \
+fact per caller key per PROCESS, not one per request: the ML batch sends seven tokenless \
+POSTs a night and the log holds one fact a night. A caller already tallied before the cut \
+writes no new fact after it unless the service restarted, and 'no fact after the cut' is \
+then true of a caller that presented nothing. Eight recorded car probes held that shape \
+on the day it was measured, five of them on cars already recorded PROVEN.\n\
+Read the same window's LIVE tally as well, for the service the caller calls, and answer \
+not-yet when it cannot be read whole — an overflowed tally names no caller:\n  \
+live=$(boss-sor-read \"/api/events/gate-window?gate=machine-gate&hours=$hours\" | jq -r --argjson cut \"$cut\" '\n    \
+def epoch: sub(\"\\\\.[0-9]+\"; \"\") | fromdateiso8601;\n    \
+([ .live[]? | select(.service == \"jobs\") ] | first) as $j\n    \
+| if $j == null or $j.error != null or (($j.snapshot.rows | type) != \"array\") or (($j.snapshot.overflow // 0) != 0) then \"unreadable\"\n      \
+else ([ $j.snapshot.rows[] | select(.user == \"<the caller>\" and .presented == \"none\") | select((.last_seen | epoch) > $cut) ] | length | tostring) end')\n  \
+case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally could not be read whole'; exit 75;; esac\n  \
+if [ \"$live\" -gt 0 ]; then echo \"FAILED: $live tokenless row(s) seen since the cut\"; exit 1; fi";
+
+/// The two kinds a tokenless request is stated under on the gate's log:
+/// `would_refuse` while the gate reports, `refused` once it enforces.
+/// Both are written by `MachineGate::record` on a key's first sighting
+/// and by nothing afterwards.
+const GATE_MISS_KINDS: [&str; 2] = ["machine_gate.would_refuse", "machine_gate.refused"];
+
+/// WHEN A PROBE CLEARS A CALLER FROM THE GATE LOG ALONE — the tenth
+/// shape, and one that fails OPEN.
+///
+/// THE DEFECT (backlog ce72aea9, measured 2026-10-08). `boss-core`'s
+/// `MachineGate::record` looks the request's key up in the tally, and
+/// when a row is already there it increments the row and RETURNS — the
+/// emit is below that return. The gate-window's `.log.dirty` therefore
+/// holds one `machine_gate.would_refuse` per caller key per process. A
+/// probe that reads "no would-refuse fact from caller X after the cut,
+/// so X presents the token" is true of every caller the running process
+/// had already tallied before the cut, whatever it sent afterwards. Car
+/// f636c71b's first probe was this shape and was replaced by a
+/// same-head re-gate; of the eight other cars measured carrying it,
+/// five had landed and been recorded PROVEN on it.
+///
+/// Returns the fact kind as written, so the warning can name it. Four
+/// conditions, all required, each there to keep a correct probe quiet:
+///
+/// - it reads the `gate-window`;
+/// - it reads that window's `log.dirty` — the list a clean claim is
+///   counted over;
+/// - it names a kind the gate writes once per key (`would_refuse`,
+///   `refused`), because a window read for its roster, its coverage or
+///   its `asked` facts makes no claim this gap can break;
+/// - and it never reads `snapshot.rows`, the live tally's rows, where
+///   every request moves a `last_seen` whether or not a fact was
+///   written. A probe that names them has taken the second reading.
+///
+/// WARNING, NOT REFUSAL, on its siblings' argument and no stronger one:
+/// the text cannot tell an ABSENCE assertion ("no fact since the cut"),
+/// which this gap turns into a false green, from a PRESENCE assertion
+/// ("the gate did record this caller"), which the log answers correctly
+/// and which fails closed. So it is said at the two doors with a reader
+/// — `boss gate --park-probe` and `boss prove` — and its text says which
+/// way it fails.
+pub fn clears_a_caller_from_the_gate_log_alone(probe: &str) -> Option<&str> {
+    if !probe.contains("gate-window")
+        || !probe.contains("log.dirty")
+        || probe.contains("snapshot.rows")
+    {
+        return None;
+    }
+    GATE_MISS_KINDS
+        .iter()
+        .find_map(|kind| probe.find(kind).map(|i| &probe[i..i + kind.len()]))
 }
 
 /// WHEN A PROBE GREPS A NAME WHERE A DEFINITION IS MEANT — the eighth
@@ -2585,6 +2662,119 @@ echo "ONE-HOME-FOR-A-DISPATCHER-RULE""#;
                 "{text}"
             );
         }
+    }
+
+    /// The window leg of car f636c71b's FIRST probe, verbatim from
+    /// gate-run 6715ffbd's `park_probe` (2026-10-08): the whole of what
+    /// it read of the machine gate before the same-head re-gate.
+    const F636_LOG_LEG: &str = r#"bad=$(boss-sor-read "/api/events/gate-window?gate=machine-gate&hours=$hours" | jq -r --argjson cut "$cut" '
+  def epoch: sub("\\.[0-9]+"; "") | fromdateiso8601;
+  if (.log_error == null) and ((.log.dirty | type) == "array") then
+    [ .log.dirty[] | select(.kind == "machine_gate.would_refuse")
+      | select(.payload.key.user == "automation:discover-admission-source")
+      | select((.at | epoch) > $cut) ] | length
+  else empty end')
+case ${bad:-empty} in empty|*[!0-9]*) echo 'not yet: the machine-gate window could not be read'; exit 75;; esac
+if [ "$bad" -gt 0 ]; then echo "FAILED: $bad would-refuse fact(s) from the discover-admission-source verb more than an hour after this car converged, with $ran run(s) answered since"; exit 1; fi
+"#;
+
+    /// What gate-run ac6706d3 added below it on the same head: the jobs
+    /// service's live tally rows, and not-yet when they cannot be read
+    /// whole.
+    const F636_LIVE_LEG: &str = r#"live=$(boss-sor-read "/api/events/gate-window?gate=machine-gate&hours=$hours" | jq -r --argjson cut "$cut" '
+  def epoch: sub("\\.[0-9]+"; "") | fromdateiso8601;
+  ([ .live[]? | select(.service == "jobs") ] | first) as $j
+  | if $j == null or $j.error != null or (($j.snapshot.rows | type) != "array") or (($j.snapshot.overflow // 0) != 0) then "unreadable"
+    else ([ $j.snapshot.rows[] | select(.user == "automation:discover-admission-source" and .presented == "none") | select((.last_seen | epoch) > $cut) ] | length | tostring) end')
+case ${live:-empty} in unreadable|empty|*[!0-9]*) echo "not yet: the jobs service's live machine-gate tally could not be read whole (${live:-nothing})"; exit 75;; esac
+if [ "$live" -gt 0 ]; then echo "FAILED: the jobs service's live tally holds $live row(s)"; exit 1; fi
+echo 'DISCOVER_ADMISSION_SOURCE_PRESENTS_THE_MACHINE_TOKEN'
+"#;
+
+    /// ONE FACT PER CALLER PER PROCESS (backlog ce72aea9). The shape is a
+    /// clean claim counted over the gate log's dirty facts with the live
+    /// tally never read — car f636c71b's first probe, and the one-line
+    /// spelling cars 3b8d02f6 and 099f8a9f recorded.
+    #[test]
+    fn a_caller_cleared_from_the_gate_log_alone_is_named() {
+        for (probe, kind) in [
+            (F636_LOG_LEG.to_string(), "machine_gate.would_refuse"),
+            (
+                r#"n=$(boss-sor-read "/api/events/gate-window?gate=machine-gate&hours=$hours" | jq -r --arg cut "$cut" 'if (.log_error == null) and ((.log.dirty | type) == "array") then [.log.dirty[] | select(.kind == "machine_gate.would_refuse" and .payload.service == "jobs" and .payload.key.user == "automation:estate-observer" and .at > $cut)] | length else empty end')"#.to_string(),
+                "machine_gate.would_refuse",
+            ),
+            (
+                r#"n=$(boss-sor-read "/api/events/gate-window?gate=machine-gate&hours=$hours" | jq -r --arg cut "$cut" 'if (.log_error == null) and ((.log.dirty | type) == "array") then [.log.dirty[] | select(.kind == "machine_gate.would_refuse" and .at > $cut and .payload.key.presented == "none") | .payload.key | select(.user == "automation:recovery-sheet" or .user == "automation:ci-disk-reclaim")] | length else empty end')"#.to_string(),
+                "machine_gate.would_refuse",
+            ),
+            // Once the gate enforces, the same first sighting is `refused`.
+            (
+                r#"boss-sor-read '/api/events/gate-window?gate=machine-gate&hours=24' | jq '[.log.dirty[] | select(.kind == "machine_gate.refused" and .payload.key.user == "automation:x")] | length'"#.to_string(),
+                "machine_gate.refused",
+            ),
+        ] {
+            assert_eq!(
+                clears_a_caller_from_the_gate_log_alone(&probe),
+                Some(kind),
+                "{probe}"
+            );
+        }
+    }
+
+    /// The corrected probe is clean — the log leg WITH the live leg under
+    /// it — and so is car 217c2d66's, which read both in one jq.
+    #[test]
+    fn a_probe_that_also_reads_the_live_tally_is_not_reported() {
+        let corrected = format!("{F636_LOG_LEG}{F636_LIVE_LEG}");
+        for clean in [
+            corrected.as_str(),
+            r#"read_out=$(boss-sor-read "/api/events/gate-window?gate=machine-gate&hours=$hours" | jq -r --arg cut "$cut" 'if (.log_error == null) and ((.log.dirty | type) == "array") and ((.live | type) == "array") then ([.live[] | select(.service == "jobs")] | .[0]) as $j | if $j == null or $j.error != null or (($j.snapshot.rows | type) != "array") or (($j.snapshot.overflow // 0) != 0) then empty else "\([.log.dirty[] | select(.kind == "machine_gate.would_refuse" and .payload.key.presented == "none" and .at > $cut)] | length) \([$j.snapshot.rows[] | select(.presented == "none" and .last_seen > $cut)] | length)" end else empty end')"#,
+        ] {
+            assert_eq!(
+                clears_a_caller_from_the_gate_log_alone(clean),
+                None,
+                "clean: {clean}"
+            );
+        }
+    }
+
+    /// And a window read for ANOTHER purpose is left alone: the roster
+    /// generation (car 35baf5b0), the actor-role watch (22e6e8de), the
+    /// `asked` facts with no miss kind named, a schema grep for the kind
+    /// that never opens the window (6e022f85), and a probe that names
+    /// the kind in a sentence it prints.
+    #[test]
+    fn a_gate_window_read_for_another_purpose_is_not_reported() {
+        for clean in [
+            r#"got=$(boss-sor-read '/api/events/gate-window?gate=machine-gate&hours=1' | jq -r 'if type != "object" or .gate != "machine-gate" then "unread" elif (.roster_generations | type) != "array" then "absent" else "one" end')"#,
+            r#"window=$(boss-sor-read '/api/events/gate-window?gate=actor-role&hours=72'); printf '%s' "$window" | jq -r '([(.log.coverage // [])[] | select(.service == "jobs")] | first) as $c | [(.observation.facts.Ok // [])[] | select(.kind == "actor_role.recording_began")] | length'"#,
+            r#"boss-sor-read '/api/events/gate-window?gate=machine-gate&hours=2' | jq '[.log.dirty[] | select(.kind == "machine_gate.asked")] | length'"#,
+            r#"git show HEAD:infra/postgres/schema/20261001141502-a-would-refuse-is-a-fact-on-the-log.sql | grep -q "'machine_gate.would_refuse'" || exit 1"#,
+            r#"boss-sor-read '/api/events/gate-window?gate=machine-gate&hours=1' | jq -r '.clean_since // empty'; echo 'no machine_gate.would_refuse is read here'"#,
+        ] {
+            assert_eq!(
+                clears_a_caller_from_the_gate_log_alone(clean),
+                None,
+                "clean: {clean}"
+            );
+        }
+    }
+
+    /// The evidence names the repair and is not itself the shape, and it
+    /// trips neither of the two count checks a builder would read beside
+    /// it.
+    #[test]
+    fn the_gate_log_evidence_does_not_teach_the_shape_it_warns_about() {
+        assert_eq!(
+            clears_a_caller_from_the_gate_log_alone(GATE_LOG_ALONE_EVIDENCE),
+            None
+        );
+        assert!(GATE_LOG_ALONE_EVIDENCE.contains("snapshot.rows"));
+        assert_eq!(
+            counts_a_page_it_may_not_have_read(GATE_LOG_ALONE_EVIDENCE),
+            None
+        );
+        assert_eq!(compares_an_unguarded_number(GATE_LOG_ALONE_EVIDENCE), None);
     }
 
     /// The two recorded probes backlog 8ac42ee5 measured, VERBATIM from

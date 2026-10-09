@@ -655,6 +655,57 @@ fn agent_stop_reports_the_run_it_remembered() {
     assert_eq!(f.calls("boss-calls").len(), 1);
 }
 
+/// A BACKGROUND Agent call returns at LAUNCH: a status and an agent id,
+/// no text, no usage. That is not a handback, and reporting it as one
+/// put "(the Agent tool returned no text)" and a zero-token finish
+/// record on every run packet a minute into the run; the run then
+/// landed on that pair — `reported` completed with the placeholder as
+/// its summary and an `agent_runs` row holding no count — and the
+/// agent's own report, with the real usage, was refused. Measured on 21
+/// of the 56 runs of 2026-10-08 (backlog b5a3a174; ec97dbeb named the
+/// cause on 2026-10-01). The hook reports what the tool handed back or
+/// nothing: the run it remembered stays remembered, and the agent's own
+/// `boss dispatch --report` is the report.
+#[test]
+fn agent_stop_does_not_report_a_launch_that_handed_nothing_back() {
+    let f = Fixture::new("agent-stop-launch");
+    f.stub_boss(false);
+    let runs = f.state.join("s-1").join("runs");
+    std::fs::create_dir_all(&runs).unwrap();
+    for (n, response) in [
+        r#","tool_response":{"status":"async_launched","agentId":"a4d2","isAsync":true}"#,
+        r#","tool_response":{"status":"completed","agentId":"a4d2","content":[]}"#,
+        r#","tool_response":{"status":"completed","content":[{"type":"text","text":"  \n "}]}"#,
+        r#","tool_response":"""#,
+        "",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        std::fs::write(runs.join("toolu_01"), format!("{RUN}\n")).unwrap();
+        let (code, out, err) = f.run(
+            "agent-stop.sh",
+            &agent_payload("PostToolUse", "Packet: da925366", response),
+            true,
+        );
+        assert_eq!(code, 0, "case {n}: {err}");
+        assert_eq!(out, "", "case {n}");
+        assert!(
+            f.calls("boss-calls").is_empty(),
+            "case {n}: nothing was handed back, so nothing is reported: {:?}",
+            f.calls("boss-calls")
+        );
+        assert!(
+            err.contains("handed back no text") && err.contains(RUN),
+            "case {n}: the journal says why, naming the run: {err}"
+        );
+        assert!(
+            runs.join("toolu_01").exists(),
+            "case {n}: the run was not reported, so it is still remembered"
+        );
+    }
+}
+
 #[test]
 fn session_end_completes_active_as_clean_through_boss_api() {
     let f = Fixture::new("end");

@@ -395,6 +395,126 @@ fn jq_any_line(re: &str, text: &str) -> bool {
 // The verb.
 // ---------------------------------------------------------------------------
 
+/// BOTH READS PRESENT THE MACHINE TOKEN, AND THE PLAN IS THE SAME PLAN
+/// (design 6805c764; backlog 44b2087e). The verb's two reads — the
+/// estate registry for the other runners, the jobs API for the queue —
+/// went out with `x-boss-user` alone. Each now carries the header file
+/// the one shell reader made FOR ITS OWN URL: the registry read may be
+/// pointed at another host (`BOSS_ESTATE_NODES_URL`), and a header made
+/// for the jobs API must not follow it there. The token is presented,
+/// never required: the plan and its hash are byte for byte the plan of
+/// a host that holds none.
+#[test]
+fn both_reads_present_the_machine_token_and_the_plan_is_the_same_plan() {
+    if !tools() {
+        return;
+    }
+    const TOKEN: &str = "synthetic-machine-fixture";
+    // The harness's stub, with one line in front: every request and
+    // whether a header file it was handed holds the token's header.
+    let stub = CURL_STUB.replacen(
+        "#!/bin/sh\n",
+        "#!/bin/sh\n\
+         t=no; q=; u=; for a in \"$@\"; do case \"$a\" in http://*|https://*) u=\"$a\" ;; esac; \
+         if [ \"$q\" = -H ]; then case \"$a\" in @*) if grep -q '^x-boss-machine-token: ' \"${a#@}\" 2>/dev/null; then t=yes; fi ;; esac; fi; q=\"$a\"; done\n\
+         printf '%s token=%s\\n' \"$u\" \"$t\" >> \"$STUB_CALL_LOG\"\n\
+         case \"$*\" in *synthetic-machine-fixture*) echo argv >> \"$STUB_CALL_LOG\" ;; esac\n",
+        1,
+    );
+    let go = |name: &str, slot: bool, hosts: &str, nodes_url: Option<&str>| {
+        let h = Host::new(name);
+        write_exec(&h.bin.join("curl"), &stub);
+        let mount = h.root.join("mount");
+        std::fs::create_dir_all(&mount).unwrap();
+        if slot {
+            write_file(&mount.join("current"), &format!("{TOKEN}\n"));
+        }
+        let (mount, calls) = (
+            mount.display().to_string(),
+            h.root.join("calls.log").display().to_string(),
+        );
+        let mut env = vec![
+            ("BOSS_MACHINE_TOKEN_DIR", mount.as_str()),
+            ("BOSS_MACHINE_TOKEN_HOSTS", hosts),
+            ("STUB_CALL_LOG", calls.as_str()),
+        ];
+        if let Some(u) = nodes_url {
+            env.push(("BOSS_ESTATE_NODES_URL", u));
+        }
+        let (rc, plan, err) = h.verb(&["--dry-run"], &env);
+        assert_eq!(
+            rc, 0,
+            "{name}: the dry run passes every bound:\n{plan}\n{err}"
+        );
+        assert!(
+            !plan.contains(TOKEN) && !err.contains(TOKEN),
+            "{name}: {plan}\n{err}"
+        );
+        let calls: Vec<String> = std::fs::read_to_string(&calls)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            !calls.iter().any(|l| l == "argv"),
+            "{name}: the token was in curl's argv"
+        );
+        // The plan names this case's own scratch paths (the marker, the
+        // cache); compare what it says, not where the fixture lives.
+        (plan.replace(&h.root.display().to_string(), "<host>"), calls)
+    };
+
+    let (plan, calls) = go("token-absent", false, "sor.test", None);
+    assert!(
+        calls
+            .iter()
+            .any(|l| l.starts_with("http://sor.test/api/estate/nodes "))
+            && calls
+                .iter()
+                .any(|l| l.starts_with("http://sor.test/api/jobs?")),
+        "the stub received neither read, so this case proves nothing: {calls:?}"
+    );
+    assert!(calls.iter().all(|l| l.ends_with(" token=no")), "{calls:?}");
+
+    let (with, with_calls) = go("token-present", true, "sor.test", None);
+    assert_eq!(with, plan, "a token changes nothing the plan says");
+    assert_eq!(
+        with_calls.len(),
+        calls.len(),
+        "{with_calls:?} against {calls:?}"
+    );
+    assert!(
+        with_calls.iter().all(|l| l.ends_with(" token=yes")),
+        "a request reached the system of record without the token this host holds: {with_calls:?}"
+    );
+
+    // The registry read named at another host: the queue read is still
+    // stamped, and nothing sent to the other host carries the token.
+    let (_, split) = go(
+        "token-other-nodes-host",
+        true,
+        "sor.test",
+        Some("http://registry.elsewhere.test/api/estate/nodes"),
+    );
+    assert!(
+        split
+            .iter()
+            .any(|l| l.starts_with("http://registry.elsewhere.test/")),
+        "{split:?}"
+    );
+    for l in &split {
+        let want = if l.starts_with("http://sor.test/") {
+            "yes"
+        } else {
+            "no"
+        };
+        assert!(
+            l.ends_with(&format!(" token={want}")),
+            "the token follows the host it was made for, never the request beside it: {split:?}"
+        );
+    }
+}
+
 #[test]
 fn the_dry_run_prints_every_bound_and_the_plan_and_stops_nothing() {
     if !tools() {

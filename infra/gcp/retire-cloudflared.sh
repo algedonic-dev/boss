@@ -165,7 +165,21 @@ say "hostnames the in-cluster connector must serve (${INSTANCES#"$REPO"/}): ${HO
 ACTOR="${BOSS_OPS_ACTOR:-automation:ops-runner}"
 BOSS_USER="{\"id\":\"$ACTOR\",\"role\":\"platform-admin\",\"access_tier\":\"operator\",\"territory_account_ids\":[],\"direct_report_ids\":[],\"department\":\"platform\"}"
 CONVERGE_URL="$BOSS_JOBS_URL/api/jobs?kind=$CONVERGE_KIND&limit=40&full=true"
-if ! curl -fsS --max-time 15 -H "x-boss-user: $BOSS_USER" "$CONVERGE_URL" > "$TMP/converges.json" 2> "$TMP/curl.err"; then
+# The machine token, PRESENTED and never required (design 6805c764;
+# backlog 44b2087e): this read went out with x-boss-user alone. Made in
+# the script's own shell, after the trap above. No token on the host, no
+# lib beside this checkout, or a header file that could not be written:
+# MT_HDR is empty and the read is the one it was — the bound is judged
+# by what the record answers, never by the token.
+MT_HDR=""
+SECRET_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/secret-header.sh"
+if [ -r "$SECRET_LIB" ]; then
+    # shellcheck source=infra/lib/secret-header.sh
+    . "$SECRET_LIB"
+    machine_token_header MT_HDR "$BOSS_JOBS_URL" || MT_HDR=""
+fi
+if ! curl -fsS --max-time 15 -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} \
+        "$CONVERGE_URL" > "$TMP/converges.json" 2> "$TMP/curl.err"; then
     say "REFUSED — the system of record did not answer the converge read ($CONVERGE_URL):"
     sed 's/^/    /' "$TMP/curl.err" >&2
     say "  the hand-over cannot be evaluated, and a bound that cannot be evaluated is not passed. Nothing was stopped."

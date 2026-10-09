@@ -47,6 +47,19 @@
 #     null, a `snapshot`) whose mode is recording (`report` or `enforce`,
 #     no `mode_error`), whose `rows` are empty, whose `overflow` is 0 and
 #     whose own `not_clean` is empty.
+#   * for the machine gate, whose required services come from the
+#     launcher's record: `roster_generations` names EXACTLY ONE launch
+#     roster generation, and it is stated. The join already refuses a
+#     window whose hours span a change of selection (its `not_clean`
+#     names both generations and the instant — design 3cc6152a, backlog
+#     14fe115c, `boss_core::gate_window::judged_generations`) and one in
+#     which a required service's own running process stated anything
+#     else, whatever another service stated after it (review 6858ef1d,
+#     B1: that generation, or the absence of one, is then a second entry
+#     of `roster_generations`); this line
+#     is the same rule read off the same answer, so an answer from a
+#     build that predates it is refused rather than read as "one". The
+#     policy check consults no launch record and names none.
 # A field that is ABSENT is refused like a dirty one: an answer from a
 # build that does not carry it cannot be read as zero.
 #
@@ -136,6 +149,15 @@ reasons="$(printf '%s' "$body" | jq -r --arg gate "$gate" --argjson hours "$hour
 
         ($w.live | listed("live")),
 
+        (if $gate != "machine-gate" then empty
+         elif ($w.roster_generations | type) != "array" then
+           "roster_generations is missing or not a list: the answer does not say which launch roster its hours were judged under"
+         elif ($w.roster_generations | length) != 1 then
+           "roster_generations names \($w.roster_generations | length) launch roster generation(s), not exactly one: \($w.roster_generations | map("\(.generation? // "none stated") since \(.since? // "?")") | join("; "))"
+         elif ($w.roster_generations[0].generation | type) != "string" then
+           "roster_generations: the process starts state no generation (\($w.roster_generations[0].unstated? // "no reason given"))"
+         else empty end),
+
         (if ($w.required_services | type) != "array" or ($w.required_services | length) == 0 then
            "required_services names no service: a window over nothing is not a window"
          else
@@ -188,4 +210,5 @@ fi
 
 # The receipt line: every value copied out of the answer judged.
 printf '%s' "$body" | jq -r --arg gate "$gate" --arg hours "$hours" '
-    "GATE-WINDOW-CLEAN gate=\($gate) hours=\($hours) from=\(.from) now=\(.now) clean_since=\(.clean_since) services=\(.required_services | join(",")) modes=\([.live[] | "\(.service):\(.snapshot.mode)"] | join(","))"'
+    "GATE-WINDOW-CLEAN gate=\($gate) hours=\($hours) from=\(.from) now=\(.now) clean_since=\(.clean_since) services=\(.required_services | join(",")) modes=\([.live[] | "\(.service):\(.snapshot.mode)"] | join(","))"
+    + (if $gate == "machine-gate" then " roster_generation=\(.roster_generations[0].generation)" else "" end)'

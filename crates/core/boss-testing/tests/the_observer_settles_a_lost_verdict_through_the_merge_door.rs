@@ -83,3 +83,63 @@ fn the_merge_goes_before_the_flip() {
         "the flip must be gated on the merge answering 2xx:\n{block}"
     );
 }
+
+/// A RUNNER THAT LEAVES ITS VERDICT IS NOT THIS PASS'S TO SETTLE (backlog
+/// 934ccad1). A Job of the pod-log layout writes nothing itself, so its
+/// red gate is a Failed Job over an OPEN packet until the conductor
+/// records the receipt — and this pass would settle that `lost`, turning
+/// a real `failed` into an infrastructure death. The pass's own jq
+/// program is lifted from the manifest and run over a Job list: the
+/// old-layout corpse is still listed, the carrier one is not.
+#[test]
+fn a_failed_job_that_leaves_its_verdict_is_not_listed_as_a_dead_runner() {
+    let path = repo_root().join(OBSERVER);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let start = text
+        .find("jq -r '(.items // []) as $all")
+        .expect("the dead-runner selection");
+    let program = &text[start + "jq -r '".len()..];
+    let program = &program[..program
+        .find("' \"$WORK/gate-jobs.json\"")
+        .expect("the selection reads gate-jobs.json")];
+    let failed = |name: &str, packet: &str, carrier: Option<&str>| {
+        let mut labels = serde_json::json!({"app": "gate-runner", "boss.dev/packet": packet});
+        if let Some(c) = carrier {
+            labels["boss.dev/verdict-carrier"] = serde_json::json!(c);
+        }
+        serde_json::json!({
+            "metadata": {"name": name, "labels": labels},
+            "status": {"failed": 1, "conditions": [
+                {"type": "Failed", "reason": "BackoffLimitExceeded",
+                 "lastTransitionTime": "2026-10-07T19:00:00Z", "message": "m"}]}
+        })
+    };
+    let list = serde_json::json!({"items": [
+        failed("gate-old-11111", "p-old", None),
+        failed("gate-new-22222", "p-new", Some("pod-log")),
+        // Any other word under the label is not that layout: still listed.
+        failed("gate-odd-33333", "p-odd", Some("true")),
+    ]});
+    let dir = boss_testing::scratch_dir("observer-dead-runner-selection");
+    let file = dir.join("gate-jobs.json");
+    boss_testing::write_file(&file, &list.to_string());
+    let out = std::process::Command::new("jq")
+        .args(["-r", program])
+        .arg(&file)
+        .output()
+        .expect("jq runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let listed: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.split('\t').next().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        listed,
+        vec!["gate-old-11111".to_string(), "gate-odd-33333".to_string()],
+        "the observer's dead-runner pass lists a Job whose verdict the conductor records"
+    );
+}

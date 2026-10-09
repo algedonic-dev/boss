@@ -33,7 +33,11 @@
 //!   PROMOTE, one write per Secret: `current` → `previous`, `next` →
 //!   `current`, `promoted-at` = now. Callers now send the new value and
 //!   every gate still accepts the old one as `previous`. The step
-//!   completes when every port answers `matched: current`.
+//!   completes when every port answers `matched: current` AND every
+//!   declared Secret, read again, still holds the value as `current`
+//!   under this packet's name — a mirror is read by its namespace's
+//!   callers and by no gate, so the gates cannot vouch for it (backlog
+//!   50c0d155).
 //! - **revoke** — blank `previous`, but only once the gates have shown
 //!   for a whole drain window that nothing presents it: every served
 //!   port's durable recording history plus healthy live tally in
@@ -62,6 +66,32 @@
 //! window one delivery may hold — records why it stopped on the step
 //! (`<step>_deferred`), and acknowledges. Every pass reads the state
 //! afresh, so any firing can resume any other's work.
+//!
+//! TWO SLOT SETS, ONE HANDLER (design b35c22b4, "an argument, not a
+//! second handler"; backlog d26515c5). A machine gate reads a second
+//! `current`/`next`/`previous` from the probe-reader credential's Secret,
+//! admits a match for GET and HEAD only, and names it `reader.<slot>`.
+//! The rule `broker-rotates-the-probe-reader` runs this same walk over
+//! that Secret by declaring `gate_slots = "reader"` ([`GateSlots`]), and
+//! everything above holds for it with four differences, each read off
+//! the declaration and none off the credential's id:
+//!
+//! - verify waits for `reader.next`, then `reader.current`;
+//! - a gate that names the value by a BARE slot is saying it equals an
+//!   estate machine token — every method, any asserted identity — and
+//!   that is a refusal for a hand, before the promotion and after it
+//!   ([`named_as_estate`]; review 177b4976, N2);
+//! - the revoke waits out `reader.previous`, in the tallies and on the
+//!   log (`gate_window::join_drain_window`), and an estate `previous`
+//!   neither holds it nor is held by it;
+//! - a gate's tally refuses a reader value, so that drain's reads are
+//!   opened with the estate token this process's own mount holds —
+//!   presented alone, as every gate read here presents one value alone
+//!   (a reader value beside another is a 400, N1). With no estate token
+//!   mounted there is no evidence, and the revoke holds.
+//!
+//! A rule that declares nothing fills the estate set: the machine
+//! token's two rules read exactly as before.
 //!
 //! THE SECRET IS THE LEDGER. Beside each slot the handler writes
 //! `<slot>.minted-for`, the packet that made that value, in the same
@@ -120,7 +150,8 @@
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use boss_core::machine_gate::{Accepts, MAX_KEYS_PER_SOURCE, Misses, Mode, Presented};
+use boss_core::gate_evidence::DrainedSlot;
+use boss_core::machine_gate::{Accepts, MAX_KEYS_PER_SOURCE, Misses, Mode, Presented, Slot};
 use boss_dispatcher::rules::expr::Value;
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext, arg, arg_string};
 use boss_jobs::credentials::RotationPhase;
@@ -183,6 +214,76 @@ pub const DRAIN_FLOOR_MINUTES: i64 = 60;
 
 /// The service this process IS: the roster's control read.
 pub const CONTROL_SERVICE: &str = "dispatcher";
+
+/// The rule arg naming which of a machine gate's two slot sets the
+/// credential fills ([`GateSlots`]).
+pub const GATE_SLOTS_ARG: &str = "gate_slots";
+
+/// The rule arg naming the clock rule that resumes this credential's
+/// rotation, for the note every deferral leaves. Absent, it is
+/// [`ADVANCE_RULE`], the machine token's.
+pub const ADVANCE_RULE_ARG: &str = "advance_rule";
+
+/// Which of a machine gate's two slot sets a rule's credential fills
+/// (design b35c22b4, "an argument, not a second handler"; backlog
+/// d26515c5). The Secret's keys are `current`, `next` and `previous`
+/// either way — the gate reads the estate token's from one mounted
+/// directory and the probe reader's from another — but everything the
+/// gate SAYS about a value differs by set, and this handler decides on
+/// what the gate says:
+///
+/// - the accepts route names an estate match by the bare slot and a
+///   reader match `reader.<slot>` ([`GateSlots::answers`]);
+/// - the tally and the log record a superseded estate value as
+///   `previous` and a superseded reader value as `reader.previous`
+///   ([`GateSlots::drained`]);
+/// - a gate's tally answers an estate token and refuses a reader value,
+///   so the estate rotation opens it with the value it rotates and the
+///   reader rotation with the token the dispatcher's own mount holds;
+/// - a reader value a gate names by a BARE slot equals an estate token,
+///   and is refused ([`named_as_estate`]).
+///
+/// It is the RULE's declaration (`gate_slots`), never read off the
+/// credential's id: a rule that says nothing fills the estate set, as
+/// the machine token's two rules always have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GateSlots {
+    Estate,
+    Reader,
+}
+
+impl GateSlots {
+    /// Every refusal is PERMANENT: an unknown word must never fall back
+    /// to the set whose values can write.
+    fn parse(raw: Option<&str>) -> Result<Self, HandlerError> {
+        match raw {
+            None | Some("estate") => Ok(GateSlots::Estate),
+            Some("reader") => Ok(GateSlots::Reader),
+            Some(other) => Err(HandlerError::Permanent(format!(
+                "{GATE_SLOTS_ARG} = {other:?} names no slot set a machine gate reads: \"estate\" \
+                 (the default, the estate machine token's) or \"reader\" (the probe-reader \
+                 credential's)"
+            ))),
+        }
+    }
+
+    /// What a gate's accepts route answers for a value in `slot` of this
+    /// set — the gate's own spelling, read from its types.
+    pub fn answers(self, slot: Slot) -> &'static str {
+        match self {
+            GateSlots::Estate => slot.name(),
+            GateSlots::Reader => Presented::reader(slot).name(),
+        }
+    }
+
+    /// The set whose `previous` this credential's revoke waits out.
+    pub fn drained(self) -> DrainedSlot {
+        match self {
+            GateSlots::Estate => DrainedSlot::Estate,
+            GateSlots::Reader => DrainedSlot::Reader,
+        }
+    }
+}
 
 /// The key naming the packet that made a slot's value.
 pub fn minted_for_key(slot: &str) -> String {
@@ -498,6 +599,27 @@ pub fn judge_accepts(reads: &[(String, GateRead<Accepts>)], want: &str) -> Accep
     v
 }
 
+/// The ports whose gate names a presented value by a BARE estate slot —
+/// `<port> answers matched <slot>` for each. Asked about a probe-reader
+/// value, any such answer means that value EQUALS an estate machine
+/// token: the estate set wins a match (`machine_gate::Matched::of`), so
+/// the gate admits whoever presents it for every method under any
+/// identity it asserts, and the reader's read-only scope is gone (review
+/// 177b4976, N2). The gate says the same at ERROR on its own log; this is
+/// the rotation hearing it, from the answer it was already reading.
+pub fn named_as_estate(reads: &[(String, GateRead<Accepts>)]) -> Vec<String> {
+    let estate = [Slot::Current, Slot::Next, Slot::Previous].map(Slot::name);
+    reads
+        .iter()
+        .filter_map(|(service, read)| match read {
+            GateRead::Answered(a) if estate.contains(&a.matched.as_str()) => {
+                Some(format!("{service} answers matched {}", a.matched))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 impl<T> GateRead<T> {
     fn answered(&self) -> bool {
         matches!(self, GateRead::Answered(_))
@@ -542,6 +664,26 @@ pub fn judge_drain(
     window: chrono::Duration,
     excused: &[String],
 ) -> Result<String, Vec<String>> {
+    judge_drain_of(reads, now, window, excused, Presented::Previous)
+}
+
+/// [`judge_drain`] for either slot set: `drained` is what the tallies
+/// name a presentation of the superseded value — `previous` for the
+/// estate token, `reader.previous` for the probe-reader credential. A
+/// reader presentation past its source's share is counted by source, not
+/// keyed (review 177b4976, B1), so it is read where an estate `previous`
+/// is only ever read defensively: in `source_overflow`, aged by its
+/// `last_seen` as a row is.
+pub fn judge_drain_of(
+    reads: &[(String, GateRead<Misses>)],
+    now: DateTime<Utc>,
+    window: chrono::Duration,
+    excused: &[String],
+    drained: Presented,
+) -> Result<String, Vec<String>> {
+    // The slot's name as the gate spells it: `previous` for the estate
+    // token, so every sentence below reads as it always has for it.
+    let slot = drained.name();
     let cutoff = now - window;
     let mut held = Vec::new();
     let (mut clean, mut not_served, mut noisy) = (Vec::new(), Vec::new(), Vec::new());
@@ -563,7 +705,7 @@ pub fn judge_drain(
                 held.push(format!(
                     "{service} refused the connection at the drain, and it is not recorded as \
                      down since the promotion ({NOT_SERVED_AT_VERIFY}): a process there took its \
-                     tally, and any previous presentation it held, with it. The revoke holds until \
+                     tally, and any {slot} presentation it held, with it. The revoke holds until \
                      {service} answers again, or a build whose boss_ports drops it"
                 ));
                 continue;
@@ -600,17 +742,17 @@ pub fn judge_drain(
             // N3).
             held.push(format!(
                 "{service}'s tally overflowed ({} request(s) not keyed: the whole tally was full, \
-                 and nothing names who sent them), so a previous match may be among them",
+                 and nothing names who sent them), so a {slot} match may be among them",
                 m.overflow
             ));
         }
         for o in &m.source_overflow {
-            if o.presented == Presented::Previous {
+            if o.presented == drained {
                 if o.last_seen.is_some_and(|t| t <= cutoff) {
                     continue;
                 }
                 held.push(format!(
-                    "{service}: {} presented previous {} time(s) past its own share of the tally, \
+                    "{service}: {} presented {slot} {} time(s) past its own share of the tally, \
                      last {}, so its callers are not named: the old value was in use there inside \
                      the window",
                     o.source,
@@ -636,10 +778,10 @@ pub fn judge_drain(
         for row in m
             .rows
             .iter()
-            .filter(|r| r.key.presented == Presented::Previous && r.last_seen > cutoff)
+            .filter(|r| r.key.presented == drained && r.last_seen > cutoff)
         {
             held.push(format!(
-                "{service}: {} as {} still presents previous on {} {} ({} time(s), last {})",
+                "{service}: {} as {} still presents {slot} on {} {} ({} time(s), last {})",
                 row.key.peer,
                 row.key.user,
                 row.key.method,
@@ -657,13 +799,13 @@ pub fn judge_drain(
     }
     if held.is_empty() {
         Ok(format!(
-            "no port recorded a previous match since {}: {} tall{} read clean ({}){}{}",
+            "no port recorded a {slot} match since {}: {} tall{} read clean ({}){}{}",
             cutoff.to_rfc3339(),
             clean.len(),
             if clean.len() == 1 { "y" } else { "ies" },
             clean.join(", "),
             not_served_text(&not_served),
-            noisy_text(&noisy)
+            noisy_text(&noisy, slot)
         ))
     } else {
         Err(held)
@@ -691,15 +833,16 @@ pub fn still_excused<T>(excused: &[String], reads: &[(String, GateRead<T>)]) -> 
 }
 
 /// The sources that sent past their own share of a tally without
-/// presenting `previous`: they did not hold the revoke, and the revoke's
-/// record says who they were (backlog 93bcf490).
-fn noisy_text(noisy: &[String]) -> String {
+/// presenting the drained slot (`previous`, or `reader.previous`): they
+/// did not hold the revoke, and the revoke's record says who they were
+/// (backlog 93bcf490).
+fn noisy_text(noisy: &[String], slot: &str) -> String {
     if noisy.is_empty() {
         String::new()
     } else {
         format!(
             "; past their own share of a tally ({MAX_KEYS_PER_SOURCE} keys), counted and not \
-             keyed, none presenting previous: {}",
+             keyed, none presenting {slot}: {}",
             noisy.join(", ")
         )
     }
@@ -737,6 +880,10 @@ struct Declaration<'a> {
     credential_id: &'a str,
     drain: chrono::Duration,
     phase: Option<&'a str>,
+    /// Which slot set the gates read this Secret as.
+    slots: GateSlots,
+    /// The clock rule a deferral names as what acts next.
+    advance_rule: &'a str,
 }
 
 impl<'a> Declaration<'a> {
@@ -774,6 +921,8 @@ impl<'a> Declaration<'a> {
             credential_id: arg_string(args, "credential_id")?,
             drain: chrono::Duration::minutes(minutes),
             phase: optional_arg(args, "phase"),
+            slots: GateSlots::parse(optional_arg(args, GATE_SLOTS_ARG))?,
+            advance_rule: optional_arg(args, ADVANCE_RULE_ARG).unwrap_or(ADVANCE_RULE),
         })
     }
 
@@ -821,6 +970,11 @@ pub struct CredentialRotateSelfIssued {
     secrets: Arc<dyn SecretStore>,
     gates: Arc<dyn GateReader>,
     poll: GatePoll,
+    /// The estate machine token as this process's own mount holds it —
+    /// the one every `api_client()` request is stamped from. Read only
+    /// to open a gate's tally for a credential that cannot open it
+    /// itself, and never written anywhere.
+    estate: Arc<boss_core::machine_token::Source>,
 }
 
 /// What the copies say about `current` ([`CredentialRotateSelfIssued::copies`]).
@@ -870,12 +1024,33 @@ impl CredentialRotateSelfIssued {
         gates: Arc<dyn GateReader>,
         poll: GatePoll,
     ) -> Arc<Self> {
+        Self::with_estate_token(
+            jobs_base,
+            secrets,
+            gates,
+            poll,
+            boss_core::machine_token::shared(),
+        )
+    }
+
+    /// [`Self::with_poll`] with the estate machine token's source given
+    /// (tests): the token this process's own mount holds, which opens a
+    /// gate's tally for a credential whose own value cannot
+    /// ([`GateSlots::Reader`]).
+    pub fn with_estate_token(
+        jobs_base: impl Into<String>,
+        secrets: Arc<dyn SecretStore>,
+        gates: Arc<dyn GateReader>,
+        poll: GatePoll,
+        estate: Arc<boss_core::machine_token::Source>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client: super::common::api_client(),
             jobs_base: jobs_base.into(),
             secrets,
             gates,
             poll,
+            estate,
         })
     }
 
@@ -950,17 +1125,74 @@ impl CredentialRotateSelfIssued {
     }
 
     /// Read until every served port answers `want`, at most
-    /// `poll.attempts` times.
-    async fn poll_accepts(&self, presented: &str, want: &str) -> AcceptsVerdict {
-        let mut verdict = judge_accepts(&self.read_accepts(presented).await, want);
+    /// `poll.attempts` times. The last reads come back beside the
+    /// verdict, for what a verdict does not carry: which SET a gate
+    /// named the value in ([`named_as_estate`]).
+    async fn poll_accepts(
+        &self,
+        presented: &str,
+        want: &str,
+    ) -> (AcceptsVerdict, Vec<(String, GateRead<Accepts>)>) {
+        let mut reads = self.read_accepts(presented).await;
+        let mut verdict = judge_accepts(&reads, want);
         for _ in 1..self.poll.attempts {
             if verdict.ready {
                 break;
             }
             tokio::time::sleep(self.poll.interval).await;
-            verdict = judge_accepts(&self.read_accepts(presented).await, want);
+            reads = self.read_accepts(presented).await;
+            verdict = judge_accepts(&reads, want);
         }
-        verdict
+        (verdict, reads)
+    }
+
+    /// `Some(why)` when a gate names this credential's value by an
+    /// estate slot and the credential is not the estate's: the refusal
+    /// no later firing gets past. `where_it_is` says which slot of the
+    /// Secret holds the value.
+    fn estate_collision(
+        d: &Declaration<'_>,
+        reads: &[(String, GateRead<Accepts>)],
+        where_it_is: &str,
+    ) -> Option<String> {
+        if d.slots == GateSlots::Estate {
+            return None;
+        }
+        let named = named_as_estate(reads);
+        (!named.is_empty()).then(|| {
+            format!(
+                "the value in {where_it_is} of {}/{} is named by an ESTATE slot ({}): it equals \
+                 an estate machine token, which every gate admits for every method under any \
+                 identity the caller asserts, so it must never be this credential's value, and \
+                 no holder of this credential may be handed it (review 177b4976, N2). Nothing \
+                 is promoted and nothing is verified. {STUCK_NEEDS_A_HAND}; a new rotation then \
+                 stages a fresh value over this one",
+                d.secret_namespace,
+                d.secret_name,
+                named.join("; ")
+            )
+        })
+    }
+
+    /// The token that opens a gate's tally for this credential's drain.
+    /// The estate token's own `current` opens it, as it always has. A
+    /// probe-reader value does not — the tally names callers' addresses
+    /// and answers an estate slot alone — so that drain is read with the
+    /// estate token this process's mount holds, presented by itself.
+    /// With none mounted there is no evidence to read, and that holds.
+    fn tally_token(&self, d: &Declaration<'_>, current: &str) -> Result<String, String> {
+        match d.slots {
+            GateSlots::Estate => Ok(current.to_string()),
+            GateSlots::Reader => self.estate.current().ok_or_else(|| {
+                format!(
+                    "the dispatcher holds no estate machine token (its mount is empty or \
+                     unread), and a gate's tally answers an estate token alone, never a {} \
+                     value: nothing can show that {} went unpresented, so it stays accepted",
+                    d.slots.answers(Slot::Current),
+                    d.slots.answers(Slot::Previous),
+                )
+            }),
+        }
     }
 
     // ----- the jobs API -----
@@ -1004,7 +1236,10 @@ impl CredentialRotateSelfIssued {
             s if s.is_success() => Ok(()),
             reqwest::StatusCode::NOT_FOUND => Err(HandlerError::Permanent(format!(
                 "credential {credential_id} has no registry row (GET {url} answered 404): its \
-                 rotation events would have nowhere to land, so nothing is minted"
+                 rotation events would have nowhere to land, so nothing is minted. The row is \
+                 the instance's own declaration: a [[credential]] block with this id in the \
+                 tenant directory's seeds/credentials.toml, landed by `boss tenant publish` \
+                 (docs/tenant-contract.md). Once it is there the next firing mints"
             ))),
             s => Err(HandlerError::Downstream(format!("GET {url} returned {s}"))),
         }
@@ -1072,13 +1307,18 @@ impl CredentialRotateSelfIssued {
     async fn defer(
         &self,
         rule: &str,
+        d: &Declaration<'_>,
         job_id: &str,
         steps: &HashMap<String, StepView>,
         slug: &str,
         why: String,
     ) -> Result<Pass, HandlerError> {
+        // The clock rule is the declaration's to name: each credential
+        // has its own, and a note naming another credential's sends its
+        // reader to a rule that will never touch this packet.
         let note = format!(
-            "{why}. The clock rule {ADVANCE_RULE} resumes this every fifteen minutes; no hand is needed."
+            "{why}. The clock rule {} resumes this every fifteen minutes; no hand is needed.",
+            d.advance_rule
         );
         tracing::info!(job_id, slug, %note, "machine token rotation deferred");
         let mut evidence = vec![(format!("{slug}_deferred"), note)];
@@ -1223,7 +1463,13 @@ impl CredentialRotateSelfIssued {
         // for being down at verify that answers now has a tally from here
         // on, and loses the excuse before it can crash and take that tally
         // with it (review fd151a97, D1).
-        let reads = self.read_misses(current).await;
+        // Opened with the token the tally answers ([`Self::tally_token`]):
+        // the rotated value itself for the estate token, as before.
+        let tally = match self.tally_token(d, current) {
+            Ok(token) => token,
+            Err(why) => return Ok(Err(vec![why])),
+        };
+        let reads = self.read_misses(&tally).await;
         let excused = still_excused(&primary.not_served_at_verify, &reads);
         if excused != primary.not_served_at_verify {
             let wrote = self
@@ -1261,7 +1507,7 @@ impl CredentialRotateSelfIssued {
             ]));
         }
         let before = boss_clock_client::wall_now();
-        let snapshot = match self.gates.window(current, hours).await {
+        let snapshot = match self.gates.window(&tally, hours).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return Ok(Err(vec![format!(
@@ -1331,7 +1577,10 @@ impl CredentialRotateSelfIssued {
             .into_iter()
             .filter(|service| !excused.contains(service))
             .collect::<Vec<_>>();
-        let joined = boss_core::gate_window::join_previous_window(
+        // Judged against presentations of THIS set's previous: the estate
+        // token's `previous`, or the probe reader's `reader.previous`.
+        let joined = boss_core::gate_window::join_drain_window(
+            d.slots.drained(),
             &required,
             target_from,
             observation.now,
@@ -1347,7 +1596,13 @@ impl CredentialRotateSelfIssued {
             let mut held = joined.not_clean;
             // Preserve existing caller/mode/port diagnostics; the durable
             // projection alone decides whether the drain is proven.
-            if let Err(reasons) = judge_drain(&reads, observation.now, d.drain, &excused) {
+            if let Err(reasons) = judge_drain_of(
+                &reads,
+                observation.now,
+                d.drain,
+                &excused,
+                d.slots.drained().presented(),
+            ) {
                 held.extend(reasons);
             }
             if held.is_empty() {
@@ -1359,7 +1614,8 @@ impl CredentialRotateSelfIssued {
             return Ok(Err(held));
         }
         let clean = format!(
-            "complete durable previous-specific drain of {} minutes through {}; permanently not served at verify: {}",
+            "complete durable {}-specific drain of {} minutes through {}; permanently not served at verify: {}",
+            d.slots.answers(Slot::Previous),
             d.drain.num_minutes(),
             observation.now.to_rfc3339(),
             excused.join(", ")
@@ -1565,7 +1821,12 @@ impl CredentialRotateSelfIssued {
         closed_as: &str,
     ) -> Result<Result<String, String>, HandlerError> {
         let value = primary.next.value.clone().unwrap_or_default();
-        let staged = judge_accepts(&self.read_accepts(&value).await, SLOTS[1]);
+        let reads = self.read_accepts(&value).await;
+        // No deferral: the clock would ask again and hear the same.
+        if let Some(why) = Self::estate_collision(d, &reads, "next") {
+            return Err(HandlerError::Permanent(why));
+        }
+        let staged = judge_accepts(&reads, d.slots.answers(Slot::Next));
         if !staged.ready {
             return Ok(Err(format!(
                 "a half-applied promotion of {by}'s value waits to be finished until every gate \
@@ -1783,7 +2044,7 @@ impl CredentialRotateSelfIssued {
         if !primary.next.is_for(job_id)
             && let Some(why) = self.ahead_of(d, job_id).await?
         {
-            return self.defer(rule, job_id, steps, "issue", why).await;
+            return self.defer(rule, d, job_id, steps, "issue", why).await;
         }
         let refusal = match self.copies(d, &primary).await? {
             Copies::Agree => None,
@@ -1795,7 +2056,7 @@ impl CredentialRotateSelfIssued {
                         .roll_forward(rule, d, job_id, &primary, &by, &closed_as)
                         .await?
                     {
-                        Err(why) => return self.defer(rule, job_id, steps, "issue", why).await,
+                        Err(why) => return self.defer(rule, d, job_id, steps, "issue", why).await,
                         Ok(rolled) => {
                             self.put_step(
                                 rule,
@@ -1842,6 +2103,7 @@ impl CredentialRotateSelfIssued {
                     return self
                         .defer(
                             rule,
+                            d,
                             job_id,
                             steps,
                             "issue",
@@ -1864,7 +2126,20 @@ impl CredentialRotateSelfIssued {
                 }
                 Ok(None) => {}
             }
-            self.require_registry_row(d.credential_id).await?;
+            // An undeclared credential is said ON THE PACKET, not only
+            // returned: the firing's failure lands on the dispatcher's
+            // record, and the packet a person just scoped otherwise shows
+            // an issue step with nothing on it (backlog d26515c5 — the
+            // probe reader's row is instance data, published after the
+            // rule that names it lands). Nothing has been written yet.
+            if let Err(e) = self.require_registry_row(d.credential_id).await {
+                return Err(match e {
+                    HandlerError::Permanent(why) => {
+                        self.refuse(rule, job_id, steps, "issue", why).await
+                    }
+                    other => other,
+                });
+            }
             // Read again: the drain may have written, and the mint below
             // is conditioned on the version this read returns.
             let primary = self.read_slots(d.secret_namespace, d.secret_name).await?;
@@ -2021,11 +2296,18 @@ impl CredentialRotateSelfIssued {
                 .await);
         };
         if !promoted {
-            let staged = self.poll_accepts(&value, SLOTS[1]).await;
+            let (staged, asked) = self.poll_accepts(&value, d.slots.answers(Slot::Next)).await;
+            // Before anything else the answer could mean: a gate that
+            // names this value in the ESTATE set is no lagging gate, and
+            // no later firing hears differently.
+            if let Some(why) = Self::estate_collision(d, &asked, "next") {
+                return Err(self.refuse(rule, job_id, steps, "verify", why).await);
+            }
             if !staged.ready {
                 return self
                     .defer(
                         rule,
+                        d,
                         job_id,
                         steps,
                         "verify",
@@ -2101,6 +2383,7 @@ impl CredentialRotateSelfIssued {
                 return self
                     .defer(
                         rule,
+                        d,
                         job_id,
                         steps,
                         "verify",
@@ -2184,11 +2467,105 @@ impl CredentialRotateSelfIssued {
             )
             .await?;
         }
-        let live = judge_accepts(&reads, SLOTS[0]);
+        // Callers already send the value, so this cannot un-promote it; it
+        // can refuse to call it verified, and say so for a hand.
+        if let Some(why) = Self::estate_collision(d, &reads, "current") {
+            return Err(self.refuse(rule, job_id, steps, "verify", why).await);
+        }
+        // EVERY NAMED COPY is read again and judged before anything says
+        // verified, on every path here — the firing that promoted and
+        // each one after it (backlog 50c0d155). The gates read the
+        // primary and a mirror is read by callers only, never by a gate,
+        // so until 2026-10-08 a firing that found the primary promoted
+        // recorded Verified, and went on to the revoke, over a mirror
+        // whose current was no longer this packet's value: that
+        // namespace's callers were then sending something else, on a
+        // record saying the rotation had verified. The candidate is a
+        // value AND its origin, as it is at the promotion.
+        // - A copy holding anything else is REFUSED, by path: the broker
+        //   writes a copy's current only at a promotion, so no later
+        //   firing brings it back, and the note must not say one will
+        //   (review 34313729, F1). It is not sticky; the first firing to
+        //   find every copy agreeing verifies.
+        // - A copy that cannot be read is no evidence either way, and
+        //   the clock does get past that one: deferred, with the store's
+        //   error beside the path.
+        // Judged before the gates' answer so that a copy astray is named
+        // at once, not behind a wait; nothing awaits between this and the
+        // Verified record but that record itself.
+        let (mut held_in, mut astray, mut unread) = (Vec::new(), Vec::new(), Vec::new());
+        for (ns, name) in d.targets() {
+            match self.read_slots(ns, name).await {
+                Ok(s)
+                    if s.current.is_for(job_id)
+                        && s.current.value.as_deref() == Some(value.as_str()) =>
+                {
+                    held_in.push(format!("{ns}/{name}"));
+                }
+                Ok(s) => astray.push(format!(
+                    "{ns}/{name} holds current minted for {} ({} bytes)",
+                    s.current
+                        .minted_for
+                        .as_deref()
+                        .unwrap_or("nothing recorded"),
+                    s.current.value.as_deref().map_or(0, str::len)
+                )),
+                Err(e) => unread.push(format!("{ns}/{name} ({e})")),
+            }
+        }
+        if !astray.is_empty() {
+            let also = if unread.is_empty() {
+                String::new()
+            } else {
+                format!("; and could not be read: {}", unread.join("; "))
+            };
+            return Err(self
+                .refuse(
+                    rule,
+                    job_id,
+                    steps,
+                    "verify",
+                    format!(
+                        "this packet's value was promoted, but not every named copy holds it as \
+                         current now, by value and by the packet that made it: {}{also}. Callers \
+                         reading such a copy do not send the value the gates were asked about, so \
+                         nothing is recorded verified and nothing is revoked; previous stays \
+                         accepted wherever it is held. The broker writes a copy's current only at \
+                         a promotion, so no later firing brings the copies together, and a hand is \
+                         needed: find what wrote that copy and make the copies agree, and the \
+                         first firing after that verifies. If they cannot be made to agree, close \
+                         this packet on its abandoned terminal, the exit for a rotation that is \
+                         stuck — a new rotation stages nothing while the copies disagree. Until \
+                         then every other rotation of this credential is held behind this one",
+                        astray.join("; ")
+                    ),
+                )
+                .await);
+        }
+        if !unread.is_empty() {
+            return self
+                .defer(
+                    rule,
+                    d,
+                    job_id,
+                    steps,
+                    "verify",
+                    format!(
+                        "this packet's value was promoted, but not every named copy could be read, \
+                         and a copy not read is not evidence that it holds the value: {}. Nothing \
+                         is recorded verified and nothing is revoked until every copy is read \
+                         holding it as current",
+                        unread.join("; ")
+                    ),
+                )
+                .await;
+        }
+        let live = judge_accepts(&reads, d.slots.answers(Slot::Current));
         if !live.ready {
             return self
                 .defer(
                     rule,
+                    d,
                     job_id,
                     steps,
                     "verify",
@@ -2202,11 +2579,14 @@ impl CredentialRotateSelfIssued {
                 .await;
         }
         let verified = format!(
-            "every served port answers GET /api/machine-gate/accepts with matched current for the \
-             new value: {} port(s) ({}){}",
+            "every served port answers GET /api/machine-gate/accepts with matched {} for the \
+             new value: {} port(s) ({}){}; and every named copy, read again, holds it as current \
+             beside current.minted-for = this packet: {}",
+            d.slots.answers(Slot::Current),
             live.agreeing.len(),
             live.agreeing.join(", "),
-            not_served_text(&live.not_served)
+            not_served_text(&live.not_served),
+            held_in.join(", ")
         );
         // The excuse is already in the primary, beside promoted-at, where
         // every drain — this packet's revoke, or a later packet's leftover —
@@ -2223,6 +2603,8 @@ impl CredentialRotateSelfIssued {
                 "agreeing": live.agreeing,
                 "not_served": live.not_served,
                 "excused": excused,
+                // Paths only: the copies this fact rests on.
+                "current_held_in": held_in,
             }),
         )
         .await?;
@@ -2265,6 +2647,7 @@ impl CredentialRotateSelfIssued {
                 return self
                     .defer(
                         rule,
+                        d,
                         job_id,
                         steps,
                         "revoke",

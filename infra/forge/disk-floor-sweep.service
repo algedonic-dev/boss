@@ -51,6 +51,16 @@ Environment=BOSS_DISK_FLOOR_GB=100
 # Rootless docker, same as cluster-deploy-runner; the script defaults
 # DOCKER_HOST itself.
 User=david
+# WHAT THE RUN DID, ON ITS OWN PACKET (backlog 37742794). The sweep
+# leaves the floor, free space before and after, what the per-train
+# image pass freed and how it ended in this file; boss-step.sh
+# (ExecStopPost) merges it onto the `run` step and deletes it. Declared
+# ONCE, here, so producer and consumer cannot disagree about the path
+# (the step helper's header has the reasoning). In david's home, the
+# converge runner's
+# choice for the same account: not a shared temp directory, which
+# another account on this host could plant a file in.
+Environment=BOSS_RUN_SUMMARY_FILE=/home/david/.boss-disk-floor-sweep.summary.json
 # A cold builder-cache prune can take minutes; nowhere near the
 # converge's build times, but not seconds either.
 TimeoutStartSec=30min
@@ -60,6 +70,18 @@ TimeoutStartSec=30min
 # the fleet view until a later run succeeds or a human decides.
 # The helpers refuse without BOSS_JOBS_URL; the EnvironmentFile above
 # gives every Exec line the same one.
+# THE TOKEN'S HEADER FILE NEVER OUTLIVES A RUN (backlog df38075a, F1;
+# the second car, which took the class and not the six units the item
+# named). The wrap pair on the Exec lines below presents the machine
+# token, and infra/lib/secret-header.sh makes its 0600 header file in
+# $RUNTIME_DIRECTORY when a unit declares one: /run/disk-floor-sweep,
+# tmpfs, 0700, this unit's account's, removed by systemd when this
+# oneshot stops whatever ended it. Without it the file was made in the
+# host's shared /tmp, where a killed run left it. The reasoning is in
+# infra/forge/estate-observe-units.service; the pin that walks every
+# unit is a_killed_sender_leaves_no_header_behind.rs.
+RuntimeDirectory=disk-floor-sweep
+RuntimeDirectoryMode=0700
 ExecStartPre=-/home/david/boss/infra/boss-maintenance-wrap.sh maintenance-disk-floor-sweep "Forge disk floor sweep"
 ExecStart=/home/david/boss/infra/forge/disk-floor-sweep.sh
 ExecStopPost=-/home/david/boss/infra/boss-step.sh maintenance-disk-floor-sweep run

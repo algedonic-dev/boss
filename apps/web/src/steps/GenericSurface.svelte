@@ -4,7 +4,7 @@
   // every service Job's steps pick up implicitly. Port of
   // apps/web-legacy/src/steps/GenericSurface.tsx.
 
-  import { untrack, type Snippet } from 'svelte';
+  import { onDestroy, tick, untrack, type Snippet } from 'svelte';
   import {
     isTerminal as _isTerminal,
     type StepStatus,
@@ -13,6 +13,14 @@
   import type { SpecStep } from '../jobs/fork';
   import type { Employee } from '../people/types';
   import { releaseStep, saveStep, startStep } from './stepWrite';
+  import {
+    completeWithPresence,
+    scrollNote,
+    shownAfter,
+    signedRows,
+    signedText,
+    type ShownStep,
+  } from './presence';
   import { PROCEDURE_KEY } from './procedure';
   import {
     HOLDER_LOCKED_NOTE,
@@ -43,6 +51,10 @@
     assignee_id: string | null;
     metadata: Record<string, unknown>;
     notes: string | null;
+    /// What the step demands of its completion, when it says: `presence`
+    /// is a passkey. A `human_only` step demands one whether it says so
+    /// or not (see `passkeyAsked`).
+    assurance_required?: string | null;
     /// The step's completion contract. Declared on the Workflow step
     /// (inline authoring), so it is data rather than a bespoke
     /// surface — which is exactly why this generic view can honour it.
@@ -214,6 +226,119 @@
     [...employees].sort((a, b) => (a.name ?? "").localeCompare(b.name ?? "")),
   );
 
+  // A STEP RESERVED FOR A PERSON COMPLETES ON THEIR PASSKEY (David,
+  // 2026-10-07, item 570c66e9: "human-only step completion should use
+  // passkey for enforcement"). The jobs API refuses a bare completion of
+  // a `human_only` step — the id a caller asserts is not proof of the
+  // person — and nine of the ten plain human-only steps on the live
+  // registry (a flight's decide and widen, the deposit keys' scope,
+  // verify and revoke, a GitHub installation's scope) render HERE, where
+  // Complete was one PUT with no ceremony. So on such a step this
+  // surface does what the approval surface does: it draws everything the
+  // passkey would sign, and answers the server's `{required: "presence"}`
+  // with ONE tap on the step as shown and ONE retry (presence.ts).
+  //
+  // The declaration is read the way the server reads it
+  // (boss-jobs human_only::declared): the bool `true` or the string
+  // "true". A step that declares presence itself is drawn the same way.
+  let passkeyAsked = $derived(
+    !_isTerminal(step.status) &&
+      (step.metadata['human_only'] === true ||
+        (typeof step.metadata['human_only'] === 'string' &&
+          step.metadata['human_only'].trim().toLowerCase() === 'true') ||
+        step.assurance_required === 'presence'),
+  );
+  // WHAT THE PASSKEY SIGNS IS ON SCREEN (design f623e425 D3): the step's
+  // title and EVERY metadata key, with this gesture's own write folded
+  // in while it is in flight — the one object the ceremony is handed as
+  // its answer to "what is on screen", so it refuses any key it would
+  // sign that is not drawn (presence.ts notShown).
+  let pending = $state<Readonly<Record<string, unknown>> | null>(null);
+  let onScreen = $derived<ShownStep>({
+    title: step.title,
+    metadata: shownAfter(step.metadata, pending ?? {}),
+  });
+  let signed = $derived(signedRows(onScreen));
+  // A destroyed surface, or one the rail has moved to another step,
+  // shows nothing of the step a gesture began on (backlogs d82b5f60,
+  // 7c53b1bf): its ceremony refuses and its prompt is taken down.
+  let destroyed = false;
+  let gesture: AbortController | null = null;
+  onDestroy(() => {
+    destroyed = true;
+    gesture?.abort();
+  });
+  let scrolling = $state<Readonly<Record<string, boolean>>>({});
+  let shownStepId = $derived(step.id);
+  $effect(() => {
+    void shownStepId;
+    gesture?.abort();
+    gesture = null;
+    pending = null;
+    scrolling = {};
+  });
+  function watchOverflow(node: HTMLElement, row: { key: string; text: string }) {
+    let key = row.key;
+    const check = (): void => {
+      const scrolls =
+        node.scrollHeight > node.clientHeight + 1 || node.scrollWidth > node.clientWidth + 1;
+      if ((scrolling[key] ?? false) !== scrolls) scrolling = { ...scrolling, [key]: scrolls };
+    };
+    const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(check) : null;
+    observer?.observe(node);
+    check();
+    return {
+      update(next: { key: string; text: string }) {
+        key = next.key;
+        requestAnimationFrame(check);
+      },
+      destroy() {
+        observer?.disconnect();
+      },
+    };
+  }
+
+  /// Complete a step that asks for a passkey. Three writes, in the order
+  /// the server needs them: the answer through the merge door and the
+  /// notes and holder through a PUT that does NOT complete — a
+  /// completion that stands on a passkey may change nothing beside the
+  /// status (backlogs c0b56fd9, 42e7c6b9) — then the completion, bare,
+  /// which the server answers by asking for the tap.
+  async function completeWithPasskey(
+    metadata: Readonly<Record<string, unknown>>,
+  ): Promise<void> {
+    // The step this click was aimed at, captured before the first await
+    // and the only step any write below names (d82b5f60).
+    const target = { id: step.id, title: step.title, metadata: { ...step.metadata } };
+    const job = jobId;
+    const controller = new AbortController();
+    gesture = controller;
+    try {
+      // Drawn before anything is written or signed (D3).
+      pending = metadata;
+      await tick();
+      const details = { notes: notes ?? undefined, ...gestureFields(step, assigneeId) };
+      const wrote = await saveStep(job, target.id, { ...details, metadata });
+      if (wrote.kind === 'failed') {
+        writeError = wrote.error;
+        return;
+      }
+      const done = await completeWithPresence(
+        job,
+        target.id,
+        { title: target.title, metadata: shownAfter(target.metadata, metadata) },
+        () => (!destroyed && step.id === target.id && passkeyAsked ? onScreen : null),
+        controller.signal,
+      );
+      if (done.kind === 'failed') writeError = done.error;
+      // The answer DID land either way: the host re-reads the step.
+      onUpdate();
+    } finally {
+      pending = null;
+      if (gesture === controller) gesture = null;
+    }
+  }
+
   /// `status` is the one the gesture moves the step to — Complete — and
   /// absent for a Save: the page's own copy of the status is a snapshot,
   /// and sending it back released an agent's claim made after the page
@@ -228,18 +353,23 @@
       // spread of the step's metadata (backlog e39a9d2a). A cleared due
       // date is an explicit null, which the door deletes; it used to be
       // cleared by OMISSION from a wholesale PUT.
+      const metadata = {
+        ...(dueOnDirty ? { due_on: dueOn || null } : {}),
+        // Only send fields the operator actually filled — an
+        // empty string is not an answer, and writing one would
+        // satisfy a required-field check with nothing in it.
+        ...Object.fromEntries(
+          Object.entries(fieldValues).filter(([, v]) => v.trim() !== ''),
+        ),
+      };
+      if (status === 'completed' && passkeyAsked) {
+        await completeWithPasskey(metadata);
+        return;
+      }
       const body = {
         notes: notes ?? undefined,
         ...gestureFields(step, assigneeId, status),
-        metadata: {
-          ...(dueOnDirty ? { due_on: dueOn || null } : {}),
-          // Only send fields the operator actually filled — an
-          // empty string is not an answer, and writing one would
-          // satisfy a required-field check with nothing in it.
-          ...Object.fromEntries(
-            Object.entries(fieldValues).filter(([, v]) => v.trim() !== ''),
-          ),
-        },
+        metadata,
       };
       let res = await saveStep(jobId, step.id, body);
       if (res.kind === 'ok' && start) {
@@ -338,6 +468,33 @@
        assignee, due date and notes are details of the step, and they
        follow the ask (feedback 26ae4d44). -->
   {@render children?.()}
+
+  {#if passkeyAsked}
+    <!-- A step reserved for a person completes on their passkey, and a
+         passkey signs the step's title and every metadata key: all of it
+         is drawn here, as the bytes it is, before the tap is asked. -->
+    <section class="step-signed-keys" aria-label="What your passkey signs">
+      <div class="step-signed-keys-head">What your passkey signs</div>
+      <p class="step-signed-keys-note">
+        Completing this step takes your passkey. It signs the step
+        <strong class="step-signed-title">{signedText(onScreen.title)}</strong>
+        and every key below, exactly as shown. Text in double quotes has each
+        character you could not otherwise see or tell apart written as an
+        escape. What you enter below joins them when you press Complete.
+      </p>
+      <dl>
+        {#each signed as row (row.key)}
+          <dt class="step-signed-key">{row.label}</dt>
+          <dd>
+            <pre class="step-signed-value" use:watchOverflow={{ key: row.key, text: row.text }}>{row.text}</pre>
+            {#if scrolling[row.key]}
+              <div class="step-signed-overflow">{scrollNote(row.text)}</div>
+            {/if}
+          </dd>
+        {/each}
+      </dl>
+    </section>
+  {/if}
 
   {#if hasAsk}
     <!-- The step's own completion contract, rendered from data.

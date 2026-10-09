@@ -102,6 +102,11 @@ regex = "1"
 # hdrhistogram); these name them.
 tempfile = "3"
 flate2 = "1"
+# Process-group signals for `boss dispatch --launch` (review f7f0b689, B3): the
+# stop must reach what a launched harness starts, and the gate image has no
+# `kill` binary to shell out to. Already in the lock (tempfile depends on it);
+# `process` adds modules, not crates.
+rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
 # Paused time (backlog 034002b3): a jobs-API call against a dark SoR

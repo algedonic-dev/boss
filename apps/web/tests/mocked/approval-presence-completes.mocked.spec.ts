@@ -1,17 +1,17 @@
-// Backlog b568044a (round-4 review of car 7abc0154, 2026-09-25): no
-// screen could complete a passkey-gated step. ApprovalSurface ran the
-// presence ceremony for the STAMP, then completed with a PUT that
-// carried no ticket — and the jobs API judges assurance on every
-// request that leaves the open states, from that request's own header
-// (steps.rs is_leaving_open -> judge_assurance). So the stamp landed,
-// the completion answered 422, and the step stayed ready after the
-// passkey tap. The server half is pinned in boss-jobs
-// (the_sign_offs_own_ticket_completes_the_step_and_the_stamp_alone_does_not).
+// Design 1ce67f7e (decided 2026-10-07): a presence step that names
+// sign-off roles completes on the live passkey stamps it holds. The
+// jobs API used to judge the completing request on its own header alone
+// (backlog b568044a), so ApprovalSurface carried the stamp's ticket on to
+// the completion; it now reads the stamps (steps.rs judge_completion,
+// pinned in boss-jobs by an_assurance_holds_on_every_path), and the
+// surface keeps no ticket.
 //
-// The mocks below refuse a ticketless stamp AND a ticketless completion
-// exactly as the server does, so the surface is green only if the
-// completion carries the ticket its own ceremony was issued — once, for
-// Approve and for Reject alike, since both complete the step.
+// The mocks below are that server: a stamp is written only on the
+// ceremony's ticket, and the completion is accepted BARE once the role
+// is stamped and refused, naming the role, while it is not. So the
+// surface is green only if the stamp ceremony ran once and the
+// completion carried nothing — for Approve and for Reject alike, since
+// both complete the step.
 
 import { expect, test, type Page, type Route } from './_test';
 import { servePeopleRows } from './_smokeMocks';
@@ -30,6 +30,13 @@ const PRESENCE_REFUSAL = {
   error: 'step requires stronger assurance than this request carries',
   required: 'presence',
   produced: 'session',
+};
+
+const STAMPS_OWED = {
+  error: 'this step completes on its sign-off stamps, and they do not carry it',
+  completes_on: 'stamps',
+  missing_or_stale_roles: ['platform-admin'],
+  detail: 'role platform-admin has no live presence stamp over the current content',
 };
 
 type Seen = { stampTickets: (string | undefined)[]; putTickets: (string | undefined)[];
@@ -108,7 +115,7 @@ async function presenceGatedApproval(page: Page): Promise<Seen> {
   await page.route(new RegExp(`/api/jobs/${JOB_ID}/steps/s1$`), async (r) => {
     const ticket = await r.request().headerValue('x-presence-ticket');
     seen.putTickets.push(ticket ?? undefined);
-    if (ticket !== TICKET) return json(r, PRESENCE_REFUSAL, 422);
+    if (step.sign_offs.length === 0) return json(r, STAMPS_OWED, 422);
     step.status = 'completed';
     return json(r, step);
   });
@@ -116,7 +123,7 @@ async function presenceGatedApproval(page: Page): Promise<Seen> {
 }
 
 for (const [button, decision] of [['Approve', 'approved'], ['Reject', 'rejected']] as const) {
-  test(`${button} on a presence-gated step completes it with the ticket its own ceremony was issued`, async ({ page }) => {
+  test(`${button} on a presence-gated step: one tap for the stamp, and a bare completion lands`, async ({ page }) => {
     const seen = await presenceGatedApproval(page);
 
     await page.goto(`/ux/jobs/${JOB_ID}`);
@@ -126,11 +133,11 @@ for (const [button, decision] of [['Approve', 'approved'], ['Reject', 'rejected'
     await expect(surface.locator('.step-status')).toHaveText('completed');
     await expect(surface.locator('.step-write-error')).toHaveCount(0);
     await expect(surface.locator('.step-approval-result')).toContainText(decision);
-    // One passkey tap: the ticket the stamp was granted on is the one
-    // the completion carries — never a second ceremony, never none.
+    // One passkey tap, for the stamp. The completion carries no ticket:
+    // the stamp is the approval, and nothing is kept to send again.
     expect(seen.begins).toBe(1);
     expect(seen.finishes).toBe(1);
     expect(seen.stampTickets).toEqual([undefined, TICKET]);
-    expect(seen.putTickets).toEqual([TICKET]);
+    expect(seen.putTickets).toEqual([undefined]);
   });
 }

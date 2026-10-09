@@ -168,16 +168,21 @@ async fn main() -> Result<()> {
     // the clock's mode (design 21946380): wall mode keeps no pool of its
     // own, so the gate's outbox takes a lazy one on the same URL, which
     // opens nothing until the first fact.
-    let recorder = match (&pool, &cli.postgres_url) {
-        (Some(pool), _) => Some(boss_events::outbox::PgOutboxRecorder::shared(pool)),
-        (None, Some(url)) => Some(boss_events::outbox::PgOutboxRecorder::shared(
-            &sqlx::postgres::PgPoolOptions::new()
+    // The actor-role report states its facts through the same outbox and
+    // reads its window back through the same pool (backlog e0bdba74).
+    let gate_pool = match (&pool, &cli.postgres_url) {
+        (Some(pool), _) => Some(pool.clone()),
+        (None, Some(url)) => Some(
+            sqlx::postgres::PgPoolOptions::new()
                 .max_connections(2)
                 .connect_lazy(url)
                 .with_context(|| "reading the Postgres URL for the machine gate's outbox")?,
-        )),
+        ),
         (None, None) => None,
     };
+    let recorder = gate_pool
+        .as_ref()
+        .map(boss_events::outbox::PgOutboxRecorder::shared);
 
     let state = ClockApiState { mode, params, pool };
 
@@ -216,9 +221,7 @@ async fn main() -> Result<()> {
         )),
         roles.clone(),
         mode.clone(),
-        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
-            boss_policy_client::role_service::REPORT_CAPACITY,
-        )),
+        boss_events::role_tally::durable("clock", mode.clone(), gate_pool.as_ref()),
     );
     let app = clock_http_router(router(state), wiring.inventory);
 

@@ -36,7 +36,7 @@
 //! to this crate, so every scoped gate runs it whatever its scope
 //! (`tree_wide_pins` in infra/gate.sh; backlog c87ad472).
 
-use boss_testing::{repo_root, scratch_dir};
+use boss_testing::{dark_port, repo_root, scratch_dir};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -298,11 +298,10 @@ fn a_503_from_the_sor_does_not_stop_the_converge() {
 #[test]
 fn every_bad_answer_lets_the_chore_run_and_is_kept() {
     let kind = "maintenance-disk-floor-sweep";
-    // A refused connect: a port that was bound, then released.
-    let dark = {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("http://{}", l.local_addr().unwrap())
-    };
+    // A refused connect: a port HELD dark for the whole test (backlog
+    // ec131700). It was bound, read and released, and a released port is
+    // the next bind's to take.
+    let dark = dark_port();
     let cases: Vec<(&str, String, Option<Sor>)> = vec![
         ("a 500", String::new(), Some(Sor::always(500, "boom"))),
         (
@@ -323,7 +322,7 @@ fn every_bad_answer_lets_the_chore_run_and_is_kept() {
                 _ => (200, r#"{"data":[]}"#.to_string()),
             }))),
         ),
-        ("a refused connect", dark, None),
+        ("a refused connect", dark.base.clone(), None),
     ];
     for (what, dark_url, sor) in cases {
         let url = sor.as_ref().map_or(dark_url, |s| s.url.clone());
@@ -498,14 +497,17 @@ fn an_oversized_ledger_still_opens_a_packet_and_empties() {
 fn a_kept_row_is_small_whatever_the_retries_printed() {
     let kind = "maintenance-disk-floor-sweep";
     let home = scratch_dir("sor-row-small");
-    let dark = {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("http://{}", l.local_addr().unwrap())
-    };
+    // HELD dark, not bound and released (backlog ec131700): on gate-run
+    // 8b71013e (2026-10-08) another test's server was handed the released
+    // port and answered this read with a 422, so no wait was printed and
+    // the assertion below failed on a car that touches neither file.
+    // Reproduced by binding a listener that answers 422 on the released
+    // port: the gate's own line, every time.
+    let dark = dark_port();
     // More than one attempt inside a three-second window: the roll's wait
     // lines and one curl line per attempt reach the journal, not the row.
     let out = wrap_with(
-        Some(&dark),
+        Some(&dark.base),
         &home,
         kind,
         &[("BOSS_API_RETRY_DEADLINE", "3")],

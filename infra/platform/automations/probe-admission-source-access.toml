@@ -1,0 +1,12 @@
+# automation:probe-admission-source-access — not in the role-report tally
+# read 2026-10-07T02:13Z (that tally is held in memory and starts again with
+# the pod, so absence there is not absence of the caller); registered from
+# the tree, where every_script_sender_signs_as_a_registered_automation found
+# it.
+# Signs as audit-readonly today:
+# infra/forge/probe-admission-source-access.sh, with sor_reader_header.
+
+[[automation]]
+id = "automation:probe-admission-source-access"
+role = "audit-readonly"
+description = 'The probe-admission-source-access ops verb reading the estate nodes (infra/forge/probe-admission-source-access.sh). Reads only.'

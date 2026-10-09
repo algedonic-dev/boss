@@ -15,6 +15,8 @@ pub mod outbox;
 pub mod outbox_http;
 #[cfg(feature = "postgres")]
 pub mod replay;
+#[cfg(feature = "postgres")]
+pub mod role_tally;
 pub mod store;
 #[cfg(feature = "postgres")]
 pub mod tail_http;

@@ -12,7 +12,7 @@ use boss_people::people_config::PeopleApiConfig;
 use boss_policy_client::role_reader::{
     HttpRoleReader, MonotonicRoleSnapshotClock, MountedReportMode, SnapshotRoleReader,
 };
-use boss_policy_client::role_reporting::{ReportTally, ReportingPolicyClient};
+use boss_policy_client::role_reporting::ReportingPolicyClient;
 use clap::Parser;
 use tokio::net::TcpListener;
 use tracing::info;
@@ -154,9 +154,7 @@ async fn main() -> Result<()> {
         std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
         boss_policy_client::User::service("people"),
     )?);
-    let role_tally = Arc::new(ReportTally::new(
-        boss_policy_client::role_service::REPORT_CAPACITY,
-    ));
+    let role_tally = boss_events::role_tally::durable("people", role_mode.clone(), Some(&pool));
     let policy: Arc<dyn boss_policy_client::PolicyClient> =
         Arc::new(ReportingPolicyClient::with_mode_source(
             original_policy.clone(),

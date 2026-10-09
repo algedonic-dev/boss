@@ -727,16 +727,27 @@ async fn the_required_services_are_what_the_launcher_started_and_no_record_hides
         "rows":[],"overflow":0,"source_overflow":[],"not_clean":[],
         "evidence":{"recorder":true,"instance":format!("{service}-process"),"lost":0,"unstated":0,"retrying":false,"last_error":null}})
     };
-    let events: Vec<_> = ["jobs", "people"]
-        .into_iter()
-        .map(|service| Event {
-            id: Uuid::new_v4(),
-            timestamp: since,
-            source: service.into(),
-            kind: "machine_gate.recording_began".into(),
-            payload: json!({"service":service,"mode":"report","since":since,"instance":format!("{service}-process")}),
-        })
-        .collect();
+    // Each process start states the generation of the record it was
+    // launched under (design 3cc6152a, backlog 14fe115c): `stated` is
+    // that record's text, or none for a process that stated nothing.
+    let started = |stated: Option<&str>| -> Vec<Event> {
+        ["jobs", "people"]
+            .into_iter()
+            .map(|service| {
+                let mut payload = json!({"service":service,"mode":"report","since":since,"instance":format!("{service}-process")});
+                if let Some(record) = stated {
+                    payload["roster"] = boss_core::gate_window::roster_stamp(Ok(record), Some("fixture"));
+                }
+                Event {
+                    id: Uuid::new_v4(),
+                    timestamp: since,
+                    source: service.into(),
+                    kind: "machine_gate.recording_began".into(),
+                    payload,
+                }
+            })
+            .collect()
+    };
     let upstream = |body: String, status: StatusCode| Upstream {
         body,
         status,
@@ -772,13 +783,16 @@ async fn the_required_services_are_what_the_launcher_started_and_no_record_hides
     };
     let record = write("whole", &whole);
     let cut = write("cut", &whole.replace("end 3\n", ""));
-    let all_started = write("all-started", &whole.replace(skip, "start boss-assets-api"));
+    let started_all = whole.replace(skip, "start boss-assets-api");
+    let all_started = write("all-started", &started_all);
+    let events = started(Some(&whole));
     struct Case {
         name: &'static str,
         assets: String,
         record: Result<std::path::PathBuf, String>,
         clean: bool,
         required: serde_json::Value,
+        log: Vec<Event>,
     }
     let two = json!(["jobs", "people"]);
     let three = json!(["assets", "jobs", "people"]);
@@ -789,6 +803,27 @@ async fn the_required_services_are_what_the_launcher_started_and_no_record_hides
             record: Ok(record.clone()),
             clean: true,
             required: two.clone(),
+            log: events.clone(),
+        },
+        // The same silent, skipped service — but the processes on the
+        // log were launched under a selection that STARTED it, or said
+        // nothing about their selection at all. The excuse is this
+        // record's; those hours were watched under another.
+        Case {
+            name: "the processes on the log state another selection",
+            assets: closed.clone(),
+            record: Ok(record.clone()),
+            clean: false,
+            required: two.clone(),
+            log: started(Some(&started_all)),
+        },
+        Case {
+            name: "the processes on the log state no selection",
+            assets: closed.clone(),
+            record: Ok(record.clone()),
+            clean: false,
+            required: two.clone(),
+            log: started(None),
         },
         Case {
             name: "recorded as skipped while a process answers on its port",
@@ -796,6 +831,7 @@ async fn the_required_services_are_what_the_launcher_started_and_no_record_hides
             record: Ok(record.clone()),
             clean: false,
             required: two.clone(),
+            log: events.clone(),
         },
         Case {
             name: "started and down",
@@ -803,6 +839,7 @@ async fn the_required_services_are_what_the_launcher_started_and_no_record_hides
             record: Ok(all_started),
             clean: false,
             required: three.clone(),
+            log: events.clone(),
         },
         Case {
             name: "the record is missing",
@@ -810,6 +847,7 @@ async fn the_required_services_are_what_the_launcher_started_and_no_record_hides
             record: Ok(dir.join("absent")),
             clean: false,
             required: three.clone(),
+            log: events.clone(),
         },
         Case {
             name: "the record is cut short",
@@ -817,6 +855,7 @@ async fn the_required_services_are_what_the_launcher_started_and_no_record_hides
             record: Ok(cut),
             clean: false,
             required: three.clone(),
+            log: events.clone(),
         },
         Case {
             name: "no record path was handed to this process",
@@ -824,6 +863,7 @@ async fn the_required_services_are_what_the_launcher_started_and_no_record_hides
             record: Err("BOSS_LAUNCH_RECORD is unset".into()),
             clean: false,
             required: three.clone(),
+            log: events.clone(),
         },
     ];
     for case in cases {
@@ -837,7 +877,7 @@ async fn the_required_services_are_what_the_launcher_started_and_no_record_hides
         )
         .with_launch_record(case.record.clone());
         let app = gate_window_router(
-            Arc::new(InMemoryGateEvidence::new(events.clone())),
+            Arc::new(InMemoryGateEvidence::new(case.log.clone())),
             Arc::new(live),
             Arc::new(FixedClock::new(now)),
         );
@@ -869,6 +909,32 @@ async fn the_required_services_are_what_the_launcher_started_and_no_record_hides
                 // The excused port's read stays in the observation.
                 assert_eq!(result["observation"]["reads"].as_array().unwrap().len(), 3);
                 assert_eq!(result["observation"]["not_launched"], json!(["assets"]));
+                // The answer names the one generation it was judged under.
+                let judged = result["roster_generations"].as_array().unwrap();
+                assert_eq!(judged.len(), 1, "{result}");
+                assert_eq!(
+                    judged[0]["generation"],
+                    json!(boss_core::gate_window::roster_generation(&whole).unwrap())
+                );
+            }
+            "the processes on the log state another selection" => {
+                assert!(
+                    why.contains("launch roster: this reader's launch record is generation"),
+                    "{why}"
+                );
+                assert!(
+                    result["not_launched"][0]["not_clean"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            "the processes on the log state no selection" => {
+                assert!(
+                    why.contains("launch roster: ") && why.contains("no stated generation"),
+                    "{why}"
+                );
+                assert_eq!(result["roster_generations"][0]["generation"], json!(null));
             }
             "recorded as skipped while a process answers on its port" => {
                 assert!(

@@ -47,6 +47,12 @@ required-features = ["postgres"]
 [lints]
 workspace = true
 
+# The reader module is behind `postgres`; this target itself opens no
+# database (its log and live reads are in-memory doubles).
+[[test]]
+name = "the_actor_role_window_has_the_same_reader"
+required-features = ["postgres"]
+
 [[test]]
 name = "events_role_reports"
 required-features = ["postgres"]

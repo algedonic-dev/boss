@@ -49,7 +49,21 @@ BODY="$WORK/body"
 HDRS=()
 machine_token_header MT_HDR "$BOSS_JOBS_URL" || fail
 [ -z "$MT_HDR" ] || HDRS+=(-H "$MT_HDR")
-secret_header RC_HDR "x-boss-runner-credential: $CUR" || fail
+# present VALUE — the credential's header, made ONLY for a host the machine
+# token's rule admits (machine_token_admits: loopback or
+# BOSS_MACHINE_TOKEN_HOSTS). Both presentations below were plain
+# secret_header, which judges no host, so a BOSS_JOBS_URL pointed off the
+# estate kept the machine token home and sent this (backlog 50708d76, F2
+# of review 927f8602 — the shape car 025640e3 repaired in the ops runner).
+# The line names the rule and nothing of the URL.
+present() {
+    if ! machine_token_admits "$BOSS_JOBS_URL"; then
+        echo 'runner-credential-recv: the runner credential is NOT presented — the host of BOSS_JOBS_URL is not loopback and not in BOSS_MACHINE_TOKEN_HOSTS' >&2
+        return 1
+    fi
+    secret_header RC_HDR "x-boss-runner-credential: $1" || fail
+}
+present "$CUR" || refuse
 CODE=""
 api_get() {
     local path="$1"; shift
@@ -90,7 +104,7 @@ TMP=""
 sync -- "$DIR" || fail
 # Acknowledgment proves the installed bytes, not merely the transport input.
 CUR="$(cat "$DEST" 2>/dev/null)" || fail
-secret_header RC_HDR "x-boss-runner-credential: $CUR" || fail
+present "$CUR" || fail
 resolve_bound || fail
 last8() { printf '%s' "${1: -8}"; }
 rc=0

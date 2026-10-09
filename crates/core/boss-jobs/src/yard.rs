@@ -3171,15 +3171,16 @@ pub fn build_status_for(
 
 /// The compiled gate-concurrency fallback, mirrored here for the
 /// no-policy case. It equals `boss-cli`'s `DEFAULT_MAX_CONCURRENT` /
-/// `COMPILED_GATE_MAX_CONCURRENT` (4 since policy v5, backlog e6dc7331,
-/// 2026-09-30 — three under v4 while each gate's workspace, and its
-/// 160Gi request, sat on w-1's install disk; four under v3 before
-/// that): a page with no policy shows the
+/// `COMPILED_GATE_MAX_CONCURRENT` (3 since policy v7, backlog 17f6170c,
+/// 2026-10-07, until the untrimmed gate drive is fixed and four is
+/// measured under load — four under v5 and v6, three under v4 while
+/// each gate's workspace, and its 160Gi request, sat on w-1's install
+/// disk; four under v3 before that): a page with no policy shows the
 /// same bound a gate obeys with an unreachable registry, and boss-cli's
 /// pin `the_yard_no_policy_capacity_equals_the_cli_compiled_bound` names
 /// this if it ever drifts (CLAUDE.md §9a — the two live in different
 /// crates, so equality is the mechanism).
-pub const COMPILED_GATE_MAX_CONCURRENT: i32 = 4;
+pub const COMPILED_GATE_MAX_CONCURRENT: i32 = 3;
 
 #[cfg(test)]
 mod tests {

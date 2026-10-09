@@ -24,7 +24,7 @@
 //! declaration is refused; and the observation is POSTed to the estate
 //! door, or spooled when the door will not take it.
 
-use boss_testing::{repo_root, scratch_dir, write_exec, write_file};
+use boss_testing::{dark_port, repo_root, scratch_dir, write_exec, write_file};
 use serde_json::Value;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -108,10 +108,10 @@ fn the_public_half_is_the_name_the_tunnel_routes_to_that_service() {
 fn the_watchdog_unit_runs_the_observer_after_the_watchdog_and_best_effort() {
     let unit = read("infra/forge/cluster-watchdog.service");
     let watchdog = unit
-        .find("\nExecStart=/home/david/boss/infra/forge/cluster-watchdog.sh")
+        .find("\nExecStart=/var/lib/boss/tree/current/infra/forge/cluster-watchdog.sh")
         .expect("the unit runs the watchdog");
     let door = unit
-        .find("\nExecStart=-/home/david/boss/infra/estate/observe-door.sh")
+        .find("\nExecStart=-/var/lib/boss/tree/current/infra/estate/observe-door.sh")
         .expect(
             "the unit runs the door observer, prefixed `-` so a failed reading never \
              fails the watchdog's unit",
@@ -232,14 +232,6 @@ fn half<'a>(obs: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("no {name} half in {obs}"))
 }
 
-/// A port nothing listens on: bind one, read its number, let it go.
-fn refused_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = l.local_addr().expect("addr").port();
-    drop(l);
-    port
-}
-
 fn exists(p: &Path) -> bool {
     p.exists()
 }
@@ -295,7 +287,9 @@ fn an_open_door_is_observed_open_on_both_halves() {
 #[test]
 fn a_refused_port_is_dark_and_the_first_dark_reading_is_remembered() {
     let w = World::new("door-refused");
-    w.declare(&format!("127.0.0.1:{}", refused_port()), "dev.example.test");
+    // Held dark for the whole test, never bound and let go (backlog ec131700).
+    let dark = dark_port();
+    w.declare(&dark.addr.to_string(), "dev.example.test");
     let obs = w.observe(&[("STUB_KEYSCAN_KEY", "ssh-ed25519")]);
     let l = half(&obs, "lan");
     assert_eq!(l["open"], false, "{l}");
@@ -422,7 +416,9 @@ fn stub_curl(w: &World) -> PathBuf {
 fn the_observation_is_posted_to_the_estate_door() {
     let w = World::new("door-post");
     let posted = stub_curl(&w);
-    w.declare(&format!("127.0.0.1:{}", refused_port()), "dev.example.test");
+    // Held dark for the whole test, never bound and let go (backlog ec131700).
+    let dark = dark_port();
+    w.declare(&dark.addr.to_string(), "dev.example.test");
     let out = w.run(&[], &[("JOBS_API", "http://stub")]);
     assert!(
         out.status.success(),
@@ -446,7 +442,9 @@ fn the_observation_is_posted_to_the_estate_door() {
 fn a_reading_the_door_will_not_take_is_kept_for_replay() {
     let w = World::new("door-spool");
     stub_curl(&w);
-    w.declare(&format!("127.0.0.1:{}", refused_port()), "dev.example.test");
+    // Held dark for the whole test, never bound and let go (backlog ec131700).
+    let dark = dark_port();
+    w.declare(&dark.addr.to_string(), "dev.example.test");
     let out = w.run(&[], &[("JOBS_API", "http://stub"), ("STUB_STATUS", "503")]);
     assert!(
         !out.status.success(),
@@ -463,7 +461,9 @@ fn a_reading_the_door_will_not_take_is_kept_for_replay() {
 #[test]
 fn posting_needs_the_system_of_record_named() {
     let w = World::new("door-noapi");
-    w.declare(&format!("127.0.0.1:{}", refused_port()), "dev.example.test");
+    // Held dark for the whole test, never bound and let go (backlog ec131700).
+    let dark = dark_port();
+    w.declare(&dark.addr.to_string(), "dev.example.test");
     let out = w.run(&[], &[]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("JOBS_API"));

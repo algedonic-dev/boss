@@ -1372,6 +1372,10 @@ impl Converge {
                 self.case.root.join("journald.conf.d"),
             )
             .env("BOSS_JOURNALD_SYSTEMCTL", "true")
+            // The cluster-operator's Talos client, which the converge's
+            // host check judges whatever the roles turn out to be
+            // (backlog 62b09c57, N7): never downloaded to this machine.
+            .env("INSTALL_TALOSCTL", "0")
             .env(
                 "BOSS_GCP_CONVERGE_INSTALLER",
                 self.case.bin.join("installer-ok"),
@@ -1716,6 +1720,13 @@ impl ForgeInstall {
             &case.bin.join("systemctl"),
             "#!/usr/bin/env bash\necho \"systemctl $*\" >>\"$STUB_SYSTEMCTL_LOG\"\n[ \"${1:-}\" = is-active ] && echo active\nexit 0\n",
         );
+        // The package manager the journal door asks when its socket unit
+        // is absent, and an empty unit library so it is absent here as on
+        // a machine without the package (backlog 62b09c57, N7: this
+        // fixture left both at the machine's own until install.sh's host
+        // check judged them).
+        write_exec(&case.bin.join("apt-get"), "#!/bin/sh\nexit 0\n");
+        std::fs::create_dir_all(case.root.join("unit-lib")).unwrap();
         let sor_env = case.root.join("sor.env");
         Self { case, etc, sor_env }
     }
@@ -1736,6 +1747,12 @@ impl ForgeInstall {
             .env("INSTALL_SYSTEMCTL", self.case.bin.join("systemctl"))
             .env("INSTALL_KUBECTL", "0")
             .env("INSTALL_TALOSCTL", "0")
+            .env("INSTALL_APT_GET", self.case.bin.join("apt-get"))
+            .env("INSTALL_UNIT_LIB", self.case.root.join("unit-lib"))
+            .env(
+                "BOSS_OPS_RUNNER_RETIRED",
+                self.case.root.join("ops-runner.retired"),
+            )
             .env("INSTALL_SOR_ENV", &self.sor_env)
             .env("BOSS_SOR_ENV", &self.sor_env)
             .env("BOSS_NODE_ROLES", roles)

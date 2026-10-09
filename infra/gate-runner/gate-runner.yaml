@@ -53,7 +53,8 @@
 #     reflink, metadata only; since 52ea56ac the seed is `seed/` of the
 #     same gate claim the workspaces are `runs/` of.)
 #   - DATABASE SIDECAR with the 1Gi /dev/shm the dev pod's sidecar
-#     earned on 2026-08-22.
+#     earned on 2026-08-22. Since backlog 9cd74fd5 (2026-10-08) its data
+#     directory is MEMORY, not the install disk: see the `pgdata` volume.
 #   - SELF-REPORTING: run.sh completes the gate-run packet with the
 #     verdict (green/failed/lost). A runner that dies anyway leaves
 #     an overdue packet — the alarm the protocol already provides.
@@ -145,6 +146,37 @@ metadata:
   labels:
     app: gate-runner
     boss.dev/packet: $GATE_RUN_JOB_ID
+    # THIS RUNNER LEAVES ITS VERDICT AND WRITES NOTHING (backlog 934ccad1;
+    # design bdc60b65, question gate-verdict). The label tells the
+    # conductor to record this Job's verdict from its pod log
+    # (boss-cli train/carried_verdict.rs reads only a Job labelled so);
+    # GATE_VERDICT_CARRIER on the gate container, below, tells run.sh to
+    # stop reporting for itself. ONE WITHOUT THE OTHER is a verdict
+    # written twice or never, so the two lines travel together and
+    # boss-testing's the_gate_runner_leaves_its_verdict_and_writes_nothing
+    # holds them to it.
+    #
+    # THE ROLLBACK, AS A PROCEDURE (review 47319ee7, S2). The target is
+    # "every runner reports for itself and the conductor leaves every
+    # Job alone", which is this manifest with BOTH lines deleted - the
+    # label here and GATE_VERDICT_CARRIER below. WHERE that manifest has
+    # to be differs by who launches:
+    #   - a car's gate (`boss gate`) renders the manifest of the tree it
+    #     is run from: a worktree whose manifest lacks the two lines
+    #     gates the old way at once, with nothing landed.
+    #   - a TRAIN's gate and the dock's re-gate are rendered by the
+    #     conductor from its IMAGE's manifest
+    #     (/opt/boss/infra/gate-runner/gate-runner.yaml, or wherever
+    #     BOSS_GATE_MANIFEST points). So the train that carries the
+    #     two-line deletion is itself gated in the layout being rolled
+    #     back. If the carried path is what is broken, that train
+    #     cannot go green: it lands through the emergency lane, or the
+    #     conductor is pointed at a manifest without the two lines
+    #     (BOSS_GATE_MANIFEST on deploy/boss-conductor) until an image
+    #     built from the deletion is running.
+    # A verdict lost meanwhile is not gone: its receipt is in the pod log
+    # for the Job's 24 h (`kubectl logs job/<gate Job> -c gate`).
+    boss.dev/verdict-carrier: pod-log
     boss.dev/branch: $GATE_NAME_HINT
 spec:
   backoffLimit: 0
@@ -283,9 +315,63 @@ spec:
             # ("could not resize shared memory segment"); same fix the
             # dev pod's sidecar carries.
             - {name: pg-shm, mountPath: /dev/shm}
+          # MEMORY: THIS CONTAINER IS CHARGED FOR ITS DATA (backlog
+          # 9cd74fd5). Both volumes above are tmpfs, and a tmpfs page is
+          # charged to the cgroup that wrote it and is never reclaimed
+          # (no swap). So the LIMIT is the two volumes' sizeLimits plus
+          # the server's own processes — 6Gi (pgdata) + 1Gi (pg-shm) + 2Gi
+          # (128 MB of shared buffers, up to 100 backends) — and must stay
+          # at or above that sum: under it the kernel OOM-kills the
+          # database BELOW the volume's size, where the gate container
+          # cannot see why, and the run reads as tests failing on a
+          # correct branch. The REQUEST is the measured data directory
+          # (1.93 GiB, see the `pgdata` volume) plus the 512Mi this
+          # container asked before, rounded up, so the scheduler reserves
+          # what a gate really takes and an ordinary gate is not in the
+          # kubelet's "usage exceeds request" class under memory
+          # pressure. It was 512Mi / 4Gi while the data was on disk and
+          # most of the 4Gi was reclaimable page cache. Pinned by
+          # the_gate_postgres_data_lives_in_memory.rs, with the bays'
+          # arithmetic.
+          #
+          # WHAT THAT REQUEST COSTS (review bc011e92, F4 and F3). Every
+          # pod on w-1 is Burstable, and the kubelet ranks for memory
+          # eviction by usage-over-request FIRST and priority second. A
+          # gate pod now requests 11 GiB (8Gi + this 3Gi) and an ordinary
+          # gate stays inside it, so the dev pod - request 8.56 GiB,
+          # usually far over it with builders running, limit 32Gi - is
+          # the likely FIRST eviction under node memory pressure, its
+          # higher priority notwithstanding. The dev pod is the
+          # operator's session. And a NODE-level OOM (the kernel, not
+          # the kubelet) prefers the lowest request share: these
+          # sidecars, at 3Gi, before any compiler. Killing one frees
+          # almost nothing, because its data is tmpfs in an emptyDir that
+          # outlives the container and stays charged, so the kernel moves
+          # to the next gate's database.
+          #
+          # WHAT A GATE DOES WHEN MEMORY RUNS OUT, AND THE BLIND SPOT
+          # (review bc011e92, F2 and F3). Nothing here rewrites a verdict.
+          #   - The data volume fills (6Gi): Postgres answers `No space
+          #     left on device`, DB tests fail, the run is `failed`, and
+          #     the receipt shows runtime_evidence.pgdata.full beside it.
+          #   - The GATE container is OOM-killed: the kubelet sets
+          #     memory.oom.group, so the kill takes every process in it,
+          #     run.sh included. No receipt is written and the conductor
+          #     settles the run `lost`. (oom.group read on the dev
+          #     container on w-1, same kubelet; not read on a gate pod.)
+          #     runtime_evidence.memory.oom_kill is therefore a count a
+          #     receipt will almost never carry above zero.
+          #   - THIS container is killed (its own limit, or the node):
+          #     it restarts on the surviving tmpfs, the gate sees
+          #     connection errors, DB tests fail and the run is `failed` -
+          #     WITH NOTHING ON THE RECEIPT TO SAY WHY: the volume is not
+          #     full and the gate's own cgroup counted no kill. This is
+          #     the known blind spot. The gate container cannot see this
+          #     cgroup and does not try to; the one place it shows is the
+          #     pod's `restartCount` for `postgres`, while the Job lives.
           resources:
-            requests: {cpu: 250m, memory: 512Mi}
-            limits: {cpu: "2", memory: 4Gi}
+            requests: {cpu: 250m, memory: 3Gi}
+            limits: {cpu: "2", memory: 9Gi}
       containers:
         - name: gate
           image: 10.20.0.15:3000/david/boss-ci:rust1.96
@@ -302,6 +388,14 @@ spec:
             - {name: GATE_BRANCH, value: "$GATE_BRANCH"}
             - {name: GATE_RUN_JOB_ID, value: "$GATE_RUN_JOB_ID"}
             - {name: GATE_MODE, value: "$GATE_MODE"}
+            # The runner's half of the verdict-carrier label on this Job's
+            # metadata (see there). The verdict leaves this container in
+            # two places a holder of the gates Role reads and this pod's
+            # ServiceAccount-less code cannot reach beyond: its stdout,
+            # and its termination message (the default
+            # /dev/termination-log, 4096 bytes, published by the kubelet
+            # once the container has ended).
+            - {name: GATE_VERDICT_CARRIER, value: pod-log}
             # The BAKED browser, not a per-run PVC download. The keystone
             # bakes chromium + its libs into boss-ci at /opt/ms-playwright;
             # pointing here lets gate.sh's web suite run the mocked
@@ -358,6 +452,16 @@ spec:
             # a_runner_mounting_the_gate_claim_arms_the_guard, never a
             # silently disarmed guard.
             - {name: GATE_DISK, value: required}
+            # WHERE THE POSTGRES DATA VOLUME IS READABLE (backlog 9cd74fd5):
+            # the read-only mount of `pgdata` below. The clone's
+            # runtime-evidence.py reads how full it is (one statvfs, at
+            # every check boundary and from run.sh's watcher between them)
+            # and the receipt carries the peak as runtime_evidence.pgdata,
+            # so the volume's sizeLimit is checked by a number on every
+            # gate. A runner without this key records `unavailable`, never
+            # a zero. Tests inherit it like every key here and set their
+            # own.
+            - {name: BOSS_GATE_PGDATA, value: /gate-pgdata}
           # uid 65534 (`nobody`) WITH GROUP 1500, so everything this build
           # writes is owned by the group that owns the volumes. The gate's
           # capability posture was already compliant; only the uid was
@@ -519,6 +623,16 @@ spec:
             # leave a gate Pending is a red. Under pressure a gate within
             # 40Gi still ranks below a dev pod within its own request
             # (priority), and a runaway gate past 40Gi is evicted first.
+            #
+            # 2026-10-08 (backlog 9cd74fd5): the pgdata emptyDir LEFT
+            # EPHEMERAL for memory, so the paragraphs above that count it
+            # on this disk are history. 40Gi is unchanged and now covers
+            # the writable layer and /tmp alone; it was not re-measured
+            # here. MEMORY, which the first paragraph counts per gate at
+            # this container's 8Gi: a gate POD now requests 8Gi + 3Gi,
+            # the postgres sidecar's share being its data directory — the
+            # arithmetic for the bays is beside the `pgdata` volume and
+            # pinned in the_gate_postgres_data_lives_in_memory.rs.
             requests: {cpu: "4", memory: 8Gi, ephemeral-storage: 40Gi}
             limits: {cpu: "20", memory: 32Gi}
           volumeMounts:
@@ -536,6 +650,10 @@ spec:
             - {name: gate-disk, mountPath: /gate-seed, subPath: seed}
             - {name: gate-disk, mountPath: /gate-target, subPathExpr: runs/$(POD_NAME)}
             - {name: gate-disk, mountPath: /gate-runs, subPath: runs}
+            # READ-ONLY, and only to be measured (BOSS_GATE_PGDATA above).
+            # The database's own directory under it is 0700 to uid 999, so
+            # code a gate runs can neither write nor read its files here.
+            - {name: pgdata, mountPath: /gate-pgdata, readOnly: true}
             - {name: run-script, mountPath: /repo-script}
             - {name: forge-token, mountPath: /etc/forge, readOnly: true}
       volumes:
@@ -629,8 +747,73 @@ spec:
         # than one reader finds that container by its `- name: gate` line.
         - name: gate-disk
           persistentVolumeClaim: {claimName: gate}
+        # THE GATE'S POSTGRES DATA DIRECTORY IS MEMORY (backlog 9cd74fd5,
+        # design 3a8a44c1 step 2, 2026-10-08). It was `emptyDir: {}`,
+        # which the kubelet puts on the install disk's EPHEMERAL — the
+        # Samsung, beside the dev pod's builders. Design 8457c07b moved a
+        # gate's disk I/O to the gate volume and left this one writer
+        # behind. Measured on backlog 17f6170c: a gate's test check (30 of
+        # its 37 minutes alone) barely writes the gate drive and writes
+        # the Samsung, with write await spikes of 40 to 143 ms there, and
+        # two false reds on loopback timeouts on 2026-10-07 came with
+        # three gates plus five builders. The sidecar already runs with
+        # fsync, synchronous_commit and full_page_writes off, so the data
+        # is disposable by design and loses nothing by being pages.
+        #
+        # MEASURED, 2026-10-07 23:18Z to 2026-10-08 00:42Z, on three
+        # `--auto` gates on w-1 (two car gates and the 23:36 train gate):
+        # the sum of pg_database_size over every database plus pg_wal,
+        # read from each running gate's own Postgres every 20 to 25 s
+        # (the kubelet's volume stats are not readable by the dev
+        # session). The shape repeated: about ten minutes in, 110 to 120
+        # scratch databases appear within 90 seconds, 16 MB each, and
+        # stay for most of the test check; the directory peaks at 1.78,
+        # 1.85 and 1.93 GiB, pg_wal never passed 0.08 GiB, and the train
+        # gate ended at 0.19 GiB once they were dropped. Largest reading:
+        # 2,072,238,410 bytes, 126 databases. NOT measured: a full-scope
+        # gate, the first ten minutes of two of the three, and anything
+        # between two reads.
+        #
+        # 6Gi IS THAT PEAK TIMES THREE (3.1), the factor standing in for
+        # what was not measured. Since Kubernetes 1.22 a memory emptyDir
+        # with a sizeLimit is a tmpfs OF that size, so at the limit
+        # Postgres gets `No space left on device` and the DB-backed tests
+        # after it fail; the kubelet evicts the pod only if use ever reads
+        # ABOVE the limit. A run that fails that way is recorded
+        # `failed`, like any other red: the collector marks the volume
+        # (runtime_evidence.pgdata.full, at 95% of its size) as EVIDENCE
+        # for whoever reads the red and changes no verdict, because a
+        # reading over a threshold cannot say which check failed or
+        # whether the car's own tests filled the database (review
+        # bc011e92, F1). An evicted pod leaves no receipt, which the
+        # conductor settles `lost`. Every receipt carries the peak
+        # (runtime_evidence.pgdata), so this number is re-read on every
+        # gate: raise it, with the postgres container's limit, when a
+        # receipt shows a peak over half of it.
+        #
+        # WHAT IT COSTS w-1 (62.7 GiB; MemTotal 65,735,920 kB). By
+        # request: three bays plus the train gate (delivery policy v7) at
+        # 8Gi + 3Gi each, beside the dev pod's 8.6Gi, is 52.6 GiB. THAT IS
+        # FOUR GATES, AND IT IS THE CEILING: a FIFTH concurrent gate (a
+        # dock re-gate beside three bays and a train gate) asks 63.6 GiB,
+        # over the node's whole 62.7, and would sit Pending until one
+        # finishes. Five ran together on 2026-10-06/07 at the old 8.5 GiB
+        # a pod (51.1). The pin holds four against nine tenths of
+        # MemTotal - the node's allocatable is not readable from the dev
+        # session, and the pin counts only this namespace's pods. By use:
+        # MemAvailable read 44 GB (41 GiB) with FIVE gates running, their
+        # builds' memory included (17f6170c); four gates at the measured
+        # peak take 7.7 GiB of it, and four gates each FILLING this volume
+        # take 24 GiB and leave 17. The gate container's own memory.peak
+        # read 11.7 to 14.7 GiB on four gates that day, file cache
+        # included, against its 32Gi limit.
+        #
+        # THE FALLBACK, if receipts or the node show memory pressure: put
+        # this directory on the gate volume instead (a `pgdata/$(POD_NAME)`
+        # subPath of the `gate-disk` claim, emptied by run.sh like the
+        # workspace) — never EPHEMERAL again. Not built: memory fits.
         - name: pgdata
-          emptyDir: {}
+          emptyDir: {medium: Memory, sizeLimit: 6Gi}
         - name: pg-shm
           emptyDir: {medium: Memory, sizeLimit: 1Gi}
         # run.sh ships in the repo and reaches the pod through this

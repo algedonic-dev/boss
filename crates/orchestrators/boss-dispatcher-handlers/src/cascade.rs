@@ -235,8 +235,15 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // kind that has gone silent past a bound (c87fb59b car 2: an
         // agent-run whose builder died). The completion carries the
         // packet to its own terminal; nothing listens for a run's
-        // close, so the loop ends at the packet.
-        ("jobs.age_out_step", vec!["jobs.step.completed"]),
+        // close, so the loop ends at the packet. A rule naming `post_to`
+        // also posts a record as it ends the step (b5a3a174: the
+        // `agent_runs` row of a run that never reported), which the
+        // agent-runs door records as `agents.run.recorded`; nothing
+        // listens for it.
+        (
+            "jobs.age_out_step",
+            vec!["jobs.step.completed", "agents.run.recorded"],
+        ),
         // A step going ready is completed from a record its own packet
         // already holds (b951c00a: a builder's pre-green report lands
         // on the green). The completion carries the packet to its own

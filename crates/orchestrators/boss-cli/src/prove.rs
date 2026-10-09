@@ -156,7 +156,7 @@ const KILL_AFTER_SECS: u64 = 5;
 pub(crate) struct Shell {
     pub cwd: Option<std::path::PathBuf>,
     /// The user to run as, when this process is root — the forge's
-    /// `runuser -u david`. A process that is not root runs the probe
+    /// `runuser -u boss-probe`. A process that is not root runs the probe
     /// as itself, the twin's by-hand path: a person who is already the
     /// probe user.
     pub user: Option<String>,
@@ -432,14 +432,85 @@ pub(crate) struct EnvironmentRefusal(pub String);
 
 impl std::fmt::Display for EnvironmentRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = if ran_without_a_read(&self.0) {
+            "the probe's result was discarded"
+        } else {
+            "the probe did not run"
+        };
         write!(
             f,
-            "ENVIRONMENT REFUSAL — the probe did not run and nothing about the claim was \
+            "ENVIRONMENT REFUSAL — {what} and nothing about the claim was \
              judged: {}. This host could not give the probe the environment it is promised; \
              repair the named cause and run it again.",
             self.0
         )
     }
+}
+
+/// How the cause of the ONE refusal that follows a run begins. Every
+/// other environment refusal is made before the probe starts, and its
+/// record says "did not run", which is true of it. This one is found
+/// after: the probe ran, and the reader door refused a read it asked
+/// for. The cause is stored on the car as written, so the record says
+/// which of the two it was in its own first words, and the two fixed
+/// sentences around it ([`EnvironmentRefusal`]'s and
+/// [`environment_why`]) follow it rather than claim a run did not
+/// happen.
+pub(crate) const RAN_WITHOUT_A_READ: &str = "the probe ran without a read it asked for";
+
+fn ran_without_a_read(cause: &str) -> bool {
+    cause.starts_with(RAN_WITHOUT_A_READ)
+}
+
+/// A PROBE THAT RAN WITHOUT A READ IT ASKED FOR JUDGED NOTHING (review
+/// 991bb439, N1). The door serves a port only where that port's own gate
+/// names the credential a reader; anywhere else it answers 502, which
+/// `boss-sor-read`'s `curl -f` turns into exit 22. Until this, that was
+/// the probe's verdict: "A probe that fails is evidence AGAINST the
+/// claim" — a FAILED proof on correct code, for every car whose probe
+/// reads a service that does not mount the reader directory yet or whose
+/// rotation has moved on. The cause is the host's, exactly as a missing
+/// credential's is, so it is the host's refusal: nothing judged, exit
+/// [`REFUSED_EXIT`], the car a NOT YET the hourly recheck runs again,
+/// with the port and what its gate answered on the record.
+///
+/// WHATEVER THE PROBE EXITED, a pass included. A probe whose text
+/// swallows the failed read (`|| true`, a pipe into `jq` with no
+/// pipefail) and prints its marker has asserted something about a page
+/// it never saw — the absence assertion against a narrower world this
+/// door exists to prevent (61085a9e). Discarding a pass is the strict
+/// side of the rule; nothing here can turn a not-proven into a proven.
+///
+/// What it does NOT cover: an upstream that is simply DARK is still the
+/// probe's own failed read, as it was on the LAN before the door
+/// existed — whether it went dark after the door vouched for it or was
+/// dark the first time the probe read it. The door remembers only a
+/// port where something ANSWERED and did not name the credential a
+/// reader (`probe_reader::Unvouched`; review cd3f6a99, N1 — the first
+/// cut remembered a connect error too, so a car that took its own
+/// service down read NOT YET every hour instead of NOT PROVEN).
+fn unserved_read_refusal(unserved: &[String], exit: i32) -> Option<String> {
+    if unserved.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{RAN_WITHOUT_A_READ}: the reader door refused {} port(s) no gate vouches for — {} — \
+         so what the probe concluded (exit {exit}) is not a judgement of the claim",
+        unserved.len(),
+        unserved.join("; ")
+    ))
+}
+
+/// WHOM THE READER DOOR'S SOCKET IS HANDED TO: the user this door drops
+/// to, and only when this process is root — the one uid for which
+/// "drops to" is an act. Anyone else runs the probe as themselves
+/// ([`Shell::command_prefix`] adds no `runuser`), so the socket stays
+/// theirs; naming a recipient there would ask a non-root process to
+/// chown, which succeeds for itself and is a refusal for anybody else —
+/// a door that named a user would stop proving by hand (review
+/// 991bb439, N4: nothing held this line).
+fn door_recipient(shell: &Shell, as_root: bool) -> Option<&str> {
+    shell.user.as_deref().filter(|_| as_root)
 }
 
 impl std::error::Error for EnvironmentRefusal {}
@@ -451,6 +522,13 @@ pub(crate) fn environment_refusal(e: anyhow::Error) -> Result<String> {
         Some(r) => Ok(r.0.clone()),
         None => Err(e),
     }
+}
+
+/// A refusal a door reached BEFORE `execute_with`, in the shape
+/// `execute_with` gives its own — so the door's one refusal arm records
+/// and exits for both, and neither can be routed differently.
+fn not_run(cause: String) -> Result<Outcome> {
+    Err(anyhow::Error::new(EnvironmentRefusal(cause)))
 }
 
 /// The four doors that run a car's probe.
@@ -495,9 +573,14 @@ pub(crate) fn on_environment_refusal(door: Door) -> OnRefusal {
 /// and the cause so the fault is visible where the car is.
 pub(crate) fn environment_why(host: &str, cause: &str) -> String {
     format!(
-        "NOT YET: the probe did not run — {host} refused its environment ({cause}). \
+        "NOT YET: {} — {host} refused its environment ({cause}). \
          ENVIRONMENT REFUSAL, not a verdict against the change; repair the named cause, \
-         and recheck-failing-probes-hourly runs it again."
+         and recheck-failing-probes-hourly runs it again.",
+        if ran_without_a_read(cause) {
+            "the probe's result was discarded"
+        } else {
+            "the probe did not run"
+        }
     )
 }
 
@@ -602,12 +685,99 @@ pub(crate) fn exit_refused(door: Door, cause: &str) -> ! {
     std::process::exit(on_environment_refusal(door).exit)
 }
 
+/// The file whose presence says "the probe account verified on this host,
+/// this runner tick" — named by the drop-in `infra/forge/probe-account.sh`
+/// writes for the ops runner, and written by that script's `verify-tick`
+/// into the unit's runtime directory before each tick.
+pub(crate) const PROBE_VERIFIED_FILE_ENV: &str = "BOSS_PROBE_VERIFIED_FILE";
+
+/// THE VERIFIED ACCOUNT, OR NO PROBE (decided by David on design-doc
+/// c98c79aa, question `fallback`, 2026-10-06; backlog 703358ce). Where a
+/// host names the marker, a probe runs only when the marker exists and
+/// names the user this door is about to drop to. Absent, unreadable or
+/// naming anyone else, the probe is NOT RUN — an environment refusal, so
+/// the car records did-not-run with the cause and the hourly recheck
+/// retries it; never NOT PROVEN, and never a run as some other user.
+/// It has to be here, before `runuser`: `runuser -u <absent>` exits 1,
+/// and exit 1 is what a probe that ran and failed exits.
+///
+/// `None` from a host that names no marker: that host's converge has not
+/// reached this rule yet, and the door behaves as it did.
+pub(crate) fn probe_account_refusal(user: &str, marker: Option<&Path>) -> Option<String> {
+    let marker = marker?;
+    let said = std::fs::read_to_string(marker).ok();
+    if said.as_deref().map(str::trim) == Some(user) {
+        return None;
+    }
+    Some(format!(
+        "the probe account {user} is not verified on this host for this runner tick ({} {}); \
+         no probe runs until it is — the host's converge packet says why under probe_account, \
+         and that converge is what repairs it",
+        marker.display(),
+        match said {
+            Some(other) => format!("names {:?}", other.trim()),
+            None => "is absent".to_string(),
+        }
+    ))
+}
+
 /// [`execute_with`] with the empty token directory's making handed in,
 /// so the failure to make it can be pinned without filling a disk.
 fn execute_given(
     probe: &str,
     shell: &Shell,
     no_token: Result<crate::door_env::NoTokenInReach>,
+) -> Result<Outcome> {
+    execute_gated(probe, shell, no_token, probe_account_marker().as_deref())
+}
+
+/// The marker this host names, if it names one — the ONE read of the
+/// environment both askers share: the unattended door before it touches
+/// the probe's directory ([`unattended_ground`]) and every door before
+/// `runuser` ([`execute_given`]).
+fn probe_account_marker() -> Option<PathBuf> {
+    std::env::var_os(PROBE_VERIFIED_FILE_ENV).map(PathBuf::from)
+}
+
+/// WHAT THE UNATTENDED DOOR HOLDS BEFORE THE PROBE RUNS: the shell with
+/// the car's own instant, and the tree observed where the probe will
+/// run — or the account's refusal, and then NEITHER.
+///
+/// THE ACCOUNT IS ASKED FIRST (backlog dda26693, review acab446c F4).
+/// Both of the others run programs in the probe's directory: the instant
+/// is root's own `git` there with `safe.directory` set, and the
+/// observation is `pwd`, `id` and `git` through `runuser` as the named
+/// user. Until this, `run_unattended` did both and only then reached
+/// [`probe_account_refusal`] inside `execute_with`, so on a tick whose
+/// verify had refused the account or its view, root's git still opened
+/// that view and three programs still ran as the unverified account. No
+/// car text ran, which is the claim that matters, but "no marker, nothing
+/// runs" was not literally true of this door. Now it is: a refusal
+/// returns before either, and the caller records it as the environment's
+/// the same way `execute_with` would have.
+pub(crate) fn unattended_ground(
+    shell: Shell,
+    merge_ref: Option<&str>,
+) -> (Shell, ProbeObservation, Option<String>) {
+    let refused = shell
+        .user
+        .as_deref()
+        .and_then(|user| probe_account_refusal(user, probe_account_marker().as_deref()));
+    if refused.is_some() {
+        return (shell, ProbeObservation::default(), refused);
+    }
+    let shell = shell.with_car_instant(merge_ref);
+    let tree = probe_tree(&shell);
+    (shell, tree, None)
+}
+
+/// [`execute_given`] with the probe account's marker handed in, so the
+/// stop can be pinned without this process's environment.
+fn execute_gated(
+    probe: &str,
+    shell: &Shell,
+    no_token: Result<crate::door_env::NoTokenInReach>,
+    marker: Option<&Path>,
 ) -> Result<Outcome> {
     // Car-written text runs below: no machine token in reach of it, at
     // EITHER door, and not by the shell's own `strip` — removing the
@@ -620,6 +790,17 @@ fn execute_given(
     let no_token =
         no_token.map_err(|e| anyhow::Error::new(EnvironmentRefusal(format!("{e:#}"))))?;
     let as_root = shell.user.is_some() && running_as_root();
+    // THE ACCOUNT FIRST, before the reader door, the channel, the argv and
+    // `runuser`: a door that drops to a user runs nothing unless that user
+    // verified this tick — and opens no reader door for it either, so an
+    // unverified account is never handed a socket (decision c98c79aa).
+    if let Some(cause) = shell
+        .user
+        .as_deref()
+        .and_then(|user| probe_account_refusal(user, marker))
+    {
+        return Err(anyhow::Error::new(EnvironmentRefusal(cause)));
+    }
     // THE READER DOOR, IF THIS HOST HOLDS A READER CREDENTIAL (design
     // b35c22b4; review 0bd6a9c2, B1). `None` is a host with no
     // credential file: no door, and everything below is the read path
@@ -631,10 +812,8 @@ fn execute_given(
     // without the door it was meant to have is how an absence assertion
     // passes against a narrower world (61085a9e).
     let reader = match &shell.reader {
-        Some(config) => {
-            crate::probe_reader::open(config, shell.user.as_deref().filter(|_| as_root))
-                .map_err(|error| anyhow::Error::new(EnvironmentRefusal(format!("{error:#}"))))?
-        }
+        Some(config) => crate::probe_reader::open(config, door_recipient(shell, as_root))
+            .map_err(|error| anyhow::Error::new(EnvironmentRefusal(format!("{error:#}"))))?,
         None => None,
     };
     let bound = shell.bound(reader.is_some());
@@ -670,6 +849,11 @@ fn execute_given(
     }
     let argv = shell.command_line_under(probe, as_root, bound);
     let mut cmd = shell.command(&argv);
+    // Neither name reaches the probe from anywhere but the line below:
+    // not from this process's own environment, and not from the shell's
+    // `env`. A `BOSS_SOR_DOOR` left standing there would send every
+    // `boss-sor-read` of a probe that was given NO door to a socket
+    // somebody else chose (review 991bb439, N4).
     cmd.env_remove(crate::probe_reader::CREDENTIAL_ENV)
         .env_remove(crate::probe_reader::DOOR_ENV);
     if let Some(reader) = &reader {
@@ -697,6 +881,12 @@ fn execute_given(
     // A signalled probe reports no code; -1 is recorded rather than
     // silently becoming 0, because "killed" must not read as "passed".
     let exit = out.status.code().unwrap_or(-1);
+    // Asked while the door still stands, and before anything is made of
+    // what the probe said.
+    let unserved = reader.as_ref().map(|r| r.unserved()).unwrap_or_default();
+    if let Some(cause) = unserved_read_refusal(&unserved, exit) {
+        return Err(anyhow::Error::new(EnvironmentRefusal(cause)));
+    }
     let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     // `timeout` exits 124 for a probe it had to stop; the record says
     // so where the probe's own last words are, as the forge's did.
@@ -1565,6 +1755,13 @@ pub(crate) fn admit(probe: &str, from_car: bool) -> Admission {
 /// probes and earn a routine override, which is read by nobody
 /// (CLAUDE.md §Diagnosis). Both texts therefore SAY that they can fail
 /// open, because a warning is only worth what its reader does with it.
+///
+/// THE SEVENTH SAID HERE (ce72aea9) FAILS OPEN TOO, and stays a warning
+/// on the same argument: a clean claim counted over the machine gate's
+/// logged facts with the live tally never read. The gate writes one
+/// would-refuse fact per caller key per process, so "none since the
+/// cutoff" is true of a caller already tallied — but a probe asserting
+/// that a fact EXISTS has the same text and is correct.
 pub(crate) fn shape_warnings(probe: &str) -> impl Iterator<Item = String> {
     let inverted = boss_jobs::probe::asserts_its_own_negation(probe).then(|| {
         format!(
@@ -1653,6 +1850,21 @@ pub(crate) fn shape_warnings(probe: &str) -> impl Iterator<Item = String> {
             evidence = boss_jobs::probe::MENTION_NOT_DEFINITION_EVIDENCE,
         )
     });
+    let log_alone = boss_jobs::probe::clears_a_caller_from_the_gate_log_alone(probe).map(|kind| {
+        format!(
+            "THIS PROBE CLEARS A CALLER FROM THE GATE LOG ALONE — it counts `{kind}` facts in \
+             the gate window's `.log.dirty` and never reads the live tally's \
+             `.live[].snapshot.rows`. The log holds ONE such fact per caller key per process, \
+             so a caller the running service had already tallied before the cutoff writes no \
+             new fact after it, whatever it sends.\n  {evidence}\n  \
+             THIS SHAPE CAN FAIL OPEN: 'no fact since the cutoff' passes for a caller that \
+             presented nothing. It is a warning and not a refusal only because the text \
+             cannot tell that absence claim from a PRESENCE claim — the gate did state this \
+             caller — which the log answers correctly; if yours counts facts to conclude \
+             there are none, add the live reading before this gate starts.",
+            evidence = boss_jobs::probe::GATE_LOG_ALONE_EVIDENCE,
+        )
+    });
     inverted
         .into_iter()
         .chain(rewritten)
@@ -1660,6 +1872,7 @@ pub(crate) fn shape_warnings(probe: &str) -> impl Iterator<Item = String> {
         .chain(moving)
         .chain(truncated)
         .chain(mention)
+        .chain(log_alone)
 }
 
 /// THE NINTH SHAPE, AND THE ONE THE TEXT CANNOT SHOW (backlog
@@ -2289,8 +2502,9 @@ fn read_proof(raw: &Value) -> Result<Recorded> {
 ///
 /// WHERE IT RUNS. Two callers run this text on two different machines:
 /// `--from-car` runs it wherever the operator is standing, and the
-/// arrival rule runs it on the FORGE HOST as david, in the converged
-/// checkout, with that host's tools. The forge has no kubeconfig, so a
+/// arrival rule runs it on the FORGE HOST as the low-privilege account
+/// boss-probe, in a read-only view of the converged checkout, with that
+/// host's tools. The forge has no kubeconfig, so a
 /// probe can pass here and be unrunnable there — measured 2026-09-09
 /// (f9304366), which is why `boss gate --park-probe` refuses a probe
 /// naming a tool in infra/forge/host-absent-tools.txt.
@@ -2452,10 +2666,14 @@ fn proven_writes(car_id: &str, step_id: &str, md: &Value) -> Vec<(reqwest::Metho
 // reference-rows.sh and prune-registry-versions.sh have none), and the
 // gaps it had were these, each closed here:
 //
-//   - the probe runs as ANOTHER USER (root drops to $BOSS_PROBE_USER,
-//     default david) in the converged checkout ($BOSS_PROBE_DIR,
-//     default /home/david/boss) under a timeout ($BOSS_PROBE_TIMEOUT,
-//     default 60 s) — `Shell::unattended`;
+//   - the probe runs as ANOTHER USER (root drops to $BOSS_PROBE_USER)
+//     in the converged checkout ($BOSS_PROBE_DIR) under a timeout
+//     ($BOSS_PROBE_TIMEOUT, default 60 s) — `Shell::unattended`. On the
+//     forge both are named by the drop-in infra/forge/probe-account.sh
+//     writes: the account boss-probe and its read-only view,
+//     /var/lib/boss/probe-view (backlog 703358ce). The code's own
+//     defaults, david and /home/david/boss, are the twin's from before
+//     that account, and are what a host with no drop-in still gets;
 //   - the probe's environment is exactly what a recorded probe is
 //     promised: BOSS_JOBS_URL, a READ-ONLY reader identity as
 //     BOSS_SOR_USER (backlog 61085a9e — never this verb's own write
@@ -2519,10 +2737,24 @@ pub(crate) fn sor_ports_table(text: &str) -> String {
         .join(" ")
 }
 
+/// THE ACCOUNT THE UNATTENDED DOOR DROPS TO, and whether the host named
+/// it: `BOSS_PROBE_USER` from the ops runner's drop-in
+/// (infra/forge/probe-account.sh), or the default the twin had. One
+/// reading, so the host check of the reader socket's hand-over
+/// (`probe_door_check`) hands to the account this door would.
+pub(crate) fn probe_user() -> (String, bool) {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    // The read and its default stay on ONE line: boss-testing's
+    // machine_token_deposit_sh holds the forge's unit roster to it.
+    let user = var("BOSS_PROBE_USER").unwrap_or_else(|| "david".into());
+    let named = var("BOSS_PROBE_USER").is_some();
+    (user, named)
+}
+
 /// Where the twin's tools live, relative to the checkout the probe runs
 /// in: the sanctioned reader on PATH, and the port table it reads.
 const PROBE_BIN: &str = "infra/forge/probe-bin";
-const SOR_PORTS_ENV: &str = "infra/forge/sor-ports.env";
+pub(crate) const SOR_PORTS_ENV: &str = "infra/forge/sor-ports.env";
 
 impl Shell {
     /// The unattended door's shell, from the same environment the
@@ -2532,7 +2764,7 @@ impl Shell {
     /// this verb resolved, handed to the probe as `BOSS_JOBS_URL`.
     pub(crate) fn unattended(base: &str) -> Result<Self> {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-        let user = var("BOSS_PROBE_USER").unwrap_or_else(|| "david".into());
+        let (user, _) = probe_user();
         let dir = std::path::PathBuf::from(
             var("BOSS_PROBE_DIR").unwrap_or_else(|| "/home/david/boss".into()),
         );
@@ -2606,11 +2838,14 @@ impl Shell {
             .ok()
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| READER_ACTOR.into());
-        let ports = tree
-            .and_then(|t| std::fs::read_to_string(t.join(SOR_PORTS_ENV)).ok())
-            .map(|t| sor_ports_table(&t))
+        // One open of the file: the text and whose file it was, so the
+        // door judges the owner of what was READ (review 991bb439, N3).
+        let (ports, ports_from) = tree
+            .and_then(|t| crate::probe_reader::read_ports_file(&t.join(SOR_PORTS_ENV)))
+            .map(|(text, source)| (sor_ports_table(&text), Some(source)))
             .unwrap_or_default();
         self.reader = Some(crate::probe_reader::Config {
+            ports_from,
             credential: std::env::var_os(crate::probe_reader::CREDENTIAL_ENV)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(crate::probe_reader::DEFAULT_CREDENTIAL)),
@@ -2789,17 +3024,19 @@ pub(crate) async fn run_unattended(car_id: &str, now: chrono::DateTime<chrono::U
         std::process::exit(REFUSED_EXIT);
     }
 
-    let shell = Shell::unattended(&base)?.with_car_instant(car_merge_ref(&car));
     println!("boss prove: {short}  $ {probe}");
     // THE TREE THIS PROBE READS, observed where it will run — the
     // converged checkout. Here the standing is nearly always
     // `unreadable`, because the forge's clone need not carry a
     // remote-tracking ref, and `tree_head` is the fact that matters:
     // production's own revision at the moment the claim was judged.
-    let tree = probe_tree(&shell);
+    // Observed only once the account has answered: `unverified` is its
+    // refusal, and then nothing was run in that directory at all.
+    let (shell, tree, unverified) =
+        unattended_ground(Shell::unattended(&base)?, car_merge_ref(&car));
     let at = now.to_rfc3339();
     let here = host();
-    let o = match execute_with(&probe, &shell) {
+    let o = match unverified.map_or_else(|| execute_with(&probe, &shell), not_run) {
         Ok(o) => o,
         // The host refused the probe's environment: recorded on the car
         // as a NOT YET naming the host and the cause, so the hourly
@@ -5929,6 +6166,320 @@ ugrep: warning: complete\": No such file or directory\n";
         );
     }
 
+    /// A shell at the hand door whose reader door would open on
+    /// `credential`, whose port table is `ports` and nothing from the
+    /// tree's, and whose probe finds the shipped `boss-sor-read`.
+    fn reader_shell(base: &str, credential: &Path, ports: &str) -> Shell {
+        let root = boss_testing::repo_root();
+        let mut shell = Shell::here(None).with_probe_reader(Some(&root), base);
+        let reader = shell.reader.as_mut().unwrap();
+        reader.credential = credential.to_path_buf();
+        reader.ports = ports.to_string();
+        shell.env.retain(|(k, _)| k != "BOSS_SOR_PORTS");
+        shell.env.push(("BOSS_SOR_PORTS".into(), ports.into()));
+        shell
+    }
+
+    /// N5 (review 991bb439), THE WHOLE DOOR AGAINST A GATE THAT ENFORCES
+    /// — the reviewer's first measurement, in the tree. Every fixture
+    /// before this reported, and the estate's gates enforce at row C of
+    /// design b08725c2. The shipped `boss-sor-read`, through the door,
+    /// is answered by the real gate in ENFORCE and the handler is told
+    /// the probe reader; the same read with no door at all (no
+    /// credential on the host) is refused by that gate, which is what
+    /// makes the first leg a statement about the door.
+    #[test]
+    fn under_an_enforcing_gate_a_probe_reads_through_the_door_as_the_probe_reader() {
+        use crate::probe_reader::fixture;
+        let upstream = fixture::enforcing_with_reader(Some(fixture::VALUE));
+        let held = tempfile::tempdir().unwrap();
+        let credential = fixture::credential(held.path(), fixture::VALUE, 0o600);
+        let out = execute_with(
+            "boss-sor-read /api/yard/status",
+            &reader_shell(&upstream.base, &credential, ""),
+        )
+        .unwrap();
+        assert_eq!(out.exit, 0, "{out:?}");
+        assert!(out.stdout.contains(fixture::BODY), "{out:?}");
+        {
+            let seen = upstream.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "one read, through the door");
+            let user: Value = serde_json::from_slice(seen[0].2["x-boss-user"].as_bytes()).unwrap();
+            assert_eq!(user["id"], boss_core::roles::PROBE_READER_ACTOR);
+        }
+        // The control: no credential, so no door, and the gate refuses
+        // the LAN read `BOSS_SOR_USER` used to carry.
+        let absent = held.path().join("never-deposited.credential");
+        let out = execute_with(
+            "boss-sor-read /api/yard/status",
+            &reader_shell(&upstream.base, &absent, ""),
+        )
+        .unwrap();
+        assert_eq!(out.exit, 22, "{out:?}");
+        assert!(out.stderr.contains("401"), "{out:?}");
+        assert_eq!(upstream.seen.lock().unwrap().len(), 1);
+    }
+
+    /// N5, the reviewer's second measurement, at all four doors: under
+    /// ENFORCE a credential no reader slot holds is the host's refusal
+    /// at door-open — naming the 401 the gate gave the accepts read —
+    /// and nothing runs and nothing is read. Under a reporting gate the
+    /// same value is refused for a different reason (`none`), which is
+    /// the only leg the tree held until now.
+    #[test]
+    fn under_an_enforcing_gate_an_unaccepted_credential_is_refused_at_door_open() {
+        use crate::probe_reader::fixture;
+        let upstream = fixture::enforcing_with_reader(Some(fixture::VALUE));
+        let scratch = boss_testing::scratch::scratch_dir("prove-reader-door-enforce-refused");
+        let marker = scratch.join("the-probe-ran");
+        let probe = format!("touch '{}'", marker.display());
+        let held = tempfile::tempdir().unwrap();
+        let credential = fixture::credential(held.path(), "fixture-value-no-slot-holds", 0o600);
+        for (door, shell) in the_four_doors(&upstream.base, &credential) {
+            let refused = match execute_with(&probe, &shell) {
+                Ok(o) => panic!("{door}: the probe ran: {o:?}"),
+                Err(e) => e,
+            };
+            let said = refused
+                .downcast_ref::<EnvironmentRefusal>()
+                .unwrap_or_else(|| panic!("{door}: not a refusal: {refused:#}"))
+                .to_string();
+            assert!(said.contains("the probe did not run"), "{door}: {said}");
+            assert!(
+                said.contains("answered HTTP 401 to the accepts read"),
+                "{door}: {said}"
+            );
+            assert!(!said.contains("fixture-value-no-slot-holds"), "{door}");
+            assert!(!marker.exists(), "{door}: the probe ran anyway");
+        }
+        assert!(
+            upstream.seen.lock().unwrap().is_empty(),
+            "a read was served"
+        );
+    }
+
+    /// N1 (review 991bb439): A PORT NO GATE VOUCHES FOR, MID-PROBE, IS
+    /// THE HOST'S REFUSAL AND NOT THE CAR'S FAILURE. The base's gate
+    /// names the reader; a second service's does not (it mounts no
+    /// reader slot). The probe reads that second service. Measured
+    /// before this change: exit 1, `curl: (22) ... 502`, and the judge's
+    /// "A probe that fails is evidence AGAINST the claim" — a failed
+    /// proof on correct code.
+    ///
+    /// Now it is an [`EnvironmentRefusal`] whose words are true of it:
+    /// the probe RAN (its marker is there) and its result was discarded,
+    /// with the port and the gate's answer named. A probe that swallows
+    /// the failed read and prints its marker is refused the same way —
+    /// the strict side. The controls: the same probe against a second
+    /// service that DOES name the reader passes, and a probe that reads
+    /// only the base is untouched by the unvouched port's existence.
+    #[test]
+    fn a_port_no_gate_vouches_for_mid_probe_is_the_hosts_refusal_not_the_cars_failure() {
+        use crate::probe_reader::fixture;
+        let base = fixture::enforcing_with_reader(Some(fixture::VALUE));
+        let unmounted = fixture::enforcing_with_reader(None);
+        let mounted = fixture::enforcing_with_reader(Some(fixture::VALUE));
+        let held = tempfile::tempdir().unwrap();
+        let credential = fixture::credential(held.path(), fixture::VALUE, 0o600);
+        let scratch = boss_testing::scratch::scratch_dir("prove-reader-door-unvouched");
+        let marker = scratch.join("the-probe-ran");
+        let reads = format!(
+            "touch '{}'; boss-sor-read /api/events/tail | grep -q {} && echo EXPECTED",
+            marker.display(),
+            fixture::BODY
+        );
+        let swallows = "boss-sor-read /api/events/tail || true; echo EXPECTED";
+
+        let ports = format!("events={}", unmounted.port);
+        let shell = reader_shell(&base.base, &credential, &ports);
+        for probe in [reads.as_str(), swallows] {
+            let refused = match execute_with(probe, &shell) {
+                Ok(o) => panic!("judged a probe that ran without its read: {o:?}"),
+                Err(e) => e,
+            };
+            let said = refused.to_string();
+            let cause = environment_refusal(refused).expect("the host's refusal");
+            assert!(cause.starts_with(RAN_WITHOUT_A_READ), "{cause}");
+            assert!(
+                cause.contains(&format!("port {} answered HTTP 401", unmounted.port)),
+                "{cause}"
+            );
+            assert!(cause.contains("is not a judgement of the claim"), "{cause}");
+            assert!(!cause.contains(fixture::VALUE), "{cause}");
+            // The fixed sentences follow the cause: this one RAN.
+            assert!(said.contains("the probe's result was discarded"), "{said}");
+            assert!(!said.contains("did not run"), "{said}");
+            let why = environment_why("forge", &cause);
+            assert!(why.starts_with("NOT YET: the probe's result was discarded"));
+            assert!(!why.contains("did not run"), "{why}");
+            // And on the car it is a not-yet the hourly recheck retries.
+            let patch = refusal_patch(&json!({"metadata": {}}), probe, None, "forge", "t", &cause);
+            assert!(boss_jobs::car::attempt_said_not_yet(
+                &patch["proof_attempt"]
+            ));
+        }
+        assert!(marker.exists(), "the first probe never started");
+        assert!(
+            unmounted.seen.lock().unwrap().is_empty(),
+            "an unvouched service was read"
+        );
+        // A refusal made BEFORE the run still says so.
+        assert!(
+            EnvironmentRefusal("the temp filesystem is full".into())
+                .to_string()
+                .contains("the probe did not run")
+        );
+        assert!(environment_why("forge", "full").contains("the probe did not run"));
+
+        // Control one: a second service that names the reader is read.
+        let ports = format!("events={}", mounted.port);
+        let out = execute_with(&reads, &reader_shell(&base.base, &credential, &ports)).unwrap();
+        assert_eq!(out.exit, 0, "{out:?}");
+        assert!(out.stdout.contains("EXPECTED"), "{out:?}");
+        assert_eq!(mounted.seen.lock().unwrap().len(), 1);
+        // Control two: the unvouched port, listed and never read.
+        let ports = format!("events={}", unmounted.port);
+        let out = execute_with(
+            "boss-sor-read /api/yard/status > /dev/null && echo EXPECTED",
+            &reader_shell(&base.base, &credential, &ports),
+        )
+        .unwrap();
+        assert_eq!(out.exit, 0, "{out:?}");
+        assert_eq!(unserved_read_refusal(&[], 1), None);
+    }
+
+    /// N1 (review cd3f6a99): A LISTED SERVICE THAT IS SIMPLY DARK when the
+    /// probe first reads it is the probe's own failed read — judged, as
+    /// it was before the door — and not the host's refusal. A car that
+    /// took its own service down must read NOT PROVEN, not an hourly
+    /// NOT YET that says "not a verdict against the change".
+    #[test]
+    fn a_listed_service_that_is_dark_is_the_probes_own_failed_read() {
+        use crate::probe_reader::fixture;
+        let base = fixture::enforcing_with_reader(Some(fixture::VALUE));
+        let held = tempfile::tempdir().unwrap();
+        let credential = fixture::credential(held.path(), fixture::VALUE, 0o600);
+        let dark = fixture::dark_port();
+        let closed = dark.port;
+        let shell = reader_shell(&base.base, &credential, &format!("events={closed}"));
+        let probe = "boss-sor-read /api/events/tail && echo EXPECTED";
+        let out = execute_with(probe, &shell)
+            .unwrap_or_else(|e| panic!("a dark service was made the host's refusal: {e:#}"));
+        assert_eq!(out.exit, 22, "{out:?}");
+        assert!(out.stderr.contains("502"), "{out:?}");
+        let said = format!("{:?}", judge_probe(probe, &out, Some("EXPECTED")));
+        assert!(said.contains("AGAINST the claim"), "{said}");
+    }
+
+    /// N4 (review 991bb439), THE STRIP: a `BOSS_SOR_DOOR` standing in the
+    /// probe's environment from anywhere but this door never reaches a
+    /// probe. With no credential the probe is given NO door, and says
+    /// `none` — not a socket somebody else named, which the shipped
+    /// reader would send every read to. With a door open, the probe
+    /// sees this door's socket and not the planted name. (The mutant
+    /// that deleted the strip survived every test: each either opened a
+    /// door, which overwrites the name, or started with none set.)
+    #[test]
+    fn a_door_name_standing_in_the_environment_never_reaches_a_probe() {
+        use crate::probe_reader::fixture;
+        let held = tempfile::tempdir().unwrap();
+        let planted = held.path().join("somebody-elses.sock");
+        let absent = held.path().join("never-deposited.credential");
+        let plant = |mut shell: Shell| {
+            shell.env.push((
+                crate::probe_reader::DOOR_ENV.into(),
+                planted.display().to_string(),
+            ));
+            shell
+        };
+        for (door, shell) in the_four_doors("http://sor.invalid:7900", &absent) {
+            let o = execute_with(DOOR_REPORT, &plant(shell)).unwrap();
+            assert!(
+                o.stdout.contains("DOOR=none "),
+                "{door}: a planted door name reached a probe given no door: {o:?}"
+            );
+        }
+        let upstream = fixture::gated_with_reader(Some(fixture::VALUE));
+        let credential = fixture::credential(held.path(), fixture::VALUE, 0o600);
+        let o = execute_with(
+            DOOR_REPORT,
+            &plant(reader_shell(&upstream.base, &credential, "")),
+        )
+        .unwrap();
+        assert!(o.stdout.contains("DOOR=/"), "{o:?}");
+        assert!(!o.stdout.contains("somebody-elses.sock"), "{o:?}");
+    }
+
+    /// N4, THE RECIPIENT: the socket is handed to the door's user only
+    /// when this process is root. Pure, so it is held on every uid —
+    /// the mutant that dropped the condition is invisible to a root run,
+    /// where the condition is true anyway.
+    #[test]
+    fn the_reader_socket_is_handed_over_only_by_root() {
+        let named = Shell {
+            user: Some("boss-probe".into()),
+            ..Shell::here(None)
+        };
+        assert_eq!(door_recipient(&named, true), Some("boss-probe"));
+        assert_eq!(door_recipient(&named, false), None);
+        assert_eq!(door_recipient(&Shell::here(None), true), None);
+        assert_eq!(door_recipient(&Shell::here(None), false), None);
+    }
+
+    /// N4 by effect, where it can be seen — as anyone but root. A door
+    /// that names a user, run by a process that cannot drop to one,
+    /// proves as itself: the reader door opens for THIS process and the
+    /// probe reads through it. Handing the socket to the named user
+    /// instead is a refusal there (root's own uid could rename within
+    /// /tmp), so every hand run of the unattended shell would stop.
+    #[test]
+    fn a_door_that_names_a_user_still_proves_by_hand_as_anyone_but_root() {
+        use crate::probe_reader::fixture;
+        if running_as_root() {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "SKIPPED, NOT PASSED: prove::tests::\
+                 a_door_that_names_a_user_still_proves_by_hand_as_anyone_but_root — this \
+                 process is root, for which the hand-over is the real one. The gate's uid \
+                 exercises it; the_reader_socket_is_handed_over_only_by_root holds the rule here."
+            );
+            return;
+        }
+        let upstream = fixture::gated_with_reader(Some(fixture::VALUE));
+        let held = tempfile::tempdir().unwrap();
+        let credential = fixture::credential(held.path(), fixture::VALUE, 0o600);
+        let shell = Shell {
+            user: Some("root".into()),
+            ..reader_shell(&upstream.base, &credential, "")
+        };
+        let token = crate::door_env::NoTokenInReach::new();
+        let out = execute_gated("boss-sor-read /api/yard/status", &shell, token, None)
+            .expect("a hand run of a door that names a user");
+        assert_eq!(out.exit, 0, "{out:?}");
+        assert_eq!(upstream.seen.lock().unwrap().len(), 1);
+    }
+
+    /// N3 (review 991bb439): the door is told whose file its port list
+    /// came out of — the tree's own, read once — and a door with no
+    /// tree has no list and nothing to be told.
+    #[test]
+    fn the_reader_door_knows_whose_file_its_port_list_was() {
+        use std::os::unix::fs::MetadataExt;
+        let root = boss_testing::repo_root();
+        let list = root.join(SOR_PORTS_ENV);
+        let shell = Shell::here(None).with_probe_reader(Some(&root), "http://sor.invalid:7900");
+        let reader = shell.reader.unwrap();
+        let from = reader.ports_from.expect("the tree's list names its file");
+        assert_eq!(from.path, list);
+        assert_eq!(from.uid, std::fs::metadata(&list).unwrap().uid());
+        assert!(reader.ports.contains("jobs=7900"), "{}", reader.ports);
+        let none = Shell::here(None).with_probe_reader(None, "http://sor.invalid:7900");
+        let reader = none.reader.unwrap();
+        assert_eq!(reader.ports_from, None);
+        assert_eq!(reader.ports, "");
+    }
+
     /// F2 (review 0bd6a9c2). The 60 s cap belongs to an OPEN door. With
     /// none, each door keeps what it asked for — the hand door no
     /// timeout at all, as its help says — and when a door does shorten
@@ -6116,6 +6667,42 @@ ugrep: warning: complete\": No such file or directory\n";
             !shape_warnings(fixed).any(|w| w.contains("COUNTS A PAGE")),
             "{:?}",
             shape_warnings(fixed).collect::<Vec<_>>()
+        );
+    }
+
+    /// ONE FACT PER CALLER PER PROCESS, SAID AT THE DOOR (ce72aea9). Car
+    /// 3b8d02f6's recorded probe is the live instance: PROVEN on a count
+    /// of logged would-refuse facts, the live tally never read.
+    #[test]
+    fn a_probe_that_clears_a_caller_from_the_gate_log_alone_is_warned_about() {
+        let log = r#"n=$(boss-sor-read "/api/events/gate-window?gate=machine-gate&hours=$hours" | jq -r --arg cut "$cut" 'if (.log_error == null) and ((.log.dirty | type) == "array") then [.log.dirty[] | select(.kind == "machine_gate.would_refuse" and .payload.service == "jobs" and .payload.key.user == "automation:estate-observer" and .at > $cut)] | length else empty end')
+case ${n:-empty} in empty|*[!0-9]*) echo 'not yet: the machine-gate window could not be read'; exit 75;; esac
+"#;
+        let w: Vec<String> = shape_warnings(log).collect();
+        let said = w
+            .iter()
+            .find(|w| w.contains("FROM THE GATE LOG ALONE"))
+            .unwrap_or_else(|| panic!("{w:?}"));
+        assert!(said.contains("machine_gate.would_refuse"), "{said}");
+        assert!(
+            said.contains(boss_jobs::probe::GATE_LOG_ALONE_EVIDENCE),
+            "{said}"
+        );
+        // It says which way it fails, and names the reading that repairs it.
+        assert!(said.contains("CAN FAIL OPEN"), "{said}");
+        assert!(said.contains(".live[].snapshot.rows"), "{said}");
+        // The rewrite it names — the same window's live rows read too —
+        // is not warned about in turn.
+        let fixed = format!(
+            "{log}{}",
+            r#"live=$(boss-sor-read "/api/events/gate-window?gate=machine-gate&hours=$hours" | jq -r '([ .live[]? | select(.service == "jobs") ] | first) as $j | if $j == null or (($j.snapshot.rows | type) != "array") or (($j.snapshot.overflow // 0) != 0) then "unreadable" else ([ $j.snapshot.rows[] | select(.user == "automation:estate-observer" and .presented == "none") ] | length | tostring) end')
+case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally could not be read whole'; exit 75;; esac
+"#
+        );
+        assert!(
+            !shape_warnings(&fixed).any(|w| w.contains("FROM THE GATE LOG ALONE")),
+            "{:?}",
+            shape_warnings(&fixed).collect::<Vec<_>>()
         );
     }
 
@@ -6553,6 +7140,396 @@ ugrep: warning: complete\": No such file or directory\n";
             assert!(message.contains(cause), "{message}");
             assert!(message.contains("repair the named cause"), "{message}");
             assert!(!message.contains("free the"), "{message}");
+        }
+    }
+
+    /// THE VERIFIED ACCOUNT, OR NO PROBE (decision c98c79aa, `fallback`).
+    /// On a host that names the marker, a door that drops to a user runs
+    /// the probe only when the marker names that user. Absent, or naming
+    /// anyone else: nothing runs — as that user or as anyone — and the
+    /// error is the environment's refusal, so the car records did-not-run
+    /// and is never read as exit 1, "ran, not proven".
+    #[test]
+    fn a_probe_whose_account_is_not_verified_this_tick_does_not_run() {
+        let dir = boss_testing::scratch::scratch_dir("prove-account-not-verified");
+        let ran = dir.join("ran");
+        let probe = format!("touch '{}'; echo claim:ok", ran.display());
+        // `root` so the verified leg can run wherever this test does: as
+        // root it drops to root, and as anyone else it drops to nobody.
+        let shell = Shell {
+            user: Some("root".into()),
+            ..Shell::here(None)
+        };
+        let token = crate::door_env::NoTokenInReach::new;
+
+        let marker = dir.join("probe-account.verified");
+        let e =
+            execute_gated(&probe, &shell, token(), Some(&marker)).expect_err("no marker, no run");
+        assert!(!ran.exists(), "the probe ran with no verified account");
+        let said = format!("{e:#}");
+        assert!(environment_refusal(e).is_ok(), "{said}");
+        assert!(said.contains("did not run"), "{said}");
+        assert!(said.contains("is not verified on this host"), "{said}");
+        assert!(said.contains("is absent"), "{said}");
+
+        // A marker for somebody else is not this user's.
+        std::fs::write(&marker, "david\n").unwrap();
+        let e = execute_gated(&probe, &shell, token(), Some(&marker))
+            .expect_err("another account's marker, no run");
+        assert!(!ran.exists(), "the probe ran on another account's marker");
+        assert!(format!("{e:#}").contains("names \"david\""), "{e:#}");
+        assert!(environment_refusal(e).is_ok());
+
+        // Verified this tick: it runs.
+        std::fs::write(&marker, "root\n").unwrap();
+        let o = execute_gated(&probe, &shell, token(), Some(&marker)).expect("verified, runs");
+        assert_eq!(o.exit, 0, "{o:?}");
+        assert!(ran.exists());
+
+        // A host that names no marker has not converged onto the rule,
+        // and the hand door drops to nobody: both run as before.
+        assert!(execute_gated("true", &shell, token(), None).is_ok());
+        assert!(
+            execute_gated("true", &Shell::here(None), token(), Some(&dir.join("none"))).is_ok()
+        );
+    }
+
+    /// THE ACCOUNT IS ASKED BEFORE THE READER DOOR OPENS. On a host that
+    /// holds a reader credential AND names the marker, an unverified
+    /// account gets no door: no accepts read reaches any gate, no socket
+    /// is made for it, and the refusal is the account's. The control is
+    /// the same shell with the account verified — then the door IS tried,
+    /// the upstream sees its accepts read, and (this upstream answering
+    /// nonsense) the refusal is the door's. So the first leg's silence is
+    /// the order, not a door that never asks.
+    #[test]
+    fn an_unverified_account_opens_no_reader_door_and_asks_no_gate() {
+        use crate::probe_reader::fixture;
+        let upstream = fixture::serve(fixture::recorder);
+        let dir = boss_testing::scratch::scratch_dir("prove-account-before-door");
+        let held = tempfile::tempdir().unwrap();
+        let ran = dir.join("ran");
+        let probe = format!("touch '{}'", ran.display());
+        let shell = Shell {
+            user: Some("root".into()),
+            reader: Some(crate::probe_reader::Config {
+                credential: fixture::credential(held.path(), fixture::VALUE, 0o600),
+                base: upstream.base.clone(),
+                ports: String::new(),
+                ports_from: None,
+            }),
+            ..Shell::here(None)
+        };
+        let token = crate::door_env::NoTokenInReach::new;
+        let marker = dir.join("probe-account.verified");
+
+        let e = execute_gated(&probe, &shell, token(), Some(&marker))
+            .expect_err("unverified: nothing runs");
+        let said = format!("{e:#}");
+        assert!(said.contains("is not verified on this host"), "{said}");
+        assert!(environment_refusal(e).is_ok(), "{said}");
+        assert!(
+            upstream.seen.lock().unwrap().is_empty(),
+            "a gate was asked about a reader credential for an unverified account"
+        );
+        assert!(!ran.exists());
+
+        std::fs::write(&marker, "root\n").unwrap();
+        let e = execute_gated(&probe, &shell, token(), Some(&marker))
+            .expect_err("this upstream is no gate, so the door refuses");
+        let said = format!("{e:#}");
+        assert!(!said.contains("is not verified on this host"), "{said}");
+        assert!(environment_refusal(e).is_ok(), "{said}");
+        // The door was TRIED. As anyone but root it gets as far as asking
+        // the gate, once. As root it is refused one step earlier — the
+        // door will not make a socket directory in a /tmp the user it
+        // drops to (here root itself) could rename — which is the door's
+        // own refusal and still proves it was reached.
+        let asked = upstream.seen.lock().unwrap().len();
+        assert!(
+            asked == 1 || (asked == 0 && said.contains("the reader door's directory")),
+            "verified, the reader door is tried (gate asked {asked} time(s)): {said}"
+        );
+        assert!(!ran.exists());
+    }
+
+    /// The name the forge's drop-in sets for the marker, read off the one
+    /// line of `infra/forge/probe-account.sh` that writes it.
+    fn marker_name_the_drop_in_sets() -> (String, String) {
+        let script =
+            std::fs::read_to_string(boss_testing::repo_root().join("infra/forge/probe-account.sh"))
+                .expect("infra/forge/probe-account.sh");
+        let names: Vec<String> = script
+            .lines()
+            .filter_map(|l| {
+                l.trim()
+                    .strip_prefix("echo \"Environment=")?
+                    .strip_suffix("=$marker\"")
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            names.len(),
+            1,
+            "probe-account.sh must write exactly one drop-in line whose value is the marker: \
+             {names:?}"
+        );
+        (names[0].clone(), script)
+    }
+
+    /// THE MARKER'S NAME LIVES TWICE AND IS HELD EQUAL (CLAUDE.md §9a;
+    /// backlog dda26693, review acab446c F1). The door reads the marker's
+    /// path from one environment name; the forge's drop-in sets it, the
+    /// tick's verify writes the file it names, and the converge asks the
+    /// installed binary whether it knows the name before it trusts the
+    /// stop. Respell it on either side and nothing errors: the door finds
+    /// no name, takes the host for one that has not converged onto the
+    /// rule, and hands an unverified account to runuser.
+    #[test]
+    fn the_marker_name_is_the_one_the_forge_drop_in_sets() {
+        let (name, script) = marker_name_the_drop_in_sets();
+        assert_eq!(
+            name, PROBE_VERIFIED_FILE_ENV,
+            "the drop-in sets {name} and the door reads {PROBE_VERIFIED_FILE_ENV}: with two \
+             names the forge stops refusing an unverified account, silently"
+        );
+        // Every spelling in the script is this one: the drop-in line, the
+        // tick's own read, and the question put to the installed binary.
+        let stem = "BOSS_PROBE_VERIFIED_";
+        let spelled: Vec<&str> = script
+            .match_indices(stem)
+            .map(|(i, _)| {
+                let rest = &script[i..];
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_uppercase() || c == '_'))
+                    .unwrap_or(rest.len());
+                &rest[..end]
+            })
+            .collect();
+        assert!(
+            spelled.len() >= 3,
+            "the script no longer names the marker: {spelled:?}"
+        );
+        for s in &spelled {
+            assert_eq!(*s, PROBE_VERIFIED_FILE_ENV, "probe-account.sh spells {s}");
+        }
+        for line in [
+            format!("local marker=\"${{{PROBE_VERIFIED_FILE_ENV}:-}}\""),
+            format!("grep -aq '{PROBE_VERIFIED_FILE_ENV}' \"$cli\""),
+        ] {
+            assert!(
+                script.contains(&line),
+                "probe-account.sh must carry `{line}`"
+            );
+        }
+    }
+
+    /// AND THE DOOR READS IT FROM THE ENVIRONMENT (review acab446c F1,
+    /// mutant X1). Both tests above hand the marker to `execute_gated`, so
+    /// the one line that reads this process's environment was held by
+    /// nothing: with `None` handed over instead, 132 tests stayed green and
+    /// the forge would stop refusing. Proven by effect, through the door
+    /// every caller uses: this binary re-run with the name THE SCRIPT sets
+    /// (not this crate's constant) pointing at a marker that is absent,
+    /// then at one that names the user, then with no name at all. The
+    /// second leg is the control — the refusal of the first is the
+    /// marker's, not a door that never runs.
+    #[test]
+    fn the_door_reads_the_marker_from_the_name_the_drop_in_sets() {
+        const INNER: &str = "BOSS_PROVE_MARKER_WIRE_INNER";
+        if let Ok(ran) = std::env::var(INNER) {
+            // `root`, as above: it runs wherever this test does.
+            let shell = Shell {
+                user: Some("root".into()),
+                ..Shell::here(None)
+            };
+            match execute_with(&format!("touch '{ran}'"), &shell) {
+                Ok(o) => println!("WIRE=ran exit={}", o.exit),
+                Err(e) => {
+                    let said = format!("{e:#}");
+                    let kind = if environment_refusal(e).is_ok() {
+                        "refused"
+                    } else {
+                        "error"
+                    };
+                    println!("WIRE={kind} {said}");
+                }
+            }
+            return;
+        }
+        let (name, _) = marker_name_the_drop_in_sets();
+        let dir = boss_testing::scratch::scratch_dir("prove-marker-wire");
+        let absent = dir.join("absent.verified");
+        let verified = dir.join("root.verified");
+        std::fs::write(&verified, "root\n").unwrap();
+        let leg = |label: &str, marker: Option<&Path>| {
+            let ran = dir.join(format!("ran-{label}"));
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args([
+                "--exact",
+                "prove::tests::the_door_reads_the_marker_from_the_name_the_drop_in_sets",
+                "--nocapture",
+            ])
+            .env(INNER, &ran)
+            .env_remove(PROBE_VERIFIED_FILE_ENV)
+            .env_remove(&name);
+            if let Some(m) = marker {
+                cmd.env(&name, m);
+            }
+            let out = cmd.output().unwrap();
+            let printed = String::from_utf8_lossy(&out.stdout).to_string();
+            assert!(
+                out.status.success(),
+                "{label}: {printed}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            (printed, ran.exists())
+        };
+
+        let (printed, ran) = leg("unverified", Some(&absent));
+        assert!(
+            printed.contains("WIRE=refused"),
+            "a host that names the marker and has none must refuse: {printed}"
+        );
+        assert!(
+            printed.contains("is not verified on this host"),
+            "{printed}"
+        );
+        assert!(printed.contains("is absent"), "{printed}");
+        assert!(!ran, "the probe ran with no verified account: {printed}");
+
+        let (printed, ran) = leg("verified", Some(&verified));
+        assert!(printed.contains("WIRE=ran exit=0"), "{printed}");
+        assert!(ran, "verified this tick, the probe runs: {printed}");
+
+        let (printed, ran) = leg("unconverged", None);
+        assert!(printed.contains("WIRE=ran exit=0"), "{printed}");
+        assert!(ran, "a host that names no marker runs as before: {printed}");
+    }
+
+    /// THE UNATTENDED DOOR ASKS THE ACCOUNT BEFORE IT RUNS ANYTHING IN THE
+    /// PROBE'S DIRECTORY (backlog dda26693, review acab446c F4). The door
+    /// used to resolve the car's instant (root's own git in the view) and
+    /// observe the tree (`pwd`, `id` and `git` as the named user) and only
+    /// then reach the account's refusal, so an unverified account still
+    /// had three programs run as it and a refused view was still opened.
+    ///
+    /// By effect, not by reading the order: this binary re-run with `git`,
+    /// `id`, `pwd` and `runuser` replaced on PATH by recorders that write
+    /// one line each time they are started and then run the real program.
+    /// With the marker the drop-in names absent, the record must not
+    /// exist. The second leg is the control — verified, the same call
+    /// starts them, so an empty record in the first is the refusal's and
+    /// not a recorder that never fires. The name set is the one THE SCRIPT
+    /// writes, so the read of the environment is held here too.
+    #[test]
+    fn the_unattended_door_runs_nothing_for_an_unverified_account() {
+        const INNER: &str = "BOSS_PROVE_GROUND_INNER";
+        if std::env::var(INNER).is_ok() {
+            // `root`, as above: it runs wherever this test does.
+            let shell = Shell {
+                user: Some("root".into()),
+                ..Shell::here(Some(&std::env::current_dir().unwrap()))
+            };
+            let (shell, tree, refused) = unattended_ground(shell, Some("0123456789ab"));
+            match refused {
+                Some(cause) => println!("GROUND=refused {cause}"),
+                None => println!(
+                    "GROUND=asked merge_ref={} unreadable={}",
+                    shell.env.iter().any(|(k, _)| k == CAR_MERGE_REF_VAR),
+                    tree.unreadable.len()
+                ),
+            }
+            return;
+        }
+        let (name, _) = marker_name_the_drop_in_sets();
+        let dir = boss_testing::scratch::scratch_dir("prove-ground-account-first");
+        let bin = dir.join("bin");
+        let view = dir.join("view");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&view).unwrap();
+        for program in ["git", "id", "pwd", "runuser"] {
+            boss_testing::scratch::write_exec(
+                &bin.join(program),
+                "#!/bin/sh\n\
+                 me=${0##*/}\n\
+                 printf '%s %s\\n' \"$me\" \"$*\" >> \"$GROUND_STARTED\"\n\
+                 PATH=$GROUND_REAL_PATH exec \"$me\" \"$@\"\n",
+            );
+        }
+        let real_path = std::env::var("PATH").unwrap();
+        let absent = dir.join("absent.verified");
+        let verified = dir.join("root.verified");
+        std::fs::write(&verified, "root\n").unwrap();
+        let leg = |label: &str, marker: &Path| {
+            let started = dir.join(format!("started-{label}"));
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "prove::tests::the_unattended_door_runs_nothing_for_an_unverified_account",
+                    "--nocapture",
+                ])
+                .current_dir(&view)
+                .env(INNER, "1")
+                .env("GROUND_STARTED", &started)
+                .env("GROUND_REAL_PATH", &real_path)
+                .env("PATH", format!("{}:{real_path}", bin.display()))
+                .env_remove(PROBE_VERIFIED_FILE_ENV)
+                .env(&name, marker)
+                .output()
+                .unwrap();
+            let printed = String::from_utf8_lossy(&out.stdout).to_string();
+            assert!(
+                out.status.success(),
+                "{label}: {printed}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            (printed, std::fs::read_to_string(&started).ok())
+        };
+
+        let (printed, started) = leg("unverified", &absent);
+        assert!(printed.contains("GROUND=refused"), "{printed}");
+        assert!(
+            printed.contains("is not verified on this host"),
+            "{printed}"
+        );
+        assert_eq!(
+            started, None,
+            "programs were started in the probe's directory for an unverified account: {printed}"
+        );
+
+        let (printed, started) = leg("verified", &verified);
+        assert!(printed.contains("GROUND=asked merge_ref=true"), "{printed}");
+        let started = started.expect("verified, the door reads the instant and the tree");
+        // As root each read goes through `runuser -u root -- <program>`,
+        // so the program is a word of the line, not always its first.
+        for program in ["git", "id", "pwd"] {
+            assert!(
+                started
+                    .lines()
+                    .any(|l| l.split_whitespace().any(|w| w == program)),
+                "the control leg never started `{program}`, so the recorders prove nothing: \
+                 {started}"
+            );
+        }
+
+        // And `run_unattended` reaches the probe's directory only through
+        // that one function: neither half is spelled at the door itself.
+        let prod = include_str!("prove.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or("");
+        let door = prod
+            .split("pub(crate) async fn run_unattended(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("run_unattended");
+        assert!(door.contains("unattended_ground("), "{door}");
+        for early in [".with_car_instant(", "probe_tree("] {
+            assert!(
+                !door.contains(early),
+                "run_unattended calls `{early}` itself, ahead of the account's answer"
+            );
         }
     }
 

@@ -169,4 +169,69 @@ def lh_physical_room($opct; $mpct):
           else ([lh_limit($opct) - (.max - .available - .reserved), .available + .reserved - $floor] | min)
                | if . < 0 then 0 else . end end
     end;
+# What read-only DISCOVERY asks of its inputs before it may name an
+# argument (a size, a replica): exact non-negative integers jq holds
+# without rounding, and identities that resolve ONE way. Written for the
+# largest-fit read (backlog 53c8cb72) and moved here, unchanged, when the
+# decisive-move read needed the same guard (design ada8f698): $vol the
+# volume name, $V the volume, $R the replica items, $N the node items,
+# $O and $M the two settings values. Any error inside is CANNOT ANSWER
+# to the caller: no evidence is not a proposal.
+def lh_uint:
+    (type == "number" or (type == "string" and test("^[0-9]+$")))
+    and (try (tonumber | . >= 0 and . <= 9007199254740991 and . == floor) catch false);
+def lh_safe: type == "number" and . >= 0 and . <= 9007199254740991 and . == floor;
+def lh_exact_inputs($vol; $V; $R; $N; $O; $M):
+    ($O | lh_uint) and ($M | lh_uint)
+    and ($M | tonumber <= 100)
+    and ($V.spec.size | lh_uint)
+    and all($R[]; (.spec.volumeName | type == "string"))
+    and all($R[] | select(.spec.volumeName == $vol);
+        (.spec.nodeID | type == "string")
+        and (.spec.nodeID == "" or (.spec.diskID | type == "string" and length > 0)))
+    and all($N[]; (.status.diskStatus | type == "object"))
+    and all($N[]; . as $n
+        | all(.status.diskStatus | to_entries[]; . as $D
+            | all([$D.value.storageMaximum, $D.value.storageScheduled,
+                $D.value.storageAvailable, $n.spec.disks[$D.key].storageReserved][]; lh_uint)))
+    and ([ $N[].status.diskStatus[] | .diskUUID ]
+        | all(.[]; type == "string" and length > 0)
+          and length == (unique | length))
+    and all($R[] | select(.spec.volumeName == $vol and .spec.nodeID != "");
+        . as $r | [$N[] | select(.metadata.name == $r.spec.nodeID)
+            | .status.diskStatus[] | select(.diskUUID == $r.spec.diskID)] | length == 1)
+    and (lh_disks($N) | all(.[];
+        all([.max, .reserved, .scheduled, .available][]; lh_uint)
+        and .reserved <= .max and .available <= .max
+        and ((.max - .reserved) * ($O | tonumber) | lh_safe)
+        and (.max * ($M | tonumber) | lh_safe)));
 '
+
+# The fewest replicas a retirement may leave (retire-volume-replica.sh,
+# which reads it as its default and lets BOSS_RETIRE_FLOOR declare another).
+# The decisive-move read holds a volume against the same number: above it,
+# retiring the replica on the short disk is ALSO admissible by count, and
+# which of the two is a person's choice (design ada8f698, option A).
+LONGHORN_RETIRE_FLOOR=3
+
+# lh_one_object <file> <Kind> <name> <namespace, or ""> — the file is ONE
+# JSON document, an object of that kind and identity. lh_whole_list <file>
+# <Kind> <namespace> — ONE complete list (no continue token) of uniquely
+# named objects of that kind there. Discovery's read guards, one copy; the
+# caller has sourced infra/lib/jq.sh (jq_doc_file).
+lh_one_object() {
+    jq_doc_file "$1" && jq -e -s --arg kind "$2" --arg name "$3" --arg ns "$4" '
+        length == 1 and (.[0] | type == "object"
+            and .kind == $kind
+            and .metadata.name == $name
+            and ($ns == "" or .metadata.namespace == $ns))' "$1" >/dev/null 2>&1
+}
+lh_whole_list() {
+    jq_doc_file "$1" && jq -e -s --arg kind "$2" --arg ns "$3" '
+        length == 1 and (.[0] | type == "object" and (.items | type == "array")
+            and (.kind == "List" or .kind == ($kind + "List"))
+            and ((.metadata.continue // "") == "")
+            and all(.items[]; .kind == $kind and .metadata.namespace == $ns
+                and (.metadata.name | type == "string" and length > 0))
+            and ([.items[].metadata.name] | length == (unique | length)))' "$1" >/dev/null 2>&1
+}

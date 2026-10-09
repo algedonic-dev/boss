@@ -1,0 +1,12 @@
+{
+  "about": "READ-ONLY: what the tree root executes from on this host says about itself (infra/forge/root-tree.sh status; backlog a604a35b, decided by David on design-doc c98c79aa question root-tree and as position B on that packet). One fact a line: the commit each of the three names under /var/lib/boss/tree points at — `current` (the newest generation root accepted from the forge's own repository, which the ExecStart of every forge unit goes through except the cluster converge's and the disk sweep's), `previous` (what current was before its last move) and `good` (the newest generation whose own converge script completed a refresh, which forge-converge-launch falls back to; once it exists the forge CONVERGE never runs the checkout's copy again — and that is all it closes: root's ops runner still executes every verb, this one included, from the checkout, the cluster converge and the disk sweep still run there as its owner, and a merged revert of the car puts the old units back on purpose; crates/core/boss-testing/tests/no_unattended_unit_runs_from_a_home.rs is the roster) — the tree directory's mode and owner, how many generations stand, and where the forge's repository is with the uid that owns it. That last line is the one to read against the checkout owner's uid: the tree is fetched from that repository served as its owner, so a repository the checkout's owner can write is a repository that account can advance. It then prints the owner and mode of the compose file that repository path is derived from, and of its directory (an account that can write either chooses which repository root fetches), and the commit root's own store records as accepted (refs/boss/accepted, which makes the next fetch incremental). exit 0 when current names a whole generation and the source is found; 1 otherwise. Nothing on the host is changed. No arguments.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/root-tree.sh",
+    "status"
+  ],
+  "params": [],
+  "timeout": 30
+}

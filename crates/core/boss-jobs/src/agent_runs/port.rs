@@ -22,7 +22,7 @@ use boss_core::agent::{AgentCaps, AgentLoad, BudgetDecision};
 use chrono::{DateTime, Utc};
 
 use super::profile::{RunProfile, WorkProfile};
-use super::types::{AgentRun, NewAgentRun, RateCardRow, RunFilter};
+use super::types::{AgentRun, NewAgentRun, RateCardRow, RunFilter, TokenUsage};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentRunError {
@@ -57,10 +57,79 @@ pub fn admit(agent: Option<&RegisteredAgent>, load: AgentLoad) -> BudgetDecision
 /// already on the log — a retried report, not a failure — and the
 /// returned run is the one already held, so the caller sees the
 /// authoritative record either way.
+///
+/// `replaced: true` (always with `recorded: true`) means the row this
+/// `run_id` already held carried no count, and this record took its
+/// place — see [`replaces`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordedRun {
     pub recorded: bool,
+    pub replaced: bool,
     pub run: AgentRun,
+}
+
+/// The `detail` key a replacing record carries: what the row it
+/// replaced held. One spelling, because the recorder writes it and the
+/// rebuilder reads it to know the event supersedes a row rather than
+/// collapsing onto it (CLAUDE.md §9a).
+pub const REPLACED_KEY: &str = "replaced";
+
+/// May `new` take the place of the row `held` holds for the same run?
+///
+/// THE ONE EXCEPTION TO INSERT-ONCE, and why it is safe (backlog
+/// b5a3a174, measured 2026-10-08). A run's row was written the moment
+/// the run LANDED — by the landing rule, from whatever stood on the
+/// packet — and that was routinely before the agent's own report: 21 of
+/// that day's 56 rows held no count (19) or a metered zero at $0 (2),
+/// and each then refused the report that carried the run's real usage
+/// (10,703,524 tokens on run ca00400b; $16.50 on af8c0cd7). The cost
+/// record said $0 for a third of the day's work.
+///
+/// A row with no count prices nothing — it is a placeholder for a cost,
+/// not a cost — so the first record that DOES carry one replaces it.
+/// Exactly once, by construction rather than by a flag: only a row
+/// without a count is replaceable, and only a record with one replaces,
+/// so the row that results can never be replaced again. A row that
+/// holds a count still stands against every later report; correcting a
+/// recorded cost is backlog b4fd594e's decision, not this one.
+pub fn replaces(held: &AgentRun, new: &NewAgentRun) -> bool {
+    let counted = |t: &TokenUsage| t.total().is_some_and(|n| n > 0);
+    !counted(&held.run.tokens) && counted(&new.tokens)
+}
+
+/// `new` as it is recorded when it replaces `held`: itself, with what
+/// it replaced under [`REPLACED_KEY`] in its `detail` — so the row says
+/// it is a replacement, the event says so, and a rebuild replays it as
+/// one. `null` for the count or the price the old row did not have.
+pub fn replacement(held: &AgentRun, new: &NewAgentRun) -> NewAgentRun {
+    let mut detail = match &new.detail {
+        serde_json::Value::Object(m) => m.clone(),
+        serde_json::Value::Null => serde_json::Map::new(),
+        // `detail` is free-form: keep a non-object whole rather than
+        // drop it to make room for the key.
+        other => serde_json::Map::from_iter([("detail".to_string(), other.clone())]),
+    };
+    detail.insert(
+        REPLACED_KEY.to_string(),
+        serde_json::json!({
+            "recorded_at": held.recorded_at,
+            "finished_at": held.run.finished_at,
+            "outcome": held.run.outcome.as_str(),
+            "total_tokens": held.run.tokens.total(),
+            "usd_micros": held.usd_micros,
+            "why": "the row held no count, so it priced nothing; the first record carrying \
+                    one replaces it, once (backlog b5a3a174)",
+        }),
+    );
+    NewAgentRun {
+        detail: serde_json::Value::Object(detail),
+        ..new.clone()
+    }
+}
+
+/// Does a recorded run say it replaced a row? The rebuilder's question.
+pub fn is_replacement(run: &NewAgentRun) -> bool {
+    run.detail.get(REPLACED_KEY).is_some_and(|v| v.is_object())
 }
 
 #[async_trait]
@@ -76,7 +145,10 @@ pub trait AgentRunLog: Send + Sync {
     /// with a number that was still moving.
     ///
     /// Idempotent on `run_id`, so the reporter can retry a failed
-    /// report without inventing a second run.
+    /// report without inventing a second run. One exception: a held
+    /// row that carries no count is replaced by the first record that
+    /// carries one ([`replaces`]), and that replacement is a second
+    /// `agents.run.recorded` fact naming what it replaced.
     ///
     /// Judged against the actor's budget (backlog 7dd9f28c): the
     /// actor's registry caps against its priced spend in the hour

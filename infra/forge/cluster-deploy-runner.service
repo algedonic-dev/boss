@@ -12,6 +12,18 @@ Type=oneshot
 User=david
 # The build is a cached docker build (~minutes warm, ~an hour cold).
 TimeoutStartSec=90min
+# THE TOKEN'S HEADER FILE NEVER OUTLIVES A RUN (backlog df38075a, F1 of
+# review a92c0b94). The wrap pair and the converge's own posts present
+# the machine token, and the 0600 header file infra/lib/secret-header.sh
+# hands curl is made in $RUNTIME_DIRECTORY when a unit declares one:
+# /run/cluster-deploy-runner, tmpfs, 0700 and david's because User= is,
+# removed by systemd when this oneshot stops whatever ended it — the
+# 90-minute kill above and a SIGKILL included, neither of which runs the
+# reader's EXIT trap. Without it the file sat in the host's shared /tmp.
+# It is there through ExecStopPost and gone after it. RuntimeDirectory=
+# makes no mount namespace; the shape of estate-observe-host.service.
+RuntimeDirectory=cluster-deploy-runner
+RuntimeDirectoryMode=0700
 # Job visibility. The forge host has no /opt/boss — it runs from
 # this checkout, which is where the installed units already point.
 # The facts the run leaves for its own packet (build_s, push_s, roll_s,
@@ -25,6 +37,13 @@ Environment=BOSS_RUN_SUMMARY_FILE=/home/david/.boss-cluster-converge.summary.jso
 # the run step, rather than whatever the machine calls itself (backlog
 # 79f7678b, 2026-09-26).
 Environment=HOST_ID=forge
+# Where an alert this converge raises is KEPT when the record will not
+# take it (the tenant check's refusals, cluster-deploy-lib.sh through
+# alert-lib.sh), in this user's home and not alert-lib's default under
+# world-writable /var/tmp (backlog dda26693). This converge replays it
+# itself on every tick (replay_kept_alerts): the watchdog, root since
+# backlog a604a35b, keeps a spool of its own and replays only that.
+Environment=ALERT_SPOOL=/home/david/.boss-alert-spool
 # `-`: the packet is visibility, never a precondition. This is the loop
 # that deploys a fix to the SoR, so it cannot wait on the SoR — not while
 # it is dark (2026-09-05) and not while it answers 503 on a policy outage

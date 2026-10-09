@@ -68,7 +68,10 @@ pub mod seed;
 pub mod types;
 
 pub use automations::{AUTOMATION_DECLARED, AutomationActor, AutomationsSeedOutcome};
-pub use door::{LoginDoor, Resolution, UNRESOLVED_LOGIN, decide, resolve_login};
+pub use door::{
+    Judged, LoginDoor, ROW_ROLE_MODE_FILE, ROW_ROLE_MODE_FILE_ENV, Resolution, UNRESOLVED_LOGIN,
+    decide, judge, resolve_login,
+};
 pub use in_memory::InMemoryAgents;
 pub use port::{AGENT_DECLARED, AGENT_UPDATED, AgentsError, AgentsRegistry};
 #[cfg(feature = "postgres")]

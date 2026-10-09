@@ -857,6 +857,27 @@ tenant_check() {
     fi
     return 1
 }
+# replay_kept_alerts — file what this converge's alert door KEPT while
+#   the record would not take it (backlog a604a35b). The watchdog used to
+#   replay it: both units named one spool. The watchdog runs as root now
+#   and presents the machine token, so it replays only a spool nobody but
+#   root can write — never a file this account wrote — and the converge
+#   files its own, on every tick, here. Same subshell and the same actor
+#   as tenant_check_alert, for the same reasons; nothing kept is the
+#   ordinary case and costs one directory read. It cannot fail a tick.
+replay_kept_alerts() {
+    local CDL_ALERT_MT_HDR=""
+    if declare -F machine_token_header >/dev/null; then
+        machine_token_header CDL_ALERT_MT_HDR "${JOBS_API:-${BOSS_JOBS_URL:-}}" || CDL_ALERT_MT_HDR=""
+    fi
+    (
+        ALERT_ACTOR="automation:cluster-deploy-runner"
+        . "$(dirname "${BASH_SOURCE[0]}")/alert-lib.sh"
+        alert_replay
+    ) || echo "cluster-deploy-runner: kept alerts were not all filed ($?) — they stay kept for the next tick" >&2
+    return 0
+}
+
 # tenant_check_alert TITLE DETAIL — the refusal as a PACKET for the
 #   platform owner, through the door the watchdog files with
 #   (alert-lib.sh: filed when the API answers, KEPT in the spool and

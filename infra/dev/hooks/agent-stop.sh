@@ -6,7 +6,8 @@
 # at start) is not reported — there is no run to report on.
 #
 # The summary is the Agent tool's own result — `tool_response.content`
-# text blocks, joined — copied, not retyped; the tokens are the
+# text blocks, joined — copied, not retyped, and a response with no text
+# is not reported at all (below); the tokens are the
 # response's `usage` split when it carries one (the only shape the rate
 # card prices). `--report` is car 3's half of the run
 # (feat/agent-controls-station-per-role-model-and-budgeted-claim); on a
@@ -28,7 +29,21 @@ summary=$(printf '%s' "$payload" | jq -r '
   | if type == "string" then .
     elif type == "object" then ([.content[]? | select(.type == "text") | .text] | join("\n"))
     else "" end' 2>/dev/null || true)
-[ -n "$summary" ] || summary="(the Agent tool returned no text)"
+# NO TEXT IS NOT A HANDBACK (backlog b5a3a174, cause named by ec97dbeb).
+# A BACKGROUND Agent call returns at launch — a status and an agent id,
+# no text, no usage — and this hook used to report that as the run's
+# handback under the summary "(the Agent tool returned no text)". The
+# pair it put on the packet, a minute into the run, is what the run then
+# LANDED on: `reported` completed with the placeholder as its summary,
+# an agent_runs row holding no count, and the agent's own report — the
+# real usage — refused on that row. 21 of the 56 runs of 2026-10-08.
+# So the hook reports what the tool handed back, or nothing. The run it
+# remembered stays remembered; the agent's own `boss dispatch --report`
+# is the report, and a run that never sends one ends `unreported`.
+case "$summary" in
+  *[![:space:]]*) ;;
+  *) bail "call $tool_use handed back no text, so run $run is not reported from here — a launch is not a handback; the agent's own boss dispatch --report is" ;;
+esac
 tokens=$(printf '%s' "$payload" | jq -r '
   .tool_response.usage
   | select(type == "object")

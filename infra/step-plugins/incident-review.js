@@ -38,6 +38,20 @@
 // learn the kind (validate_metadata is permissive for kinds it does not
 // know).
 //
+// THE REVIEW COMPLETES ON THE REVIEWER'S PASSKEY (item 570c66e9,
+// 2026-10-07: "human-only step completion should use passkey for
+// enforcement"). The incident `review` step is `human_only` and names no
+// sign-off role, so the jobs API completes it only on a verifying ticket
+// from the person sending the completion — and this surface's completion
+// was one bare PUT. It now draws what the passkey signs (the step's title
+// and every metadata key, as the bytes they are), completes bare, and
+// answers the server's 422 {required: "presence"} with ONE tap on the
+// step as drawn and ONE retry. The ceremony itself is not here: it is
+// passkey-ceremony.js beside this file, the one copy sign-off.js uses
+// too, loaded by `withPasskey` at the foot before the mount is
+// registered. This surface records no metadata key of its own, so it
+// writes nothing before the tap: what is drawn is what is signed.
+//
 // Plugin contract: window.__boss_register_step_plugin(kind, mount).
 // Host calls mount(container, props) with { step, jobId, onUpdate }.
 
@@ -248,12 +262,86 @@
     let loadError = null;
     let saving = false;
     let saveError = null;
+    // What the passkey signs, as last drawn: {title, metadata} COPIED at
+    // the render, so a later change to the step this mount was handed is
+    // not mistaken for what is on screen. null while no block is drawn.
+    let onScreen = null;
+    // Set when the server asked a passkey of a step that declares neither
+    // human_only nor presence (a kind's floor): the block is drawn then.
+    let revealed = false;
+    // Set by the cleanup. An unmounted surface shows nothing, so a
+    // ceremony still in flight refuses, and a prompt still up is aborted.
+    let disposed = false;
+    const unmounted = new AbortController();
+    let overflowObservers = [];
 
     const root = document.createElement('div');
     root.className = 'step-surface step-incident-review';
     container.appendChild(root);
 
     const terminal = step.status === 'completed' || step.status === 'skipped';
+
+    // The declaration, read the way the server reads it (boss-jobs
+    // human_only::declared): the bool `true` or the string "true".
+    const humanOnly = () => {
+      const v = (step.metadata || {}).human_only;
+      return v === true || (typeof v === 'string' && v.trim().toLowerCase() === 'true');
+    };
+    const signedVisible = () =>
+      !disposed && !terminal && (humanOnly() || step.assurance_required === 'presence' || revealed);
+
+    // WHAT THE PASSKEY SIGNS, DRAWN (design f623e425 D3): the title and
+    // EVERY metadata key the shape hash covers, each as the bytes it is
+    // (P.signedText), a box that scrolls saying so (6093cf13). Derived
+    // from the step's own keys, never an allow-list, so it cannot fall
+    // behind the hash.
+    function signedBlock() {
+      overflowObservers.forEach((o) => o.disconnect());
+      overflowObservers = [];
+      onScreen = null;
+      if (!signedVisible()) return null;
+      const md = step.metadata || {};
+      onScreen = { title: step.title, metadata: JSON.parse(JSON.stringify(md)) };
+      const rows = Object.keys(md)
+        .sort()
+        .map((k) => {
+          const text = P.signedText(md[k]);
+          const pre = h('pre', { className: 'step-signed-value' }, text);
+          const note = h('div', { className: 'step-signed-overflow' });
+          const check = () => {
+            const scrolls =
+              pre.scrollHeight > pre.clientHeight + 1 || pre.scrollWidth > pre.clientWidth + 1;
+            note.textContent = scrolls ? P.scrollNote(text) : '';
+          };
+          if (typeof ResizeObserver === 'function') {
+            const o = new ResizeObserver(check);
+            o.observe(pre);
+            overflowObservers.push(o);
+          }
+          // Measured once it is laid out.
+          Promise.resolve().then(check);
+          return h(
+            'div',
+            { className: 'step-signed-row' },
+            h('div', { className: 'step-signed-key' }, P.signedText(k)),
+            pre,
+            note,
+          );
+        });
+      return h(
+        'section',
+        { className: 'step-signed-keys', 'aria-label': 'What your passkey signs' },
+        h('div', { className: 'step-signed-keys-head' }, 'What your passkey signs'),
+        h(
+          'p',
+          { className: 'step-signed-keys-note' },
+          'Completing this review takes your passkey. It signs the step ',
+          h('strong', { className: 'step-signed-title' }, P.signedText(step.title)),
+          ' and every key below, exactly as shown. Text in double quotes has each character you could not otherwise see or tell apart written as an escape.',
+        ),
+        rows,
+      );
+    }
 
     function findings() {
       if (loadError) {
@@ -340,11 +428,77 @@
     }
 
     function render() {
-      root.replaceChildren(...[...findings(), actions()].filter(Boolean));
+      root.replaceChildren(...[...findings(), signedBlock(), actions()].filter(Boolean));
     }
+
+    // The ceremony over the step AS DRAWN (passkey-ceremony.js). A key
+    // the passkey would sign that the block did not draw — the step this
+    // mount holds changed after the draw, or the block was not up —
+    // refuses before any request; the block is drawn as the step now
+    // stands, and the reviewer reads it and presses again.
+    //
+    // THE BEGIN NAMES WHAT THIS SURFACE SHOWED, and it is not a write:
+    // assert/begin stores nothing on the step, it only compares, and the
+    // gateway refuses (412) a shown step that is not the step as it
+    // stands. So the lost update step-plugins-own-their-keys refuses
+    // cannot happen here; the snapshot is named for what it is, as
+    // sign-off.js names it.
+    function passkeyTicket() {
+      const renderedMetadata = step.metadata || {};
+      return P.ticket({
+        jobId,
+        stepId: step.id,
+        shown: { title: step.title, metadata: renderedMetadata },
+        onScreen: () => onScreen,
+        isGone: () => disposed,
+        signal: unmounted.signal,
+        onUnseen: (unseen) => {
+          revealed = true;
+          return `nothing was signed: your passkey would sign ${unseen.join(', ')}, which this page had not shown — it is shown now; read it and press again`;
+        },
+      });
+    }
+
+    // The two writes this surface makes, each spelled in full (the pin
+    // a-step-plugin-put-carries-no-metadata reads the completion's body
+    // off this text). Each may be refused for presence: it is sent bare,
+    // then — on a 422 {required: "presence"} — once more carrying the
+    // ticket of ONE ceremony.
+    const withTicket = (ticket) => {
+      const headers = { 'Content-Type': 'application/json' };
+      if (ticket) headers['x-presence-ticket'] = ticket;
+      return headers;
+    };
+    const signOff = (role) => (ticket) =>
+      fetch(`/api/jobs/${jobId}/steps/${step.id}/sign-offs`, {
+        method: 'POST',
+        headers: withTicket(ticket),
+        body: JSON.stringify({ role }),
+      });
+    const completeStep = (ticket) =>
+      fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
+        method: 'PUT',
+        headers: withTicket(ticket),
+        body: JSON.stringify({ status: 'completed' }),
+      });
 
     async function complete() {
       if (saving) return;
+      // WHAT IS SIGNED IS WHAT WAS READ. Every render below redraws the
+      // signing block from the step as it then stands, so the check
+      // comes FIRST, against the block as the reviewer saw it: a key
+      // that changed on this step since that draw refuses here, before
+      // any request and before the passkey is asked, and the block is
+      // drawn again for them to read.
+      if (onScreen) {
+        const renderedMetadata = step.metadata || {};
+        const unseen = P.notShown({ title: step.title, metadata: renderedMetadata }, onScreen);
+        if (unseen.length > 0) {
+          saveError = `Nothing was signed or sent: ${unseen.join(', ')} changed on this step after this page drew it — it is drawn again now; read it and press again.`;
+          render();
+          return;
+        }
+      }
       saving = true;
       saveError = null;
       render();
@@ -361,29 +515,47 @@
         // Stamp every required sign-off role first, in the step's
         // final shape (v1 of the workflow requires none; this stays
         // generic so a v2 that adds one keeps working).
-        for (const role of step.sign_offs_required || []) {
-          const sr = await fetch(`/api/jobs/${jobId}/steps/${step.id}/sign-offs`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ role }),
-          });
-          if (!sr.ok) {
-            throw new Error(`sign-off as ${role} failed (HTTP ${sr.status}): ${await sr.text()}`);
+        //
+        // A stamp or the completion refused {required: "presence"} is
+        // answered with ONE passkey tap on the step as drawn and ONE
+        // retry (P.completeOnce). The v1 step is human_only with no
+        // role, so the tap comes on the completion; a row that names a
+        // role is stamped on the tap and then completes bare.
+        const tapped = async (what, put) => {
+          const answer = await P.completeOnce({ put, ticket: passkeyTicket });
+          if (answer.failed) {
+            const e = answer.failed;
+            const why = e && e.message ? e.message : String(e);
+            const refused = new Error(
+              `${what} needs your passkey, and it was not given — ${why}. The step is still open; nothing was completed.`,
+            );
+            refused.moved = Boolean(e && e.status === 412);
+            throw refused;
           }
+          if (!answer.done.ok) {
+            const again = answer.retried && (await P.refusedForPresence(answer.done));
+            const text = await answer.done.text();
+            throw new Error(
+              again
+                ? `${what} was refused again after a fresh passkey tap — HTTP ${answer.done.status}: ${text}. The step is still open.`
+                : `${what} failed (HTTP ${answer.done.status}): ${text}`,
+            );
+          }
+        };
+        for (const role of step.sign_offs_required || []) {
+          await tapped(`The sign-off as ${role}`, signOff(role));
         }
-        const r = await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ status: 'completed' }),
-        });
         // Read the code — a swallowed non-2xx leaves the surface
         // looking saved while the packet never moved.
-        if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+        await tapped('Completing the review', completeStep);
         onUpdate();
       } catch (e) {
         saveError = e && e.message ? e.message : String(e);
         saving = false;
         render();
+        // The step moved under this surface (the gateway's 412): what is
+        // drawn is no longer what the step holds, so the host re-reads.
+        if (e && e.moved && typeof onUpdate === 'function') onUpdate();
       }
     }
 
@@ -406,13 +578,52 @@
       });
 
     return function cleanup() {
+      disposed = true;
+      unmounted.abort();
+      overflowObservers.forEach((o) => o.disconnect());
+      overflowObservers = [];
       root.remove();
     };
+  }
+
+  // passkey-ceremony.js, bound before the mount is registered (see
+  // `withPasskey`): the one copy of the ceremony, shared with sign-off.js.
+  let P;
+
+  // The bundle registers its mount only once passkey-ceremony.js has
+  // run. It is a classic script, so it cannot import; it adds the shared
+  // file's script tag itself, from the directory it was served from, and
+  // the host — which already waits for a registration — knows nothing of
+  // it. A shared file that does not load registers a mount that says so,
+  // rather than leaving the step blank. (The same dozen lines stand at
+  // the foot of sign-off.js: they are what loads the shared file, so
+  // they cannot live in it.)
+  function withPasskey(ready, failed) {
+    if (window.__boss_passkey) return ready(window.__boss_passkey);
+    const script = document.createElement('script');
+    script.src = '/plugins/passkey-ceremony.js';
+    script.onload = () =>
+      window.__boss_passkey ? ready(window.__boss_passkey) : failed('it ran and defined nothing');
+    script.onerror = () => failed('it did not load');
+    document.head.appendChild(script);
   }
 
   if (typeof window.__boss_register_step_plugin !== 'function') {
     console.error('[incident-review-plugin] __boss_register_step_plugin not on window');
     return;
   }
-  window.__boss_register_step_plugin('incident-review', mount);
+  withPasskey(
+    (shared) => {
+      P = shared;
+      window.__boss_register_step_plugin('incident-review', mount);
+    },
+    (why) => {
+      window.__boss_register_step_plugin('incident-review', (container) => {
+        const p = document.createElement('p');
+        p.className = 'sir-err';
+        p.textContent = `This review surface cannot run: /plugins/passkey-ceremony.js — ${why}. The review cannot be completed here; reload the page.`;
+        container.append(p);
+      });
+    },
+  );
 })();

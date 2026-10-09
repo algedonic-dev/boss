@@ -32,11 +32,52 @@
 #   * prod's jobs door for the packet: the crawl is IT's work about the
 #     playground, recorded where IT's queue is — the same door the
 #     conductor in this namespace uses.
-#   * the chore wrapper (boss-chore.sh), copied in from the boss image
-#     by an init container:
-#     the wrapper is what records `failed` as well as `ok` (480e183c),
-#     and boss-ci does not carry it. Copied BEFORE the clone so a clone
-#     that cannot read the forge is a recorded failure, not silence.
+#   * the chore wrapper (boss-chore.sh) records `failed` as well as
+#     `ok` (480e183c), and it runs in a container of its own — see TWO
+#     CONTAINERS below.
+#
+# TWO CONTAINERS, AND ONLY ONE OF THEM CAN SPEAK TO THE RECORD (backlog
+# 37742794; David's answer to design-doc c8502e17, `crawl-and-sheet`,
+# 2026-10-07: "move its packet writes out of the browser container into
+# a small wrapper container that holds the token and only records the
+# result, so the container that runs Playwright never has it").
+#
+# Until then one container did everything: it cloned the tree, ran
+# `bun install` from npm and a headless Chromium against the playground,
+# AND opened and closed the packet, with the chore helpers copied in
+# beside the browser. It held no machine token, so its wrap pair and
+# its converge read went out bare (the maintenance-timer and boss-step
+# rows from a boss-dev pod at 04:45Z in the 2026-10-07 window) — and the
+# fix for a bare sender, a Secret mount, is exactly what that container
+# must never get: the token lets its holder assert any identity to every
+# service port, and decision c395e62c (2026-10-05) keeps it away from
+# anything that runs code from a branch or a package registry.
+#
+#   `crawl`   boss-ci. The clone, the install, the browser. No token, no
+#             chore helper, no reader, and no address of the jobs door:
+#             it has nothing to send a gated request WITH and nowhere to
+#             send one. It leaves two files in `result`: its whole
+#             output, then its exit status.
+#   `record`  the boss image, which carries the wrapper, its helpers and
+#             the reader where the Dockerfile puts them — so this pod
+#             needs no init container. It holds the token, opens the
+#             packet, waits out a converge rolling the playground, tells
+#             the crawl to start (one empty file in `go`), waits for the
+#             result, and closes the packet with it.
+#
+# THE RESULT IS DATA. The record container never executes what the crawl
+# left and never puts it in a command: it reads at most 1 MiB of
+# `output` and 16 bytes of `exit`, through an open that refuses a
+# symbolic link (a link to this container's own token mount is the
+# obvious way to ask it to post the token onto a packet), drops control
+# bytes and invalid UTF-8, and prints the rest — which boss-chore.sh
+# then bounds again, as it bounds every check's output, and hands to jq
+# as one argument. `result` is mounted read-only here and `go` read-only
+# there, so each container can write exactly one thing the other reads.
+# Held by every_in_cluster_sender_holds_the_machine_token_or_is_named.rs
+# (the pod's shape, parsed) and
+# the_playground_crawl_record_takes_its_result_as_data.rs (the script
+# below, extracted and run against hostile results).
 #
 # THE VERDICT. The wrapper carries the check's output onto the `run`
 # step: `crawled N routes … : R red`, then one `RED <route> <kind>:
@@ -93,30 +134,6 @@ spec:
           imagePullSecrets:
             - {name: forgejo-registry}
           restartPolicy: Never
-          initContainers:
-            # The chore wrapper and the two helpers it resolves next to
-            # itself, plus the transport-retry curl the step helper finds
-            # the same way. The boss image is where the Dockerfile COPYs
-            # them (a_chore_records_ok_and_failed.rs pins that). The
-            # curl helper sources lib/curl-through-a-roll.sh from beside
-            # itself and refuses without it, so lib/ comes too, which is
-            # what -r is for (backlog c51967b5; a_chore_write_is_sent_once.rs).
-            - name: tools
-              image: 10.20.0.15:3000/david/boss:latest
-              command:
-                - cp
-                - -r
-                - /usr/local/bin/boss-chore.sh
-                - /usr/local/bin/boss-maintenance-wrap.sh
-                - /usr/local/bin/boss-step.sh
-                - /usr/local/bin/boss-api-curl.sh
-                - /usr/local/bin/lib
-                - /tools/
-              securityContext:
-                allowPrivilegeEscalation: false
-                capabilities: {drop: ["ALL"]}
-              volumeMounts:
-                - {name: tools, mountPath: /tools}
           containers:
             - name: crawl
               image: 10.20.0.15:3000/david/boss-ci:rust1.96
@@ -127,24 +144,34 @@ spec:
               command: ["/bin/bash", "-c"]
               args:
                 - |
-                  set -euo pipefail
-                  # The clone is INSIDE the check: a forge that refuses the
-                  # credential is a failed run the packet records, with the
-                  # refusal in its output. Then the tree's guard waits out a
-                  # converge rolling the playground (the converge packet
-                  # open, or a head it built within the settle window) before
-                  # the browser starts, and says so on this packet: on
-                  # 2026-09-28 the crawl ran inside train #768's roll and every
-                  # route read no-shell (backlog c8c6b9a8). It never fails
-                  # the check.
-                  /tools/boss-chore.sh maintenance-playground-crawl "Playground crawl" -- bash -c '
+                  set -uo pipefail
+                  # The clone comes first and waits for nothing: a forge
+                  # that refuses the credential is a failed run the
+                  # packet records within seconds, with the refusal in
+                  # its output. Then the `go` file — the record
+                  # container writes it once the converge guard is
+                  # clear (on 2026-09-28 the crawl ran inside train
+                  # #768's roll and every route read no-shell, backlog
+                  # c8c6b9a8). The wait is bounded past the guard's own
+                  # 45 minutes: a crawl that never runs is silence.
+                  bash -c '
                     set -euo pipefail
                     git clone --depth 1 "$FORGE_URL" /work/boss
-                    BOSS_API_CURL=/tools/boss-api-curl.sh bash /work/boss/infra/wait-out-a-converge.sh
+                    waited=0
+                    while [ ! -e /go/go ] && [ "$waited" -lt "$GO_WAIT_MAX_S" ]; do
+                      sleep 5
+                      waited=$((waited + 5))
+                    done
+                    [ -e /go/go ] || echo "crawl: no go signal from the record container after ${waited}s — starting anyway"
                     cd /work/boss/apps/web
                     PUPPETEER_SKIP_DOWNLOAD=1 bun install --frozen-lockfile
                     bun run test:live
-                  '
+                  ' 2>&1 | tee /result/output
+                  rc=${PIPESTATUS[0]}
+                  # The status LAST, and by rename: the record container
+                  # reads the output only once this file exists.
+                  printf '%s\n' "$rc" > /result/exit.part && mv /result/exit.part /result/exit
+                  exit "$rc"
               env:
                 - {name: HOME, value: /work}
                 - {name: CI, value: "1"}
@@ -161,21 +188,130 @@ spec:
                 # crates/core/boss-testing/tests/the_playground_is_crawled_nightly.rs.
                 - name: BOSS_E2E_BASE_URL
                   value: http://boss-gateway.boss-playground.svc.cluster.local
-                # The record: prod's jobs door, IT's queue.
-                - name: BOSS_JOBS_URL
-                  value: http://boss-jobs-internal.boss.svc.cluster.local:7900
+                # The guard waits at most 45 minutes (CONVERGE_WAIT_MAX_MIN);
+                # one more for the record container to start and say go.
+                - {name: GO_WAIT_MAX_S, value: "2760"}
               resources:
                 # Headroom for bun install plus one headless chromium; a
                 # bounded Job dies alone if it is wrong.
                 requests: {cpu: "1", memory: 2Gi}
                 limits: {cpu: "2", memory: 4Gi}
               volumeMounts:
-                - {name: tools, mountPath: /tools, readOnly: true}
                 - {name: work, mountPath: /work}
                 - {name: forge-token, mountPath: /etc/forge, readOnly: true}
+                - {name: result, mountPath: /result}
+                - {name: go, mountPath: /go, readOnly: true}
+            - name: record
+              # The boss image: the wrapper, its helpers, the curl door
+              # and the reader are where the Dockerfile COPYs them
+              # (a_chore_records_ok_and_failed.rs pins that), and the
+              # converge rewrites this tag to a build the registry
+              # holds, as it does for every boss-image manifest.
+              image: 10.20.0.15:3000/david/boss:latest
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities: {drop: ["ALL"]}
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -uo pipefail
+                  # Every path the check reads is a PARAMETER whose
+                  # default is this pod's own, for the estate observer's
+                  # reason: the pin named in the header extracts this
+                  # block and RUNS it, and inline shell nothing executes
+                  # is untested shell. The wrapper itself is spelled out,
+                  # kind and all, on one line: timers-leave-a-packet.sh
+                  # reads that line to know this CronJob leaves a packet.
+                  export RESULT_DIR="${BOSS_CRAWL_RESULT_DIR:-/result}"
+                  export GO_DIR="${BOSS_CRAWL_GO_DIR:-/go}"
+                  export GUARD="${BOSS_CRAWL_GUARD:-/usr/local/bin/wait-out-a-converge.sh}"
+                  # Inside the Job's one-hour activeDeadlineSeconds, so
+                  # a crawl container that died without a word is a
+                  # packet closed `failed`, not a pod killed mid-wait.
+                  export RECORD_DEADLINE_S="${BOSS_CRAWL_RECORD_DEADLINE_S:-3450}"
+                  export RESULT_POLL_S="${BOSS_CRAWL_RESULT_POLL_S:-5}"
+                  exec /usr/local/bin/boss-chore.sh maintenance-playground-crawl "Playground crawl" -- bash -c '
+                    set -uo pipefail
+                    # 1. The converge guard, HERE: it reads the record, so
+                    #    it runs where the door is. It never fails the
+                    #    check. An image built before the guard was
+                    #    copied in has none; say so and go.
+                    if [ -x "$GUARD" ]; then
+                      "$GUARD" || echo "record: the converge guard exited $? — the crawl starts anyway"
+                    else
+                      echo "record: this image carries no converge guard at $GUARD — the crawl starts without the wait"
+                    fi
+                    : > "$GO_DIR/go" || echo "record: the go signal could not be written — the crawl starts on its own bound"
+                    # 2. The result: the exit file is written last.
+                    while [ ! -e "$RESULT_DIR/exit" ] && [ ! -L "$RESULT_DIR/exit" ] && [ "$SECONDS" -lt "$RECORD_DEADLINE_S" ]; do
+                      sleep "$RESULT_POLL_S"
+                    done
+                    # 3. What the crawl left is DATA. `take` opens one
+                    #    name inside the result directory and nothing it
+                    #    points at (nofollow), never blocks on a pipe
+                    #    (nonblock, and a 30 s bound), and stops at
+                    #    BS x COUNT bytes however large the file is.
+                    take() { timeout 30 dd if="$RESULT_DIR/$1" iflag=nofollow,nonblock bs="$2" count="$3" 2>/dev/null; }
+                    take output 65536 16 | tr -d "\000-\010\013-\037\177" | { iconv -c -f UTF-8 -t UTF-8 2>/dev/null || cat; }
+                    echo
+                    #    A status is one to three digits and nothing
+                    #    else; anything more is not a status, and is
+                    #    never read for the digits it happens to hold.
+                    status=$(take exit 16 1 | tr -d "\n")
+                    case "$status" in
+                      "" | *[!0-9]* | ????*)
+                        echo "record: the crawl container left no exit status this container can read, ${SECONDS}s into its ${RECORD_DEADLINE_S}s — recorded as failed; its own log has what it was doing"
+                        exit 1
+                        ;;
+                    esac
+                    status=$((10#$status))
+                    [ "$status" -le 255 ] || status=1
+                    exit "$status"
+                  '
+              env:
+                # The record: prod's jobs door, IT's queue.
+                - name: BOSS_JOBS_URL
+                  value: http://boss-jobs-internal.boss.svc.cluster.local:7900
+                # The reader stamps loopback and the hosts named here.
+                - name: BOSS_MACHINE_TOKEN_HOSTS
+                  value: ".boss.svc.cluster.local"
+                # Where the reader writes the 0600 header file it hands
+                # curl: the memory volume below.
+                - name: RUNTIME_DIRECTORY
+                  value: /run/boss-secret-header
+                # The guard's door, named rather than found on PATH.
+                - {name: BOSS_API_CURL, value: /usr/local/bin/boss-api-curl.sh}
+              resources:
+                # It sleeps, reads one file and sends a handful of
+                # requests.
+                requests: {cpu: 50m, memory: 64Mi}
+                limits: {cpu: 500m, memory: 256Mi}
+              volumeMounts:
+                - {name: result, mountPath: /result, readOnly: true}
+                - {name: go, mountPath: /go}
+                - {name: machine-token, mountPath: /etc/boss/machine-token, readOnly: true}
+                - {name: secret-header, mountPath: /run/boss-secret-header}
           volumes:
-            - name: tools
-              emptyDir: {}
+            # The hand-over, one direction each. `result`: the crawl
+            # writes, the record container reads. `go`: the reverse.
+            # Bounded, because what a container can fill is what it can
+            # take from the node — a crawl that writes more than this is
+            # evicted, and the packet it never closed is what the
+            # cadence-silence sweep is for.
+            - name: result
+              emptyDir: {sizeLimit: 64Mi}
+            - name: go
+              emptyDir: {sizeLimit: 1Mi}
+            # THE GRANT, to the `record` container alone: the estate
+            # machine token, Secret boss-machine-token — boss-dev's
+            # copy — whole, optional (an unfilled Secret is an empty
+            # directory and the record goes out unstamped, which every
+            # gate in `report` admits), 0440 with the pod's fsGroup 1500.
+            - name: machine-token
+              secret: {secretName: boss-machine-token, optional: true, defaultMode: 0440}
+            # The header file's directory: memory, gone with the pod.
+            - name: secret-header
+              emptyDir: {medium: Memory, sizeLimit: 1Mi}
             # The clone, node_modules and bun's cache; gone with the pod.
             - name: work
               emptyDir: {sizeLimit: 4Gi}

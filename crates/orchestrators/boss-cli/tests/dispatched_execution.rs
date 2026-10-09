@@ -14,6 +14,21 @@ use serde_json::{Value, json};
 
 const ACTOR: &str = "agent-codex";
 const THREAD: &str = "bbbbbbbb-1111-4111-8111-111111111111";
+/// How long a launch may run before a test calls it HUNG — a deadlock
+/// turned into a named failure, and never a measure of speed (backlog
+/// ec131700). Three tests here ask whether a launch returns at all: against
+/// a response that never comes, a refused write behind a full pipe, a child
+/// that writes before it reads. Each held the launch to a bound of its own
+/// (3 s, 3 s, and 18 s around a launcher whose deadline is 10), so each was
+/// also a test of the runner: on a gate whose test check ran 422 s against
+/// 13 s on the dev pod, the 18 was spent before the launcher's 10 had run
+/// (gate-run bd136c2e, 2026-10-06). Measured on the dev pod, 2026-10-07:
+/// that launch takes 10.2 s idle and 11.3 to 12.2 s at load average 32 to
+/// 45 — the part that is not the launcher's deadline grew from 0.2 s to as
+/// much as 2.2 under processor load alone. A deadlock never returns, so
+/// any finite guard catches it; this one is far outside a loaded runner
+/// and costs nothing when the launch returns.
+const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(300);
 
 struct World {
     root: tempfile::TempDir,
@@ -186,7 +201,12 @@ printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":20,"cached_inp
                         if mode == "start-stalled" {
                             // The server received and stored the native start,
                             // but its response never reaches the paired IO leg.
-                            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                            // NEVER, not sixty seconds on (backlog ec131700):
+                            // the launch returning at all is then the proof
+                            // that the launcher gave up by its own deadline,
+                            // with no second clock to race it. The connection
+                            // drops when the launcher does.
+                            std::future::pending::<()>().await;
                         }
                         *response.status_mut() = axum::http::StatusCode::CONFLICT;
                         *response.body_mut() =
@@ -656,7 +676,14 @@ exec python3 -c 'import json, os, pathlib, sys; pathlib.Path(os.environ["FIXTURE
 "#
         ),
     );
-    let out=tokio::time::timeout(std::time::Duration::from_secs(18), world.launch()).await.expect("a withheld HTTP response must hit its own deadline, stop the child and preserve evidence");
+    // What is asserted is that the launch RETURNS against a response that
+    // never comes, and what its receipt then says. How long that took is
+    // the runner's business: the launcher's deadline is ten seconds of the
+    // child's own clock, and the eight this used to allow on top were
+    // spent by a slow start on a stalled gate (gate-run bd136c2e).
+    let out = tokio::time::timeout(HANG_GUARD, world.launch()).await.expect(
+        "a withheld HTTP response must hit its own deadline, stop the child and preserve evidence",
+    );
     assert!(!out.status.success(), "{out:?}");
     let receipt: Value = serde_json::from_slice(&out.stdout)
         .expect("unknown outcome retained durably after transport timeout");
@@ -703,7 +730,7 @@ cat > "$FIXTURE_CAPTURE/prompt"
 "#
         ),
     );
-    let out = tokio::time::timeout(std::time::Duration::from_secs(3), world.launch())
+    let out = tokio::time::timeout(HANG_GUARD, world.launch())
         .await
         .expect("a refused output write must unblock a pending prompt write");
     assert!(!out.status.success(), "{out:?}");
@@ -874,7 +901,7 @@ printf '%s\n' '{{"type":"turn.completed"}}'
 "#
         ),
     );
-    let out = tokio::time::timeout(std::time::Duration::from_secs(3), world.launch())
+    let out = tokio::time::timeout(HANG_GUARD, world.launch())
         .await
         .expect("a native process writing before reading the prompt must not deadlock");
     assert!(out.status.success(), "{out:?}");

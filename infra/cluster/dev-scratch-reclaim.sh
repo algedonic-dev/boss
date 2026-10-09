@@ -92,6 +92,13 @@
 # git's own refusal is a problem on the packet, never a silent stall.
 # The long form is at the pass itself.
 #
+# AND SINCE 2026-10-08, ONE THING IT KEEPS RUNNING (backlog 9ecd12ea):
+# the memory watch, infra/cluster/dev-memory-watch.sh — a ring of
+# per-process samples on the PVC and an alert on a container restart,
+# after the dev container was OOMKilled with no record of either. Each
+# hourly pass starts its loop when none is alive. The long form is in
+# that script.
+#
 # WHAT RUNS IT. The `reclaim` sidecar in boss-dev.yaml fires it hourly
 # (the disk-floor-sweep.timer cadence: above the floor a pass is one
 # log line; below it a pass frees GBs, well ahead of the fill rate).
@@ -360,6 +367,9 @@ FF_TO=""
 # maintenance helpers use, under this sidecar's own id: a scope that
 # cannot see the gate-runs and cars it asks about answers a smaller
 # world, not the record.
+# The machine token's header file: empty until the hourly pass makes it
+# (at the bottom, before its first leg), and empty in every other mode.
+MT_HDR=""
 SOR_USER='{"id":"automation:dev-scratch-reclaim","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
 
 fast_forward_checkout() {
@@ -710,7 +720,12 @@ sor_read() {
     [ -n "$url" ] || return 3
     api="$here/../boss-api-curl.sh"
     [ -x "$api" ] || api=boss-api-curl.sh
-    "$api" -fsS -H "x-boss-user: $SOR_USER" "$url$1"
+    # MT_HDR: the machine token's header file, made once at the top
+    # level of the hourly pass (below, before its first leg) — this
+    # function runs inside `$( )`, where the reader refuses a first call.
+    # Empty wherever no token is mounted, and then this is the read it
+    # always was.
+    "$api" -fsS -H "x-boss-user: $SOR_USER" ${MT_HDR:+-H "$MT_HDR"} "$url$1"
 }
 
 # `metadata=` for a list read: a one-key containment document, url-encoded.
@@ -1476,9 +1491,40 @@ install_tree_cli() {
 # unrecorded and says so; an unreachable API costs the same — the
 # executor never waits on its visibility.
 RECLAIM_KIND=maintenance-dev-scratch-reclaim
+
+# THE MEMORY WATCH'S STATE, for the packet (backlog 9ecd12ea; the long
+# form is at the hourly pass's `--ensure` below). `--state` prints
+# key=value lines — the loop's pid and generation, the newest sample's
+# age, alerts kept / refused / dropped, what --ensure last decided — and
+# each rides the run step as its own key. BOSS_DEV_MEMORY_WATCH=off is
+# for a harness that drives this script against a fixture pod: there the
+# watch has nothing to stand outside of, and its refusal would be every
+# test's problem.
+MEMORY_WATCH="${BOSS_DEV_MEMORY_WATCH:-on}"
+MEMORY_WATCH_SCRIPT="$(dirname "$(readlink -f "$0")")/dev-memory-watch.sh"
+WATCH_STARTED=0
+WATCH_STATE=()
+read_watch_state() {
+    WATCH_STATE=()
+    if [ "$MEMORY_WATCH" = off ]; then
+        WATCH_STATE=("memory_watch=off")
+        return 0
+    fi
+    mapfile -t WATCH_STATE < <(bash "$MEMORY_WATCH_SCRIPT" --state 2> /dev/null)
+    [ "${#WATCH_STATE[@]}" -gt 0 ] || WATCH_STATE=("memory_watch=not sampling: its state could not be read")
+}
+watch_field() {
+    local kv
+    for kv in "${WATCH_STATE[@]}"; do
+        case "$kv" in "$1="*) printf '%s' "${kv#*=}"; return 0 ;; esac
+    done
+}
+
 record_pass() {
     local acted
-    acted=$((WT_REMOVED + WT_TARGETS_REMOVED + WT_PRUNED + FLOOR_WORKTREES_REMOVED + STALE_TARGETS_RECLAIMED + FLOOR_TARGETS_RECLAIMED + INCREMENTAL_DROPPED))
+    # The floor mode reaches here without the hourly pass's read.
+    [ "${#WATCH_STATE[@]}" -gt 0 ] || read_watch_state
+    acted=$((WT_REMOVED + WT_TARGETS_REMOVED + WT_PRUNED + FLOOR_WORKTREES_REMOVED + STALE_TARGETS_RECLAIMED + FLOOR_TARGETS_RECLAIMED + INCREMENTAL_DROPPED + WATCH_STARTED))
     if [ "$acted" -eq 0 ] && [ "$problems" -eq 0 ]; then
         log "nothing reclaimed and no floor unmet — a pass that only looked files no packet"
         return 0
@@ -1526,6 +1572,7 @@ record_pass() {
             "floor_targets_reclaimed=$FLOOR_TARGETS_RECLAIMED" "floor_targets_mib=$FLOOR_TARGETS_MIB" \
             "incremental_dirs_dropped=$INCREMENTAL_DROPPED" \
             "cli_sha=$CLI_SHA" "cli_result=$CLI_RESULT" \
+            "${WATCH_STATE[@]}" \
         || log "could not complete the $RECLAIM_KIND run step — its packet stays open for the next acting pass to complete" >&2
 }
 
@@ -1588,6 +1635,96 @@ if [ "${1:-}" = "--scratch-floor" ]; then
     reclaim_targets_to_floor "$floor_gb"
     record_pass
     exit 0
+fi
+
+# THE MEMORY WATCH (backlog 9ecd12ea, 2026-10-08): the dev container was
+# OOMKilled at its 32Gi limit and nothing had recorded what filled it or
+# that it happened. infra/cluster/dev-memory-watch.sh keeps a ring of
+# per-process samples on the PVC and raises one alert per container
+# restart; this pass only makes sure its loop is alive, because this
+# pass is what the sidecar runs from the checkout and the manifest is
+# not the place (an edit there rolls the pod and ends every session).
+# Hourly passes only — the two modes above have exited by here, and both
+# run inside the dev container, where a sampler dies with what it
+# watches. Never fatal: the reclaim does not wait on its neighbour.
+#
+# AND IT SAYS SO ON THE PACKET (review of car 7849553a, finding 2).
+# Every way `--ensure` declines returns 0, so a watch that never started
+# left one line on the sidecar's stdout, which nobody reads. The watch's
+# own state now rides this pass's packet (record_pass), a pass that
+# STARTED the loop counts as having acted, and a watch that is not
+# sampling after `--ensure` is a PROBLEM — both of which file the
+# packet, so the refusal and its reason reach a reader.
+if [ "$MEMORY_WATCH" != off ]; then
+    bash "$MEMORY_WATCH_SCRIPT" --ensure \
+        || log "the memory watch could not be ensured — the dev container is unsampled until a pass manages it" >&2
+    read_watch_state
+    case "$(watch_field memory_watch_ensure)" in started*) WATCH_STARTED=1 ;; esac
+    if [ "$(watch_field memory_watch)" != sampling ]; then
+        log "PROBLEM: the dev memory watch is $(watch_field memory_watch) — ensure said: $(watch_field memory_watch_ensure)" >&2
+        problems=$((problems + 1))
+    fi
+    # AN ALERT THAT DID NOT LEAVE IS A PROBLEM TOO (delta review, N2).
+    # The counts ride the packet, but a packet is filed only for a pass
+    # that acted or had a problem — so on a healthy pod a kill alert the
+    # API refused five times, or one the spool dropped, would be counted
+    # on a packet nobody files. It stays a problem every hour until a
+    # person has read it: empty alert-refused/ (each body has its
+    # refusal beside it as .why) and remove alerts-dropped, under the
+    # watch's directory on the work volume.
+    watch_refused="$(watch_field memory_watch_alerts_refused)"
+    watch_dropped="$(watch_field memory_watch_alerts_dropped)"
+    case "${watch_refused:-0}${watch_dropped:-0}" in
+        *[!0]*)
+            log "PROBLEM: the dev memory watch holds alerts that never reached the system of record — ${watch_refused:-0} refused and moved aside, ${watch_dropped:-0} dropped from a full spool" >&2
+            problems=$((problems + 1))
+            ;;
+    esac
+fi
+
+# THE MACHINE TOKEN, ONCE, HERE — PRESENTED AND NEVER REQUIRED (backlog
+# 37742794; David's answer to design-doc c8502e17, `reclaim-sidecar`,
+# 2026-10-07). The worktree pass asks the record which cars landed
+# (sor_read), and until this line every one of those reads went out
+# with x-boss-user alone: 66 would-refuse facts in the 26 h to
+# 2026-10-07T18:00Z, and on the day the machine door enforces, a record
+# that cannot be read — which fails closed, so no landed worktree is
+# ever reclaimed early again. The sidecar mounts Secret
+# boss-machine-token at the reader's default directory
+# (infra/cluster/manifests/boss-dev.yaml); the reader leaves MT_HDR
+# naming a 0600 file, and sor_read hands curl that FILE.
+#
+# AFTER the two modes above, on purpose: `--cli` and `--scratch-floor`
+# run in the dev container, before a write verb and before every build,
+# where no token is mounted at that directory and none is wanted; they
+# source nothing. HERE and not inside sor_read, because that runs in
+# `$( )` and the reader chains its cleanup onto THIS shell's EXIT.
+#
+# Every way this can go wrong leaves MT_HDR empty and the pass exactly
+# as it was: no system of record named, no reader beside this checkout,
+# one that does not parse (a syntax error in a sourced file ends the
+# shell, `set -e` or not, so it is asked first), no mount, a blank or
+# malformed slot, a host that is not the estate's, a header file that
+# could not be written. The wrap and the step below make their own.
+#
+# AFTER THE MEMORY WATCH'S `--ensure` ABOVE, AND NOTHING IS HANDED TO IT
+# (the re-rail over car 7849553a, 2026-10-08). The watch's loop is this
+# container's too, so the mount is its mount: each tick is its own bash,
+# and its alert POST and owner read take the token from the same reader
+# in that process (dev-memory-watch.sh file_kept_alerts, alert-lib.sh
+# alert_machine_headers). MT_HDR is this shell's variable, never
+# exported, and it is made only after the loop was started, so no child
+# of this pass inherits a header path. The watch's read of the cluster
+# API carries the pod's service-account token and never this one
+# (dev_memory_watch_sh.rs holds both).
+MT_HDR=""
+_reclaim_here="$(dirname "$(readlink -f "$0")")"
+_reclaim_sor="${BOSS_JOBS_URL:-$(head -n1 "$_reclaim_here/../dev/sor-url" 2>/dev/null || true)}"
+if [ -n "$_reclaim_sor" ] && [ -r "$_reclaim_here/../lib/secret-header.sh" ] \
+    && bash -n "$_reclaim_here/../lib/secret-header.sh" 2>/dev/null; then
+    # shellcheck source=infra/lib/secret-header.sh
+    . "$_reclaim_here/../lib/secret-header.sh"
+    machine_token_header MT_HDR "$_reclaim_sor" || MT_HDR=""
 fi
 
 fast_forward_checkout

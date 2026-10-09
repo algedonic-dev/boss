@@ -132,11 +132,16 @@ fn every_registered_service_has_a_production_role_report_owner() {
             "{}: no production refresh lifetime",
             service.name
         );
-        let route = match service.name {
-            "sim-control" => "/actor-role-reports".to_owned(),
-            "simulator" => "/simulator/api/actor-role-reports".to_owned(),
-            name => format!("/api/{name}/actor-role-reports"),
-        };
+        // The ONE definition of where a service answers its report: the
+        // gate-window reader asks each service there for the actor-role
+        // window (backlog e0bdba74), so a binary that mounts another
+        // path would be a service the window cannot read.
+        let route = boss_policy_client::role_service::report_path(service.name);
+        assert!(
+            route.ends_with("/actor-role-reports"),
+            "{}: {route}",
+            service.name
+        );
         let mount = match service.name {
             "classes" | "policy" => production(
                 &path

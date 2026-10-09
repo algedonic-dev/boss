@@ -78,6 +78,22 @@ if [ -z "${BOSS_JOBS_URL:-}" ]; then
     exit 0
 fi
 
+# The machine token, PRESENTED and never required (design 6805c764;
+# backlog 44b2087e): the converge read went out with x-boss-user alone.
+# Made here, in the script's own shell, because judge runs inside $(…).
+# A host or pod with no token mounted — the playground crawl's, today —
+# gets an empty MT_HDR and sends exactly the read it sent before; so
+# does a copy of this script with no lib/ beside it, and a reader that
+# could not write its file. Nothing here can stop the wait: this script
+# exits 0 on every path.
+MT_HDR=""
+SECRET_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/secret-header.sh"
+if [ -r "$SECRET_LIB" ]; then
+    # shellcheck source=infra/lib/secret-header.sh
+    . "$SECRET_LIB"
+    machine_token_header MT_HDR "$BOSS_JOBS_URL" || MT_HDR=""
+fi
+
 # judge — one line: `clear`, or `wait <why>`.
 #
 # The newest 20 packets: the list is newest first (opened_on DESC,
@@ -87,6 +103,7 @@ fi
 judge() {
     local body rc=0 verdict
     body=$("$API_CURL" -fsS --max-time 20 -H "x-boss-user: $BOSS_USER" \
+        ${MT_HDR:+-H "$MT_HDR"} \
         "$BOSS_JOBS_URL/api/jobs?kind=$KIND&limit=20&full=true" 2>/dev/null) || rc=$?
     if [ "$rc" -ne 0 ]; then
         echo "wait the system of record did not answer the converge read (exit $rc)"

@@ -1,0 +1,77 @@
+# boss-machine-token-push CronJob (infra/cluster/manifests/boss-machine-token-push.yaml)
+#
+# The ten-minute push of the estate machine token's three slots to
+# boss-gcp (design-doc bdc60b65, question gcp-push; backlog 88379df3).
+# Its packet is where a run is READ: the `output` carries the lengths of
+# the slots it read, the receiver's own answer, and — when nothing was
+# pushed — which enrollment is missing. No value ever reaches it: the
+# script prints slots and lengths only (machine_token_push_sh.rs).
+#
+# THREE ENDINGS, one per thing a run can honestly say:
+#   completed  boss-gcp took the three slots, or already held them, and
+#              reported the lengths sent;
+#   not-yet    nothing could be pushed and nothing is wrong that an
+#              enrollment does not change: no transport key is prepared
+#              (the prepare-the-machine-token-deposit-key packet is not filed or scoped),
+#              the key is not yet accepted by boss-gcp (its enroll step's
+#              line is not placed), or the broker has not minted a token.
+#              The script exits 75 and the manifest sets
+#              BOSS_CHORE_NOT_YET_ON_75, the only way boss-chore.sh
+#              records result=not-yet;
+#   failed     anything else — a changed host key, a receiver that
+#              refuses, lengths that disagree, a malformed slot — whose
+#              RED line the chore judge files as a backlog-item
+#              (file-backlog-items-on-machine-token-push-red).
+# `failed` excludes not-yet by name, so the two terminals never race.
+[[workflow]]
+kind = "maintenance-machine-token-push"
+label = "Machine token push to boss-gcp"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "The ten-minute push of the estate machine token's three slots to boss-gcp over its own forced-command key, read back by slot length (boss-machine-token-push). Not-yet names the enrollment that is missing."
+metadata = { department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
+
+[[workflow.step]]
+title = "scheduled"
+kind = "trigger"
+ready_when = "true"
+title_template = "Timer fired"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "cluster-cronjob" }
+
+[[workflow.step]]
+title = "run"
+kind = "task"
+ready_when = "steps.scheduled.done"
+title_template = "Run to completion"
+# The automation's step, as every maintenance run's is (backlog
+# 4f909642): born assigned to the actor boss-step.sh signs as.
+audience = { individual = "automation:boss-step" }
+fields = [{ name = "result", field_type = "string", required = true }]
+
+[[workflow.step]]
+title = "completed"
+kind = "outcome"
+ready_when = "steps.run.done AND steps.run.metadata.result = \"ok\""
+title_template = "Maintenance completed"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "completed" }
+
+# No key prepared, a key boss-gcp does not accept yet, or no token
+# minted: nothing shipped, and the run's output names what is owed.
+[[workflow.step]]
+title = "not-yet"
+kind = "outcome"
+ready_when = "steps.run.done AND steps.run.metadata.result = \"not-yet\""
+title_template = "Not yet — an enrollment is missing"
+metadata_defaults = { outcome_kind = "skipped" }
+terminal = { outcome = "not-yet" }
+
+# A refused push lands here, with the refusal's own words in `output`.
+[[workflow.step]]
+title = "failed"
+kind = "outcome"
+ready_when = "steps.run.done AND steps.run.metadata.result != \"ok\" AND steps.run.metadata.result != \"not-yet\""
+title_template = "Maintenance failed"
+metadata_defaults = { outcome_kind = "aborted" }
+terminal = { outcome = "failed" }

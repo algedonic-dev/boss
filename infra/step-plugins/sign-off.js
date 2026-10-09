@@ -47,6 +47,9 @@
 // must be IN the shape), then the user's own stamp if their role is
 // required and unsigned, then the completion — skipped, with a plain
 // explanation, while other roles' signatures are still outstanding.
+// On a presence step the passkey is asked for the STAMP; the completion
+// is sent bare and stands on the stamps (design 1ce67f7e), and no ticket
+// is kept between the two.
 // Request changes records without completing — unless the step's
 // protocol declares `changes_requested_completes = true`, when it takes
 // the Approve path (backlog da322e8f). NOTHING writes metadata
@@ -106,89 +109,22 @@
     return typeof v === 'string' && v.trim().length > 0 ? v : null;
   }
 
-  // A signed value AS THE BYTES IT IS (backlog 6093cf13, adversarial
-  // review of car 30674304): a string that reads as exactly itself is
-  // drawn bare; any other — empty, spaced at an edge, multi-line, holding
-  // a character that is not printable ASCII or an em dash, starting with
-  // a quote, or reading as a number, boolean, null or JSON — is drawn in
-  // double quotes with each such character written as \u{XXXX}. Anything
-  // else is its indented JSON with the same escapes. So '42' and 42, a
-  // bidi override, a zero-width space and a Cyrillic look-alike are all
-  // visibly what they are. Key names and the title are drawn through it
-  // too. The app's copy is signedText in apps/web/src/steps/presence.ts
-  // (the reasoning is there); signOffPlugin.test.ts pins the two equal on
-  // generated inputs, because a bundle cannot import it.
-  const AS_ITSELF = /^[\x20-\x7E\u2014]$/u;
-  const NOT_AS_ITSELF = /[^\x20-\x7E\n\u2014]/gu;
-  const escaped = (c) =>
-    `\\u{${(c.codePointAt(0) || 0).toString(16).toUpperCase().padStart(4, '0')}}`;
-  const QUOTED = { '\\': '\\\\', '"': '\\"', '\n': '\\n\n', '\t': '\\t', '\r': '\\r' };
-  const quoted = (s) =>
-    `"${[...s]
-      .map((c) =>
-        Object.prototype.hasOwnProperty.call(QUOTED, c)
-          ? QUOTED[c]
-          : AS_ITSELF.test(c)
-            ? c
-            : escaped(c),
-      )
-      .join('')}"`;
-
-  function readsAsItself(s) {
-    if (s === '' || s.startsWith('"') || s.startsWith(' ') || s.endsWith(' ')) return false;
-    if (![...s].every((c) => AS_ITSELF.test(c))) return false;
-    try {
-      JSON.parse(s);
-      return false;
-    } catch (_) {
-      return true;
-    }
-  }
-
-  function signedText(v) {
-    if (typeof v === 'string') return readsAsItself(v) ? v : quoted(v);
-    const s = JSON.stringify(v, null, 2);
-    return s === undefined ? String(v) : s.replace(NOT_AS_ITSELF, escaped);
-  }
-
-  // What a value whose box scrolls says under it (6093cf13): rendered is
-  // not read. The app's copy is scrollNote in presence.ts, pinned equal.
-  function scrollNote(text) {
-    const lines = text.split('\n').length;
-    return `scrolls in its box: ${lines} ${lines === 1 ? 'line' : 'lines'}, ${[...text].length} characters. Read it to the end; your passkey signs all of it.`;
-  }
-
-  function canonical(v) {
-    if (Array.isArray(v)) return `[${v.map(canonical).join(',')}]`;
-    if (v !== null && typeof v === 'object') {
-      return `{${Object.keys(v)
-        .sort()
-        .map((k) => `${JSON.stringify(k)}:${canonical(v[k])}`)
-        .join(',')}}`;
-    }
-    const s = JSON.stringify(v);
-    return s === undefined ? 'null' : s;
-  }
-
-  // What a passkey would sign in `shown` that `screen` (the step as this
-  // surface last drew it, or null when it drew no signed content) does
-  // not show as signed: 'title', then each metadata key missing or drawn
-  // with another value. The app's copy is notShown in presence.ts, pinned
-  // equal by signOffPlugin.test.ts.
-  function notShown(shown, screen) {
-    const keys = Object.keys(shown.metadata).sort();
-    if (!screen) return ['title', ...keys];
-    const out = shown.title === screen.title ? [] : ['title'];
-    keys.forEach((k) => {
-      if (
-        !Object.prototype.hasOwnProperty.call(screen.metadata, k) ||
-        canonical(screen.metadata[k]) !== canonical(shown.metadata[k])
-      ) {
-        out.push(k);
-      }
-    });
-    return out;
-  }
+  // HOW WHAT A PASSKEY SIGNS IS DRAWN, AND THE CEREMONY ITSELF, live in
+  // passkey-ceremony.js beside this file — one copy, shared with every
+  // other bundle that asks a passkey (incident-review.js, since a
+  // human-only step completes on one: item 570c66e9, 2026-10-07). They
+  // were defined here until then. Bound by `withPasskey` at the foot of
+  // this file BEFORE the mount is registered, so every function below
+  // finds them set. signedText draws a value as the bytes it is
+  // (6093cf13); scrollNote is what a box that scrolls says; canonical
+  // and notShown are the check that what would be signed was drawn. The
+  // app's copies are in apps/web/src/steps/presence.ts, and
+  // signOffPlugin.test.ts pins the two equal on generated inputs.
+  let P;
+  let signedText;
+  let scrollNote;
+  let canonical;
+  let notShown;
 
   function mount(container, { step, jobId, onUpdate }) {
     const required = Array.isArray(step.sign_offs_required) ? step.sign_offs_required : [];
@@ -204,17 +140,16 @@
     const stale = new Set();
     // The stages of the current gesture, in the order they landed.
     let progress = [];
-    // The presence ticket the gateway issued for THIS surface's own
-    // signature — kept so the completion carries it (backlog b568044a,
-    // 2026-09-25). The jobs API judges assurance on every request that
-    // leaves the open states, from that request's own header, so a
-    // presence stamp followed by a bare completion PUT answered 422 and
-    // the step stayed ready after the stamp. It is only ever a ticket a
-    // ceremony on this step minted for this user, and it authorises
-    // nothing new: the server re-checks its step, person, shape and
-    // two-minute expiry on the PUT exactly as on the stamp, and a step
-    // edited since the ceremony refuses it. Nothing here mints one.
-    let presenceTicketHeld = null;
+    // NO TICKET IS KEPT BETWEEN REQUESTS (design 1ce67f7e, 2026-10-07).
+    // A ceremony's ticket rides the one request it was run for and is
+    // gone. This surface used to hold the stamp's ticket to send it
+    // again with the completion (b568044a): the jobs API judged a
+    // completion on that request's own header alone, so a bare PUT after
+    // a presence stamp answered 422. A step that names sign-off roles now
+    // completes on the live passkey stamps it holds, so the completion
+    // carries nothing — which also ends the two-minute race and the
+    // failure when the stamp and the completion happened on different
+    // surfaces.
     // What the passkey signs, as last drawn: {title, metadata} copied at
     // the render, so a later write to the local cache is not mistaken for
     // what is on screen. null while no signed content is drawn.
@@ -589,134 +524,32 @@
     // Presence ceremony (docs/design/presence.md): a presence-gated
     // step refuses a plain stamp with 422 {required:"presence"}; the
     // passkey then signs a challenge bound to this step's CURRENT
-    // shape hash and the stamp retries with the issued ticket. Plugins
-    // are self-contained bundles, so the ceremony rides along here
-    // rather than importing the app's helper. No fallback path (Q3).
-    const b64uBytes = (s) => {
-      const pad = s.length % 4 === 2 ? '==' : s.length % 4 === 3 ? '=' : '';
-      return Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/') + pad), (c) =>
-        c.charCodeAt(0),
-      );
-    };
-    const bytesB64u = (buf) =>
-      btoa(String.fromCharCode(...new Uint8Array(buf)))
-        .replace(/\+/g, '-')
-        .replace(/\//g, '_')
-        .replace(/=+$/, '');
-    //
-    // THE BEGIN NAMES WHAT THIS SURFACE SHOWED (backlog fd7090cc, the
-    // security re-review of 2026-09-25): the step as rendered, with this
-    // gesture's own decision folded in by decide() below — never a fresh
-    // read. The gateway hashes it and refuses (412) a begin whose shown
-    // step is not the step as it stands, so a plan swapped between the
-    // render and the key press is never what the passkey signs.
-    //
-    // This is the ONE place the mount-prop snapshot rightly leaves the
-    // page, and it is not a write: assert/begin stores nothing on the
-    // step, it only compares. The lost update step-plugins-own-their-keys
-    // refuses cannot happen here — a stale snapshot is refused 412, which
-    // is the whole point — so the snapshot is named for what it is.
-    // Unmounted mid-gesture (6093cf13): the step this gesture began on is
-    // no longer on screen, so the passkey is never asked, and an answer it
-    // already gave is never sent to be turned into a ticket.
-    const offScreen = () =>
-      new Error('Nothing was signed: this step is no longer on screen, so your passkey was not used for it.');
-
-    async function presenceTicket() {
-      if (disposed) throw offScreen();
+    // shape hash and the stamp retries with the issued ticket. No
+    // fallback path (Q3). The ceremony is P.ticket (passkey-ceremony.js):
+    // this surface hands it what it owns — the step as rendered, with
+    // this gesture's own decision folded in by decide() below, never a
+    // fresh read (fd7090cc); what its signed block drew; whether it is
+    // still mounted (6093cf13); and the signal its cleanup aborts
+    // (7c53b1bf).
+    function presenceTicket() {
       const renderedMetadata = step.metadata || {};
-      // THE PASSKEY SIGNS ONLY WHAT WAS DRAWN (design f623e425 D3): a key
-      // of what the begin would name that the signed block did not draw
-      // as it would be signed refuses here, before any request. The only
-      // way this surface reaches it is a step that never declared
-      // presence: the block is drawn now and the tap asked for again, so
-      // the approver reads before signing.
-      const unseen = notShown({ title: step.title, metadata: renderedMetadata }, onScreen);
-      if (unseen.length > 0) {
-        revealed = true;
-        renderAll();
-        throw new Error(
-          `nothing was signed: your passkey would sign ${unseen.join(', ')}, which this page had not shown — it is shown now; read it and press again`,
-        );
-      }
-      const begin = await fetch('/api/auth/passkey/assert/begin', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          job_id: jobId,
-          step_id: step.id,
-          shown: { title: step.title, metadata: renderedMetadata },
-        }),
+      return P.ticket({
+        jobId,
+        stepId: step.id,
+        shown: { title: step.title, metadata: renderedMetadata },
+        onScreen: () => onScreen,
+        isGone: () => disposed,
+        signal: unmounted.signal,
+        // THE PASSKEY SIGNS ONLY WHAT WAS DRAWN (design f623e425 D3).
+        // The only way this surface reaches it is a step that never
+        // declared presence: the block is drawn now and the tap asked
+        // for again, so the approver reads before signing.
+        onUnseen: (unseen) => {
+          revealed = true;
+          renderAll();
+          return `nothing was signed: your passkey would sign ${unseen.join(', ')}, which this page had not shown — it is shown now; read it and press again`;
+        },
       });
-      if (begin.status === 409) throw new Error('No passkey enrolled — add one first.');
-      if (!begin.ok) {
-        // The gateway's refusal text names which of its steps refused
-        // (job fetch, stored passkeys, challenge mint); the status alone
-        // does not. The app's own copy of the ceremony says the same
-        // since 2e893e27 (backlog f3436d99).
-        const text = await begin.text().catch(() => '');
-        const refused = new Error(`presence ceremony unavailable (${begin.status}): ${text}`);
-        // The status travels with the error: a 412 means the step moved
-        // under this surface, which its callers answer differently.
-        refused.status = begin.status;
-        throw refused;
-      }
-      const opts = await begin.json();
-      if (disposed) throw offScreen();
-      let cred;
-      try {
-        cred = await navigator.credentials.get({
-          signal: unmounted.signal,
-          publicKey: {
-            challenge: b64uBytes(opts.publicKey.challenge).buffer,
-            rpId: opts.publicKey.rpId || undefined,
-            allowCredentials: (opts.publicKey.allowCredentials || []).map((c) => ({
-              type: c.type,
-              id: b64uBytes(c.id).buffer,
-            })),
-            userVerification: opts.publicKey.userVerification,
-            timeout: opts.publicKey.timeout,
-          },
-        });
-      } catch (err) {
-        // A prompt the cleanup aborted is the refusal it is, not the
-        // browser's AbortError.
-        if (disposed) throw offScreen();
-        throw err;
-      }
-      if (!cred) throw new Error('Passkey prompt returned no credential.');
-      if (disposed) throw offScreen();
-      const a = cred.response;
-      const finish = await fetch('/api/auth/passkey/assert/finish', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          challenge_id: opts.challenge_id,
-          credential: {
-            id: cred.id,
-            rawId: bytesB64u(cred.rawId),
-            type: cred.type,
-            response: {
-              authenticatorData: bytesB64u(a.authenticatorData),
-              clientDataJSON: bytesB64u(a.clientDataJSON),
-              signature: bytesB64u(a.signature),
-              userHandle: a.userHandle ? bytesB64u(a.userHandle) : null,
-            },
-          },
-        }),
-      });
-      if (!finish.ok) {
-        // e.g. 410 'challenge already spent or expired — begin again',
-        // or the verifier's own reason on a 401.
-        const text = await finish.text().catch(() => '');
-        throw new Error(`assertion rejected (${finish.status}): ${text}`);
-      }
-      const { ticket } = await finish.json();
-      // Unmounted while the finish was in flight: the ticket is never
-      // stamped with, so no stamp lands for a step no longer on screen;
-      // unspent, it lapses in its two minutes (7c53b1bf).
-      if (disposed) throw offScreen();
-      return ticket;
     }
 
     // A begin refused 412 says the step no longer matches what this
@@ -757,7 +590,6 @@
               },
               body: JSON.stringify({ role }),
             });
-            if (res.ok) presenceTicketHeld = ticket;
           }
         }
         if (!res.ok) {
@@ -867,10 +699,10 @@
           if (typeof onUpdate === 'function') onUpdate();
           return;
         }
-        // The completion carries the ticket this surface's signature was
-        // granted on, when it holds one: a presence-gated step is judged
-        // again on this request, and the stamp does not lend it its
-        // assurance (b568044a).
+        // The completion is sent BARE. A step that names sign-off roles
+        // completes on the live passkey stamps it holds (design
+        // 1ce67f7e): the signature above is the approval, and the server
+        // asks no second proof of the request that flips the status.
         const complete = (ticket) => {
           const headers = { 'Content-Type': 'application/json' };
           if (ticket) headers['x-presence-ticket'] = ticket;
@@ -880,53 +712,39 @@
             body: JSON.stringify({ status: 'completed' }),
           });
         };
-        // The held ticket is spent on the attempt it rode, whatever the
-        // answer: kept, it rode every later completion from this mount
-        // long past its two-minute life (backlog 3ce3c15f). In a finally,
-        // because a request that THREW has no answer, and the ticket
-        // outlived it (d82b5f60).
-        let done;
-        try {
-          done = await complete(presenceTicketHeld);
-        } finally {
-          presenceTicketHeld = null;
+        // A completion refused for PRESENCE ({required: "presence"}) is
+        // the one shape that still takes a ticket on the completing
+        // request: a presence step that names NO sign-off role, whose
+        // completion is its only act. It is answered with ONE ceremony
+        // on the step as shown, and ONE retry (3ce3c15f; P.completeOnce).
+        // The ticket is the gateway's, minted by that ceremony for this
+        // step and this person, and rides that retry alone. Never a
+        // second ceremony.
+        // (A step whose STAMPS do not carry it — a role unsigned, or a
+        // signature past its age — is refused without that key, naming
+        // the roles under missing_or_stale_roles: the roster below
+        // offers those signatures again, and no ticket would help.)
+        const refusedForPresence = P.refusedForPresence;
+        const answer = await P.completeOnce({
+          put: complete,
+          ticket: presenceTicket,
+          onAsk: () => {
+            progress.push('Completing needs your passkey');
+            renderAll();
+          },
+        });
+        if (answer.failed) {
+          const e = answer.failed;
+          error = `Could not complete: ${e && e.message ? e.message : e}`;
+          // The decision DID land: the host re-reads the step, and a
+          // 412 also takes down the claim this mount can no longer
+          // vouch for (d82b5f60).
+          if (e && e.status === 412) stepMovedUnderUs();
+          else if (typeof onUpdate === 'function') onUpdate();
+          return;
         }
-        // A completion refused for PRESENCE — after a reload the stamp is
-        // already on the step and this mount holds no ticket; a held one
-        // may have expired; or no role this user signs is required — is
-        // answered with ONE ceremony on the step as shown, and ONE retry
-        // (3ce3c15f). It used to print the raw 422, and the only way on
-        // was to edit the comment until the shape moved and a signature
-        // was forced. The ticket is the gateway's, minted by that
-        // ceremony for this step and this person; the server judges it on
-        // the retry exactly as on a stamp. Never a second ceremony.
-        const refusedForPresence = async (res) => {
-          if (res.status !== 422) return false;
-          const refusal = await res
-            .clone()
-            .json()
-            .catch(() => null);
-          return Boolean(refusal && refusal.required === 'presence');
-        };
-        let retried = false;
-        if (await refusedForPresence(done)) {
-          progress.push('Completing needs your passkey');
-          renderAll();
-          let ticket;
-          try {
-            ticket = await presenceTicket();
-          } catch (e) {
-            error = `Could not complete: ${e && e.message ? e.message : e}`;
-            // The decision DID land: the host re-reads the step, and a
-            // 412 also takes down the claim this mount can no longer
-            // vouch for (d82b5f60).
-            if (e && e.status === 412) stepMovedUnderUs();
-            else if (typeof onUpdate === 'function') onUpdate();
-            return;
-          }
-          done = await complete(ticket);
-          retried = true;
-        }
+        const done = answer.done;
+        const retried = answer.retried;
         if (!done.ok) {
           // 400: a required-at-done contract this surface did not
           // satisfy — name it, never swallow it (v1's ApprovalSurface
@@ -1015,11 +833,47 @@
   // 6093cf13 — the pin used to reach signedText alone, and canonical and
   // notShown only through one empty-screen case). Pure functions of their
   // arguments: exposing them grants nothing.
-  mount.signed = Object.freeze({ signedText, canonical, notShown, scrollNote });
+
+  // The bundle registers its mount only once passkey-ceremony.js has
+  // run. It is a classic script, so it cannot import; it adds the shared
+  // file's script tag itself, from the directory it was served from, and
+  // the host — which already waits for a registration — knows nothing of
+  // it. A shared file that does not load registers a mount that says so,
+  // rather than leaving the step blank: an approval surface that cannot
+  // run its ceremony must not look like one that can.
+  function withPasskey(ready, failed) {
+    if (window.__boss_passkey) return ready(window.__boss_passkey);
+    const script = document.createElement('script');
+    script.src = '/plugins/passkey-ceremony.js';
+    script.onload = () =>
+      window.__boss_passkey ? ready(window.__boss_passkey) : failed('it ran and defined nothing');
+    script.onerror = () => failed('it did not load');
+    document.head.appendChild(script);
+  }
 
   if (typeof window.__boss_register_step_plugin !== 'function') {
     console.error('[sign-off-plugin] __boss_register_step_plugin not on window');
     return;
   }
-  window.__boss_register_step_plugin('sign-off', mount);
+  withPasskey(
+    (shared) => {
+      P = shared;
+      ({ signedText, scrollNote, canonical, notShown } = shared);
+      // The copies of presence.ts's functions, where signOffPlugin.test.ts
+      // can hold them equal to the app's on generated inputs (CLAUDE.md
+      // §9a; 6093cf13 — the pin used to reach signedText alone, and
+      // canonical and notShown only through one empty-screen case). Pure
+      // functions of their arguments: exposing them grants nothing.
+      mount.signed = Object.freeze({ signedText, canonical, notShown, scrollNote });
+      window.__boss_register_step_plugin('sign-off', mount);
+    },
+    (why) => {
+      window.__boss_register_step_plugin('sign-off', (container) => {
+        const p = document.createElement('p');
+        p.className = 'step-error';
+        p.textContent = `This sign-off surface cannot run: /plugins/passkey-ceremony.js — ${why}. Nothing can be signed here; reload the page.`;
+        container.append(p);
+      });
+    },
+  );
 })();

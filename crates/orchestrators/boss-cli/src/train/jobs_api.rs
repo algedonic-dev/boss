@@ -774,6 +774,15 @@ pub(crate) fn dead_gate_run_hours(run: &Value, now: DateTime<Utc>) -> Option<i64
     (hours >= GATE_DEADLINE_HOURS).then_some(hours)
 }
 
+/// Whole minutes since a gate-run last said it was alive — the same
+/// reading as both clocks above — or `None` when it carries no stamp
+/// that parses. For the recorder's note on a run it is keeping waiting
+/// (`carried_verdict::blocked_note`, backlog 06ae925a).
+pub(crate) fn gate_run_quiet_minutes(run: &Value, now: DateTime<Utc>) -> Option<i64> {
+    let (_, (_, at)) = last_sign_of_life(&metadata_map(run))?;
+    Some((now - at).num_minutes())
+}
+
 /// The newest parseable of [`ALIVE_STAMPS`] — its key, its value verbatim
 /// and its instant — or `None` when `opened_at` itself does not parse
 /// (no stamp, no claim). A stamp that does not parse is skipped, never a
@@ -2215,12 +2224,24 @@ mod tests {
     // waits it out — and ONLY it: anything past the connect may have
     // landed a write.
 
-    /// The tests' wait: the same decisions, over milliseconds.
-    const QUICK_ROLL: RollWait = RollWait {
-        window: Duration::from_millis(40),
-        first: Duration::from_millis(2),
-        cap: Duration::from_millis(5),
-    };
+    // Every test below that can reach the wait runs on a PAUSED runtime
+    // clock and walks the production [`ROLL_WAIT`] itself, so what it
+    // asserts is how many attempts went out and in what order — never
+    // how many real seconds that took. Until backlog 2bd6c5a8 they
+    // shared a 40 ms real-time window (`QUICK_ROLL`), and the window is
+    // measured from before the FIRST attempt: gate-run b3c19ff2
+    // (2026-10-08) spent 7 s of a stalled build node inside one
+    // loopback round trip and the wait gave up after "1 attempts" on a
+    // car that had touched nothing here. On a paused clock only the
+    // wait's own sleeps move time, so a slow attempt costs no budget.
+    // A test whose op never waits holds no bound to miss; it is paused
+    // too, so a regression that made it wait fails on its count at
+    // once instead of sleeping the two minutes first.
+
+    /// How many attempts [`ROLL_WAIT`] makes against an API that never
+    /// comes back: one at 0 s, then after waits of 2, 4, 8 and seven of
+    /// 15 s (119 s), and a last one after the 1 s the window had left.
+    const WINDOW_ATTEMPTS: u32 = 12;
 
     /// A journal that keeps its lines, so a test can read what the
     /// operator would have seen.
@@ -2228,12 +2249,12 @@ mod tests {
         move |l| lines.lock().unwrap().push(l.to_string())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_refused_connect_is_waited_out_until_the_api_answers() {
         let mut calls = 0u32;
         let lines = std::sync::Mutex::new(Vec::new());
         let out: Result<u8> = waiting_out_a_roll(
-            &QUICK_ROLL,
+            &ROLL_WAIT,
             "jobs api POST /api/jobs",
             &keeping_journal(&lines),
             || {
@@ -2260,9 +2281,13 @@ mod tests {
             );
             assert!(l.contains("POST /api/jobs"), "names the call: {l}");
         }
+        // The order of the waits, read off the clock the wait itself
+        // moved: 2 s from a standing start, then 4 s.
+        assert!(lines[0].contains("in 2s (0s of 120s)"), "{}", lines[0]);
+        assert!(lines[1].contains("in 4s (2s of 120s)"), "{}", lines[1]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn only_a_refused_connect_is_waited_out() {
         // Everything past the connect is either an ANSWER (any status)
         // or a request that may have reached the server — a timeout or
@@ -2278,7 +2303,7 @@ mod tests {
                 let mut calls = 0u32;
                 let lines = std::sync::Mutex::new(Vec::new());
                 let out: Result<()> = waiting_out_a_roll(
-                    &QUICK_ROLL,
+                    &ROLL_WAIT,
                     &format!("jobs api {method} /api/jobs"),
                     &keeping_journal(&lines),
                     || {
@@ -2298,12 +2323,12 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_roll_that_outlasts_the_window_fails_naming_the_elapsed_time() {
         let mut calls = 0u32;
         let lines = std::sync::Mutex::new(Vec::new());
         let err = waiting_out_a_roll::<(), _, _>(
-            &QUICK_ROLL,
+            &ROLL_WAIT,
             "jobs api POST /api/jobs",
             &keeping_journal(&lines),
             || {
@@ -2313,11 +2338,12 @@ mod tests {
         )
         .await
         .expect_err("a jobs API still dark after the window is an outage");
-        assert!(calls > 1, "it waited before giving up ({calls} attempt)");
+        assert_eq!(calls, WINDOW_ATTEMPTS, "it walked the whole window");
+        assert_eq!(lines.into_inner().unwrap().len() as u32, calls - 1);
         let said = format!("{err:#}");
         assert!(
             said.contains("jobs api POST /api/jobs")
-                && said.contains("refused every connection for")
+                && said.contains("refused every connection for 120s (12 attempts")
                 && said.contains("Connection refused (os error 61)"),
             "the failure names the call, the elapsed time and the cause: {said}"
         );
@@ -2404,7 +2430,7 @@ mod tests {
         ("503 Service Unavailable", "policy-unreachable"),
     ];
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_policy_outage_is_waited_out_on_an_idempotent_call() {
         for (status, body) in OUTAGES {
             for method in [Method::GET, Method::PUT, Method::DELETE] {
@@ -2412,7 +2438,7 @@ mod tests {
                 let lines = std::sync::Mutex::new(Vec::new());
                 let client = reqwest::Client::new();
                 let resp = send_through(
-                    &QUICK_ROLL,
+                    &ROLL_WAIT,
                     &format!("jobs api {method} /api/jobs/x"),
                     &keeping_journal(&lines),
                     || client.request(method.clone(), &url),
@@ -2429,7 +2455,7 @@ mod tests {
                 let lines = lines.into_inner().unwrap();
                 assert_eq!(lines.len(), 1, "one visible line per wait: {lines:?}");
                 assert!(
-                    lines[0].contains("policy service") && lines[0].contains("retrying"),
+                    lines[0].contains("policy service") && lines[0].contains("in 2s"),
                     "the wait names the policy service, not a dark API: {}",
                     lines[0]
                 );
@@ -2437,7 +2463,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_policy_answer_is_returned_first_time_with_its_body() {
         // A scope refusal is the same status and a real answer; a 503
         // that does not name the policy service is the roll wait's old
@@ -2450,7 +2476,7 @@ mod tests {
             let lines = std::sync::Mutex::new(Vec::new());
             let client = reqwest::Client::new();
             let resp = send_through(
-                &QUICK_ROLL,
+                &ROLL_WAIT,
                 "jobs api GET /api/jobs/x",
                 &keeping_journal(&lines),
                 || client.get(&url),
@@ -2473,7 +2499,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_write_that_meets_a_policy_outage_is_answered_not_resent() {
         // POST and PATCH stay final: whether a handler checks policy
         // before it writes is not this wait's to assume (the same bound
@@ -2483,7 +2509,7 @@ mod tests {
                 let (url, seen) = serving(vec![(status, body), ("200 OK", "{}")]).await;
                 let client = reqwest::Client::new();
                 let resp = send_through(
-                    &QUICK_ROLL,
+                    &ROLL_WAIT,
                     &format!("jobs api {method} /api/jobs"),
                     &|_| {},
                     || client.request(method.clone(), &url).body("{}"),
@@ -2501,23 +2527,24 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_policy_outage_that_outlasts_the_window_names_the_policy_service() {
         let (url, seen) = serving(vec![OUTAGES[0]]).await;
         let client = reqwest::Client::new();
-        let err = send_through(&QUICK_ROLL, "jobs api GET /api/jobs/x", &|_| {}, || {
+        let err = send_through(&ROLL_WAIT, "jobs api GET /api/jobs/x", &|_| {}, || {
             client.get(&url)
         })
         .await
         .expect_err("a policy service still failing after the window is an outage");
-        assert!(
-            seen.load(Ordering::SeqCst) > 1,
-            "it waited before giving up"
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            WINDOW_ATTEMPTS,
+            "it asked through the whole window before giving up"
         );
         let said = format!("{err:#}");
         assert!(
             said.contains("jobs api GET /api/jobs/x")
-                && said.contains("policy service")
+                && said.contains("policy service was still failing closed after 120s (12 attempts")
                 && said.contains("403 Forbidden: reading packets is refused: policy-unreachable"),
             "names the call, the service and the answer it kept getting: {said}"
         );

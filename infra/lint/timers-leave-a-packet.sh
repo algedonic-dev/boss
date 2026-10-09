@@ -418,6 +418,23 @@ CRONJOB_OWN_VISIBILITY=(
     # observation IS the record, and a maintenance packet beside it
     # would say less than the thing it wrapped.
     "boss-estate-observe"
+    # Files NO packet ITSELF, by decision (backlog 17f6170c): it holds a
+    # node capability (CAP_SYS_ADMIN, to fstrim the build node's disks)
+    # in the one namespace labelled privileged, so it is given no
+    # machine token and no door to the jobs API, and that namespace's
+    # admission policy refuses the second container this check would
+    # ask for. Its packet is filed FOR it, from outside (backlog
+    # 33e62de8): the dispatcher rule check-node-trim-daily files the
+    # forge's read-only check-node-trim verb every day — the last
+    # success and its age, the newest finished Job's outcome and cause,
+    # and the discard counters before and after — and
+    # watch-check-node-trim-daily alarms on a failed, stale, missing or
+    # evidence-free trim. That ops-request is on the silence roster by
+    # derivation (`ops-request/node-trim`). The entry STAYS, because
+    # this check reads the manifest and the manifest can never carry the
+    # wrapper; crates/core/boss-testing/tests/node_trim_check_sh.rs
+    # fails if the name is excused here and either rule is gone.
+    "boss-node-trim"
 )
 
 if [ -d "$CLUSTER_MANIFESTS" ]; then

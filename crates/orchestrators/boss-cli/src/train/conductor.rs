@@ -21,6 +21,12 @@ pub(super) struct Conductor {
     /// this file reaches for a policy constant any more; if a threshold
     /// appears in a decision here, it arrived on this field.
     policy: DeliveryPolicy,
+    /// The cluster's gate Jobs and their pod logs, as a port: `kubectl`
+    /// in production, a fake under test — a field rather than a call to
+    /// `Kubectl` at the site, so the tests drive the SAME lines reconcile
+    /// runs (`settle_gate_runs`) instead of a wiring that was dead code
+    /// under `cfg!(test)` (review e0ecb2f6, F4/m22).
+    cluster: Box<dyn GateCluster>,
 }
 
 /// The conductor as a car writer's door: `boss car unland`'s writer runs
@@ -270,6 +276,7 @@ impl Conductor {
             forge,
             owner,
             policy: DeliveryPolicy::compiled(),
+            cluster: Box::new(Kubectl::default()),
         })
     }
 
@@ -1349,12 +1356,17 @@ impl Conductor {
                         (
                             "receipt",
                             Some(format!(
-                                "NO VERDICT WAS PRODUCED. Active {hours}h with none recorded, \
-                                 past the gate Job's {GATE_DEADLINE_HOURS}h \
-                                 activeDeadlineSeconds, so the pod is gone and the checks never \
-                                 finished. Settled as LOST by the conductor's reconcile: this run \
-                                 says nothing about {branch}, and an infrastructure death is not \
-                                 a consist failure. Re-gate for a real verdict."
+                                "NO VERDICT WAS RECORDED. Active {hours}h with none, past the \
+                                 gate Job's {GATE_DEADLINE_HOURS}h activeDeadlineSeconds, by \
+                                 which the cluster has ended any Job this run had. What was \
+                                 observed is only that: no verdict reached this packet in that \
+                                 time. Whether the runner left none, or left one in a pod or a \
+                                 log the conductor could not read, is in the conductor's \
+                                 journal for this gate-run and — for a day after the Job \
+                                 ended — in `kubectl logs job/<its gate Job> -c gate`. Settled \
+                                 as LOST by the conductor's reconcile: this run says nothing \
+                                 about {branch}, and an infrastructure death is not a consist \
+                                 failure. Re-gate for a real verdict."
                             )),
                         ),
                     ],
@@ -1573,6 +1585,289 @@ impl Conductor {
             ));
         }
         Ok(())
+    }
+
+    /// Record the verdicts gate runners LEFT in their pod logs (backlog
+    /// 934ccad1; design bdc60b65, question `gate-verdict`). The runner of
+    /// the new layout writes nothing to the system of record — it runs a
+    /// car's branch and must never hold the estate token — so this, the
+    /// holder of the gates Role that runs no branch code, records for it.
+    /// The decisions are `carried_verdict`'s, pure and tested; this is
+    /// the adapter that reads the cluster and writes the step.
+    ///
+    /// DRIVEN FROM THE JOBS, NOT FROM THE PACKETS. One cluster read lists
+    /// every gate Job; a packet is asked about only when a Job labelled
+    /// as a carrier is its newest. So a gate whose Job finished while this
+    /// conductor or the jobs API was rolling is found on the next pass for
+    /// as long as the Job exists (24 h), and settled — the lost-during-a-
+    /// roll class (23188cc5) cannot recur by construction. A packet with
+    /// no carrier Job costs nothing beyond that one read.
+    ///
+    /// ONLY FROM A CONTAINER THAT HAS ENDED. The verdict is the frame the
+    /// gate container's termination message names (`carried_verdict`,
+    /// module doc), so a running gate is one pod read a pass and no log
+    /// read at all, and a line in a running pod's log decides nothing.
+    ///
+    /// IDEMPOTENT, AND NEVER OVER ANOTHER WRITER. A packet that is not
+    /// open, or whose `record-verdict` step is done, is left exactly as it
+    /// is: an old-layout runner's own report, the estate observer's
+    /// settle, a withdrawal, and this pass's earlier recording all read
+    /// the same here. The write is `complete_step` — the merge door, then
+    /// the status alone — so every reader of a gate-run reads it as it
+    /// read the runner's.
+    ///
+    /// NOTHING HERE IS FATAL TO THE PASS: an unreadable cluster, packet or
+    /// log, or a refused write, is logged by name and tried again next
+    /// pass, and the three-hour clock in `reap_dead_gate_runs` stays the
+    /// ceiling over all of it.
+    async fn record_carried_verdicts(&self) -> Result<()> {
+        let ns = self.cfg.gate_namespace.clone();
+        let jobs = self.cluster.gate_jobs(&ns).await?;
+        let mut by_packet: std::collections::BTreeMap<&str, Vec<GateJob>> = Default::default();
+        for j in &jobs {
+            by_packet
+                .entry(j.packet.as_str())
+                .or_default()
+                .push(j.clone());
+        }
+        for (packet, jobs) in by_packet {
+            if !jobs.iter().any(|j| j.carrier) {
+                continue;
+            }
+            let run = match self.get_job(packet).await {
+                Ok(run) => run,
+                Err(e) => {
+                    log(format!(
+                        "reconcile: gate-run {} has a verdict-carrying Job but could not be read \
+                         this pass (retries next): {e:#}",
+                        id8(packet)
+                    ));
+                    continue;
+                }
+            };
+            // A verdict waiting on a read is said ONCE per state, not once
+            // per pass (review 47319ee7, N1): `waiting` latches it by packet.
+            let waiting_dir = Path::new(&self.cfg.home).join("gate-verdict-waiting");
+            let waiting = |kind: &str, line: String| {
+                if let Some(line) = waiting_line(&waiting_dir, packet, Some((kind, line))) {
+                    log(line);
+                }
+            };
+            // The common case for a day after every gate: already
+            // recorded. Silent, or the journal is this line 40 times a pass.
+            if verdict_owed(&run).is_err() {
+                waiting_line(&waiting_dir, packet, None);
+                continue;
+            }
+            let job = match carrier_subject(&jobs) {
+                Ok(job) => job,
+                Err(why) => {
+                    waiting(
+                        "no-subject",
+                        format!(
+                            "reconcile: gate-run {} owes a verdict and is not recorded from a \
+                             pod log — {why}",
+                            id8(packet)
+                        ),
+                    );
+                    continue;
+                }
+            };
+            // THE POD FIRST: whether the gate container has ended, and the
+            // termination message that names its receipt. A read that
+            // fails settles nothing — "could not see the pod" is not "the
+            // pod is gone", which only a list that answered empty says.
+            let pod = match self.cluster.gate_pod(&ns, &job.name).await {
+                Ok(pod) => pod,
+                Err(e) => {
+                    waiting(
+                        "pod-unreadable",
+                        format!(
+                            "reconcile: gate-run {} owes a verdict but the pod of its Job {} \
+                             could not be read ({e:#}) — NOT settled; the \
+                             {GATE_DEADLINE_HOURS}h clock is the ceiling",
+                            id8(packet),
+                            job.name
+                        ),
+                    );
+                    continue;
+                }
+            };
+            // The log only when the pod's end names a receipt in it.
+            let text = if !needs_log(&pod) {
+                String::new()
+            } else {
+                match self.cluster.gate_log(&ns, &job.name).await {
+                    Ok(text) => text,
+                    Err(e) => {
+                        waiting(
+                            "log-unreadable",
+                            format!(
+                                "reconcile: gate-run {} owes a verdict but the log of its Job \
+                                 {} could not be read ({e:#}) — NOT settled; the \
+                                 {GATE_DEADLINE_HOURS}h clock is the ceiling",
+                                id8(packet),
+                                job.name
+                            ),
+                        );
+                        continue;
+                    }
+                }
+            };
+            let (verdict, receipt) = match judge(&run, job, &pod, &text, &ns, Utc::now()) {
+                Carried::Wait(_) => continue,
+                Carried::Record { verdict, receipt } => (verdict, receipt),
+                Carried::Lost { receipt } => ("lost".to_string(), receipt),
+            };
+            log(format!(
+                "reconcile: gate-run {} — recording `{verdict}` from the pod log of Job {} \
+                 ({} bytes of receipt)",
+                id8(packet),
+                job.name,
+                receipt.len()
+            ));
+            let step = find_step(&run, "record-verdict", "Record the gate verdict");
+            if let Err(e) = self
+                .complete_step(
+                    &run,
+                    step,
+                    &[("verdict", Some(verdict)), ("receipt", Some(receipt))],
+                )
+                .await
+            {
+                log(format!(
+                    "reconcile: gate-run {} — the verdict from Job {} was NOT recorded this pass \
+                     (retries next; the log keeps it): {e:#}",
+                    id8(packet),
+                    job.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Say on the PACKET that its verdict is waiting on the recorder
+    /// (backlog 06ae925a). The read of the gate Jobs failed on every pass
+    /// for a day and the only record was one line in this pod's log; the
+    /// people and verbs waiting on a gate read the gate-run. So while the
+    /// read fails, each open gate-run that owes a verdict and has been
+    /// quiet long enough gets one metadata note through the merge door,
+    /// and on the pass the read works again each note still standing on
+    /// an open run is removed. `carried_verdict::blocked_note` decides,
+    /// pure and tested; this reads the packets and writes.
+    ///
+    /// NEVER FATAL, AND QUIET WHEN THERE IS NOTHING TO SAY: an unreadable
+    /// run or a refused write is logged and the rest are still told, and
+    /// a run already carrying this outage's note is not written again
+    /// (the merge door records an event per write). It runs only on a
+    /// failing pass and on the one that recovers, so a working cluster
+    /// pays nothing for it.
+    async fn note_recorder_blocked(
+        &self,
+        blocked: Option<&(String, String)>,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let runs = rows(
+            self.api(
+                Method::GET,
+                "/api/jobs?kind=gate-run&status=open&limit=100",
+                None,
+            )
+            .await?,
+        )?;
+        for r0 in runs {
+            let Ok(rid) = job_id(&r0) else { continue };
+            let run = match self.get_job(rid).await {
+                Ok(run) => run,
+                Err(e) => {
+                    log(format!(
+                        "reconcile: gate-run {} unreadable, so not told its verdict is waiting \
+                         on the recorder (retries next): {e:#}",
+                        id8(rid)
+                    ));
+                    continue;
+                }
+            };
+            let Some(note) = carried_verdict::blocked_note(
+                &run,
+                blocked.map(|(since, cause)| (since.as_str(), cause.as_str())),
+                gate_run_quiet_minutes(&run, now),
+                now,
+            ) else {
+                continue;
+            };
+            log(format!(
+                "reconcile: gate-run {} — {} the note that its verdict is waiting on the \
+                 recorder ({})",
+                id8(rid),
+                if note.is_null() {
+                    "removing"
+                } else {
+                    "writing"
+                },
+                carried_verdict::RECORDER_BLOCKED_KEY
+            ));
+            if let Err(e) = self
+                .merge_job_metadata(rid, vec![(carried_verdict::RECORDER_BLOCKED_KEY, note)])
+                .await
+            {
+                log(format!(
+                    "reconcile: gate-run {} — that note was NOT written this pass (retries \
+                     next): {e:#}",
+                    id8(rid)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The gate-run half of reconcile: record what runners left, THEN
+    /// bury the dead. Returns nothing, because nothing in it may stop
+    /// the pass that boards and merges trains — each half's error is
+    /// said and the other half still runs.
+    ///
+    /// THE ORDER IS THE POINT. A run with a receipt waiting in its pod
+    /// log must be recorded with it before either clock in the reap can
+    /// call it `lost`, which cannot be taken back.
+    ///
+    /// ITS OWN METHOD so a test drives these exact lines (review
+    /// e0ecb2f6, F4/m22): the first version sat inline in `reconcile`
+    /// behind `!cfg!(test)`, and nothing proved the pass was called,
+    /// called first, or survived. `reconcile` itself has no test in this
+    /// crate — it opens with a `git clone` of the upstream — so its one
+    /// line calling this is held by a source pin beside the tests.
+    ///
+    /// A cluster that cannot be read is said when it starts, hourly while
+    /// it lasts and when its cause changes — not once per pass, and not
+    /// once per outage (`cluster_read_line`): this runs every two
+    /// minutes. And it is said WHERE A READER IS: on each gate-run it
+    /// keeps waiting (`note_recorder_blocked`), not only in this pod's log.
+    pub(super) async fn settle_gate_runs(&self, now: DateTime<Utc>) {
+        let read = self.record_carried_verdicts().await;
+        let failure = read.as_ref().err().map(|e| format!("{e:#}"));
+        let latch = Path::new(&self.cfg.home).join("gate-jobs-read.failing");
+        let said = cluster_read_line(&latch, failure.as_deref(), Utc::now());
+        let recovered = failure.is_none() && said.is_some();
+        if let Some(line) = said {
+            log(line);
+        }
+        // The outage as the latch holds it; a latch that could not be
+        // written still names this pass's failure.
+        let blocked = failure.as_deref().map(|why| {
+            carried_verdict::outage(&latch)
+                .unwrap_or_else(|| (crate::gate::stamp(now), carried_verdict::cause_of(why)))
+        });
+        if (blocked.is_some() || recovered)
+            && let Err(e) = self.note_recorder_blocked(blocked.as_ref(), now).await
+        {
+            log(format!(
+                "reconcile: the gate-runs kept waiting could not be told so this pass \
+                 (non-fatal; retries next): {e:#}"
+            ));
+        }
+        if let Err(e) = self.reap_dead_gate_runs(now).await {
+            log(format!("reconcile: gate-run reap failed (non-fatal): {e}"));
+        }
     }
 
     /// A change that landed buries its own verdicts. A closed gate-run
@@ -2202,8 +2497,26 @@ impl Conductor {
         .await;
         let manifest_text = admitted.map_err(GateLaunchFailed::unfiled)?;
         let ns = self.cfg.gate_namespace.clone();
+        // The instance's edit level, read here by the holder of the token
+        // and handed to the Job (backlog 934ccad1): the pod that runs the
+        // train's tree makes no request for it. Unreadable, none is
+        // handed and the gate's own lint says so — never fatal to a launch.
+        let edit_level = match self
+            .api(Method::GET, crate::dispatch::EDIT_LEVEL_PATH, None)
+            .await
+        {
+            Ok(answer) => answer,
+            Err(e) => {
+                log(format!(
+                    "gate launch for {branch}: the instance's edit level could not be read to \
+                     hand to the gate ({e:#}) — none is handed"
+                ));
+                None
+            }
+        };
         let start = |run_id: &str| -> Result<()> {
             let job = crate::gate::render_job(&manifest_text, branch, run_id, "--auto")?;
+            let job = crate::gate::hand_edit_level(&job, edit_level.as_ref());
             let mut child = crate::gate::kubectl(&ns)
                 .args(["create", "-f", "-"])
                 .stdin(std::process::Stdio::piped())
@@ -2400,9 +2713,7 @@ impl Conductor {
         // Under it, a run NO Job carries and nothing has held for
         // ORPHAN_GATE_RUN_MINUTES is settled from a read of the gates
         // Role this conductor already holds (backlog 137c176d).
-        if let Err(e) = self.reap_dead_gate_runs(now).await {
-            log(format!("reconcile: gate-run reap failed (non-fatal): {e}"));
-        }
+        self.settle_gate_runs(now).await;
         if let Err(e) = self.bury_landed_verdicts(now).await {
             log(format!(
                 "reconcile: burying landed verdicts failed this pass (retries next): {e}"
@@ -6572,6 +6883,7 @@ mod tests {
             forge,
             owner: crate::owner::resolver("http://jobs.invalid"),
             policy: policy(),
+            cluster: Box::new(FakeCluster::new(Vec::new(), "")),
         }
     }
 
@@ -7290,6 +7602,754 @@ mod tests {
             observed >= before - chrono::Duration::seconds(1) && observed <= after,
             "observed_at {observed} is the cluster read, not the pass start {now}"
         );
+    }
+
+    // -- verdicts recorded from the runner's pod log (934ccad1) ------------
+
+    /// The cluster as the recorder's port sees it: the Jobs it lists, one
+    /// pod and one log for all of them, and the reads it was asked for
+    /// (shared, so a test still holds them once the conductor owns the
+    /// fake).
+    #[derive(Clone)]
+    struct FakeCluster {
+        jobs: Result<Vec<GateJob>, String>,
+        pod: Result<GatePod, String>,
+        log: Result<String, String>,
+        pod_reads: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        log_reads: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeCluster {
+        /// The pod ENDED as an honest runner of `log` ends: its
+        /// termination message is the trailer the log holds.
+        fn new(jobs: Vec<GateJob>, log: &str) -> Self {
+            Self {
+                jobs: Ok(jobs),
+                pod: Ok(carried_verdict::fixtures::ended(log)),
+                log: Ok(log.to_string()),
+                pod_reads: Default::default(),
+                log_reads: Default::default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl GateCluster for FakeCluster {
+        async fn gate_jobs(&self, _: &str) -> Result<Vec<GateJob>> {
+            self.jobs.clone().map_err(|e| anyhow!(e))
+        }
+        async fn gate_pod(&self, ns: &str, job: &str) -> Result<GatePod> {
+            self.pod_reads.lock().unwrap().push(format!("{ns}/{job}"));
+            self.pod.clone().map_err(|e| anyhow!(e))
+        }
+        async fn gate_log(&self, ns: &str, job: &str) -> Result<String> {
+            self.log_reads.lock().unwrap().push(format!("{ns}/{job}"));
+            self.log.clone().map_err(|e| anyhow!(e))
+        }
+    }
+
+    /// A conductor against `jobs` whose cluster is `cluster`.
+    fn carried_conductor(jobs: String, cluster: &FakeCluster) -> Conductor {
+        let mut c = settle_conductor(jobs);
+        c.cluster = Box::new(cluster.clone());
+        c
+    }
+
+    const CARRIED_HEAD: &str = "26b7e3081a52923879dd07cda85c2f3f74e7abdf";
+
+    fn carrier_job(packet: &str, carrier: bool, failed: Option<bool>) -> GateJob {
+        GateJob {
+            name: "gate-fix-x-abc12".into(),
+            uid: "uid-1".into(),
+            packet: packet.into(),
+            created: "2026-10-06T19:00:00Z".into(),
+            carrier,
+            finished: failed.map(|failed| Finished {
+                failed,
+                reason: "BackoffLimitExceeded".into(),
+                at: "2026-10-06T19:40:00Z".into(),
+            }),
+        }
+    }
+
+    /// A gate-run that owes its verdict, as the jobs API returns it.
+    fn owing_gate_run() -> Value {
+        json!({
+            "id": "orph", "kind": "gate-run", "status": "open",
+            "metadata": { "branch": "fix/x", "sha": CARRIED_HEAD },
+            "steps": [{"id": "s-v", "spec_slug": "record-verdict",
+                       "title": "Record the gate verdict", "status": "ready", "metadata": {}}]
+        })
+    }
+
+    /// run.sh's two lines, for `payload` printed by Job `gate-fix-x-abc12`.
+    fn carried_log(verdict: &str, payload: &str) -> String {
+        use sha2::{Digest, Sha256};
+        format!(
+            "gate-runner: receipt {payload}\ngate-runner: receipt-end v1 job=gate-fix-x-abc12 \
+             verdict={verdict} bytes={} sha256={}\n",
+            payload.len(),
+            hex::encode(Sha256::digest(payload.as_bytes()))
+        )
+    }
+
+    /// The new-layout path end to end: the runner wrote nothing, its gate
+    /// container has ended on a termination message naming its receipt
+    /// (the Job's own condition may lag the container by a moment), and
+    /// the conductor records what the log carries — on the packet the JOB
+    /// names, whatever the receipt says about itself.
+    #[tokio::test]
+    async fn a_verdict_left_in_the_pod_log_is_recorded_on_the_jobs_packet() {
+        let (jobs, writes) = settle_api(owing_gate_run(), false).await;
+        let payload = json!({"verdict": "failed", "head": CARRIED_HEAD, "packet": "another",
+                             "fails": ["test: a_thing - FAILED"]})
+        .to_string();
+        let cluster = FakeCluster::new(
+            vec![carrier_job("orph", true, None)],
+            &carried_log("failed", &payload),
+        );
+        carried_conductor(jobs, &cluster)
+            .record_carried_verdicts()
+            .await
+            .expect("recorded");
+        let w = writes.lock().unwrap().clone();
+        let order: Vec<(String, String)> =
+            w.iter().map(|(m, p, _)| (m.clone(), p.clone())).collect();
+        assert_eq!(
+            order,
+            vec![
+                ("PATCH".into(), "/api/jobs/orph/steps/s-v/metadata".into()),
+                ("PUT".into(), "/api/jobs/orph/steps/s-v".into()),
+            ],
+            "the verdict through the merge door, then the status alone — as run.sh wrote it"
+        );
+        assert_eq!(w[0].2["verdict"], "failed");
+        assert_eq!(w[1].2, json!({"status": "completed"}));
+        let receipt: Value = serde_json::from_str(w[0].2["receipt"].as_str().unwrap()).unwrap();
+        assert_eq!(receipt["fails"], json!(["test: a_thing - FAILED"]));
+        assert_eq!(receipt["recorded_by"]["job"], "gate-fix-x-abc12");
+        assert_eq!(receipt["recorded_by"]["head_matches_launch"], true);
+        assert_eq!(
+            *cluster.log_reads.lock().unwrap(),
+            vec!["boss-dev/gate-fix-x-abc12".to_string()]
+        );
+    }
+
+    /// Rollout: a Job without the carrier label is an old-layout runner
+    /// that reports for itself. Its packet is not even read.
+    #[tokio::test]
+    async fn an_old_layout_gate_is_left_to_its_own_runner() {
+        let (jobs, writes) = settle_api(owing_gate_run(), false).await;
+        let payload = json!({"verdict": "green", "head": CARRIED_HEAD}).to_string();
+        let cluster = FakeCluster::new(
+            vec![carrier_job("orph", false, Some(false))],
+            &carried_log("green", &payload),
+        );
+        carried_conductor(jobs, &cluster)
+            .record_carried_verdicts()
+            .await
+            .expect("nothing to do is not an error");
+        assert!(writes.lock().unwrap().is_empty());
+        assert!(cluster.log_reads.lock().unwrap().is_empty());
+    }
+
+    /// A receipt arriving twice, or after the packet was settled another
+    /// way (an old-layout script's own report, the observer, a
+    /// withdrawal): the step is done, so nothing is read and nothing
+    /// written — never a second verdict over the first.
+    #[tokio::test]
+    async fn a_packet_that_already_carries_a_verdict_is_never_written_again() {
+        let payload = json!({"verdict": "green", "head": CARRIED_HEAD}).to_string();
+        for (status, verdict) in [
+            ("open", "green"),
+            ("closed", "withdrawn"),
+            ("closed", "lost"),
+        ] {
+            let mut run = owing_gate_run();
+            run["status"] = json!(status);
+            run["steps"][0]["status"] = json!("completed");
+            run["steps"][0]["metadata"] = json!({"verdict": verdict});
+            let (jobs, writes) = settle_api(run, false).await;
+            let cluster = FakeCluster::new(
+                vec![carrier_job("orph", true, Some(false))],
+                &carried_log("green", &payload),
+            );
+            carried_conductor(jobs, &cluster)
+                .record_carried_verdicts()
+                .await
+                .expect("left alone");
+            assert!(
+                writes.lock().unwrap().is_empty(),
+                "a {status} packet carrying `{verdict}` was written again"
+            );
+            assert!(cluster.log_reads.lock().unwrap().is_empty());
+        }
+    }
+
+    /// AN INFRASTRUCTURE REFUSAL IS NOT A CONSIST FAILURE. The Job ended
+    /// and its log holds no complete receipt (an eviction, a node reset,
+    /// a script that died): `lost` at once, naming the Job — never
+    /// `failed`, and never three silent hours.
+    #[tokio::test]
+    async fn a_finished_job_with_no_receipt_is_settled_lost_and_named() {
+        let (jobs, writes) = settle_api(owing_gate_run(), false).await;
+        let cluster = FakeCluster::new(
+            vec![carrier_job("orph", true, Some(true))],
+            "gate-runner: swept 0 dead gate workspace(s) from /gate-runs\n",
+        );
+        carried_conductor(jobs, &cluster)
+            .record_carried_verdicts()
+            .await
+            .expect("settled");
+        let w = writes.lock().unwrap().clone();
+        assert_eq!(w[0].2["verdict"], "lost", "{w:?}");
+        let receipt = w[0].2["receipt"].as_str().unwrap();
+        assert!(
+            receipt.contains("gate-fix-x-abc12") && receipt.contains("BackoffLimitExceeded"),
+            "{receipt}"
+        );
+        assert_eq!(w[1].0, "PUT");
+    }
+
+    /// A running gate — WHATEVER ITS LOG HOLDS — an unreadable pod, an
+    /// unreadable log, and a refused write each cost one pass and nothing
+    /// else.
+    #[tokio::test]
+    async fn nothing_is_settled_on_what_could_not_be_read_and_no_refusal_is_fatal() {
+        let (jobs, writes) = settle_api(owing_gate_run(), false).await;
+        // A whole green frame in the log of a pod whose gate container
+        // is still running: not a verdict, and the log is not even read.
+        let green = json!({"verdict": "green", "head": CARRIED_HEAD}).to_string();
+        let mut running = FakeCluster::new(
+            vec![carrier_job("orph", true, None)],
+            &carried_log("green", &green),
+        );
+        running.pod = Ok(carried_verdict::fixtures::running());
+        carried_conductor(jobs.clone(), &running)
+            .record_carried_verdicts()
+            .await
+            .expect("waits");
+        assert_eq!(running.pod_reads.lock().unwrap().len(), 1);
+        assert!(
+            running.log_reads.lock().unwrap().is_empty(),
+            "a running gate's log was read"
+        );
+        // "Could not see the pod" is not "the pod is gone".
+        let mut dark_pod = FakeCluster::new(
+            vec![carrier_job("orph", true, Some(true))],
+            &carried_log("green", &green),
+        );
+        dark_pod.pod = Err("kubectl get pods did not answer within 30s and was killed".into());
+        carried_conductor(jobs.clone(), &dark_pod)
+            .record_carried_verdicts()
+            .await
+            .expect("an unreadable pod is logged, not fatal, and settles nothing");
+        assert!(dark_pod.log_reads.lock().unwrap().is_empty());
+        let mut dark_log = FakeCluster::new(
+            vec![carrier_job("orph", true, Some(true))],
+            &carried_log("green", &green),
+        );
+        dark_log.log = Err("pods \"x\" not found".into());
+        carried_conductor(jobs.clone(), &dark_log)
+            .record_carried_verdicts()
+            .await
+            .expect("an unreadable log is logged, not fatal, and settles nothing");
+        assert!(
+            writes.lock().unwrap().is_empty(),
+            "{:?}",
+            writes.lock().unwrap()
+        );
+        let mut dark = FakeCluster::new(vec![], "");
+        dark.jobs = Err("kubectl: forbidden".into());
+        assert!(
+            carried_conductor(jobs, &dark)
+                .record_carried_verdicts()
+                .await
+                .is_err(),
+            "an unreadable cluster is the caller's line to log, never an empty list"
+        );
+        // The jobs API refuses the flip (the step moved under the pass):
+        // logged, the pass goes on.
+        let (jobs, _) = settle_api(owing_gate_run(), true).await;
+        let payload = json!({"verdict": "green", "head": CARRIED_HEAD}).to_string();
+        let cluster = FakeCluster::new(
+            vec![carrier_job("orph", true, Some(false))],
+            &carried_log("green", &payload),
+        );
+        carried_conductor(jobs, &cluster)
+            .record_carried_verdicts()
+            .await
+            .expect("a refused write is not fatal to the pass");
+    }
+
+    /// THE FORGED FRAME, END TO END (review 7e5356f7's first probe: "a
+    /// forged green before the real failed frame records green"). The
+    /// log holds a green frame first and the runner's own `failed` after
+    /// it; the gate container ended on the runner's trailer. The packet
+    /// gets `failed`, with the runner's receipt.
+    #[tokio::test]
+    async fn a_green_frame_printed_before_the_runners_own_does_not_decide_the_verdict() {
+        let (jobs, writes) = settle_api(owing_gate_run(), false).await;
+        let forged = json!({"verdict": "green", "head": CARRIED_HEAD}).to_string();
+        let real = json!({"verdict": "failed", "head": CARRIED_HEAD,
+                          "fails": ["test: a_thing - FAILED"]})
+        .to_string();
+        let log = format!(
+            "{}{}",
+            carried_log("green", &forged),
+            carried_log("failed", &real)
+        );
+        let mut cluster = FakeCluster::new(vec![carrier_job("orph", true, Some(true))], &log);
+        cluster.pod = Ok(carried_verdict::fixtures::ended_on(
+            carried_log("failed", &real).lines().nth(1).unwrap(),
+            1,
+            "Error",
+        ));
+        carried_conductor(jobs, &cluster)
+            .record_carried_verdicts()
+            .await
+            .expect("recorded");
+        let w = writes.lock().unwrap().clone();
+        assert_eq!(w[0].2["verdict"], "failed", "{w:?}");
+        let receipt: Value = serde_json::from_str(w[0].2["receipt"].as_str().unwrap()).unwrap();
+        assert_eq!(receipt["fails"], json!(["test: a_thing - FAILED"]));
+        assert_eq!(receipt["recorded_by"]["exit_code"], 1);
+    }
+
+    /// NO EVIDENCE IS NOT A PASS, END TO END: the gate container was
+    /// killed (no termination message) with a whole green frame in its
+    /// log. `lost`, which strikes no car — never green, never `failed`.
+    #[tokio::test]
+    async fn a_killed_gate_with_a_green_frame_in_its_log_is_lost_not_green() {
+        let (jobs, writes) = settle_api(owing_gate_run(), false).await;
+        let green = json!({"verdict": "green", "head": CARRIED_HEAD}).to_string();
+        let mut cluster = FakeCluster::new(
+            vec![carrier_job("orph", true, Some(true))],
+            &carried_log("green", &green),
+        );
+        cluster.pod = Ok(carried_verdict::fixtures::ended_on("", 137, "OOMKilled"));
+        carried_conductor(jobs, &cluster)
+            .record_carried_verdicts()
+            .await
+            .expect("settled");
+        let w = writes.lock().unwrap().clone();
+        assert_eq!(w[0].2["verdict"], "lost", "{w:?}");
+        assert!(
+            w[0].2["receipt"].as_str().unwrap().contains("OOMKilled"),
+            "{w:?}"
+        );
+        assert!(
+            cluster.log_reads.lock().unwrap().is_empty(),
+            "no message names a receipt, so the log is not read"
+        );
+        // And what `lost` means to the reader that strikes cars.
+        let mut run = owing_gate_run();
+        run["steps"][0]["status"] = json!("completed");
+        run["steps"][0]["metadata"] = w[0].2.clone();
+        assert_eq!(
+            crate::train_gate::standing(&run),
+            crate::train_gate::Standing::Lost
+        );
+    }
+
+    /// EXACTLY ONCE, ACROSS PASSES AND ACROSS A CONDUCTOR RESTART. Every
+    /// reconcile is its own process, so "already recorded" lives only on
+    /// the packet: a second pass over the same finished Job — a new
+    /// conductor, the same cluster — reads the step done and writes
+    /// nothing, and the verdict the first pass left is the one that stands.
+    #[tokio::test]
+    async fn a_second_pass_over_a_recorded_gate_writes_nothing() {
+        let (jobs, held) = stateful_runs_api(vec![owing_gate_run()]).await;
+        let payload = json!({"verdict": "failed", "head": CARRIED_HEAD}).to_string();
+        let cluster = FakeCluster::new(
+            vec![carrier_job("orph", true, Some(true))],
+            &carried_log("failed", &payload),
+        );
+        carried_conductor(jobs.clone(), &cluster)
+            .record_carried_verdicts()
+            .await
+            .expect("recorded");
+        let first = held.lock().unwrap()["orph"].clone();
+        assert_eq!(first["steps"][0]["metadata"]["verdict"], "failed");
+        // The second conductor meets a cluster that now tells another
+        // story — the pass must not even ask it.
+        let other = json!({"verdict": "green", "head": CARRIED_HEAD}).to_string();
+        let later = FakeCluster::new(
+            vec![carrier_job("orph", true, Some(true))],
+            &carried_log("green", &other),
+        );
+        carried_conductor(jobs, &later)
+            .record_carried_verdicts()
+            .await
+            .expect("left alone");
+        assert_eq!(
+            held.lock().unwrap()["orph"],
+            first,
+            "the second pass changed a recorded verdict"
+        );
+        assert!(later.pod_reads.lock().unwrap().is_empty());
+        assert!(later.log_reads.lock().unwrap().is_empty());
+    }
+
+    /// r11 of review 7e5356f7: a packet no carrier Job is on is not READ
+    /// — not its packet, not its pod, not its log. The old-layout test
+    /// above could not see the packet read; this one counts it.
+    #[tokio::test]
+    async fn a_packet_with_no_carrier_job_is_never_read() {
+        use axum::routing::get;
+        let gets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let g = gets.clone();
+        let app = axum::Router::new().fallback(get(move || {
+            let g = g.clone();
+            async move {
+                g.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                axum::Json(owing_gate_run())
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let payload = json!({"verdict": "green", "head": CARRIED_HEAD}).to_string();
+        let cluster = FakeCluster::new(
+            vec![carrier_job("orph", false, Some(false))],
+            &carried_log("green", &payload),
+        );
+        carried_conductor(format!("http://{addr}"), &cluster)
+            .record_carried_verdicts()
+            .await
+            .expect("nothing to do");
+        assert_eq!(
+            gets.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the packet of an old-layout gate was read"
+        );
+        assert!(cluster.pod_reads.lock().unwrap().is_empty());
+    }
+
+    /// A jobs API holding `runs` by id and KEEPING what is written: the
+    /// step merge door merges into the first step's metadata, the step
+    /// PUT overlays it, the list answers every run it holds, and an id
+    /// it does not hold is 404 — so a pass can be read back, and a second
+    /// writer in the same pass meets what the first one left.
+    async fn stateful_runs_api(
+        runs: Vec<Value>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Value>>>,
+    ) {
+        use axum::extract::Path;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::{get, patch, put};
+        use axum::{Json, Router};
+        use std::sync::{Arc, Mutex};
+
+        let held: Arc<Mutex<std::collections::BTreeMap<String, Value>>> = Arc::new(Mutex::new(
+            runs.into_iter()
+                .map(|r| (r["id"].as_str().unwrap().to_string(), r))
+                .collect(),
+        ));
+        let (h1, h2, h3, h4) = (held.clone(), held.clone(), held.clone(), held.clone());
+        let h5 = held.clone();
+        let app = Router::new()
+            .route(
+                "/api/jobs",
+                get(move || {
+                    let h = h1.clone();
+                    async move {
+                        let rows: Vec<Value> = h.lock().unwrap().values().cloned().collect();
+                        let total = rows.len();
+                        Json(json!({ "data": rows, "total": total }))
+                    }
+                }),
+            )
+            .route(
+                "/api/jobs/{id}",
+                get(move |Path(id): Path<String>| {
+                    let h = h2.clone();
+                    async move {
+                        match h.lock().unwrap().get(&id) {
+                            Some(r) => Json(r.clone()).into_response(),
+                            None => (StatusCode::NOT_FOUND, "job not found").into_response(),
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/jobs/{id}/metadata",
+                // The merge door: a key is set, a null key is deleted.
+                patch(move |Path(id): Path<String>, Json(b): Json<Value>| {
+                    let h = h5.clone();
+                    async move {
+                        let mut held = h.lock().unwrap();
+                        let Some(run) = held.get_mut(&id) else {
+                            return (StatusCode::NOT_FOUND, "job not found").into_response();
+                        };
+                        let md = run["metadata"].as_object_mut().unwrap();
+                        for (k, v) in b.as_object().cloned().unwrap_or_default() {
+                            if v.is_null() {
+                                md.remove(&k);
+                            } else {
+                                md.insert(k, v);
+                            }
+                        }
+                        StatusCode::NO_CONTENT.into_response()
+                    }
+                }),
+            )
+            .route(
+                "/api/jobs/{id}/steps/{sid}/metadata",
+                patch(
+                    move |Path((id, _sid)): Path<(String, String)>, Json(b): Json<Value>| {
+                        let h = h3.clone();
+                        async move {
+                            let mut held = h.lock().unwrap();
+                            let Some(run) = held.get_mut(&id) else {
+                                return (StatusCode::NOT_FOUND, "job not found").into_response();
+                            };
+                            let step = &mut run["steps"][0];
+                            if step["status"] == "completed" {
+                                return (StatusCode::CONFLICT, "step is completed").into_response();
+                            }
+                            for (k, v) in b.as_object().cloned().unwrap_or_default() {
+                                step["metadata"][k.as_str()] = v;
+                            }
+                            StatusCode::NO_CONTENT.into_response()
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/api/jobs/{id}/steps/{sid}",
+                put(
+                    move |Path((id, _sid)): Path<(String, String)>, Json(b): Json<Value>| {
+                        let h = h4.clone();
+                        async move {
+                            let mut held = h.lock().unwrap();
+                            let Some(run) = held.get_mut(&id) else {
+                                return (StatusCode::NOT_FOUND, "job not found").into_response();
+                            };
+                            for (k, v) in b.as_object().cloned().unwrap_or_default() {
+                                run["steps"][0][k.as_str()] = v;
+                            }
+                            StatusCode::NO_CONTENT.into_response()
+                        }
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), held)
+    }
+
+    /// The verdict a held run's `record-verdict` step ended with.
+    fn held_verdict(
+        held: &std::sync::Mutex<std::collections::BTreeMap<String, Value>>,
+        id: &str,
+    ) -> (Value, Value) {
+        let run = held.lock().unwrap()[id].clone();
+        (
+            run["steps"][0]["status"].clone(),
+            run["steps"][0]["metadata"]["verdict"].clone(),
+        )
+    }
+
+    /// m16 of review e0ecb2f6. One packet the jobs API will not return —
+    /// closed and reaped, a refused scope — must not cost every packet
+    /// after it its verdict: the walk is per packet.
+    #[tokio::test]
+    async fn one_unreadable_packet_does_not_stop_the_carried_pass() {
+        let mut run = owing_gate_run();
+        run["id"] = json!("b-run");
+        let (jobs, held) = stateful_runs_api(vec![run]).await;
+        let payload = json!({"verdict": "green", "head": CARRIED_HEAD}).to_string();
+        let cluster = FakeCluster::new(
+            vec![
+                carrier_job("a-gone", true, Some(false)),
+                carrier_job("b-run", true, Some(false)),
+            ],
+            &carried_log("green", &payload),
+        );
+        carried_conductor(jobs, &cluster)
+            .record_carried_verdicts()
+            .await
+            .expect("an unreadable packet is said, not fatal");
+        assert_eq!(
+            held_verdict(&held, "b-run"),
+            (json!("completed"), json!("green")),
+            "the packet after the unreadable one was not recorded"
+        );
+    }
+
+    /// A gate-run old enough for the three-hour clock to call it dead.
+    fn stale_owing_run(now: DateTime<Utc>) -> Value {
+        let mut run = owing_gate_run();
+        run["metadata"]["opened_at"] = json!(crate::gate::stamp(now - chrono::Duration::hours(4)));
+        run
+    }
+
+    /// m22 of review e0ecb2f6: the lines reconcile runs. The carried pass
+    /// goes FIRST — a run the clock would call lost, with a receipt
+    /// waiting in its pod log, ends with the receipt's verdict.
+    #[tokio::test]
+    async fn a_receipt_waiting_in_a_pod_log_is_recorded_before_the_clock_calls_the_run_lost() {
+        let now = Utc::now();
+        let (jobs, held) = stateful_runs_api(vec![stale_owing_run(now)]).await;
+        let payload = json!({"verdict": "green", "head": CARRIED_HEAD}).to_string();
+        let cluster = FakeCluster::new(
+            vec![carrier_job("orph", true, Some(false))],
+            &carried_log("green", &payload),
+        );
+        carried_conductor(jobs, &cluster)
+            .settle_gate_runs(now)
+            .await;
+        assert_eq!(
+            held_verdict(&held, "orph"),
+            (json!("completed"), json!("green")),
+            "the reap ran before the carried pass, or the pass did not run"
+        );
+        assert_eq!(cluster.log_reads.lock().unwrap().len(), 1);
+    }
+
+    /// m22, the other half: a cluster that cannot be read costs the
+    /// carried pass and NOTHING ELSE. The reap behind it still settles
+    /// its dead run, and the outage is said on the latch, not thrown.
+    #[tokio::test]
+    async fn a_dark_cluster_costs_the_carried_pass_and_never_the_reap_behind_it() {
+        let now = Utc::now();
+        let (jobs, held) = stateful_runs_api(vec![stale_owing_run(now)]).await;
+        let mut dark = FakeCluster::new(vec![], "");
+        dark.jobs = Err("kubectl get jobs did not answer within 30s and was killed".into());
+        let mut c = carried_conductor(jobs, &dark);
+        // Its own home: the latch is a file, and the other tests of this
+        // pass share the default one.
+        c.cfg.home = boss_testing::scratch_dir("carried-verdict-dark-cluster")
+            .display()
+            .to_string();
+        let latch = Path::new(&c.cfg.home).join("gate-jobs-read.failing");
+        let _ = fs::remove_file(&latch);
+        c.settle_gate_runs(now).await;
+        assert_eq!(
+            held_verdict(&held, "orph"),
+            (json!("completed"), json!("lost")),
+            "the carried pass's error stopped the reap"
+        );
+        let said = fs::read_to_string(&latch).expect("the outage is latched in the home");
+        assert!(said.contains("did not answer within 30s"), "{said}");
+        let _ = fs::remove_file(&latch);
+    }
+
+    /// Backlog 06ae925a: the outage reaches a READER. A cluster that
+    /// cannot be read is written on the gate-run it keeps waiting, by the
+    /// lines reconcile runs, BEFORE the reap — so even the run the clock
+    /// then calls lost says why nobody recorded it.
+    #[tokio::test]
+    async fn a_dark_cluster_is_said_on_the_gate_run_it_keeps_waiting() {
+        let now = Utc::now();
+        let (jobs, held) = stateful_runs_api(vec![stale_owing_run(now)]).await;
+        let mut dark = FakeCluster::new(vec![], "");
+        dark.jobs = Err("kubectl get jobs failed: E1007 08:56:24.1 69 refused".into());
+        let mut c = carried_conductor(jobs, &dark);
+        c.cfg.home = boss_testing::scratch_dir("carried-verdict-dark-note")
+            .display()
+            .to_string();
+        let latch = Path::new(&c.cfg.home).join("gate-jobs-read.failing");
+        let _ = fs::remove_file(&latch);
+        c.settle_gate_runs(now).await;
+        let note = held.lock().unwrap()["orph"]["metadata"][RECORDER_BLOCKED_KEY].clone();
+        assert_eq!(
+            note["cause"], "kubectl get jobs failed: E# #:#:#.# # refused",
+            "{note}"
+        );
+        assert!(
+            DateTime::parse_from_rfc3339(note["since"].as_str().unwrap()).is_ok(),
+            "{note}"
+        );
+        assert!(
+            recorder_blocked_line(&held.lock().unwrap()["orph"])
+                .is_some_and(|l| l.starts_with("verdict waiting: the recorder cannot read")),
+            "a reader of the packet has no line for it"
+        );
+        let _ = fs::remove_file(&latch);
+    }
+
+    /// The same note, pass after pass: written ONCE per outage and cause
+    /// (each write is an event), never on a run just launched, and
+    /// removed from an open run on the pass the read works again.
+    #[tokio::test]
+    async fn the_waiting_note_is_written_once_and_removed_when_the_read_works() {
+        let now = Utc::now();
+        let aged = |id: &str, minutes: i64| {
+            let mut run = owing_gate_run();
+            run["id"] = json!(id);
+            run["metadata"]["opened_at"] =
+                json!(crate::gate::stamp(now - chrono::Duration::minutes(minutes)));
+            run
+        };
+        let (jobs, held) = stateful_runs_api(vec![aged("quiet", 40), aged("fresh", 3)]).await;
+        let c = carried_conductor(jobs, &FakeCluster::new(vec![], ""));
+        let noted = |id: &str| held.lock().unwrap()[id]["metadata"][RECORDER_BLOCKED_KEY].clone();
+        let outage = ("2026-10-07T08:56:24Z".to_string(), "refused".to_string());
+
+        c.note_recorder_blocked(Some(&outage), now).await.unwrap();
+        assert_eq!(noted("quiet")["since"], "2026-10-07T08:56:24Z");
+        assert_eq!(
+            noted("fresh"),
+            Value::Null,
+            "a run three minutes old was told"
+        );
+
+        // A later pass of the same outage: the note is the one first written.
+        let first = noted("quiet");
+        let later = now + chrono::Duration::minutes(2);
+        c.note_recorder_blocked(Some(&outage), later).await.unwrap();
+        assert_eq!(noted("quiet"), first, "the same outage was written twice");
+
+        // A changed cause is a new fact for the reader.
+        let forbidden = (outage.0.clone(), "Forbidden".to_string());
+        c.note_recorder_blocked(Some(&forbidden), later)
+            .await
+            .unwrap();
+        assert_eq!(noted("quiet")["cause"], "Forbidden");
+
+        // The read works: gone, and the other keys untouched.
+        c.note_recorder_blocked(None, later).await.unwrap();
+        let run = held.lock().unwrap()["quiet"].clone();
+        assert!(run["metadata"].get(RECORDER_BLOCKED_KEY).is_none(), "{run}");
+        assert_eq!(run["metadata"]["branch"], "fix/x");
+    }
+
+    /// `reconcile` has no test of its own (it opens with a `git clone`),
+    /// so the one line that reaches the gate-run half is pinned in the
+    /// source: called once, before the open trains are read, and neither
+    /// half called from `reconcile` any other way.
+    #[test]
+    fn reconcile_settles_gate_runs_once_before_it_reads_the_trains() {
+        let src = include_str!("conductor.rs");
+        let body = &src[src
+            .find("pub(super) async fn reconcile(&self, now: DateTime<Utc>) -> Result<()> {")
+            .expect("reconcile")..];
+        let body = &body[..body.find("\n    }\n").expect("the end of reconcile")];
+        let call = "self.settle_gate_runs(now).await;";
+        assert_eq!(
+            body.matches(call).count(),
+            1,
+            "reconcile calls the gate-run half once"
+        );
+        assert!(
+            body.find(call).unwrap()
+                < body
+                    .find("kind=pr-train&status=open")
+                    .expect("the trains read"),
+            "the gate-run half runs before the trains are read"
+        );
+        for direct in ["self.record_carried_verdicts(", "self.reap_dead_gate_runs("] {
+            assert!(
+                !body.contains(direct),
+                "reconcile calls `{direct}` beside settle_gate_runs — the tested lines are no longer the ones it runs"
+            );
+        }
     }
 
     /// An orphan queued for a head a car already vouches for.

@@ -1,0 +1,148 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: boss-node-maintenance
+  labels:
+    app.kubernetes.io/part-of: boss
+    boss.dev/purpose: node-maintenance
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all
+  namespace: boss-node-maintenance
+  labels:
+    app.kubernetes.io/part-of: boss
+    boss.dev/purpose: node-maintenance
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: boss-node-trim
+  namespace: boss-node-maintenance
+  labels:
+    app.kubernetes.io/part-of: boss
+    boss.dev/purpose: node-maintenance
+spec:
+  schedule: "40 12 * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 1800
+      template:
+        metadata:
+          labels:
+            app: boss-node-trim
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          enableServiceLinks: false
+          hostNetwork: false
+          hostPID: false
+          hostIPC: false
+          nodeSelector:
+            boss.dev/purpose: build
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: trim
+              image: 10.20.0.15:3000/david/alpine-k8s:1.33.3@sha256:cdeda0da2cd6896023cc5f96505bc94a699a989dff2bfc3e2008ab92eab1e93a
+              securityContext:
+                privileged: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+                  add:
+                    - SYS_ADMIN
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 16Mi
+                limits:
+                  cpu: 500m
+                  memory: 64Mi
+              volumeMounts:
+                - name: gate
+                  mountPath: /trim/gate
+                  readOnly: true
+                - name: ephemeral
+                  mountPath: /trim/ephemeral
+                  readOnly: true
+              command:
+                - /bin/sh
+                - -c
+              args:
+                - |
+                  set -u
+                  # The four paths are parameters only so the pin can RUN
+                  # this text (inline shell nothing executes is untested
+                  # shell); the pod sets no env, so it gets the defaults.
+                  GATE="${TRIM_GATE:-/trim/gate}"
+                  EPHEMERAL="${TRIM_EPHEMERAL:-/trim/ephemeral}"
+                  OUT="${TRIM_TERMINATION_LOG:-/dev/termination-log}"
+                  SYS="${TRIM_SYS_BLOCK:-/sys/block}"
+                  # Every line goes to the log AND the termination message,
+                  # so the result is on the pod's status as well as in a
+                  # log that needs a second grant to read.
+                  say() {
+                    echo "node-trim: $*"
+                    echo "node-trim: $*" >>"$OUT" 2>/dev/null || true
+                  }
+                  # The EFFECT, beside the claim: each NVMe's completed
+                  # discards and discarded sectors (fields 12 and 14 of
+                  # its stat), before and after.
+                  counters() {
+                    for s in "$SYS"/nvme*/stat; do
+                      [ -r "$s" ] || continue
+                      say "$1 ${s%/stat}: $(awk '{print "discards=" $12 " sectors=" $14}' "$s")"
+                    done
+                    return 0
+                  }
+                  # A gate volume that is not mounted leaves its directory
+                  # on EPHEMERAL: then both paths are one filesystem and
+                  # the drive this exists for would go untrimmed in
+                  # silence. Refuse, by name.
+                  gd=$(stat -c %d "$GATE") || { say "RED cannot stat $GATE"; exit 1; }
+                  ed=$(stat -c %d "$EPHEMERAL") || { say "RED cannot stat $EPHEMERAL"; exit 1; }
+                  if [ "$gd" = "$ed" ]; then
+                    say "RED $GATE and $EPHEMERAL are one filesystem (device $gd): the gate volume is not mounted, nothing trimmed"
+                    exit 1
+                  fi
+                  counters before
+                  rc=0
+                  for m in "$GATE" "$EPHEMERAL"; do
+                    if out=$(fstrim -v "$m" 2>&1); then
+                      say "$out"
+                    else
+                      say "RED fstrim $m failed: $out"
+                      rc=1
+                    fi
+                  done
+                  counters after
+                  if [ "$rc" -eq 0 ]; then say "OK"; else say "RED"; fi
+                  exit "$rc"
+          volumes:
+            - name: gate
+              hostPath:
+                path: /var/mnt/gate/seed
+                type: Directory
+            - name: ephemeral
+              hostPath:
+                path: /var/local/gate-seed
+                type: Directory

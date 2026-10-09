@@ -1,45 +1,50 @@
-//! THE RECLAIM FOLLOWS THE BUILD.
+//! THE FORGE'S DISK RECLAIM IS THE HOST'S, AND SO IS ITS RECORD.
 //!
-//! Measured on the forge host, 2026-09-11 (backlog `0357e0eb`): six
-//! consecutive observations fifteen minutes apart read 89, 100, 99,
-//! **60**, 92, 98 GB free of 227. The locomotive refuses to START a CI
-//! run below 40 GB (`infra/forge/locomotive.sh`, `BOSS_CI_MIN_FREE_GB`;
-//! 70 until 2026-09-16),
-//! so the 04:03 trough sat ten gigabytes under the door a train boards
-//! through — and a locomotive refusal happens BEFORE any check runs, so
-//! it says nothing about the branch while striking every car aboard.
-//! Four clean cars lost five departures that way on 2026-08-22 and a
-//! whole day went to holding on 2026-09-05.
+//! HOW IT GOT HERE. Measured on the forge host, 2026-09-11 (backlog
+//! `0357e0eb`): six observations fifteen minutes apart read 89, 100, 99,
+//! **60**, 92, 98 GB free of 227, with the locomotive refusing to START
+//! a CI run below 70 — a refusal that happens before any check runs and
+//! strikes every car aboard. The fill was event-driven (every CI run
+//! builds and pulls a per-train `boss-ci:<sha>` image) and the reclaim
+//! timer-driven (`disk-floor-sweep.timer`, hourly), so a `reclaim` job
+//! was added to the CI workflow: at the end of every run it measured the
+//! disk and, below the sweep's floor, POSTed an ops-request for the
+//! `reclaim-disk` verb, signed `automation:ci-disk-reclaim`. This file
+//! pinned that trigger.
 //!
-//! THE CAUSE IS A CADENCE MISMATCH, NOT A SHORTAGE, and both floors are
-//! individually right. The FILL is event-driven: every CI run builds and
-//! pulls a per-train `boss-ci:<sha>` image into the system docker
-//! daemon. The RECLAIM is timer-driven: `disk-floor-sweep.timer` runs
-//! hourly and its unit defends 100 GB — deliberately higher than the
-//! locomotive's 40, so a floor buys headroom above the one being
-//! defended. A dip whose amplitude exceeds that 30 GB gap, inside one
-//! timer interval, walks straight through it.
+//! WHY IT IS GONE (backlog `37742794`; David's answer to design-doc
+//! `c8502e17`, question `ci-reclaim`, 2026-10-07). A CI job runs branch
+//! code. The machine door's gate refuses, once a port enforces, a
+//! request with no estate machine token, and decision `c395e62c`
+//! (2026-10-05) keeps that token away from anything that runs a branch.
+//! So the CI job's packet is DELIBERATELY REFUSED under enforce — and a
+//! request whose designed answer is a refusal is a line in every
+//! would-refuse window that can never be cleared. The job and its script
+//! are deleted. "The reclaim itself still runs; the record of it moves
+//! to the forge host disk-floor sweep, which already watches that disk."
 //!
-//! So the reclaim must follow the EVENT that fills the disk. The
-//! mechanism was already complete and only the trigger was missing: the
-//! forge runs an ops-runner on a ~1-minute poll, and `reclaim-disk` is
-//! an allowlisted bounded verb (`infra/ops/verbs/reclaim-disk.json`) that runs the
-//! SAME `disk-floor-sweep.sh` the timer runs. `request-reclaim-disk.sh`
-//! is the trigger, and the CI workflow — which already runs on every
-//! train, green or red, and needs no install step on the host — is what
-//! fires it.
+//! What is pinned here now:
+//!  - no workflow sends anything to the system of record: no address, no
+//!    identity header, no jobs-API path, and no trigger script to call;
+//!  - the reclaim still runs without it — the hourly timer is there, and
+//!    its unit defends a floor ABOVE the one the locomotive refuses at
+//!    (the two floors moved to 100 and 40 on 2026-09-16; 30 GB apart
+//!    when the trigger was built, 60 now);
+//!  - the sweep records what it did where its own packet can carry it:
+//!    the floor, free space before and after, what the per-train image
+//!    pass freed and how the run ended — on a run that had nothing to
+//!    do, on one that ended FLOOR UNMET, and never when nothing asked.
 //!
-//! What is pinned here:
-//!  - the workflow actually asks, after the heavy jobs, whatever their
-//!    verdict (a red train's CI filled the disk just the same);
-//!  - the request is the allowlisted verb with the allowlisted shape;
-//!  - the floor it asks for is the floor the sweep's own unit defends,
-//!    read out of that unit rather than copied beside it (CLAUDE.md §9a
-//!    — one number wearing two names is how the sweep and the
-//!    locomotive drifted before);
-//!  - nothing about this can fail a CI run. An accelerator that reds a
-//!    train would cause the exact strike it exists to prevent, and the
-//!    hourly timer remains the independent floor.
+//! WHAT IS NOT CLAIMED. The reclaim no longer follows the build within a
+//! minute; it follows the clock. Whether an hour is still short enough
+//! is a number to watch on the sweep's packets (`free_gb_before`), and
+//! the repair if it is not is the timer's cadence — never a write from a
+//! CI job.
+//!
+//! tree-wide pin — it reads the CI workflows and the forge's units and
+//! runs the sweep, none of which a changed-file map attributes to this
+//! crate, so every scoped gate runs it (`tree_wide_pins` in
+//! infra/gate.sh).
 
 use boss_testing::{repo_root, write_exec};
 use std::path::PathBuf;
@@ -50,293 +55,367 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-const SCRIPT: &str = "infra/forge/request-reclaim-disk.sh";
+const SWEEP: &str = "infra/forge/disk-floor-sweep.sh";
 const SWEEP_UNIT: &str = "infra/forge/disk-floor-sweep.service";
-const WORKFLOW: &str = ".forgejo/workflows/ci.yml";
+const SWEEP_TIMER: &str = "infra/forge/disk-floor-sweep.timer";
+const WORKFLOWS: &str = ".forgejo/workflows";
+const ESTATE: &str = "infra/estate/estate.toml";
+const GONE: &[&str] = &[
+    "infra/forge/request-reclaim-disk.sh",
+    "infra/platform/automations/ci-disk-reclaim.toml",
+];
+const SUMMARY_VAR: &str = "BOSS_RUN_SUMMARY_FILE";
 
-/// Every fixture path carries the uid and the pid (`scratch`): the gate
-/// runs as uid 65534 and several of these suites share one machine, so a
-/// fixed temp path is a collision waiting for a parallel run, and a
-/// pid-only one waits for a recycled pid under the other uid (307df975).
-fn fixture_dir(name: &str) -> PathBuf {
-    boss_testing::scratch_dir(&format!("boss-reclaim-{name}"))
+// ---------------------------------------------------------------------
+// No CI job writes to the system of record
+// ---------------------------------------------------------------------
+
+/// The host of an estate.toml URL value: `sor_url = "http://H:P"` -> H.
+fn estate_host(key: &str) -> String {
+    let estate = read(ESTATE);
+    let url = estate
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("{key} = \"")))
+        .and_then(|l| l.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("{ESTATE} names no {key}"));
+    let host = url.split("://").nth(1).unwrap_or(url);
+    host.split([':', '/']).next().unwrap_or(host).to_string()
 }
 
-/// A stub `df` reporting a fixed number of free GB in POSIX columns, and
-/// a stub `curl` that records every invocation and answers with a
-/// plausible `{"id": ...}`. Driving the real script beside stubs is the
-/// idiom `infra/lint/ci-images-are-pruned-by-age.sh` already uses for
-/// the prune loop: no daemon, no network, no system of record.
-struct Stubs {
-    dir: PathBuf,
-    df: PathBuf,
-    curl: PathBuf,
+/// What a workflow line would have to hold to reach the system of
+/// record: its address (either spelling), the variable every sender
+/// reads it from, the identity header, or a jobs-API path.
+fn record_words() -> Vec<String> {
+    vec![
+        estate_host("sor_url"),
+        estate_host("sor_cluster_url"),
+        "BOSS_JOBS_URL".to_string(),
+        "x-boss-user".to_string(),
+        "/api/jobs".to_string(),
+        "boss-maintenance-wrap".to_string(),
+        "boss-step.sh".to_string(),
+    ]
 }
 
-fn stubs(name: &str, free_gb: u64, curl_exit: i32) -> Stubs {
-    let dir = fixture_dir(name);
-    let df = dir.join("df");
+/// `(file, line number, line)` for every live workflow line naming one.
+fn workflow_lines_that_reach_the_record(workflows: &[(String, String)]) -> Vec<String> {
+    let words = record_words();
+    let mut out = Vec::new();
+    for (name, text) in workflows {
+        for (n, line) in text.lines().enumerate() {
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            let lower = line.to_ascii_lowercase();
+            if let Some(w) = words
+                .iter()
+                .find(|w| lower.contains(&w.to_ascii_lowercase()))
+            {
+                out.push(format!("{name}:{}: names `{w}`: {}", n + 1, line.trim()));
+            }
+        }
+    }
+    out
+}
+
+fn workflows() -> Vec<(String, String)> {
+    let dir = repo_root().join(WORKFLOWS);
+    let mut out: Vec<(String, String)> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{WORKFLOWS}: {e}"))
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "yml" || x == "yaml"))
+        .map(|p| {
+            (
+                p.file_name().unwrap().to_string_lossy().into_owned(),
+                std::fs::read_to_string(&p).expect("a workflow"),
+            )
+        })
+        .collect();
+    out.sort();
+    assert!(
+        out.iter().any(|(n, _)| n == "ci.yml"),
+        "the scan found no ci.yml under {WORKFLOWS} — it has stopped seeing the workflows"
+    );
+    out
+}
+
+#[test]
+fn no_ci_job_sends_anything_to_the_system_of_record() {
+    let found = workflow_lines_that_reach_the_record(&workflows());
+    assert!(
+        found.is_empty(),
+        "a CI job runs branch code, so it may not hold the estate machine token (decision \
+         c395e62c), and without one a request to the system of record is one every machine gate \
+         refuses under enforce (David, design-doc c8502e17 `ci-reclaim`). These workflow lines \
+         reach for it:\n  {}",
+        found.join("\n  ")
+    );
+    for gone in GONE {
+        assert!(
+            !repo_root().join(gone).exists(),
+            "{gone} is back — the CI job's trigger and the identity it signed as were deleted \
+             with the job; the reclaim is the host sweep's, on its timer"
+        );
+    }
+    assert!(
+        !read(&format!("{WORKFLOWS}/ci.yml")).contains("\n  reclaim:"),
+        "ci.yml has a `reclaim` job again"
+    );
+}
+
+/// The scan has teeth: the job as it stood on 2026-10-07 is refused by
+/// each of the lines that made it a sender.
+#[test]
+fn the_deleted_job_would_be_refused() {
+    let sor = estate_host("sor_url");
+    let old = format!(
+        "  reclaim:\n    runs-on: docker\n    env:\n      BOSS_JOBS_URL: http://{sor}:7900\n    steps:\n      - name: ask\n        run: |\n          # curl -H 'x-boss-user: prose' is not a sender\n          curl -X POST \"$BASE/api/jobs\" -H \"X-Boss-User: $U\"\n"
+    );
+    let found = workflow_lines_that_reach_the_record(&[("ci.yml".to_string(), old)]);
+    assert_eq!(found.len(), 2, "{found:#?}");
+    assert!(
+        found[0].contains("ci.yml:4:") && found[1].contains("ci.yml:9:"),
+        "{found:#?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// The reclaim still runs: the timer, and a floor above the locomotive's
+// ---------------------------------------------------------------------
+
+fn defended_floor() -> u64 {
+    read(SWEEP_UNIT)
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Environment=BOSS_DISK_FLOOR_GB="))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_else(|| panic!("{SWEEP_UNIT} no longer pins Environment=BOSS_DISK_FLOOR_GB"))
+}
+
+#[test]
+fn the_host_timer_reclaims_with_no_trigger_and_defends_more_than_ci_needs() {
+    let timer = read(SWEEP_TIMER);
+    assert!(
+        timer
+            .lines()
+            .any(|l| l.trim().starts_with("OnUnitActiveSec=")),
+        "{SWEEP_TIMER} declares no cadence — with the CI trigger gone the timer is the only \
+         thing that runs the reclaim"
+    );
+    // The sweep's own bare default IS the floor CI refuses under — its
+    // header holds the two to one number (§9a, "MUST match the
+    // locomotive's") — so the unit's floor is read against that, here,
+    // without a second reader of the locomotive's script.
+    let refuses_below: u64 = read(SWEEP)
+        .lines()
+        .find_map(|l| l.split("${BOSS_DISK_FLOOR_GB:-").nth(1))
+        .and_then(|rest| rest.split('}').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{SWEEP} no longer reads BOSS_DISK_FLOOR_GB with a default"));
+    let floor = defended_floor();
+    assert!(
+        floor > refuses_below,
+        "the unit defends {floor} GB and CI refuses below {refuses_below}: a floor only buys \
+         headroom if it is ABOVE the one being defended, and the margin between them is all \
+         that covers a build between two ticks now"
+    );
+}
+
+// ---------------------------------------------------------------------
+// The record: the sweep leaves what it did for its own packet
+// ---------------------------------------------------------------------
+
+struct Run {
+    out: Output,
+    summary: PathBuf,
+}
+
+/// The sweep against stubs (the idiom of
+/// the_floor_sweep_keeps_the_compilers_cache.rs): `df` reports
+/// `free_gb`, both docker daemons answer and free nothing, the record
+/// is not asked.
+fn sweep(case: &str, free_gb: u64, with_summary: bool) -> Run {
+    let dir = boss_testing::scratch_dir(&format!("reclaim-record-{case}"));
+    let bin = dir.join("bin");
+    boss_testing::create_dir(&bin);
     write_exec(
-        &df,
+        &bin.join("df"),
         &format!(
             "#!/usr/bin/env bash\n\
              echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
-             echo \"/dev/fake 1 1 {} 50% /\"\n",
-            free_gb * 1024 * 1024
+             echo \"/dev/fake 1 1 $(({free_gb} * 1024 * 1024)) 50% /\"\n"
         ),
     );
-    let curl = dir.join("curl");
     write_exec(
-        &curl,
-        &format!(
-            "#!/usr/bin/env bash\n\
-             printf '%s\\n' \"$*\" >> {log}\n\
-             echo '{{\"id\":\"11111111-2222-3333-4444-555555555555\"}}'\n\
-             exit {exit}\n",
-            log = dir.join("calls").display(),
-            exit = curl_exit
-        ),
+        &bin.join("docker"),
+        "#!/usr/bin/env bash\n\
+         case \"$1 $2\" in\n\
+         'system df') echo 'TYPE TOTAL ACTIVE SIZE RECLAIMABLE'; echo 'Build Cache 40 12 7.2GB 6.1GB (84%)' ;;\n\
+         *) echo 'Total reclaimed space: 0B' ;;\n\
+         esac\n\
+         exit 0\n",
     );
-    Stubs { dir, df, curl }
+    write_exec(
+        &bin.join("system-docker"),
+        "#!/usr/bin/env bash\ncase \"$1\" in info) echo /var/lib/docker;; images) :;; esac\nexit 0\n",
+    );
+    write_exec(
+        &bin.join("curl"),
+        "#!/usr/bin/env bash\necho '{}'\nexit 0\n",
+    );
+    let sor_env = dir.join("sor.env");
+    let rendered = Command::new("bash")
+        .arg(repo_root().join("infra/estate/render-sor-env.sh"))
+        .arg("--to")
+        .arg(&sor_env)
+        .output()
+        .expect("render sor.env");
+    assert!(
+        rendered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rendered.stderr)
+    );
+    let summary = dir.join("summary.json");
+    let _ = std::fs::remove_file(&summary);
+    let mut cmd = Command::new("bash");
+    cmd.arg(repo_root().join(SWEEP))
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("BOSS_SOR_ENV", &sor_env)
+        .env("BOSS_CI_IMAGE_DOCKER", bin.join("system-docker"))
+        .env("BOSS_CI_IMAGE_DAEMON_ROOT", "/var/lib/docker")
+        .env("BOSS_SWEEP_CURL_CMD", bin.join("curl"))
+        .env("BOSS_DISK_FLOOR_GB", "100")
+        // Its own layout: no system of record, no token, and the summary
+        // only where this test says.
+        .env_remove("BOSS_JOBS_URL")
+        .env_remove(SUMMARY_VAR)
+        .env("BOSS_MACHINE_TOKEN_DIR", dir.join("no-machine-token"))
+        .current_dir(repo_root());
+    if with_summary {
+        cmd.env(SUMMARY_VAR, &summary);
+    }
+    Run {
+        out: cmd.output().expect("run the sweep"),
+        summary,
+    }
 }
 
-impl Stubs {
-    fn run(&self, jobs_url: Option<&str>) -> Output {
-        let mut cmd = Command::new("bash");
-        cmd.arg(repo_root().join(SCRIPT))
-            .env("BOSS_RECLAIM_DF_CMD", &self.df)
-            .env("BOSS_RECLAIM_CURL_CMD", &self.curl)
-            .env_remove("BOSS_JOBS_URL")
-            .current_dir(repo_root());
-        if let Some(url) = jobs_url {
-            cmd.env("BOSS_JOBS_URL", url);
-        }
-        cmd.output().unwrap_or_else(|e| {
-            panic!(
-                "run {}: {e} — the trigger does not exist yet, which is the point of this test",
-                SCRIPT
-            )
-        })
-    }
-
-    fn calls(&self) -> String {
-        std::fs::read_to_string(self.dir.join("calls")).unwrap_or_default()
-    }
-}
-
-fn say(out: &Output) -> String {
+fn say(r: &Run) -> String {
     format!(
         "exit {:?}\nstdout: {}\nstderr: {}",
-        out.status.code(),
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+        r.out.status.code(),
+        String::from_utf8_lossy(&r.out.stdout),
+        String::from_utf8_lossy(&r.out.stderr)
     )
 }
 
-/// The floor the sweep's own unit defends — the ONE definition the
-/// trigger must derive its request from rather than carry a copy of.
-fn defended_floor() -> String {
-    let unit = read(SWEEP_UNIT);
-    unit.lines()
-        .find_map(|l| l.trim().strip_prefix("Environment=BOSS_DISK_FLOOR_GB="))
-        .map(|v| v.trim().to_string())
-        .unwrap_or_else(|| {
-            panic!(
-                "{SWEEP_UNIT} no longer pins Environment=BOSS_DISK_FLOOR_GB — \
-                 the trigger reads its floor from there, so nothing can ask for \
-                 the floor the sweep actually defends"
-            )
-        })
-}
-
-// ---------------------------------------------------------------------
-// The wiring: the workflow asks, after the heavy jobs, whatever happened
-// ---------------------------------------------------------------------
-
-/// The job that fires the trigger. `test` is the last of the heavy jobs
-/// and `reclaim` follows it, so the slice runs to the end of the file.
-fn reclaim_job() -> String {
-    let ci = read(WORKFLOW);
-    let start = ci.find("\n  reclaim:").unwrap_or_else(|| {
+fn summary(r: &Run) -> serde_json::Value {
+    let text = std::fs::read_to_string(&r.summary).unwrap_or_else(|e| {
         panic!(
-            "{WORKFLOW} has no `reclaim` job — a CI run still fills the forge's \
-             disk with a per-train image and asks nobody to reclaim it, so the \
-             only reclaim is the hourly timer and a 30GB dip inside one interval \
-             walks through the locomotive's floor (backlog 0357e0eb)"
+            "the sweep left no summary at {} ({e}) — its packet would say `result=ok` and \
+             nothing about what the reclaim did, and with the CI job's request gone that was \
+             the only record there was\n{}",
+            r.summary.display(),
+            say(r)
         )
     });
-    ci[start + 1..].to_string()
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("the summary is not JSON ({e}): {text}"))
 }
 
 #[test]
-fn the_workflow_asks_for_a_reclaim_when_a_ci_run_completes() {
-    let job = reclaim_job();
+fn a_sweep_with_nothing_to_do_records_the_disk_it_found() {
+    let r = sweep("above", 180, true);
+    assert!(r.out.status.success(), "{}", say(&r));
+    let s = summary(&r);
+    assert_eq!(s["floor_gb"], "100", "{s}");
+    assert_eq!(s["free_gb_before"], "180", "{s}");
+    assert_eq!(s["free_gb_after"], "180", "{s}");
+    assert_eq!(s["freed_mib"], "0", "{s}");
+    assert_eq!(s["ci_image_prune_freed_mib"], "0", "{s}");
     assert!(
-        job.contains(SCRIPT),
-        "the `reclaim` job does not invoke {SCRIPT} — the trigger is what makes \
-         the reclaim follow the build instead of the clock"
+        s["sweep_outcome"]
+            .as_str()
+            .is_some_and(|o| o.contains("nothing more to do")),
+        "{s}"
     );
 }
 
 #[test]
-fn the_reclaim_waits_for_the_heavy_jobs_and_runs_whatever_their_verdict() {
-    let job = reclaim_job();
-    let needs = job
+fn a_sweep_that_ends_floor_unmet_records_that_and_still_fails() {
+    let r = sweep("unmet", 30, true);
+    assert_eq!(
+        r.out.status.code(),
+        Some(1),
+        "the record must not change how the sweep ends: FLOOR UNMET is a failed unit\n{}",
+        say(&r)
+    );
+    let s = summary(&r);
+    assert_eq!(s["free_gb_before"], "30", "{s}");
+    assert!(
+        s["sweep_outcome"]
+            .as_str()
+            .is_some_and(|o| o.contains("FLOOR UNMET")),
+        "{s}"
+    );
+}
+
+#[test]
+fn a_sweep_nobody_asked_for_a_summary_writes_none_and_ends_the_same() {
+    for (case, free, code) in [("quiet-above", 180, Some(0)), ("quiet-unmet", 30, Some(1))] {
+        let with = sweep(&format!("{case}-with"), free, true);
+        let without = sweep(case, free, false);
+        assert_eq!(without.out.status.code(), code, "{}", say(&without));
+        assert_eq!(with.out.status.code(), code, "{}", say(&with));
+        assert!(
+            !without.summary.exists(),
+            "the reclaim-disk verb and a hand run declare no summary file, and get none"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&with.out.stdout),
+            String::from_utf8_lossy(&without.out.stdout),
+            "the summary is a record, not a behaviour: the sweep says and does the same"
+        );
+    }
+}
+
+#[test]
+fn the_unit_declares_the_summary_once_and_its_step_carries_it() {
+    let unit = read(SWEEP_UNIT);
+    let live: Vec<&str> = unit
         .lines()
-        .find(|l| l.trim_start().starts_with("needs:"))
-        .unwrap_or_else(|| panic!("the `reclaim` job declares no `needs:`"))
-        .to_string();
-    // `fast` and `test` left this workflow on 2026-09-13 (design
-    // 128b5496: the Rust checks run as the train's cluster gate); `web`
-    // is the heavy job that remains on the forge.
-    for heavy in ["build-image", "web"] {
-        assert!(
-            needs.contains(heavy),
-            "the `reclaim` job does not wait for `{heavy}` ({needs}) — reclaiming \
-             while a job is still building frees nothing it is allowed to touch, \
-             because the space in flight is a live workspace volume"
-        );
-    }
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect();
+    let declared: Vec<&&str> = live
+        .iter()
+        .filter(|l| l.starts_with(&format!("Environment={SUMMARY_VAR}=")))
+        .collect();
+    assert_eq!(
+        declared.len(),
+        1,
+        "{SWEEP_UNIT} declares {SUMMARY_VAR} exactly once, in Environment=, so ExecStart (the \
+         producer) and ExecStopPost (the consumer) inherit one path: {declared:?}"
+    );
+    let path = declared[0].rsplit('=').next().unwrap_or("");
     assert!(
-        job.contains("always()"),
-        "the `reclaim` job is not guarded with always() — a RED train's CI built \
-         and pulled the same per-train image, so skipping the reclaim on failure \
-         drops the reclaim exactly when the disk is worst. It must also survive a \
-         locomotive refusal, which is the self-healing case: the door refused for \
-         want of disk, and this is what frees it before the next boarding."
+        path.starts_with('/') && !path.starts_with("/tmp/") && !path.starts_with("/var/tmp/"),
+        "the summary file ({path}) is not in a shared temp directory, where another account \
+         on the host could plant what the step then records"
     );
     assert!(
-        job.contains("continue-on-error: true"),
-        "the `reclaim` job is not continue-on-error — an accelerator that can red \
-         a train causes the strike it exists to prevent"
-    );
-}
-
-// ---------------------------------------------------------------------
-// The request: the allowlisted verb, with the floor the sweep defends
-// ---------------------------------------------------------------------
-
-#[test]
-fn below_the_floor_it_files_an_ops_request_for_the_reclaim_disk_verb() {
-    let s = stubs("below-floor", 60, 0);
-    let out = s.run(Some("http://10.20.0.34:7900"));
-    assert!(
-        out.status.success(),
-        "the trigger must never fail a CI run.\n{}",
-        say(&out)
-    );
-    let calls = s.calls();
-    assert!(
-        calls.contains("/api/jobs"),
-        "60GB free is below the sweep's floor and no packet was filed.\ncalls: \
-         {calls}\n{}",
-        say(&out)
-    );
-    for needle in [
-        "\"kind\":\"ops-request\"",
-        "\"host\":\"forge\"",
-        "\"verb\":\"reclaim-disk\"",
-    ] {
-        assert!(
-            calls.contains(needle),
-            "the filed packet does not carry {needle} — the ops-runner matches \
-             metadata.host exactly and reads the verb out of the allowlist, so a \
-             packet missing either sits open and unanswered.\ncalls: {calls}"
-        );
-    }
-    assert!(
-        !calls.contains("127.0.0.1"),
-        "the packet went somewhere other than the system of record it was given \
-         — a wrong target answers instead of erroring.\ncalls: {calls}"
-    );
-}
-
-#[test]
-fn the_floor_it_asks_for_is_the_floor_the_sweep_defends() {
-    let floor = defended_floor();
-    let s = stubs("floor-number", 10, 0);
-    let out = s.run(Some("http://10.20.0.34:7900"));
-    let calls = s.calls();
-    assert!(
-        calls.contains(&format!("\"args\":[\"{floor}\"]")),
-        "the trigger asked for a floor other than the {floor}GB \
-         {SWEEP_UNIT} defends. The reclaim-disk verb's own default is 25, which \
-         defends nothing in the band where CI refuses — and a copy of the number \
-         beside the unit is the §9a pair that already drifted once between the \
-         sweep and the locomotive. Read it from the unit.\ncalls: {calls}\n{}",
-        say(&out)
-    );
-}
-
-#[test]
-fn above_the_floor_it_files_nothing() {
-    let s = stubs("above-floor", 180, 0);
-    let out = s.run(Some("http://10.20.0.34:7900"));
-    assert!(
-        out.status.success(),
-        "a healthy host must be a quiet exit.\n{}",
-        say(&out)
+        live.iter().any(|l| l.starts_with("ExecStopPost=")
+            && l.contains("boss-step.sh maintenance-disk-floor-sweep run")),
+        "{SWEEP_UNIT}: boss-step.sh closes the run step from ExecStopPost, which is what reads \
+         and deletes the summary"
     );
     assert!(
-        s.calls().is_empty(),
-        "180GB free is above the sweep's floor: the sweep itself would log \
-         `nothing to do`, so filing a packet per CI run would put tens of \
-         auto-answered packets a day on the board for no work.\ncalls: {}",
-        s.calls()
-    );
-}
-
-// ---------------------------------------------------------------------
-// It can never fail the run it rides in
-// ---------------------------------------------------------------------
-
-#[test]
-fn an_unreachable_system_of_record_never_fails_the_run() {
-    // curl exit 7 — connection refused.
-    let s = stubs("unreachable", 60, 7);
-    let out = s.run(Some("http://10.20.0.34:7900"));
-    assert!(
-        out.status.success(),
-        "an unreachable system of record must cost this run its ACCELERATOR and \
-         nothing else: the hourly disk-floor-sweep.timer owes nothing to the SoR \
-         and remains the independent floor, so a best-effort request that fails \
-         costs latency, never a missed reclaim. Exiting non-zero here would red a \
-         train for a packet nobody could file.\n{}",
-        say(&out)
-    );
-    let both = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        both.contains("hourly") || both.contains("timer"),
-        "a failed request must say what still covers the disk, or the next reader \
-         has to re-derive it.\n{}",
-        say(&out)
-    );
-}
-
-#[test]
-fn it_refuses_to_guess_the_system_of_record() {
-    let s = stubs("no-url", 60, 0);
-    let out = s.run(None);
-    assert!(
-        out.status.success(),
-        "a missing BOSS_JOBS_URL is a configuration fault, and in a CI job a \
-         non-zero exit for one strikes the cars aboard.\n{}",
-        say(&out)
-    );
-    assert!(
-        s.calls().is_empty(),
-        "with no system of record named the trigger guessed one. Defaulting to \
-         127.0.0.1 is how weeks of maintenance packets landed on a \
-         non-authoritative instance (2026-08-17).\ncalls: {}",
-        s.calls()
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("BOSS_JOBS_URL"),
-        "the refusal does not name what is missing.\n{}",
-        say(&out)
+        read("infra/boss-step.sh").contains(SUMMARY_VAR),
+        "infra/boss-step.sh no longer merges {SUMMARY_VAR} onto the step"
     );
 }

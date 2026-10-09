@@ -190,6 +190,23 @@ if [[ "$TIMER_ETC" == "/etc/systemd/system" && "$(id -u)" != "0" ]]; then
     echo "error: units mode needs root to write $TIMER_ETC — re-run with sudo" >&2
     exit 1
 fi
+# WHICH MACHINE THIS IS, BEFORE THE FIRST UNIT FILE (backlog 62b09c57,
+# N7; infra/lib/host-check.sh carries the incident and the rule). The
+# one-time bootstrap in boss-gcp-converge.sh's header starts THIS file by
+# hand, so it asks for itself and does not lean on its caller: with a
+# seam below left at the host's default, the machine must hold the
+# address infra/estate/estate.toml declares for boss-gcp, or nothing is
+# installed and the exit is 78. The journal door's package install and
+# the ops runner's retirement marker are named here because those two
+# files serve both hosts and this caller is the one that knows which.
+# shellcheck source=infra/lib/host-check.sh
+. "$(dirname "$0")/../lib/host-check.sh"
+host_seam INSTALL_ETC /etc/systemd/system
+host_seam INSTALL_SYSTEMCTL systemctl
+host_seam INSTALL_APT_GET
+host_seam BOSS_OPS_RUNNER_RETIRED
+host_check boss-gcp install-units
+[ -z "$HOST_CHECK_VERDICT" ] || echo "install-units: host check — $HOST_CHECK_VERDICT"
 echo "==> install timer units from $REPO_ROOT (files only: no build, no schema, no restart)"
 
 # WHAT IT INSTALLED IS COUNTED, NOT ASSUMED. The tail line used to print

@@ -2,9 +2,13 @@
 
 One file per held kind, `<kind>.toml`, named for the workflow kind it
 holds (the row is `infra/platform/workflows/<kind>.toml`). **Holding a
-kind is dropping a file in; lifting the hold is a car that deletes it.**
-Nothing is appended anywhere, so two cars holding two kinds touch no
-shared line.
+kind is dropping a file in. Lifting a hold is a car too, and which car
+depends on why the kind is held:** a kind held only by its file is
+lifted by deleting the file; a kind held BY DEFAULT (its row declares a
+`writer` or an `executor`, below) stays held when its file is deleted,
+and is lifted by a file that says `drift_publish = "released"`. Nothing
+is appended anywhere, so two cars holding two kinds touch no shared
+line.
 
 ## Why this exists (backlog 083d240e)
 
@@ -81,13 +85,36 @@ R1 of the signer car, run 7cee49b9). Both pass through
   same act is the rollback. The CLI says the kind is held and stays held.
   Publishing does not lift a hold; only a car that changes this directory
   does. That is what makes a rollback stick.
+- **No machine voice asks for that door on a held kind** (backlog
+  c6bd9f18). Four voices name `boss workflow publish` as a remedy: the
+  item `infra/forge/registry-drift.sh` files after a converge, the
+  report of `infra/lint/the-live-protocols-are-the-authored-protocols.sh`,
+  the refusal `boss dispatch` gives a step with no agent block, and the
+  drain's standing prompt (`infra/dev/drain.md`, after each landing).
+  The first three ask this reader first, and the prompt tells its
+  reader to. For a held kind each says it is held, why, and what lifts
+  it, and names no publish. The converge files no item for a held kind
+  the tree is ahead on by an edit (that is the hold working, and
+  `lifts` already names the item that ends it) and says it on every run
+  instead, on its journal and in the `registry_drift` summary on its
+  packet; a held kind where live may carry work of its own (both moved,
+  side not measured) is filed, with the hold and no publish. An item
+  ALREADY OPEN for a held kind that still names the publish is
+  corrected by the converge through the metadata door and marked
+  `publish_withdrawn`; the mark, not the item's prose, says it is done
+  (a hold's own `why` may name the door), a hold whose text changes
+  re-corrects its item once, and a correction is counted only when the
+  item reads back corrected. If the holds cannot be read, none of the three
+  names a publish for any kind, and the converge files one item saying
+  so.
 - **What this does not guarantee.** It does not stop an actor who holds
   `publish` on `workflow` from running that hand door, at any hour,
   without David. Who may run it, and whether it should need a passkey, is
   a policy question this directory does not answer.
 - **Fail closed.** A file here that does not parse, lacks its `why`,
   carries an unknown key or state, names a kind the bundle does not
-  author, or is neither `README.md` nor `<kind>.toml` makes
+  author, or is neither `README.md` nor `<kind>.toml` — or this path
+  being anything but a directory, or a row file that does not parse — makes
   `publish-workflow` refuse every mode and `publish-drift` refuse the
   whole run in both modes (exit 78: nothing published). The pin
   `crates/core/boss-testing/tests/publish_drift_sh.rs`

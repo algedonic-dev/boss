@@ -1600,11 +1600,18 @@ fn install(dir: &Path, visudo_ok: bool, user: &str) -> Output {
             rc = if visudo_ok { 0 } else { 1 }
         ),
     );
+    // The fixture's passwd table: one ordinary account, root, and a
+    // second name for uid 0. Nobody else exists on this "host".
+    write_exec(
+        &bin.join("getent"),
+        "#!/bin/sh\n[ \"$1\" = passwd ] || exit 2\ncase \"$2\" in\n  kitwriter) echo 'kitwriter:x:1000:1000::/home/kitwriter:/bin/sh' ;;\n  root) echo 'root:x:0:0::/root:/bin/sh' ;;\n  toor) echo 'toor:x:0:0::/root:/bin/sh' ;;\n  broken) exit 1 ;;\n  *) exit 2 ;;\nesac\n",
+    );
     Command::new("bash")
         .arg(repo_root().join(INSTALLER))
         .env("INSTALL_KIT_LIBEXEC", dir.join("libexec"))
         .env("INSTALL_KIT_SUDOERS_DIR", dir.join("sudoers.d"))
         .env("INSTALL_VISUDO", bin.join("visudo"))
+        .env("INSTALL_KIT_GETENT", bin.join("getent"))
         .env("INSTALL_KIT_USER", user)
         .env("INSTALL_KIT_OWNER", "")
         .output()
@@ -1696,6 +1703,27 @@ fn a_rule_visudo_refuses_is_never_placed_and_root_is_never_the_grantee() {
         assert!(
             !install(&dir, true, bad).status.success(),
             "user {bad:?} was accepted"
+        );
+    }
+
+    // An account this host does not have, and a second name for uid 0
+    // (backlog ebfd2f46): a rule for a name nobody holds is granted to
+    // whoever is later given it, and uid 0 by another name is still root.
+    for (bad, why) in [
+        ("ghost", "there is no account 'ghost' on this host"),
+        ("toor", "is uid 0"),
+        // A lookup that failed is said as that, never as an absence.
+        ("broken", "could not look up the account 'broken'"),
+    ] {
+        let dir = scratch_dir("recovery-kit-install-no-account");
+        let out = install(&dir, true, bad);
+        let (so, se) = text(&out);
+        assert!(!out.status.success(), "user {bad:?} was accepted: {so}");
+        assert!(se.contains(why), "{bad}: {se}");
+        assert!(
+            !dir.join("sudoers.d/boss-recovery-kit").exists()
+                && !dir.join("libexec/recovery-kit-read").exists(),
+            "{bad}: something was installed for a refused user"
         );
     }
 }

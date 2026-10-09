@@ -71,9 +71,7 @@ async fn main() -> Result<()> {
         boss_policy_client::User::service("classes"),
     )?);
     let mode = Arc::new(boss_policy_client::role_reader::MountedReportMode::mount());
-    let tally = Arc::new(boss_policy_client::role_reporting::ReportTally::new(
-        boss_policy_client::role_service::REPORT_CAPACITY,
-    ));
+    let tally = boss_events::role_tally::durable("classes", mode.clone(), Some(&pool));
     let app = boss_classes::role_reports::mount_snapshot(
         ClassesApiState { classes, policy },
         roles.clone(),

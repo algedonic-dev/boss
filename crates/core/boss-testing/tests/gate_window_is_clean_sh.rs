@@ -298,13 +298,80 @@ fn it_refuses_a_gate_it_was_not_named_and_hours_that_are_not_a_number() {
     }
 }
 
+/// `clean()` as the machine gate's answer: the same halves, and the one
+/// launch roster generation its hours were judged under (design
+/// 3cc6152a, backlog 14fe115c).
+fn clean_machine() -> Value {
+    let mut doc = clean();
+    doc["gate"] = json!("machine-gate");
+    doc["log"]["gate"] = json!("machine-gate");
+    doc["roster_generations"] = json!([{
+        "generation": "sha256:0f0e0d",
+        "since": "2026-10-01T02:00:00Z",
+        "stated_by": "5a0c2f0e-8f2a-4b4e-9d57-3c2f6f1f7a10",
+        "service": "policy",
+        "unstated": null
+    }]);
+    doc
+}
+
+/// Row C's window is judged under ONE launch roster generation, and the
+/// judge reads that from the answer itself: the join already refuses a
+/// spanning window in `not_clean`, and an answer that names no
+/// generation at all — a build from before the rule — is refused like
+/// any other missing half, never read as "one".
+#[test]
+fn the_machine_window_names_the_one_generation_it_was_judged_under() {
+    let (code, out, err) = judge(&["machine-gate"], &clean_machine().to_string());
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(
+        out.contains("GATE-WINDOW-CLEAN gate=machine-gate hours=72")
+            && out.contains("roster_generation=sha256:0f0e0d"),
+        "the receipt names the generation, copied from the answer: {out}"
+    );
+    let second = json!({"generation": "sha256:aaaaaa", "since": "2026-10-05T00:00:00Z",
+        "stated_by": "5a0c2f0e-8f2a-4b4e-9d57-3c2f6f1f7a11", "service": "jobs", "unstated": null});
+    let unstated = json!({"generation": null, "since": "2026-10-01T02:00:00Z",
+        "stated_by": "5a0c2f0e-8f2a-4b4e-9d57-3c2f6f1f7a10", "service": "policy",
+        "unstated": "the process start carries no roster stamp"});
+    let mut absent = clean_machine();
+    absent.as_object_mut().unwrap().remove("roster_generations");
+    let mut two = clean_machine();
+    two["roster_generations"]
+        .as_array_mut()
+        .unwrap()
+        .push(second);
+    let mut none = clean_machine();
+    none["roster_generations"] = json!([]);
+    let mut silent = clean_machine();
+    silent["roster_generations"] = json!([unstated]);
+    for (what, doc, names) in [
+        (
+            "a build that names no generation",
+            absent,
+            "roster_generations",
+        ),
+        ("two generations inside the window", two, "sha256:aaaaaa"),
+        ("no generation on the log", none, "roster_generations"),
+        ("a stretch that stated none", silent, "no roster stamp"),
+    ] {
+        let (code, out, err) = judge(&["machine-gate"], &doc.to_string());
+        assert_eq!(code, 1, "{what}: {out}{err}");
+        assert!(!out.contains("GATE-WINDOW-CLEAN"), "{what}: {out}");
+        assert!(err.contains(names), "{what} names `{names}`: {err}");
+    }
+    // The policy check consults no launch record: it has no generation
+    // to name, and its receipt line is what it was.
+    let (code, out, err) = judge(&["policy-check"], &clean().to_string());
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(!out.contains("roster_generation"), "{out}");
+}
+
 /// Every required service is judged, not the first: a second service
 /// that never recorded refuses the window (row C's shape, 27 services).
 #[test]
 fn every_required_service_is_judged() {
-    let mut doc = clean();
-    doc["gate"] = json!("machine-gate");
-    doc["log"]["gate"] = json!("machine-gate");
+    let mut doc = clean_machine();
     doc["required_services"] = json!(["policy", "assets"]);
     let (code, _, err) = judge(&["machine-gate"], &doc.to_string());
     assert_eq!(code, 1, "{err}");

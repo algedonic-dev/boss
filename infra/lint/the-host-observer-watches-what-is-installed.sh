@@ -289,9 +289,9 @@ forge_unit="$repo/infra/forge/estate-observe-units.service"
     unobserved, which is how 72 failed forge-converge runs raised nothing (backlog c98dcf38)"
 grep -qx 'Environment=HOST_ID=forge' "$forge_unit" \
     || fail "$forge_unit does not name its host HOST_ID=forge (the estate node id)"
-grep -qx 'Environment=OBSERVE_UNITS_INSTALLER=/home/david/boss/infra/forge/install.sh' "$forge_unit" \
+grep -qx 'Environment=OBSERVE_UNITS_INSTALLER=/var/lib/boss/tree/current/infra/forge/install.sh' "$forge_unit" \
     || fail "$forge_unit does not derive its roster from the forge's own installer"
-grep -qx 'ExecStart=/home/david/boss/infra/estate/observe-units.sh' "$forge_unit" \
+grep -qx 'ExecStart=/var/lib/boss/tree/current/infra/estate/observe-units.sh' "$forge_unit" \
     || fail "$forge_unit does not run the one observer, infra/estate/observe-units.sh"
 ! grep -qE '^Environment="?UNITS=' "$forge_unit" \
     || fail "$forge_unit hardcodes a UNITS list — the second copy check 5 forbids for boss-gcp"

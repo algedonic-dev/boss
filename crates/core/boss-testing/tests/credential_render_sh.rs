@@ -617,7 +617,7 @@ fn the_forge_converge_renders_the_token_before_every_push() {
             .unwrap_or_else(|| panic!("forge-converge.sh has no line running {needle:?}"))
     };
     let render = at("credential-render.sh");
-    let push = at("infra/forge/offsite-push.sh");
+    let push = at("/forge/offsite-push.sh\"");
     assert!(
         render < push,
         "the token is rendered BEFORE the push reads it, on the same tick"

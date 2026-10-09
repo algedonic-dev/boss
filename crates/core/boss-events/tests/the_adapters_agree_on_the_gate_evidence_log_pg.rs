@@ -110,6 +110,8 @@ boss_testing::adapters_agree! {
         a_tie_at_one_instant_is_broken_by_the_event_id,
         the_window_reads_the_same_verdict_through_either_adapter,
         two_processes_join_across_a_clean_end_read_through_either_adapter,
+        the_actor_role_window_is_judged_per_process_through_either_adapter,
+        the_starts_a_roster_generation_is_judged_by_read_the_same_through_either_adapter,
     }
 }
 
@@ -390,6 +392,197 @@ async fn two_processes_join_across_a_clean_end_read_through_either_adapter<W: Wo
     );
 }
 
+/// Backlog e0bdba74: the actor-role report's facts take the same road —
+/// outbox, relay, `audit_log` — and are read by the same statement, so
+/// its window is judged from either adapter alike. `suite-role-jobs`
+/// restarted across a clean end; its first process sighted a shape
+/// before the read opened. The read keeps that sighting, the join
+/// refuses to call it unused, and another gate's read holds none of it.
+async fn the_actor_role_window_is_judged_per_process_through_either_adapter<W: World>(
+    w: &W,
+    adapter: &str,
+) {
+    use boss_core::gate_window::{LiveRead, join_window};
+    let gate = Gate::ActorRole;
+    let service = "suite-role-jobs";
+    let start = |instance: &str, at_: DateTime<Utc>| {
+        fact(
+            gate,
+            Fact::RecordingBegan,
+            service,
+            at_,
+            json!({"mode": "report", "since": at_, "instance": instance}),
+        )
+    };
+    let sighting = fact(
+        gate,
+        Fact::WouldRefuse,
+        service,
+        at(1),
+        json!({"instance": "role-a", "mode": "report", "recording_since": at(0),
+               "reason": "would-deny",
+               "key": {"actor": "agent-claude", "asserted_role": "platform-admin",
+                       "recorded_role": "engineering-agent", "action": "update",
+                       "resource": "job", "lookup_status": "registered",
+                       "would_deny": true}}),
+    );
+    for e in [
+        start("role-a", at(0)),
+        sighting.clone(),
+        fact(
+            gate,
+            Fact::RecordingEnded,
+            service,
+            at(5) - chrono::Duration::minutes(2),
+            json!({"instance": "role-a", "clean": true, "lost": 0, "unstated": 0}),
+        ),
+        start("role-b", at(5)),
+    ] {
+        w.record(e).await;
+    }
+    let live = |instance: &str| LiveRead {
+        service: service.into(),
+        answer: Ok(json!({"service": service, "report": {
+            "mode": "report", "recording_since": at(5), "rows": [], "overflow": 0,
+            "not_clean": [],
+            "evidence": {"recorder": true, "instance": instance, "lost": 0, "unstated": 0,
+                         "retrying": false, "last_error": null}}})),
+    };
+    let facts = read(w, gate, at(2)).await;
+    assert_eq!(
+        shape(&facts),
+        vec![
+            row("actor_role.recording_began", service, at(0)),
+            row("actor_role.would_refuse", service, at(1)),
+            row(
+                "actor_role.recording_ended",
+                service,
+                at(5) - chrono::Duration::minutes(2)
+            ),
+            row("actor_role.recording_began", service, at(5)),
+        ],
+        "{adapter}: the opening process's sighting is kept with its start"
+    );
+    let v = join_window(
+        gate,
+        &[service.to_string()],
+        at(2),
+        at(9),
+        Ok(facts),
+        vec![live("role-b")],
+    );
+    assert!(
+        !v.covers_requested_window
+            && v.not_clean
+                .iter()
+                .any(|why| why.contains("unknown final usage")),
+        "{adapter}: first seen before the window by a process that ended inside it: {v:?}"
+    );
+    // Read from after that process ended, the window is the second
+    // process's own, and clean.
+    let facts = read(w, gate, at(6)).await;
+    let v = join_window(
+        gate,
+        &[service.to_string()],
+        at(6),
+        at(9),
+        Ok(facts),
+        vec![live("role-b")],
+    );
+    assert!(v.covers_requested_window, "{adapter}: {v:?}");
+    assert!(
+        !shape(&read(w, Gate::MachineGate, at(0)).await)
+            .iter()
+            .any(|(kind, _, _)| kind.starts_with("actor_role.")),
+        "{adapter}: another gate's read holds none of this gate's kinds"
+    );
+}
+
+/// Review 6858ef1d, B1, through either adapter. The launch roster rule
+/// judges each required service by the start of the process running
+/// when the window opened and by each start inside it
+/// (`gate_window::judged_generations`). The port must hand back exactly
+/// those starts — each service's NEWEST before the window, roster stamp
+/// whole, and every one inside — or the rule would read a different
+/// verdict from the double than from the log.
+async fn the_starts_a_roster_generation_is_judged_by_read_the_same_through_either_adapter<
+    W: World,
+>(
+    w: &W,
+    adapter: &str,
+) {
+    use boss_core::gate_window::judged_generations;
+    let declared = "sha256:suite-declared";
+    let stamped = |service: &str, when: DateTime<Utc>, roster: serde_json::Value| {
+        let mut e = began(service, Mode::Report, when);
+        e.payload["roster"] = roster;
+        e
+    };
+    let good = || json!({"generation": declared, "commit": "suite"});
+    let unreadable = "the launch record /etc/boss-launch-record is unreadable: EIO";
+    for e in [
+        // An older process of the required service: replaced, the past.
+        stamped("suite-policy", at(0), good()),
+        // Its process at the window's opening could not read its record.
+        stamped(
+            "suite-policy",
+            at(1),
+            json!({"error": unreadable, "commit": null}),
+        ),
+        // Another service states a good start after it, before the
+        // window opens, and again inside it.
+        stamped("suite-jobs", at(2), good()),
+        stamped("suite-jobs", at(6), good()),
+    ] {
+        w.record(e).await;
+    }
+    let required = ["suite-policy".to_string()];
+    let facts = read(w, Gate::MachineGate, at(4)).await;
+    assert_eq!(
+        shape(&facts),
+        vec![
+            row("machine_gate.recording_began", "suite-policy", at(1)),
+            row("machine_gate.recording_began", "suite-jobs", at(2)),
+            row("machine_gate.recording_began", "suite-jobs", at(6)),
+        ],
+        "{adapter}"
+    );
+    assert_eq!(facts[0].payload["roster"]["error"], unreadable, "{adapter}");
+    let (generations, why) =
+        judged_generations(Gate::MachineGate, &facts, &required, at(4), declared);
+    assert_eq!(why.len(), 1, "{adapter}: {why:?}");
+    assert!(
+        why[0].starts_with("suite-policy: 1 of the 1 process start(s)")
+            && why[0].contains(unreadable),
+        "{adapter}: {why:?}"
+    );
+    assert_eq!(
+        generations
+            .iter()
+            .map(|g| (g.service.as_str(), g.generation.as_deref(), g.since))
+            .collect::<Vec<_>>(),
+        vec![
+            ("suite-policy", None, at(1)),
+            ("suite-jobs", Some(declared), at(2)),
+        ],
+        "{adapter}"
+    );
+    // The required service relaunches under the declared generation
+    // before the window opens: its unreadable start is no longer the
+    // one the port returns, and the window is judged under one.
+    w.record(stamped("suite-policy", at(3), good())).await;
+    let facts = read(w, Gate::MachineGate, at(4)).await;
+    let (generations, why) =
+        judged_generations(Gate::MachineGate, &facts, &required, at(4), declared);
+    assert!(why.is_empty(), "{adapter}: {why:?}");
+    assert_eq!(generations.len(), 1, "{adapter}: {generations:?}");
+    assert_eq!(
+        generations[0].generation.as_deref(),
+        Some(declared),
+        "{adapter}"
+    );
+}
+
 // ----- the path end to end, and the registry pin ----------------------------
 
 /// A REAL machine gate, wired the way every service binary wires it
@@ -490,6 +683,100 @@ async fn the_machine_gates_facts_outlive_its_process() {
     assert!(v.log_clean_since.is_some_and(|s| s > facts[1].timestamp));
 }
 
+/// Backlog e0bdba74, end to end and wired the way every service binary
+/// wires it (`boss_events::role_tally::durable`): a process sees one
+/// shape `enforce` would answer differently, three times, and is gone;
+/// the relay carries its facts to `audit_log`; and the NEXT process —
+/// which has seen nothing — answers a window that holds the shape. Until
+/// this the answer was `durable_window: false` and an empty tally.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_role_reports_window_is_read_from_audit_log_by_the_next_process() {
+    use boss_policy_client::role_reporting::{
+        ReportMode, ReportModeSource, RoleObservation, RoleReportSink,
+    };
+    let db = boss_testing::TestDb::new().await;
+    let service = "suite-role-report";
+    let mode: Arc<dyn ReportModeSource> = Arc::new(ReportMode::Report);
+    let opened = Utc::now() - chrono::Duration::seconds(1);
+    // Relay until the log holds `wanted` of this service's facts.
+    let relayed = |wanted: usize| {
+        let (pool, log) = (db.pool.clone(), PgGateEvidence::new(db.pool.clone()));
+        async move {
+            for _ in 0..400 {
+                let bus = RecordingEventBus::new();
+                drain_outbox_once(&pool, &(bus as Arc<dyn EventBus>), 100)
+                    .await
+                    .expect("drain");
+                let held = log.facts(Gate::ActorRole, opened).await.unwrap();
+                if held.len() >= wanted {
+                    return held;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("the log never held {wanted} fact(s)");
+        }
+    };
+    {
+        let first = boss_events::role_tally::durable(service, Arc::clone(&mode), Some(&db.pool));
+        for _ in 0..3 {
+            first.record(RoleObservation {
+                actor: "agent-claude".into(),
+                asserted_role: "platform-admin".into(),
+                recorded_actor: Some("agent-claude".into()),
+                recorded_role: Some("engineering-agent".into()),
+                action: "update".into(),
+                resource: "job".into(),
+                lookup_status: "registered".into(),
+                asserted_allowed: Some(true),
+                recorded_allowed: Some(false),
+                would_deny: Some(true),
+                would_change_scope: Some(false),
+            });
+        }
+        let held = relayed(2).await;
+        assert_eq!(
+            shape(&held)
+                .into_iter()
+                .map(|(kind, service, _)| (kind, service))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "actor_role.recording_began".to_string(),
+                    service.to_string()
+                ),
+                ("actor_role.would_refuse".to_string(), service.to_string()),
+            ],
+            "three observations of one shape are ONE fact"
+        );
+    }
+    let second = boss_events::role_tally::durable(service, mode, Some(&db.pool));
+    relayed(3).await;
+    let answer = second.durable_snapshot().await;
+    assert!(answer.rows.is_empty(), "this process has seen nothing");
+    assert!(answer.durable_window, "{answer:?}");
+    let window = answer.window.expect("a window read from audit_log");
+    let log_half = window.log.expect("the log half");
+    assert_eq!(log_half.dirty.len(), 1, "{log_half:?}");
+    assert_eq!(log_half.dirty[0].payload["key"]["actor"], "agent-claude");
+    assert_eq!(log_half.dirty[0].payload["reason"], "would-deny");
+    // The first process was dropped, not ended: it stated no clean end,
+    // so the watch starts with the second — said, never bridged.
+    assert!(
+        log_half.coverage[0]
+            .started_after
+            .as_deref()
+            .is_some_and(|why| why.contains("stated no clean end")),
+        "{log_half:?}"
+    );
+    assert_eq!(
+        window.clean_since,
+        Some(answer.recording_since),
+        "{:?}",
+        window.not_clean
+    );
+    assert!(!window.covers_requested_window);
+}
+
 /// A FACT THAT LIVES TWICE (CLAUDE.md §9a): the kinds the gates emit
 /// (`gate_evidence::KINDS`) and the `event_kinds` rows the migration
 /// declares. Each kind must be registered, by exact row, in the live
@@ -501,6 +788,7 @@ async fn every_gate_evidence_kind_is_registered() {
     let registered: Vec<String> = sqlx::query_scalar(
         "SELECT kind_pattern FROM event_kinds \
          WHERE kind_pattern LIKE 'machine\\_gate.%' OR kind_pattern LIKE 'policy.check.%' \
+            OR kind_pattern LIKE 'actor\\_role.%' \
          ORDER BY kind_pattern",
     )
     .fetch_all(&db.pool)

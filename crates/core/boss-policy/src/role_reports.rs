@@ -69,7 +69,7 @@ async fn reports<R: PolicyRepository + 'static>(
     {
         Ok(Decision::Allow { scope: Scope::All }) => Json(serde_json::json!({
             "service": "policy", "mode": state.mode.mode(),
-            "snapshot": state.roles.snapshot_status(), "report": state.tally.snapshot(),
+            "snapshot": state.roles.snapshot_status(), "report": state.tally.durable_snapshot().await,
             "policy_snapshot_atomic": false
         }))
         .into_response(),

@@ -15,14 +15,19 @@ pub struct PreparationPacket {
     kind: String,
     status: String,
     partition: String,
-    subject: PreparationSubject,
+    // boss-core's own `Subject`, the type the jobs API serializes
+    // (`{subject_kind, id}`), not a private mirror of it. This read
+    // carried one — `{kind, id}` — from the runner key's handler (train
+    // 927) until delta review 76249509 (B1) drove the handler against
+    // the real router: every real packet answered "malformed consumed
+    // field" at this, the handler's FIRST read, a Permanent error, so
+    // after the human scope nothing was minted, for ever, for either
+    // key. The stub jobs server in `tests/broker_transport_key.rs`
+    // spelled the subject this struct's way, so its 25 tests were green;
+    // `tests/deposit_key_enrollment_e2e.rs` is the test that reads what
+    // the router serves (CLAUDE.md §9a: a fact that lives twice).
+    subject: boss_core::job::Subject,
     steps: Vec<PreparationStep>,
-}
-
-#[derive(serde::Deserialize)]
-struct PreparationSubject {
-    kind: String,
-    id: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -131,6 +136,27 @@ pub fn authorize_preparation(
     Ok(packet)
 }
 
+/// What the first transport is for; the purpose of a rule row that
+/// names none (the runner's row, 1e50e66b).
+pub const RUNNER_PURPOSE: &str = "ops-runner credential deposit";
+
+/// The command a rule row forces on its key: one line with no quote,
+/// backslash or control character, so that wrapped as
+/// `command="<it>",restrict` it cannot close its own quoting or carry a
+/// second option or key onto the step a passkey signs.
+pub fn is_forced_command(command: &str) -> bool {
+    !command.trim().is_empty()
+        && !command
+            .chars()
+            .any(|c| c == '"' || c == '\\' || c.is_control())
+}
+
+/// The authorized_keys line for `command` and `public_key`: the forced
+/// command, `restrict` (no pty, forwarding, agent or user rc), the key.
+pub fn authorized_keys_line(command: &str, public_key: &str) -> String {
+    format!("command=\"{command}\",restrict {public_key}")
+}
+
 /// The registered broker executor prepares a public enrollment proposal.
 /// Receiver installation is a separate human step; this handler never
 /// completes it or records verified/revoked effects.
@@ -201,6 +227,31 @@ impl boss_dispatcher::rules::handler::Handler for CredentialPrepareSshDeposit {
         let credential = arg_string(args, "credential_id")?;
         let protocol = arg_string(args, "protocol_kind")?;
         let receiver = arg_string(args, "receiver_host")?;
+        // WHAT THE KEY IS FOR, AND THE ONE LINE THAT ENROLLS IT, are the
+        // rule row's to declare (backlog 88379df3; design-doc bdc60b65,
+        // gcp-push). Until a second transport existed both were the
+        // runner's, spelled here: a key prepared to carry the estate
+        // machine token would have put `ops-runner credential deposit`
+        // under the passkey that signs its enrollment. A row that names
+        // neither keeps the runner's purpose and carries no line.
+        let purpose = match boss_dispatcher::rules::handler::arg(args, "purpose") {
+            None => RUNNER_PURPOSE,
+            Some(_) => arg_string(args, "purpose")?,
+        };
+        let forced = match boss_dispatcher::rules::handler::arg(args, "forced_command") {
+            None => None,
+            Some(_) => Some(arg_string(args, "forced_command")?),
+        };
+        if purpose.is_empty() || purpose.chars().any(char::is_control) {
+            return Err(HandlerError::Permanent(
+                "preparation rule declares an empty or multi-line purpose".into(),
+            ));
+        }
+        if forced.is_some_and(|line| !is_forced_command(line)) {
+            return Err(HandlerError::Permanent(
+                "preparation rule's forced_command is empty or carries a quote, a backslash or a line break; nothing minted".into(),
+            ));
+        }
         let event = super::common::StepEvent::from_payload(&context.event_payload)?;
         if event.kind != "credential-rotation"
             || event.subject_kind != "custom"
@@ -238,6 +289,19 @@ impl boss_dispatcher::rules::handler::Handler for CredentialPrepareSshDeposit {
         for slug in ["issue", "install", "enroll"] {
             let step = packet.step(slug).map_err(HandlerError::Permanent)?;
             let public = step.metadata.get("public_key");
+            // Under a forced command the enrollment step holds the LINE
+            // and no bare key (below). A line there is still a recorded
+            // proposal — storage lost after it is a failed replay — and
+            // it is judged whole further down, against the line this
+            // handler joins from the pair the Secret holds.
+            if slug == "enroll"
+                && forced.is_some()
+                && public.is_none()
+                && step.metadata.contains_key("authorized_keys_line")
+            {
+                recorded = true;
+                continue;
+            }
             if step.status == "completed" || public.is_some() {
                 recorded = true;
                 let public = public
@@ -273,7 +337,30 @@ impl boss_dispatcher::rules::handler::Handler for CredentialPrepareSshDeposit {
             ));
         };
         let enroll = packet.step("enroll").map_err(HandlerError::Permanent)?;
-        let proposal = json!({"public_key": public_key, "receiver_host": receiver, "purpose": "ops-runner credential deposit"});
+        // The whole authorized_keys line, joined here from the rule's
+        // forced command and the public half this handler prepared, so
+        // the passkey signs the line itself and nobody assembles it.
+        //
+        // AND WHERE THERE IS A LINE, THE STEP CARRIES NO BARE KEY (backlog
+        // dea2236f). This wrote `public_key` beside the line until the
+        // first live enrolment (packet 96a0f7bb, 2026-10-07), where the
+        // key alone was the one copied into authorized_keys: sshd took
+        // it as a login, and for ten to fifteen minutes a key minted for
+        // one receiver command opened the deposit account's shell. The
+        // line ends with the key, so nothing a signer needs is lost; the
+        // public half to COMPARE it with is on the completed `install`
+        // receipt, which nobody can rewrite. A row that forces nothing
+        // has no line to place, and keeps the key as its proposal.
+        let proposal = match forced {
+            Some(forced) => json!({
+                "receiver_host": receiver,
+                "purpose": purpose,
+                "authorized_keys_line": authorized_keys_line(forced, &public_key),
+            }),
+            None => {
+                json!({"public_key": public_key, "receiver_host": receiver, "purpose": purpose})
+            }
+        };
         let proposal_fields = proposal.as_object().ok_or_else(|| {
             HandlerError::Permanent("enrollment proposal was not an object".into())
         })?;
@@ -315,7 +402,7 @@ impl boss_dispatcher::rules::handler::Handler for CredentialPrepareSshDeposit {
             if step.status == "completed" {
                 continue;
             }
-            let fields = json!({field: evidence, "public_key": public_key, "receiver_host": receiver, "purpose": "ops-runner credential deposit", "enrollment": "pending"});
+            let fields = json!({field: evidence, "public_key": public_key, "receiver_host": receiver, "purpose": purpose, "enrollment": "pending"});
             let fields = fields.as_object().cloned().ok_or_else(|| {
                 HandlerError::Permanent("preparation evidence was not an object".into())
             })?;

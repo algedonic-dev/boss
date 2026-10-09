@@ -57,6 +57,9 @@
 //! 4. the protocols in [`ALWAYS`]: the runner names its packet kind
 //!    (`ops-request`) without the file's extension, so no closure finds
 //!    the row that decides who may file, approve and claim a request.
+//!    And the directories in [`ALWAYS_DIRS`] — the harness roster, whose
+//!    files say what `boss dispatch --launch` executes and as whom, and
+//!    which nothing names by path (review f7f0b689, B1).
 //! 5. every file under [`CANDIDATES`] whose own text says [`CLAIM`] —
 //!    that every change to it is a credentials-area car waiting for an
 //!    adversarial review — and the CLI module its text names as the
@@ -68,7 +71,12 @@
 //!    unheld. The dev pod's login selector, `infra/dev/dev-session.sh`,
 //!    makes it too (review a27c860d F4): every interactive ssh login
 //!    runs it as root, and it names no renderer and prints from no
-//!    file, so it holds itself alone.
+//!    file, so it holds itself alone. So does the node-maintenance
+//!    manifest, `infra/cluster/manifests/boss-node-maintenance.yaml`
+//!    (review 9b05cc55 N8): its pod runs as root with CAP_SYS_ADMIN on
+//!    the build node, and it was held only because three lints happened
+//!    to name its file. The rule is unchanged; the manifest's header
+//!    now makes the sentence.
 //!    The sentence IS the list (CLAUDE.md 9a): a file that
 //!    makes it is held, a car that deletes it is held by the base that
 //!    still makes it, and a test on the real tree fails if the sheet
@@ -195,6 +203,16 @@ pub(crate) const CLI_HUBS: [&str; 2] = ["gate", "train"];
 /// Covered whatever names them: the packet protocol the runner answers,
 /// which it names by kind (`ops-request`), never by file.
 pub(crate) const ALWAYS: [&str; 1] = ["infra/platform/workflows/ops-request.toml"];
+
+/// Covered whatever names them, by DIRECTORY: every file under one, on
+/// either side of the change, so a file added or deleted there holds too.
+///
+/// `infra/platform/harnesses/` (review f7f0b689, B1). A harness file says
+/// what `boss dispatch --launch` executes — its argv, the actor it signs
+/// as, its sandbox per profile, the environment it inherits — and nothing
+/// names it by path: the launcher reads the directory. A car changing
+/// only such a file judged Clear and would have boarded on its green.
+pub(crate) const ALWAYS_DIRS: [&str; 1] = ["infra/platform/harnesses/"];
 
 /// The item that asked for this, named in every reason the doors print.
 const ITEM: &str = "backlog fdbb447e";
@@ -398,7 +416,7 @@ fn prose_sources(text: &str) -> BTreeSet<String> {
 fn closure(side: &Side) -> BTreeSet<String> {
     let mut covered: BTreeSet<String> = side
         .keys()
-        .filter(|p| p.starts_with(OPS_DIR))
+        .filter(|p| p.starts_with(OPS_DIR) || ALWAYS_DIRS.iter().any(|d| p.starts_with(d)))
         .cloned()
         .collect();
     covered.extend(ALWAYS.iter().map(|p| p.to_string()));
@@ -730,8 +748,9 @@ impl Judgement {
         match self {
             Judgement::Clear => None,
             Judgement::Touches { paths, mutating } => Some(format!(
-                "touches an ops verb, what a verb runs, the runner, or a file that claims a \
-                 review, its renderer, or a file it prints prose from ({}){}: waits for its \
+                "touches an ops verb, what a verb runs, the runner, a harness file, or a \
+                 file that claims a review, its renderer, or a file it prints prose from \
+                 ({}){}: waits for its \
                  adversarial review; boss release records the RELEASE verdict ({ITEM})",
                 paths.join(", "),
                 if mutating.is_empty() {
@@ -1217,6 +1236,47 @@ mod tests {
             paths: paths(p),
             mutating: paths(m),
         }
+    }
+
+    /// A HARNESS FILE IS HELD (review f7f0b689, B1). A file under
+    /// infra/platform/harnesses decides what `boss dispatch --launch`
+    /// executes, as which actor, with which sandbox and environment, and
+    /// a car changing ONLY such a file — or adding or deleting one — used
+    /// to judge Clear and board on its green.
+    #[test]
+    fn a_car_that_changes_only_a_harness_file_is_held() {
+        let df = verb("read: disk", &["df"]);
+        let without = side(&[("infra/ops/verbs/df.json", &df)]);
+        let with = side(&[
+            ("infra/ops/verbs/df.json", &df),
+            (
+                "infra/platform/harnesses/codex-exec.toml",
+                "id = \"codex-exec\"\n",
+            ),
+            ("infra/platform/stations/repair.toml", "name = \"repair\"\n"),
+        ]);
+        let file = "infra/platform/harnesses/codex-exec.toml";
+        for (what, before, after) in [
+            ("changed", &with, &with),
+            ("added", &without, &with),
+            ("deleted", &with, &without),
+        ] {
+            let judged = touched(&paths(&[file]), &[before, after]);
+            assert_eq!(judged, touches(&[file], &[]), "{what}");
+            let hold = judged.hold_reason().expect("held");
+            assert!(
+                hold.contains(file) && hold.contains("harness"),
+                "{what}: {hold}"
+            );
+        }
+        // The neighbouring registry data is not swept in with it.
+        assert_eq!(
+            touched(
+                &paths(&["infra/platform/stations/repair.toml"]),
+                &[&with, &with]
+            ),
+            Judgement::Clear
+        );
     }
 
     #[test]
@@ -1907,8 +1967,17 @@ mod tests {
         } = claimed(&tree);
         assert_eq!(
             claimants.iter().map(String::as_str).collect::<Vec<_>>(),
-            ["infra/dev/dev-session.sh", "infra/recovery/re-entry.toml"],
-            "the dev pod's login selector makes the claim too (review a27c860d F4)"
+            [
+                "infra/cluster/manifests/boss-node-maintenance-admission.yaml",
+                "infra/cluster/manifests/boss-node-maintenance.yaml",
+                "infra/dev/dev-session.sh",
+                "infra/recovery/re-entry.toml"
+            ],
+            "the dev pod's login selector makes the claim too (review a27c860d F4), and so \
+             does the admission policy that bounds the node-maintenance namespace (backlog \
+             8eac4893): it is the bound on a privileged namespace, and a car loosening it \
+             alone would otherwise park unheld; and so does the one manifest whose pod \
+             holds a node capability (review 9b05cc55 N8)"
         );
         assert_eq!(
             renderers.iter().map(String::as_str).collect::<Vec<_>>(),

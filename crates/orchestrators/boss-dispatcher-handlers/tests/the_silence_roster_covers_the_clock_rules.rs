@@ -124,6 +124,15 @@ const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
          broker-revokes-the-cloudflare-tunnel-daily stands here.",
     ),
     (
+        "broker-advances-the-probe-reader-rotation",
+        "runs `credential.rotate.self-issued` with phase = advance over rotation packets \
+         already scoped for boss-probe-reader (design b35c22b4, backlog d26515c5); it advances \
+         those and files nothing, so on a quarter-hour with no open rotation it produces \
+         NOTHING — it reads the packet list and no Secret — and that zero is the healthy \
+         reading. The packets it advances are rotate-a-credential, opened by an operator, not \
+         by this rule: the reason broker-advances-the-machine-token-rotation stands here.",
+    ),
+    (
         "sensors-poll-every-5-minutes",
         "runs `sensor.poll`, which reads every declared sensor's SOURCE and opens a packet \
          of the kind the SENSOR ROW declares only when the source recorded something new \

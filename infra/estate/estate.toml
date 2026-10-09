@@ -76,14 +76,25 @@ mirror_url = "https://github.com/algedonic-dev/boss"
 
 
 # Report-only ongoing intent, independent of bootstrap templates and
-# filesystem capacity. Assignment copied from design 32e7cf87 review Q1;
-# this declaration grants no storage mutation authority.
+# filesystem capacity (design 32e7cf87); this declaration grants no
+# storage mutation authority.
+#
+# 40 GiB since 2026-10-07, the first time BOSS grew this claim by its
+# own verb (backlog ebbb923f): ops-request b018a106, expand-instance-volume
+# boss pgdata-postgres-0 40Gi, read back at 42949672960 bytes. The
+# assignment below is that packet's `approve` step — the plan David's
+# passkey signed, whose bytes carry "30Gi (32212254720 bytes) -> 40Gi
+# (42949672960 bytes)" — copied from the step: its id, its completed_by,
+# its decided_at, and the sha256 of the signed plan as the question it
+# answered. It replaces design 32e7cf87 review Q1 (step a40668dd,
+# 2026-10-02), which assigned 30 GiB; left at that, the grown claim
+# reads as capacity_drift against a size nobody wants back.
 [[volume_intent]]
 namespace = "boss"
 claim = "pgdata-postgres-0"
-desired_bytes = 32212254720
+desired_bytes = 42949672960
 # employee-id-ok: immutable approved decision receipt, never current owner/signer/authority
-assignment = { packet = "32e7cf87-7d8e-4764-94a3-3b0cfa8548c4", step = "a40668dd-27d0-467b-822c-10f5d28b657a", question = "Q1", decided_by = "emp-david", decided_at = "2026-10-02T23:53:23.553088Z" }
+assignment = { packet = "b018a106-a324-4d7a-a2b3-755df63ff8a3", step = "0e8a8ae8-ce9b-48b0-bdf7-e06ea62bf13d", question = "approve the plan: expand-instance-volume boss pgdata-postgres-0 40Gi, rendered_plan_sha256 0622895f516f6b094b82a50249dcc6e3748bae45ed2503d7ba06771f4f6097b6", decided_by = "emp-david", decided_at = "2026-10-07T02:24:17.059Z" }
 
 # THE MACHINES — the estate's nodes and their roles, declared here and
 # published on every pod start by the launcher (`boss estate declare`,
@@ -188,6 +199,31 @@ cpu = 4
 memory_gb = 15
 disk_gb = 48
 notes = "WireGuard bastion and the public edge. Second cluster-operator since 2026-09-20: the only estate node that is neither the forge nor inside the cluster, so a forge window does not leave the estate with no talosctl/kubectl. Its credential is SCOPED (break-glass ServiceAccount, infra/cluster/manifests/boss-break-glass-operator.yaml), not the forge's admin kubeconfig — the public edge gets read plus roll-to-last-known-good, not cluster-admin. Hosted the second, older BOSS stack until it was retired on 2026-09-15 (7912c9ae). The conductor moved into the cluster on 2026-09-04. 48GB is the smallest disk in the estate."
+
+
+# WHICH MACHINE A MANAGED HOST IS — an address the machine itself holds
+# on an interface, for a node whose `address` above is not one (backlog
+# 62b09c57, N7). infra/lib/host-check.sh reads it before an installer or
+# a converge writes a host's own system: the script proceeds only on a
+# machine that HOLDS an address this file declares for the node it
+# installs — the node row's `address`, or its line here — so a fixture or
+# a mistaken shell on another machine is refused instead of converged
+# (it happened to the dev pod on 2026-10-07; the lib carries the account).
+#
+# The forge needs no line: its row's address is on its own interface (the
+# host observer posts it from there every fifteen minutes). boss-gcp's row
+# carries the public address its provider translates, which no interface
+# of the VM holds; what it holds is the WireGuard hub's address, the one
+# infra/cluster/wireguard/setup-hub.sh gives wg0 and infra/forge/
+# journal-read.sh reads its journal door at. Its converge fetches from
+# the forge over that tunnel, so a boss-gcp without this address is one
+# that could not have converged anyway.
+#
+# One line per node, `<node id> = "<address>"`, read with the shell. A
+# first install on a machine the estate does not declare yet is said on
+# purpose: BOSS_FIRST_INSTALL_AS=<node id> (the lib says what it prints).
+[host_identity]
+boss-gcp = "10.99.0.1"
 
 
 # THE OPS CREDENTIALS EACH CLUSTER-OPERATOR HOLDS — one table per host

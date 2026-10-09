@@ -11,9 +11,11 @@ import { readdirSync, readFileSync } from 'node:fs';
  *  `@boss/web-kit/step-doors` (car 2, `a-step-put-carries-no-metadata`).
  *  The bundles under `infra/step-plugins/` cannot import it: each is a
  *  standalone IIFE the gateway serves as-is, with no build step, and the
- *  host loads exactly one bundle per step kind, so there is no place a
- *  shared helper could live. So each bundle spells its own two fetches,
- *  and this pin reads every one of them: the body of a fetch to a step's
+ *  host loads exactly one bundle per step kind. (One file there is
+ *  shared since 2026-10-07 — `passkey-ceremony.js`, which a bundle adds
+ *  by script tag — but it holds the passkey ceremony and makes no step
+ *  write; it is read here like every other file.) So each bundle spells
+ *  its own two fetches, and this pin reads every one of them: the body of a fetch to a step's
  *  own resource must be `JSON.stringify({ status })` or `JSON.stringify({
  *  status: '<word>' })`, nothing more. Eleven bundles once PUT metadata
  *  there — five the whole drawn step with a snapshot spread, five a

@@ -1374,10 +1374,116 @@ sign-off door, a stamp whose `presence_nonce` is already on ANY stamp
 of the step, live or voided, judged under the row lock it already takes
 for the shape check. The step's own stamps are the consumed-nonce
 record, because a ticket is bound to one step: no table, no expiry
-sweep. The completion PUT still carries the ticket its sign-off was
-granted on (`completeWithPresence`): the completion judges assurance
-and writes no stamp, and a completed step is frozen, so it consumes
-nothing.
+sweep. A completion writes no stamp, so it consumes no nonce.
+
+**A stamped presence step completes on its live stamps** (design
+`1ce67f7e`, decided by David 2026-10-07; backlog `570c66e9`). Presence
+stays where a step's completion needs it and is removed where it adds
+nothing: a step whose approval IS its passkey stamps takes no second
+passkey proof to complete. Until then the completing request was judged
+on its own ticket alone and the stamps the step held were never
+consulted, so a step a passkey had just stamped refused a bare
+completion, and both surfaces kept the stamp's ticket client-side to
+send it again — a credential held between two requests, a two-minute
+race, and a failure whenever the stamp and the completion happened on
+different surfaces. The rule, judged in one place for every request
+that moves a step out of its open states (`judge_completion` in
+`boss-jobs/src/http/steps.rs`, reached by the status PUT and by
+`POST …/complete-if`; pinned by `an_assurance_holds_on_every_path`):
+
+1. **A presence step that declares sign-off roles** completes when every
+   role in `sign_offs_required` holds a LIVE stamp (`Step::live_stamps`:
+   never voided, on the step's current shape) that a passkey produced,
+   and that stamp is no older than **72 hours** on the clock that wrote
+   it. The completing request then needs a session only, and **any actor
+   the step-update policy admits may send it** ("think about an admin
+   grabbing 5 sign-offs"). Collecting a further sign-off voids none of
+   the earlier ones; any other change to the signed content voids every
+   stamp taken before it. A ticket on the completion is not an
+   alternative to a missing stamp.
+2. **A presence step with no sign-off roles** keeps the earlier rule: its
+   completion carries a verifying ticket for that step, shape and actor,
+   because that completion is the only act.
+3. **A header that does not verify is refused on every path**, even when
+   the stamps would carry the step.
+4. Unchanged: the completing request changes nothing the stamps cover
+   (title, metadata) nor notes or holder; a presence step is never
+   skipped; WRITING a presence stamp still takes a verifying ticket at
+   the sign-off door.
+
+The 72 hours is one declared value,
+`boss_core::job::PRESENCE_STAMP_COMPLETES_FOR_HOURS` ("for now" — it
+will be revisited), and the refusal names the stale stamp's role,
+authority and `stamped_at` and asks for a fresh signature; so that it
+can be given, the sign-off door answers "already signed" on an OPEN
+presence step only for a stamp that still carries its role, and is
+unchanged on a finished one. It bounds completing only: a consumer that
+ACTS on an approval keeps its own tighter bound, and the ops runner
+still runs an approved plan once, within ten minutes of the signature,
+judged on the stamp whoever completed the step. How a presence step's
+completion was assured — the request's ticket, or the stamps named —
+is recorded on its `jobs.step.completed` event as `assured`.
+
+**A human-only step completes on a passkey** (David, 2026-10-07, item
+`570c66e9`: "human-only step completion should use passkey for
+enforcement", and "we may also be able to update jobs such that I stamp
+the instructions so the step no longer requires human completion if it
+doesn't make sense"). `human_only` was enforced by the roster alone, on
+the id a caller ASSERTS, and the machine door believes any id — review
+`3f7b70bc` measured `emp-ghost` and `emp-david`, with no presence,
+writing a human-only step; and once a stamped presence step completes
+from any actor, that check was the last guard on three of the eight
+presence steps. So the declaration **raises the step's required
+assurance to presence** (`judge_assurance`, read by the sign-off door
+and by the completion alike), and the same one judgement
+(`judge_completion`) answers at both doors, with the roster check kept
+beside the passkey:
+
+- **with sign-off roles** — the live passkey stamps of every required
+  role, each BY A PERSON (`human_only::person_check` on the stamp's
+  authority). Any actor that may update the step, a machine included,
+  may then send the completion: no second ceremony.
+- **with no sign-off roles** — a verifying ticket on the completing
+  request, for this step, shape and actor, and the actor is a person. A
+  bare completion (`boss step complete`, the machine door, any asserted
+  id) is refused 422 `{required: "presence", human_only: true}` naming
+  both ways out: complete it from a surface that runs the ceremony, or
+  give the step a sign-off role in its Workflow row so it is stamped.
+  An automation is still told it is not a person (403) before it is
+  asked for a passkey it cannot have.
+
+A human-only step is completed, never skipped, and the request that
+completes it changes nothing beside the status, as on any presence step.
+The completion's `assured` record carries `human_only` and, with no
+roles, the `person`. **A step already open when this landed** needs
+nothing done to it: the declaration is read off the stored step at
+completion, so its completion simply takes the ticket. Every surface
+that renders one of the ten plain human-only steps draws what the
+passkey signs and answers the refusal with one tap and one retry, as
+the approval surface does: `GenericSurface` for the `task` and
+`credential-rotation` steps, and the `incident-review.js` plugin for an
+incident's `review`. **The plugins share one copy of the ceremony**,
+`infra/step-plugins/passkey-ceremony.js` (how what is signed is drawn,
+the check that it was drawn, begin/finish with the off-screen guards,
+and the one-tap-one-retry answer): a bundle is a classic script and
+cannot import, so `sign-off.js` and `incident-review.js` each add that
+file's script tag and register their mount only once it has run. It
+registers no step kind and no `step_plugins` row names it; the app's
+own copy stays `apps/web/src/steps/presence.ts`, held equal to the
+plugins' by `signOffPlugin.test.ts`. The workflow lint's phase 10 is NOT
+extended to human-only steps: it reads a step's declared presence, and
+the incident `review` step, human-only with no declared field, would be
+quarantined by it — a follow-up, once that row declares what its review
+signs.
+
+**What an approval depends on is rendered onto the step being signed**
+(the same decision). The binding is the step's title and metadata, not
+the job: hashing the whole job was rejected, because routine writes
+elsewhere on it would void approvals and bring the redundant ceremony
+back. So the workflow lint (`workflow_lint`, phase 10 — author time,
+every publish, boot) refuses a presence step that declares no field but
+the signer's own `decision`, `decided_at` and `comment`, as ops-request
+renders its plan and the plan's hash onto `approve`.
 
 The v1 step-type catalog derives from the traditional software
 stack BOSS replaces (CRM/ITSM/ERP/HR/comms); the canonical source
@@ -2164,6 +2270,42 @@ tally restart clears a loss the log does not yet state, and a process
 joins the next one's watch only across a clean `<gate>.recording_ended`
 stated at SIGTERM — one that died holding facts breaks the watch.
 
+**The actor-role report is the third gate on that reader, and its
+window is judged per process** (backlog `e0bdba74`, 2026-10-08; amends
+point 4 of design `abf9eeae`, which called the tally "telemetry, not
+audit-log events"). Row H earns `enforce` on 72 hours with zero
+would-deny for every registered actor and zero unregistered writers,
+and that tally was process memory in a pod seven trains restarted in
+twelve hours: `durable_window` was a constant `false`. It now states
+`actor_role.*` facts by the same rule and through the same machinery
+(`Gate::ActorRole`): a start and every mode move, one fact per SHAPE
+`enforce` would answer differently at its first sighting in a tally,
+one for the first overflow — never one per request, and none at all for
+a request whose asserted and recorded answers agree. A shape is the
+tally's own key: the actor id, the asserted role, the role of record,
+the door's action and resource names, the lookup status and the two
+answers; no header, credential, body or path. What bounds the facts is
+what already bounded the tally — 512 shapes and 4096 bytes of caller
+text a shape, per tally start, then one overflow that names no one and
+is never clean. One rule (`gate_evidence::actor_role_would_refuse`)
+says which shapes those are, for the producer and for the reader that
+re-judges every live row: `would-deny`, `would-change-scope`,
+`unregistered-writer`, and `unjudged` — a comparison that could not be
+made is no pass. The window is read at
+`/api/events/gate-window?gate=actor-role`, over every service the
+launcher started, and each service's own report answers its own
+window, `durable_window` true only when the log was read. Two things
+it holds that a merged reading does not: every live process must
+answer and match the newest start the log holds FOR THAT SERVICE, so
+one service's clean restart never stands in for another's long-lived
+process; and a shape first seen before the window by a process that
+ended inside it is not read as unused, because a first sighting never
+says when the last use was. A restart across a clean end does not
+reset the clock, nor does the mode word moving between words that
+record; `off`, a process that states no clean end, a gap longer than a
+restart, a lost fact and any would-refuse do. It refuses nothing: the
+car that makes `enforce` refuse declares `actor_role.refused` then.
+
 **One actor, one identity: an agent's login resolves to a registered
 id the way a human's does** (design `6fda05ae`, David 2026-09-12; all
 three questions accepted as proposed; folds backlog `adf025df` and
@@ -2703,6 +2845,30 @@ road that applies it in its park prose**, and a first misfire is
 handled by that named rollback, never by improvising. The must-fix lists
 from each car's own review travel with the car and are not re-decided
 here.
+
+**Which in-cluster senders hold the machine token** (design-doc
+`c8502e17`, David 2026-10-07; backlog `37742794`; under the standing
+rule of `c395e62c` that a workload running branch or third-party code
+never holds it). The rule is per CONTAINER, not per pod or manifest: a
+container that sends to a port the machine door fronts mounts Secret
+`boss-machine-token` read-only and optional and takes the reader from
+the boss image (it runs that image, or an init container running it
+copies the helpers in), or it is named with the reason it must not —
+held by a parsed read of every manifest in
+`every_in_cluster_sender_holds_the_machine_token_or_is_named.rs`. Three
+applications: (1) the dev pod's `reclaim` sidecar holds it, at the
+reader's default directory, and the `dev` container's mounts are pinned
+whole — which adds a stamping sender and no new reader, since that pod's
+doors already held the token and the sidecar runs the checkout the dev
+container writes; (2) the recovery-sheet check holds it; (3) the
+playground crawl's browser container never does: its packet writes moved
+to a `record` container of the boss image in the same pod, and what the
+crawl leaves that container is DATA — read through an open that follows
+no link, bounded, cleaned, never executed. And (4) a CI job sends
+nothing to the system of record at all: the `reclaim` job that asked the
+forge to sweep its disk after each run is deleted rather than left as a
+request whose designed answer is a refusal; the hourly host sweep is the
+reclaim, and its own packet carries what it did.
 
 ## Calendar
 
@@ -3843,8 +4009,11 @@ bootstrap, live request and filesystem capacity** (design
 2026-10-02; answers child `10effd3f` of `53c8cb72`). Namespace and
 claim identify each declaration in `infra/estate/estate.toml`;
 desired bytes carry the assignment's packet, review step, question,
-actor and time. Q1 explicitly assigns 30 GiB to
-`boss/pgdata-postgres-0` for reporting. Other claims without an
+actor and time. Q1 explicitly assigned 30 GiB to
+`boss/pgdata-postgres-0` for reporting; since 2026-10-07 the
+declaration reads 40 GiB and its assignment is the `approve` step of
+ops-request `b018a106`, the signed plan under which
+`expand-instance-volume` grew the claim. Other claims without an
 assignment remain unknown. The pure comparison retains declaration,
 live request, provenance and match, drift or unknown in the existing
 comparison event; the estate page renders that record. Missing,

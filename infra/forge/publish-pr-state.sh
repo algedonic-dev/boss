@@ -57,7 +57,9 @@ publish_pr_states() {
     if [ -z "${MT_HDR+set}" ]; then
         fail "the caller made no machine_token_header MT_HDR call (infra/lib/secret-header.sh) — the pr-state writes would go out without the machine token"
     fi
+    # The read carries the token as the writes below do (backlog 44b2087e).
     if ! curl -fsS -H "x-boss-user: $BOSS_USER" \
+            ${MT_HDR:+-H "$MT_HDR"} \
             "$BASE/api/jobs?kind=publish-to-github&limit=60&full=true" > "$workdir/prs-published" 2>"$workdir/prs-err"; then
         fail "jobs API unreachable at $BASE — $(cat "$workdir/prs-err")"
     fi

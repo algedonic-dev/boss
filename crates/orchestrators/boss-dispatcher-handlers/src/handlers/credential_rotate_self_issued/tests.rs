@@ -39,6 +39,10 @@ struct FakeSecrets {
     /// by it — a write placed exactly between two of a firing's own reads
     /// and writes (review 34313729, P6).
     after_primary_reads: Mutex<Option<(usize, OnMisses)>>,
+    /// (namespace, the store's error): every whole read of that
+    /// namespace's Secret fails with it — or, with no error, answers that
+    /// the Secret does not exist (backlog 50c0d155).
+    unreadable: Mutex<Option<(String, Option<String>)>>,
 }
 
 impl FakeSecrets {
@@ -131,6 +135,11 @@ impl SecretStore for FakeSecrets {
     }
     async fn read_secret(&self, ns: &str, name: &str) -> Result<Option<SecretData>, String> {
         self.store_call(Some(ns));
+        if let Some((dark, failure)) = self.unreadable.lock().unwrap().clone()
+            && dark == ns
+        {
+            return failure.map_or(Ok(None), Err);
+        }
         let prefix = format!("{ns}/{name}/");
         let data = self
             .map
@@ -1049,6 +1058,210 @@ async fn a_next_superseded_between_firings_is_a_recorded_refusal() {
     let first = tick(&h).await;
     assert_nothing_was_promoted(&j, &s, &left);
     assert_refused(&j, &first, &[PRIMARY], OTHER, &mine);
+}
+
+// ----- verified: every named copy still holds the candidate (50c0d155) -----
+
+/// This packet's value promoted to `current` of both copies by a clock
+/// firing, and read as `current` by every gate: the state in which the
+/// next firing used to record Verified from the gates and the primary
+/// alone. Returns the value.
+async fn promoted() -> (Rotation, String) {
+    let (j, s, g, h) = staged().await;
+    let mine = s.get(PRIMARY, "next").unwrap();
+    tick(&h).await.expect("promoted, and waiting on the gates");
+    for copy in [PRIMARY, MIRROR] {
+        assert_eq!(s.get(copy, "current").as_deref(), Some(mine.as_str()));
+        assert_eq!(s.get(copy, "current.minted-for").as_deref(), Some(JOB));
+    }
+    assert_ne!(j.status(JOB, "verify"), "completed");
+    g.refresh(&s);
+    ((j, s, g, h), mine)
+}
+
+/// Nothing said verified, nothing was revoked, and no copy was written
+/// since `left` was taken.
+fn assert_not_verified(j: &Jobs, s: &FakeSecrets, left: &Snapshot) {
+    assert_eq!(snapshot(s), *left, "a copy was written");
+    assert_ne!(j.status(JOB, "verify"), "completed");
+    assert_ne!(j.status(JOB, "revoke"), "completed");
+    assert!(j.meta(JOB, "verify", "verified").is_none());
+    let phases = j.phases();
+    assert!(
+        !phases.iter().any(|p| p.ends_with("/verified")),
+        "{phases:?}"
+    );
+    assert!(
+        !phases.iter().any(|p| p.ends_with("/revoked")),
+        "{phases:?}"
+    );
+}
+
+/// The item's headline, on the ALREADY-PROMOTED path: the mirror's
+/// current replaced (value and origin) after the promotion, the gates all
+/// answering `current` for the primary's value. Verify used to complete —
+/// it read the gates and the primary, and a mirror is read by callers
+/// only, never by a gate. Now it is a recorded refusal naming the copy,
+/// on every firing, and the first firing after the copy holds the
+/// candidate again verifies.
+#[tokio::test]
+async fn verify_refuses_while_a_mirror_no_longer_holds_the_promoted_value() {
+    let ((j, s, g, h), mine) = promoted().await;
+    s.seed(MIRROR, "current", COMPETING);
+    s.seed(MIRROR, "current.minted-for", OTHER);
+    s.bump(MIRROR, SECRET);
+    let left = snapshot(&s);
+    for _ in 0..2 {
+        g.refresh(&s);
+        let result = tick(&h).await;
+        assert_not_verified(&j, &s, &left);
+        assert_refused(&j, &result, &[MIRROR], OTHER, &mine);
+        let refused = j.meta(JOB, "verify", "verify_refused").unwrap();
+        assert!(
+            !refused.contains(&format!("{PRIMARY}/{SECRET} holds")),
+            "the primary agrees and is not named as astray: {refused}"
+        );
+        assert!(
+            refused.contains("nothing is recorded verified"),
+            "{refused}"
+        );
+    }
+    // The copy holds the candidate again: verified THEN, the refusal is
+    // cleared, and what is recorded names every copy it judged.
+    s.seed(MIRROR, "current", &mine);
+    s.seed(MIRROR, "current.minted-for", JOB);
+    s.bump(MIRROR, SECRET);
+    tick(&h).await.expect("every copy agrees");
+    assert_eq!(j.status(JOB, "verify"), "completed");
+    let refused = j.meta(JOB, "verify", "verify_refused").unwrap();
+    assert!(refused.starts_with("cleared:"), "{refused}");
+    let verified = j.meta(JOB, "verify", "verified").unwrap();
+    for copy in [PRIMARY, MIRROR] {
+        assert!(verified.contains(&format!("{copy}/{SECRET}")), "{verified}");
+    }
+    let rotations = j.rotations.lock().unwrap().clone();
+    let facts: Vec<&JsonValue> = rotations
+        .iter()
+        .filter(|(phase, _)| phase.ends_with("/verified"))
+        .map(|(_, evidence)| evidence)
+        .collect();
+    assert_eq!(facts.len(), 1, "one Verified fact, at the agreeing firing");
+    assert_eq!(
+        facts[0]["current_held_in"],
+        json!([format!("{PRIMARY}/{SECRET}"), format!("{MIRROR}/{SECRET}")])
+    );
+    let record = j.everything_written();
+    for value in [mine.as_str(), COMPETING] {
+        assert!(!record.contains(value), "the record carries a value");
+    }
+}
+
+/// The candidate is a value AND its origin, in every copy: the same
+/// bytes under another packet's name, another value under this packet's
+/// name, and a blank current are each not this packet's promoted value.
+#[tokio::test]
+async fn verify_judges_each_copys_current_by_value_and_by_origin() {
+    for (value, origin, names) in [
+        (None, Some(OTHER), OTHER),
+        (Some(COMPETING), None, JOB),
+        (Some(""), Some(""), "nothing recorded"),
+    ] {
+        let ((j, s, _g, h), mine) = promoted().await;
+        if let Some(value) = value {
+            s.seed(MIRROR, "current", value);
+        }
+        if let Some(origin) = origin {
+            s.seed(MIRROR, "current.minted-for", origin);
+        }
+        s.bump(MIRROR, SECRET);
+        let left = snapshot(&s);
+        let result = tick(&h).await;
+        assert_not_verified(&j, &s, &left);
+        assert_refused(&j, &result, &[MIRROR], names, &mine);
+    }
+}
+
+/// The mirror replaced right after the promotion's own writes, inside
+/// the firing that promoted: the copies are judged on that path too, and
+/// before the gates' answer is, so the divergence is named at once
+/// rather than behind "waiting for every gate".
+#[tokio::test]
+async fn verify_judges_the_copies_in_the_firing_that_promoted_too() {
+    let (j, s, _g, h) = staged().await;
+    let mine = s.get(PRIMARY, "next").unwrap();
+    let shared = s.clone();
+    // The primary is read three times before the copies are judged: at
+    // verify's start, in the promotion's judge pass, and for the excuse.
+    *s.after_primary_reads.lock().unwrap() = Some((
+        3,
+        Box::new(move || {
+            shared.seed(MIRROR, "current", COMPETING);
+            shared.seed(MIRROR, "current.minted-for", OTHER);
+            shared.bump(MIRROR, SECRET);
+        }),
+    ));
+    let result = tick(&h).await;
+    assert!(
+        s.after_primary_reads.lock().unwrap().is_none(),
+        "the mirror never moved"
+    );
+    assert_eq!(s.get(PRIMARY, "current").as_deref(), Some(mine.as_str()));
+    assert_not_verified(&j, &s, &snapshot(&s));
+    assert_refused(&j, &result, &[MIRROR], OTHER, &mine);
+}
+
+/// A copy that cannot be READ is not verified either, and that one is a
+/// defer the clock resumes: the store's error is kept on the step beside
+/// the copy's path, and the firing after the copy reads again verifies.
+/// So is a copy that does not exist, which the converge creates.
+#[tokio::test]
+async fn verify_defers_while_a_copy_cannot_be_read_and_verifies_once_it_can() {
+    const DARK: &str = "GET boss-dev/boss-machine-token returned 503 Service Unavailable";
+    for (failure, says) in [(Some(DARK), DARK), (None, "does not exist")] {
+        let ((j, s, g, h), mine) = promoted().await;
+        *s.unreadable.lock().unwrap() = Some((MIRROR.into(), failure.map(str::to_string)));
+        let left = snapshot(&s);
+        for _ in 0..2 {
+            g.refresh(&s);
+            tick(&h).await.expect("a defer acknowledges");
+            assert_not_verified(&j, &s, &left);
+            let deferred = j.meta(JOB, "verify", "verify_deferred").unwrap();
+            assert!(
+                deferred.contains(&format!("{MIRROR}/{SECRET}")),
+                "{deferred}"
+            );
+            assert!(deferred.contains(says), "{deferred}");
+            assert!(deferred.contains("nothing is revoked"), "{deferred}");
+            assert!(deferred.contains(RESUMES), "{deferred}");
+            assert!(j.meta(JOB, "verify", "verify_refused").is_none());
+        }
+        *s.unreadable.lock().unwrap() = None;
+        tick(&h).await.expect("every copy is read, and agrees");
+        assert_eq!(j.status(JOB, "verify"), "completed");
+        assert!(!j.everything_written().contains(&mine));
+    }
+}
+
+/// A copy astray and another unreadable: the refusal wins, since it is
+/// the one no later firing gets past, and it names both.
+#[tokio::test]
+async fn verify_refuses_naming_an_astray_copy_beside_an_unreadable_one() {
+    const THIRD: &str = "boss-third";
+    let ((j, s, _g, h), mine) = promoted().await;
+    let a: Vec<(String, Value)> = args(&[("phase", ADVANCE_PHASE)])
+        .into_iter()
+        .map(|(k, v)| match k.as_str() {
+            "also_in_namespaces" => (k, Value::String(format!("{MIRROR},{THIRD}"))),
+            _ => (k, v),
+        })
+        .collect();
+    s.seed(MIRROR, "current.minted-for", OTHER);
+    s.bump(MIRROR, SECRET);
+    *s.unreadable.lock().unwrap() = Some((THIRD.into(), Some("503".into())));
+    let left = snapshot(&s);
+    let result = h.invoke(&a, &tick_ctx()).await;
+    assert_not_verified(&j, &s, &left);
+    assert_refused(&j, &result, &[MIRROR, THIRD], OTHER, &mine);
 }
 
 // ----- pure: the value, the judgements -----
@@ -2944,3 +3157,7 @@ async fn durable_down_exception_case(raced: bool) {
             .contains("sim-control")
     );
 }
+
+// The probe-reader credential's rotation — the same handler under
+// `gate_slots = "reader"` — with fixtures of its own (design b35c22b4).
+mod reader;

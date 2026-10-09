@@ -160,6 +160,14 @@ sor_url=$(sed -n 's/^BOSS_JOBS_URL=//p' "$sor_env")
 # Until 2026-09-20 that fixture spelled the URL itself — two of the four
 # copies the mirror had with no home (backlog f8af6040) — and a fixture
 # that spells its own subject stops testing the real one.
+# EVERY SEAM THE INSTALLERS JUDGE IS NAMED, or they refuse (backlog
+# 62b09c57, N7; infra/lib/host-check.sh). Until that check this lint left
+# the ops runner's retirement marker at the host's own path — which
+# install-ops-runner.sh REMOVES when it finds one — and the Talos client
+# at /usr/local/bin, on whatever machine ran the gate. Exported once, so
+# no run below can forget them.
+export BOSS_OPS_RUNNER_RETIRED="$tmp/ops-runner.retired"
+export INSTALL_TALOSCTL=0
 mirror_url=$(sed -n 's/^BOSS_MIRROR_URL=//p' "$sor_env")
 [ -n "$mirror_url" ] || fail "the rendered address file names no BOSS_MIRROR_URL"
 

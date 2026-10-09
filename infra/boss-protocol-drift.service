@@ -57,6 +57,18 @@ TimeoutStartSec=10min
 # read git here say the same. Not `safe.directory` (infra/gate.sh says
 # why), and nothing here needs root.
 User=david
+# THE TOKEN'S HEADER FILE NEVER OUTLIVES A RUN (backlog df38075a, F1;
+# the second car, which took the class and not the six units the item
+# named). The wrap pair on the Exec lines below presents the machine
+# token, and infra/lib/secret-header.sh makes its 0600 header file in
+# $RUNTIME_DIRECTORY when a unit declares one: /run/boss-protocol-drift,
+# tmpfs, 0700, this unit's account's, removed by systemd when this
+# oneshot stops whatever ended it. Without it the file was made in the
+# host's shared /tmp, where a killed run left it. The reasoning is in
+# infra/forge/estate-observe-units.service; the pin that walks every
+# unit is a_killed_sender_leaves_no_header_behind.rs.
+RuntimeDirectory=boss-protocol-drift
+RuntimeDirectoryMode=0700
 ExecStartPre=-/opt/boss/infra/boss-maintenance-wrap.sh maintenance-protocol-drift "Protocol drift"
 ExecStart=/opt/boss/infra/protocol-drift.sh file --repo /opt/boss
 ExecStopPost=-/opt/boss/infra/boss-step.sh maintenance-protocol-drift run

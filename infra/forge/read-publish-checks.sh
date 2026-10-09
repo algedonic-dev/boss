@@ -217,7 +217,11 @@ publish_pr_states "read-publish-checks"
 
 # 1. The packet: the open publish whose read-checks is ready or active
 #    (a rule fired on readiness), and what its open-pr recorded.
+#    The read carries the machine token as the writes do (backlog
+#    44b2087e: it went out with x-boss-user alone, six times in half an
+#    hour on 2026-10-07, each a caller the jobs gate would refuse).
 if ! curl -fsS -H "x-boss-user: $BOSS_USER" \
+        ${MT_HDR:+-H "$MT_HDR"} \
         "$BASE/api/jobs?kind=publish-to-github&status=open&limit=20&full=true" > "$workdir/jobs" 2> "$workdir/err"; then
     fail "jobs API unreachable at $BASE — $(cat "$workdir/err")"
 fi

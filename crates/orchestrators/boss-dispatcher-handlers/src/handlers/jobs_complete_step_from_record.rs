@@ -72,7 +72,10 @@
 //! - `post_fill` — keys read off another step of the packet, filled where
 //!   the record holds none: `{key: {step, from: [pointer, …]}}`, the
 //!   first non-empty string wins — the car's `branch`, which only the
-//!   green's evidence on `building` knows.
+//!   green's evidence on `building` knows. A spec that names no `step`
+//!   reads its pointers off the packet itself (`/metadata/model`), which
+//!   is how `jobs.age_out_step` builds a record for a run that stored
+//!   none (b5a3a174).
 //!
 //! The POST goes BEFORE the completion: the row is insert-once
 //! (`ON CONFLICT (run_id) DO NOTHING`), so a redelivery re-posting is
@@ -219,7 +222,11 @@ pub(crate) fn landing_fields(
 #[derive(Debug, Clone)]
 pub(crate) struct Post<'a> {
     pub to: &'a str,
-    pub record: &'a str,
+    /// The packet metadata key holding the record. `None` is a post
+    /// that starts from nothing and is built from `fields` and `fill`
+    /// alone — `jobs.age_out_step`'s, for a run that stored no record
+    /// because it never reported (backlog b5a3a174).
+    pub record: Option<&'a str>,
     /// The body key that must name THIS packet (`run_id`): the packet's
     /// own id is written there, and a stored value naming another packet
     /// is refused rather than posted (review de8a09bd N1: a record that
@@ -241,11 +248,15 @@ pub(crate) fn post_body(
     job: &serde_json::Value,
     p: &Post<'_>,
 ) -> Option<Result<serde_json::Value, String>> {
-    let mut body = job
-        .get("metadata")
-        .and_then(|m| m.get(p.record))
-        .and_then(|r| r.as_object())
-        .cloned()?;
+    let mut body = match p.record {
+        Some(record) => job
+            .get("metadata")
+            .and_then(|m| m.get(record))
+            .and_then(|r| r.as_object())
+            .cloned()?,
+        None => serde_json::Map::new(),
+    };
+    let record = p.record.unwrap_or("the post");
     // A null is unset here, unlike on a step: the record states the
     // keys it could not know as null (`branch` before the green).
     let unset = |b: &serde_json::Map<String, serde_json::Value>, k: &str| {
@@ -255,9 +266,8 @@ pub(crate) fn post_body(
         let own = job.get("id").and_then(|v| v.as_str()).unwrap_or_default();
         if !unset(&body, key) && body.get(key).and_then(|v| v.as_str()) != Some(own) {
             return Some(Err(format!(
-                "`{}.{key}` names {} and the packet is {own}; a record for another packet is \
-                 never posted",
-                p.record,
+                "`{record}.{key}` names {} and the packet is {own}; a record for another packet \
+                 is never posted",
                 body.get(key).cloned().unwrap_or_default()
             )));
         }
@@ -270,11 +280,13 @@ pub(crate) fn post_body(
         if !unset(&body, k) {
             continue;
         }
-        let Some(step) = spec
-            .get("step")
-            .and_then(|s| s.as_str())
-            .and_then(|slug| step_by_slug(job, slug))
-        else {
+        // The pointers read a step when the spec names one, else the
+        // packet itself (`/metadata/model`). A step it names and the
+        // packet lacks fills nothing.
+        let Some(root) = (match spec.get("step").and_then(|s| s.as_str()) {
+            Some(slug) => step_by_slug(job, slug),
+            None => Some(job),
+        }) else {
             continue;
         };
         let found = spec
@@ -283,8 +295,11 @@ pub(crate) fn post_body(
             .into_iter()
             .flatten()
             .filter_map(|ptr| ptr.as_str())
-            .find_map(|ptr| step.pointer(ptr).and_then(|v| v.as_str()))
-            .filter(|s| !s.is_empty());
+            .find_map(|ptr| {
+                root.pointer(ptr)
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+            });
         if let Some(found) = found {
             body.insert(k.clone(), json!(found));
         }
@@ -305,7 +320,7 @@ pub(crate) fn post_body(
 /// ready, which is the state b951c00a fixed. So for this post 400 and
 /// 422 are final, and everything else (409, 404, 429, 5xx, transport)
 /// retries as before.
-async fn post_record(
+pub(crate) async fn post_record(
     client: &boss_core::machine_token::Client,
     url: &str,
     body: &serde_json::Value,
@@ -347,7 +362,7 @@ fn post_args<'a>(
         (None, None) => Ok(None),
         (Some(to), Some(record)) => Ok(Some(Post {
             to,
-            record,
+            record: Some(record),
             id_key: text("post_id_key"),
             fields: template_arg(args, "post_fields", rule).unwrap_or_default(),
             fill: template_arg(args, "post_fill", rule).unwrap_or_default(),
@@ -421,15 +436,16 @@ impl Handler for JobsCompleteStepFromRecord {
                 tracing::warn!(rule = %ctx.rule_name, packet = %job_id, "{e}");
                 format!("refused: {e}")
             };
+            let record = p.record.unwrap_or_default();
             let posted = match post_body(&job, p) {
-                None => format!("absent: the packet holds no `{}`", p.record),
+                None => format!("absent: the packet holds no `{record}`"),
                 Some(Err(e)) => refused(e),
                 Some(Ok(body)) => {
                     let url = format!("{}{}", self.base(), p.to);
                     // A refusal no redelivery repairs must not hold the
                     // landing hostage — the step's own evidence carries it.
                     match post_record(&self.client, &url, &body, &ctx.rule_name).await? {
-                        Ok(()) => format!("recorded: `{}` posted to {}", p.record, p.to),
+                        Ok(()) => format!("recorded: `{record}` posted to {}", p.to),
                         Err(e) => refused(e),
                     }
                 }

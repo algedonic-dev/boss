@@ -31,7 +31,10 @@
 # tmpfs under /run, which systemd removes when the unit stops — after a
 # SIGKILL or an OOM kill too — and a power loss clears (the shape car
 # 5f77b205 gave github-act.sh). Anywhere else, in a `mktemp -d` directory
-# (0700) under ${TMPDIR:-/tmp}. Either way the directory is removed by an
+# (0700) under ${TMPDIR:-/tmp}. Every unit that starts a sender declares
+# one (a_killed_sender_leaves_no_header_behind.rs walks the unit files),
+# so the second place is a hand run's, the pod door's and a pod's. Either
+# way the directory is removed by an
 # EXIT trap, CHAINED IN FRONT OF any EXIT trap the script already set:
 # most of these scripts `trap 'rm -rf "$workdir"' EXIT`, and a helper
 # that replaced a caller's trap would leak the caller's own scratch. The
@@ -56,7 +59,7 @@
 # POSIX sh, because infra/ops/ops-runner.sh is `#!/bin/sh` (dash on the
 # hosts) and the other callers are bash: nothing here may be a bashism
 # (infra/lint/a-sh-script-parses-under-sh.sh). Every name it sets begins
-# `_secret_header_`, except the VAR you name and the two machine-token
+# `_secret_header_`, except the VAR you name and the four machine-token
 # functions at the end of this file.
 #
 # THE MACHINE TOKEN (design 6805c764 car 4; backlog 1876bbdb INFO-6 and
@@ -139,6 +142,84 @@ $_secret_header_prev" EXIT
     fi
 }
 
+# _secret_header_born PID — when PID started, in the kernel's clock ticks
+# since boot (field 22 of /proc/PID/stat, read after the last `) ` so a
+# process name holding spaces or brackets cannot shift it). Empty where
+# there is no /proc or no such process.
+_secret_header_born() {
+    [ -r "/proc/$1/stat" ] || return 0
+    sed -e 's/^.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f20
+}
+
+# _secret_header_sweep BASE — remove the header directories that DEAD runs
+# of this account left under BASE, and say how many, by path.
+#
+# WHY (backlog df38075a, F1 of review a92c0b94). The EXIT trap is the
+# only thing that removes the directory, and a SIGKILL runs no trap in
+# any shell, a SIGTERM none under dash. Measured 2026-10-06: the dev
+# pod's /tmp held four such directories dated 10-03 to 10-06, three with
+# the door's TOKEN_HDR file in them, left by killed boss-api calls. A
+# unit's RuntimeDirectory= is the mechanism where there is a unit; this
+# is what is left for a sender with none, and for a unit's first run
+# after one that had none — which is why _secret_header_open calls it on
+# the temp directory as well as on the directory it writes in.
+#
+# WHAT IT MAY JUDGE. Only a real directory (never a link) of this name
+# that THIS account owns. Each one carries `.owner`, written when it is
+# made: the owner's pid, when that pid was born, and its pid namespace.
+#   * same namespace, and no such pid, or one born at another time (a
+#     recycled pid): the owner is dead — removed.
+#   * same namespace, same pid, same birth: a live sender mid-request —
+#     left alone, whatever its age. Removing it would send that request
+#     unstamped, a would-refuse fact made by the cleanup.
+#   * anything else — another namespace sharing this directory (a second
+#     container on one volume), no record (a reader older than the
+#     record, or a run killed before it was written), a record that is
+#     not three plain fields, a host with no /proc: its pids mean nothing
+#     here, so only AGE judges it, and only past a day.
+# Never a refusal and never a reason to stop: a caller that cannot sweep
+# sends exactly as it would have.
+_secret_header_sweep() {
+    _secret_header_sw_ns=$(readlink /proc/self/ns/pid 2>/dev/null) || _secret_header_sw_ns=""
+    _secret_header_sw_n=0
+    _secret_header_sw_said=""
+    _secret_header_sw_flags="$-"
+    set +f
+    for _secret_header_sw_d in "$1"/boss-secret-header.*; do
+        [ -d "$_secret_header_sw_d" ] && [ ! -L "$_secret_header_sw_d" ] && [ -O "$_secret_header_sw_d" ] || continue
+        _secret_header_sw_pid="" _secret_header_sw_born="" _secret_header_sw_ons="" _secret_header_sw_more=""
+        if [ -f "$_secret_header_sw_d/.owner" ] && [ ! -L "$_secret_header_sw_d/.owner" ]; then
+            read -r _secret_header_sw_pid _secret_header_sw_born _secret_header_sw_ons _secret_header_sw_more \
+                < "$_secret_header_sw_d/.owner" 2>/dev/null || :
+        fi
+        # PLACED: a record of two plain numbers from THIS pid namespace —
+        # the only kind whose pid can be looked up here.
+        _secret_header_sw_placed=""
+        if [ -z "$_secret_header_sw_more" ] && [ -n "$_secret_header_sw_ns" ] \
+            && [ "$_secret_header_sw_ons" = "$_secret_header_sw_ns" ]; then
+            case "$_secret_header_sw_pid:$_secret_header_sw_born" in
+                *[!0-9:]* | :* | *:) ;;
+                *) _secret_header_sw_placed=1 ;;
+            esac
+        fi
+        if [ -n "$_secret_header_sw_placed" ]; then
+            [ "$(_secret_header_born "$_secret_header_sw_pid")" != "$_secret_header_sw_born" ] || continue
+        else
+            [ -n "$(find "$_secret_header_sw_d" -maxdepth 0 -mmin +1440 2>/dev/null)" ] || continue
+        fi
+        rm -rf "$_secret_header_sw_d" 2>/dev/null || continue
+        _secret_header_sw_n=$((_secret_header_sw_n + 1))
+        _secret_header_sw_said="$_secret_header_sw_said $_secret_header_sw_d"
+    done
+    case "$_secret_header_sw_flags" in *f*) set -f ;; esac
+    if [ "$_secret_header_sw_n" -eq 1 ]; then
+        echo "secret_header: removed 1 header directory a killed earlier run left:$_secret_header_sw_said" >&2
+    elif [ "$_secret_header_sw_n" -gt 1 ]; then
+        echo "secret_header: removed $_secret_header_sw_n header directories killed earlier runs left:$_secret_header_sw_said" >&2
+    fi
+    return 0
+}
+
 # _secret_header_open — the private directory, made once per shell.
 _secret_header_open() {
     if [ -z "$_secret_header_dir" ] || [ ! -d "$_secret_header_dir" ]; then
@@ -151,12 +232,28 @@ _secret_header_open() {
         if [ -z "$_secret_header_base" ] || [ ! -d "$_secret_header_base" ]; then
             _secret_header_base="${TMPDIR:-/tmp}"
         fi
+        _secret_header_sweep "$_secret_header_base" || :
+        # UNDER A RuntimeDirectory, THE TEMP DIRECTORY TOO (backlog
+        # df38075a, F1, second car). A unit that gains RuntimeDirectory=
+        # writes in /run from then on, and a sweep of only the directory
+        # it writes in finds a fresh tmpfs: what the unit's killed runs
+        # had left under /tmp before had no remover but a hand run of the
+        # same account. Same rules, same account, one glob.
+        _secret_header_tmp="${TMPDIR:-/tmp}"
+        if [ "$_secret_header_base" != "$_secret_header_tmp" ] && [ -d "$_secret_header_tmp" ]; then
+            _secret_header_sweep "$_secret_header_tmp" || :
+        fi
         _secret_header_dir=$(mktemp -d "$_secret_header_base/boss-secret-header.XXXXXX") || {
             _secret_header_dir=""
             echo "secret_header: cannot make a private directory under $_secret_header_base — nothing was sent" >&2
             return 1
         }
         chmod 700 "$_secret_header_dir" || return 1
+        # Who owns it, for the next run's sweep (see _secret_header_sweep).
+        # Written before any header is: a run killed between the two lines
+        # leaves an empty directory, which a day's age removes.
+        (umask 077 && printf '%s %s %s\n' "$$" "$(_secret_header_born "$$")" \
+            "$(readlink /proc/self/ns/pid 2>/dev/null)" > "$_secret_header_dir/.owner") || :
         _secret_header_arm || {
             echo "secret_header: could not chain the cleanup onto the EXIT trap — nothing was sent" >&2
             _secret_header_close
@@ -220,9 +317,15 @@ secret_header() {
 # `Hosts::from_env` takes, held equal to it on the rows of the table in
 # crates/core/boss-testing/tests/secret_header_sh.rs. Off those rows the
 # two can differ (a backslash before `@`, malformed IPv6, the short and
-# octal IPv4 spellings Url::parse expands); review ef2da426 F4 measured
-# each against where curl actually connects, and every difference either
-# withholds or stamps a host curl reaches as loopback. Until car 4 a
+# octal IPv4 spellings Url::parse expands, a scheme that is not http or
+# https); review ef2da426 F4 measured each against where curl actually
+# connects, and ON A URL THAT BEGINS WITH `http://` OR `https://` every
+# difference either withholds, stamps a host curl reaches as the one the
+# rule read, or stamps a URL curl refuses to send (exit 3). That sentence
+# was written without the qualifier and was false for a URL with no
+# leading scheme — six rows of review 927f8602 read ADMIT while curl
+# delivered the header elsewhere (backlog 50708d76, F1). Such a URL is
+# now never read for a host at all: machine_token_host, below. Until car 4 a
 # script sent the token to whatever $BASE held, so a hand run with
 # BOSS_JOBS_URL pointed at the public edge sent it there (INFO-7, the
 # shell half of 2ee29275 F1).
@@ -284,22 +387,26 @@ machine_token_header() {
             return 0
             ;;
     esac
-    if [ -n "${BOSS_MACHINE_TOKEN_HOSTS+set}" ]; then
-        _secret_header_mt_list="$BOSS_MACHINE_TOKEN_HOSTS"
-    elif [ "$#" -ge 3 ]; then
-        _secret_header_mt_list="$3"
+    if [ "$#" -ge 3 ]; then
+        _secret_header_mt_hosts "$3"
     else
-        _secret_header_mt_list=$(sed -n 's/^BOSS_MACHINE_TOKEN_HOSTS=//p' "${BOSS_SOR_ENV:-/etc/boss/sor.env}" 2>/dev/null | sed -n '1p') || _secret_header_mt_list=""
+        _secret_header_mt_hosts
     fi
     _secret_header_mt_host=$(machine_token_host "${2:-}")
     if ! _secret_header_mt_allowed "$_secret_header_mt_host" "$_secret_header_mt_list"; then
         # The scheme and host, never the path or query (a login's state
-        # rides there) and never the userinfo.
+        # rides there) and never the userinfo. A URL with no leading
+        # http(s) scheme has no host to name, and NOTHING of it is
+        # printed: what stands before its first `://`, if it has one, may
+        # be a path, a query or a userinfo (backlog 50708d76, F1).
         case "${2:-}" in
-            *://*) _secret_header_mt_scheme="${2%%://*}" ;;
-            *) _secret_header_mt_scheme="(no scheme)" ;;
+            [Hh][Tt][Tt][Pp]://* | [Hh][Tt][Tt][Pp][Ss]://*)
+                echo "$_secret_header_mt_me: machine token withheld from ${2%%://*}://$_secret_header_mt_host — not loopback and not in BOSS_MACHINE_TOKEN_HOSTS, so this request goes out without it" >&2
+                ;;
+            *)
+                echo "$_secret_header_mt_me: machine token withheld — the URL does not begin with http:// or https://, so no host is read from it (curl would guess one); this request goes out without it" >&2
+                ;;
         esac
-        echo "$_secret_header_mt_me: machine token withheld from $_secret_header_mt_scheme://$_secret_header_mt_host — not loopback and not in BOSS_MACHINE_TOKEN_HOSTS, so this request goes out without it" >&2
         _secret_header_mt_tok=""
         return 0
     fi
@@ -309,13 +416,125 @@ machine_token_header() {
     return "$_secret_header_mt_rc"
 }
 
+# ---------------------------------------------------------------------
+# machine_gate_value_header VAR URL VALUE — the same header for a value
+# the CALLER holds, not the mount: VAR is `@<0600 file>`, or empty when
+# this request must not carry it. machine_token_header above still reads
+# the mount and is still the only way the ESTATE token is sent.
+#
+# WHY A SECOND DOOR (backlog d26515c5, unit 7). The forge's probe-reader
+# deposit must ask every gate what it makes of the Secret's `current`
+# slot BEFORE that value is written anywhere a reader could find it, so
+# it has no mount to read: the value is in a variable. Writing the header
+# by hand in that script would be a second place the header is spelled
+# (every_shell_sender_reads_the_machine_token_from_its_mount.rs refuses
+# one) and a second copy of the host rule.
+#
+# ONE CALLER. crates/core/boss-testing/tests/
+# every_shell_sender_reads_the_machine_token_from_its_mount.rs refuses
+# every live line under infra/ that names this function outside a roster
+# of one (review 4d39f4dc, B1): a door for "a value the caller holds" is
+# a door for the estate token read by hand, unless who may use it is
+# held somewhere a reviewer can read.
+#
+# THE SAME HOST RULE ON THE SAME LIST, by the same lines:
+# _secret_header_mt_hosts resolves the list for both functions and
+# _secret_header_mt_allowed judges the host for both (held row for row
+# by machine_gate_value_header_sh.rs). A host outside the rule is said
+# on stderr and VAR is empty: the caller sends nothing, since unlike a
+# stamped request this one has no purpose without the value. An empty
+# VALUE is VAR empty and nothing said. Non-zero only as secret_header's
+# own.
+machine_gate_value_header() {
+    case "${1:-}" in
+        '' | [0-9]* | *[!A-Za-z0-9_]*)
+            echo "machine_gate_value_header: '${1:-}' is not a variable name" >&2
+            return 2
+            ;;
+    esac
+    eval "$1="
+    if [ -z "${3:-}" ]; then
+        return 0
+    fi
+    _secret_header_mt_hosts
+    _secret_header_gv_host=$(machine_token_host "${2:-}")
+    if ! _secret_header_mt_allowed "$_secret_header_gv_host" "$_secret_header_mt_list"; then
+        echo "${0##*/}: a machine-gate value was withheld from host '$_secret_header_gv_host' — not loopback and not in BOSS_MACHINE_TOKEN_HOSTS, so nothing is sent" >&2
+        return 0
+    fi
+    secret_header "$1" "x-boss-machine-token: $3"
+}
+
+# ---------------------------------------------------------------------
+# machine_token_admits URL — the host rule's JUDGEMENT alone: return 0
+# when a request to URL may carry the machine token, 1 when it may not.
+# Nothing is read from the mount, written, or said; the caller says what
+# it withheld, in its own words.
+#
+# WHY (backlog 7369b078, F1 of review 9c484ca8). The ops runner presents
+# a SECOND secret to the system of record, its own credential in
+# x-boss-runner-credential, and made that header with plain
+# secret_header — which judges no host. So with BOSS_JOBS_URL pointed off
+# the estate the machine token stayed home and the runner's credential
+# went, on a queue read sent every minute. A secret that goes where the
+# machine token goes is held to the machine token's rule by asking THIS,
+# not by a second copy of the rule: it is the two calls the header
+# writers above make, on the same list, and
+# machine_gate_value_header_sh.rs holds all three equal row for row.
+machine_token_admits() {
+    _secret_header_mt_hosts
+    _secret_header_mt_allowed "$(machine_token_host "${1:-}")" "$_secret_header_mt_list"
+}
+
+# _secret_header_mt_hosts [LIST] — the hosts list of the rule above into
+# _secret_header_mt_list, by ONE resolution for both header writers
+# (review 4d39f4dc, F2: it lived in each, and the copies had already
+# drifted on four rows). $BOSS_MACHINE_TOKEN_HOSTS when it is SET (even
+# empty); else LIST, when one is given (even empty); else the first
+# `BOSS_MACHINE_TOKEN_HOSTS=` line of the rendered sor.env ($BOSS_SOR_ENV,
+# default /etc/boss/sor.env). A sor.env that is absent or cannot be read
+# is NO list: loopback is the rule's own and needs none, and no other
+# host is named.
+_secret_header_mt_hosts() {
+    if [ -n "${BOSS_MACHINE_TOKEN_HOSTS+set}" ]; then
+        _secret_header_mt_list="$BOSS_MACHINE_TOKEN_HOSTS"
+    elif [ "$#" -ge 1 ]; then
+        _secret_header_mt_list="$1"
+    else
+        _secret_header_mt_list=$(sed -n 's/^BOSS_MACHINE_TOKEN_HOSTS=//p' "${BOSS_SOR_ENV:-/etc/boss/sor.env}" 2>/dev/null | sed -n '1p') || _secret_header_mt_list=""
+    fi
+}
+
 # machine_token_host URL — the host a request to URL goes to, as the
 # decision above reads it: lowercased, no port, no userinfo, no IPv6
 # brackets, one trailing dot dropped. The authority ends at the first
 # `/`, `?` or `#`, cut BEFORE the userinfo is, or `http://evil.com#@127.0.0.1`
 # reads as loopback while curl and boss-core both send it to evil.com
 # (review of 54d9a23a, MEDIUM-2). Printed without a newline.
+#
+# ONLY AFTER A LEADING `http://` OR `https://` (backlog 50708d76, F1 of
+# review 927f8602). Anything else prints NOTHING, and an empty host is
+# withheld by _secret_header_mt_allowed. Until 2026-10-08 this stripped
+# `${1#*://}` — up to the first `://` ANYWHERE — so a URL with no scheme
+# that held `://` further on was judged by the host after it, while curl
+# guesses http and connects to the FIRST: with the list naming
+# sor.invalid, `evil.invalid/x://sor.invalid`, `evil.invalid?x=://sor.invalid`,
+# `evil.invalid#://sor.invalid`, `evil.invalid:80/x://sor.invalid:7900`,
+# `evil.invalid/x://127.0.0.1` and `user@evil.invalid/://localhost` each
+# read ADMIT and curl 7.88.1 delivered the header to evil.invalid
+# (measured through a loopback stub, dash and bash alike). WITHHELD
+# RATHER THAN JUDGED BY THE FIRST HOST: reading it as curl would means
+# keeping a second copy of curl's guess (it also guesses ftp, dict and
+# others from the host's first label), and boss-core withholds every such
+# URL already — Url::parse refuses a relative one. No sender here builds
+# a URL without a scheme (render-sor-env.sh writes sor_url whole), so the
+# only caller this refuses is the mistyped BOSS_JOBS_URL it is for. Not
+# every scheme either: curl speaks twenty and the estate two.
 machine_token_host() {
+    case "${1:-}" in
+        [Hh][Tt][Tt][Pp]://* | [Hh][Tt][Tt][Pp][Ss]://*) ;;
+        *) return 0 ;;
+    esac
     _secret_header_h="${1#*://}"
     _secret_header_h="${_secret_header_h%%[/?#]*}"
     _secret_header_h="${_secret_header_h##*@}"

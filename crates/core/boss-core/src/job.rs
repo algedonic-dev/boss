@@ -537,6 +537,115 @@ pub fn apply_voids(stamps: &mut [SignOffStamp], from: &[SignOffStamp]) {
     }
 }
 
+/// HOW LONG A PRESENCE STAMP CARRIES ITS STEP'S COMPLETION, in hours,
+/// counted from the stamp's `stamped_at` on the clock that wrote it.
+///
+/// Design 1ce67f7e, question `stamp-age`, decided by David 2026-10-07:
+/// 72 hours "for now" (the proposal said 24). A step whose approval IS
+/// its passkey stamps completes on them with no second ceremony; what a
+/// stamp does not have, and the two-minute ticket did, is an end. This
+/// is it: an approval given and then forgotten does not complete a step
+/// days later. "For now" means it will be revisited, so it is ONE
+/// declared value — every reader takes it from here, the refusal prints
+/// it, and no second literal exists to fall behind it (CLAUDE.md §9a).
+///
+/// It bounds COMPLETING the step, nothing else. A consumer that ACTS on
+/// an approval keeps its own tighter bound: the ops runner runs an
+/// approved plan within ten minutes of the signature (`APPROVAL_TTL_S`,
+/// infra/ops/ops-runner.sh), judged on the stamp, whoever completed.
+pub const PRESENCE_STAMP_COMPLETES_FOR_HOURS: i64 = 72;
+
+/// How far AHEAD of the clock a stamp may be dated and still be judged
+/// by age. An age cannot be read off a stamp dated after `now`: the
+/// clock went back (a sim epoch restarted) or two replicas disagree, and
+/// without this bound such a stamp would never grow old. Minutes, so
+/// ordinary skew between two reads of one clock port refuses nothing.
+pub const STAMP_CLOCK_TOLERANCE_MINUTES: i64 = 5;
+
+/// [`Step::stamped_presence`]'s answer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StampedPresence<'a> {
+    /// The step names no sign-off role, so no stamp can stand for its
+    /// completion: the completing request carries the proof itself.
+    NoRoles,
+    /// Every required role is carried; one stamp per role, in the order
+    /// the step requires them — what a completion records it stood on.
+    Carried(Vec<&'a SignOffStamp>),
+    /// At least one required role is not carried; every such role, in
+    /// the order the step requires them.
+    Owed(Vec<StampOwed>),
+}
+
+/// One required role whose stamps do not carry the step's completion,
+/// and the stamp that came closest — named so the refusal can say whose
+/// signature is asked for again.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StampOwed {
+    pub role: String,
+    pub why: StampOwedWhy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authority_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stamped_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl StampOwed {
+    fn of(role: &str, why: StampOwedWhy, stamp: Option<&SignOffStamp>) -> Self {
+        Self {
+            role: role.to_string(),
+            why,
+            authority_id: stamp.map(|st| st.authority_id.clone()),
+            stamped_at: stamp.map(|st| st.stamped_at),
+        }
+    }
+
+    /// One sentence a person can act on.
+    pub fn sentence(&self) -> String {
+        let who = self.authority_id.as_deref().unwrap_or("unknown");
+        let when = self
+            .stamped_at
+            .map(|at| at.to_rfc3339())
+            .unwrap_or_default();
+        let role = &self.role;
+        match self.why {
+            StampOwedWhy::NoLiveStamp => format!(
+                "role {role} has no live presence stamp over the current content (never \
+                 signed, or its stamp died when the content changed)"
+            ),
+            StampOwedWhy::BelowPresence => format!(
+                "role {role} is signed by {who} at {when} on a session, not a passkey: that \
+                 stamp does not carry a presence step"
+            ),
+            StampOwedWhy::TooOld => format!(
+                "role {role} was signed by {who} at {when}, more than \
+                 {PRESENCE_STAMP_COMPLETES_FOR_HOURS} hours ago: a presence stamp carries its \
+                 step's completion for {PRESENCE_STAMP_COMPLETES_FOR_HOURS} hours"
+            ),
+            StampOwedWhy::DatedAhead => format!(
+                "role {role} is signed by {who} at {when}, which is after this service's \
+                 clock: a stamp that cannot be dated cannot be aged"
+            ),
+        }
+    }
+}
+
+/// Why a required role's stamps do not carry the completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StampOwedWhy {
+    /// No stamp of the role is live: none was written, each was voided,
+    /// or each signs a shape the step no longer has.
+    NoLiveStamp,
+    /// The role's live stamp was written on a session.
+    BelowPresence,
+    /// The role's newest live presence stamp is older than
+    /// [`PRESENCE_STAMP_COMPLETES_FOR_HOURS`].
+    TooOld,
+    /// The role's newest live presence stamp is dated more than
+    /// [`STAMP_CLOCK_TOLERANCE_MINUTES`] after `now`.
+    DatedAhead,
+}
+
 /// Hash of a step's completion-relevant content — what a sign-off
 /// stamp attests. Title + metadata, canonically serialized (sorted
 /// keys) so hashing is insertion-order independent. Fields that
@@ -829,6 +938,84 @@ impl Step {
     /// True when every required role holds a live stamp.
     pub fn sign_offs_satisfied(&self) -> bool {
         self.roles_without_a_live_stamp().is_empty()
+    }
+
+    /// WHETHER THIS STEP'S STAMPS CARRY ITS COMPLETION AT PRESENCE
+    /// (design 1ce67f7e, decided 2026-10-07): every role the step
+    /// requires holds a LIVE stamp ([`Step::live_stamps`], the one rule)
+    /// that a passkey produced, and the newest such stamp of each role is
+    /// no older than [`PRESENCE_STAMP_COMPLETES_FOR_HOURS`] at `now`.
+    ///
+    /// `now` is the clock the stamps were written with — the service's
+    /// clock port, the sim clock on a simulated instance — never the
+    /// wall clock beside it: an age is a difference, and it means
+    /// something only between two reads of one clock.
+    ///
+    /// THREE ANSWERS, NEVER TWO. A step that names no role has no stamp
+    /// to stand on, and "every role of none" is vacuously true: answered
+    /// as a boolean, the presence step with no sign-off roles — the shape
+    /// packet d5efbb3c was completed in with no ceremony (backlog
+    /// 148549c5) — would read as carried. [`StampedPresence::NoRoles`]
+    /// is its own arm so no caller can take it for a pass.
+    ///
+    /// The stamps' ASSURANCE is read off each stamp, not assumed from the
+    /// step: `assurance_required` is not in the shape hash, and a re-pin
+    /// re-projects it onto an open step (`repin.rs`), so a step can come
+    /// to require presence while holding a live stamp a session wrote.
+    pub fn stamped_presence(&self, now: chrono::DateTime<chrono::Utc>) -> StampedPresence<'_> {
+        if self.sign_offs_required.is_empty() {
+            return StampedPresence::NoRoles;
+        }
+        let mut carried = Vec::new();
+        let mut owed = Vec::new();
+        for role in &self.sign_offs_required {
+            match self.presence_stamp_of(role, now) {
+                Ok(st) => carried.push(st),
+                Err(short) => owed.push(short),
+            }
+        }
+        if owed.is_empty() {
+            StampedPresence::Carried(carried)
+        } else {
+            StampedPresence::Owed(owed)
+        }
+    }
+
+    /// The stamp that carries `role` at presence, or what the role owes —
+    /// the per-role half of [`Step::stamped_presence`], and the one place
+    /// liveness, assurance and age are read together.
+    ///
+    /// The role is carried by its newest live presence stamp that can be
+    /// DATED inside the window: a signature renewed after its
+    /// predecessor aged out is the role's word now, and the older stamp
+    /// beside it is history. When none is inside the window the role's
+    /// newest presence stamp is the one named, so the refusal says whose
+    /// signature is asked for again.
+    pub fn presence_stamp_of(
+        &self,
+        role: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<&SignOffStamp, StampOwed> {
+        let oldest = now - chrono::Duration::hours(PRESENCE_STAMP_COMPLETES_FOR_HOURS);
+        let latest = now + chrono::Duration::minutes(STAMP_CLOCK_TOLERANCE_MINUTES);
+        let live = || self.live_stamps().filter(|st| st.role == role);
+        let by_passkey = || live().filter(|st| st.assurance >= Assurance::Presence);
+        if let Some(st) = by_passkey()
+            .filter(|st| st.stamped_at >= oldest && st.stamped_at <= latest)
+            .max_by_key(|st| st.stamped_at)
+        {
+            return Ok(st);
+        }
+        Err(match by_passkey().max_by_key(|st| st.stamped_at) {
+            Some(st) if st.stamped_at > latest => {
+                StampOwed::of(role, StampOwedWhy::DatedAhead, Some(st))
+            }
+            Some(st) => StampOwed::of(role, StampOwedWhy::TooOld, Some(st)),
+            None => match live().max_by_key(|st| st.stamped_at) {
+                Some(weak) => StampOwed::of(role, StampOwedWhy::BelowPresence, Some(weak)),
+                None => StampOwed::of(role, StampOwedWhy::NoLiveStamp, None),
+            },
+        })
     }
 
     /// A STAMP DIES WHEN THE SHAPE IT SIGNED LEAVES THE STEP (design
@@ -1298,6 +1485,160 @@ mod tests {
             voided_by_event: None,
         });
         s
+    }
+
+    // ---- a stamped presence step completes on its stamps (1ce67f7e) ----
+
+    fn at(now: chrono::DateTime<chrono::Utc>, minutes_ago: i64) -> chrono::DateTime<chrono::Utc> {
+        now - chrono::Duration::minutes(minutes_ago)
+    }
+
+    fn why(s: &Step, now: chrono::DateTime<chrono::Utc>) -> Vec<(String, StampOwedWhy)> {
+        match s.stamped_presence(now) {
+            StampedPresence::Owed(owed) => owed.into_iter().map(|o| (o.role, o.why)).collect(),
+            other => panic!("expected Owed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_step_with_no_roles_is_never_carried_by_stamps() {
+        let now = chrono::Utc::now();
+        let mut s = stamped_step(serde_json::json!({"plan": "x"}));
+        s.sign_offs_required.clear();
+        assert_eq!(
+            s.stamped_presence(now),
+            StampedPresence::NoRoles,
+            "no role asked for the stamp it holds, so it stands for nothing"
+        );
+    }
+
+    #[test]
+    fn every_required_role_must_hold_a_live_passkey_stamp() {
+        let now = chrono::Utc::now();
+        let s = stamped_step(serde_json::json!({"plan": "x"}));
+        match s.stamped_presence(now) {
+            StampedPresence::Carried(stamps) => {
+                assert_eq!(stamps.len(), 1);
+                assert_eq!(stamps[0].role, "cto");
+            }
+            other => panic!("expected Carried, got {other:?}"),
+        }
+
+        // A second required role nobody signed.
+        let mut two = s.clone();
+        two.sign_offs_required.push("cfo".into());
+        assert_eq!(
+            why(&two, now),
+            vec![("cfo".to_string(), StampOwedWhy::NoLiveStamp)]
+        );
+
+        // The content moved: the stamp signs another shape.
+        let mut moved = s.clone();
+        moved.metadata = serde_json::json!({"plan": "y"});
+        assert_eq!(
+            why(&moved, now),
+            vec![("cto".to_string(), StampOwedWhy::NoLiveStamp)]
+        );
+
+        // Voided, on this very shape.
+        let mut voided = s.clone();
+        voided.sign_offs[0].voided_at = Some(now);
+        assert_eq!(
+            why(&voided, now),
+            vec![("cto".to_string(), StampOwedWhy::NoLiveStamp)]
+        );
+
+        // Live, and written on a session.
+        let mut weak = s.clone();
+        weak.sign_offs[0].assurance = Assurance::Session;
+        assert_eq!(
+            why(&weak, now),
+            vec![("cto".to_string(), StampOwedWhy::BelowPresence)]
+        );
+
+        // A stamp of a role the step does not require carries nothing.
+        let mut other = s.clone();
+        other.sign_offs[0].role = "cfo".into();
+        assert_eq!(
+            why(&other, now),
+            vec![("cto".to_string(), StampOwedWhy::NoLiveStamp)]
+        );
+    }
+
+    #[test]
+    fn a_stamp_carries_for_the_declared_hours_and_not_a_minute_more() {
+        let now = chrono::Utc::now();
+        let bound = PRESENCE_STAMP_COMPLETES_FOR_HOURS * 60;
+        let aged = |minutes: i64| {
+            let mut s = stamped_step(serde_json::json!({"plan": "x"}));
+            s.sign_offs[0].stamped_at = at(now, minutes);
+            s
+        };
+        assert!(matches!(
+            aged(bound).stamped_presence(now),
+            StampedPresence::Carried(_)
+        ));
+        assert_eq!(
+            why(&aged(bound + 1), now),
+            vec![("cto".to_string(), StampOwedWhy::TooOld)]
+        );
+        // The unit: 71 and 73 HOURS sit either side of it.
+        assert!(matches!(
+            aged(71 * 60).stamped_presence(now),
+            StampedPresence::Carried(_)
+        ));
+        assert_eq!(why(&aged(73 * 60), now)[0].1, StampOwedWhy::TooOld);
+        // Dated after the clock, past the tolerance and inside it.
+        assert_eq!(
+            why(&aged(-(STAMP_CLOCK_TOLERANCE_MINUTES + 1)), now)[0].1,
+            StampOwedWhy::DatedAhead
+        );
+        assert!(matches!(
+            aged(-STAMP_CLOCK_TOLERANCE_MINUTES).stamped_presence(now),
+            StampedPresence::Carried(_)
+        ));
+    }
+
+    #[test]
+    fn a_renewed_signature_carries_the_role_beside_the_aged_one() {
+        let now = chrono::Utc::now();
+        let mut s = stamped_step(serde_json::json!({"plan": "x"}));
+        s.sign_offs[0].stamped_at = at(now, 80 * 60);
+        let mut fresh = s.sign_offs[0].clone();
+        fresh.stamped_at = at(now, 5);
+        fresh.presence_nonce = Some("n2".into());
+        s.sign_offs.push(fresh);
+        match s.stamped_presence(now) {
+            StampedPresence::Carried(stamps) => {
+                assert_eq!(stamps[0].presence_nonce.as_deref(), Some("n2"));
+            }
+            other => panic!("expected Carried, got {other:?}"),
+        }
+        // A fresh stamp that is DEAD does not rescue the aged one.
+        s.sign_offs[1].voided_at = Some(now);
+        assert_eq!(why(&s, now)[0].1, StampOwedWhy::TooOld);
+        // Nor does a fresh one a session wrote.
+        s.sign_offs[1].voided_at = None;
+        s.sign_offs[1].assurance = Assurance::Session;
+        assert_eq!(why(&s, now)[0].1, StampOwedWhy::TooOld);
+    }
+
+    #[test]
+    fn the_refusal_sentence_names_the_role_the_signer_and_the_instant() {
+        let now = chrono::Utc::now();
+        let mut s = stamped_step(serde_json::json!({"plan": "x"}));
+        s.sign_offs[0].stamped_at = at(now, 80 * 60);
+        let StampedPresence::Owed(owed) = s.stamped_presence(now) else {
+            panic!("expected Owed");
+        };
+        let said = owed[0].sentence();
+        assert!(said.contains("role cto"), "{said}");
+        assert!(said.contains("emp-a"), "{said}");
+        assert!(
+            said.contains(&s.sign_offs[0].stamped_at.to_rfc3339()),
+            "{said}"
+        );
+        assert!(said.contains("72 hours"), "{said}");
     }
 
     /// A-B-A (backlog c085256d, design 87329a13): the stamp dies when X

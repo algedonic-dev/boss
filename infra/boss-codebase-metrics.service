@@ -71,6 +71,18 @@ User=david
 # for some other copy. The path is held equal to the installer's store
 # by codebase_metrics_unit_user.rs.
 Environment=BOSS_LEAKED_POLICY_BIN=/opt/boss-cli/current/boss-leaked-policy
+# THE TOKEN'S HEADER FILE NEVER OUTLIVES A RUN (backlog df38075a, F1;
+# the second car, which took the class and not the six units the item
+# named). The wrap pair on the Exec lines below presents the machine
+# token, and infra/lib/secret-header.sh makes its 0600 header file in
+# $RUNTIME_DIRECTORY when a unit declares one: /run/boss-codebase-metrics,
+# tmpfs, 0700, this unit's account's, removed by systemd when this
+# oneshot stops whatever ended it. Without it the file was made in the
+# host's shared /tmp, where a killed run left it. The reasoning is in
+# infra/forge/estate-observe-units.service; the pin that walks every
+# unit is a_killed_sender_leaves_no_header_behind.rs.
+RuntimeDirectory=boss-codebase-metrics
+RuntimeDirectoryMode=0700
 ExecStartPre=-/opt/boss/infra/boss-maintenance-wrap.sh maintenance-codebase-metrics "Codebase metrics"
 ExecStart=/opt/boss/infra/codebase-metrics.sh file --repo /opt/boss --ref main
 ExecStopPost=-/opt/boss/infra/boss-step.sh maintenance-codebase-metrics run

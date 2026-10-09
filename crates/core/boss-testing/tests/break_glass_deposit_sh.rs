@@ -410,8 +410,15 @@ fn the_installer_places_a_copy_and_one_checked_rule_that_names_the_argument() {
             )
             .as_str(),
             format!("david ALL=(root) NOPASSWD: {r} kubeconfig").as_str(),
+            // The receiver's second purpose, over a key of its own
+            // (backlog 88379df3; design-doc bdc60b65, gcp-push). A second
+            // LINE naming its whole command line: the break-glass key's
+            // forced command is `… kubeconfig` and reaches only the line
+            // above. machine_token_push_sh.rs holds this half.
+            format!("david ALL=(root) NOPASSWD: {r} machine-token").as_str(),
         ],
-        "the sudoers rule grants something other than the receiver for the kubeconfig:\n{body}"
+        "the sudoers rule grants something other than the receiver for its two named \
+         purposes:\n{body}"
     );
     assert_eq!(mode(&rule), 0o440);
     assert!(

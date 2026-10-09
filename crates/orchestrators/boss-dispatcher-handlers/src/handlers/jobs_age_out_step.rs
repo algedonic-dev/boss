@@ -72,6 +72,23 @@
 //! An unreadable or incomplete linked roster refuses before any writes.
 //! Report prose alone proves neither an active gate nor success.
 //!
+//! ## The record an ending posts (backlog b5a3a174)
+//!
+//! A run aged out as `unreported` shipped its work and cost something,
+//! and until 2026-10-08 it ended with no `agent_runs` row — or, where a
+//! launch-time placeholder had been posted for it, with one reading
+//! zero tokens at $0, which is a cost nobody measured. A rule naming
+//! `post_to` posts a record as it ends the step, by the landing
+//! handler's own `post_*` vocabulary (`jobs.complete_step_from_record`,
+//! whose `Post` this reuses) less `post_record`: a packet aged out for
+//! want of a record stored none, so the body is `post_fields` (fixed
+//! keys — `total_tokens = null`, the stated absence of a count, and a
+//! `detail.unpriced` sentence) plus `post_fill` (keys read off the
+//! packet or a named step), with `post_id_key` naming the packet and
+//! `post_at_key` the body key stamped with the tick's instant. Posted
+//! BEFORE the completion; what the door answered rides the evidence as
+//! `posted`.
+//!
 //! `now` is the tick's own `_at`, which the schedule runner writes onto
 //! every sub-day firing. The handler holds no clock: a rule that fires
 //! this on a DAILY cadence gets no `_at` and is refused as permanent —
@@ -85,7 +102,7 @@
 
 use super::common::{api_client, complete_step, get_json, open_jobs_of_kind, rows_or_refuse};
 use super::jobs_complete_linked_step::{is_open, is_unset, step_by_slug, template_arg};
-use super::jobs_complete_step_from_record::job_holds;
+use super::jobs_complete_step_from_record::{Post, job_holds, post_body, post_record};
 use async_trait::async_trait;
 use boss_dispatcher::rules::expr::Value;
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext, arg, arg_string};
@@ -457,6 +474,21 @@ impl Handler for JobsAgeOutStep {
             Some(Value::String(s)) if !s.is_empty() => Some(s.as_str()),
             _ => None,
         };
+        let text = |k: &str| match arg(args, k) {
+            Some(Value::String(s)) if !s.is_empty() => Some(s.as_str()),
+            _ => None,
+        };
+        // THE RECORD THE ENDING POSTS (b5a3a174 — see the module doc):
+        // built from the rule's own args, because a packet aged out for
+        // want of a record stored none.
+        let post = text("post_to").map(|to| Post {
+            to,
+            record: None,
+            id_key: text("post_id_key"),
+            fields: template_arg(args, "post_fields", &ctx.rule_name).unwrap_or_default(),
+            fill: template_arg(args, "post_fill", &ctx.rule_name).unwrap_or_default(),
+        });
+        let post_at_key = text("post_at_key");
 
         // The tick's own instant. Absent on a daily firing, which is a
         // rule-authoring error this handler cannot make good by
@@ -545,15 +577,39 @@ impl Handler for JobsAgeOutStep {
                 .filter(|(k, _)| is_unset(existing.and_then(|m| m.get(*k))))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-            fields.insert(
-                evidence_key.to_string(),
-                json!({
-                    "silent_hours": (silent * 100.0).round() / 100.0,
-                    "bound_hours": bound,
-                    "at": now.to_rfc3339(),
-                    "rule": ctx.rule_name,
-                }),
-            );
+            let mut evidence = json!({
+                "silent_hours": (silent * 100.0).round() / 100.0,
+                "bound_hours": bound,
+                "at": now.to_rfc3339(),
+                "rule": ctx.rule_name,
+            });
+            // THE RECORD, BEFORE THE COMPLETION — the landing handler's
+            // order and its reason: the door is insert-once, so a tick
+            // that dies after the post re-posts harmlessly, while a
+            // completion made first would close the step and no later
+            // tick would reach this line. A refusal no retry repairs
+            // does not hold the ending hostage; the evidence carries it.
+            if let Some(p) = &post {
+                let posted = match post_body(job, p) {
+                    None => "absent: nothing to post".to_string(),
+                    Some(Err(e)) => format!("refused: {e}"),
+                    Some(Ok(mut body)) => {
+                        if let Some(key) = post_at_key {
+                            body[key] = json!(now.to_rfc3339());
+                        }
+                        let url = format!("{}{}", self.base(), p.to);
+                        match post_record(&self.client, &url, &body, &ctx.rule_name).await? {
+                            Ok(()) => format!("recorded: posted to {}", p.to),
+                            Err(e) => {
+                                tracing::warn!(rule = %ctx.rule_name, packet = %job_id, "{e}");
+                                format!("refused: {e}")
+                            }
+                        }
+                    }
+                };
+                evidence["posted"] = json!(posted);
+            }
+            fields.insert(evidence_key.to_string(), evidence);
             // Those keys through the step merge door, then the status
             // alone (backlog e39a9d2a): this PUT the step's metadata AS
             // READ plus them, which the step PUT refuses once anything
@@ -658,7 +714,21 @@ mod tests {
         let merge_jobs = by_id.clone();
         let put_log = puts.clone();
         let merge_log = puts.clone();
+        let post_log = puts.clone();
         let app = Router::new()
+            // The agent-runs door, recorded in order with the step writes.
+            .route(
+                "/api/agent-runs",
+                axum::routing::post(move |Json(body): Json<serde_json::Value>| {
+                    let puts = post_log.clone();
+                    async move {
+                        puts.lock()
+                            .unwrap()
+                            .push(("POST".into(), "/api/agent-runs".into(), body));
+                        Json(json!({ "recorded": true }))
+                    }
+                }),
+            )
             .route(
                 "/api/jobs",
                 get(move |Query(q): Query<HashMap<String, String>>| {
@@ -894,6 +964,103 @@ mod tests {
             !written.iter().any(|(j, _, _)| j == SILENT),
             "nothing is written onto the run whose report is on the packet: {written:?}"
         );
+    }
+
+    /// The unreported rule as `infra/dispatcher/rules/` authors it,
+    /// read from the file so this judges the rule that runs (§9a).
+    fn unreported_args() -> Vec<(String, Value)> {
+        let path = boss_testing::repo_root().join(
+            "infra/dispatcher/rules/agent-run-ends-unreported-when-the-handback-never-arrives.toml",
+        );
+        let text = std::fs::read_to_string(&path).expect("the rule is authored");
+        let rule: toml::Value = toml::from_str(&text).expect("the rule parses");
+        rule["rule"][0]["do"][0]["args"]
+            .as_table()
+            .expect("the rule has args")
+            .iter()
+            .map(|(k, v)| {
+                // An arg is an expression: a quoted string literal.
+                let lit: String = serde_json::from_str(v.as_str().expect("an expression string"))
+                    .expect("a string literal");
+                (k.clone(), Value::String(lit))
+            })
+            .collect()
+    }
+
+    /// A RUN THAT NEVER REPORTS STILL ENDS WITH A ROW, AND THE ROW SAYS
+    /// WHY IT HAS NO PRICE (backlog b5a3a174; the died and refused
+    /// endings stay on 4f45f5ec). The clock that ends the run
+    /// `unreported` posts its `agent_runs` record first: the run's own
+    /// id, the agent `building` was placed with, the model the packet
+    /// declared, finished at the tick — and NO count, stated as a null,
+    /// with `detail.unpriced` naming the absence. Never a zero, which
+    /// reads as a cost of $0. A report that arrives later replaces it,
+    /// once (`boss_jobs::agent_runs::port::replaces`).
+    #[tokio::test]
+    async fn a_run_that_never_reported_ends_with_a_row_that_says_so() {
+        let mut silent = run(SILENT, Some("2026-10-08T14:00:00Z"), None);
+        silent["metadata"] = json!({
+            "packet": "77777777-7777-4777-8777-777777777777", "step": "build",
+            "agent": "claude@algedonic.dev", "model": "opus-5[1m]",
+            "opened_at": "2026-10-08T13:59:00Z",
+        });
+        silent["steps"][2] = json!({
+            "id": format!("{SILENT}-building"), "spec_slug": "building", "status": "completed",
+            "assignee_id": "agent-claude", "completed_at": "2026-10-08T15:00:00Z",
+            "metadata": { "result": "gated", "gate_run": { "branch": "fix/the-car" } },
+        });
+        let (base, puts) = mock_jobs(vec![silent]).await;
+        let h = JobsAgeOutStep::with_client(crate::handlers::common::api_client(), &base);
+        let mut c = ctx(tick("2026-10-08T18:00:00Z"));
+        c.rule_name = "agent-run-ends-unreported-when-the-handback-never-arrives".into();
+        h.invoke(&unreported_args(), &c)
+            .await
+            .expect("the tick runs");
+        let written = puts.lock().unwrap().clone();
+        assert_eq!(
+            written.len(),
+            3,
+            "the record, the merge, the flip: {written:?}"
+        );
+        let (_, path, row) = &written[0];
+        assert_eq!(path, "/api/agent-runs", "the record goes first");
+        assert_eq!(row["run_id"], SILENT);
+        assert_eq!(row["actor_id"], "agent-claude");
+        assert_eq!(row["model"], "opus-5[1m]");
+        assert_eq!(row["started_at"], "2026-10-08T13:59:00Z");
+        assert_eq!(row["finished_at"], "2026-10-08T18:00:00+00:00");
+        assert_eq!(row["outcome"], "success", "the work shipped");
+        assert_eq!(row["job_id"], "77777777-7777-4777-8777-777777777777");
+        assert_eq!(row["branch"], "fix/the-car");
+        assert!(
+            row.as_object().unwrap().get("total_tokens") == Some(&serde_json::Value::Null),
+            "no count, said as a null — never a zero: {row}"
+        );
+        assert!(
+            row["detail"]["unpriced"]
+                .as_str()
+                .is_some_and(|w| w.starts_with("never reported")),
+            "{row}"
+        );
+        // The door reads this body as a run that reported no count.
+        let parsed: boss_jobs::agent_runs::NewAgentRun =
+            serde_json::from_value(row.clone()).expect("the door's own shape");
+        assert_eq!(parsed.tokens, boss_jobs::agent_runs::TokenUsage::Unreported);
+
+        let merge = &written[1].2;
+        assert_eq!(merge["handback"], "absent");
+        assert!(
+            merge["aged_out"]["posted"]
+                .as_str()
+                .is_some_and(|p| p.starts_with("recorded")),
+            "the step says the row was posted: {merge}"
+        );
+        assert_eq!(written[2].2, json!({ "status": "completed" }));
+
+        h.invoke(&unreported_args(), &c)
+            .await
+            .expect("the next tick runs");
+        assert_eq!(puts.lock().unwrap().len(), 3, "nothing is written twice");
     }
 
     /// A daily firing carries no `_at`; the handler refuses rather than
@@ -1356,7 +1523,7 @@ mod tests {
             crate::cascade::handler_emits()
                 .get("jobs.age_out_step")
                 .cloned(),
-            Some(vec!["jobs.step.completed"]),
+            Some(vec!["jobs.step.completed", "agents.run.recorded"]),
             "the cascade table knows what this handler emits"
         );
     }

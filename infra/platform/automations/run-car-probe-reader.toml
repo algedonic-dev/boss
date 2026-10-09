@@ -1,0 +1,11 @@
+# automation:run-car-probe-reader — the role-report tally (GET
+# /api/jobs/actor-role-reports), read 2026-10-07T02:13Z: 20 observations,
+# all read job.
+# Signs as audit-readonly today: boss_core::roles::PROBE_READER_ACTOR,
+# through reader_header; every machine gate writes this id over a caller
+# presenting the probe-reader credential (design b35c22b4).
+
+[[automation]]
+id = "automation:run-car-probe-reader"
+role = "audit-readonly"
+description = 'The identity a recorded car probe reads the system of record as (boss prove, and boss-sor-read on the forge). Reads only, and runs car-supplied shell, so it must never hold more than the read role.'

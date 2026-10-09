@@ -34,6 +34,39 @@ cluster config, and it converges the same way code does:
   `boss-gcs-offsite`, `forgejo-registry`,
   `cloudflare-tunnel-credentials`); the Secret objects
   themselves are created out-of-band and stay out-of-tree.
+- **One namespace admits a node capability, and it holds one
+  workload.** Every namespace here enforces PodSecurity `baseline`
+  except the node-maintenance one (backlog 17f6170c), labelled
+  `privileged` for a daily `fstrim` of the build node's two
+  filesystems. `privileged` admits anything, so the bound is not the
+  label. **It is at admission**: `boss-node-maintenance-admission.yaml`
+  declares the namespace, its label, and a ValidatingAdmissionPolicy
+  (Deny) that admits into it only the trim CronJob, a Job and a Pod
+  whose pod spec is exactly the trim pod, and the deny-all
+  NetworkPolicy — whoever sends the object and however a file spells
+  it (backlog 8eac4893, landed first, on train #987). The workload
+  itself is `boss-node-maintenance.yaml`, which declares no Namespace,
+  so the converge always writes the policy before the CronJob.
+  `the_node_maintenance_namespace_is_bounded_at_admission.rs` evaluates
+  the policy against that file's CronJob; the two change together or
+  the gate is red. Beside it, a line-based net:
+  `the_privileged_namespace_holds_one_workload.rs` holds every
+  non-comment line of the workload file — two documents and the inline
+  script — and the Namespace document to its own copy, and refuses the
+  namespace's name, `hostPath`, `privileged`, a host namespace or
+  `SYS_ADMIN` as text on a line of every other yaml under `infra/`
+  (the admission file excepted, by name), together with the spellings
+  found so far that hide such a word from a line (a line break that is
+  not LF, a tag, a backslash-continued or unclosed quoted scalar, an
+  explicit key, a flow collection open across lines). That net is a
+  line-based reading of YAML plus review, not a YAML reader, which is
+  why it is not the bound. That pod's image and script are root on
+  w-1: CAP_SYS_ADMIN lets hostile code in either remount its mounts or
+  reach the host, and nothing in the pod's settings bounds that. The
+  controls are the digest, the pinned script and review of any change
+  to either; the narrower seccomp profile is owed (item fb2f849f). A
+  second thing that needs the node is its own car and its own review,
+  never a line added there.
 
 **One source, rendered per instance.** This directory is written for
 ONE instance — prod, namespace `boss` — and every instance in

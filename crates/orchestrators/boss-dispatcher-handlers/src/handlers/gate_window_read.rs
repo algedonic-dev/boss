@@ -186,6 +186,7 @@ mod tests {
             required: vec!["policy".into()],
             not_launched: vec![excuse("assets")],
             errors: vec![],
+            generation: None,
         };
         // Required plus excused is the consumer's whole roster, and
         // every port of it was read.

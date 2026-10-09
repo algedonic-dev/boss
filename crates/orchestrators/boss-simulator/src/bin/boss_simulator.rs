@@ -320,9 +320,7 @@ async fn main() -> Result<()> {
         )),
         roles.clone(),
         mode.clone(),
-        Arc::new(boss_policy_client::role_reporting::ReportTally::new(
-            boss_policy_client::role_service::REPORT_CAPACITY,
-        )),
+        boss_policy_client::role_service::unrecorded_tally("simulator", mode.clone()),
     );
 
     let state = Arc::new(AppState {

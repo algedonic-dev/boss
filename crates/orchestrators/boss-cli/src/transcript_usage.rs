@@ -549,17 +549,40 @@ pub(crate) fn sum_usage(jsonl: &str) -> Option<Usage> {
     ))
 }
 
-/// Where the harness keeps its projects: `$CLAUDE_CONFIG_DIR/projects`
-/// when the session set one, else `$HOME/.claude/projects`.
-pub(crate) fn projects_root() -> Option<PathBuf> {
-    std::env::var_os("CLAUDE_CONFIG_DIR")
-        .filter(|v| !v.is_empty())
-        .map(|d| PathBuf::from(d).join("projects"))
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|v| !v.is_empty())
-                .map(|h| PathBuf::from(h).join(".claude").join("projects"))
+/// Where ONE harness keeps its transcripts: its home and the glob under
+/// it, both from the harness's own file (`crate::harness`, backlog
+/// 2f7b8c00).
+///
+/// THE SEARCH THIS REPLACES looked in one place — Claude Code's
+/// `<projects>/*/*/subagents/agent-*.jsonl` — whatever harness ran the
+/// run. A Codex run's rollout is under `$CODEX_HOME/sessions/`, so its
+/// report answered "no subagent transcript names the run" and went on
+/// unmetered unless a hand passed `--transcript`: measured 2026-10-07,
+/// 1 of 86 Codex runs carried a token count while the adapter that reads
+/// a rollout had been in this file for six days. The run's own agent
+/// now names its harness, and the harness names the layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Layout {
+    /// The harness's id, for the sentence that says where it looked.
+    pub harness: String,
+    pub home: PathBuf,
+    /// Relative to `home`; `*` matches within one path segment.
+    pub glob: String,
+}
+
+impl Layout {
+    /// The layout of `harness` in this process's environment, or `None`
+    /// when neither its home variable nor `HOME` is set.
+    pub(crate) fn of(
+        harness: &crate::harness::Harness,
+        env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> Option<Layout> {
+        Some(Layout {
+            harness: harness.id.clone(),
+            home: harness.home(env)?,
+            glob: harness.transcript.glob.clone(),
         })
+    }
 }
 
 /// The phrase a run's own transcript holds and no other run's does.
@@ -567,25 +590,12 @@ pub(crate) fn needle(run_id: &str) -> String {
     format!("agent-run {run_id}")
 }
 
-/// Every subagent transcript under `root` (`<project>/<session>/
-/// subagents/agent-*.jsonl`) written at or after `since` whose text
+/// Every transcript of `layout` written at or after `since` whose text
 /// holds [`needle`]. The caller decides what none or several mean.
-pub(crate) fn find_transcripts(root: &Path, run_id: &str, since: SystemTime) -> Vec<PathBuf> {
+pub(crate) fn find_transcripts(layout: &Layout, run_id: &str, since: SystemTime) -> Vec<PathBuf> {
     let needle = needle(run_id);
-    let dirs = |p: &Path| -> Vec<PathBuf> {
-        std::fs::read_dir(p)
-            .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect())
-            .unwrap_or_default()
-    };
-    let mut found: Vec<PathBuf> = dirs(root)
+    let mut found: Vec<PathBuf> = crate::harness::glob_files(&layout.home, &layout.glob)
         .into_iter()
-        .flat_map(|project| dirs(&project))
-        .flat_map(|session| dirs(&session.join("subagents")))
-        .filter(|f| {
-            f.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("agent-") && n.ends_with(".jsonl"))
-        })
         .filter(|f| {
             std::fs::metadata(f)
                 .and_then(|m| m.modified())
@@ -1068,31 +1078,36 @@ pub(crate) struct Metered {
     pub slice: Sliced,
 }
 
-/// The run's transcript: `explicit` when the operator named one, else
-/// the one transcript [`find_transcripts`] finds. `Err` is a sentence
+/// The run's transcript, from the strongest statement there is of it:
+/// `explicit` when the operator named one; else `recorded`, the path a
+/// launcher wrote on the run when it found the file by the process's own
+/// runtime id; else the one transcript [`find_transcripts`] finds in the
+/// layout of the run's own harness. `layout` is `Err` with the reason
+/// when no harness could be named for the run. `Err` is a sentence
 /// saying why none was chosen — printed, and the report goes on with
 /// the count it was given.
 pub(crate) fn locate(
     explicit: Option<&Path>,
-    root: Option<&Path>,
+    recorded: Option<&Path>,
+    layout: Result<&Layout, &str>,
     run_id: &str,
     since: SystemTime,
 ) -> Result<PathBuf, String> {
-    Ok(match explicit {
+    Ok(match explicit.or(recorded) {
         Some(p) => p.to_path_buf(),
         None => {
-            let root = root.ok_or(
-                "no transcript directory (neither CLAUDE_CONFIG_DIR nor HOME is set) — pass \
-                 --transcript <path>",
-            )?;
-            let mut found = find_transcripts(root, run_id, since);
+            let layout = layout
+                .map_err(|why| format!("{why} — pass --transcript <path> to meter this run"))?;
+            let mut found = find_transcripts(layout, run_id, since);
             match found.len() {
                 1 => found.remove(0),
                 0 => {
                     return Err(format!(
-                        "no subagent transcript under {} names {:?} — pass --transcript <path> \
+                        "no {} transcript under {} ({}) names {:?} — pass --transcript <path> \
                          to meter this run",
-                        root.display(),
+                        layout.harness,
+                        layout.home.display(),
+                        layout.glob,
                         needle(run_id)
                     ));
                 }
@@ -2228,9 +2243,15 @@ mod tests {
         );
         write(&root, "-work-boss/s-1.jsonl", "agent-run r-1");
         let epoch = SystemTime::UNIX_EPOCH;
-        assert_eq!(find_transcripts(&root, "r-1", epoch), vec![mine.clone()]);
+        let layout = Layout {
+            harness: "claude-code".into(),
+            home: root.clone(),
+            glob: "*/*/subagents/agent-*.jsonl".into(),
+        };
+        let root = &layout;
+        assert_eq!(find_transcripts(root, "r-1", epoch), vec![mine.clone()]);
 
-        let found = locate(None, Some(&root), "r-1", epoch).expect("found");
+        let found = locate(None, None, Ok(root), "r-1", epoch).expect("found");
         assert_eq!(found, mine);
         let got = meter(&found, "r-1", &Slice::default()).expect("metered");
         assert_eq!(got.path, mine);
@@ -2238,20 +2259,29 @@ mod tests {
 
         // Written before the run opened: not this run's.
         let later = SystemTime::now() + std::time::Duration::from_secs(3600);
-        assert!(find_transcripts(&root, "r-1", later).is_empty());
+        assert!(find_transcripts(root, "r-1", later).is_empty());
 
         write(
-            &root,
+            &layout.home,
             "-work-boss/s-2/subagents/agent-b1.jsonl",
             "agent-run r-1",
         );
-        let why = locate(None, Some(&root), "r-1", epoch).expect_err("two is ambiguous");
+        let why = locate(None, None, Ok(root), "r-1", epoch).expect_err("two is ambiguous");
         assert!(why.contains("refusing to guess"), "{why}");
-        let why = locate(None, Some(&root), "r-9", epoch).expect_err("none is none");
+        let why = locate(None, None, Ok(root), "r-9", epoch).expect_err("none is none");
         assert!(why.contains("--transcript"), "{why}");
+        let why = locate(
+            None,
+            None,
+            Err("no harness is named for agent-x"),
+            "r-1",
+            epoch,
+        )
+        .expect_err("no layout, no search");
+        assert!(why.starts_with("no harness is named for agent-x"), "{why}");
 
         // Named outright, the search is skipped.
-        let named = locate(Some(&mine), None, "r-1", epoch).expect("named");
+        let named = locate(Some(&mine), None, Err("unused"), "r-1", epoch).expect("named");
         assert_eq!(
             meter(&named, "r-1", &Slice::default())
                 .unwrap()
@@ -2259,5 +2289,48 @@ mod tests {
                 .output,
             466
         );
+    }
+
+    /// THE 1-OF-86 CAUSE, as a test (backlog 2f7b8c00). A Codex run's
+    /// rollout lives in the Codex harness's layout; the report searched
+    /// Claude Code's alone and went on unmetered. Read through the
+    /// SHIPPED harness files: the run's harness names where to look, a
+    /// launcher's recorded path is believed before any search, and the
+    /// other harness's layout is never searched for it.
+    #[test]
+    fn a_codex_runs_rollout_is_found_in_the_codex_layout_and_metered() {
+        let home = boss_testing::scratch_dir("transcript-usage-codex-home");
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let harnesses = crate::harness::read_all(&repo).unwrap();
+        let env = |name: &str| (name == "HOME").then(|| home.clone().into_os_string());
+        let by_actor = |actor: &str| {
+            let h = harnesses.iter().find(|h| h.actor == actor).unwrap();
+            Layout::of(h, env).unwrap()
+        };
+        let codex = by_actor("agent-codex");
+        let claude = by_actor("agent-claude");
+        assert_eq!(codex.home, home.join(".codex"));
+        let rollout = write(
+            &home,
+            ".codex/sessions/2026/10/07/rollout-2026-10-07T10-00-00-01a1-thread.jsonl",
+            &codex_rollout(),
+        );
+        let epoch = SystemTime::UNIX_EPOCH;
+        // What the report did until this car: Claude Code's layout only.
+        let why = locate(None, None, Ok(&claude), "r-1", epoch).expect_err("not there");
+        assert!(why.contains("no claude-code transcript"), "{why}");
+        // The run's own harness.
+        let found = locate(None, None, Ok(&codex), "r-1", epoch).expect("found by its harness");
+        assert_eq!(found, rollout);
+        let got = meter(&found, "r-1", &Slice::default()).expect("metered");
+        assert_eq!(
+            got.usage.total(),
+            120,
+            "run r-1's one owned response: 100 in + 20 out"
+        );
+        assert_eq!(got.models.recorded().as_deref(), Some("gpt-6.1-sol"));
+        // A launcher's record is the path, with no search at all.
+        let recorded = locate(None, Some(&rollout), Err("unused"), "r-1", epoch).unwrap();
+        assert_eq!(recorded, rollout);
     }
 }

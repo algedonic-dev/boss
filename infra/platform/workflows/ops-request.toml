@@ -122,16 +122,78 @@ metadata_defaults = { procedure = "READ THE PLAN ON THIS STEP AND NOTHING ELSE. 
 # array the runner writes with --argjson, empty for a verb whose only
 # param is the plan hash the runner appends (reclaim-gcp-root, filed by
 # machine with `args = []`) — present, and an array, so it completes.
-# No `writer` yet: `runner:ops` is declared in the car that delivers
-# the runner credential (design f623e425), because a writer no door
-# resolves locks its key against everyone and the publish lint refuses
-# it (workflow_lint phase 9).
+# No `writer` ON THESE FIVE yet: `runner:ops` is declared in the car
+# that delivers the runner credential (design f623e425), because a
+# writer no door resolves locks its key against everyone and the publish
+# lint refuses it (workflow_lint phase 9).
+#
+# THE SIGNER'S TWO KEYS ARE THE SIGNER'S (design 09618594, question
+# `signer`, David 2026-10-06; the signer half of backlog 6c9183de, ahead
+# of the runner half because it needs no runner credential). `decision`
+# is what `execute` and `refused` fork on, and it sits inside the shape
+# the passkey signs — and until this row anyone with Update on the step
+# could merge `decision = "approved"` onto a plan and leave the approver
+# one tap from signing a decision he never made (extend b of the item;
+# backlog c085256d replays the same open write). `writer = "signer"` is
+# not a host credential: both metadata doors verify the gateway session
+# cookie the approver's own browser carries and require a sign-off role
+# this step names, within the packet's scope (boss_jobs::http::signer,
+# car a4a6009c). So the two surfaces that write these keys — the
+# approval surface and sign-off.js, each one PATCH of `decision`,
+# `decided_at` and `comment` from the approver's session — are admitted,
+# and every machine-door caller is refused 409 naming the key, its
+# writer and the door. `decided_at` stays undeclared: it is the time of
+# the write, signed with the rest, and reserving it is not what the
+# design decided.
+#
+# The types are the sign-off kind's own (boss-jobs seeds/step_types.toml)
+# and neither is required, so the fork lint reads the same vocabulary it
+# read off the kind and a step completed with no decision still reaches
+# `refused`. Nothing here has a default: a default is the protocol
+# writing a key it reserves to someone else, and the lint refuses that.
+#
+# THIS IS A REFUSAL, AND IT WENT LIVE AT THE REGISTRY PUBLISH, NOT AT
+# THE MERGE. The seed is insert-if-missing, so the live row kept saying
+# what it said until David ran `boss workflow publish ops-request
+# infra/platform/workflows/ops-request.toml` from a checkout: v10,
+# 2026-10-07. NO MACHINE ROAD PUBLISHED IT, and there are two (review
+# 7cee49b9, R1): publish-drift, which files its own --for-real on a
+# check that answers `refused 0`, and the one-kind publish-workflow
+# verb, which declares no approval. Both pass through
+# infra/gcp/publish-workflow.sh, which refuses a held kind, and until
+# that publish and its positive control had held this kind was held
+# twice over: by default, because the row declares a writer, and by
+# declaration, in infra/platform/workflow-holds/ops-request.toml.
+#
+# THAT FILE NOW SAYS `released`, for these two keys only, and carries
+# the evidence. So a later edit to this row rides the unattended roads
+# like any other kind's — and a hand rollback no longer stays rolled
+# back by itself. The one-kind `publish-workflow ops-request` declares
+# no approval and puts this row back at once for anyone who may file an
+# ops-request; publish-drift does the same after its next clean check
+# (none was clean on 2026-10-07: ten unrelated kinds refused, which is
+# an accident and not a control). A deliberate rollback re-holds in a
+# car FIRST. A car that declares ANOTHER writer here, or an executor,
+# adds a refusal that release never covered and puts `held` back in the
+# same car (pinned in boss-testing's publish_drift_sh.rs, which reads
+# the parsed row).
+#
+# In-flight requests keep the fields they
+# were admitted with and are approved exactly as before; the convert
+# door refuses to move one onto this row (field_writer::repin_refusals).
+# THE ROAD BACK needs no approval, no passkey and no session: publish
+# this file as it stood before car 3616120a through the same verb, then
+# cancel and refile any request admitted under the declared row. Rehearsed
+# end to end in boss-jobs'
+# tests/only_the_signer_writes_an_ops_request_decision.rs.
 fields = [
     { name = "plan", field_type = "string", required = true },
     { name = "verb", field_type = "string", required = true },
     { name = "host", field_type = "string", required = true },
     { name = "args", field_type = "array", required = true },
     { name = "rendered_plan_sha256", field_type = "string", required = true },
+    { name = "decision", field_type = "pending|approved|rejected|changes-requested", required = false, writer = "signer" },
+    { name = "comment", field_type = "string", required = false, writer = "signer" },
 ]
 
 [[workflow.step]]

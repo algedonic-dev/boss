@@ -74,19 +74,27 @@ fn stub_curl(root: &Path) -> PathBuf {
         &bin.join("curl"),
         concat!(
             "#!/usr/bin/env bash\n",
-            "method=GET; url=; body=\n",
+            "method=GET; url=; body=; stamp=bare\n",
             "while [ $# -gt 0 ]; do\n",
             "    case \"$1\" in\n",
             "        -X) method=$2; shift ;;\n",
             "        -d) body=$(printf '%s' \"$2\" | jq -c . 2>/dev/null || printf '%s' \"$2\"); shift ;;\n",
             // The wrap sends its packet from a file (backlog 9fd7f51e).
             "        --data-binary) body=$(jq -c . \"${2#@}\" 2>/dev/null || cat \"${2#@}\"); shift ;;\n",
-            "        -H) shift ;;\n",
+            // A header FILE is the machine token's (backlog 37742794):
+            // `stamped` when it is the one line STUB_EXPECT_HDR holds,
+            // mode 600. Logged beside the request in `$STUB_LOG.stamps`,
+            // so the main log keeps the shape every other test reads.
+            "        -H) case \"$2\" in @*)\n",
+            "                if [ -n \"${STUB_EXPECT_HDR:-}\" ] && cmp -s \"${2#@}\" \"$STUB_EXPECT_HDR\" \\\n",
+            "                    && [ \"$(stat -c %a \"${2#@}\")\" = 600 ]; then stamp=stamped; else stamp=wrong-header-file; fi ;;\n",
+            "            esac; shift ;;\n",
             "        http*) url=$1 ;;\n",
             "    esac\n",
             "    shift\n",
             "done\n",
             "printf '%s %s %s\\n' \"$method\" \"$url\" \"$body\" >> \"$STUB_LOG\"\n",
+            "printf '%s %s %s\\n' \"$stamp\" \"$method\" \"$url\" >> \"$STUB_LOG.stamps\"\n",
             // The fast-forward pass asked the system of record whether a
             // gate was LAUNCHING until backlog af27db95 (2026-10-01)
             // deleted the question; the answers stay, so a pin can hand
@@ -224,11 +232,27 @@ fn run_with(scratch: &Path, args: &[&str], extra: &[(&str, &str)]) -> Output {
         // record, and a transport failure gives up at once.
         .env("BOSS_JOBS_URL", "http://sor.test:7900")
         .env("BOSS_API_RETRY_DEADLINE", "0")
+        // No machine token unless a test plants one: the pass reads the
+        // mount at the reader's default directory, and a gate pod's or
+        // a host's own environment is handed to every process in it.
+        .env("BOSS_MACHINE_TOKEN_DIR", scratch.join("no-machine-token"))
+        .env("BOSS_SOR_ENV", scratch.join("no-sor.env"))
+        .env_remove("BOSS_MACHINE_TOKEN_HOSTS")
+        .env_remove("RUNTIME_DIRECTORY")
+        .env_remove("STUB_EXPECT_HDR")
         .env("STUB_LOG", scratch.join("curl-log.txt"))
         .env("STUB_LS_REMOTE", scratch.join("git-ls-remote.txt"))
         // What the system of record holds about worktrees, cars and
         // runs: absent, it holds nothing (see `write_record`).
         .env("STUB_RECORD", scratch.join("record.json"))
+        // The memory watch the hourly pass ensures (backlog 9ecd12ea)
+        // has no pod to stand outside of in a fixture, and a watch that
+        // is not sampling is a problem the pass files — every test's
+        // problem, here. Off unless a test asks; and with no
+        // service-account token in reach it asks the cluster nothing,
+        // whichever pod these tests run in.
+        .env("BOSS_DEV_MEMORY_WATCH", "off")
+        .env("BOSS_K8S_SA_DIR", scratch.join("no-service-account"))
         .env(
             "PATH",
             format!(
@@ -1916,6 +1940,99 @@ fn above_the_floor_the_scratch_floor_mode_is_silent_and_takes_nothing() {
 }
 
 // ---------------------------------------------------------------------
+// THE HOURLY PASS KEEPS THE MEMORY WATCH RUNNING (backlog 9ecd12ea).
+// ---------------------------------------------------------------------
+// The dev container was OOMKilled on 2026-10-08 and nothing had sampled
+// it. The sampler (infra/cluster/dev-memory-watch.sh, pinned in
+// dev_memory_watch_sh.rs) needs something to start it that is not the
+// manifest — an edit there rolls the pod — and the hourly pass is what
+// the sidecar already runs from the checkout. The build-triggered floor
+// mode must NOT: it runs in the dev container before every build, where
+// a sampler would die with the container it watches.
+
+#[test]
+fn the_hourly_pass_ensures_the_memory_watch_and_the_floor_mode_does_not() {
+    let root = boss_testing::scratch_dir("boss-dsr-memory-watch");
+    let _guard = Scratch(root.clone());
+    boss_testing::create_dir(&root.join("work").join("wt"));
+    boss_testing::create_dir(&root.join("work").join("repo"));
+    target_dir(&root, "target", 0);
+
+    let on = [("BOSS_DEV_MEMORY_WATCH", "on")];
+    let out = run(&root, &on);
+    let text = say(&out);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("dev-memory-watch: not started"),
+        "the hourly pass asks the watch to be running, and the watch says why it is not \
+         (no service-account token in this fixture)\n{text}"
+    );
+    // Review of car 7849553a, finding 2: every way --ensure declines
+    // returns 0, so its refusal reached only the sidecar's stdout. A
+    // watch that is not sampling is now a PROBLEM, which files the
+    // packet, and the packet carries the watch's state and its reason.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a pass that leaves the dev container unsampled is not a clean pass\n{text}"
+    );
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .find(|l| is_run_step_merge(l))
+        .unwrap_or_else(|| {
+            panic!("a pass with an unsampled dev container records itself\n{log}\n{text}")
+        });
+    for want in [
+        "\"memory_watch\":\"not sampling: no loop is alive\"",
+        "\"memory_watch_ensure\":\"not started: no service-account token",
+        "\"memory_watch_alerts_kept\":\"0\"",
+        "\"memory_watch_alerts_refused\":\"0\"",
+        "\"memory_watch_sample_age_s\":\"\"",
+        "\"result\":\"incomplete\"",
+    ] {
+        assert!(put.contains(want), "the packet lacks {want}\n{put}\n{text}");
+    }
+    assert!(
+        put.contains("\"problems\":\"1\""),
+        "the unsampled watch is this fixture's one problem\n{put}"
+    );
+
+    // Delta review, N2: an alert the API refused until it was moved
+    // aside rode the packet as a count but was never itself a reason
+    // to file one — on a healthy pod it would have reached nobody.
+    let aside = root
+        .join("work")
+        .join("telemetry")
+        .join("dev-memory")
+        .join("alert-refused");
+    boss_testing::create_dir(&aside);
+    boss_testing::write_file(&aside.join("1-1-1.json"), "{}");
+    let out = run(&root, &on);
+    let text = say(&out);
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("alerts that never reached the system of record"),
+        "an alert that did not leave is said aloud\n{text}"
+    );
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .rfind(|l| is_run_step_merge(l))
+        .unwrap_or_else(|| panic!("the pass records itself\n{log}\n{text}"));
+    assert!(
+        put.contains("\"memory_watch_alerts_refused\":\"1\"") && put.contains("\"problems\":\"2\""),
+        "and counted as a problem of its own\n{put}\n{text}"
+    );
+
+    let out = run_with(&root, &["--scratch-floor"], &on);
+    let text = say(&out);
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("dev-memory-watch"),
+        "the floor mode runs before every build, inside the dev container\n{text}"
+    );
+}
+
+// ---------------------------------------------------------------------
 // THE /work FLOOR IS THE GATE'S FLOOR PLUS A MARGIN (backlog 99ce8744).
 // ---------------------------------------------------------------------
 // Measured 2026-09-24 ~23:00Z: /work at 12 GB free of 40. The gate
@@ -2524,5 +2641,184 @@ fn an_entry_outside_the_mounts_this_pass_can_see_is_kept_and_a_gone_one_inside_i
                 "the run step carries {field}\n{put}\n{text}"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// The sidecar presents the estate machine token (backlog 37742794;
+// David's answer to design-doc c8502e17, `reclaim-sidecar`, 2026-10-07).
+// The pass sends two kinds of request: its own reads of the record (the
+// gate-runs from a worktree, the car on its branch, a run by id) and
+// the wrap + step pair that files its packet. With the Secret mounted in
+// the sidecar every one of them carries the token as a 0600 header file;
+// with nothing mounted — the dev container, where wt-cargo and the shim
+// run this same script — the pass sends exactly what it sent before.
+// ---------------------------------------------------------------------
+
+/// Short on purpose: a fixture, and no-secrets.sh reads 32+ characters
+/// after such a name as a credential.
+const FIXTURE_TOKEN: &str = "fixture-not-a-credential";
+
+/// `(stamp, "METHOD URL")` per request the stub curl saw.
+fn stamps(root: &Path) -> Vec<(String, String)> {
+    std::fs::read_to_string(root.join("curl-log.txt.stamps"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| {
+            let (stamp, rest) = l.split_once(' ').expect("stamp, then the request");
+            (stamp.to_string(), rest.to_string())
+        })
+        .collect()
+}
+
+/// The record-reading scenario of REFUSAL 2 under `root`, run with
+/// `extra` on top: three reads of the record, then the packet.
+fn a_pass_that_reads_the_record_and_files(root: &Path, extra: &[(&str, &str)]) -> Output {
+    let yard = Yard::new(root);
+    let open_run = yard.worktree("agent-open-run", Some("fix/open-run"), 2);
+    yard.worktree("agent-unknown", Some("worktree-agent-unknown"), 2);
+    abandoned_tree(&yard);
+    write_record(
+        root,
+        serde_json::json!({
+            "gate_runs": [{"worktree": path_str(&open_run), "branch": "fix/open-run", "agent_run": "run0open"}],
+            "cars": [{"id": "c0parked", "branch": "fix/open-run", "status": "open"}],
+            "runs": {"run0open": "open"},
+        }),
+    );
+    let floor = under_the_work_floor();
+    let mut env: Vec<(&str, &str)> = vec![("STUB_DF_WORK_GB", &floor)];
+    env.extend_from_slice(extra);
+    run(root, &env)
+}
+
+/// A machine-token mount holding `slot` as its `current`, a header
+/// directory, and the one line a stamped request's file must hold.
+fn token_mount(root: &Path, slot: &str) -> (String, String, String) {
+    boss_testing::create_dir(&root.join("mt/tok"));
+    boss_testing::create_dir(&root.join("mt/hdr"));
+    boss_testing::write_file(&root.join("mt/tok/current"), slot);
+    boss_testing::write_file(
+        &root.join("mt/expect-header"),
+        &format!("x-boss-machine-token: {FIXTURE_TOKEN}\n"),
+    );
+    (
+        path_str(&root.join("mt/tok")),
+        path_str(&root.join("mt/hdr")),
+        path_str(&root.join("mt/expect-header")),
+    )
+}
+
+#[test]
+fn with_the_token_mounted_every_request_of_a_pass_carries_it_as_a_header_file() {
+    let root = boss_testing::scratch_dir("boss-dsr-token-held");
+    let _guard = Scratch(root.clone());
+    let (tok, hdr, expect) = token_mount(&root, &format!("{FIXTURE_TOKEN}\n"));
+    let out = a_pass_that_reads_the_record_and_files(
+        &root,
+        &[
+            ("BOSS_MACHINE_TOKEN_DIR", &tok),
+            ("BOSS_MACHINE_TOKEN_HOSTS", "sor.test"),
+            ("RUNTIME_DIRECTORY", &hdr),
+            ("STUB_EXPECT_HDR", &expect),
+        ],
+    );
+    let text = say(&out);
+    let sent = stamps(&root);
+    for needle in [
+        "kind=gate-run",
+        "kind=ship-a-change",
+        "/api/jobs/run0open",
+        "POST ",
+        "PATCH ",
+        "PUT ",
+    ] {
+        assert!(
+            sent.iter().any(|(_, r)| r.contains(needle)),
+            "the pass did not send `{needle}` — a route this test never drives is one it never judges\n{sent:#?}\n{text}"
+        );
+    }
+    let bare: Vec<&(String, String)> = sent.iter().filter(|(s, _)| s != "stamped").collect();
+    assert!(
+        bare.is_empty(),
+        "these requests went out without the machine token as a 0600 file holding the one \
+         header line — the machine door refuses each the day it enforces:\n{bare:#?}\n{text}"
+    );
+    let everything = format!("{text}{}", curl_log(&root));
+    assert!(
+        !everything.contains(FIXTURE_TOKEN),
+        "the token is in the pass's output or in a curl argv\n{text}"
+    );
+    let left: Vec<PathBuf> = std::fs::read_dir(root.join("mt/hdr"))
+        .expect("the header directory")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect();
+    assert!(left.is_empty(), "a header file outlived the pass: {left:?}");
+}
+
+#[test]
+fn without_a_token_or_for_another_host_the_pass_sends_the_same_requests_bare() {
+    let base_root = boss_testing::scratch_dir("boss-dsr-token-none");
+    let _g0 = Scratch(base_root.clone());
+    let base = a_pass_that_reads_the_record_and_files(&base_root, &[]);
+    // The requests, with the one thing that differs by fixture — the
+    // scratch root inside a url-encoded `metadata=` worktree path — cut.
+    let requests = |root: &Path| -> Vec<String> {
+        stamps(root)
+            .into_iter()
+            .map(|(_, r)| match r.split_once("metadata=") {
+                Some((head, _)) => format!("{head}metadata=…"),
+                None => r,
+            })
+            .collect()
+    };
+    assert!(
+        stamps(&base_root).iter().all(|(s, _)| s == "bare"),
+        "with no token directory nothing is stamped\n{}",
+        say(&base)
+    );
+    assert!(
+        requests(&base_root).len() >= 6,
+        "the reference pass read the record and filed its packet\n{:#?}\n{}",
+        requests(&base_root),
+        say(&base)
+    );
+    for (name, hosts, slot) in [
+        (
+            "boss-dsr-token-off-host",
+            "elsewhere.test",
+            format!("{FIXTURE_TOKEN}\n"),
+        ),
+        ("boss-dsr-token-blank", "sor.test", "\n  \n".to_string()),
+    ] {
+        let root = boss_testing::scratch_dir(name);
+        let _g = Scratch(root.clone());
+        let (tok, hdr, expect) = token_mount(&root, &slot);
+        let out = a_pass_that_reads_the_record_and_files(
+            &root,
+            &[
+                ("BOSS_MACHINE_TOKEN_DIR", &tok),
+                ("BOSS_MACHINE_TOKEN_HOSTS", hosts),
+                ("RUNTIME_DIRECTORY", &hdr),
+                ("STUB_EXPECT_HDR", &expect),
+            ],
+        );
+        assert_eq!(
+            out.status.code(),
+            base.status.code(),
+            "{name}: the pass must never end differently because of the token\n{}",
+            say(&out)
+        );
+        assert!(
+            stamps(&root).iter().all(|(s, _)| s == "bare"),
+            "{name}: nothing is sent for a token that is not one, or to a host that is not the estate's\n{:#?}",
+            stamps(&root)
+        );
+        assert_eq!(
+            requests(&root),
+            requests(&base_root),
+            "{name}: the token is a header, not a behaviour — the same requests go out"
+        );
     }
 }

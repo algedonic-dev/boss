@@ -69,6 +69,11 @@ fn write_exec(path: &Path, body: &str) {
 ///     `patch.json` and appended to `STUB_PATCH_LOG` when set, because
 ///     one pass may write two.
 ///
+/// Every REQUEST — a read as much as a write — is appended to
+/// `STUB_CALL_LOG` when set, one line each: its method, its url, and
+/// `token=yes` when one of its `-H @file` arguments holds the machine
+/// token's header, `token=no` otherwise (backlog 44b2087e).
+///
 /// Every write's method and url is appended to `STUB_WRITE_ORDER` when
 /// set, so a case can read which door was used first. A `gh` stub stands
 /// in for the publish verb's `--check` tool probe, and a `df` stub for
@@ -82,6 +87,7 @@ fn stub_sor(root: &Path) -> PathBuf {
          m=GET; prev=; o=; w=; u=\n\
          for a in \"$@\"; do [ \"$prev\" = -X ] && m=\"$a\"; [ \"$prev\" = -o ] && o=\"$a\"; [ \"$prev\" = -w ] && w=1; case \"$a\" in http*) u=\"$a\";; esac; prev=\"$a\"; done\n\
          if [ -n \"${STUB_ARGV_LOG:-}\" ]; then printf '%s\\n' \"$@\" >> \"$STUB_ARGV_LOG\"; fi\n\
+         if [ -n \"${STUB_CALL_LOG:-}\" ]; then t=no; q=; for a in \"$@\"; do if [ \"$q\" = -H ]; then case \"$a\" in @*) if grep -q '^x-boss-machine-token: ' \"${a#@}\" 2>/dev/null; then t=yes; fi;; esac; fi; q=\"$a\"; done; printf '%s %s token=%s\\n' \"$m\" \"$u\" \"$t\" >> \"$STUB_CALL_LOG\"; fi\n\
          p=\n\
          for a in \"$@\"; do if [ \"$p\" = -H ]; then p=\"$a\"; case \"$a\" in @*) if [ -n \"${STUB_HEADER_LOG:-}\" ]; then cat \"${a#@}\" >> \"$STUB_HEADER_LOG\"; fi;; esac; continue; fi; p=\"$a\"; case \"$a\" in @*)\n\
              if [ -n \"${STUB_WRITE_ORDER:-}\" ]; then printf '%s %s\\n' \"$m\" \"$u\" >> \"$STUB_WRITE_ORDER\"; fi\n\
@@ -786,6 +792,97 @@ fn the_machine_token_rides_in_a_header_file_never_in_argv() {
     );
 }
 
+/// EVERY REQUEST OF A PASS CARRIES THE TOKEN, THE QUEUE READ FIRST
+/// (backlog 44b2087e, 2026-10-07). The test above asks whether the token
+/// reaches "the requests" and is satisfied by one of them: the runner's
+/// seven writes handed curl the header file and its queue read — the
+/// request it sends every minute on every host, whether or not anything
+/// is queued — did not. Measured live: 77 tokenless `GET /api/jobs` from
+/// `automation:ops-runner` in 44 minutes, every one a caller the jobs
+/// gate would refuse under `enforce`, while its writes were clean. So
+/// this reads the stub's own record of what it RECEIVED, request by
+/// request, and holds every line of it.
+///
+/// And the other half of the rule (presented, never required): the same
+/// pass with no token on the host answers the same request, and no
+/// request carries a header.
+#[test]
+fn every_request_of_a_pass_carries_the_machine_token_and_the_queue_read_is_one() {
+    needs_jq!();
+    let token = "stub-machine-token-44b2087e";
+    let pass = |case: &str, with_token: bool| -> (String, Vec<String>) {
+        let root = scratch(case);
+        stub_sor(&root);
+        let verbs = real_verbs(&root);
+        packet_for(&root, "boss-gcp", "df", "[]");
+        let calls = root.join("curl-calls.log");
+        let mut env = vec![
+            ("HOST_ID", "boss-gcp".to_string()),
+            ("BOSS_MACHINE_TOKEN_HOSTS", "sor.invalid".to_string()),
+            ("STUB_CALL_LOG", calls.display().to_string()),
+        ];
+        if with_token {
+            env.push(("BOSS_MACHINE_TOKEN_DIR", token_dir(&root, token)));
+        }
+        let (out, payload) = run(&root, &verbs, &env);
+        let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+        assert_eq!(md["disposition"], "answered", "{md} / {out}");
+        assert!(
+            !out.contains(token),
+            "the token is in the pass's output: {out}"
+        );
+        let lines = std::fs::read_to_string(&calls)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        (out, lines)
+    };
+
+    let (out, calls) = pass("token-every-request", true);
+    assert!(
+        calls
+            .iter()
+            .any(|l| l.starts_with("GET http://sor.invalid/api/jobs?kind=ops-request&status=open")),
+        "the stub never received the queue read, so this case proves nothing about it:\n{}\n{out}",
+        calls.join("\n")
+    );
+    assert!(
+        calls.iter().any(|l| !l.starts_with("GET ")),
+        "the pass wrote nothing, so this case holds the read alone:\n{}",
+        calls.join("\n")
+    );
+    let bare: Vec<&String> = calls
+        .iter()
+        .filter(|l| !l.ends_with(" token=yes"))
+        .collect();
+    assert!(
+        bare.is_empty(),
+        "these requests reached the system of record without the machine token while the host \
+         holds one — each is a caller its gate would refuse:\n{}\nall {} requests:\n{}",
+        bare.iter()
+            .map(|l| format!("  {l}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        calls.len(),
+        calls.join("\n")
+    );
+
+    let (_, without) = pass("token-every-request-absent", false);
+    assert_eq!(
+        without.len(),
+        calls.len(),
+        "a host with no token sends the same requests:\n{}\nagainst\n{}",
+        without.join("\n"),
+        calls.join("\n")
+    );
+    assert!(
+        without.iter().all(|l| l.ends_with(" token=no")),
+        "no token on the host, and a request carried a header anyway:\n{}",
+        without.join("\n")
+    );
+}
+
 /// THE RUNNER PRESENTS ITS CREDENTIAL (design f623e425 Q1, option A;
 /// backlog 6c9183de). The jobs API knows the runner by a credential it
 /// presents in `x-boss-runner-credential`, never by the id it types, so
@@ -876,6 +973,122 @@ fn the_runner_credential_rides_beside_the_machine_token_in_a_header_file() {
         left.is_empty(),
         "the pass must leave nothing under TMPDIR: {left:?}"
     );
+}
+
+/// THE RUNNER'S CREDENTIAL LEAVES ONLY FOR AN ESTATE HOST (backlog
+/// 7369b078, F1 of review 9c484ca8). The credential's header was made by
+/// plain `secret_header`, which judges no host, and since 44b2087e it
+/// rides on the queue read the runner sends every minute — so with
+/// `BOSS_JOBS_URL` pointed off the estate the machine token stayed home
+/// and the runner's own credential went to whatever answered. It is now
+/// made only when the machine token's host rule admits the record
+/// (`machine_token_admits`, the same two functions `machine_token_header`
+/// calls), and the file is not even read otherwise.
+///
+/// Read by EFFECT, from what the stub received: a record off the list
+/// gets neither header and the pass still answers (DR rule 62dac114); the
+/// rendered sor.env admits a host exactly as the env var does; and the
+/// credential does not depend on the machine token being on the host.
+#[test]
+fn the_runner_credential_is_presented_only_to_a_host_the_machine_token_rule_admits() {
+    needs_jq!();
+    let token = "stub-machine-token-7369b078";
+    let credential = "stub-runner-credential-7369b078-boss-gcp";
+    // (case, BOSS_MACHINE_TOKEN_HOSTS, sor.env's list, a token on the host)
+    let pass = |case: &str,
+                env_hosts: Option<&str>,
+                sor_hosts: Option<&str>,
+                with_token: bool|
+     -> (String, String) {
+        let root = scratch(case);
+        stub_sor(&root);
+        let verbs = real_verbs(&root);
+        packet_for(&root, "boss-gcp", "df", "[]");
+        let header_log = root.join("curl-headers.log");
+        let file = root.join("runner.credential");
+        std::fs::write(&file, format!("{credential}\n")).unwrap();
+        let mut env = vec![
+            ("HOST_ID", "boss-gcp".to_string()),
+            ("BOSS_RUNNER_CREDENTIAL_FILE", file.display().to_string()),
+            ("STUB_HEADER_LOG", header_log.display().to_string()),
+        ];
+        if with_token {
+            env.push(("BOSS_MACHINE_TOKEN_DIR", token_dir(&root, token)));
+        }
+        if let Some(hosts) = env_hosts {
+            env.push(("BOSS_MACHINE_TOKEN_HOSTS", hosts.to_string()));
+        }
+        if let Some(hosts) = sor_hosts {
+            let sor = root.join("sor.env");
+            std::fs::write(&sor, format!("BOSS_MACHINE_TOKEN_HOSTS={hosts}\n")).unwrap();
+            env.push(("BOSS_SOR_ENV", sor.display().to_string()));
+        }
+        let (out, payload) = run(&root, &verbs, &env);
+        let md = payload.unwrap_or_else(|| panic!("[{case}] no step completed: {out}"));
+        assert_eq!(md["disposition"], "answered", "[{case}] {md} / {out}");
+        assert!(!out.contains(credential), "[{case}] on the log: {out}");
+        (
+            out,
+            std::fs::read_to_string(&header_log).unwrap_or_default(),
+        )
+    };
+    let sent = |headers: &str, name: &str| {
+        headers
+            .lines()
+            .filter(|l| l.starts_with(&format!("{name}: ")))
+            .count()
+    };
+
+    // The harness's record is http://sor.invalid. Off the list, three
+    // ways: the env var names another host, the env var is set and empty
+    // over a sor.env that would admit it, and no list anywhere.
+    for (case, env_hosts, sor_hosts) in [
+        ("rc-off-env", Some("elsewhere.invalid"), None),
+        ("rc-off-empty-env", Some(""), Some("sor.invalid")),
+        ("rc-off-no-list", None, None),
+        ("rc-off-sor-env", None, Some("elsewhere.invalid")),
+    ] {
+        let (out, headers) = pass(case, env_hosts, sor_hosts, true);
+        assert_eq!(
+            sent(&headers, "x-boss-runner-credential"),
+            0,
+            "[{case}] the runner's credential left for a host the machine token's rule does not \
+             admit:\n{headers}\n{out}"
+        );
+        assert_eq!(
+            sent(&headers, "x-boss-machine-token"),
+            0,
+            "[{case}] {headers}"
+        );
+        assert!(
+            out.contains("runner credential")
+                && out.contains("NOT presented")
+                && out.contains("sor.invalid")
+                && out.contains("BOSS_MACHINE_TOKEN_HOSTS"),
+            "[{case}] a withheld credential is said on the log, naming the host and the list: \
+             {out}"
+        );
+    }
+
+    // On the list, by the rendered sor.env alone: both ride, in step.
+    let (out, headers) = pass("rc-on-sor-env", None, Some("sor.invalid"), true);
+    let n = sent(&headers, "x-boss-runner-credential");
+    assert!(
+        n > 0,
+        "an estate host is sent the credential:\n{headers}\n{out}"
+    );
+    assert_eq!(n, sent(&headers, "x-boss-machine-token"), "{headers}");
+    assert!(!out.contains("NOT presented"), "{out}");
+
+    // On the list with no machine token on the host: the credential is
+    // judged by the host, not by whether a token happens to be mounted.
+    let (out, headers) = pass("rc-on-no-token", Some("sor.invalid"), None, false);
+    assert_eq!(
+        sent(&headers, "x-boss-runner-credential"),
+        n,
+        "{headers}\n{out}"
+    );
+    assert_eq!(sent(&headers, "x-boss-machine-token"), 0, "{headers}");
 }
 
 /// `disk-report` answers on boss-gcp too (backlog d3c7eada, 2026-09-26):

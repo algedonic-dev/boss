@@ -1,0 +1,44 @@
+# ---------------------------------------------------------------------
+# The probe-reader rotation advances on its own (design b35c22b4;
+# backlog d26515c5) — the twin of `broker-rotates-the-probe-reader`, as
+# `broker-advances-the-machine-token-rotation` is the machine token's.
+#
+# THE GAP THIS CLOSES is the one that rule's header names: the rotation
+# fires once, on a packet's scope step, and its phases wait on things
+# one 30-second delivery cannot — kubelet refreshing the boss pod's
+# mount of the Secret (about a minute after a write), and a whole drain
+# window with no `reader.previous` presentation. The handler does what
+# the state allows, records why it stopped on the step
+# (`<step>_deferred`, naming THIS rule), and acknowledges; this clock
+# rule hands it the same declaration every fifteen minutes with
+# `phase = "advance"`.
+#
+# IT MINTS NOTHING UNATTENDED. `phase = "advance"` runs only over open
+# rotate-a-credential packets about boss-probe-reader whose scope step a
+# person has completed; a quarter-hour with none reads the packet list
+# and nothing else — no Secret, no gate (pinned in the handler's own
+# tests). The credential's rotation_policy is on-demand: the packet is
+# the request, and its scope step is the approval.
+#
+# THE ARGS ARE THE ROTATION RULE'S DECLARATION, verbatim, plus `phase`
+# — a fact that lives twice (CLAUDE.md §9a), pinned equal by
+# crates/core/boss-dispatcher/tests/probe_reader_rotation_rules.rs: a
+# sweep reading another Secret, or another slot set, would promote on a
+# name the gates never give this value, or drain on another
+# credential's callers.
+[[rule]]
+name = "broker-advances-the-probe-reader-rotation"
+why = """
+A TIMER, the standing exemption, and EXTERNAL GLUE at once: the
+conditions it waits on are a mounted Secret reaching the boss pod and a
+day passing with no caller presenting the old reader value — nothing in
+the system emits an event for either, and both outlast the ack window
+of the event that started the rotation. Its effect lives outside the
+system (the k8s Secret store, every service port's machine gate), which
+no Workflow definition can address. It adds no routing: it advances the
+packets it finds and spawns nothing.
+"""
+schedule = { cadence = "every-15-minutes", anchor_date = "2026-10-07" }
+[[rule.do]]
+handler = "credential.rotate.self-issued"
+args = { phase = "\"advance\"", secret_namespace = "\"boss\"", secret_name = "\"boss-probe-reader\"", credential_id = "\"boss-probe-reader\"", gate_slots = "\"reader\"", advance_rule = "\"broker-advances-the-probe-reader-rotation\"", drain_minutes = "\"1440\"" }

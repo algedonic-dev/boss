@@ -1,0 +1,14 @@
+# automation:prune-registry-versions — not in the role-report tally read
+# 2026-10-07T02:13Z (that tally is held in memory and starts again with the
+# pod, so absence there is not absence of the caller); registered from the
+# tree, where every_script_sender_signs_as_a_registered_automation found it.
+# Signs as platform-admin today: infra/forge/prune-registry-versions.sh sets
+# BOSS_SWEEP_ACTOR for infra/forge/landed-train-shas.lib.sh.
+# NARROWER THAN IT SIGNS, for the reason on disk-floor-sweep.toml: the id
+# signs one request, the same landed-train read, and the deletions it guards
+# go to the forge registry, not the system of record.
+
+[[automation]]
+id = "automation:prune-registry-versions"
+role = "audit-readonly"
+description = 'The registry-version prune reading which trains landed before it deletes a container version from the forge (infra/forge/prune-registry-versions.sh, through infra/forge/landed-train-shas.lib.sh). Reads only.'

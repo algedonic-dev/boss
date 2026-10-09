@@ -51,6 +51,16 @@
 # equal), and `branch` off the green's own evidence on `building`. The
 # row is keyed on the run id, so a later `--report` or a redelivery
 # writes nothing twice.
+#
+# WHAT IT LANDS IS ONLY EVER A HANDBACK (backlog b5a3a174, 2026-10-08).
+# This rule copies whatever `report` the packet holds, and for a week
+# the stop hook put one there at every background LAUNCH — "(the Agent
+# tool returned no text)" with a finish record holding no count — so 21
+# of that day's 56 runs landed on a placeholder summary and a row that
+# priced nothing, which then refused the agent's real report. Two
+# things changed, neither of them here: the hook no longer reports a
+# response with no text, and the agent-runs door lets the first record
+# that carries a count replace a row that holds none, once.
 [[rule]]
 name = "agent-run-lands-a-report-sent-before-green"
 why = """

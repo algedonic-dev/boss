@@ -1,0 +1,16 @@
+# automation:disk-floor-sweep — the role-report tally (GET
+# /api/jobs/actor-role-reports), read 2026-10-07T02:13Z: 1 observation, read
+# job.
+# Signs as platform-admin today: infra/forge/landed-train-shas.lib.sh (the
+# default of BOSS_SWEEP_ACTOR).
+# NARROWER THAN IT SIGNS. Its one request is GET /api/jobs?kind=pr-train
+# (the landed-train read that keeps a merged image from being pruned), which
+# audit-readonly is granted, so the row holds the read role and not the
+# platform-admin its header asserts. Nothing reads the row to decide until
+# the resolver enforces; until then the tally reports whether this role
+# would have denied anything it sent.
+
+[[automation]]
+id = "automation:disk-floor-sweep"
+role = "audit-readonly"
+description = 'The forge disk-floor sweep reading which trains landed, so it does not prune an image a train still needs (infra/forge/disk-floor-sweep.sh, through infra/forge/landed-train-shas.lib.sh). Reads only.'

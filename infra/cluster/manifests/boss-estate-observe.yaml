@@ -23,6 +23,42 @@
 #
 # Pins: reads nodes cluster-wide (read-only), posts to the jobs API by
 # service DNS. Secrets are referenced by name only.
+#
+# IT PRESENTS THE ESTATE MACHINE TOKEN (backlog 066a7613; decided by
+# David 2026-10-06 on design-doc bdc60b65, question `observer`). Until
+# then its four jobs-API routes went out with no token: 1,124
+# would-refuse facts from 207 peers in the 72 h to 2026-10-06T17:41Z,
+# every one a request the machine door refuses the day it enforces —
+# and what would be lost is the node observation and the dead-runner
+# settle. The grant is ONE read-only mount of Secret boss-machine-token
+# on the `observe` container, and it was allowed on two conditions that
+# ride in the same change, because this pod also holds a cluster-wide
+# node read:
+#   1. THE IMAGE IS PINNED BY DIGEST, from the forge mirror. It was
+#      `alpine/k8s:1.33.3`, a third-party tag resolved at Docker Hub on
+#      whichever node the pod landed. It is now the mirror's copy
+#      (infra/forge/mirror-base-images.sh IMAGES) at the digest the forge
+#      registry serves for that tag — read 2026-10-06 from
+#      GET /v2/david/alpine-k8s/manifests/1.33.3 (Docker-Content-Digest),
+#      and the sha256 of the manifest body fetched at that digest is the
+#      digest. It is the same image the pods ran: the live observer pods
+#      report docker.io/alpine/k8s@sha256:47e4ea4c…, a multi-arch index
+#      whose linux/amd64 entry is this manifest, config and 18 layers
+#      equal. A new upstream tag is a mirror run and an edit here, on
+#      the record; nothing moves under a pod that holds the token.
+#   2. THE READER IS THE TREE'S ONE COPY. infra/lib/secret-header.sh
+#      (machine_token_header) decides where the token is read, which
+#      hosts may be sent it, and that it rides in a 0600 file and never
+#      in curl's argv. The alpine image carries none of this repo, and a
+#      copy pasted into this manifest would be the second definition
+#      that drifts (CLAUDE.md §9a) — so the `reader` init container
+#      copies it out of the boss image into an emptyDir, and the script
+#      sources it from there.
+# It runs only this file's text: no branch, no clone, no probe.
+# infra/lint/a-manifest-sender-presents-the-machine-token.sh holds all
+# of it, and RUNS the script below across every state the token can be
+# in: the observer never fails, and never changes what it sends, because
+# of the token.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -204,9 +240,93 @@ spec:
         spec:
           restartPolicy: Never
           serviceAccountName: estate-observer
+          # BESIDE deploy/boss WHEN IT CAN BE, never required. The
+          # `reader` init container below runs the boss image at the
+          # converged build, a tag that moves with every converge; the
+          # node deploy/boss runs on has pulled that build already, so
+          # there the init container starts from the node's image store
+          # and owes the forge registry nothing. PREFERRED, because this
+          # pod is how a dead node is seen: when that node is the one
+          # down, the pod schedules anywhere and pulls.
+          affinity:
+            podAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 100
+                  podAffinityTerm:
+                    labelSelector: {matchLabels: {app: boss}}
+                    topologyKey: kubernetes.io/hostname
+          initContainers:
+            # THE ONE COPY OF THE READER, out of the boss image (the
+            # header says why it is not pasted here). The image is the
+            # placeholder every boss-image manifest commits: the
+            # converge's apply rewrites the tag to the build already
+            # converged (cluster-deploy-lib.sh manifests_with_image), as
+            # it does for the recovery sheet's and the crawl's `tools`
+            # init containers — so the reader is at most one converge
+            # behind the tree, and the tag is always one the registry
+            # holds. The path is where infra/oss-quickstart/Dockerfile
+            # COPYs infra/lib/secret-header.sh.
+            #
+            # THE PULL. The forge registry serves david/boss to an
+            # anonymous pull (measured 2026-10-06: its token endpoint
+            # hands an unauthenticated caller a pull token and the
+            # manifest answers 200), which is how the eleven CronJobs in
+            # this namespace that name no imagePullSecrets pull a new
+            # boss tag every converge, on cp-1, cp-2 and cp-3, under
+            # the default and the break-glass-deposit ServiceAccounts
+            # alike. So this pod names none either: nothing about the
+            # estate-observer ServiceAccount is in the path of the pull.
+            #
+            # IT NEVER FAILS THE POD. An init container that exits
+            # non-zero holds the pod in Init and the observation never
+            # runs — the observer would be down because of the token.
+            # A copy that fails says so and exits 0; the script below
+            # then finds no reader and sends unstamped, out loud. No
+            # `args:` key: the lints that extract the observe script
+            # find it by that key.
+            - name: reader
+              image: 10.20.0.15:3000/david/boss:latest
+              command:
+                - /bin/sh
+                - -c
+                - cp /usr/local/bin/lib/secret-header.sh /reader/secret-header.sh || echo "reader - the copy failed, so this pass sends no machine token"
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities: {drop: ["ALL"]}
+              volumeMounts:
+                - {name: reader, mountPath: /reader}
+          volumes:
+            # The reader, copied in by the init container; read-only to
+            # the script.
+            - name: reader
+              emptyDir: {}
+            # WHERE THE HEADER FILE LIVES: memory, and this pod's own.
+            # secret-header.sh writes the token into a 0600 file for
+            # curl's `-H @file` and removes it on EXIT — but a tick that
+            # is KILLED runs no trap (a review on 2026-10-06 measured
+            # killed senders leaving /tmp/boss-secret-header.* behind).
+            # /tmp here is the container's writable layer, which stays on
+            # the node's disk for as long as the finished pod is kept
+            # (successfulJobsHistoryLimit); a memory emptyDir is gone
+            # when the pod stops, however it stopped. The reader takes
+            # $RUNTIME_DIRECTORY first, which the env below points here.
+            - name: secret-header
+              emptyDir: {medium: Memory, sizeLimit: 1Mi}
+            # THE GRANT (David, 2026-10-06, design-doc bdc60b65): the
+            # estate machine token, Secret boss-machine-token, whole —
+            # the broker writes it (design 6805c764 car 4). Optional:
+            # until its first mint the directory is empty and the
+            # observer sends no token, which every gate in `report`
+            # admits. 0444: the alpine image runs as root and sets no
+            # fsGroup; the file is the token's only copy in the
+            # container, never an env var.
+            - name: machine-token
+              secret: {secretName: boss-machine-token, optional: true, defaultMode: 0444}
           containers:
             - name: observe
-              image: alpine/k8s:1.33.3
+              # The forge mirror's copy, by digest (the header says where
+              # the digest was read and that it is the image this ran).
+              image: 10.20.0.15:3000/david/alpine-k8s:1.33.3@sha256:cdeda0da2cd6896023cc5f96505bc94a699a989dff2bfc3e2008ab92eab1e93a
               command: ["/bin/sh", "-c"]
               args:
                 - |
@@ -231,6 +351,54 @@ spec:
                   # its own mktemp -d; the pod sets nothing and gets /tmp.
                   WORK="${BOSS_OBSERVE_WORK:-/tmp}"
                   mkdir -p "$WORK"
+                  # THE MACHINE TOKEN, ONCE, HERE (backlog 066a7613).
+                  # machine_token_header reads the mounted Secret's
+                  # `current` slot and, when $JOBS_API is a host the token
+                  # may go to, leaves MT_HDR naming a 0600 header file;
+                  # api_curl below hands curl that FILE on every jobs-API
+                  # request, so the token is never in an argv. Called once,
+                  # at the top level, before any `$( )`: the reader chains
+                  # its cleanup onto this shell's EXIT trap and refuses a
+                  # first call from a subshell.
+                  #
+                  # THE OBSERVER NEVER FAILS BECAUSE OF THE TOKEN, and
+                  # never sends anything different because of it. Every
+                  # way this can go wrong ends in the same place — MT_HDR
+                  # empty, the same requests, the same exit status, one
+                  # line saying why:
+                  #   - no reader in the pod (the init container's copy
+                  #     failed), or one that does not parse: it is sourced
+                  #     only when it is readable AND `sh -n` accepts it,
+                  #     because a syntax error in a sourced file ends a
+                  #     POSIX shell outright, `set -e` or not;
+                  #   - no mount, an empty mount, a blank, malformed,
+                  #     oversized or unreadable slot, a host that is not
+                  #     the estate's: the reader's own contract — it says
+                  #     so on stderr and returns 0 with nothing to send;
+                  #   - the header file could not be written, or the
+                  #     reader is one that has no machine_token_header:
+                  #     the one non-zero return, caught here.
+                  # A gate in `report` admits the unstamped request and
+                  # tallies it, which is how a pass that went out bare is
+                  # found from outside.
+                  #
+                  # The reader's path is a PARAMETER for the reason WORK
+                  # is one: the lint that runs this text hands it the
+                  # tree's infra/lib/secret-header.sh; the pod sets nothing
+                  # and gets the init container's copy.
+                  MT_HDR=""
+                  READER="${BOSS_OBSERVE_READER:-/reader/secret-header.sh}"
+                  if [ -r "$READER" ] && sh -n "$READER" 2>/dev/null && . "$READER"; then
+                    machine_token_header MT_HDR "$JOBS_API" \
+                      || { MT_HDR=""; echo "machine token: the reader at $READER handed over no header — this pass is sent without it"; }
+                  else
+                    echo "machine token: no usable reader at $READER — this pass is sent without it"
+                  fi
+                  if [ -n "$MT_HDR" ]; then
+                    echo "machine token: presented on every jobs-API request of this pass"
+                  else
+                    echo "machine token: not presented on this pass"
+                  fi
                   # Transport-retry curl, INLINE. This pod runs the
                   # alpine/k8s image, which does NOT carry
                   # /usr/local/bin/boss-api-curl.sh (that script is baked
@@ -251,11 +419,32 @@ spec:
                   # returns as curl wrote it. The exit list is
                   # infra/lib/curl-through-a-roll.sh's, pinned equal to it
                   # by a_chore_write_is_sent_once.rs.
+                  #
+                  # EVERY JOBS-API REQUEST GOES THROUGH HERE, AND HERE IS
+                  # WHERE IT IS STAMPED (backlog 066a7613): one place, so a
+                  # send added below cannot be the one that goes out bare
+                  # (infra/lint/a-manifest-sender-presents-the-machine-token.sh
+                  # refuses an x-boss-user sender in a manifest that is not
+                  # this function). The header rides only when an argument
+                  # is a $JOBS_API URL — the host MT_HDR was judged for — so
+                  # a call aimed anywhere else carries no token.
+                  #
+                  # AND EVERY SEND IS BOUNDED. curl had no `-m`: a connect
+                  # that was accepted and then never answered held the tick
+                  # open with no limit, and concurrencyPolicy Forbid then
+                  # skips every later tick behind it. SEND_MAX_S, default
+                  # 60, is per attempt; a timeout is curl exit 28, which is
+                  # surfaced like any other exit that may follow a request
+                  # the server received, never re-sent.
+                  SEND_MAX_S="${SEND_MAX_S:-60}"
                   api_curl() {
-                    local deadline=150 start delay=5 rc out now left sleep_for
+                    local deadline=150 start delay=5 rc out now left sleep_for a hdr=""
+                    for a in "$@"; do
+                      case "$a" in "$JOBS_API"/*) hdr="$MT_HDR" ;; esac
+                    done
                     start=$(date +%s)
                     while :; do
-                      rc=0; out=$(curl "$@") || rc=$?
+                      rc=0; out=$(curl -m "$SEND_MAX_S" ${hdr:+-H "$hdr"} "$@") || rc=$?
                       case "$rc" in
                         0) printf '%s' "$out"; return 0 ;;
                         6|7) ;;
@@ -561,11 +750,27 @@ spec:
                   # tabs into one and every field after an empty one
                   # shifts left (measured here: the dead runner's message
                   # arrived as the live sibling's name).
+                  #
+                  # A RUNNER THAT LEAVES ITS VERDICT IS THE CONDUCTOR'S, NOT
+                  # THIS PASS'S (backlog 934ccad1). "A Job that failed AFTER
+                  # reporting already carries its verdict" was true while
+                  # the runner reported before it exited. A Job labelled
+                  # boss.dev/verdict-carrier=pod-log writes nothing: its red
+                  # gate exits non-zero with the packet STILL OPEN, for the
+                  # minutes until the conductor's reconcile records the
+                  # receipt its pod log holds - and settled `lost` here in
+                  # that window, a real `failed` would be on the record as
+                  # an infrastructure death, for good. So such a Job is not
+                  # this pass's to settle, dead or not: the conductor reads
+                  # its pod and settles it `lost` itself when the container
+                  # ended with no verdict or the pod is gone
+                  # (boss-cli train/carried_verdict.rs, `judge`).
                   GATE_NS="${BOSS_GATE_NAMESPACE:-boss-dev}"
                   if kubectl get jobs -n "$GATE_NS" -l app=gate-runner -o json >"$WORK/gate-jobs.json" 2>"$WORK/gate-jobs.err"; then
                     jq -r '(.items // []) as $all
                       | $all[]
                       | select((.status.failed // 0) > 0)
+                      | select((.metadata.labels["boss.dev/verdict-carrier"] // "") != "pod-log")
                       | ((.status.conditions // []) | map(select(.type == "Failed")) | .[0] // {}) as $c
                       | (.metadata.labels["boss.dev/packet"] // "") as $packet
                       | [ .metadata.name,
@@ -901,9 +1106,23 @@ spec:
                       echo "evictions: $fresh new in $DEV_NS recorded -> $ecode"
                     fi
                   fi
+              volumeMounts:
+                - {name: reader, mountPath: /reader, readOnly: true}
+                - {name: secret-header, mountPath: /run/boss-secret-header}
+                - {name: machine-token, mountPath: /etc/boss/machine-token, readOnly: true}
               env:
                 - name: JOBS_API
                   # boss-jobs-internal is the in-cluster door; ns boss has
                   # no Service named `boss` — the original value resolved
                   # to nothing and no observation could ever land.
                   value: "http://boss-jobs-internal.boss.svc.cluster.local:7900"
+                # The hosts the token may be sent to: this namespace's
+                # Services and nothing else, the value every chore beside
+                # this one carries. JOBS_API pointed anywhere else sends
+                # the same requests without the token.
+                - name: BOSS_MACHINE_TOKEN_HOSTS
+                  value: ".boss.svc.cluster.local"
+                # Where secret-header.sh makes the header file: the
+                # memory emptyDir above, not /tmp.
+                - name: RUNTIME_DIRECTORY
+                  value: /run/boss-secret-header

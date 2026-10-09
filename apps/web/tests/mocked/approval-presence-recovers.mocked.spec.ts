@@ -1,19 +1,19 @@
 // Backlog 3ce3c15f (review of car 5b30ccf9, 2026-09-25): a completion the
 // jobs API refuses for PRESENCE stopped ApprovalSurface at the raw 422.
-// Two shapes, measured on the car's tree:
 //
-//   - a RELOAD after the signature: the stamp is already on the step, and
-//     a presence step whose sign-offs this user's role does not carry
-//     never runs the stamp ceremony at all — so the gesture holds no
-//     ticket, and the completion goes bare;
-//   - an EXPIRED ticket: the ceremony ran for the stamp, but the ticket it
-//     issued is past its two-minute life by the time the completion lands.
+// Since design 1ce67f7e (2026-10-07) that refusal — {required:
+// "presence"} — has one source: a presence step that names NO sign-off
+// role, whose completion is its only act and so carries the ticket
+// itself. (A step that names roles completes on its stamps with a bare
+// request; the expired-ticket shape this file once covered is gone with
+// the ticket the surface used to hold.) The surface answers it with ONE
+// passkey tap on the step as shown and retries the completion ONCE with
+// the fresh ticket. The mocks below issue a distinct ticket per ceremony
+// and honour only the ones they say, so a surface that looped or invented
+// a ticket cannot pass.
 //
-// Either way the surface now answers that 422 with ONE passkey tap on the
-// step as shown and retries the completion ONCE with the fresh ticket. The
-// mocks below issue a distinct ticket per ceremony and honour only the
-// ones they say, so a surface that re-sent the stale ticket, looped, or
-// invented a ticket cannot pass.
+// And a step whose STAMPS do not carry it is refused without that key,
+// naming the roles and the reason: no tap is taken for it.
 
 import { expect, test, type Page, type Route } from './_test';
 import { servePeopleRows } from './_smokeMocks';
@@ -41,6 +41,8 @@ type Setup = Readonly<{
   signOffs: unknown[];
   /** Which tickets the completion honours, given every ticket issued so far. */
   completionHonours: (ticket: string | undefined, issued: readonly string[]) => boolean;
+  /** What a completion not honoured is answered with (default: the presence refusal). */
+  completionRefusal?: unknown;
 }>;
 
 async function presenceGatedApproval(page: Page, setup: Setup): Promise<Seen> {
@@ -119,17 +121,20 @@ async function presenceGatedApproval(page: Page, setup: Setup): Promise<Seen> {
   await page.route(new RegExp(`/api/jobs/${JOB_ID}/steps/s1$`), async (r) => {
     const ticket = (await r.request().headerValue('x-presence-ticket')) ?? undefined;
     seen.putTickets.push(ticket);
-    if (!setup.completionHonours(ticket, issued)) return json(r, PRESENCE_REFUSAL, 422);
+    if (!setup.completionHonours(ticket, issued)) {
+      return json(r, setup.completionRefusal ?? PRESENCE_REFUSAL, 422);
+    }
     step.status = 'completed';
     return json(r, step);
   });
   return seen;
 }
 
-test('after a reload with the stamp already on the step, Approve takes one tap and completes', async ({ page }) => {
-  // The signature landed before the reload; this user's role carries no
-  // sign-off on the step, so the gesture runs no stamp ceremony and holds
-  // no ticket. The completion honours only a ticket a ceremony issued.
+test('a presence step with no sign-off role: Approve takes one tap and completes', async ({ page }) => {
+  // The step names no role, so no stamp ceremony runs and the server
+  // judges the completion on its own ticket: it honours only one a
+  // ceremony issued. (The stray stamp stands for nothing — no role asked
+  // for it.)
   const seen = await presenceGatedApproval(page, {
     signOffsRequired: [],
     signOffs: [{ role: 'controller', authority_id: 'emp-002', shape_hash: 'h',
@@ -154,24 +159,34 @@ test('after a reload with the stamp already on the step, Approve takes one tap a
   expect(shown.metadata.decision).toBe('approved');
 });
 
-test('a stamp ticket expired before the completion: one fresh tap, and the retry carries it', async ({ page }) => {
-  // The stamp's own ceremony issues ticket-1; by the completion it is
-  // past its life, so the completion honours only a LATER ticket.
+test('stamps that do not carry the step: the roles and the reason are shown, and no tap is taken', async ({ page }) => {
+  // Another role's signature is past its age. A ticket on the completion
+  // would change nothing, so the refusal carries no `required: presence`
+  // and the surface runs no ceremony for it.
   const seen = await presenceGatedApproval(page, {
-    signOffsRequired: ['platform-admin'],
-    signOffs: [],
-    completionHonours: (t) => t === 'ticket-2',
+    signOffsRequired: ['controller'],
+    signOffs: [{ role: 'controller', authority_id: 'emp-002', shape_hash: 'h',
+      assurance: 'presence', presence_nonce: 'n0' }],
+    completionHonours: () => false,
+    completionRefusal: {
+      error: 'this step completes on its sign-off stamps, and they do not carry it',
+      completes_on: 'stamps',
+      missing_or_stale_roles: ['controller'],
+      detail: 'role controller was signed by emp-002 more than 72 hours ago',
+    },
   });
 
   await page.goto(`/ux/jobs/${JOB_ID}`);
   const surface = page.locator('.sg-detail');
   await surface.getByRole('button', { name: 'Approve' }).click();
 
-  await expect(surface.locator('.step-status')).toHaveText('completed');
-  await expect(surface.locator('.step-write-error')).toHaveCount(0);
-  expect(seen.stampTickets).toEqual([undefined, 'ticket-1']);
-  expect(seen.finishes).toBe(2);
-  expect(seen.putTickets).toEqual(['ticket-1', 'ticket-2']);
+  await expect(surface.locator('.step-write-error')).toContainText(
+    'sign-offs outstanding: controller — role controller was signed by emp-002 more than 72 hours ago',
+  );
+  expect(seen.stampTickets).toEqual([]);
+  expect(seen.begins).toEqual([]);
+  expect(seen.finishes).toBe(0);
+  expect(seen.putTickets).toEqual([undefined]);
 });
 
 test('refused again after the fresh tap: the surface says so and never asks a third time', async ({ page }) => {

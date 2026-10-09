@@ -9,11 +9,12 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use boss_core::machine_gate::{Mode, ModeSwitch};
 use boss_core::machine_token::{self, Source};
-use boss_core::role_of_record::{RoleLookupError, RoleOfRecord, RoleRecord};
+use boss_core::role_of_record::{RoleLookupError, RoleOfRecord, RoleRecord, is_family_member};
 use serde_json::Value;
 
 use crate::User;
 use crate::role_reporting::{ReportMode, ReportModeSource};
+use crate::types::automation_slug;
 
 pub const ROLE_MODE_FILE_ENV: &str = "BOSS_ACTOR_ROLE_MODE_FILE";
 pub const ROLE_MODE_FILE: &str = "/etc/boss/machine-gate/actor-role";
@@ -46,6 +47,19 @@ impl ReportModeSource for MountedReportMode {
                 ReportMode::Report
             }
         }
+    }
+
+    /// The word and the instant it last moved, from ONE read of the
+    /// switch, for the tally that states each move on the log. The word
+    /// `enforce` is stated as `report`: that is what this binary does
+    /// under it, and a fact names what happened.
+    fn reading_since(&self) -> (Mode, Option<chrono::DateTime<chrono::Utc>>) {
+        let ((mode, _), since) = self.switch.reading_since();
+        let stated = match mode {
+            Mode::Off => Mode::Off,
+            Mode::Report | Mode::Enforce => Mode::Report,
+        };
+        (stated, Some(since))
     }
 }
 
@@ -81,6 +95,9 @@ impl RegistryRoles {
                 // happen not to match the first caller using this projection.
                 matches_actor(&row, "", aliases, people)?;
                 record(&row)?;
+                if !aliases && !people {
+                    signs_for(&row)?;
+                }
                 rows.push((row, aliases, people));
             }
         }
@@ -102,7 +119,87 @@ impl RegistryRoles {
                 found.len()
             )));
         }
+        match found.pop() {
+            Some(exact) => Ok(Some(exact)),
+            None => self.automation_of_record(actor),
+        }
+    }
+
+    /// The automation row that answers for a caller no row names exactly
+    /// (backlog ddf0773e). Two cases, both the registry's own rules and
+    /// neither a guess:
+    ///
+    /// - the WIRE SPELLING. A firing rule signs `rule:<name>` and the
+    ///   audit log records `automation:rule:<name>`; rows are keyed by
+    ///   the recorded id. [`automation_slug`] is the one mapping, shared
+    ///   with `User::ambient_actor`, so a caller is judged under the
+    ///   identity its write is recorded under.
+    /// - the FAMILY. An id signed one per firing has no row of its own by
+    ///   design (a row per rule would copy the `dispatcher_rules`
+    ///   registry); its signer's row declares the prefix in `signs_for`.
+    ///   The longest declared prefix answers, as `boss-jobs`'
+    ///   `row_of_record` has it, and two rows declaring the same one are
+    ///   ambiguous here although the registry's unique index refuses
+    ///   them — this reads a response, not the table.
+    ///
+    /// Only rows from the automations door are read: an agent's or a
+    /// person's row answers for itself and its aliases, never a family.
+    /// An exact row always wins (the caller of this function found none).
+    fn automation_of_record(&self, actor: &str) -> Result<Option<RoleRecord>, RoleLookupError> {
+        let Some(slug) = automation_slug(actor) else {
+            return Ok(None);
+        };
+        let recorded = format!("automation:{slug}");
+        let automations = || {
+            self.rows
+                .iter()
+                .filter(|(_, aliases, people)| !aliases && !people)
+                .map(|(row, _, _)| row)
+        };
+        let mut found = Vec::new();
+        if recorded != actor {
+            for row in automations() {
+                if matches_actor(row, &recorded, false, false)? {
+                    found.push(record(row)?);
+                }
+            }
+        }
+        if found.is_empty() {
+            let mut longest = 0;
+            for row in automations() {
+                let Some(prefix) = signs_for(row)? else {
+                    continue;
+                };
+                if !is_family_member(prefix, &recorded) || prefix.len() < longest {
+                    continue;
+                }
+                if prefix.len() > longest {
+                    longest = prefix.len();
+                    found.clear();
+                }
+                found.push(record(row)?);
+            }
+        }
+        if found.len() > 1 {
+            return Err(RoleLookupError::Ambiguous(format!(
+                "{} automation rows answer for {actor}",
+                found.len()
+            )));
+        }
         Ok(found.pop())
+    }
+}
+
+/// An automation row's declared family prefix. Absent or null is no
+/// family; anything else that is not a non-blank string is a registry
+/// that could not answer.
+fn signs_for(row: &Value) -> Result<Option<&str>, RoleLookupError> {
+    match row.get("signs_for") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(prefix)) if !prefix.trim().is_empty() => Ok(Some(prefix)),
+        _ => Err(RoleLookupError::Unavailable(
+            "automation registry row has a malformed signs_for".into(),
+        )),
     }
 }
 

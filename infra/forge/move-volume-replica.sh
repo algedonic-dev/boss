@@ -4,7 +4,18 @@
 # `plan-a-volume-replica-move` (--plan) and `move-volume-replica`.
 #
 #   move-volume-replica.sh --plan <volume> <replica>
+#   move-volume-replica.sh --plan-decisive <volume> <namespace> <pvc>
 #   move-volume-replica.sh <volume> <replica> <plan-sha256>
+#
+# --plan-decisive is read-only argument discovery (backlog 53c8cb72, design
+# ada8f698 option A, David 2026-10-07): asked only by
+# expand-instance-volume.sh --plan-largest after it found that no growth
+# fits a claim, it answers whether EXACTLY ONE replica move would free the
+# volume to grow, and prints that move's plan as one JSON proposal — or
+# refuses, saying which fact was missing. See THE DECISIVE READ below. It
+# is not approval or execution: the proposal names plan-a-volume-replica-move
+# and its two words, and the move itself is still this script's write,
+# behind the hash David's passkey signed.
 #
 # WHY IT EXISTS (backlog ab39a34e, incident d3c0a67c, 2026-10-01). The
 # system of record's database volume, boss/pgdata-postgres-0 (Longhorn
@@ -132,6 +143,49 @@
 # between that read and the delete leaves N-1 for as long as Longhorn
 # takes to rebuild; no kubectl call can close that window.
 #
+# THE DECISIVE READ (--plan-decisive), each rule the design's own line
+# (design-doc ada8f698, "A tight claim proposes one evidenced replica
+# move"; its question's option A):
+#   * "a replica belongs to that exact claim-bound volume": the volume's
+#     kubernetesStatus names the namespace/pvc asked about, or it refuses;
+#   * "Unknown/malformed/duplicate/partial lists refuse rather than create
+#     a proposal": every object is ONE document of its kind and name, each
+#     list is one complete list (no continue token) of uniquely named
+#     objects, and every size, ledger field and setting is an exact
+#     non-negative integer (infra/lib/longhorn-ledger.sh, the guards the
+#     largest-fit read already used) — else CANNOT ANSWER, exit 1;
+#   * "the existing move plan admits that named source, every allowed
+#     new-target disk passes existing placement and projected next-growth
+#     checks": THE SAME bounds, run by the same lines, as --plan runs;
+#     "failed health/trim/anti-affinity checks ... make the whole judgment
+#     unavailable" — any of them refuses for every candidate at once;
+#   * "all remaining original replica disks admit the projected next growth
+#     on the same conservative shared arithmetic": for each replica in
+#     turn as the source, the plan's own `short_after` (ledger) and
+#     `after_live` (live) lists must both be empty. That is the typed
+#     judgement the design asks for ("not grep plan prose"): a plan that
+#     renders with "these are SHORT" is not a decisive move;
+#   * "if exactly one eligible replica exists, select it. Zero eligible
+#     replicas produces a named refusal. Multiple eligible replicas also
+#     refuse with the complete candidate identities" — in byte order, which
+#     is presentation and never a choice. Nothing ranks.
+# Two premises are held as well, because a proposal that passes the lines
+# above and misses either would not be DECISIVE; each refuses, neither
+# chooses:
+#   * something must be short: when no replica disk is short of the
+#     volume's next growth, a move frees nothing ("Growth blocked only by
+#     the 100Gi ceiling or another non-placement bound must refuse without
+#     movement");
+#   * the volume holds no more replicas than the retirement floor
+#     (LONGHORN_RETIRE_FLOOR, 3). Above it, retiring the replica on the
+#     short disk is admissible too, and which of the two is a person's
+#     choice — it was David's on 2026-10-01, for boss/pgdata-postgres-0's
+#     four replicas, and he chose to retire. The design does not rule on
+#     this case, so it refuses and says so.
+# The proposal is `{verb, args, target, plan, plan_sha256}` on stdout:
+# plan-a-volume-replica-move, [volume, replica], the [namespace, pvc] it
+# answers, and the plan exactly as --plan renders it for that replica.
+#
 # NO EVIDENCE IS NOT A PASS: a read that could not look is CANNOT ANSWER
 # and exit 1, never a plan; a read that fails between steps stops the
 # run before the next mutation. Exit 78 is a refusal (the request was
@@ -157,12 +211,24 @@ UUID_RE='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 VOL_RE="^pvc-${UUID_RE}\$"
 REP_RE="^pvc-${UUID_RE}-r-[0-9a-f]{8}\$"
 
-refuse() { echo "$ME: REFUSED — $*" >&2; exit 78; }
-fail() { echo "$ME: FAILED — $*" >&2; exit 1; }
+LABEL='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+
+# WHOSE is empty except in the decisive read, where every refusal and
+# every unread answer opens by saying that nothing is proposed, and for
+# which claim: one line a reader of the discovery request can act on.
+WHOSE=""
+refuse() { echo "$ME: REFUSED — $WHOSE$*" >&2; exit 78; }
+fail() { echo "$ME: FAILED — $WHOSE$*" >&2; exit 1; }
 unread() { fail "CANNOT ANSWER — $* — an unread volume has no plan, and nothing was written"; }
 
 PLAN=0
-if [ "${1-}" = "--plan" ]; then
+DECISIVE=0
+if [ "${1-}" = "--plan-decisive" ]; then
+    PLAN=1
+    DECISIVE=1
+    shift
+    [ $# -eq 3 ] || refuse "usage: move-volume-replica.sh --plan-decisive <volume> <namespace> <pvc> — read-only discovery takes the volume and the claim it must be bound to, and nothing else"
+elif [ "${1-}" = "--plan" ]; then
     PLAN=1
     shift
     [ $# -eq 2 ] || refuse "usage: move-volume-replica.sh --plan <volume> <replica> — the plan takes the volume and the replica and nothing else"
@@ -172,10 +238,21 @@ else
     APPROVED="$3"
 fi
 VOL="$1"
-REP="$2"
 [[ "$VOL" =~ $VOL_RE ]] || refuse "the volume must be one Longhorn volume name, pvc-<uuid> in lower case, got '$VOL'"
-[[ "$REP" =~ $REP_RE ]] || refuse "the replica must be one Longhorn replica name, <volume>-r-<8 hex> in lower case, got '$REP'"
-[ "${REP%-r-*}" = "$VOL" ] || refuse "the replica $REP is named for volume ${REP%-r-*}, not $VOL"
+if [ "$DECISIVE" -eq 1 ]; then
+    # The replica is what this read is asked to find. Until it has, REP is
+    # empty and names nothing.
+    REP=""
+    CLAIM_NS="$2"
+    CLAIM_PVC="$3"
+    [[ "$CLAIM_NS" =~ $LABEL ]] || refuse "the namespace must be one DNS label, got '$CLAIM_NS'"
+    [[ "$CLAIM_PVC" =~ $LABEL ]] || refuse "the claim must be one DNS label, got '$CLAIM_PVC'"
+    WHOSE="no replica move is proposed for $CLAIM_NS/$CLAIM_PVC — "
+else
+    REP="$2"
+    [[ "$REP" =~ $REP_RE ]] || refuse "the replica must be one Longhorn replica name, <volume>-r-<8 hex> in lower case, got '$REP'"
+    [ "${REP%-r-*}" = "$VOL" ] || refuse "the replica $REP is named for volume ${REP%-r-*}, not $VOL"
+fi
 command -v jq >/dev/null 2>&1 || fail "jq is not on PATH — Longhorn's answer cannot be read, and no evidence is not a plan"
 
 REBUILD_S="${BOSS_MOVE_REBUILD_S:-1200}"
@@ -212,6 +289,16 @@ read_obj() {
     fi
     jq_doc_file "$WORK/$file" && jq -e 'type == "object"' "$WORK/$file" >/dev/null 2>&1 \
         || unread "$* did not read back as one object (its first 200 bytes: '$(head -c 200 "$WORK/$file" | tr '\n' ' ')')"
+    if [ "$DECISIVE" -eq 1 ]; then
+        local kind
+        case "$1" in
+            volumes.longhorn.io) kind=Volume ;;
+            settings.longhorn.io) kind=Setting ;;
+            *) unread "the decisive read does not know the typed resource $1" ;;
+        esac
+        lh_one_object "$WORK/$file" "$kind" "$2" "$LH" \
+            || unread "$* is not exactly one object with the requested identity"
+    fi
 }
 
 # read_list <resource> <file> — a Longhorn list into $WORK/<file>.
@@ -222,6 +309,16 @@ read_list() {
     fi
     jq_doc_file "$WORK/$2" && jq -e '.items | type == "array"' "$WORK/$2" >/dev/null 2>&1 \
         || unread "$1 did not read back as a list (its first 200 bytes: '$(head -c 200 "$WORK/$2" | tr '\n' ' ')')"
+    if [ "$DECISIVE" -eq 1 ]; then
+        local kind
+        case "$1" in
+            replicas.longhorn.io) kind=Replica ;;
+            nodes.longhorn.io) kind=Node ;;
+            *) unread "the decisive read does not know the typed list $1" ;;
+        esac
+        lh_whole_list "$WORK/$2" "$kind" "$LH" \
+            || unread "$1 is not exactly one complete list with unique named objects"
+    fi
 }
 
 # facts — one JSON object judged from the reads: the volume, its
@@ -285,6 +382,13 @@ facts() {
         | [$known[] | select(.names != [$rep])
             | if (.names | index($rep)) != null then .count -= 1 | .per = ((.d.room / .count) | floor) else . end] as $remain
         | [$remain[] | select(.per < $size) | .line] as $short_after
+        # The replica disks short of the next growth TODAY, by the same
+        # two sums: what the decisive read holds a move against. Never in
+        # the signed bytes.
+        | [$known[] | . as $k | ($k.d | lh_expansion($k.count * $size; $opct; $mpct)) as $p
+            | select($k.per < $size or $p != [])
+            | {uuid: $k.uuid, names: $k.names,
+               say: "\($k.names | join(", ")) on disk \($k.uuid) (\($k.d.name) on \($k.d.node)): \(if $k.per < $size then "its ledger admits growth of \($k.per) bytes, not \($size)" else ($p | join("; ")) end)"}] as $blocked
         # The same disks, live: would the expand verb'"'"'s growth to twice
         # pass there today? Stderr only.
         | [$remain[] | . as $r | ($r.d | lh_expansion($r.count * $size; $opct; $mpct)) as $p | select($p != [])
@@ -345,6 +449,7 @@ facts() {
            unknown: $unknown,
            disk_lines: [$known[] | .line],
            short_after: $short_after,
+           blocked: $blocked,
            after_fit: (if $remain == [] then null else ([$remain[] | .per] | min) + $size end),
            targets: [$verdicts[] | select(.target) | .uuid],
            short_targets: [$verdicts[] | select(.target and (.ok | not)) | .line],
@@ -356,8 +461,15 @@ facts() {
 
 # render — read Longhorn now, apply the bounds, and write the plan to
 # $WORK/plan. Sets N (the count before), SIZE, OPCT, MPCT and TARGETS.
-# Nothing in the bytes is a clock, live free space or actualSize.
-render() {
+# Nothing in the bytes is a clock, live free space or actualSize. It is
+# four steps so that the decisive read runs the SAME lines between them:
+# read_all, bounds_volume (what must hold of the volume whichever replica
+# moves), bounds_targets (where the new replica can land — the same for
+# every replica of the volume) and write_plan.
+F="$WORK/facts.json"
+q() { jq -r "$1" "$F"; }
+
+read_all() {
     read_obj refuse vol.json volumes.longhorn.io "$VOL" -n "$LH"
     [ "$(jq -r '.metadata.name // ""' "$WORK/vol.json")" = "$VOL" ] \
         || unread "volumes.longhorn.io $VOL did not read back as that volume: $(head -c 200 "$WORK/vol.json" | tr '\n' ' ')"
@@ -367,11 +479,30 @@ render() {
     read_obj unread minavail.json settings.longhorn.io storage-minimal-available-percentage -n "$LH"
     read_obj unread antiaff.json settings.longhorn.io replica-soft-anti-affinity -n "$LH"
     read_obj unread autobal.json settings.longhorn.io replica-auto-balance -n "$LH"
-    if ! facts > "$WORK/facts.json"; then
+    [ "$DECISIVE" -eq 1 ] || return 0
+    local file
+    for file in vol.json replicas.json lhnodes.json overprov.json minavail.json; do
+        jq_doc_file "$WORK/$file" || unread "$file holds no document for the exact-input guard"
+    done
+    jq -e -n --arg vol "$VOL" \
+        --slurpfile v "$WORK/vol.json" --slurpfile r "$WORK/replicas.json" \
+        --slurpfile n "$WORK/lhnodes.json" \
+        --slurpfile o "$WORK/overprov.json" --slurpfile m "$WORK/minavail.json" \
+        "$LONGHORN_LEDGER_JQ"'
+        lh_exact_inputs($vol; $v[0]; $r[0].items; $n[0].items; $o[0].value; $m[0].value)' >/dev/null 2>&1 \
+        || unread "the decisive read needs complete unique identities and nonnegative exact integer sizes, disk fields and settings; no replica can be named from less"
+}
+
+# judge — the facts for REP as the source, into $F.
+judge() {
+    if ! facts > "$F"; then
         unread "Longhorn's answer would not parse: $(tr '\n' ' ' < "$WORK/facts.err")"
     fi
-    local f="$WORK/facts.json" n_reps nh dist
-    q() { jq -r "$1" "$f"; }
+}
+
+bounds_volume() {
+    local n_reps nh dist
+    judge
     SIZE="$(q '.size // "none"')"
     N="$(q '.current // "none"')"
     OPCT="$(q '.opct // "none"')"
@@ -379,8 +510,10 @@ render() {
     case "$SIZE" in '' | *[!0-9]*) unread "volume $VOL reports no spec.size ('$SIZE')" ;; esac
     case "$N" in '' | *[!0-9]*) unread "volume $VOL reports no spec.numberOfReplicas ('$N')" ;; esac
     case "$OPCT$MPCT" in '' | *[!0-9]*) unread "Longhorn's storage-over-provisioning-percentage or storage-minimal-available-percentage did not read as a number" ;; esac
-    [ "$(q '.rep != null')" = true ] \
-        || refuse "$REP is not a replica of $VOL — its replicas are: $(q '.replicas | join("; ")')"
+    if [ -n "$REP" ]; then
+        [ "$(q '.rep != null')" = true ] \
+            || refuse "$REP is not a replica of $VOL — its replicas are: $(q '.replicas | join("; ")')"
+    fi
     [ "$(q .state)" = attached ] \
         || refuse "$VOL is $(q .state), not attached — Longhorn rebuilds a replica of an attached volume, and a move is a rebuild"
     [ "$(q .robustness)" = healthy ] \
@@ -402,7 +535,10 @@ render() {
         || refuse "an eviction is requested where $VOL's replicas live — Longhorn trims an evicting replica itself and builds an extra one for it (cleanupEvictionRequestedReplicas, getReplenishReplicasCount), so a move here would race it: $(q '.evictions | join("; ")')"
     [ "$(q '.unknown | length')" -eq 0 ] \
         || unread "no Longhorn node reports the disk of $(q '.unknown | join(", ")') (spec.diskID against status.diskStatus[].diskUUID), or its ledger is missing — the webhook could not sum it either"
-    jq -r --arg me "$ME" '.live[] | "\($me): live, not signed (judged again when the write re-renders): \(.)"' "$f" >&2
+}
+
+bounds_targets() {
+    jq -r --arg me "$ME" '.live[] | "\($me): live, not signed (judged again when the write re-renders): \(.)"' "$F" >&2
     [ "$(q '.targets | length')" -gt 0 ] \
         || refuse "no disk on a node without a replica of $VOL can take a $SIZE-byte replica: $(q '.verdicts | join("; ")')"
     [ "$(q '.short_targets | length')" -eq 0 ] \
@@ -411,8 +547,11 @@ render() {
     # figures ride the refusal and stderr, never the signed bytes.
     [ "$(q '.live_short | length')" -eq 0 ] \
         || refuse "a disk Longhorn could place the new replica on fails Longhorn v1.11.3's live test, for the placement or for the volume's next growth there: $(q '.live_short | join("; ")')"
-    jq -r --arg me "$ME" '.after_live[] | "\($me): live, not signed — a remaining replica disk that would refuse the volume'"'"'s growth to twice today, so the read-back will name it: \(.)"' "$f" >&2
     TARGETS="$(q '.targets | join(" ")')"
+}
+
+write_plan() {
+    jq -r --arg me "$ME" '.after_live[] | "\($me): live, not signed — a remaining replica disk that would refuse the volume'"'"'s growth to twice today, so the read-back will name it: \(.)"' "$F" >&2
     {
         echo "plan: move-volume-replica"
         echo "volume: $VOL"
@@ -449,6 +588,80 @@ render() {
     } > "$WORK/plan"
     cp "$WORK/facts.json" "$WORK/planned.json"
 }
+
+render() {
+    read_all
+    bounds_volume
+    bounds_targets
+    write_plan
+}
+
+# decide — the decisive read (THE DECISIVE READ, in the header): hold the
+# volume to the claim, to the two premises and to the plan's own bounds,
+# judge every replica as the source, and set REP only when exactly one is
+# eligible. Every other outcome refuses, naming what was read.
+decide() {
+    local claim nb ne name
+    read_all
+    bounds_volume
+    claim="$(q .claim)"
+    [ "$claim" = "$CLAIM_NS/$CLAIM_PVC" ] \
+        || refuse "Longhorn volume $VOL is bound to $claim, not $CLAIM_NS/$CLAIM_PVC — the claim asked about and the volume read are not one thing"
+    nb="$(q '.blocked | length')"
+    case "$nb" in '' | *[!0-9]*) unread "the replica disks short of growth could not be counted ('$nb')" ;; esac
+    [ "$nb" -gt 0 ] \
+        || refuse "no replica disk is short of the volume's next growth (to $((2 * SIZE)) bytes, by the move plan's own ledger and live sums), so no move would free it; whatever bounds this claim is not a replica's placement: $(q '.disk_lines | join("; ")')"
+    [ "$N" -le "$LONGHORN_RETIRE_FLOOR" ] \
+        || refuse "$VOL holds $N replicas, above the retirement floor of $LONGHORN_RETIRE_FLOOR (LONGHORN_RETIRE_FLOOR in infra/lib/longhorn-ledger.sh), so retiring a replica on a short disk is as admissible by count as moving it, and which of the two is a person's choice, never a discovery's (design ada8f698 does not rule on it). Short of growth: $(q '.blocked | map(.say) | join("; ")'). Read plan-a-volume-replica-retirement or plan-a-volume-replica-move for the replica named"
+    bounds_targets
+    q '.names[]' > "$WORK/names" || unread "the volume's replicas could not be listed"
+    : > "$WORK/candidates"
+    while IFS= read -r name; do
+        [[ "$name" =~ $REP_RE ]] && [ "${name%-r-*}" = "$VOL" ] \
+            || unread "replica '$name' is not named <volume>-r-<8 hex> for $VOL, so it cannot be an argument of plan-a-volume-replica-move"
+        REP="$name"
+        judge
+        jq -c --arg rep "$name" '
+            if .rep == null or (.short_after | type) != "array" or (.after_live | type) != "array"
+            then error("no typed judgement") else
+            {rep: $rep, node: .rep.node, disk: .rep.disk,
+             blocked: ([.blocked[] | select(.names | index($rep) != null)] | length > 0),
+             remaining: (.short_after + .after_live)} end' "$F" >> "$WORK/candidates" 2> "$WORK/cand.err" \
+            || unread "the move of $name could not be judged: $(tr '\n' ' ' < "$WORK/cand.err")"
+    done < "$WORK/names"
+    REP=""
+    [ -s "$WORK/candidates" ] || unread "volume $VOL listed no replica to judge"
+    jq -s -r '[.[] | select(.remaining == []) | .rep] | sort | .[]' "$WORK/candidates" > "$WORK/eligible" \
+        || unread "the candidates could not be compared"
+    ne="$(grep -c . "$WORK/eligible")"
+    if [ "$ne" -eq 0 ]; then
+        refuse "$nb replica disks are short of the volume's next growth (to $((2 * SIZE)) bytes), so no single move frees it and none is chosen: $(jq -s -r '[.[] | select(.blocked)] | sort_by(.rep) | map("moving \(.rep) off \(.node) would leave \(.remaining | join("; "))") | join(" | ")' "$WORK/candidates")"
+    fi
+    # Not reachable while the plan holds one replica per node (then one
+    # short disk has one replica, and moving any other leaves it short).
+    # Kept because a selector must never fall through to a choice.
+    [ "$ne" -eq 1 ] \
+        || refuse "$ne replicas are each a move after which every remaining replica disk admits growth, and listing order is not a reason to choose one: $(tr '\n' ' ' < "$WORK/eligible")"
+    REP="$(cat "$WORK/eligible")"
+    judge
+    [ "$(q '.rep != null and ((.short_after + .after_live) == [])')" = true ] \
+        || unread "the chosen replica $REP did not judge the same way twice"
+    echo "$ME: decisive: $REP on $(q .rep.node) (disk $(q .rep.disk)) is the one replica whose move leaves every remaining replica disk admitting growth to $((2 * SIZE)) bytes — proposed as plan-a-volume-replica-move $VOL $REP. Nothing was moved; the move is move-volume-replica, behind the passkey that signs this plan" >&2
+    write_plan
+}
+
+if [ "$DECISIVE" -eq 1 ]; then
+    decide
+    HASH="$(sha256sum "$WORK/plan" | cut -d' ' -f1)"
+    jq -n --arg vol "$VOL" --arg rep "$REP" --arg ns "$CLAIM_NS" --arg pvc "$CLAIM_PVC" \
+        --arg hash "$HASH" --rawfile plan "$WORK/plan" \
+        '{verb: "plan-a-volume-replica-move", args: [$vol, $rep], target: [$ns, $pvc],
+          plan: $plan, plan_sha256: $hash}' \
+        || fail "the proposal could not be encoded — nothing was written"
+    echo "plan-sha256: $HASH" >&2
+    exit 0
+fi
+
 
 render
 HASH="$(sha256sum "$WORK/plan" | cut -d' ' -f1)"

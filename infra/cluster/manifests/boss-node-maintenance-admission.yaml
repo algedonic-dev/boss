@@ -1,0 +1,471 @@
+# boss-node-maintenance-admission — the namespace that admits a node
+# capability, and the policy that bounds it at the API server to one
+# workload (backlog 8eac4893; review 9b05cc55 N7 of the scheduled-trim
+# car 90d654c6, disk item 17f6170c). It was declared first WITHOUT that
+# admission; the trim car's one-line grant is the last line of this file.
+#
+# WHY AT ADMISSION. The trim car labels this namespace PodSecurity
+# `privileged` so one daily CronJob can hold CAP_SYS_ADMIN and two
+# hostPath directories on the build node. `privileged` admits anything,
+# so what stopped a SECOND privileged workload landing there was a pin
+# and lints that read YAML line by line — and two reviews in a row found
+# spellings a YAML decoder reads and a line scan does not (16efea28,
+# 9b05cc55), with a third review unable to finish the question. A net
+# over spellings has a known shape and no proof. The API server judges
+# the DECODED object, whatever file, document, quoting or line break
+# carried it, and whoever sent it: the converge, a controller or a
+# person with a kubeconfig. So the bound is here.
+#
+# WHAT THIS FILE DECLARES, AND IN WHAT ORDER IT LANDED. Three objects:
+# the policy, its binding, and the Namespace. It landed BEFORE the trim
+# car (train #987) with the Namespace labelled `baseline`, NOT
+# `privileged`, and holding nothing: the namespace existed, was bounded,
+# and still refused a hostPath and a capability exactly as every other
+# namespace here does, so the policy could be exercised against the real
+# API server (server-side dry runs of an admitted and of a refused
+# object) while no privileged admission existed anywhere. The trim car
+# then changed the label, and nothing else in this file's objects.
+#
+# THE NAMESPACE STAYS IN THIS FILE, FOR GOOD. The trim car did not take
+# it over: it changed ONE LINE here, `enforce: baseline` to `enforce:
+# privileged`, and its own manifest declares no Namespace. Two reasons,
+# the second found by review 9dc7696c (F3):
+#   * the label that admits privilege then sits in the file that bounds
+#     it, held by name, and the car that grants it shows as one line;
+#   * THE CONVERGE'S ORDER. cluster-deploy-runner.sh applies every file
+#     carrying a Namespace document FIRST (apply_namespaces), then the
+#     whole directory, and it is `set -e`. Were the Namespace in the
+#     trim file, its CronJob would be applied in that first phase,
+#     BEFORE this file: a car moving the digest or the script would meet
+#     the OLD policy, be refused, and end the converge before the new
+#     policy was ever applied — on every tick, until a revert. With the
+#     Namespace here, this file is the namespace-phase file and the trim
+#     file is not: the policy is always written before the CronJob.
+# The pin holds it: the Namespace is declared here, and once the trim
+# manifest is in the tree that manifest declares none.
+#
+# MOVING THE DIGEST OR THE SCRIPT is therefore ONE car that changes both
+# files (the pin refuses either alone). What remains is a race, not a
+# deadlock: a policy takes a few seconds to take effect after it is
+# written, and the directory apply follows the namespace phase at once.
+# If the CronJob's apply arrives inside that window it is refused under
+# the old digest and that converge fails — by name, on its packet — and
+# the next tick (ten minutes) passes, because the new policy is live by
+# then. To avoid even the one red tick, bump in TWO cars: first a policy
+# whose image and script rules admit the old value OR the new, then the
+# manifest and the narrowing of the policy to the new one alone. Never
+# the manifest first: that order is the deadlock above.
+#
+# WHAT IS ADMITTED in namespace boss-node-maintenance — and NOTHING
+# ELSE, by anyone; no user is exempt, the converge's admin included:
+#   * CronJob `boss-node-trim`, a Job, and a Pod — each only when its
+#     pod spec IS the trim pod: one container named `trim`, the image at
+#     the pinned sha256 digest, `/bin/sh -c` and the script below byte
+#     for byte, `capabilities: drop [ALL], add [SYS_ADMIN]` with
+#     `privileged: false` and a read-only root filesystem, uid and gid 0
+#     under the RuntimeDefault seccomp profile, the two read-only
+#     hostPath directories and no other volume, no ServiceAccount token,
+#     no host network, PID or IPC namespace, pinned to the build node by
+#     `boss.dev/purpose: build`, and no field the list below does not
+#     name (so no init or ephemeral container, env, probe, lifecycle
+#     hook, runtime class, pull secret or second mount);
+#   * the `deny-all` NetworkPolicy, only while it selects every pod and
+#     allows nothing;
+#   * what the control plane itself writes into every namespace and a
+#     pod's life needs: the `default` ServiceAccount, the
+#     `kube-root-ca.crt` ConfigMap, the status of the three workload
+#     kinds, a pod's binding to its node and its eviction, and the
+#     CiliumEndpoint the CNI's agent records for each pod (refusing it
+#     would leave the agent retrying against a pod it has already
+#     wired; that the agent writes one here is reasoned from the CRD
+#     being served, not measured — the dev session may not list them).
+#     Events are outside the match altogether.
+# REFUSED, each by a validation answering false with its own message:
+# every other kind (Deployment, DaemonSet, StatefulSet, ReplicaSet, bare
+# Pod of another shape, Secret, Role, RoleBinding, Service, a custom
+# resource), a CronJob of another name, `pods/exec`, `pods/attach`,
+# `pods/portforward`, `pods/proxy`, `pods/ephemeralcontainers`, a token
+# for the ServiceAccount, and an UPDATE that moves any bounded field.
+#
+# THE POD SPEC IS BOUNDED, NOT ITS OWNER. ownerReferences are written by
+# the caller, so "a pod owned by that Job" is a claim anyone can make. A
+# pod is admitted for what it IS. A hand-made pod that is byte for byte
+# the trim pod is admitted — it is one more trim.
+#
+# WHAT THIS DOES NOT BOUND, stated so nobody reads more into it:
+#   * WHEN and HOW OFTEN the one pod runs — the CronJob's schedule,
+#     concurrency, history and deadlines, a Job's parallelism and
+#     completions. They move or multiply the trim; they do not change
+#     what it can touch. A schedule of every minute stalls the gates'
+#     disk and is held by the review of the trim manifest, not here.
+#   * which node a pod is BOUND to. The nodeSelector is pinned and the
+#     kubelet refuses a pod whose selector its node does not match; a
+#     nodeName may not be written at CREATE. The two paths are w-1's.
+#   * the image's registry. The digest is the identity: a reference to
+#     another registry at this digest is these bytes or no pull at all.
+#   * what the admitted pod can DO. Its image and script are root on
+#     w-1 (the trim manifest's header says so in full); the seccomp
+#     profile that narrows it is item fb2f849f.
+#   * an object written while the binding was absent, which stays, and
+#     DELETE, which is never judged — so the way back is always open.
+#   * ANYONE WITH CLUSTER-ADMIN. The policy and its binding are
+#     cluster-scoped objects outside what they judge: whoever can delete
+#     or edit a ValidatingAdmissionPolicyBinding, or relabel a
+#     namespace, removes the bound. Only the converge's admin and
+#     David's hold that. What notices is check-manifests-applied.sh on
+#     the next converge, which compares both objects' whole `spec` to
+#     this file and names the field that moved or the object that is
+#     gone — loud at the next train, not at the moment.
+#
+# IT FAILS CLOSED, AND LOUDLY. failurePolicy Fail: an expression that
+# errors on an odd object refuses the request. A policy that misjudges
+# the real trim pod therefore STOPS THE TRIM — the converge's apply of
+# the CronJob fails by name, or the Job records FailedCreate carrying
+# the message below — rather than admitting what it could not read.
+# The match is confined three ways, because a deny-by-default policy
+# that matched one namespace too many would refuse that namespace's
+# every write: a namespaceSelector on the label the API server itself
+# sets and keeps (kubernetes.io/metadata.name), `scope: Namespaced`
+# (WITHOUT it a namespaceSelector does not exempt cluster-scoped
+# objects, and this policy would judge every node, role and CRD in the
+# cluster), and a matchCondition on the request's namespace.
+#
+# ROLLBACK, if it misfires: with David's admin kubeconfig over the LAN,
+#   kubectl delete validatingadmissionpolicybinding node-maintenance-holds-one-workload
+# A policy with no binding judges nothing. The next converge applies the
+# binding again, so a misfire that must outlive a train is a revert car.
+#
+# WHAT HAS EXECUTED, AND WHERE. The pin evaluates these expressions with
+# cel-rust against the trim manifest's own CronJob, the Job and Pod a
+# controller derives from it, and about a hundred refused shapes.
+# CEL-RUST IS NOT THE API SERVER'S CEL-GO, AND IT IS MORE PERMISSIVE: it
+# has no type checker, so the first cut of this policy was green on the
+# pin and on 73 mutants while carrying four literals the server would
+# have refused to compile. What the server's environment restricts and
+# this evaluator does not, and where each stands here:
+#   * mixed-type list and map literals — refused by the server; NONE
+#     here, held by the pin walking the parsed expressions;
+#   * `request` is a TYPED object on the server (`object`, `oldObject`
+#     and every `variables.*` derived from them are dyn): only declared
+#     fields are read (namespace, operation, subResource, resource.group,
+#     resource.resource), and the two the server omits when empty are
+#     asked for with has() first;
+#   * comparisons are between a dyn value and a literal of one scalar
+#     type, or a one-type list or map; no int is compared to a double or
+#     uint, no optional (`?.`), no extension function — only the base
+#     language: has, in, all, exists, size, startsWith, matches, the
+#     conditional, +, ==, !=, &&, ||, !, index and a raw string;
+#   * the one regex is a literal, valid RE2, anchored at both ends.
+#   * `request.namespace` selects a field named by a CEL reserved word.
+#     cel-go reserves those words as IDENTIFIERS, not as field names
+#     after a dot — again a reading, and stage 1 is its measurement.
+# That list is a READING of the upstream environment by the reviewer and
+# by this car's builder, not a run of it. So: THE OPERATOR'S STAGE-1
+# SERVER-SIDE DRY RUN IS THE PRECONDITION OF THIS CAR'S RELEASE — it is
+# the first time cel-go compiles these expressions, and nothing offline
+# stands in for it. The pin's objects are also a MODEL of what the
+# server holds after defaulting; that the server decides as the model
+# does is shown by the stage-2 dry run before the trim car's release,
+# and then by the first scheduled trim.
+#
+# The image digest, the script, the two paths and every pod setting are
+# written here AND in the trim manifest: one fact in two files, which a
+# policy cannot avoid (it has no way to read a manifest). Held equal by
+# the pin (CLAUDE.md 9a) — the trim manifest's own pod is the one this
+# admits, and a change to either file alone is a red gate.
+#
+# EVERY CHANGE TO THIS FILE is a credentials-area car and waits for an
+# adversarial review. That sentence is read by the park hold (boss-cli,
+# mutating_verb.rs): it is what holds this file by name.
+#
+# PINNED by crates/core/boss-testing/tests/the_node_maintenance_namespace_is_bounded_at_admission.rs.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: node-maintenance-holds-one-workload
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: boss-node-maintenance
+    resourceRules:
+      - apiGroups: ["*"]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE, CONNECT]
+        resources: ["*/*"]
+        scope: Namespaced
+    # Events only: every controller, the scheduler and the kubelet write
+    # them, they carry no privilege, and they are how a refusal below is
+    # read (FailedCreate). Unjudged, so this policy can never mute them.
+    excludeResourceRules:
+      - apiGroups: ["", events.k8s.io]
+        apiVersions: ["*"]
+        operations: ["*"]
+        resources: [events]
+        scope: Namespaced
+  matchConditions:
+    - name: only-the-node-maintenance-namespace
+      # `has` first: a cluster-scoped request carries NO namespace key
+      # (the server omits an empty one), and reading an absent key is an
+      # error, which failurePolicy Fail makes a refusal. So this answers
+      # false for a request the other two confinements should already
+      # have stopped, instead of refusing it (review 9dc7696c, F2).
+      expression: has(request.namespace) && request.namespace == 'boss-node-maintenance'
+  variables:
+    # '' for the object itself, else `status`, `exec`, `binding`, ...
+    # (the request omits an empty subResource, so it is asked for).
+    - name: sub
+      expression: |
+        has(request.subResource) ? request.subResource : ''
+    # `<group>/<resource>`: '/pods', 'batch/jobs', 'batch/cronjobs'.
+    - name: kind
+      expression: request.resource.group + '/' + request.resource.resource
+    # '' for an object that carries no name (the options of an exec),
+    # and for a request that carries no object at all.
+    - name: name
+      expression: |
+        object != null && has(object.metadata) && has(object.metadata.name) ? object.metadata.name : ''
+    - name: workload
+      expression: |
+        variables.sub == '' && variables.kind in ['/pods', 'batch/jobs', 'batch/cronjobs']
+    # The pod TEMPLATE each workload kind carries — the Pod itself, a
+    # Job's, a CronJob's — as {metadata, spec}; {} where there is none,
+    # which no rule below accepts.
+    - name: tmpl
+      expression: |
+        !variables.workload ? {} :
+        variables.kind == '/pods' ? object :
+        variables.kind == 'batch/jobs' ?
+          (has(object.spec) && has(object.spec.template) ? object.spec.template : {}) :
+          (has(object.spec) && has(object.spec.jobTemplate) && has(object.spec.jobTemplate.spec) && has(object.spec.jobTemplate.spec.template)
+            ? object.spec.jobTemplate.spec.template : {})
+    - name: pod
+      expression: |
+        has(variables.tmpl.spec) ? variables.tmpl.spec : {}
+    # An UPDATE that leaves `spec` as it was — a finalizer removed, a
+    # label, an ownerReference — is not judged on the pod spec: an object
+    # admitted under an EARLIER version of this policy (a digest moved by
+    # a later car) must still be able to finish and be collected.
+    - name: unchanged
+      expression: |
+        request.operation == 'UPDATE' && has(object.spec) && has(oldObject.spec) && object.spec == oldObject.spec
+    - name: judged
+      expression: variables.workload && !variables.unchanged
+    # The one container, or {} when there is not exactly one.
+    - name: c
+      expression: |
+        has(variables.pod.containers) && size(variables.pod.containers) == 1 ? variables.pod.containers[0] : {}
+    # The pod's and the container's securityContext, the volumes and the
+    # mounts, each {} or [] when absent. THEY ARE COMPARED FIELD BY FIELD
+    # BELOW, NEVER TO ONE LITERAL: the API server's CEL environment
+    # refuses to compile a map or list literal whose values are of
+    # different types (HomogeneousAggregateLiterals — `{'privileged':
+    # false, 'capabilities': {...}}` is "expected type 'bool' but found
+    # 'map'"), and a policy that does not compile is rejected when it is
+    # written. The first cut carried four such literals (review 9dc7696c,
+    # F1). Every literal here is of ONE type, the pin walks the parsed
+    # expressions to hold that, and each object is bounded by its key
+    # allow-list plus one comparison per key.
+    - name: psc
+      expression: |
+        has(variables.pod.securityContext) ? variables.pod.securityContext : {}
+    - name: csc
+      expression: |
+        has(variables.c.securityContext) ? variables.c.securityContext : {}
+    - name: vols
+      expression: |
+        has(variables.pod.volumes) ? variables.pod.volumes : []
+    - name: mounts
+      expression: |
+        has(variables.c.volumeMounts) ? variables.c.volumeMounts : []
+    # The trim script, byte for byte as the trim manifest's `args` block
+    # scalar yields it. The pin holds the two equal.
+    - name: script
+      expression: |
+        r"""set -u
+        # The four paths are parameters only so the pin can RUN
+        # this text (inline shell nothing executes is untested
+        # shell); the pod sets no env, so it gets the defaults.
+        GATE="${TRIM_GATE:-/trim/gate}"
+        EPHEMERAL="${TRIM_EPHEMERAL:-/trim/ephemeral}"
+        OUT="${TRIM_TERMINATION_LOG:-/dev/termination-log}"
+        SYS="${TRIM_SYS_BLOCK:-/sys/block}"
+        # Every line goes to the log AND the termination message,
+        # so the result is on the pod's status as well as in a
+        # log that needs a second grant to read.
+        say() {
+          echo "node-trim: $*"
+          echo "node-trim: $*" >>"$OUT" 2>/dev/null || true
+        }
+        # The EFFECT, beside the claim: each NVMe's completed
+        # discards and discarded sectors (fields 12 and 14 of
+        # its stat), before and after.
+        counters() {
+          for s in "$SYS"/nvme*/stat; do
+            [ -r "$s" ] || continue
+            say "$1 ${s%/stat}: $(awk '{print "discards=" $12 " sectors=" $14}' "$s")"
+          done
+          return 0
+        }
+        # A gate volume that is not mounted leaves its directory
+        # on EPHEMERAL: then both paths are one filesystem and
+        # the drive this exists for would go untrimmed in
+        # silence. Refuse, by name.
+        gd=$(stat -c %d "$GATE") || { say "RED cannot stat $GATE"; exit 1; }
+        ed=$(stat -c %d "$EPHEMERAL") || { say "RED cannot stat $EPHEMERAL"; exit 1; }
+        if [ "$gd" = "$ed" ]; then
+          say "RED $GATE and $EPHEMERAL are one filesystem (device $gd): the gate volume is not mounted, nothing trimmed"
+          exit 1
+        fi
+        counters before
+        rc=0
+        for m in "$GATE" "$EPHEMERAL"; do
+          if out=$(fstrim -v "$m" 2>&1); then
+            say "$out"
+          else
+            say "RED fstrim $m failed: $out"
+            rc=1
+          fi
+        done
+        counters after
+        if [ "$rc" -eq 0 ]; then say "OK"; else say "RED"; fi
+        exit "$rc"
+        """
+  validations:
+    - expression: |
+        variables.workload ||
+        (variables.sub == 'status' && variables.kind in ['/pods', 'batch/jobs', 'batch/cronjobs']) ||
+        (variables.kind == '/pods' && variables.sub in ['binding', 'eviction']) ||
+        (variables.sub == '' && variables.kind == '/serviceaccounts' && variables.name == 'default') ||
+        (variables.sub == '' && variables.kind == '/configmaps' && variables.name == 'kube-root-ca.crt') ||
+        (variables.sub == '' && variables.kind == 'networking.k8s.io/networkpolicies' && variables.name == 'deny-all') ||
+        (variables.kind == 'cilium.io/ciliumendpoints' && variables.sub in ['', 'status'])
+      message: 'boss-node-maintenance admits only CronJob boss-node-trim, its Jobs and their pods, the deny-all NetworkPolicy and what the control plane writes for them; every other kind and subresource (exec, attach, port-forward, ephemeral containers, a ServiceAccount token) is refused'
+    - expression: |
+        !(variables.sub == '' && variables.kind == 'batch/cronjobs') || variables.name == 'boss-node-trim'
+      message: 'the one CronJob in boss-node-maintenance is boss-node-trim'
+    - expression: |
+        variables.kind != 'networking.k8s.io/networkpolicies' ||
+        (has(object.spec) &&
+         has(object.spec.podSelector) && size(object.spec.podSelector) == 0 &&
+         (!has(object.spec.ingress) || size(object.spec.ingress) == 0) &&
+         (!has(object.spec.egress) || size(object.spec.egress) == 0) &&
+         has(object.spec.policyTypes) && 'Ingress' in object.spec.policyTypes && 'Egress' in object.spec.policyTypes)
+      message: 'the deny-all NetworkPolicy selects every pod and allows nothing, both ways'
+    # Judged on EVERY write of a workload, changed spec or not: a Pod's
+    # annotations sit outside its spec.
+    - expression: |
+        !variables.workload || !has(variables.tmpl.metadata) || !has(variables.tmpl.metadata.annotations) ||
+        !variables.tmpl.metadata.annotations.exists(k, k.startsWith('container.apparmor.security.beta.kubernetes.io/'))
+      message: 'the trim pod carries no AppArmor annotation (it would name a profile for a container that holds a node capability)'
+    - expression: |
+        !variables.judged || (size(variables.pod) > 0 && variables.pod.all(k, k in [
+          'restartPolicy', 'automountServiceAccountToken', 'enableServiceLinks',
+          'hostNetwork', 'hostPID', 'hostIPC', 'nodeSelector', 'securityContext',
+          'containers', 'volumes',
+          'terminationGracePeriodSeconds', 'dnsPolicy', 'schedulerName',
+          'serviceAccountName', 'serviceAccount', 'tolerations', 'priority',
+          'preemptionPolicy', 'nodeName']))
+      message: 'the trim pod spec carries a field this policy does not name (an init or ephemeral container, a runtime class, a pull secret, a shared process namespace, hostUsers, affinity and the rest are refused by absence from the list)'
+    - expression: |
+        !variables.judged ||
+        ((!has(variables.pod.hostNetwork) || variables.pod.hostNetwork == false) &&
+         (!has(variables.pod.hostPID) || variables.pod.hostPID == false) &&
+         (!has(variables.pod.hostIPC) || variables.pod.hostIPC == false))
+      message: 'the trim pod joins no host network, PID or IPC namespace'
+    - expression: |
+        !variables.judged ||
+        (has(variables.pod.restartPolicy) && variables.pod.restartPolicy == 'Never' &&
+         has(variables.pod.automountServiceAccountToken) && variables.pod.automountServiceAccountToken == false &&
+         has(variables.pod.enableServiceLinks) && variables.pod.enableServiceLinks == false &&
+         (!has(variables.pod.serviceAccountName) || variables.pod.serviceAccountName == 'default') &&
+         (!has(variables.pod.serviceAccount) || variables.pod.serviceAccount == 'default'))
+      message: 'the trim pod runs once as the default ServiceAccount, mounts no token and takes no service links'
+    - expression: |
+        !variables.judged ||
+        (has(variables.pod.nodeSelector) && variables.pod.nodeSelector == {'boss.dev/purpose': 'build'} &&
+         (!has(variables.pod.nodeName) || (variables.kind == '/pods' && request.operation == 'UPDATE')))
+      message: 'the trim pod is pinned to the build node by nodeSelector boss.dev/purpose=build and names no node at create'
+    - expression: |
+        !variables.judged ||
+        (variables.psc.all(k, k in ['runAsNonRoot', 'runAsUser', 'runAsGroup', 'seccompProfile']) &&
+         has(variables.psc.runAsNonRoot) && variables.psc.runAsNonRoot == false &&
+         has(variables.psc.runAsUser) && variables.psc.runAsUser == 0 &&
+         has(variables.psc.runAsGroup) && variables.psc.runAsGroup == 0 &&
+         has(variables.psc.seccompProfile) && variables.psc.seccompProfile == {'type': 'RuntimeDefault'})
+      message: 'the trim pod securityContext is exactly uid 0, gid 0, runAsNonRoot false and the RuntimeDefault seccomp profile'
+    - expression: |
+        !variables.judged ||
+        (size(variables.vols) == 2 &&
+         variables.vols.all(v, v.all(k, k in ['name', 'hostPath']) && has(v.name) && has(v.hostPath)) &&
+         variables.vols[0].name == 'gate' &&
+         variables.vols[0].hostPath == {'path': '/var/mnt/gate/seed', 'type': 'Directory'} &&
+         variables.vols[1].name == 'ephemeral' &&
+         variables.vols[1].hostPath == {'path': '/var/local/gate-seed', 'type': 'Directory'})
+      message: 'the trim pod mounts exactly two hostPath directories, /var/mnt/gate/seed and /var/local/gate-seed, and no other volume'
+    - expression: |
+        !variables.judged ||
+        (has(variables.c.name) && variables.c.name == 'trim' && variables.c.all(k, k in [
+          'name', 'image', 'command', 'args', 'securityContext', 'resources', 'volumeMounts',
+          'terminationMessagePath', 'terminationMessagePolicy', 'imagePullPolicy']))
+      message: 'the trim pod has exactly one container, named trim, carrying no field this policy does not name (env, envFrom, a probe, a lifecycle hook, a port, stdin, a tty and a working directory are refused by absence from the list)'
+    - expression: |
+        !variables.judged ||
+        (has(variables.c.image) &&
+         variables.c.image.matches('^[^@]+@sha256:cdeda0da2cd6896023cc5f96505bc94a699a989dff2bfc3e2008ab92eab1e93a$'))
+      message: 'the trim container image is pinned by digest sha256:cdeda0da2cd6896023cc5f96505bc94a699a989dff2bfc3e2008ab92eab1e93a'
+    - expression: |
+        !variables.judged ||
+        (has(variables.c.command) && variables.c.command == ['/bin/sh', '-c'] &&
+         has(variables.c.args) && variables.c.args == [variables.script])
+      message: 'the trim container runs /bin/sh -c and the trim script, byte for byte'
+    - expression: |
+        !variables.judged ||
+        (variables.csc.all(k, k in ['privileged', 'readOnlyRootFilesystem', 'capabilities']) &&
+         has(variables.csc.privileged) && variables.csc.privileged == false &&
+         has(variables.csc.readOnlyRootFilesystem) && variables.csc.readOnlyRootFilesystem == true &&
+         has(variables.csc.capabilities) && variables.csc.capabilities == {'drop': ['ALL'], 'add': ['SYS_ADMIN']})
+      message: 'the trim container securityContext is exactly privileged false, a read-only root filesystem, and capabilities drop ALL add SYS_ADMIN'
+    - expression: |
+        !variables.judged ||
+        (size(variables.mounts) == 2 &&
+         variables.mounts.all(m, m.all(k, k in ['name', 'mountPath', 'readOnly']) &&
+           has(m.name) && has(m.mountPath) && has(m.readOnly) && m.readOnly == true) &&
+         variables.mounts[0].name == 'gate' && variables.mounts[0].mountPath == '/trim/gate' &&
+         variables.mounts[1].name == 'ephemeral' && variables.mounts[1].mountPath == '/trim/ephemeral' &&
+         (!has(variables.c.terminationMessagePath) || variables.c.terminationMessagePath == '/dev/termination-log') &&
+         (!has(variables.c.resources) ||
+          (variables.c.resources.all(k, k in ['requests', 'limits']) &&
+           (!has(variables.c.resources.requests) || variables.c.resources.requests.all(k, k in ['cpu', 'memory'])) &&
+           (!has(variables.c.resources.limits) || variables.c.resources.limits.all(k, k in ['cpu', 'memory'])))))
+      message: 'the trim container mounts its two volumes read-only at /trim/gate and /trim/ephemeral, writes its message to /dev/termination-log and asks for cpu and memory only (no device, by claim or by a device-plugin resource)'
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: node-maintenance-holds-one-workload
+spec:
+  policyName: node-maintenance-holds-one-workload
+  # Deny from its first day — there is no report phase to pass through:
+  # the namespace is new and empty, so there is no live caller a refusal
+  # could surprise. Audit keeps each refusal in the API server's log.
+  validationActions: [Deny, Audit]
+---
+# The namespace, declared HERE for good (see the header: this keeps the
+# policy ahead of the CronJob in the converge's order). THE LAST LINE
+# BELOW IS THE PRIVILEGE GRANT: it read `baseline` from train #987 until
+# the trim car (90d654c6) changed that one line, and it is what lets the
+# policy's one pod hold its capability and its two host directories.
+# PodSecurity now admits anything here; the policy above is what refuses
+# everything but that pod. boss-node-maintenance.yaml declares no
+# Namespace of its own.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: boss-node-maintenance
+  labels:
+    app.kubernetes.io/part-of: boss
+    boss.dev/purpose: node-maintenance
+    pod-security.kubernetes.io/enforce: privileged

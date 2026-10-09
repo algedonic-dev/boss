@@ -594,28 +594,41 @@ impl User {
         if id == Self::ANONYMOUS_ID {
             return None;
         }
-        // Already a typed automation (`automation:<slug>`).
-        if let Some(slug) = id.strip_prefix("automation:") {
-            return Some(ActorId::Automation(slug.to_string()));
-        }
-        // Non-prefixed automation identities → a named automation:
-        //   rule:<name>     → automation:rule:<name>  (the firing rule)
-        //   system:<proc>   → automation:<proc>       (e.g. dispatcher)
-        //   system          → automation:platform     (legacy catch-all)
-        //   *-sim / *-runner→ automation:<id>
-        if id == "system"
-            || id.starts_with("rule:")
-            || id.starts_with("system:")
-            || id.ends_with("-sim")
-            || id.ends_with("-runner")
-        {
-            let slug = id.strip_prefix("system:").unwrap_or(id);
-            let slug = if slug == "system" { "platform" } else { slug };
+        if let Some(slug) = automation_slug(id) {
             return Some(ActorId::Automation(slug.to_string()));
         }
         // `<mode>:<model>` → Agent; anything else → Human. Infallible.
         id.parse().ok()
     }
+}
+
+/// The automation slug a wire id names, or `None` for an id that is not
+/// an automation's. ONE definition of the wire spellings, read by
+/// [`User::ambient_actor`] (who the audit log says acted) and by the
+/// role resolver (`role_reader`, whose row answers for the caller) — so
+/// a write is judged under the same identity it is recorded under
+/// (backlog ddf0773e: the resolver compared the wire spelling
+/// `rule:<name>` to rows keyed by the recorded one and found none).
+///
+///   automation:<slug> → <slug>           (already typed)
+///   rule:<name>       → rule:<name>      (the firing rule)
+///   system:<proc>     → <proc>           (e.g. dispatcher)
+///   system            → platform         (legacy catch-all)
+///   *-sim / *-runner  → <id>
+pub fn automation_slug(id: &str) -> Option<&str> {
+    if let Some(slug) = id.strip_prefix("automation:") {
+        return Some(slug);
+    }
+    if id == "system"
+        || id.starts_with("rule:")
+        || id.starts_with("system:")
+        || id.ends_with("-sim")
+        || id.ends_with("-runner")
+    {
+        let slug = id.strip_prefix("system:").unwrap_or(id);
+        return Some(if slug == "system" { "platform" } else { slug });
+    }
+    None
 }
 
 fn default_tier() -> AccessTier {

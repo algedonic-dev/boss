@@ -72,9 +72,10 @@
 
 use chrono::{DateTime, Utc};
 
+use boss_policy_client::controls::READ_POLICY_RULE;
 use boss_policy_client::coverage::{self, Control, Held, Key, Person, Table};
 use boss_policy_client::port::PolicyRepository;
-use boss_policy_client::types::{PolicyRule, Scope, UserOverride};
+use boss_policy_client::types::{PolicyRule, Scope, User, UserOverride};
 
 use crate::coverage::{COVERAGE_READER_ID, CoverageSources};
 
@@ -118,6 +119,34 @@ pub fn retires_a_deny(existing: Option<&UserOverride>, written: Option<&UserOver
 /// is unjudgeable (review 782257de, B1), so the door refuses one.
 pub fn is_the_guards_reader(ov: &UserOverride) -> bool {
     ov.user_id == COVERAGE_READER_ID
+}
+
+/// True when an override would narrow a SERVICE identity's Read on
+/// `policy-rule` below scope all (review 4bbb0f93, F1; row D of design
+/// b08725c2). Every service asks `POST /api/policy/check` signed as its
+/// own `automation:` id, and under the policy check's `enforce` mode a
+/// service whose Read on `policy-rule` is refused has its every check
+/// refused — which its client reads as policy-unreachable, so every door
+/// of that service answers 503 for everyone. The override takes no
+/// control from a real person, so [`Standing::override_write`] passes
+/// it; this is the door's own refusal, on the row alone, with no read.
+///
+/// "A service identity" is [`User::is_service`]'s own test, asked of the
+/// id the override names, so the two cannot drift. It is the id a caller
+/// ASSERTS, which is exactly the id the check judges. The pair is read
+/// off `READ_POLICY_RULE`, the control the check itself asks the caller
+/// for (`http.rs`), so the two cannot drift either — and a raw verb here
+/// is refused by the pin `a_door_asks_raw_only_where_its_resource_is_data`,
+/// which reddened this car's first gate (gate-run da8ff995, 2026-10-07).
+pub fn narrows_a_services_policy_read(ov: &UserOverride) -> bool {
+    let named = User {
+        id: ov.user_id.clone(),
+        ..User::anonymous()
+    };
+    named.is_service()
+        && ov.resource == READ_POLICY_RULE.resource()
+        && ov.action == READ_POLICY_RULE.action()
+        && ov.scope != Scope::All
 }
 
 impl Standing {

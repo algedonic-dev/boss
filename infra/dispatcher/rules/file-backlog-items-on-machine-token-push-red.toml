@@ -1,0 +1,59 @@
+# The ten-minute machine token push is judged by its own record (backlog
+# 88379df3; design-doc bdc60b65, question gcp-push). The chore
+# (infra/cluster/manifests/boss-machine-token-push.yaml, kind
+# maintenance-machine-token-push) records its verdict on its `run` step
+# through boss-chore.sh. A refusal prints ONE line
+# `RED machine-token-push refused: <why>` — a changed host key, a
+# receiver that refuses the deposit, slot lengths that disagree with
+# what was sent, a malformed slot in the mount. This rule fires when a
+# push packet closes `failed` and hands it to the chore judge the
+# break-glass deposit, the playground crawl and the recovery sheet use
+# (maintenance.chore.file_reds): one backlog-item per route, deduped
+# while it is open, so a refusal repeated 144 times a day is ONE item.
+#
+# ONE REFUSAL HAS A ROUTE OF ITS OWN (backlog dea2236f):
+# `RED machine-token-deposit-key-unconfined refused: this key reaches a
+# shell on <host> …` — the far side accepted the deposit key and did not
+# answer as the receiver, which is what a line placed without its
+# command= prefix does (packet 96a0f7bb, 2026-10-07). Under the push's
+# one route an item already open for some other refusal would have
+# deduped it away; on its own route it files beside that item.
+#
+# NO FALLBACK ROUTE, ON PURPOSE. The handler's `no_red_failure_route`
+# files one item for a failed run that printed NO shaped RED line; it is
+# granted to the break-glass deposit alone, and a pin holds it there
+# (chore_file_reds.rs, only_the_break_glass_rule_declares_the_no_red_
+# failure_route; backlog e4a9a9b3). This rule does not ask for it. Every
+# way the push script itself stops a push — refuse, usage, the transfer's
+# time bound — prints its RED line first, so what is left unfiled is a
+# run that died before saying anything (a defect `set -e` stopped on),
+# which this chore shares with every other chore but that one. Asking for
+# the route is a decision about the handler's bound, not a line in a
+# delivery car.
+#
+# NOT-YET FILES NOTHING, ON PURPOSE. A run that could not push because
+# the key is not prepared or not enrolled closes `not-yet`, which this
+# `when` does not match: that act is already a step assigned to its
+# owner on the prepare-the-machine-token-deposit-key packet, and a second item beside it
+# would be the same request twice.
+[[rule]]
+name = "file-backlog-items-on-machine-token-push-red"
+why = """
+A CROSS-PROTOCOL REACTOR: maintenance-machine-token-push ->
+backlog-item, which no single Workflow consequence can express — the
+chore's protocol records its own failure but cannot open another kind's
+packet. The cadence-silence sweep watches ARRIVAL only, and boss-chore.sh
+opens and closes the packet `failed`, so a push refused every ten
+minutes arrives on time and raises nothing while boss-gcp's callers
+drift onto a revoked slot. No authority widened: the handler is the
+crawl's judge (maintenance.chore.file_reds), its only writes are
+standard backlog-items owned by the platform owner and one `judged` note
+on the chore's own packet, and the dedup key is the route the Job
+prints. The same handler as file-backlog-items-on-break-glass-deposit-red,
+without that rule's fallback route for a failure that prints no RED line.
+"""
+on_event = "jobs.job.closed"
+when = 'kind = "maintenance-machine-token-push" AND outcome = "failed"'
+[[rule.do]]
+handler = "maintenance.chore.file_reds"
+args = { step = "\"run\"", design = "\"bdc60b65\"", area = "\"credentials\"" }

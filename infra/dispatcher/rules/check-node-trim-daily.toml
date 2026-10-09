@@ -1,0 +1,76 @@
+# Read the build node's daily trim every day, from outside its namespace,
+# so a failed, stuck or missing trim is a packet instead of nothing.
+#
+# THE GAP (backlog 33e62de8; review 8b1981da of the trim car 90d654c6,
+# F1). CronJob boss-node-trim is ONE attempt a day (12:40Z, Forbid,
+# activeDeadlineSeconds 1800, backoffLimit 0) in the one namespace
+# labelled privileged, and it is given no machine token and no door to
+# the jobs API: the pod that holds a node capability must not also hold a
+# credential on the system of record. So an image that will not pull, a
+# node that is down, a pod the admission policy refuses and a trim that
+# exits RED each left a failed or absent Job that no packet, alarm or
+# roster read — and infra/lint/timers-leave-a-packet.sh exempted the
+# CronJob by name, saying so. Twice in two days the gates slowed and
+# threw false reds before anyone looked at the drive.
+#
+# THE READER. It cannot live beside the trim: that namespace's admission
+# policy refuses a Role, a RoleBinding, a ServiceAccount token and any
+# second workload. The forge already holds the admin kubeconfig, so this
+# rule files the read-only check-node-trim there once a day;
+# watch-check-node-trim-daily judges its verdict line and files an urgent
+# alarm naming the cause (the thresholds live in that rule's `when`).
+# Each run's ops-request carries the last success and its age, the newest
+# finished Job's outcome and reason, and the trim's own before and after
+# discard counters.
+#
+# WHY THIS SHAPE and not a forge timer with the maintenance wrap. A timer
+# is a unit file, an install.sh roster line, a Workflow kind and an
+# `interval_minutes` arg on the silence sweep — four places — and a unit
+# that runs a script from the checkout. check-longhorn-drain-policy-daily
+# is the shape the tree already has for "the forge reads the cluster
+# daily and something alarms": one verb file, this rule, one watch. No
+# unit, no new kind, no request this car sends to any gated port.
+#
+# NO GUARD. The check is read-only and idempotent; a `NOT open_*` guard
+# would let one unfinished request retire the cadence
+# (`a-dedup-guard-silently-retires-a-cadence`).
+#
+# The packet's subject is `node-trim`, an identity this rule alone files,
+# so `cadence_roster::clock_cadences` derives a daily
+# `ops-request/node-trim` the silence sweep measures: the reader that
+# stops running is itself noticed, with no `interval_minutes` arg to keep
+# in step.
+#
+# WHEN IN THE DAY. A daily rule fires on the day boundary, not at an hour
+# of its choosing: its sibling check-longhorn-drain-policy-daily opened
+# its request at 00:00:16Z on 2026-10-08 and the forge answered it at
+# 00:02:00Z. So this check reads a 12:40Z trim about eleven hours later.
+# That costs nothing in detection (a Job stays the newest finished one
+# for a day, so exactly one check judges it; a missed day is 26 hours
+# without a success at the next) and something in diagnosis: a pod that
+# exited RED is kept with its Job and still names its exit code and the
+# trim's own words, but a Job that failed on its deadline has had its pod
+# removed, and events live about an hour, so for an image that would not
+# pull or a pod refused at admission the check then says the cause is no
+# longer readable rather than naming one. An hourly check would read
+# those events and would also file one alarm an hour while a trim stays
+# failed (the alarm is keyed to its request); a schedule that can name an
+# hour is the repair, and it is not this car.
+[[rule]]
+name = "check-node-trim-daily"
+why = """
+A TIMER, the standing exemption: "a day passed and the trim did not
+run" is no packet's event, and the trim itself can file none — its
+namespace is allowed no token, no Role and no second workload, so no
+Workflow consequence can fire from it. Asked for on backlog 33e62de8
+(review 8b1981da F1 of the trim car; David let that car board first on
+2026-10-07 with this owed). It files the read-only check-node-trim verb
+for the forge; watch-check-node-trim-daily turns a failed, stale,
+missing or evidence-free trim into an alarm. It adds no routing: one
+firing spawns one ops-request, and what happens next is that protocol's
+row.
+"""
+schedule = { cadence = "daily", anchor_date = "2026-10-08" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"ops-request\"", subject_kind = "\"custom\"", subject = "\"node-trim\"", title = "\"read whether the build node's daily trim ran, and what it told the drives\"", "metadata.host" = "\"forge\"", "metadata.verb" = "\"check-node-trim\"", "metadata.area" = "\"platform\"" }

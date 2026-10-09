@@ -1,0 +1,10 @@
+# automation:forge-token-audit — not in the role-report tally read
+# 2026-10-07T02:13Z (that tally is held in memory and starts again with the
+# pod, so absence there is not absence of the caller); registered from the
+# tree, where every_script_sender_signs_as_a_registered_automation found it.
+# Signs as audit-readonly today: infra/maintenance/forge-token-audit.py.
+
+[[automation]]
+id = "automation:forge-token-audit"
+role = "audit-readonly"
+description = 'The forge token audit reading the credentials registry, which holds locations and never a value (infra/maintenance/forge-token-audit.py). Reads only.'

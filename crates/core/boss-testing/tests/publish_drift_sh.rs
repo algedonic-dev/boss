@@ -1020,6 +1020,83 @@ fn a_hold_that_cannot_be_read_refuses_both_modes_and_publishes_nothing() {
     }
 }
 
+/// The holds PATH itself can be the thing that cannot be read (review
+/// 72485f08 of car ca5d0218, finding F2). The reader asked `isdir` and had
+/// no else, so a regular file or a dangling symlink where the directory
+/// belongs read as "no declared holds", exit 0 — every declared hold gone
+/// in silence. Only a path that does not exist at all is an absent
+/// directory (the README is what keeps it, so that is a tree without the
+/// door, and the default hold still stands).
+#[test]
+fn a_holds_path_that_is_not_a_directory_refuses_both_modes() {
+    if !ready() {
+        return;
+    }
+    for shape in ["regular-file", "dangling-symlink"] {
+        let c = Case::new(&format!("hold-path-{shape}"));
+        c.verdicts(&[("maintenance-alpha", 0, 3), ("maintenance-beta", 0, 9)]);
+        let path = c.repo.join(HOLDS_REL);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        if shape == "regular-file" {
+            write_file(&path, HOLD);
+        } else {
+            std::os::unix::fs::symlink(c.root.join("nowhere-at-all"), &path).unwrap();
+        }
+        for mode in ["--check", "--for-real"] {
+            let (rc, out) = c.run(&[mode]);
+            assert_eq!(rc, 78, "{shape} {mode}: {out}");
+            contains_all(
+                &out,
+                &[
+                    "infra/platform/workflow-holds is not a directory",
+                    "REFUSED",
+                    "nothing published",
+                ],
+                &format!("{shape} {mode}"),
+            );
+            assert!(
+                c.calls().is_empty(),
+                "{shape} {mode} asked or published: {:?}",
+                c.calls()
+            );
+        }
+    }
+}
+
+/// A ROW file that does not parse cannot say whether it declares a writer
+/// or an executor, so the default hold cannot be derived for it: a named
+/// problem, never a kind quietly read as open (same review, finding F4 —
+/// the branch had no test, and a mutant that skipped the row in silence
+/// survived).
+#[test]
+fn a_row_file_that_does_not_parse_refuses_both_modes() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("hold-bad-row");
+    c.verdicts(&[("maintenance-alpha", 0, 3), ("maintenance-beta", 0, 9)]);
+    c.row_file("maintenance-beta", "[[workflow]\nkind = \"maintenance-beta");
+    for mode in ["--check", "--for-real"] {
+        let (rc, out) = c.run(&[mode]);
+        assert_eq!(rc, 78, "{mode}: {out}");
+        contains_all(
+            &out,
+            &[
+                "infra/platform/workflows/maintenance-beta.toml could not be read",
+                "whether it declares a writer or an executor cannot be told",
+                "REFUSED",
+                "nothing published",
+            ],
+            mode,
+        );
+        assert!(
+            c.calls().is_empty(),
+            "{mode} asked or published: {:?}",
+            c.calls()
+        );
+    }
+}
+
 /// THE DEFAULT (backlog 083d240e, part 5). A row that declares a field
 /// `writer` or a step `executor` is a refusal row by construction, so it
 /// is held with NO file — forgetting the file cannot publish a refusal
@@ -1164,6 +1241,249 @@ fn the_shipped_holds_are_readable() {
     assert!(
         repo_root().join(HOLDS_REL).join("README.md").is_file(),
         "{HOLDS_REL}/README.md is what keeps the directory, and says the shape"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// THE SIGNER ROW (design 09618594, question `signer`; backlog 6c9183de).
+// ops-request's approve step reserves `decision` and `comment` to the
+// signer: a refusal on every approval-requiring ops-request once the row
+// is published. Review 7cee49b9, condition R1: no unattended road may
+// publish it, so the car that declared the writer also DECLARED the hold.
+//
+// THE HOLD IS LIFTED (2026-10-07). David published the row by hand as
+// v10, the negative control refused a machine write of both keys, and
+// his passkey approval of ops-request ef9e591c, filed under v10,
+// completed and the runner answered. The hold file said what lifts it —
+// "a car changes this file to drift_publish = released with its own
+// why" — and this is that car's pin. These tests read the SHIPPED row
+// and the SHIPPED declaration, not a fixture's.
+//
+// Until that car they pinned the opposite (`held`, and --for-real never
+// publishing the row), which is what made the lift impossible without
+// touching a test: a hold that could be lifted without one would be a
+// hold a stray edit lifts. The same holds in reverse now. Putting
+// `held` back — the runner half of row E owes exactly that — turns
+// these red, and the car that does it rewrites them with its reason.
+// ---------------------------------------------------------------------------
+
+const SIGNER_KIND: &str = "ops-request";
+const SIGNER_HOLD_SOURCE: &str = "declared in infra/platform/workflow-holds/ops-request.toml";
+
+/// The reader's answer for one kind in the shipped tree: `(state, source,
+/// why, lifts)`.
+fn shipped_hold(kind: &str) -> Option<(String, String, String, String)> {
+    let out = Command::new("python3")
+        .arg(repo_root().join(HOLDS_READER))
+        .arg(repo_root())
+        .output()
+        .expect("the reader runs");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        out.status.success(),
+        "the shipped holds do not read clean:\n{text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    text.lines().find_map(|l| {
+        let c: Vec<&str> = l.split('\t').collect();
+        (c.len() >= 5 && c[1] == kind).then(|| {
+            (
+                c[0].to_string(),
+                c[2].to_string(),
+                c[3].to_string(),
+                c[4].to_string(),
+            )
+        })
+    })
+}
+
+/// The shipped tree RELEASES the signer row by declaration, and the
+/// declaration carries the evidence it rests on: the version David
+/// published, the control request his passkey approved under it, the
+/// item and the design.
+///
+/// AND THE RELEASE COVERS THE SIGNER HALF ONLY. The reader's default
+/// cannot tell one refusal from another: a `released` file hands back
+/// the whole row, whatever it declares. So the row this release was
+/// written for is pinned here, declaration by declaration — two fields
+/// reserved to the signer, no other writer, no executor. The car that
+/// declares `runner:ops` on this row (the runner half of row E) adds a
+/// second refusal nobody has published by hand or controlled, and
+/// without this pin both unattended roads would carry it: the drift
+/// publish on its first clean check, and the one-kind publish-workflow
+/// verb at once, for anyone who may file an ops-request. It fails here
+/// instead, and the fix is in the message.
+///
+/// THE DECLARATIONS ARE READ AS THE READER READS THEM (review 4746c046,
+/// B1). The first cut of this pin scanned the file's lines for
+/// `writer = "` and a leading `executor`, and three ordinary TOML
+/// spellings passed it green while the reader still answered `released`
+/// for the whole row: a literal string (`writer = 'runner:ops'`), no
+/// spaces (`writer="runner:ops"`), and a quoted key (`"executor" =`).
+/// So the set is now `refusal_declarations` itself, called out of
+/// infra/gcp/workflow-holds.py on the parsed row: what this pin counts
+/// is, by construction, what makes the reader call a row a refusal.
+#[test]
+fn the_shipped_signer_row_is_released_by_declaration_and_only_its_signer_half() {
+    if !ready() {
+        return;
+    }
+    let (state, source, why, lifts) = shipped_hold(SIGNER_KIND).unwrap_or_else(|| {
+        panic!("the shipped tree says nothing about {SIGNER_KIND}: a row that declares a writer is held by default, and the reader names it either way")
+    });
+    assert_eq!(
+        state, "released",
+        "{SIGNER_KIND} is `{state}` in the shipped tree ({source}). The signer half was released on 2026-10-07 after David's hand publish (v10) and its positive control (ops-request ef9e591c) held. If a car holds it again on purpose, it rewrites this test with its reason"
+    );
+    assert_eq!(
+        source, SIGNER_HOLD_SOURCE,
+        "a release is a declaration: nothing but the file can release a row the default holds"
+    );
+    contains_all(
+        &why,
+        &[
+            "6c9183de",
+            "09618594",
+            "v10",
+            "ef9e591c",
+            "signer half only",
+            "runner:ops",
+            "rollback",
+        ],
+        "the why names the item, the design, the published version, the control request, what the release does not cover, and what it gives up",
+    );
+    assert_eq!(
+        lifts, "-",
+        "a released row has nothing left to lift; the file carries no `lifts`"
+    );
+
+    // What the release was written for, read off the PARSED row by the
+    // reader's own function.
+    let declared = shipped_refusal_declarations(SIGNER_KIND);
+    assert_eq!(
+        declared,
+        vec![
+            "step approve field comment declares writer signer".to_string(),
+            "step approve field decision declares writer signer".to_string(),
+        ],
+        "infra/platform/workflows/{SIGNER_KIND}.toml declares a refusal the release of 2026-10-07 was not written for. That release covers `decision` and `comment` on `approve` reserved to the signer, and nothing else: it rests on David's hand publish of exactly that row and one approval under it. A new writer or an executor is a second refusal — put `drift_publish = \"held\"` back in {HOLDS_REL}/{SIGNER_KIND}.toml with its own why and lifts IN THE SAME CAR, and rewrite this test. The row declares (as {HOLDS_READER} reads it):\n{}",
+        declared.join("\n")
+    );
+}
+
+/// Every writer and executor the shipped row for `kind` declares, as the
+/// one hold reader derives them: `refusal_declarations` is called out of
+/// infra/gcp/workflow-holds.py itself, on the row as tomllib parses it,
+/// and its phrases come back sorted. Not a scan of the file's text — a
+/// second reading of the row is a second definition of "refusal", and
+/// the first one this file had missed three TOML spellings.
+fn shipped_refusal_declarations(kind: &str) -> Vec<String> {
+    let out = Command::new("python3")
+        .args([
+            "-c",
+            "import importlib.util, sys, tomllib\nspec = importlib.util.spec_from_file_location('workflow_holds', sys.argv[1])\nreader = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(reader)\nwith open(sys.argv[2], 'rb') as fh:\n    doc = tomllib.load(fh)\nfor phrase in sorted(reader.refusal_declarations(doc)):\n    print(phrase)\n",
+        ])
+        .arg(repo_root().join(HOLDS_READER))
+        .arg(repo_root().join(format!("infra/platform/workflows/{kind}.toml")))
+        .output()
+        .expect("python3 runs");
+    assert!(
+        out.status.success(),
+        "the reader's refusal_declarations could not be asked about the shipped {kind} row:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// `publish-drift --for-real` over the shipped row and the shipped
+/// release, in the state the release was made in — live already says
+/// what the tree says: nothing is published for the signer row, it is
+/// counted equal and no longer held, and the release is named.
+///
+/// The second pass is what the release GIVES UP, stated as a test so
+/// nobody learns it at a rollback: with the tree ahead of live again
+/// (the no-writer row republished by hand) a --for-real run publishes
+/// the signer row back. While the hold stood, a rollback stayed rolled
+/// back. Two roads undo one now (review 4746c046, S1): this one, which
+/// a rule files only after a check with nothing refused — none was
+/// clean on 2026-10-07, ten unrelated kinds refused — and the one-kind
+/// `publish-workflow ops-request`, which waits for no check and declares
+/// no approval. A rollback that must stick needs `held` back in the
+/// tree first, landed by a car.
+#[test]
+fn for_real_leaves_the_released_signer_row_alone_while_live_says_what_the_tree_says() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("released-shipped-signer");
+    let plant = |signer_rc: u32| {
+        c.verdicts(&[("maintenance-alpha", 0, 3), (SIGNER_KIND, signer_rc, 10)]);
+        c.row_file(
+            SIGNER_KIND,
+            &std::fs::read_to_string(
+                repo_root().join(format!("infra/platform/workflows/{SIGNER_KIND}.toml")),
+            )
+            .expect("the shipped ops-request row"),
+        );
+        c.hold_file(
+            &format!("{SIGNER_KIND}.toml"),
+            &std::fs::read_to_string(
+                repo_root()
+                    .join(HOLDS_REL)
+                    .join(format!("{SIGNER_KIND}.toml")),
+            )
+            .expect("the shipped tree declares what it says about ops-request"),
+        );
+    };
+    let released = format!("publish-drift: released {SIGNER_KIND} ({SIGNER_HOLD_SOURCE})");
+    let held = format!("publish-drift: held {SIGNER_KIND} ");
+
+    // Live equals the tree: the state on the day of the release.
+    plant(5);
+    c.clear_calls();
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(
+        c.publishes(),
+        vec!["maintenance-alpha".to_string()],
+        "the released signer row equals live, so nothing is published for it: {:?}",
+        c.calls()
+    );
+    assert!(
+        verdict_line(&out)
+            .starts_with("publish-drift: published 1, skipped 1 equal, refused 0, held 0"),
+        "{out}"
+    );
+    contains_all(&out, &[released.as_str()], "the release is named every run");
+    assert!(
+        !out.contains(&held),
+        "the signer row still reads held: {out}"
+    );
+    contains_all(
+        row(&out, SIGNER_KIND),
+        &["v10", "equal"],
+        "the signer row's own line",
+    );
+
+    // The tree ahead of live: a hand rollback, after the release.
+    plant(0);
+    c.clear_calls();
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(
+        c.publishes(),
+        vec!["maintenance-alpha".to_string(), SIGNER_KIND.to_string()],
+        "a released row the tree is ahead on IS published — that is what released means: {:?}",
+        c.calls()
+    );
+    assert!(
+        verdict_line(&out)
+            .starts_with("publish-drift: published 2, skipped 0 equal, refused 0, held 0"),
+        "{out}"
     );
 }
 

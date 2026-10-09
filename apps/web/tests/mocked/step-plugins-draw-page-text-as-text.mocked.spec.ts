@@ -58,6 +58,15 @@ async function mountPlugin(
       });
     };
   }, routes);
+  // The passkey ceremony sign-off.js and incident-review.js share: a
+  // bundle that needs it adds its script tag and registers once it has
+  // run; here it is already on the page, as after a first plugin load.
+  await page.addScriptTag({
+    content: readFileSync(
+      new URL('../../../../infra/step-plugins/passkey-ceremony.js', import.meta.url),
+      'utf8',
+    ),
+  });
   await page.addScriptTag({
     content: readFileSync(new URL(`../../../../infra/step-plugins/${file}`, import.meta.url), 'utf8'),
   });

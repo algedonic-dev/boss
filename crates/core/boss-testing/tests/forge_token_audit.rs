@@ -113,6 +113,28 @@ fn run(db: &Path, decl: &Path, now: i64) -> (i32, String) {
 
 /// Run the audit with extra flags (the registry direction).
 fn run_args(db: &Path, decl: &Path, now: i64, extra: &[&std::ffi::OsStr]) -> (i32, String) {
+    // No machine token, whatever the machine running the tests holds: the
+    // token cells bring their own mount (`run_env`).
+    let nowhere = db.with_file_name("no-machine-token-mount");
+    let (code, out, _) = run_env(
+        db,
+        decl,
+        now,
+        extra,
+        &[("BOSS_MACHINE_TOKEN_DIR", nowhere.as_os_str())],
+    );
+    (code, out)
+}
+
+/// Run the audit with extra flags and environment. Returns (exit code,
+/// stdout, stderr).
+fn run_env(
+    db: &Path,
+    decl: &Path,
+    now: i64,
+    extra: &[&std::ffi::OsStr],
+    env: &[(&str, &std::ffi::OsStr)],
+) -> (i32, String, String) {
     let out = Command::new("python3")
         .arg(script())
         .arg("--db")
@@ -122,11 +144,15 @@ fn run_args(db: &Path, decl: &Path, now: i64, extra: &[&std::ffi::OsStr]) -> (i3
         .arg("--now")
         .arg(now.to_string())
         .args(extra)
+        .env("BOSS_SOR_ENV", db.with_file_name("no-sor.env"))
+        .env_remove("RUNTIME_DIRECTORY")
+        .envs(env.iter().copied())
         .output()
         .expect("the audit script runs");
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
     )
 }
 
@@ -489,4 +515,247 @@ fn no_credential_material_reaches_the_output() {
         out.contains("UNDECLARED") && out.contains("MISSING"),
         "{out}"
     );
+}
+
+// ---------------------------------------------------------------------
+// THE MACHINE TOKEN (design 6805c764; backlog 44b2087e, df38075a F2,
+// 7369b078 F3)
+// ---------------------------------------------------------------------
+//
+// The registry read is the one request this audit sends to a gated port,
+// and it is Python: `urllib`, not curl, so no shell pin saw that it
+// signed `x-boss-user` and presented nothing. It now asks the ONE shell
+// reader (infra/lib/secret-header.sh, run as a child that is handed the
+// library's path and the URL and nothing else) and takes the header line
+// from the child's stdout, a pipe. Each cell below runs the real script
+// against a one-shot socket standing in for the jobs API and reads the
+// request it actually sent.
+
+/// One run against a socket that answers an agreeing registry. Returns
+/// (exit code, stdout, stderr, the request as sent, what is left under
+/// TMPDIR and the runtime directory).
+fn run_against_a_socket(
+    tag: &str,
+    slot: Option<&str>,
+    hosts: &str,
+    runtime: bool,
+    redirect_to: Option<&str>,
+) -> (i32, String, String, String, Vec<String>) {
+    use std::io::{Read, Write};
+    let dir = scratch(&format!("token-{tag}"));
+    let db = forge_db(&dir, &[("boss-gcp", "write:repository", NOW - 3600)]);
+    let decl = declaration(&dir, &[("boss-gcp", "the conductor", "write:repository")]);
+    let rows =
+        std::fs::read_to_string(registry(&dir, &[("boss-gcp", &["write:repository"])])).unwrap();
+    let (mount, tmp, run) = (dir.join("mount"), dir.join("tmp"), dir.join("run"));
+    for d in [&mount, &tmp, &run] {
+        boss_testing::create_dir(d);
+    }
+    if let Some(value) = slot {
+        boss_testing::write_file(&mount.join("current"), value);
+    }
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let redirect = redirect_to.map(str::to_string);
+    let server = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        let mut req = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = conn.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            req.extend_from_slice(&buf[..n]);
+        }
+        match redirect {
+            Some(to) => write!(
+                conn,
+                "HTTP/1.1 302 Found\r\nlocation: {to}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            ),
+            None => write!(
+                conn,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{rows}",
+                rows.len()
+            ),
+        }
+        .unwrap();
+        String::from_utf8_lossy(&req).to_string()
+    });
+
+    let mut env: Vec<(&str, &std::ffi::OsStr)> = vec![
+        ("BOSS_MACHINE_TOKEN_DIR", mount.as_os_str()),
+        ("BOSS_MACHINE_TOKEN_HOSTS", hosts.as_ref()),
+        ("TMPDIR", tmp.as_os_str()),
+    ];
+    if runtime {
+        env.push(("RUNTIME_DIRECTORY", run.as_os_str()));
+    }
+    let (code, out, err) = run_env(
+        &db,
+        &decl,
+        NOW,
+        &["--registry-url".as_ref(), url.as_ref()],
+        &env,
+    );
+    let req = server.join().unwrap();
+    let left = [&tmp, &run]
+        .iter()
+        .flat_map(|d| std::fs::read_dir(d).unwrap())
+        .filter_map(Result::ok)
+        .map(|e| e.path().display().to_string())
+        .collect();
+    (code, out, err, req, left)
+}
+
+/// The value of one header of a raw request, whatever its case.
+fn header<'a>(req: &'a str, name: &str) -> Option<&'a str> {
+    req.lines().find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.eq_ignore_ascii_case(name).then(|| v.trim())
+    })
+}
+
+const MACHINE_TOKEN: &str = "synthetic-machine-fixture";
+
+/// PRESENTED, NEVER REQUIRED. With a slot in the mount the read carries
+/// its value; with none, with a slot no header can carry, or with a slot
+/// that is not one printable word, the read is the read it was — signed,
+/// answered, clean — and nothing is left behind in either case.
+#[test]
+fn the_registry_read_presents_the_machine_token_and_is_never_stopped_by_it() {
+    let (code, out, _, req, left) = run_against_a_socket("absent", None, "", false, None);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(header(&req, "x-boss-machine-token"), None, "{req}");
+    assert!(header(&req, "x-boss-user").is_some(), "{req}");
+    assert!(left.is_empty(), "{left:?}");
+
+    let fixture = format!("{MACHINE_TOKEN}\n");
+    let (code, out, err, req, left) =
+        run_against_a_socket("present", Some(&fixture), "", false, None);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert_eq!(
+        header(&req, "x-boss-machine-token"),
+        Some(MACHINE_TOKEN),
+        "the read carries the slot's value: {req}"
+    );
+    assert!(header(&req, "x-boss-user").is_some(), "{req}");
+    assert!(
+        !out.contains(MACHINE_TOKEN) && !err.contains(MACHINE_TOKEN),
+        "the token is on the audit's output:\n{out}\n{err}"
+    );
+    assert!(
+        left.is_empty(),
+        "the reader's header directory outlived the run: {left:?}"
+    );
+
+    for (tag, slot) in [
+        ("line-break", format!("{MACHINE_TOKEN}\nsecond-line\n")),
+        ("not-a-word", format!("{MACHINE_TOKEN} \u{e9}\n")),
+    ] {
+        let (code, out, err, req, left) = run_against_a_socket(tag, Some(&slot), "", false, None);
+        assert_eq!(code, 0, "{tag}: the audit still runs clean:\n{out}\n{err}");
+        assert_eq!(
+            header(&req, "x-boss-machine-token"),
+            None,
+            "{tag}: this read goes out without the token: {req}"
+        );
+        assert!(
+            !err.is_empty(),
+            "{tag}: a token that is held and not sent is said on stderr"
+        );
+        assert!(
+            !out.contains(MACHINE_TOKEN) && !err.contains(MACHINE_TOKEN),
+            "{tag}: the token is on the audit's output:\n{out}\n{err}"
+        );
+        assert!(left.is_empty(), "{tag}: {left:?}");
+    }
+}
+
+/// Under the unit's `RuntimeDirectory=` the reader's file is made there
+/// and nowhere else, and is gone by the time the request is sent.
+#[test]
+fn under_a_runtime_directory_the_reader_leaves_nothing_in_tmp() {
+    let fixture = format!("{MACHINE_TOKEN}\n");
+    let (code, out, err, req, left) =
+        run_against_a_socket("runtime", Some(&fixture), "", true, None);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert_eq!(
+        header(&req, "x-boss-machine-token"),
+        Some(MACHINE_TOKEN),
+        "{req}"
+    );
+    assert!(left.is_empty(), "{left:?}");
+    let unit =
+        std::fs::read_to_string(repo_root().join("infra/boss-forge-token-audit.service")).unwrap();
+    assert!(
+        unit.lines()
+            .any(|l| l.trim() == "RuntimeDirectory=boss-forge-token-audit"),
+        "the unit declares the runtime directory a killed reader's file would be removed with"
+    );
+}
+
+/// A REDIRECT IS NOT FOLLOWED. urllib follows a 3xx by default and sends
+/// the same headers to wherever it points — which curl, the sender every
+/// other stamped request uses, does not do without `-L`. The reader
+/// judged ONE host; an answer from that host must not be able to name
+/// another for the token to go to. The run is honestly partial instead.
+#[test]
+fn a_redirect_is_not_followed_with_the_token() {
+    let elsewhere = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    elsewhere.set_nonblocking(true).unwrap();
+    let to = format!("http://{}/api/credentials", elsewhere.local_addr().unwrap());
+    let fixture = format!("{MACHINE_TOKEN}\n");
+    let (code, out, err, req, left) =
+        run_against_a_socket("redirect", Some(&fixture), "", false, Some(&to));
+    assert_eq!(
+        header(&req, "x-boss-machine-token"),
+        Some(MACHINE_TOKEN),
+        "the first request carried it: {req}"
+    );
+    assert!(
+        elsewhere.accept().is_err(),
+        "the audit followed the redirect, and its headers went with it"
+    );
+    assert_eq!(code, 1, "partial, not clean:\n{out}\n{err}");
+    assert!(out.contains("LIMIT") && out.contains("302"), "{out}");
+    assert!(
+        !out.contains(MACHINE_TOKEN) && !err.contains(MACHINE_TOKEN),
+        "{out}\n{err}"
+    );
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// An off-list host is the reader's own decision, and it is the reader
+/// that makes it: nothing is listening at this address, so only what the
+/// audit says and leaves can be read.
+#[test]
+fn a_registry_off_the_host_list_is_asked_without_the_token_and_said_so() {
+    let dir = scratch("token-off-host");
+    let db = forge_db(&dir, &[("boss-gcp", "write:repository", NOW - 3600)]);
+    let decl = declaration(&dir, &[("boss-gcp", "the conductor", "write:repository")]);
+    let (mount, tmp) = (dir.join("mount"), dir.join("tmp"));
+    boss_testing::create_dir(&mount);
+    boss_testing::create_dir(&tmp);
+    boss_testing::write_file(&mount.join("current"), MACHINE_TOKEN);
+    // `.invalid` never resolves (RFC 6761): the read fails fast.
+    let (code, out, err) = run_env(
+        &db,
+        &decl,
+        NOW,
+        &["--registry-url".as_ref(), "http://jobs.invalid:9".as_ref()],
+        &[
+            ("BOSS_MACHINE_TOKEN_DIR", mount.as_os_str()),
+            ("BOSS_MACHINE_TOKEN_HOSTS", "elsewhere.test".as_ref()),
+            ("TMPDIR", tmp.as_os_str()),
+        ],
+    );
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        err.contains("machine token withheld from http://jobs.invalid"),
+        "the reader says which host it withheld from: {err}"
+    );
+    assert!(!out.contains(MACHINE_TOKEN) && !err.contains(MACHINE_TOKEN));
+    assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
 }

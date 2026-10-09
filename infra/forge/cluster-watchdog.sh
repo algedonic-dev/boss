@@ -80,7 +80,43 @@ case "$image_ready" in
         unpinned="$image_ready"
         echo "watchdog: the kubectl image is not pinned — the disk sweep's next prune can take it, and a pull then needs the forge registry: $image_ready" >&2 ;;
 esac
-stamp=$(cat "$STAMP_FILE" 2>/dev/null || echo none)
+# THE STAMP IS ANOTHER ACCOUNT'S FILE, READ AS DATA (backlog a604a35b).
+# This loop runs as root; the stamp is written by the cluster converge,
+# which runs as the checkout's owner. So the path is one that account
+# can repoint — at the machine token, at the admin kubeconfig — and
+# whatever is read here goes into a kubectl patch, this journal and an
+# alert's body. A build name is seven hex characters (the converge's
+# ${HEAD_FULL:0:7}); anything else is `none`, which rolls nothing, and
+# is said WITHOUT the bytes that were found. Bounded, so a name swapped
+# for something that never ends cannot hold the tick.
+# A read that FAILED (no file, a file this cannot open, the bound) has
+# its own name and is never taken for a stamp: `none`, whatever came out.
+#
+# AND THE NAME IS NOT OPENED UNLESS IT IS A FILE OF ITS OWN (review
+# 5f3736a2, F6). Checking what came out is not enough: a symlink made
+# root OPEN whatever it pointed at — a device node of that account's
+# choosing — and a symlink to a file holding a well-formed build name
+# passed the shape check and was rolled to; a FIFO cost each tick the
+# read bound. A regular file, not a symlink, or nothing is read — the
+# check install.sh's one-time carry already made. Between this check and
+# the read the name can still be swapped; what that wins is the shape
+# check and the bound below, as before.
+stamp_unread=""
+stamp=""
+if [ -L "$STAMP_FILE" ] || { [ -e "$STAMP_FILE" ] && [ ! -f "$STAMP_FILE" ]; }; then
+    stamp_unread=1
+    echo "watchdog: $STAMP_FILE is not a regular file of its own (a symlink, a pipe, a directory) — not opened, read as none, so there is nothing to roll to" >&2
+    run_summary_field stamp "UNUSABLE: $STAMP_FILE is not a regular file of its own; not opened, nothing to roll to"
+else
+    stamp=$(timeout 5 head -c 64 -- "$STAMP_FILE" 2>/dev/null | awk 'NR == 1') || stamp_unread=1
+fi
+if [ -n "$stamp_unread" ] || ! [[ $stamp =~ ^[0-9a-f]{7}$ ]]; then
+    if [ -f "$STAMP_FILE" ] && [ ! -L "$STAMP_FILE" ]; then
+        echo "watchdog: $STAMP_FILE does not hold a build name (seven hex characters) — read as none, so there is nothing to roll to; what it holds is not printed" >&2
+        run_summary_field stamp "UNUSABLE: $STAMP_FILE does not hold a build name; nothing to roll to"
+    fi
+    stamp=none
+fi
 # THE DARK COUNT: absent is zero — the first dark tick; unreadable or
 # not a number is SAID, on the packet and in the journal, and fails the
 # run (backlog f280dd01 item 5). It used to read as zero, which restarts
@@ -91,9 +127,9 @@ stamp=$(cat "$STAMP_FILE" 2>/dev/null || echo none)
 # it does not (a full root volume, a STATE that is a directory), every
 # tick reads the same unusable count and the watchdog never reaches the
 # threshold, so the write is checked and that failure is named for
-# what it is (review of 8f50d314, L4). The count stays on disk under
-# $HOME rather than tmpfs: checking the write is the smaller change and
-# covers every way it can fail, not only a full disk.
+# what it is (review of 8f50d314, L4). The count stays on disk (the
+# unit's StateDirectory) rather than tmpfs: checking the write is the
+# smaller change and covers every way it can fail, not only a full disk.
 dark=0
 state_unreadable=""
 if [ "$live" = "down" ]; then
